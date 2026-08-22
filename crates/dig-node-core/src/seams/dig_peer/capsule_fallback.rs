@@ -59,12 +59,13 @@ impl ProviderLocator for CapsuleFallbackLocator {
         // (forward-compatible if a future writer DOES announce it) and the parent capsule key (the one
         // holders actually announce today), then union the holders. Resource-key hits keep precedence.
         let capsule = ContentId::capsule(*store_id, *root);
-        let by_resource = self.inner.find_providers(content).await.unwrap_or_default();
-        let by_capsule = self
-            .inner
-            .find_providers(&capsule)
-            .await
-            .unwrap_or_default();
+        // Best-effort for FINDING (either query erroring never removes what the other found), but NOT
+        // for ABSENCE (dig-node#273): the failure is retained so an EMPTY result can still report that
+        // nobody finished looking. `.unwrap_or_default()` on both legs is what turned a failed DHT
+        // walk into `Ok(vec![])` before it ever reached the caller that decides `absence_established`.
+        let mut failure: Option<DownloadError> = None;
+        let by_resource = unwrap_or_record(self.inner.find_providers(content).await, &mut failure);
+        let by_capsule = unwrap_or_record(self.inner.find_providers(&capsule).await, &mut failure);
 
         let mut merged: Vec<ProviderRecord> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -73,7 +74,33 @@ impl ProviderLocator for CapsuleFallbackLocator {
                 merged.push(record);
             }
         }
+        // An empty union of two granularities means "no holder announced at EITHER" only when both
+        // queries completed. If one failed, the emptiness is unproven and the caller must not read it
+        // as a negative. A non-empty result is not an absence claim, so a failure alongside it is
+        // immaterial and the holders survive.
+        if merged.is_empty() {
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
         Ok(merged)
+    }
+}
+
+/// Take the records from `result`, recording the FIRST error in `failure` instead of discarding it.
+///
+/// The two-granularity query is best-effort for finding and strict for absence; this keeps that split
+/// in one place so neither leg can quietly regain an `.unwrap_or_default()`.
+fn unwrap_or_record(
+    result: Result<Vec<ProviderRecord>, DownloadError>,
+    failure: &mut Option<DownloadError>,
+) -> Vec<ProviderRecord> {
+    match result {
+        Ok(records) => records,
+        Err(error) => {
+            failure.get_or_insert(error);
+            Vec::new()
+        }
     }
 }
 
@@ -193,6 +220,78 @@ mod tests {
             ],
             "deduped by peer_id, resource-hit first then capsule-only holders"
         );
+    }
+
+    /// dig-node#273: the resource/capsule fan-out is best-effort for FINDING and strict for
+    /// ABSENCE — the two `.unwrap_or_default()` calls made a failed walk indistinguishable from a
+    /// completed one that found nobody, one layer below where anyone was looking.
+    #[tokio::test]
+    async fn a_failed_query_makes_an_empty_fallback_an_error_but_never_hides_a_holder() {
+        let store = [6u8; 32];
+        let root = [7u8; 32];
+        let resource = ContentId::resource(store, root, [8u8; 32]);
+        let capsule = ContentId::capsule(store, root);
+
+        /// Fails for every id EXCEPT `answers_for`, where it returns `providers`. With an id nothing
+        /// answers, BOTH legs fail; priming the capsule id gives the fan-out a healthy leg.
+        struct HalfBrokenLocator {
+            answers_for: Option<ContentId>,
+            providers: Vec<ProviderRecord>,
+        }
+        #[async_trait]
+        impl ProviderLocator for HalfBrokenLocator {
+            async fn find_providers(
+                &self,
+                content: &ContentId,
+            ) -> Result<Vec<ProviderRecord>, DownloadError> {
+                if self.answers_for.as_ref() == Some(content) {
+                    Ok(self.providers.clone())
+                } else {
+                    Err(DownloadError::Transport {
+                        provider: "dht".into(),
+                        reason: "the DHT walk reached nobody".into(),
+                    })
+                }
+            }
+        }
+
+        // ARM 1 - both legs failed and nothing was found: unproven, so an error.
+        let broken = CapsuleFallbackLocator::new(Arc::new(HalfBrokenLocator {
+            answers_for: None,
+            providers: Vec::new(),
+        }));
+        assert!(
+            broken.find_providers(&resource).await.is_err(),
+            "an empty fan-out whose queries FAILED must not read as a proven absence"
+        );
+
+        // ARM 2 - the resource leg failed but the capsule leg named the announced holder: the holder
+        // survives, exactly as #1580 requires.
+        let partial = CapsuleFallbackLocator::new(Arc::new(HalfBrokenLocator {
+            answers_for: Some(capsule),
+            providers: vec![holder(1, &capsule)],
+        }));
+        let got = partial
+            .find_providers(&resource)
+            .await
+            .expect("a found holder is not an absence claim, so the sibling failure is immaterial");
+        assert_eq!(got.len(), 1, "the announced capsule holder survives");
+        assert_eq!(
+            got[0].provider_peer_id,
+            PeerId::from_bytes([1; 32]).to_hex()
+        );
+
+        // ARM 3 - the CONTROL: both legs completed and found nobody. Still a real negative.
+        let honest = CapsuleFallbackLocator::new(Arc::new(GranularityLocator {
+            answers_for: ContentId::capsule([0xEE; 32], [0xEE; 32]),
+            providers: Vec::new(),
+            queried: Mutex::new(Vec::new()),
+        }));
+        assert!(honest
+            .find_providers(&resource)
+            .await
+            .expect("two completed queries that found nobody are a real negative")
+            .is_empty());
     }
 
     /// A non-resource (capsule) lookup passes straight through — no extra fallback query.

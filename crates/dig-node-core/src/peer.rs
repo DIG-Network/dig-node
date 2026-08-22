@@ -1634,6 +1634,18 @@ impl PeerRpcResponder for NodeResponder {
                                 return write_framed(out, &errf).await;
                             }
                             crate::download::MissOutcome::NotFound => {}
+                            // Absence unproven (dig-node#273): answer with the distinct code rather
+                            // than falling through to the plain not-found below, so the peer that
+                            // asked can tell a settled answer from an unanswered question — and, when
+                            // that peer is a relaying hop, does not pass an absence downwards that
+                            // nothing here established.
+                            crate::download::MissOutcome::Inconclusive => {
+                                let errf = json!({"error": {
+                                    "code": crate::download::content_miss_inconclusive(),
+                                    "message": crate::download::MISS_INCONCLUSIVE_MESSAGE,
+                                }});
+                                return write_framed(out, &errf).await;
+                            }
                         }
                     }
                 }

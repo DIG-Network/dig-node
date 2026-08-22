@@ -3748,14 +3748,24 @@ impl Node {
             if let Some(pc) = self.p2p_content() {
                 if let Some(content) = download::availability_content_id(store, root, rk) {
                     if pc.allow_miss_lookup(requestor) {
-                        let providers = pc.locate_holders(&content, budget, requestor).await;
-                        if !providers.is_empty() {
-                            if let Some(obj) = answer.as_object_mut() {
+                        let located = pc.locate_holders(&content, budget, requestor).await;
+                        if let Some(obj) = answer.as_object_mut() {
+                            if !located.is_empty() {
                                 obj.insert(
                                     "providers".into(),
-                                    download::providers_json(&providers),
+                                    download::providers_json(&located.candidates()),
                                 );
                             }
+                            // Say whether the ABSENCE was established, not merely that no holder was
+                            // named (dig-node#273). A hop reads this to tell "my subtree does not have
+                            // it" from "my subtree did not answer", which is what stops one slow peer
+                            // downstream becoming an authoritative absence upstream. Additive: a peer
+                            // running an older build omits it, and a reader that finds it absent falls
+                            // back to today's tolerant reading.
+                            obj.insert(
+                                "absence_established".into(),
+                                serde_json::Value::Bool(located.establishes_absence()),
+                            );
                         }
                     }
                 }
@@ -4640,6 +4650,107 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    /// Every JSON-RPC error number this node PUTS ON THE WIRE, paired with the condition it names.
+    ///
+    /// Keyed by CONDITION, not by const identifier, so the two spellings of `-32004`
+    /// ([`RESOURCE_UNAVAILABLE`] and [`RESOURCE_NOT_AVAILABLE`]) are correctly read as one condition
+    /// under two names rather than as a collision.
+    ///
+    /// Deliberately NOT exhaustive yet: `content_serve::SERVE_UNREADABLE` (`-32000`) specialises the
+    /// canonical `SERVER_ERROR`, and the chat band (`-32050`..`-32052`) is undeclared upstream
+    /// entirely. Both are pre-existing and out of this change; adding them is a follow-up that has to
+    /// resolve the condition, not the table.
+    const LOCAL_WIRE_CODES: &[(i64, &str)] = &[
+        (
+            crate::download::CONTENT_MISS_RATE_LIMITED,
+            "CONTENT_MISS_RATE_LIMITED",
+        ),
+        (
+            crate::download::RESOURCE_UNAVAILABLE,
+            "RESOURCE_UNAVAILABLE",
+        ),
+        (RESOURCE_NOT_AVAILABLE, "RESOURCE_UNAVAILABLE"),
+        (ROOT_NOT_ANCHORED, "ROOT_NOT_ANCHORED"),
+        (crate::download::CONTENT_REDIRECT, "CONTENT_REDIRECT"),
+        (METADATA_TOO_LARGE, "METADATA_TOO_LARGE"),
+        (
+            crate::seams::capsule::push_capsule::PUSH_PENDING_LIMITED,
+            "PUSH_PENDING_LIMITED",
+        ),
+        (CONTROL_UNAUTHORIZED, "UNAUTHORIZED"),
+        (CONTROL_NOT_SUPPORTED, "NOT_SUPPORTED"),
+        (CONTROL_ERROR, "CONTROL_ERROR"),
+    ];
+
+    /// **Proves:** no number this node emits is already spoken for — neither by
+    /// `dig_rpc_protocol`'s canonical taxonomy under a DIFFERENT name, nor by a different local
+    /// condition.
+    ///
+    /// **Catches:** the whole defect class that produced this test, twice in one review. The wire
+    /// number is the only thing a remote client sees, so two conditions sharing one number leave it
+    /// unable to choose between opposite instructions, and no retry policy can recover — the
+    /// ambiguity is in the contract. Both instances were found by hand, one number apart:
+    ///
+    /// * `-32009` (`RANGE_METADATA_UNREPRESENTABLE`, holder-fatal) proposed for
+    ///   `CONTENT_MISS_INCONCLUSIVE` (keep looking) — caught by the canonical leg;
+    /// * `-32015` (`METADATA_TOO_LARGE`, released and docs.dig.net-catalogued) is what
+    ///   `dig-rpc-protocol` 0.9.0 assigns `ContentMissInconclusive`, having read only its own list —
+    ///   caught by the local leg, which is why one leg alone is not enough. A test asserting merely
+    ///   `!= -32009` passes on the second bug.
+    ///
+    /// **Fixture note:** the canonical leg compares by `(number, machine_code)` rather than by
+    /// number alone. Comparing numbers only would flag every code this node legitimately SHARES
+    /// with the taxonomy (`-32004`, `-32005`, `-32008`, ...) and the test would have to be weakened
+    /// to a small allowlist — which is how it would stop seeing new entries.
+    #[test]
+    fn no_local_wire_code_collides_with_a_different_canonical_code() {
+        // Side effects first: a table that has silently shrunk to nothing, or lost the code under
+        // review, would make every assertion below vacuously true.
+        assert!(
+            LOCAL_WIRE_CODES.len() >= 10,
+            "the local wire-code table lost entries; a shrinking table makes this guard vacuous"
+        );
+        // `CONTENT_MISS_INCONCLUSIVE` deliberately LEFT this table: `dig-rpc-protocol` 0.10 declares
+        // it, so it is no longer a local number and the owner answers the collision question for it.
+        // What is asserted instead is that this node still emits the OWNER'S number — the property
+        // the table entry was standing in for, now checked against the source of truth rather than
+        // against a copy of it.
+        assert!(
+            !LOCAL_WIRE_CODES
+                .iter()
+                .any(|(_, name)| *name == "CONTENT_MISS_INCONCLUSIVE"),
+            "a canonical code is being re-declared locally; that is the drift this adoption removed"
+        );
+        assert_eq!(
+            crate::download::content_miss_inconclusive(),
+            i64::from(dig_rpc_protocol::ErrorCode::ContentMissInconclusive.code()),
+            "this node must emit the taxonomy owner's number, never its own copy of it"
+        );
+        assert!(
+            dig_rpc_protocol::ErrorCode::ALL.len() >= 20,
+            "the canonical taxonomy read as near-empty; the canonical leg would pass on anything"
+        );
+
+        for (number, condition) in LOCAL_WIRE_CODES {
+            for canonical in dig_rpc_protocol::ErrorCode::ALL {
+                assert!(
+                    i64::from(canonical.code()) != *number || canonical.machine_code() == *condition,
+                    "local {condition} = {number} is already canonically {}, and the two do not mean the same thing — a client cannot tell them apart",
+                    canonical.machine_code()
+                );
+            }
+
+            let clashing_local = LOCAL_WIRE_CODES
+                .iter()
+                .find(|(other_number, other)| other_number == number && other != condition);
+            assert!(
+                clashing_local.is_none(),
+                "local {condition} = {number} collides with local {}",
+                clashing_local.map(|(_, name)| *name).unwrap_or_default()
+            );
+        }
+    }
 
     /// A per-THREAD counting allocator, installed process-wide only for the test binary.
     ///
@@ -9499,6 +9610,82 @@ mod tests {
         assert!(
             answer.get("total_length").is_some(),
             "the resource totals come from the same served module the answer agrees with"
+        );
+    }
+
+    /// **Proves:** `absence_established` has THREE states on the wire and the absent one is not a
+    /// `false` in disguise - a node that ran no search makes NO CLAIM, which is different from
+    /// claiming an incomplete search.
+    ///
+    /// **Fixture design - two nodes differing in ONE respect, the presence of a search.** Both miss
+    /// the item, so `available` is `false` in both and cannot be what distinguishes them. The node
+    /// with no P2P engine consulted nothing, so the key MUST be absent; the node with an engine ran a
+    /// conclusive lookup, so it MUST be present. The nearest wrong implementation inserts the key
+    /// unconditionally with `unwrap_or(false)`, and a test that only checked the engine-attached case
+    /// would pass against it - the absent case is the only one that sees it, which is why the
+    /// engine-less control is here rather than an all-miss fixture.
+    ///
+    /// The third state, `Some(false)`, is the `CONTENT_MISS_INCONCLUSIVE` path and is driven from the
+    /// same `LocatedHolders::establishes_absence` flag; it is exercised by the forwarded-ask tests
+    /// where a leg can actually fail to answer.
+    #[tokio::test]
+    async fn absence_established_is_absent_when_no_search_ran_and_present_when_one_did() {
+        let store = Bytes32([0xa7; 32]);
+        let root = Bytes32([0xb8; 32]);
+        let rk = [0x5c; 32];
+        let item = json!({
+            "store_id": store.to_hex(),
+            "root": root.to_hex(),
+            "retrieval_key": hex::encode(rk),
+        });
+
+        // CONTROL: no engine, so no leg was consulted and nothing may be claimed either way.
+        let (silent, _td_a) = test_node(None);
+        let snapshot = silent.cache_list_cached().await;
+        let unsearched = silent
+            .availability_answer(
+                &item,
+                &snapshot,
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
+            .await;
+        assert_eq!(
+            unsearched["available"], false,
+            "precondition: the control node misses the item, so the two cases differ only in search"
+        );
+        assert!(
+            unsearched.get("absence_established").is_none(),
+            "a node that consulted nothing must make NO claim - an inserted `false` would tell the              caller a search ran and came back incomplete, which never happened"
+        );
+
+        // A node that DID search, conclusively: the claim is present and positive.
+        let (searched, td_b) = test_node(None);
+        let searched = Arc::new(searched);
+        searched.set_self_ref(Arc::downgrade(&searched));
+        attach_p2p(
+            &searched,
+            Vec::new(),
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td_b,
+        );
+        let snapshot = searched.cache_list_cached().await;
+        let answered = searched
+            .availability_answer(
+                &item,
+                &snapshot,
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
+            .await;
+        assert_eq!(
+            answered["available"], false,
+            "precondition: this node misses it too - only the search distinguishes the two answers"
+        );
+        assert_eq!(
+            answered["absence_established"], true,
+            "a lookup where every consulted leg answered establishes the absence, and says so"
         );
     }
 

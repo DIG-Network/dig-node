@@ -123,7 +123,7 @@ dig-clvm = "0.2"
 # AES-256-GCM, versioned/magic-tagged/CRC-guarded) replaces the bespoke `digstore_chain::seed`
 # on-disk layout for NEW writes; `seed_store::decrypt_seed` still reads old-format files.
 # Published on crates.io (not a git dep) — the crate ships its library surface there.
-dig-keystore = "0.3"
+dig-keystore = "0.9"
 # The `SyncEvent` stream (design A.9): wraps the `tokio::sync::broadcast` receiver as a
 # `Stream` for the SSE `GET /events` handler (`sage::transport`). `tokio-stream` supplies the
 # `BroadcastStream` wrapper + `StreamExt` combinators; `futures-core` supplies the `Stream`

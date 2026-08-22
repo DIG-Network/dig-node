@@ -6,7 +6,7 @@
 
 mod capsule_download;
 mod capsule_store;
-mod push_capsule;
+pub(crate) mod push_capsule;
 
 pub use capsule_download::{download_capsule_via_rpc, CAPSULE_WINDOW_BYTES, MAX_CAPSULE_BYTES};
 pub use capsule_store::CapsuleStore;

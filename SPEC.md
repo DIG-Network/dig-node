@@ -2961,6 +2961,7 @@ method runs, and it MUST NOT be conflated with the wallet's own `-32043` egress 
 | -32009 | `RANGE_METADATA_UNREPRESENTABLE` | node | A holder cannot frame a conforming range stream for this resource (an inclusion proof over `MAX_INCLUSION_PROOF_B64` is the real case): the resource's own range metadata cannot fit a conforming frame, so this holder can NEVER serve the range. Named explicitly on the peer range-stream serve instead of truncating the stream with a bare `Err`. Matches `dig_rpc_protocol::ErrorCode::RangeMetadataUnrepresentable` (`-32009`). |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
 | -32015 | `METADATA_TOO_LARGE` | node | `dig.getMetadata` refused: the publisher metadata section is too large or too complex to render safely. Refused when the ENCODED section exceeds `METADATA_SECTION_MAX_BYTES` (3 MiB) or its `custom` exceeds `MAX_CUSTOM_ENTRIES`/`MAX_CUSTOM_JSON_DEPTH`/`MAX_CUSTOM_JSON_ELEMENTS` (both checked BEFORE decode, #2160), or the RENDERED body exceeds `METADATA_RESPONSE_MAX_BYTES` (3 MiB, #2145). This section is rendered WHOLE — it cannot be windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so an oversized/hostile capsule is refused with this bounded error rather than expanded ~16× in memory or blasted into a ~100 MB response (§5.5.1). A normal (kilobyte) metadata section is served unchanged. |
+| -32017 | `CONTENT_MISS_INCONCLUSIVE` | peer | No holder was named AND the search could not establish that there is none: a consulted leg timed out, was unreachable, or refused uninformatively (§10.4.5). The OPPOSITE instruction to a plain not-found — a not-found says stop looking, this says the question was not answered and the request MAY be retried. Collapsing the two let ONE slow peer manufacture an authoritative absence and, since a hop relays its answer, propagate it downwards. DEFINED by `dig-rpc-protocol` as `ErrorCode::ContentMissInconclusive` with origin `Peer` — the failure arises in the discovery layer from an unconsultable hop, mirroring `PeerUnreachable`. dig-node adopts the variant and does not assign the number. |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
 | -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
 | -32022 | *(reserved: onion `onion_hops_out_of_range`)* | — | Reserved for the onion-routing contract. |
@@ -3030,8 +3031,18 @@ disabled MUST forward nothing, and its miss answer is the DHT-only one §10.4.1-
 is what makes discovery recursive:
 a holder reachable through connections this node already holds is named even when no DHT record here
 can point at it. No new verb, address struct or result type is introduced — the hop budget rides
-`params.redirect_depth` and the answer rides the existing `providers` array — and a peer that does not
-return `providers` MUST be read as "found nobody", never as an error.
+`params.redirect_depth` and the answer rides the existing `providers` array.
+
+- **A peer that does not answer MUST NOT be read as "found nobody" (dig-node#273).** A `result` frame
+  is an ANSWER even when its `providers` array is empty or absent — that peer looked. A JSON-RPC
+  **error** frame is a REFUSAL, a frame that is neither is UNREACHABLE, and a budget that expires is a
+  TIMEOUT. Those three establish NOTHING about whether the content exists and MUST be distinguishable
+  from the one that does.
+
+  This REPEALS the earlier reading, which collapsed all four into an empty `providers` list. The
+  collapse let one slow or hostile peer manufacture an authoritative absence: a hop that simply refuses
+  every ask suppressed every holder downstream of it AND left the requestor confident about it, which
+  is a censorship primitive costing one field.
 
 - **Ordering is normative.** This node's own DHT findings MUST lead the merged list and forwarded
   records MUST follow, deduplicated by `peer_id` keeping the FIRST occurrence. The requestor dials in
@@ -3085,6 +3096,113 @@ return `providers` MUST be read as "found nobody", never as an error.
 - **Forwarded records are HEARSAY.** They are offered as candidates to DIAL, where the whole-resource
   merkle bind against the chain-anchored root is what admits bytes, so a fabricated holder costs one
   wasted dial. They MUST NOT be stored, re-served as this node's own authoritative claim, or published.
+- **A NOT-FOUND MUST cascade; an UNPROVEN absence MUST NOT (dig-node#273).** A node whose search named
+  no holder MUST answer:
+  - the plain not-found, when every leg it consulted answered — the absence is established; or
+  - `-32017` `CONTENT_MISS_INCONCLUSIVE`, when any consulted leg timed out, refused, or was
+    unreachable — the absence is unproven and the request MAY be retried.
+
+  **The condition, its number and its semantics are DEFINED BY `dig-rpc-protocol`**
+  (`ErrorCode::ContentMissInconclusive`, origin `Peer`), not by this document. dig-node ADOPTS it and
+  names the variant rather than the integer; the number above is reproduced for readability only and
+  the crate is authoritative if the two ever differ. A repo SPEC that re-declares a contract it does
+  not own is how the two silently drift apart.
+
+  **WHICH unasked path it was decides whether the absence may still be claimed.** A node that
+  consulted no peer is not one case but two, and they carry opposite answers:
+
+  - **Recursion is DISABLED on this node** (including: no forwarded leg installed at all) — the plain
+    not-found. Asking was never part of this node's answer, so nothing was withheld and the answer
+    stands on the DHT leg exactly as it did before the recursion existed. This is the stock posture,
+    and reporting it as inconclusive would make every miss on every default build unprovable — a
+    different lie, in the opposite direction, arriving by default rather than by attack.
+  - **Every other reason** — a spent hop budget, a spent or unreadable time budget, a spent relay
+    allowance, no eligible peer, no free concurrency slot, a walk already claimed by another path —
+    `CONTENT_MISS_INCONCLUSIVE`. On a node where the recursive ask IS part of the answer, a leg that
+    was supposed to run and did not leaves the search cut short. Calling that a proven absence tells
+    the reader to stop looking because this node ran out of budget, which is a fact about this node
+    and not about the content. Under a burst the saturation cases are the COMMON path, so collapsing
+    them would turn load into manufactured not-founds exactly when the network is busiest.
+
+  The DHT leg is subject to the same rule: a provider walk that FAILED (no reachable DHT peer, a
+  transport error) is not a walk that found nobody, and the absence is unproven. `absence_established`
+  is the CONJUNCTION of both legs having finished — deriving it from the forwarded leg alone left the
+  DHT leg with no way to clear it, which on a stock node made the field a constant `true`.
+
+  **EVERY layer of the provider-locator chain MUST preserve that distinction.** The chain a node
+  installs (a union over its discovery sources; a self-exclusion filter; a resource→capsule fallback)
+  is *best-effort for FINDING* — one source erroring MUST NOT remove what another source found — but
+  it is **strict for ABSENCE**: a layer whose result is EMPTY and which had a source FAIL MUST report
+  that failure rather than an empty set. A layer that returns `Ok([])` for a failed sub-query makes the
+  conjunction above unreachable, because the failure never reaches the leg that computes it; that is a
+  false `absence_established: true` for content that exists, and it needs no forged message to occur —
+  a start-up before any DHT peer answers, a partition, or an eclipsed routing table produce it. It is
+  worse on a stock node, where the recursive ask ships disabled and this conjunct is the whole search.
+  A NON-empty result is not an absence claim, so a failure beside it is immaterial and MUST NOT cost
+  the caller a holder.
+
+  `dig.getAvailability` additionally carries `absence_established` on its miss answer, defined by
+  `dig-rpc-protocol` (`AvailabilityAnswer::absence_established`). It has **THREE** states and dig-node
+  MUST NOT collapse them:
+
+  | state | meaning | dig-node's reading |
+  |---|---|---|
+  | `true` | the responder reached everything it meant to reach | the absence is established |
+  | `false` | the responder looked and its own search was incomplete | unproven; keep looking |
+  | ABSENT | the responder makes NO claim — it cannot describe its search at all | unproven; keep looking |
+
+  ABSENT is **not** `false` and MUST NOT be defaulted. Reading it as `true` turns an unknown into an
+  assertion of absence, which is the manufactured not-found this clause exists to prevent, arriving
+  through the compatibility door rather than through an attack. The cost — a mixed network reporting
+  more retries — is the right one, because an over-reported inconclusive costs a retry while an
+  over-reported absence costs content that exists and cannot be found. It does not arrive by default
+  either: the forwarded leg ships DISABLED, so a node that asks no peer never reads the field.
+
+  A node emits the field only when a search actually ran; a node that consulted nothing OMITS it,
+  because inserting `false` would report an incomplete search that never happened.
+
+  An establishment MUST come from an item that CARRIES it. A responder's `items` array that is EMPTY
+  claims nothing and MUST be read as ABSENT — folding it to the identity would let a responder assert
+  a proven absence with the cheapest possible message on the wire.
+- **The TIME budget MUST be carried DOWN and DECREMENTED, never restated (dig-node#273).** A hop asks
+  its peers SEQUENTIALLY, so a hop with `h` hops remaining needs `leaf + fan_out x work(h - 1)`. A
+  parent that grants each child a fixed per-ask timeout grants it LESS TIME THAN THE WORK IT IS ASKING
+  THAT CHILD TO DO — at the default `fan_out = 3` a child needs 15s and was given 5s — so the second
+  hop times out under any load and, before this clause, that timeout was indistinguishable from a miss.
+  The recursion was arithmetically depth-1 while appearing to work.
+
+  - The budget rides its OWN field, `params.budget_ms`, and MUST NOT be folded into
+    `redirect_depth`: the time budget is monotone DECREASING and the depth monotone INCREASING, so one
+    integer cannot carry both, and overloading it would let a hop buy itself hops by claiming time.
+  - `budget_ms` likewise has THREE states, defined by `dig-rpc-protocol`
+    (`GetAvailabilityParams::budget_ms`), and dig-node MUST NOT collapse them:
+    - **ABSENT** — unbudgeted. The responder applies its own policy; an originator derives its budget
+      from the work it is about to authorise.
+    - **`0`** — EXHAUSTED. The hop MUST NOT ask onward at all, and MUST NOT claim the absence, having
+      established nothing. Reading a zero as absent would let a spent budget silently buy a fresh one
+      at every hop, which is the unbounded reach the field exists to bound.
+    - **any other value** — the granted allowance, honoured exactly up to the ceiling below.
+  - It MUST be CLAMPED at ingress to `MAX_FORWARDED_ASK_BUDGET` (= 65s, the derived worst case at the
+    default bounds). The field is attacker-supplied, and without a ceiling one hop naming a ten-minute
+    budget holds an inbound request — and one of the 32 concurrency slots — open for ten minutes.
+  - A hop MUST NOT hand a peer more time than it was itself granted, and MUST stop asking when the
+    budget is spent. Peers left unasked make the absence UNPROVEN.
+- **The same ask MUST be walked at most once per node (dig-node#273).** A request carries an opaque
+  16-byte `params.ask_id`, minted by the originator and echoed unchanged by every hop; a node that has
+  already forwarded that id MUST NOT forward it again. Excluding the requestor stops an immediate echo
+  but NOT a diamond: in any graph that is not a tree the same ask reaches one node by two paths, and
+  without an identity neither arrival recognises the other, so the graph re-walks itself and the real
+  cost far exceeds `fan_out ^ hop_cap`.
+
+  The id MUST NOT be derived from the content (two independent readers asking about the same capsule
+  would collide, silently refusing the second) nor from the requestor (that would publish who is asking
+  to every hop, widening the §10.4.5 disclosure). A request carrying no readable id MUST be treated as
+  a NEW question, never as a duplicate — that is the honest degradation for an older peer, and the
+  alternative hands anyone a way to suppress the whole forwarded leg by omitting a field.
+- **The MERGE is `dig_sex::discovery::merge_answers`, not a local copy.** It caps the HEARSAY portion
+  only and tags every record `FirstHand` or `Hearsay`. Capping the merged set instead would let one
+  peer returning a full slate of fabricated holders evict every genuine holder for free — a denial of
+  the answer achieved without holding anything.
 
 10.4.5. **Privacy.** A miss discloses the requested `(store_id, root, retrieval_key)` to the middle
 node (it must, to locate holders). The `proxy` path additionally discloses to the serving holder that
@@ -3114,9 +3232,15 @@ Two limits are real and MUST NOT be overstated into an anonymity claim:
   mTLS and learns nothing about who originally asked. So downstream nodes learn WHAT was asked, not BY
   WHOM. This is a property of the message, not a defence against timing or traffic correlation, and it
   MUST NOT be described as anonymity.
-- **Nothing is retained.** Forwarded records are merged into one answer and never stored, re-served or
-  published (§10.4.4), so the disclosure is to a node's memory for the life of one request — but a
-  peer is free to log what it was asked, and nothing here prevents that.
+- **No HEARSAY is retained.** Forwarded records are merged into one answer and never stored,
+  re-served or published (§10.4.4), so a hop's claim lives in a node's memory for the life of one
+  request — but a peer is free to log what it was asked, and nothing here prevents that.
+
+  This is narrower than the absolute "nothing is retained" that stood here previously, and the
+  disclosure claim above is unaffected. What a node MAY retain is its OWN FIRST-HAND knowledge
+  (§10.4.7), which it necessarily already had; what it MUST NOT retain is anything a hop told it. The
+  widened radius this clause bounds is about what a hop LEARNS from being asked, and caching a record
+  this node established itself does not widen it.
 
 This is why the forwarded ask is **opt-in** (`DIG_NODE_FORWARD_ON_MISS`, default OFF, §10.4.6):
 widening the disclosure radius of every miss on a node is an operator's decision. A node with the
@@ -3134,6 +3258,44 @@ The default is OFF because the leg spends OTHER nodes' bandwidth: one admitted f
 **12 nodes** (`3 + 3^2`, the sum over hops — 48 against a full relay burst), each of which also runs a
 DHT walk, while the strictly cheaper, node-local `proxy` leg (§10.4.3) is already opt-in. A path that
 amplifies more than an opt-in path MUST NOT be gated less than it.
+
+10.4.7. **The first-hand holder cache (dig-node#275).** A node MAY remember which peers it
+established FIRST-HAND are holding which content, so a later request dials a known holder without
+repeating discovery.
+
+- **FIRST-HAND ONLY. Hearsay MUST NOT be cached.** A first-hand record is one this node obtained
+  itself; a hearsay record is one a hop relayed. This keeps §10.4.4's *"forwarded records MUST NOT be
+  stored"* intact, and it is a security property rather than a tidiness one: a cache admitting hearsay
+  would let one lying hop plant a fabricated holder that this node then re-serves as its own knowledge
+  for the whole TTL, which is a far better attack than lying once.
+- **It bounds and expires.** Keyed by `ContentId`; TTL **300s**; at most 4096 keys, evicting expired
+  entries first and then the oldest by insertion. Misses are stranger-driven — anyone may ask about
+  content this node does not have — so an unbounded cache of peer claims is a memory target a stranger
+  fills for free.
+  - The TTL MUST NOT be `ADVERTISED_TTL_SECS` (3600s). That constant is how long a holder's OWN SIGNED
+    announce is treated as live; what this cache holds is an unsigned DHT lookup ANSWER, relayed by
+    whichever node the walk reached first, and pricing the second at the lifetime of the first lends it
+    a warrant it does not carry.
+  - What the TTL bounds is a DISPLACEMENT window: first-hand records are prepended at the merge and the
+    hearsay tail is cut at `MAX_REDIRECT_PROVIDERS`, so a fabricated first-hand slate EVICTS genuine,
+    recursively-discovered holders for as long as it is remembered, and every read inside the window
+    renews it. 300s still spares rediscovery across the repeated lookups one download session makes.
+  - The TTL is a CEILING, not the whole rule: each record's own `expires_at` is honoured too, so a
+    cached entry can never outlive the claim behind it.
+- **An EMPTY slate MUST NOT be cached.** "I found nobody" is a fact about one moment; retaining it
+  would suppress rediscovery for the whole TTL, turning one unlucky lookup into an hour of manufactured
+  absence — the same failure §10.4.4 repeals on the wire.
+- **It is a discovery shortcut, never an answer.** A cache hit replaces the DHT walk ONLY; the
+  forwarded ask still runs. Short-circuiting the whole search would mean a node holding any first-hand
+  record stops asking its peers for the rest of the TTL, silently disabling the recursive enrichment.
+- **It MUST be invalidated when its slate reaches nobody**, at the same point dig-dht SPEC §6.8's
+  cached answer is forgotten. Otherwise it replays the exact candidates just proven unreachable.
+- **In memory only; never persisted.** A record of who holds what is also a record of what this node
+  looked for, so it is not written to disk and does not come under NC-2 at-rest sealing. The process
+  ending forgets it.
+- Every cached entry remains a candidate to DIAL and never a fact (NC-12): the whole-resource merkle
+  bind against the chain-anchored root is what admits bytes, so a stale entry costs one wasted dial.
+
 
 ---
 

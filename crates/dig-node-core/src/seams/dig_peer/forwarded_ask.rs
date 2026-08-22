@@ -44,6 +44,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dig_dht::{CandidateAddr, ContentId, PeerId};
+
+use super::holder_cache::AskId;
 use dig_download::ProviderRecord;
 use serde_json::{json, Value};
 
@@ -61,10 +63,115 @@ use serde_json::{json, Value};
 /// its own independent 32. Reading this as a cap on the aggregate understates the cost of this path.
 pub(crate) const MAX_CONCURRENT_FORWARDED_ASKS: usize = 32;
 
-/// Bounds one forwarded ask end to end (dial + stream + answer). A peer that is slow or gone must not
-/// hold the inbound request open: the miss answer is enrichment, so a timeout degrades it rather than
-/// failing it. Matches the DHT RPC budget, since the shape of the work is the same.
-pub(crate) const FORWARDED_ASK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds ONE LEAF ask - a peer that will not itself forward - end to end (dial + stream + answer).
+/// Matches the DHT RPC budget, since the shape of the work is the same.
+///
+/// **This is the leaf, not the whole ask.** A peer that WILL forward is doing `fan_out` asks of its
+/// own before it can answer, so granting it this same 5s guarantees it times out. The budget an
+/// intermediate hop is given is [`ask_budget`], and the arithmetic connecting the two is the subject
+/// of that function's docs.
+pub(crate) const FORWARDED_ASK_LEAF_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The ceiling on any forwarded ask's wall-clock budget, applied to BOTH the budget this node derives
+/// for itself and the budget a hop hands it on the wire.
+///
+/// It exists because the wire budget arrives from an untrusted peer (NC-12). Without a clamp, one hop
+/// naming a ten-minute budget holds this node's inbound request - and one of its
+/// [`MAX_CONCURRENT_FORWARDED_ASKS`] slots - open for ten minutes, an amplification achieved with a
+/// single integer. The clamp is applied at ingress in
+/// [`HopBudget::from_params`](crate::download::HopBudget::from_params), so no later reader has to
+/// remember to apply it.
+pub(crate) const MAX_FORWARDED_ASK_BUDGET: Duration = Duration::from_secs(65);
+
+/// The wall-clock budget an ask that may travel `hops_remaining` further hops actually needs, given a
+/// breadth of `fan_out`.
+///
+/// # Why a fixed per-ask timeout makes the recursion depth-1
+///
+/// A hop with `h` hops left asks up to `fan_out` peers SEQUENTIALLY, each of which needs
+/// `ask_budget(h - 1)`. So the work at depth `h` is `leaf + fan_out * work(h - 1)` - it grows with the
+/// same exponent the node count does. A parent that grants every child the LEAF timeout is therefore
+/// granting a child less time than the work it is asking that child to do, and at the `dig-sex`
+/// defaults (`fan_out = 3`, `hop_cap = 2`) the child needs `3 x 5s = 15s` and is given `5s`. It times
+/// out under any load at all, and - before dig-node#273 - a timeout was indistinguishable from an
+/// empty answer, so the parent reported a confident *not found* for content two hops away.
+///
+/// This is the time-domain twin of `RecursionConfig::worst_case_nodes_recruited`: the cost of enabling
+/// recursion is an exponent, and this states it as a number an operator can read rather than leaving
+/// it to be discovered in production. At the defaults it is 65s, which is also why
+/// [`MAX_FORWARDED_ASK_BUDGET`] sits exactly there.
+pub(crate) fn ask_budget(hops_remaining: u8, fan_out: u8) -> Duration {
+    let mut budget = FORWARDED_ASK_LEAF_TIMEOUT;
+    for _ in 0..hops_remaining {
+        budget = FORWARDED_ASK_LEAF_TIMEOUT
+            .saturating_add(budget.saturating_mul(u32::from(fan_out.max(1))));
+        if budget >= MAX_FORWARDED_ASK_BUDGET {
+            return MAX_FORWARDED_ASK_BUDGET;
+        }
+    }
+    budget
+}
+
+/// What ONE forwarded ask actually established - the distinction this node had none of before
+/// (dig-node#273).
+///
+/// # Why an empty `Vec` was not good enough
+///
+/// A timeout, an unreachable peer, a refusal and a genuine "I looked and found nobody" all used to
+/// return `Vec::new()`, and that emptiness then reached `MissOutcome::NotFound` unchanged. Three of
+/// those four establish NOTHING about whether the content exists; only the fourth does. Collapsing
+/// them means one slow peer converts into an authoritative absence - a surface lying to the caller
+/// about what this node knows, and a caller that believes a not-found stops looking.
+///
+/// So the emptiness of the record set and the PROVENNESS of the absence are two facts, and this type
+/// keeps them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AskOutcome {
+    /// The peer looked and reported these providers. **An empty vec here is a real answer** - that
+    /// peer, and everyone it could reach, found nobody.
+    Answered(Vec<ProviderRecord>),
+    /// The peer answered, and said SO ITSELF that its own subtree did not finish looking
+    /// (`result.absence_established == false`). The providers it did name are real candidates; the
+    /// emptiness of the rest is not an absence.
+    ///
+    /// # This is the variant that makes the distinction CASCADE
+    ///
+    /// Without it a hop's honest "I could not tell" is read by its parent as a conclusive answer of
+    /// nobody, and the parent reports a proven absence upward. An attacker two hops from a reader
+    /// then manufactures a not-found by simply STALLING - no forgery, no path position, one held
+    /// connection - because the honest intermediate between them correctly reports its uncertainty
+    /// and nothing upstream reads it.
+    AnsweredInconclusive(Vec<ProviderRecord>),
+    /// The peer answered with a JSON-RPC error frame: it declined to look (its own hop cap, its own
+    /// rate limit, recursion switched off there). Absence unproven.
+    Refused,
+    /// The budget was spent before an answer arrived. Absence unproven - and this is the case the
+    /// arithmetic above exists to stop manufacturing.
+    TimedOut,
+    /// No connection, or the exchange failed mid-stream. Absence unproven.
+    Unreachable,
+}
+
+impl AskOutcome {
+    /// The providers this outcome named - none unless the peer actually answered.
+    ///
+    /// Test-only: production code matches on the variants, because the whole point of the type is
+    /// that a caller cannot read the records without also seeing WHICH outcome produced them.
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> &[ProviderRecord] {
+        match self {
+            Self::Answered(records) | Self::AnsweredInconclusive(records) => records,
+            _ => &[],
+        }
+    }
+
+    /// True when this outcome establishes that the content was genuinely not found by that peer.
+    /// Every other variant means the peer did not look, or did not finish looking.
+    #[cfg(test)]
+    pub(crate) fn is_conclusive(&self) -> bool {
+        matches!(self, Self::Answered(_))
+    }
+}
 
 /// Issue one `dig.getAvailability` to one connected peer and report the providers it named.
 ///
@@ -73,34 +180,203 @@ pub(crate) const FORWARDED_ASK_TIMEOUT: Duration = Duration::from_secs(5);
 /// from a fixture.
 #[async_trait]
 pub(crate) trait ForwardedAsk: Send + Sync {
-    /// Ask `peer` (reachable at `addrs`) whether it — or anyone it knows — holds `content`, declaring
-    /// `next_depth` as the hop budget already consumed.
+    /// Ask `peer` (reachable at `addrs`) whether it - or anyone it knows - holds `content`, declaring
+    /// `next_depth` as the hop budget already consumed and granting it `budget` of wall clock.
     ///
-    /// Returns the providers the peer named, which may be empty. Never errors: an unreachable or
-    /// silent peer is indistinguishable from one that found nobody, and both mean the same thing to
-    /// the answer being built.
+    /// Returns WHAT WAS ESTABLISHED, not merely what was found: an unreachable, silent or refusing
+    /// peer is reported as such rather than as an answer of "nobody", because those are different
+    /// facts and the caller has to be able to tell them apart (dig-node#273).
+    ///
+    /// `budget` is the time this ask may take IN TOTAL, already decremented by everything the chain
+    /// above has spent. An implementation MUST NOT extend it.
+    ///
+    /// `ask_id` is the question's identity, and it is PASSED rather than minted because it must be
+    /// echoed unchanged onto the wire: it is what lets the peer - and every hop beyond it - recognise
+    /// a question that already reached them by another path (dig-node#273).
     async fn ask(
         &self,
         peer: &str,
         addrs: &[SocketAddr],
         content: &ContentId,
         next_depth: u64,
-    ) -> Vec<ProviderRecord>;
+        budget: Duration,
+        ask_id: AskId,
+    ) -> AskOutcome;
 }
 
 /// The `dig.getAvailability` request body for `content` at hop budget `next_depth` — the SAME shape
 /// any other caller sends, built from the same [`content_id_json`](crate::download::content_id_json)
 /// item renderer the redirect uses, so the forwarded question is byte-identical to a direct one.
-pub(crate) fn forwarded_request(content: &ContentId, next_depth: u64) -> Value {
+///
+/// # The params are the OWNER'S type, not a hand-written object
+///
+/// `dig_rpc_protocol::GetAvailabilityParams` declares `budget_ms` and `ask_id`, so this builds and
+/// serializes that type rather than naming the fields itself. A hand-written object spells the
+/// field names a second time, and the second spelling is the one that silently stops matching when
+/// the owner renames or re-shapes a field — a mismatch no test in THIS repo can see, because both
+/// sides of a local round-trip would agree with each other while disagreeing with every other node.
+///
+/// `ask_id` rides as hex, the field
+/// [`HopBudget::from_params`](crate::download::HopBudget::from_params) reads at the far end. A peer
+/// on an older build ignores it and mints its own, which is the pre-dedup behaviour and never worse.
+///
+/// `budget_ms` is set UNCONDITIONALLY, including at zero: `Some(0)` means *exhausted, do not ask
+/// onward*, which is a live instruction and not the same as the field being absent (absent means
+/// unbudgeted — the responder's own policy applies). Omitting a zero would upgrade an exhausted ask
+/// into an unbounded one at every hop that read it.
+pub(crate) fn forwarded_request(
+    content: &ContentId,
+    next_depth: u64,
+    budget: Duration,
+    ask_id: AskId,
+) -> Value {
+    let item: dig_rpc_protocol::types::AvailabilityQuery =
+        serde_json::from_value(crate::download::content_id_json(content))
+            .expect("content_id_json renders exactly an AvailabilityQuery");
+    let params = dig_rpc_protocol::types::GetAvailabilityParams::new(vec![item])
+        .with_redirect_depth(next_depth)
+        .with_budget_ms(u64::try_from(budget.as_millis()).unwrap_or(u64::MAX))
+        .with_ask_id(hex::encode(ask_id));
     json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "dig.getAvailability",
-        "params": {
-            "items": [crate::download::content_id_json(content)],
-            "redirect_depth": next_depth,
-        },
+        "params": params,
     })
+}
+
+/// Await one peer exchange under `budget` and classify what it ESTABLISHED.
+///
+/// Split out of the dial so the classification is reachable without a network. `NatForwardedAsk::ask`
+/// delegates its whole tail to this, so there is no second copy of the mapping and no way to bypass it
+/// at the call site — which matters, because a timeout read as an empty answer is exactly the defect
+/// dig-node#273 fixes and it lived in this function.
+pub(crate) async fn awaited_outcome<F>(
+    content: &ContentId,
+    peer: &str,
+    budget: Duration,
+    exchange: F,
+) -> AskOutcome
+where
+    F: std::future::Future<Output = Option<Value>>,
+{
+    match tokio::time::timeout(budget, exchange).await {
+        Ok(Some(response)) => parse_forwarded_answer(content, &response),
+        // Reached, but the exchange failed: a dial refused, a stream that would not open, a frame
+        // that would not read. Nothing was established about the content.
+        Ok(None) => {
+            tracing::debug!(peer = %peer, "forwarded ask: unreachable");
+            AskOutcome::Unreachable
+        }
+        // The budget ran out. Reported as ITSELF rather than as an empty answer, because this is
+        // precisely the case that used to become an authoritative absence (dig-node#273).
+        Err(_) => {
+            tracing::debug!(peer = %peer, ?budget, "forwarded ask: timed out");
+            AskOutcome::TimedOut
+        }
+    }
+}
+
+/// Read a `dig.getAvailability` response as an [`AskOutcome`].
+///
+/// A JSON-RPC **error frame** - what a peer at its hop cap, over its rate limit, or with recursion
+/// switched off returns - is a [`Refused`](AskOutcome::Refused), never an answer of "nobody". A
+/// `result` frame is an [`Answered`](AskOutcome::Answered) even when the provider list is empty,
+/// because there the peer genuinely did look - UNLESS the peer itself said otherwise, in which case
+/// it is an [`AnsweredInconclusive`](AskOutcome::AnsweredInconclusive). That last case is what makes
+/// a downstream hop's uncertainty TRAVEL: see [`subtree_claim`].
+///
+/// A frame that is neither is a peer that did not answer the question it was asked, which establishes
+/// nothing: [`Unreachable`](AskOutcome::Unreachable). Reading it as an empty answer would hand any
+/// peer a one-field way to manufacture an authoritative absence.
+pub(crate) fn parse_forwarded_answer(content: &ContentId, response: &Value) -> AskOutcome {
+    if response.get("error").is_some() {
+        return AskOutcome::Refused;
+    }
+    if response.get("result").is_none() {
+        return AskOutcome::Unreachable;
+    }
+    let records = parse_forwarded_providers(content, response);
+    match subtree_claim(response) {
+        SubtreeClaim::Established => AskOutcome::Answered(records),
+        // A peer that cannot describe its search has not told this node the search succeeded, so
+        // this node may not report a proven absence on the strength of it.
+        SubtreeClaim::NotEstablished | SubtreeClaim::NoClaim => {
+            AskOutcome::AnsweredInconclusive(records)
+        }
+    }
+}
+
+/// What a peer's answer claims about its OWN subtree, kept as the THREE states the wire carries.
+///
+/// `dig_rpc_protocol::AvailabilityAnswer::absence_established_or_unknown` is an `Option<bool>` and
+/// says there is no safe collapse to `bool`. This enum is that `Option` named, so the three cases
+/// have to be handled where they are read rather than defaulted at the edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubtreeClaim {
+    /// `Some(true)` — the peer reached everything it meant to reach and asserts the absence.
+    Established,
+    /// `Some(false)` — the peer looked and says its OWN search was incomplete.
+    NotEstablished,
+    /// Absent — the peer predates the field and describes its search not at all.
+    NoClaim,
+}
+
+/// Read `result.items[*].absence_established` as a [`SubtreeClaim`]. **The weakest item decides**,
+/// because one unproven item in a batch leaves the batch unproven.
+///
+/// # Why absent is NOT read as `true`
+///
+/// It used to be, via `unwrap_or(true)`, and the taxonomy owner names that exact collapse as the
+/// wrong one: it *turns an unknown into an assertion of absence*. A peer that says nothing about
+/// its search has not told this node the search succeeded — so treating its silence as a proven
+/// absence lets a stale hop manufacture the very not-found dig-node#273 exists to prevent, arriving
+/// through the compatibility door rather than through an attack.
+///
+/// The old rationale was that tolerance keeps a mixed network from reading as inconclusive
+/// everywhere. That cost is real and it is the RIGHT one to pay, for two reasons. The harms are not
+/// symmetric — an over-reported inconclusive costs a retry, an over-reported absence costs content
+/// that exists and cannot be found. And it does not arrive by default: the forwarded leg ships
+/// DISABLED, so a node that never asks a peer never reaches this function at all, and the cost falls
+/// only on nodes that opted into recursion.
+///
+/// A hop can of course LIE here, like anything else it tells us (NC-12) — but the value can only
+/// ever WEAKEN the claim this node goes on to make, never strengthen it. There is no direction in
+/// which lying about this field buys reach.
+fn subtree_claim(response: &Value) -> SubtreeClaim {
+    let items = response
+        .get("result")
+        .and_then(|r| r.get("items"))
+        .and_then(Value::as_array);
+    let Some(items) = items else {
+        return SubtreeClaim::NoClaim;
+    };
+    // An EMPTY `items` array has no item to establish anything, so folding it would return the
+    // identity — `Established` — and hand a responder a proven absence for the price of `[]`. The
+    // owner's contract says an establishment MUST come from an item that carries it. (`dispatch.rs`
+    // already rejects a malformed `items` param with an error frame, so this is the narrow remaining
+    // door rather than the main one.)
+    if items.is_empty() {
+        return SubtreeClaim::NoClaim;
+    }
+    items
+        .iter()
+        .map(
+            |item| match item.get("absence_established").and_then(Value::as_bool) {
+                Some(true) => SubtreeClaim::Established,
+                Some(false) => SubtreeClaim::NotEstablished,
+                None => SubtreeClaim::NoClaim,
+            },
+        )
+        // The weakest wins: an explicit "not established" is the strongest report of incompleteness,
+        // and a silent item is still not an establishment.
+        .fold(SubtreeClaim::Established, |acc, item| match (acc, item) {
+            (SubtreeClaim::NotEstablished, _) | (_, SubtreeClaim::NotEstablished) => {
+                SubtreeClaim::NotEstablished
+            }
+            (SubtreeClaim::NoClaim, _) | (_, SubtreeClaim::NoClaim) => SubtreeClaim::NoClaim,
+            _ => SubtreeClaim::Established,
+        })
 }
 
 /// Parse the `providers` a `dig.getAvailability` response named for `content`, into records keyed to
@@ -197,18 +473,24 @@ impl ForwardedAsk for NatForwardedAsk {
         addrs: &[SocketAddr],
         content: &ContentId,
         next_depth: u64,
-    ) -> Vec<ProviderRecord> {
+        budget: Duration,
+        ask_id: AskId,
+    ) -> AskOutcome {
         let Some(peer_id) = PeerId::from_hex(peer) else {
-            return Vec::new();
+            return AskOutcome::Unreachable;
         };
         if addrs.is_empty() {
-            return Vec::new();
+            return AskOutcome::Unreachable;
         }
         // The full candidate list, not one collapsed address: `with_addrs` sorts it IPv6-first (§5.2)
         // and the fallback ladder needs every family to try.
         let target = dig_nat::PeerTarget::with_addrs(peer_id, addrs.to_vec(), &self.network_id);
-        let config = crate::net::full_nat_config(FORWARDED_ASK_TIMEOUT, self.stun_server);
-        let request = forwarded_request(content, next_depth);
+        // The DIAL gets the leaf timeout even when the whole ask gets more: a peer we cannot reach is
+        // unreachable now, and spending a 65s recursive budget on one unanswered handshake would let a
+        // single black-holed address consume the entire question's time.
+        let config =
+            crate::net::full_nat_config(FORWARDED_ASK_LEAF_TIMEOUT.min(budget), self.stun_server);
+        let request = forwarded_request(content, next_depth, budget, ask_id);
 
         let exchange = async {
             let mut conn =
@@ -222,15 +504,7 @@ impl ForwardedAsk for NatForwardedAsk {
             crate::peer::read_framed(&mut stream).await.ok()?
         };
 
-        match tokio::time::timeout(FORWARDED_ASK_TIMEOUT, exchange).await {
-            Ok(Some(response)) => parse_forwarded_providers(content, &response),
-            // A silent, unreachable or timed-out peer found us nobody. Logged at debug because a
-            // relayed network makes this the ordinary case, not a fault.
-            _ => {
-                tracing::debug!(peer = %peer, "forwarded ask: no answer");
-                Vec::new()
-            }
-        }
+        awaited_outcome(content, peer, budget, exchange).await
     }
 }
 
@@ -242,11 +516,23 @@ mod tests {
         ContentId::resource([1; 32], [2; 32], [3; 32])
     }
 
+    /// A miss answer from a peer that DID complete its search, naming `providers`.
+    ///
+    /// `absence_established: true` is stated rather than omitted, because omitting it means
+    /// something else entirely: a peer that describes its search not at all, which this node reads
+    /// as unproven. A fixture that left the field out would be testing the compatibility case while
+    /// claiming to test a peer that looked — see
+    /// [`absence_established_is_read_as_three_states_and_absent_is_not_true`] for the case that
+    /// genuinely exercises the absent field.
     fn answer_with(providers: Value) -> Value {
         json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "result": { "items": [{ "available": false, "providers": providers }] },
+            "result": { "items": [{
+                "available": false,
+                "providers": providers,
+                "absence_established": true,
+            }] },
         })
     }
 
@@ -258,15 +544,31 @@ mod tests {
     /// see depth 0 forever and the hop cap would stop bounding anything.
     #[test]
     fn the_request_is_the_shipped_verb_carrying_the_shipped_budget_field() {
-        let request = forwarded_request(&content(), 3);
+        let request = forwarded_request(&content(), 3, Duration::from_millis(12_500), [9u8; 16]);
 
         assert_eq!(request["method"], "dig.getAvailability");
         assert_eq!(request["params"]["redirect_depth"], json!(3));
+        assert_eq!(
+            request["params"]["budget_ms"],
+            json!(12_500),
+            "the TIME budget rides its own field, because it is monotone DECREASING while \
+             redirect_depth is monotone increasing - one integer cannot honestly carry both, and \
+             overloading it would let a hop grant itself hops by claiming time"
+        );
         let items = request["params"]["items"].as_array().expect("items array");
         assert_eq!(items.len(), 1, "exactly the one content asked about");
         assert_eq!(items[0]["store_id"], json!(hex::encode([1u8; 32])));
         assert_eq!(items[0]["root"], json!(hex::encode([2u8; 32])));
         assert_eq!(items[0]["retrieval_key"], json!(hex::encode([3u8; 32])));
+        // The ask's IDENTITY has to reach the wire, or the diamond dedup at the far end is inert:
+        // each hop mints a fresh id, the same question arrives twice by two paths, and both are
+        // answered. Nothing else in this repo can see that — a local round-trip agrees with itself
+        // while disagreeing with every other node — so the emission is pinned HERE, at the bytes.
+        assert_eq!(
+            request["params"]["ask_id"],
+            json!(hex::encode([9u8; 16])),
+            "the caller's ask_id rides the request as hex; minting a new one per hop, or dropping              the field, silently disables the dedup the id exists for"
+        );
     }
 
     /// **Proves:** a well-formed answer's providers are parsed into records keyed to the content asked
@@ -307,16 +609,173 @@ mod tests {
         assert!(parse_forwarded_providers(&content(), &response).is_empty());
     }
 
-    /// **Proves:** a JSON-RPC error frame — which is what a peer at the hop cap or over its rate limit
-    /// returns — yields no candidates and no panic.
+    /// **Proves:** a JSON-RPC error frame - what a peer at the hop cap or over its rate limit returns
+    /// - is a REFUSAL, and a refusal is not an answer of "nobody".
+    ///
+    /// **This test replaces `an_error_frame_yields_nobody`, which pinned the opposite** (dig-node#273).
+    /// That test asserted a real property of the old code and was the reason the collapse survived: it
+    /// made "an error frame means nobody holds it" look like the intended contract. It is intended
+    /// that it changed.
+    ///
+    /// **Catches:** any implementation that keeps reading an error frame as an empty answer - which is
+    /// a one-field censorship primitive, since a peer that simply refuses every ask suppresses every
+    /// holder downstream of it AND makes the requestor confident about it.
     #[test]
-    fn an_error_frame_yields_nobody() {
+    fn an_error_frame_is_a_refusal_and_not_an_answer_of_nobody() {
         let response = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "error": { "code": -32003, "message": "miss lookup rate limit exceeded" },
         });
-        assert!(parse_forwarded_providers(&content(), &response).is_empty());
+
+        let outcome = parse_forwarded_answer(&content(), &response);
+
+        assert!(
+            outcome.records().is_empty(),
+            "a refusal still names no candidates"
+        );
+        assert!(
+            !outcome.is_conclusive(),
+            "a refusal establishes NOTHING about whether the content exists - reading it as \
+             'nobody holds it' is a censorship primitive costing one field"
+        );
+        assert_eq!(outcome, AskOutcome::Refused);
+    }
+
+    /// **Proves:** a `result` frame naming no providers IS an answer - the one case of the four that
+    /// genuinely establishes an absence.
+    ///
+    /// **Fixture design:** this is the truthful control for the three unproven cases. Without it the
+    /// suite could not distinguish "everything is inconclusive now" from "the right things are", and
+    /// an implementation that marked every ask unproven would pass every other test here while making
+    /// every miss on the network report as inconclusive.
+    #[test]
+    fn a_result_frame_naming_nobody_is_a_conclusive_answer() {
+        let outcome = parse_forwarded_answer(&content(), &answer_with(json!([])));
+
+        assert_eq!(outcome, AskOutcome::Answered(Vec::new()));
+        assert!(
+            outcome.is_conclusive(),
+            "the peer looked, and reported that it found nobody"
+        );
+    }
+
+    /// **Proves:** a frame that is neither a result nor an error - a peer answering something else
+    /// entirely - establishes nothing.
+    ///
+    /// **Catches:** a parser that falls through to `Answered(vec![])`, which would let a peer
+    /// manufacture an authoritative absence by replying with any well-formed JSON object at all.
+    #[test]
+    fn a_frame_that_is_neither_result_nor_error_establishes_nothing() {
+        let outcome = parse_forwarded_answer(&content(), &json!({"jsonrpc": "2.0", "id": 1}));
+
+        assert_eq!(outcome, AskOutcome::Unreachable);
+        assert!(!outcome.is_conclusive());
+    }
+
+    /// **Proves:** an exchange that does not finish inside its budget is a TIMEOUT, in the
+    /// production classifier rather than in a double.
+    ///
+    /// **Fixture design - a real future against a real (paused) clock.** The earlier version of this
+    /// proof used a `ForwardedAsk` double that RETURNED `TimedOut` itself, which meant reverting the
+    /// production mapping to `Answered(vec![])` broke nothing: the double asserted the verdict the
+    /// code was supposed to reach. Measured, that revert came back green. Driving
+    /// [`awaited_outcome`] with a future that outlives its budget is what makes the mapping
+    /// load-bearing. `start_paused` keeps it instantaneous.
+    ///
+    /// **Catches:** the shipped behaviour, in which a timeout became an empty provider list and then
+    /// an authoritative not-found.
+    #[tokio::test(start_paused = true)]
+    async fn an_exchange_that_outlives_its_budget_is_a_timeout_and_not_an_answer() {
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Some(answer_with(json!([])))
+        };
+
+        let outcome = awaited_outcome(&content(), "peer", Duration::from_secs(1), slow).await;
+
+        assert!(
+            !outcome.is_conclusive(),
+            "a peer that never answered establishes nothing, so this must not become a not-found"
+        );
+        assert_eq!(outcome, AskOutcome::TimedOut);
+    }
+
+    /// **Proves:** an exchange that DOES finish inside its budget is classified on its content.
+    ///
+    /// **Fixture design:** the truthful control for the test above. Without it, an implementation that
+    /// reported `TimedOut` unconditionally would pass every timeout assertion here while never
+    /// answering anything - and the same budget is used for both, so the only difference is whether
+    /// the future finished.
+    #[tokio::test(start_paused = true)]
+    async fn an_exchange_that_finishes_inside_its_budget_is_answered_on_its_content() {
+        let prompt = async { Some(answer_with(json!([]))) };
+
+        let outcome = awaited_outcome(&content(), "peer", Duration::from_secs(1), prompt).await;
+
+        assert!(
+            outcome.is_conclusive(),
+            "the peer answered inside its budget, so its answer stands"
+        );
+        assert_eq!(outcome, AskOutcome::Answered(Vec::new()));
+    }
+
+    /// **Proves:** a failed exchange inside the budget is UNREACHABLE, not an answer of nobody.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_exchange_is_unreachable_and_not_an_answer() {
+        let broken = async { None };
+
+        let outcome = awaited_outcome(&content(), "peer", Duration::from_secs(1), broken).await;
+
+        assert!(!outcome.is_conclusive());
+        assert_eq!(outcome, AskOutcome::Unreachable);
+    }
+
+    /// **Proves the arithmetic that makes hop 2 reachable at all** (dig-node#273): a hop that will
+    /// itself fan out is granted at least the work it is being asked to do.
+    ///
+    /// **Fixture design - the numbers come from the protocol, not from taste.** `fan_out` and
+    /// `hop_cap` are read off `RecursionConfig::default()` rather than restated, so this moves with
+    /// the canonical crate instead of pinning a private copy. The bound is checked from BOTH sides:
+    /// a leaf gets exactly the leaf timeout (one over would be slack), and an intermediate hop gets
+    /// at least `fan_out x` the budget of the hop below it (one under is the shipped defect).
+    #[test]
+    fn an_intermediate_hop_is_granted_at_least_the_work_it_must_do() {
+        let config = dig_sex::discovery::RecursionConfig::default();
+        let fan_out = config.fan_out;
+
+        let leaf = ask_budget(0, fan_out);
+        assert_eq!(
+            leaf, FORWARDED_ASK_LEAF_TIMEOUT,
+            "a hop with no hops left does exactly one ask"
+        );
+
+        let one_hop = ask_budget(1, fan_out);
+        assert!(
+            one_hop >= leaf * u32::from(fan_out),
+            "a hop that must ask {fan_out} peers sequentially, each needing {leaf:?}, cannot be \
+             given {one_hop:?} - this is the inequality whose violation made the recursion depth-1"
+        );
+
+        assert!(
+            ask_budget(config.hop_cap, fan_out) >= one_hop * u32::from(fan_out),
+            "and the same inequality holds at the originator, all the way up hop_cap"
+        );
+    }
+
+    /// **Proves:** the budget is CLAMPED, so neither a large local config nor a hop naming an absurd
+    /// budget on the wire can hold an inbound request open indefinitely.
+    ///
+    /// **Fixture design:** the input is chosen to be far past the ceiling rather than one step past
+    /// it, because the failure being excluded is unbounded growth. The at-ceiling side is pinned by
+    /// the default-config case above, which lands exactly on it.
+    #[test]
+    fn the_budget_is_clamped_however_deep_or_wide_the_configuration_claims_to_be() {
+        assert_eq!(
+            ask_budget(u8::MAX, u8::MAX),
+            MAX_FORWARDED_ASK_BUDGET,
+            "an untrusted or misconfigured breadth/depth cannot buy unbounded wall clock"
+        );
     }
 
     /// **Proves:** the parser keeps the well-formed providers out of an answer that also contains
@@ -380,5 +839,130 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].addresses.len(), 1, "only the well-formed address");
         assert_eq!(found[0].addresses[0].host, "10.0.0.5");
+    }
+
+    /// One `dig.getAvailability` answer frame naming no providers, with `absence_established` set
+    /// however the caller asks. `None` OMITS the key, which is the whole point — a key present with
+    /// a null is a different wire fact from a key that is not there.
+    fn miss_answer(absence_established: Option<bool>) -> Value {
+        let mut item = json!({ "available": false });
+        if let Some(claim) = absence_established {
+            item["absence_established"] = json!(claim);
+        }
+        json!({ "jsonrpc": "2.0", "id": 1, "result": { "items": [item] } })
+    }
+
+    /// **Proves:** `absence_established` is read as THREE states, and the absent one is not read as
+    /// `true`. Only an explicit `Some(true)` lets this node carry a peer's absence forward as proven.
+    ///
+    /// **Fixture design — the three frames differ in ONE respect and it is the field under test.**
+    /// Every arm names zero providers and misses, so the provider list cannot be what distinguishes
+    /// them; `available: false` is identical in all three. The nearest wrong implementation is the
+    /// `unwrap_or(true)` this replaced, and it is invisible to any fixture that omits the ABSENT arm
+    /// — which is exactly why the absent arm is the middle assertion rather than an afterthought.
+    /// The `Some(true)` arm is the truthful control: without it an implementation that called
+    /// everything inconclusive would pass, and that implementation never proves an absence at all.
+    #[test]
+    fn absence_established_is_read_as_three_states_and_absent_is_not_true() {
+        // Side effect first: the frames genuinely differ in the field, so the arms below are not
+        // three spellings of one input.
+        assert!(
+            miss_answer(Some(true)).pointer("/result/items/0/absence_established") == Some(&json!(true))
+                && miss_answer(Some(false)).pointer("/result/items/0/absence_established")
+                    == Some(&json!(false))
+                && miss_answer(None)
+                    .pointer("/result/items/0/absence_established")
+                    .is_none(),
+            "fixture precondition: the three frames must differ in absence_established, and the              absent one must OMIT the key rather than carry a null"
+        );
+
+        assert_eq!(
+            subtree_claim(&miss_answer(Some(true))),
+            SubtreeClaim::Established,
+            "a peer that says it reached everything it meant to reach asserts the absence"
+        );
+        assert_eq!(
+            subtree_claim(&miss_answer(None)),
+            SubtreeClaim::NoClaim,
+            "a peer that says NOTHING about its search has not said the search succeeded; reading              its silence as an establishment is the unwrap_or(true) the taxonomy owner names as wrong"
+        );
+        assert_eq!(
+            subtree_claim(&miss_answer(Some(false))),
+            SubtreeClaim::NotEstablished,
+            "and a peer reporting its own incompleteness is distinct from one that is merely silent"
+        );
+
+        // The consequence the three states exist for: only Established may become a conclusive
+        // answer this node is willing to relay as proof.
+        assert!(
+            parse_forwarded_answer(&content(), &miss_answer(Some(true))).is_conclusive(),
+            "an established absence is the ONE case a not-found may be built on"
+        );
+        assert!(
+            !parse_forwarded_answer(&content(), &miss_answer(None)).is_conclusive(),
+            "an unknown must not become a proven absence"
+        );
+        assert!(
+            !parse_forwarded_answer(&content(), &miss_answer(Some(false))).is_conclusive(),
+            "nor may a search the peer itself called incomplete"
+        );
+    }
+
+    /// **Proves:** the weakest item in a BATCH decides, so one unproven item cannot ride out on the
+    /// back of a proven sibling.
+    ///
+    /// **Fixture design:** each arm pairs an ESTABLISHED item with one weaker item, and the
+    /// established item is first — so an implementation that reads only `items[0]`, or that folds
+    /// with the strongest rather than the weakest, comes back `Established` and fails here.
+    #[test]
+    fn one_unproven_item_makes_the_whole_batch_unproven() {
+        let with = |second: Value| {
+            json!({"jsonrpc":"2.0","id":1,"result":{"items":[
+                json!({"available": false, "absence_established": true}),
+                second,
+            ]}})
+        };
+        assert_eq!(
+            subtree_claim(&with(json!({ "available": false }))),
+            SubtreeClaim::NoClaim,
+            "a silent item leaves the batch unproven even beside an established one"
+        );
+        assert_eq!(
+            subtree_claim(&with(
+                json!({"available": false, "absence_established": false})
+            )),
+            SubtreeClaim::NotEstablished,
+            "and an explicitly incomplete item is the strongest report of incompleteness"
+        );
+    }
+
+    /// **Proves:** an EMPTY `items` array claims nothing — it does not fold to the identity.
+    ///
+    /// **Fixture design — the control is the one-item frame, not another empty one.** The fold seeds
+    /// with `Established`, so `items: []` returned it untouched: a responder could assert a proven
+    /// absence by sending no item at all, which is the cheapest possible message on the wire. The
+    /// present-and-established arm is what keeps this from being satisfied by an implementation that
+    /// simply never establishes anything.
+    ///
+    /// **On the revert** (deleting the `is_empty` guard), the first assertion fires.
+    #[test]
+    fn an_empty_items_array_establishes_nothing() {
+        let empty = json!({"jsonrpc":"2.0","id":1,"result":{"items":[]}});
+        assert_eq!(
+            subtree_claim(&empty),
+            SubtreeClaim::NoClaim,
+            "an absence must be ESTABLISHED by an item that carries it; folding [] to the identity              hands a responder absence_established for free"
+        );
+        assert_eq!(
+            subtree_claim(&json!({"jsonrpc":"2.0","id":1,"result":{"items":[
+                json!({"available": false, "absence_established": true})
+            ]}})),
+            SubtreeClaim::Established,
+            "the control: a real established item still establishes, so the guard above narrowed              the empty case and nothing else"
+        );
+        assert!(
+            !parse_forwarded_answer(&content(), &empty).is_conclusive(),
+            "and the consequence - an empty batch may not become a not-found this node relays"
+        );
     }
 }
