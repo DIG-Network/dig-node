@@ -1042,6 +1042,44 @@ mod tests {
         assert!(inventory_content_ids(&[]).is_empty());
     }
 
+    /// **Proves (dig-node#276):** a `Relayed` capsule contributes NO announceable content id — neither
+    /// its capsule id nor its store id — while a `Held` capsule in the same inventory contributes both.
+    ///
+    /// **Catches:** the store-granularity half of the leak. Dropping only the capsule id would still
+    /// advertise "this node serves store X", which is enough for a finder to dial this node for a
+    /// stranger's content — the same amplification, one granularity up. It also pins the filter to the
+    /// funnel every announce cause reads, rather than to any one caller.
+    #[test]
+    fn inventory_content_ids_never_announces_a_relayed_capsule() {
+        let relayed = "aa".repeat(32);
+        let held = "bb".repeat(32);
+        let root = "11".repeat(32);
+        let ids = inventory_content_ids(&[
+            cap_with(&relayed, &root, crate::CapsuleProvenance::Relayed),
+            cap_with(&held, &root, crate::CapsuleProvenance::Held),
+        ]);
+
+        let (rb, hb, rt) = (
+            hex64(&relayed).unwrap(),
+            hex64(&held).unwrap(),
+            hex64(&root).unwrap(),
+        );
+        // The truthful control first: an empty result would otherwise satisfy every claim below.
+        assert!(
+            ids.contains(&ContentId::store(hb)) && ids.contains(&ContentId::capsule(hb, rt)),
+            "the honestly-held capsule is still announced at both granularities"
+        );
+        assert!(
+            !ids.contains(&ContentId::capsule(rb, rt)),
+            "a relayed capsule is never announced"
+        );
+        assert!(
+            !ids.contains(&ContentId::store(rb)),
+            "nor is its store — a store-granularity record is the same leak one level up"
+        );
+        assert_eq!(ids.len(), 2, "exactly the held capsule's store + capsule ids");
+    }
+
     // -- inventory_diff (on-change reaction) ---------------------------------------------------
 
     #[test]
