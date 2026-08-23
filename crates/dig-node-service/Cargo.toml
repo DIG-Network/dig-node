@@ -56,6 +56,11 @@ path = "src/lib.rs"
 testkit = []
 
 [dependencies]
+# Reads the wallet password for the offline `wallet export-seed` rescue without echoing it
+# to the terminal. Used ONLY there; it is removed with that command when node-side wallet
+# custody goes. The alternative -- an env var or an echoed stdin line -- would put a spend
+# key into shell history, a process listing, or a scrollback buffer.
+rpassword = "7"
 # The canonical NODE engine library (crate `dig_node_core`) — a first-party sibling
 # crate in this workspace (no longer a stale git-pinned digstore alias). It IS the
 # rpc.dig.net-compatible node the native DIG Browser runs in-process (`handle_rpc`):
