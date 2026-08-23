@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.141.0] - 2026-08-23
+
+### Features
+- **relay:** A holder's own answer names it, and the warm locator reaches the pool (#314)
+
 ## [0.140.0] - 2026-08-23
 
 ### Features
