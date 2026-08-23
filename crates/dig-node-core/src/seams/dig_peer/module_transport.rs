@@ -652,7 +652,6 @@ mod tests {
     /// It counts asks, so a test can distinguish "the ladder re-asked" from "the first ask was simply
     /// given longer".
     struct MemoizingHolder {
-        cold: std::time::Duration,
         warm_at: tokio::time::Instant,
         asks: std::cell::Cell<usize>,
     }
@@ -660,7 +659,6 @@ mod tests {
     impl MemoizingHolder {
         fn new(cold: std::time::Duration) -> Self {
             MemoizingHolder {
-                cold,
                 // The describe starts when the holder is first built, and finishes `cold` later
                 // whether or not anyone is still waiting — that is the non-cancellable property.
                 warm_at: tokio::time::Instant::now() + cold,
@@ -704,7 +702,10 @@ mod tests {
 
         let answer = ask_within_deadlines(&FIELD_DEADLINE, || holder.ask()).await;
 
-        assert_eq!(answer, None, "the observed bound cannot outlast a 4.0 s describe");
+        assert_eq!(
+            answer, None,
+            "the observed bound cannot outlast a 4.0 s describe"
+        );
     }
 
     /// **Proves:** the LADDER, not merely a larger first rung, is what makes the bound scale — a
