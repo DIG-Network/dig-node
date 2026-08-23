@@ -61,7 +61,7 @@ pub fn run(path: Option<PathBuf>, json: bool) -> ExitCode {
 
     match seed_export::export_mnemonic(&path, &password) {
         Ok(mnemonic) => {
-            println!("{}", &*mnemonic);
+            println!("{}", *mnemonic);
             eprintln!("{HANDLING_NOTICE}");
             ExitCode::Ok
         }
