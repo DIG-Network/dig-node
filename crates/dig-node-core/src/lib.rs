@@ -64,6 +64,8 @@ pub mod store_exchange;
 #[cfg(test)]
 mod ask_routing_tests;
 #[cfg(test)]
+mod capsule_warm_locator_tests;
+#[cfg(test)]
 mod forwarded_ask_tests;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
 /// W1b sub-PR sequence. Modules re-exported below at their ORIGINAL crate-root path keep
@@ -4384,6 +4386,38 @@ impl Node {
         })
     }
 
+    /// Whether this node already holds the whole capsule `(store_hex, root_hex)` on disk.
+    ///
+    /// The presence of that file IS this node's holder claim (see `module_reshare`), so this is the
+    /// same question the serve path asks and it is answered from the same place — never from an
+    /// index that could disagree with the filesystem.
+    pub fn holds_capsule(&self, store_hex: &str, root_hex: &str) -> bool {
+        module_exists(&self.cache_dir, store_hex, root_hex)
+    }
+
+    /// Start a background whole-capsule P2P pull for `(store_hex, root_hex)`, returning immediately.
+    ///
+    /// `false` when this build has no capsule warmer wired — the FFI/base path, which has no P2P
+    /// engine to pull with. A caller must not read that as "no holder": nothing looked.
+    ///
+    /// The pull itself takes arbitrarily long and this call does NOT wait for it. Its completion is
+    /// observable through the cache — [`Self::holds_capsule`] — which is the same evidence every
+    /// other reader of a landed capsule uses.
+    pub fn start_capsule_fetch(&self, store_hex: &str, root_hex: &str) -> bool {
+        let Some(warmer) = self
+            .p2p_content()
+            .and_then(|pc| pc.capsule_warmer().cloned())
+        else {
+            return false;
+        };
+        crate::seams::dig_peer::spawn_capsule_warm(
+            warmer,
+            store_hex.to_string(),
+            root_hex.to_string(),
+        );
+        true
+    }
+
     /// The node's cache dir root — the data root the P2P content engine's download staging
     /// (`<cache>/downloads`) + `.download.tmp` GC live under (shares the node's writability handling).
     pub fn cache_dir_path(&self) -> &Path {
@@ -5459,6 +5493,44 @@ mod tests {
         assert_eq!(served.to_hex(), root_hex, "served root == requested root");
         let cached = std::fs::read(module_path(&node.cache_dir, &store_hex, &root_hex)).unwrap();
         assert_eq!(cached, module, "served module must be cached locally");
+    }
+
+    /// **Proves:** `holds_capsule` answers from the FILESYSTEM, so it agrees with the serve path,
+    /// and `start_capsule_fetch` reports honestly that it started nothing on a build with no P2P
+    /// engine.
+    ///
+    /// **Catches:** the two ways `control.capsule.fetch` could lie to its caller — reporting
+    /// `already_cached` for a capsule that is not on disk (a client then never fetches it), and
+    /// reporting `started` when no warmer exists (a client then waits forever for a pull that was
+    /// never launched). The FFI/base node in this fixture has no warmer, which is exactly the build
+    /// the second half describes.
+    ///
+    /// **Fixture design:** the same node answers both arms, and the capsule is WRITTEN between
+    /// them. A fixture with only the absent case is satisfied by a `holds_capsule` hardwired to
+    /// `false`, which would make every fetch report `started` and never `already_cached`.
+    #[tokio::test]
+    async fn a_capsule_fetch_reads_holdership_from_disk_and_never_claims_a_pull_it_did_not_start() {
+        let (node, _td) = test_node(None);
+        let (store_hex, root_hex) = (hex::encode([0xa1u8; 32]), hex::encode([0xbbu8; 32]));
+
+        assert!(
+            !node.holds_capsule(&store_hex, &root_hex),
+            "nothing has been written, so this node is not a holder"
+        );
+        assert!(
+            !node.start_capsule_fetch(&store_hex, &root_hex),
+            "a node with no capsule warmer started nothing, and saying otherwise would leave a \
+             caller waiting on a pull that does not exist"
+        );
+
+        let path = module_path(&node.cache_dir, &store_hex, &root_hex);
+        std::fs::create_dir_all(path.parent().expect("module dir")).expect("mkdir");
+        std::fs::write(&path, b"a capsule").expect("write");
+        assert!(
+            node.holds_capsule(&store_hex, &root_hex),
+            "CONTROL: the file at the cache path IS this node\'s holder claim, so the predicate \
+             must see it the moment it exists - reading an index instead would let the two disagree"
+        );
     }
 
     /// **Proves:** `gap_fill_generation` ACTIVELY PULLS a missing generation end-to-end (SPEC §14.3) —

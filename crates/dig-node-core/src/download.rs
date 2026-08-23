@@ -2159,12 +2159,62 @@ impl NodeContent {
         self.capsule_warmer.get()
     }
 
+    /// The engine's raw DISCOVERY locator — the source behind `find_providers` and the
+    /// redirect-on-miss hint, and therefore the set of holders this node ASSERTS to other nodes.
+    ///
+    /// Test-only, and it exists to make the CLASS distinction checkable: production reads this
+    /// through the downloader it was built into, never by name. See
+    /// [`Self::warm_provider_locator`] for the other class and why they must not converge.
+    #[cfg(test)]
+    pub(crate) fn discovery_locator(&self) -> Arc<dyn ProviderLocator> {
+        self.locator.clone()
+    }
+
+    /// The dial-candidate locator the CAPSULE WARM pulls through: the engine's discovery locator
+    /// UNIONED with the connected pool, self-excluded — the same shape the resource read's
+    /// `download_locator` has, and for the same reason.
+    ///
+    /// # Why the warm cannot use `self.locator`
+    ///
+    /// `self.locator` is the DISCOVERY locator, and it deliberately excludes the pool
+    /// ([`PoolProviderLocator`]'s module docs): whatever it returns is what this node TELLS another
+    /// node is a holder, via `find_providers` and the redirect-on-miss hint, and *a redirect must
+    /// name genuine announced holders, not every connected peer*. Unioning the pool there would
+    /// launder mere reachability into holdership across the network. That reason is untouched.
+    ///
+    /// A warm's locator is the other class entirely: purely LOCAL dial-candidate selection, whose
+    /// output never leaves this node. A capsule holder that is connected in the gossip pool but
+    /// whose DHT record is unreachable (or absent) is exactly the case the pool source exists for,
+    /// and the warm could not see it — so `wire_capsule_reshare`'s own claim that the reshare pull
+    /// discovers "through exactly the same machinery the resource read does" was false. The warm got
+    /// `self.locator` because it was the handle in scope, not by decision.
+    ///
+    /// # The nesting is load-bearing
+    ///
+    /// Self-exclusion wraps the UNION, never the other way around. A relay-introduced
+    /// self-connection can surface THIS node in its own pool (see [`Self::new`]), so a pool source
+    /// placed OUTSIDE the self-exclusion offers this node its own identity as a fetch candidate —
+    /// a self-dial that starves the pull's confirm round and dead-ends it while a reachable holder
+    /// is connected. This mirrors `download_locator` exactly.
+    pub(crate) fn warm_provider_locator(self: &Arc<Self>) -> Arc<dyn ProviderLocator> {
+        SelfExcludingLocator::new(
+            UnionLocator::new(vec![
+                // Pool FIRST, as on the resource path: a live connection-verified address must lead
+                // so `best_address()` selects the reachable one rather than a stale DHT hint (#836).
+                PoolProviderLocator::new(self.connected_pool.clone()),
+                self.locator.clone(),
+            ]),
+            self.self_peer_id.clone(),
+        )
+    }
+
     /// Build + install the reshare leg from the pieces only the composition root has (#1576): this
     /// node's mTLS identity + shared NAT runtime, the CHAIN's root resolver, and the announce hook.
     ///
-    /// Everything else — the discovery locator, the resume-state store, the live connected pool, the
-    /// staging directory — is taken from the engine itself, so the reshare pull discovers and dials
-    /// through exactly the same machinery the resource read does. Two independent locators would be two
+    /// Everything else — the dial-candidate locator ([`Self::warm_provider_locator`]), the
+    /// resume-state store, the live connected pool, the staging directory — is taken from the engine
+    /// itself, so the reshare pull discovers and dials through exactly the same machinery the
+    /// resource read does. Two independent locators would be two
     /// things to keep in sync, and the read leg's history is a catalogue of what happens when a dial path
     /// diverges from the one that was debugged (#836/#1590).
     ///
@@ -2198,7 +2248,7 @@ impl NodeContent {
             self.locator.clone(),
         ));
         self.set_capsule_warmer(crate::seams::dig_peer::CapsuleWarmer::new(
-            self.locator.clone(),
+            self.warm_provider_locator(),
             transport,
             self.state_store.clone(),
             anchor_resolver,

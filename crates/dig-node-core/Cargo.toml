@@ -30,7 +30,7 @@ name = "dig-node-core"
 # dig-node#276/#296). Changing a public return type is BREAKING for an out-of-workspace implementor;
 # this crate is consumed in-workspace only and is pre-1.0, so it is a MINOR bump under SemVer's 0.x
 # rule -- recorded here rather than letting the number imply the locator surface held still.
-version = "0.53.0"
+version = "0.54.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -191,13 +191,13 @@ getrandom = "0.2"
 # values and passes them INTO dig-download, dig-gossip and dig-peer-selector, so a second dig-nat
 # instance does not merely bloat the tree -- those calls stop typechecking (verified: E0308 `expected
 # dig_nat::relay::RelayStatus, found dig_nat::RelayStatus`). So dig-nat cannot be bumped alone, and
-# dig-gossip/dig-dht/dig-download/dig-peer/dig-peer-selector cannot be bumped past it: the 0.15 line
-# (dig-gossip 0.18, dig-dht 0.9, dig-download 0.13, dig-peer 0.8, dig-peer-selector 0.8) is a single
-# atomic cascade, which #1674/#1675 completed by publishing every member. `tests/dependency_tree.rs`
-# asserts the single-instance invariant against the resolved LOCK so a partial cascade cannot quietly
-# reintroduce the duplicate.
+# dig-gossip/dig-dht/dig-download/dig-peer/dig-peer-selector cannot be bumped past it: the dig-nat
+# 0.18 line (dig-dht 0.11, dig-download 0.19, dig-peer 0.11, dig-peer-selector 0.9, dig-gossip on the
+# pinned rev below) is a single atomic cascade, every member of which is published.
+# `tests/dependency_tree.rs` asserts the single-instance invariant against the resolved LOCK so a
+# partial cascade cannot quietly reintroduce the duplicate.
 #
-# The 0.15 line carries the SafeText peer-text cascade (#1674/#1675): error text of remote origin is
+# This line carries the SafeText peer-text cascade (#1674/#1675): error text of remote origin is
 # held as `dig_nat::SafeText` rather than `String`, so a hostile peer's control characters cannot forge
 # a line in an operator's log. On a partial bump the failure is now LOUDER than the RelayStatus mismatch
 # above -- `SafeText` crosses dig-dht's AND dig-peer's public error surfaces, so two dig-nat versions is
