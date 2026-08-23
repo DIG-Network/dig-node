@@ -4,6 +4,22 @@
 //! (§18.21). This module owns the auth+unlock STATE MACHINE that makes signing SAFE BY DEFAULT: the
 //! decrypted private key MUST NOT persist in memory beyond a single signature.
 //!
+//! # DEPRECATED - frozen for removal (dig_ecosystem#1701)
+//!
+//! This whole module is the node-side USER custody unlock surface, and it is SUPERSEDED. The #1500
+//! ratification (2026-07-22T03:27:48Z) settled that the node holds no user spend key: the user's
+//! key lives in the user application, and `dig-account`'s `PolicyAuthorizer` is the ONLY enforcing
+//! custody gate from here. Everything below therefore serves EXISTING consumers only.
+//!
+//! It is FROZEN, not deleted, and the distinction is the point. #370's migration flow purged the
+//! extension's local key material once the node confirmed it could sign, so for any user who
+//! completed that migration and kept no independent mnemonic, the node keystore blob would be the
+//! only surviving copy of their spend key. Deleting the surface before counting that population
+//! would be silent, irreversible funds loss. The population has since been measured at ZERO, and
+//! removal is tracked separately as step 4 of dig_ecosystem#1701.
+//!
+//! Until then: add NO new consumer, and route no new custody through here.
+//!
 //! # The guarantee
 //!
 //! A successful [`unlock`](UnlockAuth::unlock) grants a READ-ONLY session (balances/history/reads)
@@ -352,6 +368,9 @@ impl UnlockAuth {
     /// and HOLDS the signer for the session (bound to its wallet). In the DEFAULT `per_transaction`
     /// mode NO signer is loaded. A wrong/expired/replayed credential is denied (`401`), leaves the
     /// state unchanged, and loads nothing.
+    #[deprecated(
+        note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers."
+    )]
     pub fn unlock(&self, id: Option<&str>, cred: &Credential) -> Result<AuthStatus> {
         self.verify(id, cred)?;
         let mode = self.mode();
@@ -375,6 +394,9 @@ impl UnlockAuth {
     /// ([`Self::consume_sign_grant`] drops it after one op). Required for every signature in the
     /// DEFAULT `per_transaction` mode. A wrong/expired/replayed credential is denied (`401`) and arms
     /// nothing.
+    #[deprecated(
+        note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers."
+    )]
     pub fn sign_unlock(&self, id: Option<&str>, cred: &Credential) -> Result<AuthStatus> {
         self.verify(id, cred)?;
         let grant = self.build_bound_signer(id, &cred.password)?;
@@ -501,6 +523,9 @@ impl UnlockAuth {
 
     /// Build a signer for the addressed wallet (default: active) bound to its RESOLVED id (#432
     /// Decision 8), decrypting the seed with `password`. The signer is not persisted into custody.
+    // Frozen-surface call site (dig_ecosystem#1701): `sign_once` is deprecated to stop NEW
+    // consumers, and this is the pre-existing one the freeze must keep working.
+    #[allow(deprecated)]
     fn build_bound_signer(&self, id: Option<&str>, password: &str) -> Result<BoundSigner> {
         let wallet_id = self
             .custody
@@ -612,6 +637,10 @@ fn restrict_permissions(_path: &std::path::Path) {}
 
 #[cfg(test)]
 mod tests {
+    // These tests EXERCISE the frozen surface on purpose: a freeze must not break custody for
+    // whoever currently depends on it (dig_ecosystem#1701).
+    #![allow(deprecated)]
+
     use super::super::custody::Network;
     use super::*;
 

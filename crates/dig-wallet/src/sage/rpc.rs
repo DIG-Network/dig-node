@@ -4600,8 +4600,13 @@ impl WalletBackend {
                 let active = wallets.iter().find(|w| w.active).map(|w| w.id.clone());
                 json(ListResp { active, wallets })
             }
+            // Frozen-surface dispatch (dig_ecosystem#1701): these custody entry points are
+            // deprecated to stop NEW consumers; the existing ones must keep working unchanged.
+            #[allow(deprecated)]
             "wallet.create" => provision(custody.create(&r.password, r.label)?),
+            #[allow(deprecated)]
             "wallet.import" => provision(custody.import(&r.mnemonic, &r.password, r.label)?),
+            #[allow(deprecated)]
             "wallet.restore" => provision(custody.restore(&r.mnemonic, &r.password, r.label)?),
             "wallet.unlock" => {
                 if auth_attached {
@@ -4715,7 +4720,9 @@ impl WalletBackend {
                 auth.enroll_passkey_finish(&r.response.clone().unwrap_or(Value::Null))?;
                 json(auth.status())
             }
+            #[allow(deprecated)]
             "auth.unlock" => json(auth.unlock(id, &cred)?),
+            #[allow(deprecated)]
             "auth.sign_unlock" => json(auth.sign_unlock(id, &cred)?),
             "auth.lock" => {
                 auth.lock();
@@ -5027,6 +5034,9 @@ fn paginate(coins: Vec<CoinRecord>, offset: u32, limit: u32) -> Vec<CoinRecord> 
 
 #[cfg(test)]
 mod tests {
+    // These tests EXERCISE the frozen custody surface on purpose: a freeze must not break custody
+    // for whoever currently depends on it (dig_ecosystem#1701).
+    #![allow(deprecated)]
     use super::super::db::DerivationRow;
     use super::super::db::PendingTransactionRow;
     use super::super::db::WalletDb;

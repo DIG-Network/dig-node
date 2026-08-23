@@ -1,4 +1,8 @@
 //! LIVE-FUNDS end-to-end test (§18.12, #428) — REAL mainnet `$DIG` broadcast.
+
+// This test EXERCISES the frozen custody surface on purpose: a freeze must not break custody for
+// whoever currently depends on it (dig_ecosystem#1701).
+#![allow(deprecated)]
 //!
 //! This is the ONLY test that can move real money, and it is **SKIPPED by default**. It runs a
 //! `dig-node` wallet with live broadcast ENABLED, imports the FUNDED TEST wallet, and triggers ONE

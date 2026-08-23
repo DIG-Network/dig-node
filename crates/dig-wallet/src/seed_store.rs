@@ -13,6 +13,18 @@
 //! module wants byte-for-byte the SAME plaintext (the mnemonic string) in and out — no
 //! `KeyScheme`-style derived-key reconstruction is needed here.
 //!
+//! ## One caller of this module is frozen; this module is NOT (dig_ecosystem#1701)
+//!
+//! Node-side USER custody ([`crate::sage::custody`], [`crate::sage::auth`]) is superseded by the
+//! #1500 ratification and is frozen for removal. This module is deliberately NOT marked
+//! `#[deprecated]` alongside it, because it is a SHARED at-rest primitive with a second, unaffected
+//! caller: the node's OWN operator identity ([`crate::autoseed`], the `DIGOP1`/`DIGVK1` blobs),
+//! which the node keeps and which no ratification retires. Deprecating the primitive would mark
+//! that live code as retired and say something false about it.
+//!
+//! What DOES bind here: write no NEW user-custody caller. When step 4 of dig_ecosystem#1701 removes
+//! the custody surface, this module stays and loses one caller.
+//!
 //! ## Backwards compatibility (§5.1 spirit, HARD RULE for at-rest secrets)
 //!
 //! A seed file written by an older `dig-wallet` build must keep opening. [`decrypt_seed`]

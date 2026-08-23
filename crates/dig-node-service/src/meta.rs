@@ -1379,4 +1379,124 @@ mod tests {
         let doc = well_known_document("127.0.0.1:9778", "https://rpc.dig.net", 1024, 0);
         assert_eq!(doc["endpoints"]["ws_status"], json!("/ws/status"));
     }
+
+    /// The namespaces frozen by dig_ecosystem#1701: node-side USER custody (`wallet.*`) and its
+    /// unlock-auth gate (`auth.*`).
+    ///
+    /// `control.wallet.*` is deliberately NOT frozen and must keep appearing — those are the
+    /// light-client CHAIN READS, which hold no key. Matching on the bare prefixes below is what
+    /// keeps the two apart: a control read is named `control.wallet.balance`, not `wallet.balance`.
+    const FROZEN_DISCOVERY_PREFIXES: [&str; 2] = ["auth.", "wallet."];
+
+    /// Every method name a caller can learn from `doc`, wherever the document carries one.
+    ///
+    /// This reads the RENDERED document rather than [`methods`], because the freeze can be broken
+    /// at more than one layer: a future change could re-list the surface in the catalogue, or
+    /// splice a method object straight into the OpenRPC body without touching the catalogue at
+    /// all. A guard that only inspected the catalogue would stay green through the second.
+    fn method_names_disclosed_by(doc: &Value) -> Vec<String> {
+        let mut found = Vec::new();
+        if let Some(methods) = doc.get("methods").and_then(Value::as_array) {
+            for m in methods {
+                match m {
+                    Value::String(name) => found.push(name.clone()),
+                    Value::Object(_) => {
+                        if let Some(name) = m.get("name").and_then(Value::as_str) {
+                            found.push(name.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
+
+    /// **Proves (dig_ecosystem#1701, step 1):** the frozen node-side USER custody surface is
+    /// absent from EVERY discovery artifact, so no new consumer can find it.
+    ///
+    /// This is the half of the freeze a future change can silently undo. The surface was already
+    /// absent when the freeze landed — nothing was removed here — so the guard, not a deletion, is
+    /// what makes the absence hold. Reinstating an `auth.status` entry in any of the three layers
+    /// reddens this test by name.
+    #[test]
+    fn the_frozen_custody_surface_is_absent_from_every_discovery_artifact() {
+        let openrpc = openrpc_document();
+        let well_known = well_known_document("127.0.0.1:9778", "https://rpc.dig.net", 1024, 0);
+
+        let layers: [(&str, Vec<String>); 4] = [
+            (
+                "meta::methods() catalogue",
+                methods().iter().map(|m| m.name.to_string()).collect(),
+            ),
+            (
+                "public_method_names() (the rpc.dig.net-facing view)",
+                public_method_names()
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect(),
+            ),
+            ("the OpenRPC document", method_names_disclosed_by(&openrpc)),
+            (
+                "the well-known document",
+                method_names_disclosed_by(&well_known),
+            ),
+        ];
+
+        for (layer, names) in &layers {
+            // A layer that discloses NO names cannot witness the absence of anything, so it would
+            // pass this test for the wrong reason. Fail loudly instead of counting it as evidence.
+            assert!(
+                !names.is_empty(),
+                "{layer} disclosed no method names at all - this guard cannot see it"
+            );
+            for name in names {
+                for prefix in FROZEN_DISCOVERY_PREFIXES {
+                    assert!(
+                        !name.starts_with(prefix),
+                        concat!(
+                            "{} discloses `{}`, under the frozen `{}*` namespace. Node-side ",
+                            "USER custody is superseded by the #1500 ratification ",
+                            "(dig_ecosystem#1701) and must stay undiscoverable so no NEW ",
+                            "consumer arrives before it is removed."
+                        ),
+                        layer,
+                        name,
+                        prefix
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Proves the guard above can SEE the light-client reads it must not flag.**
+    ///
+    /// The frozen prefixes are bare (`wallet.`), while the live chain reads are
+    /// `control.wallet.*`. If the guard were widened to match `wallet.` anywhere in the name it
+    /// would flag the light client, and the only honest way to make it pass again would be to stop
+    /// disclosing reads that hold no key. This pins the distinction so that widening reddens here
+    /// rather than quietly degrading discovery.
+    #[test]
+    fn the_freeze_guard_leaves_the_control_plane_wallet_chain_reads_discoverable() {
+        // The haystack is the PRODUCTION control-method list, not a literal written here: a
+        // fixture that spells out the names it then checks can only confirm itself.
+        let control_wallet_reads: Vec<&&str> = crate::control::CONTROL_METHODS
+            .iter()
+            .filter(|n| n.starts_with("control.wallet."))
+            .collect();
+        assert!(
+            control_wallet_reads.len() >= 2,
+            "expected the light-client chain reads in CONTROL_METHODS; found {} - this guard              would otherwise pass vacuously",
+            control_wallet_reads.len()
+        );
+
+        for name in &control_wallet_reads {
+            for prefix in FROZEN_DISCOVERY_PREFIXES {
+                assert!(
+                    !name.starts_with(prefix),
+                    "`{name}` is a light-client chain read and must stay discoverable, but the                      frozen prefix `{prefix}` matches it"
+                );
+            }
+        }
+    }
 }
