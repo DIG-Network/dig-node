@@ -1451,7 +1451,15 @@ mod tests {
                 for prefix in FROZEN_DISCOVERY_PREFIXES {
                     assert!(
                         !name.starts_with(prefix),
-                        "{layer} discloses `{name}`, which is under the frozen `{prefix}*`                          namespace (dig_ecosystem#1701). Node-side USER custody is superseded by                          the #1500 ratification and must stay undiscoverable so no NEW consumer                          arrives before it is removed."
+                        concat!(
+                            "{} discloses `{}`, under the frozen `{}*` namespace. Node-side ",
+                            "USER custody is superseded by the #1500 ratification ",
+                            "(dig_ecosystem#1701) and must stay undiscoverable so no NEW ",
+                            "consumer arrives before it is removed."
+                        ),
+                        layer,
+                        name,
+                        prefix
                     );
                 }
             }

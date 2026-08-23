@@ -2205,6 +2205,11 @@ These methods are NEVER relayed upstream — a signing/custody request must neve
 an authorized call is served locally by the node-custodied wallet (or, until the wallet surface is served
 on a given transport, returns a catalogued error — it is never proxied to the public gateway).
 
+The custody-lifecycle (§18.20) and unlock-auth (§18.24) groups are **DEPRECATED and frozen for removal**
+(dig_ecosystem#1701, superseded by the #1500 ratification). The gate above stays EXACTLY as strict for
+them — a freeze MUST NOT weaken an authorization check on the way out — but neither group may gain a
+method, and neither appears in OpenRPC discovery. The mutation group is unaffected.
+
 **Master-token-tier wallet methods (a paired token MUST be refused).** A Sage-parity method name that
 is an ALIAS for a master-tier `control.*` capability inherits that tier: `add_peer` is
 `control.chiaPeers.add` and `remove_peer` is `control.chiaPeers.remove` — the same writer, the same
@@ -5397,7 +5402,7 @@ cross-checks representative request/response schemas field-name-identical agains
 three real drifts documented in §18.15/§18.16/§18.17. The hand-authored `sage-endpoints-v0.12.11.json`
 (method-name-only) vector from #215 remains as a lighter first check.
 
-18.20. **Node-custodied MULTI-wallet provisioning + custody lifecycle (#370/#427).** For the thin-client
+18.20. **Node-custodied MULTI-wallet provisioning + custody lifecycle (#370/#427).** _DEPRECATED — frozen for removal by dig_ecosystem#1701; superseded by the #1500 ratification. Normative for existing consumers; no new ones, and absent from OpenRPC discovery._ For the thin-client
 model (epic #365) the node HOLDS the wallet keys: it generates or imports one or MORE independent seeds,
 encrypts each at rest via `dig-keystore` (§18.18 `seed_store`), and loads an in-memory `WalletSigner` on
 unlock. This is a distinct custody locus from the read-only path of #217/#407 (where the node holds only
@@ -5616,6 +5621,15 @@ Sage stream). Each `/ws` session forwards it as a `{ "type": "tip", "tip": <ledg
 alongside the `sync_status` + `event` frames.
 
 ## 18.24. Node-managed unlock authentication + per-transaction sign-unlock (#431/#432)
+
+> **DEPRECATED — FROZEN for removal (dig_ecosystem#1701).** Node-side USER custody is superseded. The
+> #1500 ratification (2026-07-22T03:27:48Z) settles that the node holds no user spend key: the key lives
+> in the user application, and `dig-account`'s `PolicyAuthorizer` is the only enforcing custody gate.
+> This section remains normative for the consumers that already exist — the behaviour below MUST NOT
+> change while the surface is served — but the surface MUST NOT be extended, MUST NOT gain a new
+> consumer, and MUST NOT appear in OpenRPC discovery (`rpc.discover`, `/openrpc.json`,
+> `/.well-known/dig-node.json`). Removal is step 4 of dig_ecosystem#1701.
+
 
 The node is the LOCAL authority that gates the node-custodied signer (§18.21). There is **NO central
 server**: enrollment + verification are entirely local, credential material is encrypted at rest via
