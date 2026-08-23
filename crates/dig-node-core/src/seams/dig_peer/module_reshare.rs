@@ -1285,9 +1285,8 @@ mod tests {
     /// Deliberately NOT routed through the warmer: the point under test is what an announce driven by
     /// something else entirely would publish.
     fn announce_set_from_disk(dir: &Path) -> (Vec<crate::CachedCapsule>, Vec<dig_dht::ContentId>) {
-        let inventory = crate::seams::capsule::list_cached_capsules(
-            &dir.join("cache").join("modules"),
-        );
+        let inventory =
+            crate::seams::capsule::list_cached_capsules(&dir.join("cache").join("modules"));
         let ids = crate::dht::inventory_content_ids(&inventory);
         (inventory, ids)
     }
@@ -1332,7 +1331,8 @@ mod tests {
         .warm(&local_store_hex, &root_hex)
         .await;
         assert!(
-            matches!(relayed, WarmOutcome::Held { .. }) && matches!(local, WarmOutcome::Held { .. }),
+            matches!(relayed, WarmOutcome::Held { .. })
+                && matches!(local, WarmOutcome::Held { .. }),
             "both pulls must genuinely succeed, or the announce set proves nothing"
         );
 

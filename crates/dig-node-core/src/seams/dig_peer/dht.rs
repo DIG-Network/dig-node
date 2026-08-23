@@ -1077,7 +1077,11 @@ mod tests {
             !ids.contains(&ContentId::store(rb)),
             "nor is its store — a store-granularity record is the same leak one level up"
         );
-        assert_eq!(ids.len(), 2, "exactly the held capsule's store + capsule ids");
+        assert_eq!(
+            ids.len(),
+            2,
+            "exactly the held capsule's store + capsule ids"
+        );
     }
 
     // -- inventory_diff (on-change reaction) ---------------------------------------------------
