@@ -21,7 +21,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::auth::UnlockAuth;
 use super::chain::ChainTransport;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
@@ -143,14 +142,10 @@ impl WalletService {
     pub async fn build_with(config_dir: &Path, cfg: WalletServiceConfig) -> WalletService {
         let events = Arc::new(EventBus::default());
         let db = open_db(config_dir).await;
-        // MULTI-wallet custody (#427) rooted at the node config dir: seeds live under
-        // `<config_dir>/wallets/`, and a legacy single `<config_dir>/wallet-seed.bin` is adopted.
-        let custody = WalletCustody::mainnet(config_dir.to_path_buf());
-        // The node-managed unlock authority (#431/#432, §18.24): it GATES the sign/broadcast path so
-        // signing is SAFE BY DEFAULT (per-transaction re-auth; the key is not resident between
-        // signatures). It shares the SAME custody state (a `WalletCustody` clone shares its inner
-        // Arcs), so decrypting a seed for a one-shot sign always uses the on-disk seed + password.
-        let auth = Arc::new(UnlockAuth::new(custody.clone(), config_dir.to_path_buf()));
+        // The read-only view of any wallet already enrolled on this device (dig_ecosystem#1701).
+        // It contributes that wallet's PUBLIC addresses to the subscription set and nothing else:
+        // the node cannot open a seed, so it cannot sign for those addresses (§908).
+        let custody = WalletCustody::open(config_dir.to_path_buf());
         // The addresses this node was ASKED to follow, alongside the ones it custodies. On a
         // §908-correct install (the account lives in dig-app, the node holds no seed) this is the
         // ONLY source of a subscription set, so without it the replica can never sync
@@ -257,7 +252,6 @@ impl WalletService {
         let mut base = WalletBackend::new(db, fallback, WalletConfig::default())
             .with_events(events.clone())
             .with_custody(custody)
-            .with_auth(auth)
             .with_tip_events(tip_events.clone())
             .with_pusher(chain.clone())
             .with_node_custodied_spending(cfg.enable_live_broadcast)
