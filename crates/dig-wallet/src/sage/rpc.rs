@@ -23,7 +23,6 @@ use chia::bls::PublicKey;
 use chia_wallet_sdk::driver::Cat;
 use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
 
-use super::auth::{AuthMethod, Credential, UnlockAuth, UnlockMode};
 use super::chain::PushOutcome;
 use super::coverage::CoveredSet;
 use super::custody::WalletCustody;
@@ -594,15 +593,9 @@ pub struct WalletBackend {
     /// runtime (#368 runtime signer load) — not only from a signer injected once at construction.
     /// `None` on the test/simulator path (which injects a fixed signer via [`Self::with_signer`]).
     custody: Option<WalletCustody>,
-    /// The node-managed unlock authority (#431/#432, §18.24), attached at bring-up
-    /// ([`Self::with_auth`]). When present it GOVERNS [`Self::current_signer`]: the §18.21 sign path
-    /// obtains a signer ONLY through the auth gate (read-only unlock ⇒ no signer; per-transaction ⇒ a
-    /// one-shot grant; session-unlock-all ⇒ the held session signer). `None` (the test/simulator path)
-    /// preserves the legacy behaviour where a `wallet.unlock` alone enables signing.
-    auth: Option<Arc<UnlockAuth>>,
-    /// Serializes key-touching signing dispatch (#432 Finding 1). Held across a whole signing method
-    /// through the one-shot grant's consumption, so two concurrent signing calls on the shared backend
-    /// can never both observe one armed grant (a gate TOCTOU). Reads/non-signing methods never take it.
+    /// Serializes key-touching signing dispatch. Only the simulator/test path can attach a signer
+    /// at all ([`Self::with_signer`]); this keeps two concurrent signing calls on one shared backend
+    /// from interleaving over it. Reads/non-signing methods never take it.
     sign_lock: Arc<tokio::sync::Mutex<()>>,
     /// The tipping subsystem (#378), attached at bring-up ([`Self::with_tipping`]). `None` disables
     /// the `tip.*` methods (the transport reports them unavailable). The engine holds the persisted
@@ -653,7 +646,6 @@ impl WalletBackend {
             chain_peer_tier_override: None,
             identity: Arc::new(RwLock::new(None)),
             custody: None,
-            auth: None,
             sign_lock: Arc::new(tokio::sync::Mutex::new(())),
             tipping: None,
             tip_events: Arc::new(super::tipping::TipEventBus::default()),
@@ -722,20 +714,7 @@ impl WalletBackend {
         self.custody.as_ref()
     }
 
-    /// Attach the node-managed unlock authority (#431/#432, §18.24). Once attached it GOVERNS the
-    /// effective signer: the sign/broadcast-on-behalf path (§18.21) obtains a signer only through the
-    /// auth gate, so signing is SAFE BY DEFAULT (per-transaction re-auth; key not resident between
-    /// signatures). Without it, the legacy behaviour (a `wallet.unlock` enables signing for the
-    /// session) is preserved for the simulator/test path.
-    pub fn with_auth(mut self, auth: Arc<UnlockAuth>) -> Self {
-        self.auth = Some(auth);
-        self
-    }
 
-    /// The node-managed unlock authority, if attached (#431/#432).
-    pub fn auth(&self) -> Option<&Arc<UnlockAuth>> {
-        self.auth.as_ref()
-    }
 
     /// Attach the pusher for ALREADY-SIGNED bundles (`control.wallet.broadcast`).
     ///
@@ -2786,12 +2765,7 @@ impl WalletBackend {
         if let Some(s) = self.signer.clone() {
             return Some(s);
         }
-        if let Some(auth) = self.auth.as_ref() {
-            // The auth gate is authoritative when attached — NEVER fall back to a held custody signer,
-            // or the per-transaction guarantee (key not resident between signatures) would leak.
-            return auth.effective_signer();
-        }
-        self.custody.as_ref().and_then(|c| c.signer(None))
+        None
     }
 
     /// Record `signer`'s public keys so the push guard still recognises the node's own coins after
@@ -4110,18 +4084,8 @@ impl WalletBackend {
     /// bodies are byte-identical.
     pub async fn dispatch(&self, method: &str, body: &str) -> (u16, String) {
         if is_signing_method(method) {
-            // #432 Finding 1 (gate TOCTOU): SERIALIZE signing dispatch. Held across the WHOLE
-            // dispatch (which reads `current_signer` several times) THROUGH grant consumption, so two
-            // concurrent signing calls on the shared backend can never both clone one armed grant →
-            // one `sign_unlock` authorizes exactly one signature.
+            // SERIALIZE signing dispatch: it reads `current_signer` several times.
             let _sign_lock = self.sign_lock.lock().await;
-            // #432 Finding 5 (panic-safe consume): an RAII guard consumes the one-shot grant on ANY
-            // exit — normal return OR a panic unwind — so a panicking signing handler can never leave
-            // the decrypted key armed + reusable. Drops BEFORE `_sign_lock` releases (reverse order),
-            // so consumption is still inside the serialized section.
-            let _consume = SignGrantGuard {
-                auth: self.auth.clone(),
-            };
             match self.dispatch_inner(method, body).await {
                 Ok(json) => (200, json),
                 Err(e) => (e.kind.status(), e.message),
@@ -4449,20 +4413,6 @@ impl WalletBackend {
             // notify_consumed / dev_tick. Reachable only when the engine is attached
             // ([`Self::with_tipping`]); mutations are paired-token gated by the transport (§7.12).
             m if m.starts_with("tip.") => self.dispatch_tip(m, body).await?,
-            // The node-custodied seed lifecycle (#370/#368): create/import/restore/unlock/lock/
-            // status/delete. Reachable only when custody is attached ([`Self::with_custody`]);
-            // authorization is the transport's concern (the paired-token gate, SPEC §7.12).
-            m if m.starts_with("wallet.") => {
-                self.refresh_observed_derivations(m).await;
-                self.dispatch_custody(m, body)?
-            }
-            // The node-managed unlock authority (#431/#432, §18.24): status/get_method/set_method/
-            // set_mode/enroll_totp/enroll_passkey_*/unlock/sign_unlock/lock. Reachable only when auth
-            // is attached ([`Self::with_auth`]); every `auth.*` method is paired-token gated (§7.12).
-            m if m.starts_with("auth.") => {
-                self.refresh_observed_derivations(m).await;
-                self.dispatch_auth(m, body)?
-            }
             other => {
                 return Err(Error::not_found(format!(
                     "unknown or unsupported method: {other}"
@@ -4490,249 +4440,8 @@ impl WalletBackend {
         })
     }
 
-    /// Hand custody the p2 puzzle hashes this replica has seen coins at, so the gap-limit scan can
-    /// size the derivation window from real usage (dig_ecosystem#2762).
-    ///
-    /// Called immediately before the methods that actually load keys, because an unlock is the only
-    /// moment the seed is in hand and therefore the only moment the covered window can grow. Doing
-    /// it here rather than inside custody keeps the DB out of `custody.rs`, which holds no database
-    /// handle and should not acquire one to answer a question about coins.
-    ///
-    /// # What this does NOT do
-    ///
-    /// The scan extends from usage it can SEE, and the node only sees coins at addresses it has
-    /// already subscribed — which is the window itself. So it reliably follows a wallet outgrowing its
-    /// window from inside (used index 480 of 500 → extends to 730), and it CANNOT discover history
-    /// that starts beyond the window (a wallet whose only coins sit at index 5000 is invisible, and
-    /// stays invisible). That case is covered by [`DEFAULT_DERIVATION_COUNT`] being wide enough to
-    /// begin with, not by this scan. Closing it properly means asking the chain which addresses are
-    /// used before subscribing, which is a chain read and so owed the NC-12 corroborated path —
-    /// tracked separately rather than half-built here.
-    ///
-    /// Failure is logged and ignored: a database hiccup must not make a wallet unopenable. The
-    /// window then stays at its floor, which is the conservative direction.
-    async fn refresh_observed_derivations(&self, method: &str) {
-        // Only the key-loading methods. Every other `wallet.*`/`auth.*` call is a status or config
-        // read that cannot change the window, and scanning the coin table on each would be work
-        // that provably cannot alter the outcome.
-        const KEY_LOADING: &[&str] = &[
-            "wallet.unlock",
-            "wallet.import",
-            "wallet.restore",
-            "auth.unlock",
-            "auth.sign_unlock",
-        ];
-        if !KEY_LOADING.contains(&method) {
-            return;
-        }
-        let Some(custody) = self.custody.as_ref() else {
-            return;
-        };
-        match self.db.occupied_puzzle_hashes().await {
-            Ok(hexes) => {
-                custody.observe_occupied_puzzle_hashes(
-                    hexes
-                        .iter()
-                        .filter_map(|h| singleton::bytes32_from_hex(h).ok())
-                        .collect(),
-                );
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "could not read observed puzzle hashes; the derivation window stays at its floor"
-            ),
-        }
-    }
 
-    /// Dispatch a `wallet.*` MULTI-wallet custody-lifecycle method to the attached [`WalletCustody`]
-    /// (#368/#427). Returns the Sage-shaped result value; a node without custody attached reports
-    /// the method as unavailable. The optional `id` addresses a specific custodied wallet (default:
-    /// the active wallet, so single-wallet callers are unchanged); `label` names a new wallet;
-    /// `mnemonic`/`password` are the create/import/unlock inputs — all read from the JSON body.
-    fn dispatch_custody(&self, method: &str, body: &str) -> Result<Value> {
-        /// The union of every custody-method parameter; each method reads only the fields it needs.
-        #[derive(serde::Deserialize, Default)]
-        struct CustodyReq {
-            /// Addresses a specific wallet; absent ⇒ the active wallet.
-            #[serde(default)]
-            id: Option<String>,
-            /// A human label for a newly created/imported wallet.
-            #[serde(default)]
-            label: Option<String>,
-            /// The mnemonic for import/restore.
-            #[serde(default)]
-            mnemonic: String,
-            /// The at-rest password for create/import/unlock/delete.
-            #[serde(default)]
-            password: String,
-        }
-        let custody = self
-            .custody
-            .as_ref()
-            .ok_or_else(|| Error::internal("wallet custody is not enabled on this node"))?;
-        let body_s = if body.trim().is_empty() { "{}" } else { body };
-        let r: CustodyReq = serde_json::from_str(body_s)
-            .map_err(|e| Error::api(format!("invalid request for {method}: {e}")))?;
-        let id = r.id.as_deref();
-        // When the node-managed unlock authority (§18.24) is attached it is the ONLY signer-loading
-        // path (#432 Finding 4): provisioning must NOT leave a session-long resident signer in custody,
-        // and `wallet.unlock` (which would load one) is redirected to `auth.*`.
-        let auth_attached = self.auth.is_some();
-        // Provision a wallet, then — when auth gates signing — immediately lock its custody session so
-        // NO resident `WalletSigner` lingers over the paired boundary (the auth gate loads keys on
-        // demand via `sign_once`).
-        let provision = |w: super::custody::WalletRef| -> Result<Value> {
-            if auth_attached {
-                custody.lock(Some(w.id.as_str()));
-            }
-            json(w)
-        };
-        // create/import/restore/unlock return the wallet ref `{ id, address }`.
-        match method {
-            "wallet.status" => json(custody.status(id)),
-            "wallet.list" => {
-                #[derive(serde::Serialize)]
-                struct ListResp {
-                    active: Option<String>,
-                    wallets: Vec<super::custody::WalletInfo>,
-                }
-                let wallets = custody.list();
-                let active = wallets.iter().find(|w| w.active).map(|w| w.id.clone());
-                json(ListResp { active, wallets })
-            }
-            // Frozen-surface dispatch (dig_ecosystem#1701): these custody entry points are
-            // deprecated to stop NEW consumers; the existing ones must keep working unchanged.
-            #[allow(deprecated)]
-            "wallet.create" => provision(custody.create(&r.password, r.label)?),
-            #[allow(deprecated)]
-            "wallet.import" => provision(custody.import(&r.mnemonic, &r.password, r.label)?),
-            #[allow(deprecated)]
-            "wallet.restore" => provision(custody.restore(&r.mnemonic, &r.password, r.label)?),
-            "wallet.unlock" => {
-                if auth_attached {
-                    // The auth gate owns signer loading — a resident custody unlock would leak a
-                    // session-long key never used for signing (the gate wins). Redirect the caller.
-                    Err(Error::api(
-                        "this node uses unlock authentication: use auth.unlock (read-only session) \
-                         or auth.sign_unlock (per-transaction signing)",
-                    ))
-                } else {
-                    json(custody.unlock(id, &r.password)?)
-                }
-            }
-            "wallet.select" => {
-                let sel =
-                    r.id.as_deref()
-                        .ok_or_else(|| Error::api("wallet.select requires an `id`"))?;
-                json(custody.select(sel)?)
-            }
-            "wallet.lock" => {
-                custody.lock(id);
-                // The resulting state of the addressed wallet (`locked` when it exists).
-                json(custody.status(id))
-            }
-            "wallet.delete" => {
-                custody.delete(id, &r.password)?;
-                // The node-level status after removal (a remaining wallet becomes active, else none).
-                json(custody.status(None))
-            }
-            other => Err(Error::not_found(format!(
-                "unknown or unsupported method: {other}"
-            ))),
-        }
-    }
 
-    /// Dispatch an `auth.*` node-managed unlock method to the attached [`UnlockAuth`] (#431/#432,
-    /// §18.24). A node without auth attached reports the method unavailable. Every `auth.*` method is
-    /// paired-token gated by the transport (§7.12). The credential fields (`password`/`totp_code`/
-    /// `passkey_assertion`) and the optional `id` (addresses a specific wallet) are read from the body.
-    fn dispatch_auth(&self, method: &str, body: &str) -> Result<Value> {
-        /// The union of every `auth.*` parameter; each method reads only the fields it needs.
-        #[derive(serde::Deserialize, Default)]
-        struct AuthReq {
-            /// Addresses a specific wallet; absent ⇒ the active wallet.
-            #[serde(default)]
-            id: Option<String>,
-            /// The wallet password (the seed's KDF root) — required by every unlock/enroll.
-            #[serde(default)]
-            password: String,
-            /// The current TOTP code (method = totp).
-            #[serde(default)]
-            totp_code: Option<String>,
-            /// The WebAuthn assertion (method = passkey, #433).
-            #[serde(default)]
-            passkey_assertion: Option<Value>,
-            /// The target mode for `auth.set_mode`.
-            #[serde(default)]
-            mode: Option<UnlockMode>,
-            /// The target method for `auth.set_method`.
-            #[serde(default)]
-            method: Option<AuthMethod>,
-            /// The registration response for `auth.enroll_passkey_finish` (#433).
-            #[serde(default)]
-            response: Option<Value>,
-        }
-        let auth = self
-            .auth
-            .as_ref()
-            .ok_or_else(|| Error::internal("unlock auth is not enabled on this node"))?;
-        let body_s = if body.trim().is_empty() { "{}" } else { body };
-        let r: AuthReq = serde_json::from_str(body_s)
-            .map_err(|e| Error::api(format!("invalid request for {method}: {e}")))?;
-        let id = r.id.as_deref();
-        let cred = Credential {
-            password: r.password.clone(),
-            totp_code: r.totp_code.clone(),
-            passkey_assertion: r.passkey_assertion.clone(),
-        };
-        match method {
-            "auth.status" => json(auth.status()),
-            "auth.get_method" => json(serde_json::json!({
-                "method": auth.method(),
-                "mode": auth.mode(),
-            })),
-            "auth.set_mode" => {
-                let mode = r
-                    .mode
-                    .ok_or_else(|| Error::api("auth.set_mode requires a `mode`"))?;
-                // Switching INTO session-unlock-all re-verifies the current factor (#432 Finding 3).
-                auth.set_mode(id, mode, &cred)?;
-                json(auth.status())
-            }
-            "auth.set_method" => {
-                let m = r
-                    .method
-                    .ok_or_else(|| Error::api("auth.set_method requires a `method`"))?;
-                match m {
-                    // Downgrade to password-only — re-verify the CURRENT factor first.
-                    AuthMethod::Password => {
-                        auth.set_method_password(id, &cred)?;
-                        json(auth.status())
-                    }
-                    // Enrolling re-verifies the current factor + returns the one-time secret/challenge.
-                    AuthMethod::Totp => json(auth.enroll_totp(id, &cred)?),
-                    AuthMethod::Passkey => json(auth.enroll_passkey_begin(id, &cred)?),
-                }
-            }
-            "auth.enroll_totp" => json(auth.enroll_totp(id, &cred)?),
-            "auth.enroll_passkey_begin" => json(auth.enroll_passkey_begin(id, &cred)?),
-            "auth.enroll_passkey_finish" => {
-                auth.enroll_passkey_finish(&r.response.clone().unwrap_or(Value::Null))?;
-                json(auth.status())
-            }
-            #[allow(deprecated)]
-            "auth.unlock" => json(auth.unlock(id, &cred)?),
-            #[allow(deprecated)]
-            "auth.sign_unlock" => json(auth.sign_unlock(id, &cred)?),
-            "auth.lock" => {
-                auth.lock();
-                json(auth.status())
-            }
-            other => Err(Error::not_found(format!(
-                "unknown or unsupported method: {other}"
-            ))),
-        }
-    }
 
     /// Dispatch a `tip.*` method to the attached tipping engine (#378). A node without the engine
     /// attached reports the method unavailable. Reads (`get_config`/`get_ledger`) are open; the
@@ -4839,20 +4548,7 @@ fn is_signing_method(method: &str) -> bool {
     SIGNING_METHODS.contains(&method)
 }
 
-/// An RAII guard that consumes the one-shot per-transaction sign grant (§18.24) on drop — normal
-/// return OR panic unwind (#432 Finding 5). Held for the duration of a signing dispatch so a
-/// panicking handler can never leave the decrypted key armed + reusable for a later free signature.
-struct SignGrantGuard {
-    auth: Option<Arc<UnlockAuth>>,
-}
 
-impl Drop for SignGrantGuard {
-    fn drop(&mut self) {
-        if let Some(auth) = &self.auth {
-            auth.consume_sign_grant();
-        }
-    }
-}
 
 /// Parse a wire [`Amount`] to `u64` (rejecting values beyond `u64`).
 fn amount_u64(a: &Amount) -> Result<u64> {
