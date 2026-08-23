@@ -371,6 +371,70 @@ async fn read_response_frame(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// The per-attempt deadlines for one `dig.getModuleInfo`, in order — a LADDER, not a constant.
+///
+/// # Why a ladder and not a bigger number
+///
+/// Answering a descriptor is not a message round-trip: the holder reads the whole `.dig` and SHA-256s
+/// every chunk (`module_serve`'s module docs). That cost scales with the capsule, and it is real —
+/// a 135 MB capsule measured ~4.0 s on a host whose whole-file `cat` took 0.01 s, so a 1 GB capsule
+/// is on the order of 30 s. There is no honest constant to pick, because **the asker cannot know the
+/// size before the descriptor arrives**: `dig_dht::ProviderRecord` carries the holder's addresses and
+/// expiry and no size at all, so a size-derived deadline has nothing to derive from on the first ask.
+/// Any single number is therefore either too short for a large capsule or a blanket licence for a
+/// slow peer to hold a slot on a small one.
+///
+/// A ladder needs no size. The total wait grows only for a holder that keeps being slow, and it is
+/// bounded at the sum of the rungs; a fast holder still fails fast on the first rung.
+///
+/// # Why the later rungs are nearly free
+///
+/// A cold describe runs under `spawn_blocking` on the holder ([`crate::Node::describe_held_module`]),
+/// and a blocking task is NOT cancelled when the requestor's stream drops — so the abandoned first ask
+/// still runs to completion and populates that node's descriptor memo. The re-ask therefore lands on a
+/// warm memo and is answered in milliseconds. Before this ladder the first ask was abandoned, the memo
+/// warmed one millisecond too late, and nothing ever asked again (dig_ecosystem#3128).
+///
+/// # Why the retry lives HERE
+///
+/// dig-download's outer descriptor budget (`MAX_DESCRIPTOR_ATTEMPTS`) is spent only AFTER a descriptor
+/// has been obtained and its pull failed; `fetch_module_info` returns through `?` on a transport
+/// failure, so a merely-SLOW holder gets no budget at all (dig_ecosystem#3153). That is a dig-download
+/// defect and is fixed there. This transport is the one layer in dig-node that can bound and re-ask a
+/// single holder without it.
+const DESCRIPTOR_ASK_DEADLINES: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(45),
+];
+
+/// Run `ask` under each of `deadlines` in turn, returning the first answer.
+///
+/// `None` means every rung elapsed or every attempt failed — the caller turns that into ONE transport
+/// error in this node's own vocabulary. Extracted from the dial so the LADDER's behaviour is testable
+/// on simulated time without a peer, a socket, or a capsule.
+async fn ask_within_deadlines<A, F, T>(deadlines: &[std::time::Duration], mut ask: A) -> Option<T>
+where
+    A: FnMut() -> F,
+    F: std::future::Future<Output = Option<T>>,
+{
+    for (rung, deadline) in deadlines.iter().enumerate() {
+        match tokio::time::timeout(*deadline, ask()).await {
+            Ok(Some(answer)) => return Some(answer),
+            // An attempt that ANSWERED "no" is a refusal, not slowness: re-asking cannot change it,
+            // and spending the remaining rungs on it would make every genuine miss cost the full
+            // ladder. Only an elapsed rung is retried.
+            Ok(None) => return None,
+            Err(_elapsed) => tracing::debug!(
+                rung = rung + 1,
+                deadline_secs = deadline.as_secs(),
+                "module pull: descriptor ask exceeded its deadline; re-asking on the next rung"
+            ),
+        }
+    }
+    None
+}
+
 /// One `dig.getModuleInfo` over `peer`, decoded into a [`ModuleInfo`]. `proxy` declares whether this
 /// ask permits the far end to fetch the capsule on this node's behalf.
 ///
@@ -441,12 +505,18 @@ impl ModuleTransport for NatModuleTransport {
         store_id: &str,
         root: &str,
     ) -> Result<ModuleInfo, DownloadError> {
-        let mut peer = self.connect(provider_peer_id, store_id, root).await?;
-        let proxy = self
-            .escalation
-            .escalate_for(store_id, root, provider_peer_id);
-        let result = descriptor_over(&mut peer, store_id, root, proxy).await;
-        peer.disconnect().await;
+        // Each rung re-dials: the abandoned rung's connection is gone, and the holder's memo — not the
+        // connection — is what makes the re-ask cheap. See [`DESCRIPTOR_ASK_DEADLINES`].
+        let result = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || async {
+            let mut peer = self.connect(provider_peer_id, store_id, root).await.ok()?;
+            let proxy = self
+                .escalation
+                .escalate_for(store_id, root, provider_peer_id);
+            let answer = descriptor_over(&mut peer, store_id, root, proxy).await;
+            peer.disconnect().await;
+            answer
+        })
+        .await;
         // The reason names the STEP and the sentinelled peer; the peer's own answer text is never
         // embedded (#1603) — the crate sanitizes at its Display layer and upstream must not defeat it.
         result.ok_or_else(|| DownloadError::transport(provider_peer_id, "getModuleInfo failed"))
@@ -558,6 +628,154 @@ pub(crate) fn pool_of(entries: &[(&str, &str)]) -> ConnectedPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bound the FIELD behaved as if it had: three asks 2.00 s apart, the last abandoned one
+    /// millisecond before the holder answered (the three-machine run behind dig_ecosystem#3128). The
+    /// tests below use it as the BEFORE case, so "the new bound is better" is measured against what
+    /// was actually observed rather than against a bound this file invented.
+    const FIELD_DEADLINE: [std::time::Duration; 1] = [std::time::Duration::from_secs(2)];
+
+    /// The measured cold-describe cost of the 135 MB capsule that failed: ~4.0 s on a host whose
+    /// whole-file `cat` took 0.01 s, so it is compute, not disk.
+    const COLD_135MB: std::time::Duration = std::time::Duration::from_millis(4_000);
+
+    /// The same describe throughput (~34 MB/s) applied to a 1 GB capsule: ~30 s. Chosen FROM the
+    /// measurement rather than picked, because the whole question the ladder answers is what happens
+    /// when the capsule is larger than the one that was measured.
+    const COLD_1GB: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A holder whose FIRST descriptor ask takes `cold` and whose later asks are answered from its
+    /// memo in ~0 s — the real serve-side shape, because a cold describe runs under `spawn_blocking`
+    /// on the holder ([`crate::Node::describe_held_module`]) and a blocking task is not cancelled when
+    /// the requestor's stream drops, so an ABANDONED ask still warms the memo.
+    ///
+    /// It counts asks, so a test can distinguish "the ladder re-asked" from "the first ask was simply
+    /// given longer".
+    struct MemoizingHolder {
+        cold: std::time::Duration,
+        warm_at: tokio::time::Instant,
+        asks: std::cell::Cell<usize>,
+    }
+
+    impl MemoizingHolder {
+        fn new(cold: std::time::Duration) -> Self {
+            MemoizingHolder {
+                cold,
+                // The describe starts when the holder is first built, and finishes `cold` later
+                // whether or not anyone is still waiting — that is the non-cancellable property.
+                warm_at: tokio::time::Instant::now() + cold,
+                asks: std::cell::Cell::new(0),
+            }
+        }
+
+        async fn ask(&self) -> Option<&'static str> {
+            self.asks.set(self.asks.get() + 1);
+            tokio::time::sleep_until(self.warm_at).await;
+            Some("descriptor")
+        }
+    }
+
+    /// **Proves:** the capsule that actually failed in the field is obtained under the new bound.
+    ///
+    /// **Catches:** the shipped behaviour — an ask abandoned before a legitimately-slow holder can
+    /// answer, with nothing asking again.
+    ///
+    /// **Non-vacuous:** the companion below runs the SAME fixture under the bound the field behaved as
+    /// if it had, and must fail. The fixture cannot pass by being fast — `COLD_135MB` is the measured
+    /// cost and exceeds `FIELD_DEADLINE`.
+    #[tokio::test(start_paused = true)]
+    async fn the_capsule_that_failed_in_the_field_is_obtained_under_the_new_bound() {
+        let holder = MemoizingHolder::new(COLD_135MB);
+
+        let answer = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || holder.ask()).await;
+
+        assert_eq!(answer, Some("descriptor"));
+    }
+
+    /// **Proves:** the same 135 MB describe is LOST under the bound the field behaved as if it had —
+    /// so the test above is load-bearing on the change, not on a generous fixture.
+    #[tokio::test(start_paused = true)]
+    async fn the_same_capsule_is_lost_under_the_field_deadline() {
+        assert!(
+            COLD_135MB > FIELD_DEADLINE[0],
+            "the fixture must exceed the observed bound or it proves nothing"
+        );
+        let holder = MemoizingHolder::new(COLD_135MB);
+
+        let answer = ask_within_deadlines(&FIELD_DEADLINE, || holder.ask()).await;
+
+        assert_eq!(answer, None, "the observed bound cannot outlast a 4.0 s describe");
+    }
+
+    /// **Proves:** the LADDER, not merely a larger first rung, is what makes the bound scale — a
+    /// capsule whose describe costs ~30 s is obtained, and it takes THREE asks to get it.
+    ///
+    /// **Catches:** collapsing `DESCRIPTOR_ASK_DEADLINES` back to one rung of any size. A single rung
+    /// sized for 135 MB loses a 1 GB capsule (the companion below), and a single rung sized for 1 GB
+    /// would let one unanswerable holder hold a descriptor slot for 30 s before the next is tried.
+    ///
+    /// **Non-vacuous:** the ask COUNT is asserted, so a fixture answered on rung 1 could not pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_capsule_an_order_of_magnitude_larger_needs_the_later_rungs() {
+        let holder = MemoizingHolder::new(COLD_1GB);
+
+        let answer = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || holder.ask()).await;
+
+        assert_eq!(answer, Some("descriptor"));
+        assert_eq!(
+            holder.asks.get(),
+            3,
+            "rungs 1 and 2 must elapse and rung 3 must re-ask onto the warmed memo"
+        );
+    }
+
+    /// **Proves:** a single rung sized for the measured capsule loses the order-of-magnitude-larger
+    /// one — the reason the fix is a ladder rather than a bigger number.
+    #[tokio::test(start_paused = true)]
+    async fn one_rung_sized_for_the_measured_capsule_loses_the_larger_one() {
+        let holder = MemoizingHolder::new(COLD_1GB);
+
+        let answer = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES[..1], || holder.ask()).await;
+
+        assert_eq!(answer, None);
+    }
+
+    /// **Proves:** a holder that ANSWERS "no" spends exactly one rung. A refusal is not slowness, and
+    /// re-asking it would make every genuine miss cost the whole ladder before the next holder is
+    /// tried.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_does_not_climb_the_ladder() {
+        let asks = std::cell::Cell::new(0usize);
+
+        let answer: Option<&str> = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || async {
+            asks.set(asks.get() + 1);
+            None
+        })
+        .await;
+
+        assert_eq!(answer, None);
+        assert_eq!(asks.get(), 1, "a refused ask must not be retried");
+    }
+
+    /// **Proves:** the ladder is BOUNDED — an unanswerable holder costs the sum of the rungs and no
+    /// more, so a slow or hostile peer cannot hold a descriptor slot indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswerable_holder_costs_exactly_the_ladder() {
+        let started = tokio::time::Instant::now();
+
+        let answer: Option<&str> = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || async {
+            std::future::pending::<()>().await;
+            None
+        })
+        .await;
+
+        assert_eq!(answer, None);
+        assert_eq!(
+            started.elapsed(),
+            DESCRIPTOR_ASK_DEADLINES.iter().sum::<std::time::Duration>(),
+            "the total wait must be exactly the ladder, never unbounded"
+        );
+    }
 
     /// A canonical 64-hex id built from a repeated byte, so a test id can never be the wrong length.
     fn id_of(byte: u8) -> String {

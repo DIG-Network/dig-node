@@ -578,16 +578,26 @@ impl CapsuleWarmer {
 
         // 3. ONLY `Ok` may lead to a holder claim. Not finalize-observed, not partial staging, not an
         //    `Err` that happened to leave bytes behind.
-        let Ok(bytes) = pulled else {
-            discard_staging(&staged);
-            tracing::info!(
-                store = %super::serve_log::SafeId::new(store_hex),
-                root = %super::serve_log::SafeId::new(root_hex),
-                outcome = "refused",
-                reason = "pull failed",
-                "capsule warm: pull did not complete; this node is NOT a holder"
-            );
-            return WarmOutcome::Refused(WarmFailure::PullFailed);
+        // `match`, NOT `let…else`: a `let…else` cannot bind the `Err`, so every failed warm in the
+        // field reported the one constant string "pull failed" and the download error — the only thing
+        // that says WHICH holder refused, timed out, or served an unverifiable chunk — was dropped on
+        // the floor. Four live diagnostic rounds produced no error text for exactly that reason
+        // (dig_ecosystem#3128). The reason logged here is the pull's own `Display`, which dig-download
+        // composes from this node's vocabulary plus SENTINELLED peer ids, so surfacing it cannot let a
+        // peer author what this node logs (#1603).
+        let bytes = match pulled {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                discard_staging(&staged);
+                tracing::info!(
+                    store = %super::serve_log::SafeId::new(store_hex),
+                    root = %super::serve_log::SafeId::new(root_hex),
+                    outcome = "refused",
+                    reason = %error,
+                    "capsule warm: pull did not complete; this node is NOT a holder"
+                );
+                return WarmOutcome::Refused(WarmFailure::PullFailed);
+            }
         };
 
         // 4. Promote into the cache, re-proving the artifact is the admitted one, THEN announce.
@@ -1011,6 +1021,145 @@ mod tests {
             Arc::ptr_eq(warmer.registry(), &shared),
             "the warmer must claim against the SAME registry instance it was wired with, not a fresh one"
         );
+    }
+
+    // -- the failure reason an operator actually reads ---------------------------------------------
+
+    /// A locator that offers exactly ONE holder, so the pull reaches the transport and fails THERE —
+    /// the shape a real capsule warm takes. `NoHolders` above cannot exercise this: it fails at the
+    /// locate step, before any holder-attributed reason exists to surface.
+    struct OneHolder;
+
+    #[async_trait::async_trait]
+    impl dig_download::ProviderLocator for OneHolder {
+        async fn find_providers(
+            &self,
+            _content: &dig_download::ContentId,
+        ) -> Result<Vec<dig_download::ProviderRecord>, dig_download::DownloadError> {
+            Ok(vec![dig_download::ProviderRecord {
+                content_key: "cc".repeat(32),
+                provider_peer_id: "dd".repeat(32),
+                addresses: vec![],
+                expires_at: u64::MAX,
+            }])
+        }
+    }
+
+    /// A holder that refuses the descriptor with a reason only THIS test can produce, so the assertion
+    /// below cannot be satisfied by any other string the warm path might log.
+    struct RefusingHolder;
+
+    /// The refusal text. Distinctive on purpose: an assertion on a generic word like "failed" would
+    /// also match the constant the fix removes.
+    const REFUSAL: &str = "holder-refused-the-descriptor-sentinel";
+
+    #[async_trait::async_trait]
+    impl dig_download::ModuleTransport for RefusingHolder {
+        async fn get_module_info(
+            &self,
+            peer: &str,
+            _store_id: &str,
+            _root: &str,
+        ) -> Result<dig_download::ModuleInfo, dig_download::DownloadError> {
+            Err(dig_download::DownloadError::transport(peer, REFUSAL))
+        }
+        async fn fetch_module_range(
+            &self,
+            peer: &str,
+            _store_id: &str,
+            _root: &str,
+            _offset: u64,
+            _length: u64,
+        ) -> Result<Vec<u8>, dig_download::DownloadError> {
+            Err(dig_download::DownloadError::transport(peer, REFUSAL))
+        }
+    }
+
+    /// An in-memory sink a `tracing_subscriber::fmt` layer writes formatted records into.
+    #[derive(Clone, Default)]
+    struct CaptureBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuffer {
+        type Writer = CaptureBuffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` under a scoped capturing subscriber and return exactly what an operator tailing the
+    /// node log would have seen.
+    async fn capture_logs<F: std::future::Future>(body: F) -> String {
+        let buffer = CaptureBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(buffer.clone())
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            body.await;
+        }
+        let captured = buffer.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    /// **Proves:** a failed warm logs the pull's OWN error — the holder-attributed cause — and not a
+    /// constant.
+    ///
+    /// **Catches:** the shipped `let Ok(bytes) = pulled else { … reason = "pull failed" }`. A
+    /// `let…else` cannot bind the `Err`, so every failed warm in the field reported one fixed string
+    /// and four live diagnostic rounds produced no error text at all (dig_ecosystem#3128).
+    ///
+    /// **Non-vacuous:** the needle is a sentinel this test's own transport authors and nothing else in
+    /// the crate emits, so the assertion can only pass if the pull's error genuinely reached the log.
+    #[tokio::test]
+    async fn a_failed_warm_logs_the_underlying_cause_not_a_constant() {
+        let dir = temp_dir("failure-reason");
+        let warmer = CapsuleWarmer::new(
+            Arc::new(OneHolder),
+            Arc::new(RefusingHolder),
+            Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        );
+
+        let logs = capture_logs(async {
+            let outcome = warmer.warm(&hex32(STORE), &hex32(chain_root())).await;
+            assert_eq!(
+                outcome,
+                WarmOutcome::Refused(WarmFailure::PullFailed),
+                "the fixture must actually drive a failed pull, or the log assertion proves nothing"
+            );
+        })
+        .await;
+
+        assert!(
+            logs.contains("capsule warm: pull did not complete"),
+            "the warm must still announce its refusal; captured:\n{logs}"
+        );
+        assert!(
+            logs.contains(REFUSAL),
+            "the refusal reason the holder produced must reach the operator's log, not be discarded \
+             by a `let…else`; captured:\n{logs}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **Proves:** a pull that ends in `Err` announces NOTHING and leaves no module at the cache path.
