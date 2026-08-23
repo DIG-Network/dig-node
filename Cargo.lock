@@ -2782,9 +2782,9 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.19.0"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2902186e65eb2360bd0ccff741b67f4af95d6e78b43052c01df6775ddcf3b741"
+checksum = "3677ea834b43e91713ce56ea0a84b0ff9618b8466ca854f9fd03be7b46310171"
 dependencies = [
  "async-trait",
  "dig-constants 0.10.1",

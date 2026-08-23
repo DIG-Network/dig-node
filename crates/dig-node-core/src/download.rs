@@ -4933,6 +4933,77 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn capturing_state_store_checkpoints_a_real_module_download_key() {
+        // dig-download #38 / dig_ecosystem#3128: a MODULE checkpoint key is
+        // `module:<64hex>:<64hex>` = 136 bytes. `FileStateStore` used to hex-encode the key into the
+        // filename, doubling it to 272 characters; with `.json` that is 277, past Linux's `NAME_MAX`
+        // of 255 — so EVERY capsule checkpoint write on Linux failed with
+        // `File name too long (os error 36)`, deterministically, on every host and every capsule.
+        //
+        // The defect survived 200+ dig-download tests because they all used `InMemoryStateStore`
+        // (which has no filename at all) or a 3-character key. So the fixture, not the assertion, is
+        // what makes this test load-bearing: it drives dig-node's PRODUCTION checkpoint store — the
+        // `CapturingStateStore` wrapper over `FileStateStore` that `download.rs` builds at the
+        // composition root — with a key of the real, full length.
+        //
+        // Two keys differing ONLY in their `root` half are round-tripped, so a would-be fix that
+        // bounded the filename by TRUNCATING the key would alias both capsules onto one checkpoint
+        // and fail here, exactly as the over-long name does.
+        let dir = tempfile::tempdir().unwrap();
+        let store = CapturingStateStore::new(FileStateStore::new(dir.path().join("downloads")));
+
+        let store_id = "1".repeat(64);
+        let key_a = dig_download::module_download_key(&store_id, &"a".repeat(64));
+        let key_b = dig_download::module_download_key(&store_id, &"b".repeat(64));
+        assert_eq!(
+            key_a.len(),
+            136,
+            "fixture guard: a real module checkpoint key is 136 bytes — a shorter key cannot              exhibit the NAME_MAX overflow this test exists to catch"
+        );
+
+        for (key, total) in [(&key_a, 11u64), (&key_b, 22u64)] {
+            let mut state = dig_download::DownloadState::new(key.clone());
+            state.total_length = total;
+            state.chunk_lens = vec![total];
+            state.mark_done(0);
+            store.save(&state).await.unwrap_or_else(|e| {
+                panic!("checkpointing a real module download key must succeed, got: {e}")
+            });
+        }
+
+        for (key, total) in [(&key_a, 11u64), (&key_b, 22u64)] {
+            let loaded = store
+                .load(key)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("checkpoint for {key} must read back"));
+            assert_eq!(loaded.key, *key, "a checkpoint must not alias another key");
+            assert_eq!(loaded.total_length, total);
+            assert!(loaded.is_done(0));
+            assert_eq!(
+                store.captured(key).await.map(|s| s.total_length),
+                Some(total),
+                "the capturing wrapper must snapshot the commitment it delegated"
+            );
+        }
+
+        // Belt-and-braces on the property itself: every name written is within NAME_MAX, so this
+        // holds on a Linux host as well as wherever the suite happens to run.
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("downloads"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "two distinct keys must write two checkpoints");
+        for name in &names {
+            assert!(
+                name.len() <= 255,
+                "checkpoint filename must fit NAME_MAX (255), got {} chars: {name}",
+                name.len()
+            );
+        }
+    }
+
     // -- RequestProvenance::from_sec_fetch_site (Sec-Fetch-Site → landing-gate axis) ---------------
 
     #[test]
