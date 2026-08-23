@@ -1289,13 +1289,6 @@ async fn sync_status(ctx: &ControlCtx) -> Value {
     })
 }
 
-/// Trigger a whole-store sync, either for ONE capsule (`storeId:rootHash` / `store_id` + `root`)
-/// or for a whole store BY STORE ID ALONE, in which case the node resolves the store's
-/// chain-anchored tip and syncs that generation (#1886).
-///
-/// No identity gate: the chunked `dig.getCapsule` download the sync now leads with is anonymous,
-/// so a node holding no §21 identity key syncs perfectly well. Rejecting the request here would
-/// refuse work the node can actually do.
 /// `control.capsule.fetch` — start a P2P whole-capsule pull, and ACK.
 ///
 /// # This is an acknowledgement, not a completion report
@@ -1358,6 +1351,13 @@ fn capsule_fetch_target(params: &Value) -> Result<(String, String), &'static str
     Ok((store.to_lowercase(), root.to_lowercase()))
 }
 
+/// Trigger a whole-store sync, either for ONE capsule (`storeId:rootHash` / `store_id` + `root`)
+/// or for a whole store BY STORE ID ALONE, in which case the node resolves the store's
+/// chain-anchored tip and syncs that generation (#1886).
+///
+/// No identity gate: the chunked `dig.getCapsule` download the sync now leads with is anonymous,
+/// so a node holding no §21 identity key syncs perfectly well. Rejecting the request here would
+/// refuse work the node can actually do.
 async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     // Accept `store` = "storeId[:rootHash]", or explicit store_id [+ root].
     let (store_id, root) = if let Some(s) = params.get("store").and_then(|v| v.as_str()) {

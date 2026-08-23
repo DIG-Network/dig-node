@@ -4386,8 +4386,6 @@ impl Node {
         })
     }
 
-    /// The node's cache dir root — the data root the P2P content engine's download staging
-    /// (`<cache>/downloads`) + `.download.tmp` GC live under (shares the node's writability handling).
     /// Whether this node already holds the whole capsule `(store_hex, root_hex)` on disk.
     ///
     /// The presence of that file IS this node's holder claim (see `module_reshare`), so this is the
@@ -4420,6 +4418,8 @@ impl Node {
         true
     }
 
+    /// The node's cache dir root — the data root the P2P content engine's download staging
+    /// (`<cache>/downloads`) + `.download.tmp` GC live under (shares the node's writability handling).
     pub fn cache_dir_path(&self) -> &Path {
         &self.cache_dir
     }

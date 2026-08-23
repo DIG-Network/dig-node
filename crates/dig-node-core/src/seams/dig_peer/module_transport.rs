@@ -401,9 +401,11 @@ async fn descriptor_over(
     serde_json::from_value(response.get("result")?.clone()).ok()
 }
 
-/// Open a `dig.fetchModuleRange` frame stream over `peer`, at the phase its descriptor was answered
-/// at: a window relayed by a hop must carry the same opt-in the descriptor that named it did, or the
-/// hop refuses at gate (1) and the pull stalls one frame after it was admitted.
+/// Open a `dig.fetchModuleRange` frame stream over `peer`, at the phase `proxy` names.
+///
+/// The phase is the CALLER's to decide and is not re-derived here: a window sent through a hop must
+/// carry the relay opt-in that hop expects, or it refuses at gate (1) and the pull stalls one frame
+/// after it was admitted. See [`RelayEscalation::escalate_for`] for how the caller picks it.
 async fn window_stream_over(
     peer: &mut DigPeer,
     store_id: &str,
@@ -459,8 +461,12 @@ impl ModuleTransport for NatModuleTransport {
         length: u64,
     ) -> Result<Vec<u8>, DownloadError> {
         let mut peer = self.connect(provider_peer_id, store_id, root).await?;
-        // A window rides at the phase its descriptor was answered at: `escalate_for` returns `true`
-        // for a pair already asked, which is exactly the pair whose descriptor was relayed.
+        // Escalation LATCHES per `(capsule, peer)` pair rather than per request: `escalate_for`
+        // records on its first read, so the pair's FIRST ask — its descriptor — goes plain and every
+        // later ask for that pair, windows included, is escalated. That is the bound WU2 wants: one
+        // plain round is spent per pair before any relay is asked of it, and a pair whose plain round
+        // produced no holder does not spend a second one. A window therefore does NOT necessarily
+        // ride at its own descriptor's phase, and must not be documented as if it did.
         let proxy = self
             .escalation
             .escalate_for(store_id, root, provider_peer_id);
