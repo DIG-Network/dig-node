@@ -671,13 +671,18 @@ fn scratch() -> PathBuf {
     dir
 }
 
-/// A derived (not hard-coded) custody password — CodeQL flags literal cryptographic values.
-fn test_custody_password() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    b"dig-wallet-sync-supervisor-test".hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+/// A custody with ONE wallet enrolled under `dir`, standing in for a pre-#1701 install.
+///
+/// The node can no longer enrol one itself (dig_ecosystem#1701), so the fixture writes the on-disk
+/// manifest directly — which is also the more faithful test, because the production reader now
+/// depends on that file rather than on any provisioning API.
+///
+/// The keys are `registered_key(90..)`, deliberately disjoint from the low tags the watch-registry
+/// fixtures use, so a test combining the two sides can still tell them apart.
+fn enrolled_custody(dir: &std::path::Path) -> WalletCustody {
+    let keys: Vec<chia::bls::PublicKey> = (90u8..93).map(registered_key).collect();
+    WalletCustody::enroll_for_tests(dir, "fixture-wallet", &keys);
+    WalletCustody::open(dir.to_path_buf())
 }
 
 fn peak_message(height: u32) -> Message {
@@ -838,10 +843,8 @@ async fn a_default_install_with_no_wallet_settles_on_nothing_to_watch() {
 #[tokio::test]
 async fn supervisor_runs_catch_up_once_custody_has_keys() {
     let db = WalletDb::open_in_memory().await.unwrap();
-    let custody = WalletCustody::open(scratch());
-    custody
-        .create(&test_custody_password(), None)
-        .expect("create a custodied wallet");
+    let dir = scratch();
+    let custody = enrolled_custody(&dir);
 
     let mut expected: Vec<Bytes32> = custody
         .custodied_public_keys()
@@ -849,7 +852,7 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
         .map(puzzle_hash_for)
         .collect();
     expected.sort();
-    assert!(!expected.is_empty(), "a created wallet has public keys");
+    assert!(!expected.is_empty(), "an enrolled wallet has public keys");
 
     let h = Harness::start(
         db.clone(),
@@ -1237,10 +1240,7 @@ async fn an_enrolled_wallet_with_no_derivable_addresses_is_not_an_all_clear() {
 #[test]
 fn production_any_wallet_reads_the_manifest_not_the_derivable_keys() {
     let dir = scratch();
-    let custody = WalletCustody::open(dir.clone());
-    custody
-        .create(&test_custody_password(), None)
-        .expect("create a custodied wallet");
+    enrolled_custody(&dir);
 
     // Drop the manifest so the next construction must rebuild it from the seed files alone. No
     // seed is read, written, or inspected here — only the index beside them is removed.
@@ -3535,12 +3535,9 @@ fn a_node_with_no_custody_follows_registered_keys() {
 #[test]
 fn the_union_follows_custody_and_registered_keys_together() {
     let dir = scratch();
-    let custody = WalletCustody::open(dir.clone());
-    custody
-        .create(&test_custody_password(), None)
-        .expect("create a custodied wallet");
+    let custody = enrolled_custody(&dir);
     let custodied: Vec<Bytes32> = PuzzleHashSource::puzzle_hashes(&custody);
-    assert!(!custodied.is_empty(), "a created wallet has public keys");
+    assert!(!custodied.is_empty(), "an enrolled wallet has public keys");
 
     let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
     registry.watch(&[registered_key(2)]);
@@ -3605,15 +3602,12 @@ fn unwatch_removes_the_address_from_the_subscription_set() {
 #[test]
 fn a_key_held_by_both_sides_is_watched_once() {
     let dir = scratch();
-    let custody = WalletCustody::open(dir.clone());
-    custody
-        .create(&test_custody_password(), None)
-        .expect("create a custodied wallet");
+    let custody = enrolled_custody(&dir);
     let shared = *custody
         .custodied_public_keys()
         .iter()
         .next()
-        .expect("a created wallet has public keys");
+        .expect("an enrolled wallet has public keys");
 
     let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
     registry.watch(&[shared]);
@@ -3656,10 +3650,7 @@ fn an_empty_union_still_reports_the_honest_no_wallet_state() {
 #[test]
 fn an_enrolled_but_unreachable_custody_is_not_an_all_clear_through_the_union() {
     let dir = scratch();
-    let custody = WalletCustody::open(dir.clone());
-    custody
-        .create(&test_custody_password(), None)
-        .expect("create a custodied wallet");
+    enrolled_custody(&dir);
     // Drop the manifest so it is rebuilt from the seed file alone, without public keys — one of the
     // four reachable states where an enrolled wallet derives no address.
     std::fs::remove_file(dir.join("wallets").join("index.json")).expect("remove the manifest");

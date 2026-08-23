@@ -714,8 +714,6 @@ impl WalletBackend {
         self.custody.as_ref()
     }
 
-
-
     /// Attach the pusher for ALREADY-SIGNED bundles (`control.wallet.broadcast`).
     ///
     /// Attaching this does NOT let the node spend its own coins: it holds no key either way. It
@@ -4440,9 +4438,6 @@ impl WalletBackend {
         })
     }
 
-
-
-
     /// Dispatch a `tip.*` method to the attached tipping engine (#378). A node without the engine
     /// attached reports the method unavailable. Reads (`get_config`/`get_ledger`) are open; the
     /// mutations (`set_config`/`manual`/`notify_consumed`/`dev_tick`) are paired-token gated by the
@@ -4547,8 +4542,6 @@ const SIGNING_METHODS: &[&str] = &[
 fn is_signing_method(method: &str) -> bool {
     SIGNING_METHODS.contains(&method)
 }
-
-
 
 /// Parse a wire [`Amount`] to `u64` (rejecting values beyond `u64`).
 fn amount_u64(a: &Amount) -> Result<u64> {
@@ -4902,17 +4895,6 @@ mod tests {
             created_timestamp: None,
             spent_timestamp: None,
         }
-    }
-
-    /// Derived test custody password — replaces a hard-coded literal that triggered CodeQL's
-    /// rust/hard-coded-cryptographic-value alert. The test only needs a stable, deterministic
-    /// passphrase, not a specific one.
-    fn test_custody_password() -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        b"dig-wallet-rpc-test".hash(&mut hasher);
-        format!("{:x}", hasher.finish())
     }
 
     /// Scoped + synced ⇒ the DB path: `balance` counts ONLY confirmed unspent coins (excludes
@@ -7522,8 +7504,18 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let custody = WalletCustody::new(dir.clone(), Network::Testnet11, 2);
-        let created = custody.create(&test_custody_password(), None).unwrap();
+
+        // The wallet as a pre-#1701 install left it: two HD keys persisted in the manifest, the
+        // seed unreadable. `primary` stands for the receive address the old fallback covered;
+        // `secondary` is the key beyond it, and is what the bundle spends.
+        let primary = BlsPair::new(41);
+        let secondary = BlsPair::new(42);
+        assert_ne!(
+            p2_hash(primary.pk),
+            p2_hash(secondary.pk),
+            "the fixture needs two DISTINCT keys, or it cannot tell the two guards apart"
+        );
+        WalletCustody::enroll_for_tests(&dir, "restart-fixture", &[primary.pk, secondary.pk]);
 
         let pusher = FakePusher::accepting();
         let cfg = WalletConfig {
@@ -7531,28 +7523,16 @@ mod tests {
             address_prefix: "txch".into(),
             ..Default::default()
         };
-        let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
-        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), cfg.clone())
-            .with_custody(custody.clone())
-            .with_pusher(pusher.clone());
 
-        // The key at an HD index the receive address does NOT describe.
-        let primary_ph = singleton::bytes32_from_hex(&decode_address(&created.address).unwrap())
-            .expect("the manifest address decodes to a puzzle hash");
-        let secondary = custody
-            .signer(None)
-            .unwrap()
-            .public_keys()
-            .into_iter()
-            .find(|pk| p2_hash(*pk) != primary_ph)
-            .expect("the signer must cover more than the receive address, or this proves nothing");
+        // Sign over the SECONDARY key. Signing needs a signer, which only the simulator path can
+        // attach now (§908) — and it is the right shape either way: the bundle arrives pre-signed
+        // from somewhere else, which is exactly the push the guard has to catch.
+        let signing = push_backend(secondary.sk.clone(), pusher.clone()).await;
+        let own = signed_by_the_node(&signing, bare_xch_spend(secondary.pk)).await;
 
-        let own = signed_by_the_node(&be, bare_xch_spend(secondary)).await;
-
-        // Restart: a fresh custody over the SAME directory, nothing unlocked, and a fresh backend
-        // whose memo of loaded signers is empty.
-        let restarted = WalletCustody::new(dir.clone(), Network::Testnet11, 2);
+        // Restart: a fresh custody over the SAME directory and a fresh backend whose memo of
+        // loaded signers is empty.
+        let restarted = WalletCustody::open(dir.clone());
         let db2 = WalletDb::open_in_memory().await.unwrap();
         db2.set_initial_sync_complete(true).await.unwrap();
         let after = WalletBackend::new(db2, Arc::new(MockFallback::default()), cfg)
@@ -7560,7 +7540,7 @@ mod tests {
             .with_pusher(pusher.clone());
         assert!(
             after.current_signer().is_none(),
-            "the restarted node must really be locked, or the fallback is never exercised"
+            "the restarted node must hold no signer, or the manifest fallback is never exercised"
         );
 
         assert_eq!(
@@ -9446,369 +9426,7 @@ mod tests {
         );
     }
 
-    // ---- #368: runtime signer load via node custody + wallet.* dispatch + sync-status --------
-
-    use super::super::custody::{Network, WalletCustody};
     use super::super::events::SyncLifecycle;
-
-    /// A fresh multi-wallet custody manager over a unique temp CONFIG DIR (no wallets yet), covering
-    /// a small HD range so the key-build stays fast.
-    fn fresh_custody() -> WalletCustody {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dig-wallet-rpc-custody-{}-{}",
-            std::process::id(),
-            n
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        WalletCustody::new(dir, Network::Testnet11, 2)
-    }
-
-    async fn custody_backend() -> WalletBackend {
-        let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
-        WalletBackend::new(
-            db,
-            Arc::new(MockFallback::default()),
-            WalletConfig::default(),
-        )
-        .with_custody(fresh_custody())
-    }
-
-    /// **Proves (#368 runtime signer load):** a served backend resolves its signer from the
-    /// node-custodied session at RUNTIME. With no wallet, a spend method fails "locked"; after a
-    /// `wallet.create` over the same dispatch surface, the same method no longer reports locked
-    /// (it fails later, at coin selection) — i.e. `require_signer` succeeded without a bring-up
-    /// `with_signer`.
-    #[tokio::test]
-    async fn custody_unlock_enables_the_signer_at_runtime() {
-        let be = custody_backend().await;
-        let send = r#"{"address":"txch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp7z9wc","amount":1,"fee":0,"auto_submit":false}"#;
-
-        // Locked: no signer available yet.
-        let (status, body) = be.dispatch("send_xch", send).await;
-        assert_ne!(status, 200);
-        assert!(
-            body.contains("locked") || body.contains("signing key"),
-            "expected a locked-wallet error, got: {body}"
-        );
-
-        // Create a wallet over the custody dispatch surface — leaves it unlocked with a signer.
-        let (status, body) = be
-            .dispatch(
-                "wallet.create",
-                &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
-            )
-            .await;
-        assert_eq!(status, 200, "wallet.create failed: {body}");
-        assert!(body.contains("address"), "wallet.create returns an address");
-
-        // Now the signer resolves: send_xch no longer reports locked (fails at coin selection).
-        let (_status, body2) = be.dispatch("send_xch", send).await;
-        assert!(
-            !body2.contains("no signing key") && !body2.contains("wallet is locked"),
-            "signer must be resolved after unlock, got: {body2}"
-        );
-    }
-
-    /// **Proves:** the `wallet.*` custody lifecycle is dispatchable on the served surface —
-    /// status transitions none → unlocked → locked → unlocked → none across the lifecycle calls.
-    #[tokio::test]
-    async fn wallet_custody_lifecycle_over_dispatch() {
-        let be = custody_backend().await;
-
-        let state = |body: &str| -> String {
-            serde_json::from_str::<Value>(body).unwrap()["state"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        };
-
-        let (_s, body) = be.dispatch("wallet.status", "{}").await;
-        assert_eq!(state(&body), "none");
-
-        let (s, _b) = be
-            .dispatch(
-                "wallet.create",
-                &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
-            )
-            .await;
-        assert_eq!(s, 200);
-        let (_s, body) = be.dispatch("wallet.status", "{}").await;
-        assert_eq!(state(&body), "unlocked");
-
-        let (s, _b) = be.dispatch("wallet.lock", "{}").await;
-        assert_eq!(s, 200);
-        let (_s, body) = be.dispatch("wallet.status", "{}").await;
-        assert_eq!(state(&body), "locked");
-
-        let (s, _b) = be
-            .dispatch(
-                "wallet.unlock",
-                &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
-            )
-            .await;
-        assert_eq!(s, 200);
-        let (_s, body) = be.dispatch("wallet.status", "{}").await;
-        assert_eq!(state(&body), "unlocked");
-
-        let (s, _b) = be
-            .dispatch(
-                "wallet.delete",
-                &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
-            )
-            .await;
-        assert_eq!(s, 200);
-        let (_s, body) = be.dispatch("wallet.status", "{}").await;
-        assert_eq!(state(&body), "none");
-    }
-
-    // ---- #431/#432: the node-managed unlock-auth gate on the #371 sign path ------------------
-
-    /// The canonical BIP-39 test vector — a KNOWN mnemonic so the custodied signer is deterministic.
-    const AUTH_ABANDON: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
-        abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-        abandon abandon abandon abandon abandon art";
-
-    /// A served backend with ONE imported wallet AND the node-managed unlock authority attached
-    /// (per-transaction default). Custody + auth share the same dir; the wallet is imported (so a
-    /// one-shot sign can decrypt it) but custody's own session is locked — the AUTH gate, not
-    /// `wallet.unlock`, governs signing when auth is attached.
-    async fn auth_gated_backend() -> (WalletBackend, std::sync::Arc<UnlockAuth>) {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dig-wallet-rpc-authgate-{}-{}",
-            std::process::id(),
-            n
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let custody = WalletCustody::new(dir.clone(), Network::Testnet11, 2);
-        custody.import(AUTH_ABANDON, "correcthorse", None).unwrap();
-        custody.lock(None);
-        let auth = std::sync::Arc::new(UnlockAuth::new(custody.clone(), dir));
-        let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
-        let be = WalletBackend::new(
-            db,
-            Arc::new(MockFallback::default()),
-            WalletConfig::default(),
-        )
-        .with_custody(custody)
-        .with_auth(auth.clone());
-        (be, auth)
-    }
-
-    /// **Proves (#432 gate, adversarial):** with auth attached in the DEFAULT per-transaction mode, a
-    /// read-only `auth.unlock` does NOT enable signing — a spend fails "locked"; a fresh
-    /// `auth.sign_unlock` enables exactly ONE signature (the spend then proceeds past the signer gate,
-    /// failing later at coin selection); and after that one op the grant is consumed, so the next
-    /// spend fails "locked" again until a fresh `auth.sign_unlock`.
-    #[tokio::test]
-    async fn per_transaction_auth_gates_the_sign_path() {
-        let (be, _auth) = auth_gated_backend().await;
-        let send = r#"{"address":"txch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp7z9wc","amount":1,"fee":0,"auto_submit":false}"#;
-        let locked = |body: &str| body.contains("locked") || body.contains("signing key");
-
-        // A read-only unlock authorizes reads but NOT signing.
-        let (s, b) = be
-            .dispatch("auth.unlock", r#"{"password":"correcthorse"}"#)
-            .await;
-        assert_eq!(s, 200, "read-only unlock: {b}");
-        let (_s, body) = be.dispatch("send_xch", send).await;
-        assert!(
-            locked(&body),
-            "read-only session must not sign, got: {body}"
-        );
-
-        // A fresh sign-unlock enables ONE signature: the signer resolves (fails later at selection).
-        let (s, b) = be
-            .dispatch("auth.sign_unlock", r#"{"password":"correcthorse"}"#)
-            .await;
-        assert_eq!(s, 200, "sign-unlock: {b}");
-        let (_s, body) = be.dispatch("send_xch", send).await;
-        assert!(
-            !locked(&body),
-            "sign-unlock must resolve the signer for one op, got: {body}"
-        );
-
-        // The one-shot grant was consumed by that op — the next spend is locked again.
-        let (_s, body) = be.dispatch("send_xch", send).await;
-        assert!(
-            locked(&body),
-            "the sign grant is one-shot: a second spend needs fresh auth, got: {body}"
-        );
-    }
-
-    /// **Proves (#432):** the `auth.*` surface is dispatchable and reports the secure defaults; a
-    /// wrong password is denied (`401`) and arms nothing.
-    #[tokio::test]
-    async fn auth_surface_dispatch_and_wrong_password_denied() {
-        let (be, _auth) = auth_gated_backend().await;
-
-        let (s, body) = be.dispatch("auth.status", "{}").await;
-        assert_eq!(s, 200);
-        let st: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(st["mode"], "per_transaction", "secure default mode");
-        assert_eq!(st["method"], "password");
-        assert_eq!(st["state"], "locked");
-        assert_eq!(st["has_wallet"], true);
-
-        // A wrong password is denied and arms nothing.
-        let (s, _b) = be
-            .dispatch("auth.sign_unlock", r#"{"password":"wrong"}"#)
-            .await;
-        assert_eq!(s, 401, "wrong password → unauthorized");
-        let (_s, body) = be.dispatch("auth.status", "{}").await;
-        assert_eq!(
-            serde_json::from_str::<Value>(&body).unwrap()["sign_armed"],
-            false,
-            "a denied sign-unlock arms nothing"
-        );
-    }
-
-    /// **Proves (#432):** the full `auth.*` control surface dispatches — set_mode, get_method,
-    /// enroll_totp (returns the one-time provisioning secret), set_method back to password, and lock.
-    #[tokio::test]
-    async fn auth_control_surface_dispatch() {
-        let (be, _auth) = auth_gated_backend().await;
-
-        // set_mode → session-unlock-all requires the current factor (password here), reflected in
-        // get_method (#432 Finding 3).
-        let (s, b) = be
-            .dispatch(
-                "auth.set_mode",
-                r#"{"mode":"session_unlock_all","password":"correcthorse"}"#,
-            )
-            .await;
-        assert_eq!(s, 200, "{b}");
-        let (_s, body) = be.dispatch("auth.get_method", "{}").await;
-        let gm: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(gm["mode"], "session_unlock_all");
-        assert_eq!(gm["method"], "password");
-
-        // enroll_totp returns the one-time secret + otpauth URI and switches the method.
-        let (s, body) = be
-            .dispatch("auth.enroll_totp", r#"{"password":"correcthorse"}"#)
-            .await;
-        assert_eq!(s, 200, "{body}");
-        let enroll: Value = serde_json::from_str(&body).unwrap();
-        assert!(enroll["otpauth_uri"]
-            .as_str()
-            .unwrap()
-            .starts_with("otpauth://totp/"));
-        let (_s, body) = be.dispatch("auth.get_method", "{}").await;
-        assert_eq!(
-            serde_json::from_str::<Value>(&body).unwrap()["method"],
-            "totp"
-        );
-
-        // A missing `mode` is a 400; lock is idempotent + 200.
-        let (s, _b) = be.dispatch("auth.set_mode", "{}").await;
-        assert_eq!(s, 400, "set_mode requires a mode");
-        let (s, _b) = be.dispatch("auth.lock", "{}").await;
-        assert_eq!(s, 200);
-    }
-
-    /// **Proves (#432 Finding 1, concurrency):** one `auth.sign_unlock` authorizes EXACTLY ONE
-    /// signature even under two concurrent `send_xch` on the shared backend. Without the serializing
-    /// `sign_lock`, both calls could clone the armed grant before either consumed it (a gate TOCTOU) →
-    /// two signed spends from one auth. With the fix, exactly one passes the signer gate; the other is
-    /// "locked".
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn one_sign_unlock_authorizes_exactly_one_concurrent_signature() {
-        let (be, _auth) = auth_gated_backend().await;
-        let send = r#"{"address":"txch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp7z9wc","amount":1,"fee":0,"auto_submit":false}"#;
-        let (s, _b) = be
-            .dispatch("auth.sign_unlock", r#"{"password":"correcthorse"}"#)
-            .await;
-        assert_eq!(s, 200);
-
-        // Two concurrent spends race for the single one-shot grant.
-        let a = be.clone();
-        let b = be.clone();
-        let (r1, r2) = tokio::join!(
-            async move { a.dispatch("send_xch", send).await },
-            async move { b.dispatch("send_xch", send).await },
-        );
-        let locked = |body: &str| body.contains("locked") || body.contains("signing key");
-        let n_locked = [&r1.1, &r2.1].iter().filter(|b| locked(b)).count();
-        assert_eq!(
-            n_locked, 1,
-            "exactly one concurrent spend must be gated (one auth = one signature); got r1={:?} r2={:?}",
-            r1.1, r2.1
-        );
-    }
-
-    /// **Proves (#432 Finding 4, no sibling resident key):** with auth attached, `wallet.create`/
-    /// `import` leave NO resident custody signer (the auth gate is the only signer-loading path), and
-    /// `wallet.unlock` is redirected to `auth.*` rather than loading a session-long resident key.
-    #[tokio::test]
-    async fn auth_attached_provision_leaves_no_resident_signer_and_unlock_redirects() {
-        let (be, _auth) = auth_gated_backend().await; // one wallet already imported + locked
-        let (s, _b) = be
-            .dispatch("wallet.create", r#"{"password":"anotherpw1"}"#)
-            .await;
-        assert_eq!(s, 200, "create succeeds");
-
-        // NO wallet has a resident signer — provisioning locked the custody session (auth gate wins).
-        let custody = be.custody().unwrap();
-        let list = custody.list();
-        assert_eq!(list.len(), 2, "two wallets custodied");
-        for w in &list {
-            assert!(
-                custody.signer(Some(&w.id)).is_none(),
-                "wallet {} must have NO resident signer",
-                w.id
-            );
-        }
-
-        // wallet.unlock is redirected to the auth surface (never loads a resident key).
-        let (s, body) = be
-            .dispatch("wallet.unlock", r#"{"password":"correcthorse"}"#)
-            .await;
-        assert_eq!(s, 400, "wallet.unlock redirected when auth is attached");
-        assert!(
-            body.contains("unlock authentication") || body.contains("auth.unlock"),
-            "redirect message points to auth.*, got: {body}"
-        );
-    }
-
-    /// **Proves (#432 Finding 5, panic-safe consume):** the RAII [`SignGrantGuard`] consumes the
-    /// one-shot grant on drop — the mechanism that guarantees a panicking signing handler cannot leave
-    /// the decrypted key armed + reusable (Drop runs on unwind).
-    #[tokio::test]
-    async fn sign_grant_guard_consumes_on_drop() {
-        let (be, auth) = auth_gated_backend().await;
-        be.dispatch("auth.sign_unlock", r#"{"password":"correcthorse"}"#)
-            .await;
-        assert!(auth.effective_signer().is_some(), "armed");
-        {
-            let _guard = SignGrantGuard {
-                auth: Some(auth.clone()),
-            };
-            // guard drops at end of scope — as it would during a panic unwind
-        }
-        assert!(
-            auth.effective_signer().is_none(),
-            "the guard's Drop must consume the grant (panic-safe)"
-        );
-    }
-
-    /// **Proves:** a wrong password on `wallet.unlock` fails closed (`401`) — the paired caller
-    /// cannot brute the seed for free over the dispatch surface.
-    #[tokio::test]
-    async fn wallet_unlock_wrong_password_fails_closed() {
-        let be = custody_backend().await;
-        be.dispatch("wallet.create", r#"{"password":"correcthorse"}"#)
-            .await;
-        be.dispatch("wallet.lock", "{}").await;
-        let (status, _body) = be
-            .dispatch("wallet.unlock", r#"{"password":"wrong"}"#)
-            .await;
-        assert_eq!(status, 401, "wrong password must be 401");
-    }
 
     /// **Proves (#369 sync-status):** the sync-status snapshot derives the tri-state from the DB —
     /// `syncing` before the initial catch-up completes, `synced` (with the peak height) after.

@@ -233,56 +233,88 @@ mod tests {
         tok == PAIRED
     }
 
+    /// Every name the removed node-side USER custody surface served, plus one name under each
+    /// prefix that never existed.
+    ///
+    /// The never-existed names are the point. The methods are gone, so a test listing only the old
+    /// names could be satisfied by an implementation that enumerated exactly those nine and left
+    /// the PREFIX open — which is the regression this gate exists to prevent, because the next
+    /// `wallet.*` method anyone adds would then be unauthenticated by default.
+    const RETIRED_METHODS: &[&str] = &[
+        "wallet.create",
+        "wallet.import",
+        "wallet.restore",
+        "wallet.unlock",
+        "wallet.lock",
+        "wallet.status",
+        "wallet.list",
+        "wallet.select",
+        "wallet.delete",
+        "wallet.a_name_that_never_existed",
+        "auth.status",
+        "auth.get_method",
+        "auth.set_method",
+        "auth.set_mode",
+        "auth.enroll_totp",
+        "auth.enroll_passkey_begin",
+        "auth.enroll_passkey_finish",
+        "auth.unlock",
+        "auth.sign_unlock",
+        "auth.lock",
+        "auth.a_name_that_never_existed",
+    ];
+
+    /// **Proves (dig_ecosystem#1701, step 4):** no token authorizes a retired custody name.
+    ///
+    /// Stronger than the gate this replaces, deliberately. The old gate answered "master or paired
+    /// allows it"; the removal must not turn that into "anything allows it", and the way it could
+    /// have is by falling through to [`WalletMethodClass::Other`], whose whole meaning is "not my
+    /// problem" — which for a name with no handler reads as open.
+    ///
+    /// Reverting `classify` to leave the prefixes unmatched reddens the `Other` assertion; reverting
+    /// only `authorize`'s early return reddens the master/paired ones.
     #[test]
-    fn custody_methods_are_gated() {
-        for m in [
-            "wallet.create",
-            "wallet.import",
-            "wallet.restore",
-            "wallet.unlock",
-            "wallet.lock",
-            "wallet.status",
-            "wallet.list",
-            "wallet.select",
-            "wallet.delete",
-        ] {
-            assert_eq!(classify(m), WalletMethodClass::Custody, "{m}");
-            assert!(requires_authorization(m), "{m} must be gated");
+    fn every_retired_custody_name_is_refused_with_any_token() {
+        for m in RETIRED_METHODS {
+            assert_eq!(classify(m), WalletMethodClass::Retired, "{m}");
+            assert_ne!(
+                classify(m),
+                WalletMethodClass::Other,
+                "{m} fell through to the OPEN class - a retired namespace must never do that"
+            );
+            assert!(requires_authorization(m), "{m} must reach this gate at all");
+            for token in [None, Some("nope"), Some(MASTER), Some(PAIRED)] {
+                assert!(
+                    !authorize(m, token, MASTER, is_paired),
+                    "{m}: refused with {token:?} - node-side USER custody was removed by \
+                     dig_ecosystem#1701 and no credential reinstates it"
+                );
+            }
         }
     }
 
+    /// **Proves the refusal is narrow:** the light-client chain reads are NOT caught by it.
+    ///
+    /// `control.wallet.balance` shares six characters with `wallet.balance`. A retirement written as
+    /// a substring match rather than a prefix match would refuse the light client outright, and the
+    /// node would stop answering for money while every custody test still passed.
     #[test]
-    fn auth_methods_are_gated_and_no_token_is_denied() {
-        for m in [
-            "auth.status",
-            "auth.get_method",
-            "auth.set_method",
-            "auth.set_mode",
-            "auth.enroll_totp",
-            "auth.enroll_passkey_begin",
-            "auth.enroll_passkey_finish",
-            "auth.unlock",
-            "auth.sign_unlock",
-            "auth.lock",
-        ] {
-            assert_eq!(classify(m), WalletMethodClass::Custody, "{m}");
-            assert!(requires_authorization(m), "{m} must be gated");
-            // No token / wrong token → denied; master or paired → allowed.
-            assert!(
-                !authorize(m, None, MASTER, is_paired),
-                "{m}: no token denied"
-            );
-            assert!(
-                !authorize(m, Some("nope"), MASTER, is_paired),
-                "{m}: wrong token denied"
-            );
-            assert!(
-                authorize(m, Some(MASTER), MASTER, is_paired),
-                "{m}: master ok"
-            );
-            assert!(
-                authorize(m, Some(PAIRED), MASTER, is_paired),
-                "{m}: paired ok"
+    fn the_retirement_does_not_catch_the_control_plane_wallet_reads() {
+        let reads: Vec<&&str> = crate::control::CONTROL_METHODS
+            .iter()
+            .filter(|n| n.starts_with("control.wallet."))
+            .collect();
+        assert!(
+            reads.len() >= 5,
+            "expected the five light-client chain reads in CONTROL_METHODS; found {} - this guard \
+             would otherwise pass vacuously",
+            reads.len()
+        );
+        for m in &reads {
+            assert_ne!(
+                classify(m),
+                WalletMethodClass::Retired,
+                "{m} is a light-client chain read and must not be refused as retired"
             );
         }
     }
@@ -376,7 +408,6 @@ mod tests {
     fn master_or_paired_token_authorizes_a_gated_mutation() {
         assert!(authorize("send_xch", Some(MASTER), MASTER, is_paired));
         assert!(authorize("send_xch", Some(PAIRED), MASTER, is_paired));
-        assert!(authorize("wallet.unlock", Some(PAIRED), MASTER, is_paired));
     }
 
     #[test]

@@ -19,14 +19,19 @@
 //!   which become the addresses the supervisor subscribes and which the push guard checks a
 //!   pre-signed bundle against (§18.12).
 //!
-//! # There is no longer a path from here to a private key
+//! # There is no longer a path from HERE to a private key
 //!
-//! No method reads a `.seed` file, decrypts one, derives a secret key, or builds a
-//! [`super::spend::WalletSigner`]. §908 therefore holds STRUCTURALLY rather than by policy: the
-//! node cannot sign on a user's behalf because no code here can obtain the material to do it with.
-//! The at-rest primitive those methods used, [`crate::seed_store`], survives for its OTHER caller —
-//! [`crate::autoseed`], the node's own `DIGOP1`/`DIGVK1` OPERATOR identity, which no ratification
-//! retires.
+//! No method in this module, or anywhere in [`crate::sage`], reads a `.seed` file, decrypts one,
+//! derives a secret key, or builds a [`super::spend::WalletSigner`] from user material. The
+//! Sage-parity plane cannot sign on a user's behalf because it can no longer obtain the material.
+//!
+//! The at-rest primitive those methods used, [`crate::seed_store`], survives for TWO other callers.
+//! One is [`crate::autoseed`], the node's own `DIGOP1`/`DIGVK1` OPERATOR identity, which no
+//! ratification retires. The other is [`crate::lib`]'s self-origin wallet UI, which still seals and
+//! opens a USER seed and still signs — a rival implementation of exactly what was removed here,
+//! never covered by the #1701 freeze, and outside this carve-out because the zero-population count
+//! that justified this removal was taken over the custody manifest and not over its seed path.
+//! §908 is therefore satisfied on this plane and not yet on that one.
 //!
 //! # Back-compatibility, and why it is nearly moot
 //!
@@ -263,6 +268,43 @@ impl WalletCustody {
         self.wallets_dir().join(MANIFEST_FILE)
     }
 
+    /// Enrol a wallet on disk from PUBLIC keys alone, reproducing what a pre-#1701 install left
+    /// behind. Test fixtures only.
+    ///
+    /// Takes public keys rather than a mnemonic ON PURPOSE. The production enrolment path is gone
+    /// (dig_ecosystem#1701), and a fixture that accepted a seed would hand the test suite the exact
+    /// capability this module was stripped of — so a future change could reintroduce custody and
+    /// still be tested green.
+    ///
+    /// Writes the real `<id>.seed` file alongside the real `index.json`, because reconciliation
+    /// drops a manifest entry whose seed file is missing. The seed bytes are opaque filler; nothing
+    /// left in this crate can read them.
+    #[cfg(test)]
+    pub(crate) fn enroll_for_tests(config_dir: &Path, id: &str, public_keys: &[PublicKey]) {
+        let dir = config_dir.join(WALLETS_SUBDIR);
+        std::fs::create_dir_all(&dir).expect("create the wallets dir");
+        std::fs::write(dir.join(format!("{id}.seed")), b"opaque-at-rest-blob")
+            .expect("write the seed file");
+        let manifest = Manifest {
+            active: Some(id.to_string()),
+            wallets: vec![ManifestEntry {
+                id: id.to_string(),
+                address: None,
+                label: None,
+                created_ms: now_ms(),
+                public_keys: public_keys
+                    .iter()
+                    .map(|k| hex::encode(k.to_bytes()))
+                    .collect(),
+            }],
+        };
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).expect("serialize the manifest"),
+        )
+        .expect("write the manifest");
+    }
+
     /// The legacy single-seed path (`<config_dir>/wallet-seed.bin`).
     fn legacy_seed_path(&self) -> PathBuf {
         self.config_dir.join(LEGACY_SEED_FILE)
@@ -375,13 +417,7 @@ impl WalletCustody {
             let _ = std::fs::remove_file(&tmp);
         }
     }
-
 }
-
-
-
-
-
 
 /// Read back one hex-encoded manifest public key. An unparseable entry is dropped rather than
 /// fabricated: a hand-edited manifest must not be able to invent a key the node does not hold.
@@ -389,7 +425,6 @@ fn decode_public_key(hex_key: &str) -> Option<PublicKey> {
     let bytes: [u8; 48] = hex::decode(hex_key).ok()?.try_into().ok()?;
     PublicKey::from_bytes(&bytes).ok()
 }
-
 
 /// Milliseconds since the Unix epoch (0 if the clock is before the epoch — impossible in practice).
 ///
