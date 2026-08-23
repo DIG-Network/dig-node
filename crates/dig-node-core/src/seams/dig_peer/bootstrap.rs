@@ -25,7 +25,7 @@ use std::time::Duration;
 const BOOTSTRAP_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The environment variable overriding the compiled-in bootstrap set: a comma-separated
-/// `peer_id@host:port` list, or `off`/`disabled` for an air-gapped node.
+/// `peer_id@host:port` list, or `off`/`disabled`/EMPTY for an air-gapped node.
 const BOOTSTRAP_ENV: &str = "DIG_BOOTSTRAP_PEERS";
 
 /// A bootstrap peer this node can actually dial: a pinned identity plus the authority it answers on.
@@ -48,17 +48,38 @@ pub fn bootstrap_targets_from_env() -> Vec<BootstrapTarget> {
 
 /// Pure: resolve the bootstrap targets from an optional `DIG_BOOTSTRAP_PEERS` value.
 ///
-/// An explicit `off`/`disabled` yields NO targets. An UNSET value yields the canonical compiled-in
-/// set — see [`compiled_in_targets`] — which is the whole point of dig_ecosystem#923: a node with no
-/// configuration must still have an anchor to dial. Malformed entries and entries with no identity
-/// are dropped, so the result is exactly the set that can be dialed.
+/// An UNSET value yields the canonical compiled-in set — see [`compiled_in_targets`] — which is the
+/// whole point of dig_ecosystem#923: a node with no configuration must still have an anchor to dial.
+/// An explicit `off`/`disabled`, or an explicitly EMPTY value, yields NO targets. Malformed entries
+/// and entries with no identity are dropped, so the result is exactly the set that can be dialed.
+///
+/// # SET-BUT-EMPTY means NONE, not "unset" (dig-node#312)
+///
+/// `DIG_BOOTSTRAP_PEERS=` used to be filtered into `None` and therefore into the compiled-in anchor,
+/// so a node configured with the two documented isolation knobs (`DIG_BOOTSTRAP_PEERS=` and
+/// `DIG_RELAY_URL=off`) still dialled the public anchor. Measured on real hardware during the
+/// dig_ecosystem#3128 acceptance run.
+///
+/// That is a correctness problem for every isolated measurement and not merely an inconvenience: a
+/// test fleet that silently gains an outside peer has a pool that is not the pool the experiment
+/// thinks it is, so any metric computed over pool membership is quietly wrong rather than obviously
+/// broken. It is also a surprise for an operator who set the knob and expected a closed node.
+///
+/// **The compiled-in anchor itself is untouched.** #923 exists so a fresh node with NO configuration
+/// still finds a peer, verified from three continents, and an unset variable still resolves to it.
+/// What changes is only that an operator now has a way to say "none" that is distinguishable from
+/// having said nothing.
 pub fn resolve_bootstrap_targets(env: Option<&str>) -> Vec<BootstrapTarget> {
-    let configured = env.map(str::trim).filter(|s| !s.is_empty());
-    match configured {
-        Some(v) if is_disabled(v) => Vec::new(),
-        Some(v) => v.split(',').filter_map(parse_bootstrap_target).collect(),
-        None => compiled_in_targets(),
+    let Some(configured) = env.map(str::trim) else {
+        return compiled_in_targets();
+    };
+    if configured.is_empty() || is_disabled(configured) {
+        return Vec::new();
     }
+    configured
+        .split(',')
+        .filter_map(parse_bootstrap_target)
+        .collect()
 }
 
 /// The canonical compiled-in bootstrap set, from `dig_constants::DIG_BOOTSTRAP_PEERS`.
@@ -300,27 +321,6 @@ mod tests {
         }
     }
 
-    /// A blank value is treated as UNSET — it falls back rather than disabling.
-    ///
-    /// Blank is distinguished from `off` because an empty string is what an unset variable becomes
-    /// in most process managers: reading it as an explicit "no anchors" would make the fallback
-    /// unreachable on those hosts for a reason nobody wrote down. The control is a populated value
-    /// through the same argument position, so this cannot pass merely because both arms are empty
-    /// today.
-    #[test]
-    fn a_blank_value_falls_back_rather_than_disabling() {
-        assert_eq!(
-            resolve_bootstrap_targets(Some("   ")),
-            resolve_bootstrap_targets(None)
-        );
-        let populated = format!("{}@anchor.invalid:9444", peer_id_a());
-        assert_eq!(
-            resolve_bootstrap_targets(Some(&populated)).len(),
-            1,
-            "the same argument position must be able to yield a target"
-        );
-    }
-
     // -- malformed entries ------------------------------------------------------------------------
 
     /// A malformed entry is dropped WITHOUT taking its well-formed neighbours with it.
@@ -549,5 +549,48 @@ mod tests {
     fn bootstrap_dial_timeout_is_bounded_and_nonzero() {
         assert!(BOOTSTRAP_DIAL_TIMEOUT > Duration::ZERO);
         assert!(BOOTSTRAP_DIAL_TIMEOUT <= Duration::from_secs(60));
+    }
+
+    /// **Proves:** an explicitly EMPTY `DIG_BOOTSTRAP_PEERS` means NONE, while an UNSET one still
+    /// resolves to the compiled-in anchor.
+    ///
+    /// **Catches:** dig-node#312 — `.filter(|s| !s.is_empty())` collapsing set-but-empty into unset,
+    /// so a node configured for isolation dialled the public anchor anyway. Measured on real
+    /// hardware: node C reached `44.217.228.224:9444` with both documented isolation knobs set.
+    ///
+    /// **This test replaces `a_blank_value_falls_back_rather_than_disabling`, which pinned the
+    /// opposite,** and it is intended that it changed. That test's rationale was that "an empty
+    /// string is what an unset variable becomes in most process managers" — but not in this one:
+    /// `std::env::var` answers `Err(NotPresent)` for a variable that was never set, and
+    /// `bootstrap_targets_from_env` turns that into `None`. An empty string reaches here only when
+    /// an operator wrote `DIG_BOOTSTRAP_PEERS=` on purpose.
+    ///
+    /// **Fixture design — the unset arm is the load-bearing half.** Asserting only that an empty
+    /// value yields nothing is satisfied by deleting the compiled-in set entirely, which would
+    /// silently revoke dig_ecosystem#923 and strand every fresh install with zero peers. The two
+    /// arms differ in exactly one thing: whether the variable is present.
+    #[test]
+    fn an_explicitly_empty_value_means_none_while_unset_still_anchors() {
+        assert!(
+            resolve_bootstrap_targets(Some("")).is_empty(),
+            "an operator who set the knob to nothing asked for no anchors; reading that as \
+             'unconfigured' makes every isolated measurement unfalsifiable"
+        );
+        assert!(
+            resolve_bootstrap_targets(Some("   ")).is_empty(),
+            "whitespace is how an empty value survives a shell, an .env file and a systemd unit"
+        );
+        assert!(
+            !resolve_bootstrap_targets(None).is_empty(),
+            "CONTROL: an UNSET variable must still yield the compiled-in anchor - #923 exists so a \
+             fresh node with no configuration is never stranded with zero peers"
+        );
+        let populated = format!("{}@anchor.invalid:9444", peer_id_a());
+        assert_eq!(
+            resolve_bootstrap_targets(Some(&populated)).len(),
+            1,
+            "CONTROL: the same argument position must still be able to yield a target, so neither \
+             arm above passes merely because everything resolves to nothing"
+        );
     }
 }

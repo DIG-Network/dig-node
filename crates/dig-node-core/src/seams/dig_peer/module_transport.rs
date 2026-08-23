@@ -63,6 +63,9 @@ pub struct NatModuleTransport {
     connected: ConnectedPool,
     /// Discovery fallback for a holder that is not currently connected.
     locator: Arc<dyn ProviderLocator>,
+    /// Which `(capsule, peer)` pairs have already had a plain descriptor round, so the relay opt-in
+    /// is an escalation rather than a default. See [`RelayEscalation`].
+    escalation: RelayEscalation,
 }
 
 impl NatModuleTransport {
@@ -82,6 +85,7 @@ impl NatModuleTransport {
             runtime,
             connected,
             locator,
+            escalation: RelayEscalation::default(),
         }
     }
 
@@ -225,6 +229,70 @@ impl NatModuleTransport {
     }
 }
 
+/// Remembers which `(capsule, peer)` pairs have already been asked PLAINLY, so the relay opt-in is a
+/// second-pass escalation rather than a property of every request.
+///
+/// # Why the flag cannot be unconditional
+///
+/// `ask_with_proxy` used to set `proxy: true` on every module request. That was inert only because
+/// the module pull's provider set was holders-only: every peer it asked had announced the capsule, so
+/// asking one to relay was asking a holder to serve. Once the warm locator unions the CONNECTED POOL
+/// (`NodeContent::warm_provider_locator`), the provider set becomes every connected peer — and an
+/// unconditional flag would turn the very first descriptor probe to each of them into a request to
+/// **fetch a whole capsule on this node's behalf**, before establishing that no reachable holder
+/// exists. On the module path the descriptor probe IS the relay trigger, so the widening that makes
+/// a holder reachable would also make every neighbour a courier.
+///
+/// # What it does NOT change
+///
+/// This decides WHEN gate (1) of [`module_relay::relay_capsule`](super::module_relay::relay_capsule)
+/// is satisfied — never WHETHER it is checked. All three gates (the requestor asked, the operator
+/// opted in, the requestor is inside its proxy-class allowance) run exactly as before on the far end.
+///
+/// # The bound
+///
+/// Entries are this node's own `(capsule, peer)` choices, so growth tracks this node's own pull
+/// activity rather than anything a peer controls. It is still capped: at [`Self::MAX_ENTRIES`] the
+/// oldest entry is evicted, which at worst re-sends one plain round for a capsule this node stopped
+/// working on long ago.
+#[derive(Default)]
+struct RelayEscalation {
+    /// Insertion-ordered keys, so eviction is FIFO and does not need a timestamp per entry.
+    order: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// The same keys as a set, for the O(1) membership test the hot path makes.
+    seen: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl RelayEscalation {
+    /// The ledger ceiling. Sized to cover the capsules and peers one node works with concurrently
+    /// with room to spare; a node past it is pulling from more distinct pairs than any single warm
+    /// generation involves.
+    const MAX_ENTRIES: usize = 1024;
+
+    /// Whether this node may ask `peer` to RELAY `(store_id, root)` — true once a PLAIN round for
+    /// that exact pair has already been sent and did not produce a holder.
+    ///
+    /// Records the pair as asked, so the answer is `false` the first time and `true` afterwards. It
+    /// is deliberately not conditioned on the plain round's OUTCOME: a plain ask that succeeded ends
+    /// the pull, so this is only ever consulted again after one that did not.
+    fn escalate_for(&self, store_id: &str, root: &str, peer_hex: &str) -> bool {
+        let key = format!("{store_id}:{root}:{peer_hex}");
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.contains(&key) {
+            return true;
+        }
+        let mut order = self.order.lock().unwrap_or_else(|p| p.into_inner());
+        if order.len() >= Self::MAX_ENTRIES {
+            if let Some(oldest) = order.pop_front() {
+                seen.remove(&oldest);
+            }
+        }
+        order.push_back(key.clone());
+        seen.insert(key);
+        false
+    }
+}
+
 /// The largest framed JSON body accepted for a module DESCRIPTOR answer.
 ///
 /// The generic peer-request reader ([`crate::peer::read_framed`]) caps at 64 KiB, which is right for
@@ -233,8 +301,8 @@ impl NatModuleTransport {
 /// a hard bound — a peer cannot make this node buffer an arbitrary body by declaring one.
 const MAX_DESCRIPTOR_FRAME: usize = 8 * 1024 * 1024;
 
-/// Ask `stream` a whole-`.dig` question as a framed JSON-RPC request carrying the RELAY opt-in
-/// (dig-node#276).
+/// Ask `stream` a whole-`.dig` question as a framed JSON-RPC request, declaring whether this node is
+/// asking the far end to RELAY the capsule on its behalf (dig-node#276).
 ///
 /// # Why this node frames the request itself instead of calling dig-peer's typed method
 ///
@@ -247,18 +315,13 @@ const MAX_DESCRIPTOR_FRAME: usize = 8 * 1024 * 1024;
 ///
 /// The flag is ADDITIVE: a peer that does not implement the relay ignores an unknown params key and
 /// answers precisely as it does today, so this is safe to send to every holder unconditionally.
-async fn ask_with_relay(
+async fn ask_with_proxy(
     stream: &mut dig_nat::PeerStream,
     method: dig_rpc_protocol::Method,
     mut params: serde_json::Value,
+    proxy: bool,
 ) -> std::io::Result<()> {
-    if let Some(object) = params.as_object_mut() {
-        // A whole-`.dig` download defaults to ONION mode per the recursive-download epic: if the
-        // holder we reached does not hold it, we would rather it fetched the capsule for us than tell
-        // us "not found" while sitting one hop from someone who has it. Individual RESOURCE requests
-        // are unaffected and still default to DIRECT (NC-4).
-        object.insert("proxy".to_string(), serde_json::Value::Bool(true));
-    }
+    declare_proxy(&mut params, proxy);
     crate::peer::write_framed(
         stream,
         &serde_json::json!({
@@ -269,6 +332,22 @@ async fn ask_with_relay(
         }),
     )
     .await
+}
+
+/// Write the relay opt-in into a module request's params.
+///
+/// A whole-`.dig` download escalates to ONION mode on a SECOND pass: if no reachable peer holds the
+/// capsule, we would rather a hop fetched it for us than be told "not found" by a peer sitting one
+/// hop from someone who has it. The FIRST pass is plain — see [`RelayEscalation`]. Individual
+/// RESOURCE requests are unaffected and still default to DIRECT (NC-4).
+///
+/// The flag is ALWAYS written, including `false`: absent means "unspecified" to a reader that has
+/// its own default, and this node has a specific instruction to give on every request. Extracted so
+/// the wire spelling of the key is pinned by a test rather than only by a live peer.
+fn declare_proxy(params: &mut serde_json::Value, proxy: bool) {
+    if let Some(object) = params.as_object_mut() {
+        object.insert("proxy".to_string(), serde_json::Value::Bool(proxy));
+    }
 }
 
 /// Read one framed JSON-RPC response body from `stream`, bounded by [`MAX_DESCRIPTOR_FRAME`].
@@ -292,32 +371,46 @@ async fn read_response_frame(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// One `dig.getModuleInfo` over `peer`, carrying the relay opt-in, decoded into a [`ModuleInfo`].
+/// One `dig.getModuleInfo` over `peer`, decoded into a [`ModuleInfo`]. `proxy` declares whether this
+/// ask permits the far end to fetch the capsule on this node's behalf.
 ///
 /// `None` for every failure — a refused stream, an unwritable request, an unreadable frame, an error
 /// envelope, or a body that is not a descriptor. The caller turns that into one transport error whose
 /// text is this node's own, so a peer can never author what this node logs (#1603).
-async fn descriptor_over(peer: &mut DigPeer, store_id: &str, root: &str) -> Option<ModuleInfo> {
+async fn descriptor_over(
+    peer: &mut DigPeer,
+    store_id: &str,
+    root: &str,
+    proxy: bool,
+) -> Option<ModuleInfo> {
     let params = serde_json::to_value(GetModuleInfoParams {
         store_id: store_id.to_string(),
         root: root.to_string(),
     })
     .ok()?;
     let mut stream = peer.open_stream().await.ok()?;
-    ask_with_relay(&mut stream, dig_rpc_protocol::Method::GetModuleInfo, params)
-        .await
-        .ok()?;
+    ask_with_proxy(
+        &mut stream,
+        dig_rpc_protocol::Method::GetModuleInfo,
+        params,
+        proxy,
+    )
+    .await
+    .ok()?;
     let response = read_response_frame(&mut stream).await.ok()?;
     serde_json::from_value(response.get("result")?.clone()).ok()
 }
 
-/// Open a `dig.fetchModuleRange` frame stream over `peer`, carrying the relay opt-in.
+/// Open a `dig.fetchModuleRange` frame stream over `peer`, at the phase its descriptor was answered
+/// at: a window relayed by a hop must carry the same opt-in the descriptor that named it did, or the
+/// hop refuses at gate (1) and the pull stalls one frame after it was admitted.
 async fn window_stream_over(
     peer: &mut DigPeer,
     store_id: &str,
     root: &str,
     offset: u64,
     length: u64,
+    proxy: bool,
 ) -> Option<dig_nat::PeerStream> {
     let params = serde_json::to_value(FetchModuleRangeParams {
         store_id: store_id.to_string(),
@@ -327,10 +420,11 @@ async fn window_stream_over(
     })
     .ok()?;
     let mut stream = peer.open_stream().await.ok()?;
-    ask_with_relay(
+    ask_with_proxy(
         &mut stream,
         dig_rpc_protocol::Method::FetchModuleRange,
         params,
+        proxy,
     )
     .await
     .ok()?;
@@ -346,7 +440,10 @@ impl ModuleTransport for NatModuleTransport {
         root: &str,
     ) -> Result<ModuleInfo, DownloadError> {
         let mut peer = self.connect(provider_peer_id, store_id, root).await?;
-        let result = descriptor_over(&mut peer, store_id, root).await;
+        let proxy = self
+            .escalation
+            .escalate_for(store_id, root, provider_peer_id);
+        let result = descriptor_over(&mut peer, store_id, root, proxy).await;
         peer.disconnect().await;
         // The reason names the STEP and the sentinelled peer; the peer's own answer text is never
         // embedded (#1603) — the crate sanitizes at its Display layer and upstream must not defeat it.
@@ -362,7 +459,13 @@ impl ModuleTransport for NatModuleTransport {
         length: u64,
     ) -> Result<Vec<u8>, DownloadError> {
         let mut peer = self.connect(provider_peer_id, store_id, root).await?;
-        let bytes = match window_stream_over(&mut peer, store_id, root, offset, length).await {
+        // A window rides at the phase its descriptor was answered at: `escalate_for` returns `true`
+        // for a pair already asked, which is exactly the pair whose descriptor was relayed.
+        let proxy = self
+            .escalation
+            .escalate_for(store_id, root, provider_peer_id);
+        let bytes = match window_stream_over(&mut peer, store_id, root, offset, length, proxy).await
+        {
             Some(mut stream) => read_module_window(&mut stream, provider_peer_id, length).await,
             None => Err(DownloadError::transport(
                 provider_peer_id,
@@ -610,6 +713,97 @@ mod tests {
         assert!(
             targets.iter().any(|(a, _)| a == "10.0.0.9:9444"),
             "the pool address survived a locator failure"
+        );
+    }
+
+    /// **Proves:** the FIRST module request to a `(capsule, peer)` pair is plain, and only a SECOND
+    /// pass over the same pair escalates to the relay opt-in.
+    ///
+    /// **Catches:** the shipped `proxy: true` on every request. That was inert while the module
+    /// pull's provider set was holders-only, and stops being inert the moment the warm locator
+    /// unions the connected pool: A's first descriptor probe to every connected peer would become a
+    /// request to fetch a whole capsule on A's behalf, before A had established that no reachable
+    /// holder exists.
+    ///
+    /// **Fixture design — three actors, because the nearest wrong implementations differ only in
+    /// what they key on.** A single ask/re-ask pair is satisfied by a ledger keyed on the peer alone
+    /// (which would relay a DIFFERENT capsule to a peer already asked about another) and equally by
+    /// one keyed on the capsule alone (which would relay to a peer never asked at all). Both are
+    /// plausible, both widen exactly what this bounds, and only a second capsule and a second peer
+    /// can see either.
+    #[test]
+    fn the_relay_opt_in_is_a_second_pass_escalation_per_capsule_and_peer() {
+        let escalation = RelayEscalation::default();
+        let (store, root, peer) = (store(), root(), peer_hex(1));
+
+        assert!(
+            !escalation.escalate_for(&store, &root, &peer),
+            "the FIRST descriptor round must be plain: nothing yet establishes that no reachable \
+             holder exists, so asking this peer to relay recruits a courier before looking"
+        );
+        assert!(
+            escalation.escalate_for(&store, &root, &peer),
+            "a SECOND pass over a pair a plain round did not answer is exactly when the relay is \
+             worth asking for - without this the escalation never happens and the leg is dead"
+        );
+
+        assert!(
+            !escalation.escalate_for(&store, &id_of(0xcc), &peer),
+            "CONTROL: a DIFFERENT capsule to the same peer is a new question, so it starts plain. \
+             A ledger keyed on the peer alone would relay it."
+        );
+        assert!(
+            !escalation.escalate_for(&store, &root, &peer_hex(2)),
+            "CONTROL: the same capsule to a peer never asked is a new question too. A ledger keyed \
+             on the capsule alone would relay it - to a peer that may well be the holder."
+        );
+    }
+
+    /// **Proves:** the decision reaches the WIRE under the key the far end reads, in both states.
+    ///
+    /// **Catches:** an escalation that is computed correctly and then dropped, or written as a
+    /// present-vs-absent key. `relay_capsule`'s gate (1) reads `proxy` as a boolean; omitting it on
+    /// the plain pass would leave the far end applying its own default rather than this node's
+    /// instruction, and pinning only the `true` case cannot tell the two apart.
+    #[test]
+    fn the_escalation_reaches_the_wire_in_both_states() {
+        let mut plain = serde_json::json!({ "store_id": store(), "root": root() });
+        declare_proxy(&mut plain, false);
+        assert_eq!(plain["proxy"], serde_json::json!(false));
+
+        let mut relayed = serde_json::json!({ "store_id": store(), "root": root() });
+        declare_proxy(&mut relayed, true);
+        assert_eq!(relayed["proxy"], serde_json::json!(true));
+    }
+
+    /// **Proves:** the ledger stays bounded, and eviction costs one extra plain round rather than
+    /// silently disabling the escalation for everything after it.
+    ///
+    /// **Fixture design:** the bound is taken from `RelayEscalation::MAX_ENTRIES` rather than
+    /// restated, so the test moves with the constant instead of pinning a copy. The pair inserted
+    /// FIRST is the one evicted, and the pair inserted LAST must still escalate — an implementation
+    /// that cleared the whole ledger on overflow would pass a check of the evicted pair alone.
+    #[test]
+    fn the_ledger_evicts_oldest_first_and_keeps_the_rest() {
+        let escalation = RelayEscalation::default();
+        let (store, root) = (store(), root());
+        let oldest = peer_hex(0);
+        assert!(!escalation.escalate_for(&store, &root, &oldest));
+        for n in 1..=RelayEscalation::MAX_ENTRIES {
+            let peer = format!("{n:064x}");
+            assert!(!escalation.escalate_for(&store, &root, &peer));
+        }
+
+        assert!(
+            !escalation.escalate_for(&store, &root, &oldest),
+            "the oldest pair was evicted, so it starts plain again - one wasted plain round for a \
+             capsule this node stopped working on, never an unbounded map"
+        );
+        let newest = format!("{:064x}", RelayEscalation::MAX_ENTRIES);
+        assert!(
+            escalation.escalate_for(&store, &root, &newest),
+            "everything the eviction did NOT reach must still escalate; clearing the whole ledger \
+             on overflow would disable the second pass for every live pull at once"
         );
     }
 }

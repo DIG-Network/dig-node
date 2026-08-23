@@ -229,8 +229,13 @@ Parsed as `u16`; unparsable/unset ⇒ the default **`9444`** (`peer::DEFAULT_P2P
 Bound dual-stack IPv6-first with an IPv4 fallback, per §5.2.
 
 **`DIG_BOOTSTRAP_PEERS`** — the always-on peer anchors dialled at startup, as a comma-separated
-`peer_id@host:port` list; `off`/`disabled` (case-insensitive) opts out entirely, and blank/unset falls
-back to the canonical compiled-in set.
+`peer_id@host:port` list. `off`/`disabled` (case-insensitive) and an explicitly EMPTY value each opt
+out entirely; an UNSET variable falls back to the canonical compiled-in set.
+
+Set-but-empty MUST mean "no anchors", distinguishably from unset. A node configured for isolation
+(`DIG_BOOTSTRAP_PEERS=` with `DIG_RELAY_URL=off`) MUST NOT dial the compiled-in anchor: an isolated
+node that silently gains an outside peer has a peer pool that is not the one its operator configured,
+so every metric computed over pool membership is quietly wrong rather than obviously broken.
 
 The canonical set is `dig_constants::DIG_BOOTSTRAP_PEERS` and MUST NOT be re-declared here. It names
 the PEER interface host `node-rpc.dig.net:9444` — NOT `rpc.dig.net`, which is a CloudFront
