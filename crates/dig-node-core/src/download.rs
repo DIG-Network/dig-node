@@ -4994,7 +4994,11 @@ pub(crate) mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names.len(), 2, "two distinct keys must write two checkpoints");
+        assert_eq!(
+            names.len(),
+            2,
+            "two distinct keys must write two checkpoints"
+        );
         for name in &names {
             assert!(
                 name.len() <= 255,
