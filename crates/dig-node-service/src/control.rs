@@ -179,6 +179,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.hostedStores.pin",
     "control.hostedStores.unpin",
     "control.hostedStores.status",
+    "control.capsule.fetch",
     "control.sync.status",
     "control.sync.trigger",
     "control.wallet.balance",
@@ -234,6 +235,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.hostedStores.pin",
     "control.hostedStores.unpin",
     "control.hostedStores.status",
+    "control.capsule.fetch",
     "control.sync.status",
     "control.sync.trigger",
     "control.wallet.balance",
@@ -871,6 +873,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.hostedStores.pin" => hosted_pin(ctx, id, params).await,
         "control.hostedStores.unpin" => hosted_unpin(ctx, id, params).await,
         "control.hostedStores.status" => hosted_status(ctx, id, params).await,
+        "control.capsule.fetch" => capsule_fetch(ctx, id, params),
         "control.sync.status" => control_ok(id, sync_status(ctx).await),
         "control.sync.trigger" => sync_trigger(ctx, id, params).await,
         "control.wallet.balance" => wallet_balance(ctx, id, params).await,
@@ -1293,6 +1296,68 @@ async fn sync_status(ctx: &ControlCtx) -> Value {
 /// No identity gate: the chunked `dig.getCapsule` download the sync now leads with is anonymous,
 /// so a node holding no §21 identity key syncs perfectly well. Rejecting the request here would
 /// refuse work the node can actually do.
+/// `control.capsule.fetch` — start a P2P whole-capsule pull, and ACK.
+///
+/// # This is an acknowledgement, not a completion report
+///
+/// A whole-`.dig` pull crosses the network and takes arbitrarily long, so blocking the control call
+/// on it would hold a loopback request open for the length of a multi-hundred-megabyte transfer.
+/// `"started"` therefore means STARTED — the pull is running — and never "the capsule is here".
+/// Completion is observed through the cache, which is where every other reader of a landed capsule
+/// looks; `control.hostedStores.status` reports it.
+///
+/// The three outcomes are exactly the interface's:
+///
+/// * `"already_cached"` — the capsule is on disk; no pull was needed and none was started.
+/// * `"started"` — a background pull is running.
+/// * `"unavailable"` — nothing could be started, because this build has no capsule warmer (the
+///   FFI/base path has no P2P engine). Reported rather than errored because it is a true statement
+///   about the capsule's reachability from this node, and the caller can act on it.
+///
+/// # Authorization
+///
+/// None is added here. This is a loopback control-plane method and the control plane already
+/// authorizes every call (`ControlMethod::requires_master_token`, checked before dispatch); a second
+/// story in one handler would be a second thing to keep in agreement with the first.
+fn capsule_fetch(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    let (store, root) = match capsule_fetch_target(params) {
+        Ok(target) => target,
+        Err(message) => return control_error(id, ErrorCode::InvalidParams, message),
+    };
+
+    // Checked BEFORE starting anything: a pull for a capsule already on disk would claim a warm slot
+    // and report "started" for work that will immediately no-op.
+    let status = if ctx.node.holds_capsule(&store, &root) {
+        "already_cached"
+    } else if ctx.node.start_capsule_fetch(&store, &root) {
+        "started"
+    } else {
+        "unavailable"
+    };
+    control_ok(
+        id,
+        json!({ "store": store, "root": root, "status": status }),
+    )
+}
+
+/// The `(store, root)` a `control.capsule.fetch` names, lowercased, or the refusal to answer with.
+///
+/// Pure, and separate from the handler, because the param contract is the half worth pinning by
+/// test: the handler's other half needs a live [`Node`] and answers a filesystem question already
+/// covered where that node lives.
+///
+/// Both ids are REQUIRED and both must be canonical 64-hex. Unlike `control.sync.trigger` there is
+/// no root-less form: a capsule pull names one concrete generation, and a rootless fetch would have
+/// to pick one — which is the chain's decision, made by `control.sync.trigger`, not this verb's.
+fn capsule_fetch_target(params: &Value) -> Result<(String, String), &'static str> {
+    let store = params.get("store").and_then(Value::as_str).unwrap_or("");
+    let root = params.get("root").and_then(Value::as_str).unwrap_or("");
+    if !is_hex64(store) || !is_hex64(root) {
+        return Err("control.capsule.fetch requires store and root, each 64-hex");
+    }
+    Ok((store.to_lowercase(), root.to_lowercase()))
+}
+
 async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     // Accept `store` = "storeId[:rootHash]", or explicit store_id [+ root].
     let (store_id, root) = if let Some(s) = params.get("store").and_then(|v| v.as_str()) {
@@ -2811,6 +2876,63 @@ async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// **Proves:** `control.capsule.fetch` is dispatched, requires a token, and names its params
+    /// as the published contract does.
+    ///
+    /// **Catches:** a method served under a name the contract does not declare (invisible to every
+    /// client), or one accidentally admitted to the open-read set — a capsule pull is egress this
+    /// node pays for, so any local process being able to trigger it unauthenticated would be a
+    /// widening, not a convenience.
+    #[test]
+    fn the_capsule_fetch_verb_is_served_and_is_not_an_open_read() {
+        assert!(
+            CONTROL_METHODS.contains(&"control.capsule.fetch"),
+            "a handler nothing routes to is dead code; the contract-conformance test pairs with \
+             this one from the other direction"
+        );
+        assert!(
+            !is_open_control_read("control.capsule.fetch"),
+            "a capsule pull spends this node\'s bandwidth on a stranger\'s choice of content, so \
+             it is authorized like every other write on this plane"
+        );
+    }
+
+    /// **Proves:** the verb refuses anything that is not two canonical 64-hex ids, and says which
+    /// fields it wanted.
+    ///
+    /// **Fixture design — four rejections and one acceptance.** Each rejection varies exactly one
+    /// field from a well-formed pair, so a validator that checked only `store`, only `root`, or
+    /// only presence-not-shape is caught by a different arm. The accepted pair is the control:
+    /// without it, a validator that rejected everything would pass all four.
+    #[test]
+    fn a_capsule_fetch_takes_exactly_two_canonical_ids() {
+        let good = "a1".repeat(32);
+        let bad = "not-hex";
+
+        for (store, root, why) in [
+            (bad, good.as_str(), "a malformed store"),
+            (good.as_str(), bad, "a malformed root"),
+            ("", good.as_str(), "a missing store"),
+            (good.as_str(), "", "a missing root"),
+        ] {
+            let params = json!({ "store": store, "root": root });
+            assert!(
+                capsule_fetch_target(&params).is_err(),
+                "{why} must be refused: a pull keyed on a non-canonical id names no generation the \
+                 chain could anchor"
+            );
+        }
+
+        assert_eq!(
+            capsule_fetch_target(&json!({ "store": good.to_uppercase(), "root": good })),
+            Ok((good.clone(), good.clone())),
+            "CONTROL: a well-formed pair must be ACCEPTED through the same argument positions - \
+             without this the four refusals prove only that everything is refused - and it is \
+             LOWERCASED, because the cache path is built from these ids and a case difference \
+             would make one capsule two files"
+        );
+    }
 
     /// **The CALLER-ADDRESSED reads are token-less; the arrival cursor and the PUSH are not.**
     ///

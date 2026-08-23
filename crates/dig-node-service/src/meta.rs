@@ -437,6 +437,13 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: true,
         },
         MethodInfo {
+            name: "control.capsule.fetch",
+            served: "control",
+            summary: "Start a P2P whole-capsule pull for store+root, or report it already \
+                      cached. Acknowledges the start; it does not wait for the transfer.",
+            requires_auth: true,
+        },
+        MethodInfo {
             name: "control.sync.status",
             served: "control",
             summary: "§21 sync status: whether authenticated whole-store sync is \
@@ -1210,6 +1217,7 @@ mod tests {
             "control.hostedStores.pin",
             "control.hostedStores.unpin",
             "control.hostedStores.status",
+            "control.capsule.fetch",
             "control.sync.status",
             "control.sync.trigger",
             // DIG auto-update beacon proxy (#515).

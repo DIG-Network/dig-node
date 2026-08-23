@@ -52,6 +52,8 @@ pub enum ControlAction {
     StoresUnpin { store: String },
     /// `control.hostedStores.status` — one store's pin/cache status.
     StoresStatus { store: String },
+    /// `control.capsule.fetch` — start a P2P whole-capsule pull for `store` + `root`.
+    CapsuleFetch { store: String, root: String },
     /// `control.sync.status` — §21 whole-store sync availability + pinned coverage.
     SyncStatus,
     /// `control.sync.trigger` — trigger a §21 sync for one capsule (`storeId:rootHash`).
@@ -150,6 +152,7 @@ impl ControlAction {
             ControlAction::StoresPin { .. } => "control.hostedStores.pin",
             ControlAction::StoresUnpin { .. } => "control.hostedStores.unpin",
             ControlAction::StoresStatus { .. } => "control.hostedStores.status",
+            ControlAction::CapsuleFetch { .. } => "control.capsule.fetch",
             ControlAction::SyncStatus => "control.sync.status",
             ControlAction::SyncTrigger { .. } => "control.sync.trigger",
             ControlAction::WalletBalance { .. } => "control.wallet.balance",
@@ -211,6 +214,11 @@ impl ControlAction {
             | ControlAction::StoresUnpin { store }
             | ControlAction::StoresStatus { store }
             | ControlAction::SyncTrigger { store } => json!({ "store": store }),
+            // The contract names these `store` and `root` SEPARATELY rather than as one
+            // `storeId:rootHash` reference, because a capsule fetch always needs a concrete
+            // generation; folding it into the `store` arm above would send one joined field the
+            // node refuses as a missing `root`.
+            ControlAction::CapsuleFetch { store, root } => json!({ "store": store, "root": root }),
             ControlAction::WalletBalance { address, asset }
             | ControlAction::WalletCoins { address, asset } => {
                 json!({ "address": address, "asset": asset_to_wire(asset) })
@@ -304,6 +312,11 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         .method(),
         ControlAction::StoresStatus {
             store: String::new(),
+        }
+        .method(),
+        ControlAction::CapsuleFetch {
+            store: String::new(),
+            root: String::new(),
         }
         .method(),
         ControlAction::SyncStatus.method(),
@@ -464,6 +477,21 @@ fn summarize(method: &str, result: &Value) -> String {
             pinned(&result["pinned"]),
             result["capsule_count"].as_u64().unwrap_or(0),
             result["total_bytes"].as_u64().unwrap_or(0),
+        ),
+        // The node ACKNOWLEDGES a start; it does not wait for the transfer. The summary says which
+        // of the three outcomes happened and never implies the capsule has landed — a line reading
+        // "fetched" for a pull still crossing the network would be the surface lying about what the
+        // node did.
+        "control.capsule.fetch" => format!(
+            "capsule {}:{} — {}",
+            result["store"].as_str().unwrap_or("?"),
+            result["root"].as_str().unwrap_or("?"),
+            match result["status"].as_str().unwrap_or("?") {
+                "started" => "pull started (runs in the background)",
+                "already_cached" => "already cached; no pull needed",
+                "unavailable" => "no pull possible: this node has no P2P capsule warmer",
+                other => other,
+            },
         ),
         "control.hostedStores.pin" => {
             format!("pinned {}", result["store_id"].as_str().unwrap_or("?"),)

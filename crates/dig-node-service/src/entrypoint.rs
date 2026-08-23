@@ -137,6 +137,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<StoresCommand>,
     },
+    /// Fetch a whole capsule over P2P (the `control.capsule.*` surface).
+    Capsule {
+        #[command(subcommand)]
+        action: CapsuleCommand,
+    },
     /// View §21 whole-store sync status or trigger a capsule sync (the `control.sync.*` surface).
     Sync {
         #[command(subcommand)]
@@ -234,6 +239,19 @@ enum StoresCommand {
     Status {
         /// The store reference (`storeId[:rootHash]`).
         store: String,
+    },
+}
+
+/// `dig-node capsule` sub-actions.
+#[derive(Subcommand)]
+enum CapsuleCommand {
+    /// Start a P2P whole-capsule pull. Returns as soon as the pull is STARTED; the transfer runs in
+    /// the background and its completion shows up in `dig-node stores status`.
+    Fetch {
+        /// The store id (64-hex).
+        store: String,
+        /// The capsule root (64-hex).
+        root: String,
     },
 }
 
@@ -521,6 +539,7 @@ impl Command {
             Command::Config { .. } => "config",
             Command::Cache { .. } => "cache",
             Command::Stores { .. } => "stores",
+            Command::Capsule { .. } => "capsule",
             Command::Sync { .. } => "sync",
             Command::Profile { .. } => "profile",
             Command::Wallet { .. } => "wallet",
@@ -629,6 +648,9 @@ pub fn run() -> std::process::ExitCode {
         Command::Stores { action: cmd } => {
             render(control_cli::run(&config, stores_action(cmd)), action, json)
         }
+        Command::Capsule { action: cmd } => {
+            render(control_cli::run(&config, capsule_action(cmd)), action, json)
+        }
         Command::Sync { action: cmd } => {
             render(control_cli::run(&config, sync_action(cmd)), action, json)
         }
@@ -684,6 +706,13 @@ fn stores_action(cmd: Option<StoresCommand>) -> ControlAction {
         Some(StoresCommand::Pin { store }) => ControlAction::StoresPin { store },
         Some(StoresCommand::Unpin { store }) => ControlAction::StoresUnpin { store },
         Some(StoresCommand::Status { store }) => ControlAction::StoresStatus { store },
+    }
+}
+
+/// Map the `capsule` subcommand to its [`ControlAction`].
+fn capsule_action(cmd: CapsuleCommand) -> ControlAction {
+    match cmd {
+        CapsuleCommand::Fetch { store, root } => ControlAction::CapsuleFetch { store, root },
     }
 }
 
