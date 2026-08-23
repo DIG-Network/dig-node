@@ -78,13 +78,13 @@ pub mod peers;
 /// upstream, and the bring-up probe that proves an upstream is not this node itself. See [`relay`].
 pub mod relay;
 pub mod rpc;
-/// Shared OS-owner trust gate ([`security::dir_is_privileged`]): is a directory owned by a
-/// privileged principal (SYSTEM/Administrators or root) and not user-writable? Used by the self-heal
-/// spawn root (#565) and the TLS material root (#661) so the one Win32/unix owner check lives once.
 /// The offline `wallet export-seed` rescue command: a local read of this node's
 /// encrypted seed file. Adds no network surface, and is removed with node-side custody.
 pub mod seed_export_cli;
 
+/// Shared OS-owner trust gate ([`security::dir_is_privileged`]): is a directory owned by a
+/// privileged principal (SYSTEM/Administrators or root) and not user-writable? Used by the self-heal
+/// spawn root (#565) and the TLS material root (#661) so the one Win32/unix owner check lives once.
 pub mod security;
 /// The always-on self-heal driver (#584 beacon re-arm + #651 ext-forcelist reconcile): a privileged
 /// service periodically re-arms a drifted auto-update schedule + re-applies the extension
