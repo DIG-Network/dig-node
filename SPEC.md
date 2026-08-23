@@ -854,7 +854,7 @@ allowlist (`chrome-extension://*` + allowed local `http://`); a disallowed brows
 
 - **`request`** — `{ "type":"request", "id": <string|number>, "method": <string>, "params": <object>,
   "token": <string?> }`. `id` correlates the response. `method` is any served wallet method (Sage
-  snake_case + the `wallet.*` custody lifecycle, §18.20) or a `control.*`/`pairing.*` method. `params` is
+  snake_case) or a `control.*`/`pairing.*` method. `params` is
   the method's request object (the Sage body for a wallet method). `token` is the paired/control token
   (§7.11/§7.12), required for gated ops (below).
 
@@ -878,9 +878,10 @@ Node→client frames:
 its lifetime — the client gets one socket, no explicit subscribe call. A transport ping every ~5s with a
 pong-timeout closes a half-open socket (as §4.5).
 
-**Authorization (§7.12).** Over `/ws`, wallet READS are open to the local client; every wallet MUTATION,
-every `wallet.*` custody method, and every `control.*` method REQUIRES the frame's `token` to be the
-master control token OR a valid paired token (pairing-admin `control.*` needs the master token). An
+**Authorization (§7.12).** Over `/ws`, wallet READS are open to the local client; every wallet MUTATION
+and every `control.*` method REQUIRES the frame's `token` to be the master control token OR a valid
+paired token (pairing-admin `control.*` needs the master token). A retired `wallet.*`/`auth.*` name is
+refused outright, with or without a token. An
 unauthorized request gets an `ok:false` response with an `unauthorized` error — the op never runs and is
 never relayed upstream. `pairing.request`/`pairing.poll` are open (the bootstrap, §7.11).
 
@@ -2190,25 +2191,26 @@ this store (except for the pairing-administration methods).
 
 The pairing framework (§7.11) authorizes `control.*` mutations. The thin-client model (epic #365)
 extends the SAME paired-token gate to the **wallet method surface**: over the authorized loopback
-surface, every wallet MUTATION and every custody-lifecycle method (§18.20) requires the master control
-token OR a valid paired token; an unauthorized caller (no token, a wrong token, or a revoked token) is
-rejected with `-32030 UNAUTHORIZED` before the method runs.
+surface, every wallet MUTATION requires the master control token OR a valid paired token; an
+unauthorized caller (no token, a wrong token, or a revoked token) is rejected with `-32030
+UNAUTHORIZED` before the method runs.
 
-**Gated wallet methods (MUST present a token).** The custody-lifecycle group (§18.20 —
-`wallet.create` / `wallet.import` / `wallet.restore` / `wallet.unlock` / `wallet.lock` /
-`wallet.status` / `wallet.list` / `wallet.select` / `wallet.delete`), the node-managed unlock-auth group
-(§18.24 — EVERY `auth.*` method: `auth.status` / `auth.get_method` / `auth.set_method` / `auth.set_mode` /
-`auth.enroll_totp` / `auth.enroll_passkey_begin` / `auth.enroll_passkey_finish` / `auth.unlock` /
-`auth.sign_unlock` / `auth.lock`), and the mutation group (the send/spend group §18.9, the offer suite
-+ DID/NFT mint & transfer §18.9a, and the state-changing record-update actions §18.16) are all gated.
-These methods are NEVER relayed upstream — a signing/custody request must never leave the loopback node;
-an authorized call is served locally by the node-custodied wallet (or, until the wallet surface is served
-on a given transport, returns a catalogued error — it is never proxied to the public gateway).
+**Gated wallet methods (MUST present a token).** The mutation group — the send/spend group (§18.9), the
+offer suite + DID/NFT mint & transfer (§18.9a), and the state-changing record-update actions (§18.16).
+These methods are NEVER relayed upstream — a signing request must never leave the loopback node; an
+authorized call is served locally (or, until the wallet surface is served on a given transport, returns
+a catalogued error — it is never proxied to the public gateway).
 
-The custody-lifecycle (§18.20) and unlock-auth (§18.24) groups are **DEPRECATED and frozen for removal**
-(dig_ecosystem#1701, superseded by the #1500 ratification). The gate above stays EXACTLY as strict for
-them — a freeze MUST NOT weaken an authorization check on the way out — but neither group may gain a
-method, and neither appears in OpenRPC discovery. The mutation group is unaffected.
+**Retired namespaces (`wallet.*`, `auth.*`) MUST be refused outright.** Node-side USER custody and its
+unlock-auth gate were removed by dig_ecosystem#1701, superseded by the #1500 ratification: the node holds
+no user spend key. No method exists under either prefix, and a node MUST classify the whole prefix as
+retired and DENY it before consulting any token — a retired namespace that fell through to the open class
+would leave a future `wallet.anything` unauthenticated by default, so the removal would have relaxed the
+gate. Neither prefix appears in OpenRPC discovery.
+
+`control.wallet.*` is NOT affected and MUST keep working: those are the light-client CHAIN READS
+(`control.wallet.balance` / `.coins` / `.peak` / `.syncStatus` / `.broadcast`), which hold no key. The
+distinction is the bare prefix — a control read is named `control.wallet.balance`, never `wallet.balance`.
 
 **Master-token-tier wallet methods (a paired token MUST be refused).** A Sage-parity method name that
 is an ALIAS for a master-tier `control.*` capability inherits that tier: `add_peer` is
@@ -2226,13 +2228,13 @@ local consumers. The recommendation of epic #365 is that the whole wallet WS ses
 the bidirectional WS transport (#369) carries it; the security-critical MUST is that no mutation or
 custody op ever runs unauthorized.
 
-**Node-local backup is not a wallet method.** Seed/mnemonic reveal (§18.20 backup) is reachable ONLY on
-the node-local self-origin surface (§16.3) / a `dig-node wallet backup` CLI — NEVER over the paired
-boundary, so key material never crosses to a paired caller even with a valid token.
+**There is no seed egress, because there is no seed.** The node holds no user seed and exposes no
+mnemonic reveal on any surface — RPC, self-origin, or CLI (dig_ecosystem#1701, §908).
 
 **Classification is pure + tested.** `wallet_authz::classify` maps a method to its class
-(read | mutation | master-only | custody | non-wallet) and `wallet_authz::authorize` decides allow/deny,
-unit-tested exhaustively: an unpaired caller is denied on every mutation/custody method; a paired token
+(read | mutation | master-only | retired | non-wallet) and `wallet_authz::authorize` decides allow/deny,
+unit-tested exhaustively: an unpaired caller is denied on every mutation method; a retired name is denied
+with ANY token; a paired token
 authorizes a mutation but NOT a master-tier capability under either of its names; a revoked token is
 denied on the next request.
 
@@ -5178,8 +5180,9 @@ alone; those rows are re-keyed onto the canonical id when the database is opened
 DIG-Browser callers (a `WalletSigner` over the wallet's synthetic p2 keys). Secret-touching endpoints
 (`get_secret_key`/`generate_mnemonic`/`import_key`/exportMnemonic/revealSeed) stay 501'd + loopback+token
 gated, NEVER reachable from a dapp/non-loopback origin. The MV3 extension self-custodies and does NOT use
-the node's sign/spend path. (SUPERSEDED for the PAIRED-extension thin-client path by §18.20/§18.21: there
-the node custodies the key and signs + broadcasts on behalf of a paired caller, gated per §7.12.)
+the node's sign/spend path. (The paired-extension thin-client path that once inverted this —
+the node custodying the key and signing on a caller's behalf — was removed by dig_ecosystem#1701, so
+self-custody is again the only model, §18.20.)
 
 18.11. **NFT/DID/CAT reconstruction.** A raw `CoinState` does not reveal a coin's asset kind — that lives
 in the coin's puzzle, revealed only when its parent is spent. Reconstruction uncurries the parent spend
@@ -5277,7 +5280,7 @@ unit wires the LIVE path, gated so it is OFF by default (money-safe) and ON only
   evaluated MUST be treated as custodied.
 
   The custodied set is the union of the loaded signer, every signer this process has loaded (the
-  §18.24 per-transaction grant is already gone by push time), and the custody manifest's PERSISTED
+  no signer is ever resident by push time), and the custody manifest's PERSISTED
   public keys — non-secret, readable while every wallet is locked, and covering the whole covered
   window in BOTH the unhardened and hardened trees rather than the index-0 receive address alone.
   The window is sized by §18.7a, so it is not a constant. Merely WATCHED puzzle
@@ -5296,14 +5299,12 @@ unit wires the LIVE path, gated so it is OFF by default (money-safe) and ON only
   internal comparisons stay bare-hex). Omitting this normalization is the live "have 0 $DIG" failure
   (#430): the mock/peer paths accept bare hex, so it surfaces only when a bring-up falls through to
   coinset.
-- **Live-funds e2e (env-gated, SKIPPED by default).** A documented, runnable end-to-end test
-  (`crates/dig-node-service/tests/live_funds_tip_e2e.rs` + `runbooks/live-funds-tip-e2e.md`) drives a
-  real mainnet `$DIG` tip to the DIG treasury (`digstore_chain::dig::treasury_inner_puzzle_hash()`).
-  It is SKIPPED unless `DIG_LIVE_FUNDS_TEST=1` AND the funded test wallet is provided (via
-  `/.test-credentials`, referenced by path — NEVER inlined). **CI never broadcasts to mainnet**: all
-  automated tests use the `chia-sdk-test` simulator (real consensus incl. BLS) or the recording
-  `MockBroadcaster`/`MockConfirmer`; the live path is exercised only by this explicit, capped,
-  operator-run pass.
+- **No live-funds e2e (removed with node-side custody).** The env-gated mainnet `$DIG` tip test drove
+  its spend by IMPORTING a funded mnemonic into node custody, which dig_ecosystem#1701 removed — a node
+  can no longer hold a seed, so the test's premise is gone along with the capability. **CI never
+  broadcast to mainnet** and still does not: automated tests use the `chia-sdk-test` simulator (real
+  consensus incl. BLS) or the recording `MockBroadcaster`/`MockConfirmer`. A future live pass MUST get
+  its signature from outside the node.
 
 18.12a. **Deferred to follow-on units.** The off-chain NFT data-blob/CHIP-0015 metadata fetch
 (`get_nft_data` returns on-chain fields; the metadata JSON surfaces when fetched), `exercise_options`
@@ -5402,133 +5403,68 @@ cross-checks representative request/response schemas field-name-identical agains
 three real drifts documented in §18.15/§18.16/§18.17. The hand-authored `sage-endpoints-v0.12.11.json`
 (method-name-only) vector from #215 remains as a lighter first check.
 
-18.20. **Node-custodied MULTI-wallet provisioning + custody lifecycle (#370/#427).** _DEPRECATED — frozen for removal by dig_ecosystem#1701; superseded by the #1500 ratification. Normative for existing consumers; no new ones, and absent from OpenRPC discovery._ For the thin-client
-model (epic #365) the node HOLDS the wallet keys: it generates or imports one or MORE independent seeds,
-encrypts each at rest via `dig-keystore` (§18.18 `seed_store`), and loads an in-memory `WalletSigner` on
-unlock. This is a distinct custody locus from the read-only path of #217/#407 (where the node holds only
-the client's PUBLIC puzzle hashes and NEVER a key) and supersedes, for the PAIRED-extension path, §18.10's
-"the extension self-custodies and never uses the node's sign path". The node custodies MULTIPLE wallets so
-the extension's multi-wallet registry (`WalletEntry[]`, each its own seed) can be migrated IN one wallet at
-a time (#374). `crate::sage::custody::WalletCustody` owns the lifecycle, each op authorized per §7.12.
+18.20. **The node does NOT custody user wallets (dig_ecosystem#1701).** It once did: it generated or
+imported BIP-39 seeds, encrypted them at rest, unlocked them into an in-memory `WalletSigner`, and signed
++ broadcast on a paired caller's behalf. The #1500 ratification (2026-07-22T03:27:48Z) settled that it
+must not, and the surface has been REMOVED. A node MUST NOT provide any method that generates, imports,
+restores, unlocks, deletes, reveals, or signs with a user's seed, on any transport.
 
-**Wallet identity — the master-key fingerprint (§18.20a).** Each custodied wallet has a stable id: the
-decimal string of its BIP-39 seed's Chia BLS **master public-key fingerprint** (a `u32`, the canonical Chia
-wallet identifier Sage/`get_keys`/CHIP-0002 use). The id is deterministic (same seed ⇒ same id on any
-device), non-secret (public-key-derived), and lets a paired caller correlate a node wallet to its
-extension `WalletEntry` by fingerprint. Importing a seed whose fingerprint already exists is REFUSED (no
-double-custody of one key). One wallet is the ACTIVE wallet; id-taking methods default to it when the `id`
-is omitted, so single-wallet callers are unchanged.
+This is STRUCTURAL for the SAGE-PARITY plane, not a policy a future change can quietly relax: no path
+through `crate::sage` reads a `.seed` file, decrypts one, derives a secret key, or constructs a
+`WalletSigner` from user material. The user's key lives in the user application, and `dig-account`'s
+`PolicyAuthorizer` is the only enforcing custody gate for it.
 
-Lifecycle methods (a `?`-suffixed `id` argument defaults to the active wallet):
+**§908 is NOT yet whole, and the remainder is named.** A SECOND node-side custody surface survives in
+`crate::lib` — the self-origin wallet UI (§16.3): `POST /api/import` and `/api/unlock` seal and open a
+user seed under `seed_path()`, `POST /api/send` BLS-signs a payment, and the CHIP-0002 dapp signer serves
+`chip0002_signMessage` / `chip0002_signCoinSpends` / `chia_signMessageByAddress`. It is a RIVAL
+implementation of the capability removed here, it was never frozen, and the zero-population measurement
+that made this removal safe was taken over the custody manifest — NOT over `seed_path()`. Removing it
+therefore needs its own count first, and is tracked separately.
 
-- **create(password, label?)** — generate a fresh 24-word BIP-39 mnemonic, derive its fingerprint id,
-  encrypt the mnemonic under `password` (`seed_store::encrypt_seed`), persist it to `<id>.seed`, record a
-  non-secret manifest entry, make it the active wallet if none is, and load the signer. Returns `{ id,
-  address }` — NEVER the mnemonic (backup is node-local, below).
-- **import(mnemonic, password, label?)** / **restore(mnemonic, password, label?)** — validate the mnemonic,
-  derive its fingerprint id (refused if that wallet already exists), encrypt + persist it under `password`,
-  record the manifest entry, and load the signer. This is the per-wallet migration path that accepts an
-  extension seed IN (epic §migration); it is the only inbound key path, loopback-only + gated.
-- **unlock(id?, password)** — decrypt the addressed wallet's on-disk seed and load its in-memory signer
-  (derived over the wallet's synthetic p2 keys for HD indices `0..N`); enables signing (§18.21). MULTIPLE
-  wallets may be unlocked at once. Wrong password fails closed. This is the runtime signer load that
-  replaces the bring-up-only `with_signer`.
-- **lock(id?)** — drop the addressed wallet's in-memory signer (its encrypted seed stays on disk); signing
-  with it is disabled until the next unlock. Other wallets are unaffected.
-- **list()** — enumerate every custodied wallet: `[{ id, address?, label?, state, active }]` where `state`
-  is `locked`|`unlocked` per wallet. Non-secret only (no seed, no key). The address is present once known
-  (recorded at create/import, or cached on the wallet's first unlock).
-- **select(id)** — make `id` the active wallet (must exist). The active wallet is the one the Sage-parity
-  sign/spend surface (§18.21) signs with, so `select` is how a paired caller scopes signing to a specific
-  wallet WITHOUT adding a wallet-id argument to the Sage request schemas (Sage byte-parity, §18.19).
-- **status(id?)** — the addressed (default active) wallet's state: `none` (no wallets on this device),
-  `locked` (encrypted seed present, no signer loaded), or `unlocked` (a signer is loaded), plus its address
-  when known and (additively) its `id` + whether it is `active`.
-- **delete(id?, password)** — verify `password` against the addressed wallet's on-disk seed, then remove
-  ONLY that wallet's seed file + manifest entry + in-memory signer. Other wallets are untouched; if the
-  removed wallet was active, the active pointer moves to another remaining wallet (or clears when none
-  remain).
+**What remains is a read.** `crate::sage::custody::WalletCustody` reads ONE non-secret file,
+`<config_dir>/wallets/index.json`, and answers two questions for the chain-sync supervisor (§18.6):
+whether ANY wallet is enrolled on this device (`any_wallet`), and which standard-layer PUBLIC keys it
+covers (`custodied_public_keys`). Those keys become subscription addresses and are what the push guard
+(§18.12) checks a pre-signed bundle against. Neither answer requires — or can obtain — a key.
 
-**Key at rest + never exported.** Each seed is Argon2id + AES-256-GCM encrypted at rest under its OWN
-password (§18.18), never logged, never returned by any lifecycle op, and never crosses the paired boundary.
-The manifest holds NON-SECRET data only (id, receive address, optional label, creation timestamp, the
-active id). The ONLY seed egress is the node-local, password-gated backup
-(`WalletCustody::reveal_mnemonic(id?)`, surfaced on the self-origin `/api/export` UI §16.3 or a `dig-node
-wallet backup` CLI) — never a wallet/`control.*` method (§7.12).
+18.20a. **On-disk layout, read-only (#427, reduced by dig_ecosystem#1701).** A pre-existing install's
+wallets live under `<config_dir>/wallets/`: one opaque `dig-keystore` container per wallet at
+`<config_dir>/wallets/<id>.seed`, plus a non-secret JSON manifest `<config_dir>/wallets/index.json` =
+`{ "active": "<id>"|null, "wallets": [{ "id", "address"?, "label"?, "created_ms", "public_keys"? }] }`.
+A legacy single seed at `<config_dir>/wallet-seed.bin` (the #370 layout) is adopted under the reserved id
+`default`.
 
-18.20a. **Multi-wallet on-disk layout + back-compat (#427).** Custodied wallets live under
-`<config_dir>/wallets/`: one `dig-keystore` container per wallet at `<config_dir>/wallets/<id>.seed`
-(owner-only, `0600` on Unix), plus a non-secret JSON manifest `<config_dir>/wallets/index.json` =
-`{ "active": "<id>"|null, "wallets": [{ "id", "address"?, "label"?, "created_ms" }] }` (atomic,
-owner-only writes). A seed file is encrypted INDEPENDENTLY of every other, so unlocking, signing with, or
-removing one wallet cannot decrypt or affect another; every custody error fails closed (a missing wallet
-→ not-found, a wrong password → unauthorized, and neither mutates other wallets).
+A node MUST read this layout and MUST NOT write a new wallet into it. The manifest is still self-healing —
+a missing or corrupt `index.json` is rebuilt from the seed files present, each adopted with no public keys
+— so an enrolled wallet is reported as enrolled even when no address is derivable from it. That state is
+distinct from "no wallet at all" and MUST stay distinguishable (dig_ecosystem#2609): the first means the
+node is not following coins it should be, the second is the honest all-clear.
 
-**Legacy single-wallet back-compat + canonicalization (HARD).** A pre-existing single seed at the legacy
-path `<config_dir>/wallet-seed.bin` (the #370 single-wallet layout) is adopted as the active wallet under
-the reserved TRANSIENT id `default` when the manifest names no other — its real fingerprint id is
-unknowable while the seed is encrypted (no password at construction). An existing single-wallet setup
-keeps unlocking, signing, and backing up exactly as before: a caller that omits `id` on every method
-observes the identical single-wallet behaviour. New wallets always receive a fingerprint id under
-`wallets/`.
+Since nothing can enrol a wallet, the set can only shrink. The measured population of installs holding one
+is ZERO (dig_ecosystem#1701 step 2, four machines on two independent instruments), so in practice every
+node reports no wallet.
 
-The legacy wallet is **canonicalized to its real fingerprint id** the first time its mnemonic becomes
-knowable — on its first `unlock` (or `restore`/`import` of the same key): the encrypted seed is moved
-`wallet-seed.bin` → `wallets/<fp>.seed` (its at-rest password preserved — the file is moved, not
-re-encrypted), the manifest entry is renamed `default` → `<fp>` (preserving the active pointer, label,
-timestamp, address), and any in-memory session is re-keyed. After canonicalization there is no
-`default`-vs-`<fp>` split: exactly ONE id per key. **A key is never custodied twice** — a re-import of the
-legacy key under the same password (the #374 migration re-push) canonicalizes the legacy entry FIRST and
-is then refused as a duplicate; a re-import under a different password (the legacy password being unknown,
-the only case a transient second entry can form) is collapsed to the single canonical entry on the next
-unlock of the legacy wallet.
+18.21. **The node does not sign or broadcast on a user's behalf.** _Removed by dig_ecosystem#1701._ The
+sign-and-broadcast-for-a-paired-caller path required a node-custodied signer, and there is none. A node
+MUST NOT sign a spend with user material. Relaying an ALREADY-SIGNED bundle is a different capability and
+survives (`control.wallet.broadcast`, §18.12): it moves bytes a caller signed elsewhere and needs no key.
+Whether the node may spend its OWN money remains a separate, default-OFF decision
+(`DIG_WALLET_ENABLE_LIVE_BROADCAST`, §18.12), unrelated to user custody.
 
-The manifest is self-healing: a missing or corrupt `index.json` is rebuilt from the seed files present at
-construction (adopting a legacy `wallet-seed.bin` as `default`), so a seed file is never orphaned and the
-reconciled active pointer never dangles.
-
-18.21. **Sign + broadcast on behalf of the paired caller + per-op consent (#371).** With a wallet unlocked
-(§18.20), the node is the SIGNER + BROADCASTER for a paired caller (§7.12): a spend request (or a
-wasm-built unsigned bundle) is built with the canonical `chia-wallet-sdk` driver constructors (§18.9),
-signed with the node-custodied `WalletSigner` of the ACTIVE wallet (native BLS; a paired caller scopes
-signing to a specific custodied wallet via `wallet.select`, §18.20 — the Sage request schemas gain no
-wallet-id argument), validated by `dig-clvm`
-(`validate_spend_bundle`, `DONT_VALIDATE_SIGNATURE` — §18.9) BEFORE broadcast (fail-closed on a tampered or
-over-spending bundle), and broadcast to mainnet via `crate::sage::spend::ChiaQueryBroadcaster` (the real
-`Broadcaster`, wrapping `chia_query::push_tx` = decentralized peers + coinset fallback, mirroring Sage's
-peer `send_transaction`).
-
-**Per-op consent gate.** A broadcast reaches mainnet ONLY when it is BOTH authorized (a paired/master
-token, §7.12) AND explicitly consented for that specific operation. Consent is enforced at the
-`Broadcaster` seam by `crate::sage::spend::ConsentBroadcaster`: it forwards to the real broadcaster only
-when a one-shot consent has been ARMED for the pending op (the extension surfaces the confirm; the served
-layer arms consent on the confirmed op) and DISARMS after one broadcast; an unarmed (unconsented) broadcast
-fails closed and the inner broadcaster is never called. This is the §16.2 broadcast-gate model adapted for
-the authorized-extension path (distinct from the `DIG_WALLET_ALLOW_BROADCAST` dapp dry-run env of §16.2):
-an unconsented op builds + signs + validates but does NOT broadcast (nothing is spent). CI NEVER broadcasts
-to mainnet — tests drive the `chia-sdk-test` simulator (real consensus incl. BLS) or the recording
-`MockBroadcaster`; a real mainnet broadcast is a separate, explicitly-gated live pass.
 
 18.22. **Served on the shipped node + runtime signer load + custody dispatch (#368/#369).** The
 `WalletBackend` is BUILT and SERVED by the shipped `dig-node` (§18.1): the `POST /{method}` HTTP mirror on
 `9778`, the mTLS `9776` sibling listener, and the bidirectional `/ws` transport (§4.8) all dispatch to the
 one live backend.
 
-- **Runtime signer load.** The served backend resolves its signer from the node custody (§18.20) at
-  RUNTIME: `require_signer` returns the bring-up-injected signer if present, else the signer of the
-  currently-UNLOCKED custody session. A paired `wallet.unlock` therefore enables signing/spend immediately,
-  WITHOUT reconstructing the backend; `wallet.lock`/`delete` disable it again. (The test/simulator path
-  still injects a fixed signer via `with_signer`, which wins when present.)
-- **Custody lifecycle dispatch.** The `wallet.*` methods (`wallet.status`/`list`/`create`/`import`/
-  `restore`/`unlock`/`lock`/`select`/`delete`, §18.20) are dispatched by `WalletBackend::dispatch` to the
-  attached `WalletCustody`. `wallet.create`/`import`/`restore`/`unlock`/`select` return `{ "address":
-  "xch1…", "id": "<fingerprint>" }`; `wallet.status` returns the custody status (`{ "state":
-  "none"|"locked"|"unlocked", "address"?, "id"?, "active"? }`); `wallet.list` returns `{ "active":
-  "<id>"|null, "wallets": [{ "id", "address"?, "label"?, "state", "active" }] }`; `wallet.lock`/`delete`
-  return the resulting state. A `wallet.unlock`/`lock`/`status`/`delete` with no `id` addresses the ACTIVE
-  wallet (single-wallet back-compat). The effective signer (`current_signer`) resolves to the ACTIVE
-  wallet's unlocked signer, so `wallet.select` scopes the sign/spend surface to a chosen wallet. All are
-  gated (§7.12).
+- **No runtime signer load.** `current_signer` resolves ONLY the bring-up-injected signer
+  (`with_signer`), which no shipped build attaches — it exists for the simulator/test path. A shipped node
+  therefore has no signer at all, and every method that needs one reports the wallet locked
+  (dig_ecosystem#1701, §908).
+- **No custody dispatch.** `wallet.*` and `auth.*` reach no handler; the wallet gate refuses the prefixes
+  outright (§7.12) and neither appears in discovery. The attached `WalletCustody` is a read (§18.20) that
+  contributes PUBLIC addresses to the subscription set and to the push guard.
 - **Sync-status snapshot.** `WalletBackend::sync_status()` derives the `{ state, peak_height, target_height }`
   tri-state (`SyncStatus`, `crate::sage::events`) from the wallet DB — `synced` iff the initial catch-up
   completed, else `syncing`; it is the body the `/ws` transport pushes (§4.8) and re-pushes on transition.
@@ -5620,118 +5556,20 @@ Each returns a `TipOutcome` — `{ result: "tipped", txid, dig_amount, recipient
 Sage stream). Each `/ws` session forwards it as a `{ "type": "tip", "tip": <ledger-entry> }` push frame,
 alongside the `sync_status` + `event` frames.
 
-## 18.24. Node-managed unlock authentication + per-transaction sign-unlock (#431/#432)
+## 18.24. Node-managed unlock authentication — REMOVED (dig_ecosystem#1701)
 
-> **DEPRECATED — FROZEN for removal (dig_ecosystem#1701).** Node-side USER custody is superseded. The
-> #1500 ratification (2026-07-22T03:27:48Z) settles that the node holds no user spend key: the key lives
-> in the user application, and `dig-account`'s `PolicyAuthorizer` is the only enforcing custody gate.
-> This section remains normative for the consumers that already exist — the behaviour below MUST NOT
-> change while the surface is served — but the surface MUST NOT be extended, MUST NOT gain a new
-> consumer, and MUST NOT appear in OpenRPC discovery (`rpc.discover`, `/openrpc.json`,
-> `/.well-known/dig-node.json`). Removal is step 4 of dig_ecosystem#1701.
+The `auth.*` namespace gated a node-custodied signer: `auth.unlock` granted a read-only session,
+`auth.sign_unlock` decrypted the seed for exactly one signature, and TOTP/passkey enrolment backstopped a
+stolen password. It existed because the node held the user's spend key.
 
+It no longer does (§18.20, §908), so the gate has nothing to gate and has been removed along with the
+custody it protected. A node MUST NOT serve any `auth.*` method; the wallet gate classifies the prefix as
+retired and denies it before consulting a token (§7.12), and it appears in no discovery artifact.
 
-The node is the LOCAL authority that gates the node-custodied signer (§18.21). There is **NO central
-server**: enrollment + verification are entirely local, credential material is encrypted at rest via
-`dig-keystore`, and no auth secret is ever logged or returned over any transport. This makes signing
-SAFE BY DEFAULT: the decrypted private key MUST NOT persist in memory beyond a single signature.
+The properties this section used to specify — a key not resident between signatures, one grant authorizing
+exactly one signature, a factor re-verified before it can be replaced — are all statements about holding a
+user key. Not holding one is the stronger guarantee, and it is the one the node now makes.
 
-`crate::sage::auth::UnlockAuth` owns the auth+unlock state machine; it holds a handle to the
-`WalletCustody` (§18.20) and mediates the effective signer. When an `UnlockAuth` is attached to the
-served `WalletBackend` (`with_auth`), it GOVERNS `current_signer()` — the §18.21 sign/broadcast-on-behalf
-path obtains a signer ONLY through the auth gate. When no `UnlockAuth` is attached (the simulator /
-bring-up-injected-signer path), behaviour is unchanged (back-compat).
-
-**Unlock mode (the ONLY policy knob).**
-
-- **`per_transaction` (DEFAULT, secure).** A successful `unlock` grants a READ-ONLY session
-  (balances/history/reads). It loads NO signer — `current_signer()` is `None`. **Each signing operation
-  requires a fresh `sign_unlock`**: the node decrypts the seed, builds a one-shot signer, signs exactly
-  ONE operation, and the signer is DROPPED (not resident) immediately after. The key never persists
-  beyond that single operation.
-- **`session_unlock_all` (OPT-OUT, convenience, OFF by default).** One `unlock` at session start builds
-  and HOLDS the signer for the session lifetime; `current_signer()` returns it until `lock`. Set via
-  `auth.set_mode`.
-
-**Auth model — per-wallet password + NODE-LEVEL second factor.** One method is active at a time; the user
-may add TOTP or a passkey on top of the password.
-
-- The **password is PER-WALLET**: it is the at-rest KDF root that decrypts THAT wallet's seed
-  (`dig-keystore` Argon2id, §18.18/§18.20). Every `unlock`/`sign_unlock` requires the TARGET wallet's
-  password (`WalletCustody::verify_password`).
-- The **second factor (TOTP / passkey) is NODE-LEVEL** — a single node authentication that authorizes the
-  unlock across EVERY custodied wallet (#431). Its secret is sealed at rest under a node-level device key
-  (`auth/node.key`, owner-only), NOT under any wallet password, so 2FA works uniformly for every wallet.
-  When a second factor is enrolled, `unlock`/`sign_unlock` require BOTH the target wallet's password AND
-  the node-level factor. A `Credential` carries the password plus, per the active method, a TOTP code or a
-  WebAuthn assertion; verification requires every factor the active method mandates. (This is an honest,
-  strong-at-rest design for a keyless local node; true passwordless replacement via WebAuthn PRF or a
-  TPM-sealed key is a scoped follow-up.)
-
-- **`password` (default).** Verified by decrypting the addressed wallet's seed.
-- **`totp` (RFC-6238, `totp-rs`).** `auth.enroll_totp` generates a fresh node-level secret, seals it under
-  `auth/node.key`, sets the method to `totp`, and returns the base32 secret + `otpauth://` URI EXACTLY
-  ONCE. Thereafter `unlock`/`sign_unlock` require the target wallet's password AND a current 6-digit code
-  (±1 step skew). **A code is ONE-TIME-USE** (RFC-6238 §5.2): the last-accepted time-step is persisted and
-  a code at a step `<=` it is rejected as a REPLAY (`401`). The check-and-advance is ATOMIC — the
-  find-step → compare-to-last → advance runs under a single exclusive lock — so two CONCURRENT verifies of
-  the same code cannot both pass (the replay window holds under concurrency, not just sequentially).
-- **`passkey` (WebAuthn).** `auth.enroll_passkey_begin`/`finish` register a node-level credential.
-  Thereafter `unlock`/`sign_unlock` require the password AND a valid assertion. The real `webauthn-rs`
-  ceremony is finalized with the paired-extension origin (#433 follow-up) — it fails closed until then, so
-  the active method never becomes `passkey` on this node.
-
-**Enrolling or replacing a factor re-verifies the CURRENT factor.** `auth.enroll_totp` /
-`auth.enroll_passkey_begin` / `auth.set_method` and switching mode to `session_unlock_all` all run the
-FULL current-factor verification (`verify(id, cred)` — password AND, when a second factor is already
-active, the live code/assertion) BEFORE rotating/weakening. So an attacker holding the paired token + a
-stolen password — the exact threat 2FA backstops — cannot rotate the factor to their own authenticator or
-silently downgrade the posture. Password-only enrollment is permitted ONLY while the active method is
-`password`.
-
-**State machine + the §18.21 gate.**
-
-- `unlock(id?, cred)` → verify per the active method → set the session READ-ONLY (`per_transaction`), or
-  build + hold the session signer BOUND to that wallet (`session_unlock_all`). Never returns a signer or
-  key. A wrong/expired/replayed credential is denied (`401`), leaves the state unchanged, loads nothing.
-- `sign_unlock(id?, cred)` → verify (FRESH) → decrypt the target wallet's seed, build a one-shot signer
-  BOUND to that wallet, and ARM it for exactly ONE signing operation.
-- **Grants/session signers are BOUND to their wallet id (§18.20a multi-wallet).** `current_signer()` for a
-  signing op returns the armed grant (or the held session signer) ONLY when its bound wallet id equals the
-  node's currently-ACTIVE wallet; otherwise it fails closed — a grant armed for wallet A can never sign
-  when B is active. `current_signer()` resolves: bring-up-injected signer (tests) → the wallet-matched auth
-  gate signer → (only when NO auth is attached) the legacy held custody signer.
-- **Signing dispatch is SERIALIZED + the one-shot grant is consumed panic-safely.** Every key-touching
-  signing method (`send_xch`/`send_cat`/`combine`/`split`/`sign_coin_spends`/`submit_transaction`/
-  `make_offer`/`take_offer`/mint/transfer/… AND `tip.manual`/`tip.dev_tick`/`tip.notify_consumed`, which
-  sign a $DIG tip) is dispatched under a signing mutex held from before the handler THROUGH grant
-  consumption, so two concurrent signing calls can never both observe one armed grant (a gate TOCTOU) —
-  ONE `sign_unlock` authorizes EXACTLY ONE signature. Consumption is via an RAII guard that runs on normal
-  return AND on a panic unwind, so a panicking handler can never leave the key armed + reusable.
-- `lock()` → clear the read-only session, drop the session signer AND any armed grant.
-
-**No sibling resident key over the paired boundary.** When the auth gate is attached it is the ONLY
-signer-loading path: `wallet.create`/`import`/`restore` verify-and-persist but leave NO resident custody
-signer (the custody session is locked immediately after provisioning), and `wallet.unlock` is redirected
-to `auth.unlock`/`auth.sign_unlock` rather than loading a session-long resident key.
-
-**Zeroize / residency invariant (adversarial-verified).** In `per_transaction` mode no signer is resident
-between signatures: after a `sign_unlock` + one signing operation the one-shot signer is dropped and
-`current_signer()` returns `None` — a fresh `sign_unlock` is required for the next signature. Decrypted
-mnemonic material is held only in `zeroize::Zeroizing` for the duration of a build and dropped
-immediately. (`chia-bls` 0.26 `SecretKey` does not itself zeroize-on-drop; the delivered guarantee is
-non-retention — the signer allocation is dropped promptly — plus zeroization of the mnemonic buffer.
-Byte-level scrub of the derived scalar via a key wrapper is a scoped follow-up.)
-
-**WS/RPC surface (paired-token gated, §7.12).** Every `auth.*` method requires the master control token
-OR a valid paired token, on every transport (`POST /{method}`, `/ws`, mTLS `9776`). Methods:
-`auth.status` (mode, method, session state, whether a sign-grant is armed) · `auth.get_method` /
-`auth.set_method` (switch active method — `password` resets to password-only) · `auth.set_mode`
-(`per_transaction` | `session_unlock_all`) · `auth.enroll_totp` · `auth.enroll_passkey_begin` /
-`auth.enroll_passkey_finish` · `auth.unlock` (read-only session) · `auth.sign_unlock` (per-transaction,
-authorizes exactly one signature) · `auth.lock`. Auth secrets are NEVER returned except the one-time TOTP
-enrollment secret/URI at `enroll_totp` (needed to provision the authenticator). No auth material crosses
-as a wallet/`control.*` result.
 
 ## 19. Peer network — NAT traversal, discovery, address book, and content location
 

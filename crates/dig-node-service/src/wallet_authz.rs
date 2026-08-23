@@ -7,16 +7,18 @@
 //! token) is rejected with `-32030 UNAUTHORIZED` before the method runs. Wallet READ methods stay
 //! open to local consumers (the read plane, §7.2).
 //!
-//! # The `auth.*` half is DEPRECATED - frozen for removal (dig_ecosystem#1701)
+//! # The `wallet.*` and `auth.*` namespaces are RETIRED (dig_ecosystem#1701)
 //!
-//! The `auth.*` namespace ([`AUTH_PREFIX`]) gates node-side USER custody, which the #1500
-//! ratification (2026-07-22T03:27:48Z) superseded: the node holds no user spend key, and
-//! `dig-account`'s `PolicyAuthorizer` is the only enforcing custody gate from here. The gate below
-//! is kept EXACTLY as strict for the consumers that already exist - a freeze must not weaken an
-//! authorization check on the way out - but no new `auth.*` method may be added, and the namespace
-//! is absent from OpenRPC discovery ([`crate::meta`]) so no new consumer can find it.
+//! They gated node-side USER custody, which the #1500 ratification (2026-07-22T03:27:48Z)
+//! superseded: the node holds no user spend key, and `dig-account`'s `PolicyAuthorizer` is the only
+//! enforcing custody gate from here. The methods themselves are gone (step 4), so nothing under
+//! either prefix reaches a handler.
 //!
-//! Removal is step 4 of dig_ecosystem#1701 and is deliberately not part of the freeze.
+//! The prefixes still appear here, classified [`WalletMethodClass::Retired`], because the gate must
+//! keep an opinion about a namespace it once served. A retired prefix that simply fell through to
+//! [`WalletMethodClass::Other`] would be OPEN, and a future `wallet.anything` would then be
+//! unauthenticated by default — the deletion would have relaxed the gate. Refusing the prefix
+//! outright is strictly stricter than the freeze was, and no token can satisfy it.
 //!
 //! Gated wallet methods are ALSO never relayed upstream — a signing/custody request must never
 //! leave the loopback node (the server enforces that, [`crate::server`]).
@@ -46,22 +48,11 @@ pub const CONTROL_EQUIVALENT_PARITY_METHODS: &[(&str, &str)] = &[
     ("remove_peer", "control.chiaPeers.remove"),
 ];
 
-/// The custody-lifecycle namespace prefix (§18.20/§18.20a): `wallet.create`, `wallet.import`,
-/// `wallet.restore`, `wallet.unlock`, `wallet.lock`, `wallet.status`, `wallet.list`,
-/// `wallet.select`, `wallet.delete`. EVERY `wallet.*` method is gated by this prefix (even the reads
-/// `wallet.status`/`wallet.list`, which reveal which wallets are custodied + their addresses), so a
-/// new custody method is gated the moment it lands under `wallet.*` — no per-method allowlist.
-pub const CUSTODY_PREFIX: &str = "wallet.";
-
-/// The node-managed unlock-auth namespace prefix (§18.24, #431/#432): `auth.status`, `auth.unlock`,
-/// `auth.sign_unlock`, `auth.set_mode`, `auth.set_method`, `auth.enroll_totp`, `auth.enroll_passkey_*`,
-/// `auth.lock`, `auth.get_method`. EVERY `auth.*` method is paired-token gated (§7.12) — even the
-/// reads reveal the auth posture (mode/method/session state), and `unlock`/`sign_unlock` gate the
-/// node-custodied signer — so a new auth method is gated the moment it lands under `auth.*`.
-#[deprecated(
-    note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers."
-)]
-pub const AUTH_PREFIX: &str = "auth.";
+/// The namespaces node-side USER custody used to occupy: the custody lifecycle (`wallet.*`,
+/// §18.20/§18.20a) and its unlock-auth gate (`auth.*`, §18.24). Both are RETIRED
+/// (dig_ecosystem#1701) — no method under either prefix exists, and [`classify`] refuses the whole
+/// prefix rather than letting an unhandled name fall through to the open class.
+pub const RETIRED_CUSTODY_PREFIXES: [&str; 2] = ["wallet.", "auth."];
 
 /// Wallet MUTATION methods that MUST be authorized (§7.12): they sign, spend, broadcast, or change
 /// persisted wallet state. Sourced from the dig-wallet Sage surface (§18.9/§18.9a/§18.16/§18.17).
@@ -128,9 +119,9 @@ const GATED_WALLET_MUTATIONS: &[&str] = &[
 /// The authorization class of a JSON-RPC method w.r.t. the wallet surface (§7.12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletMethodClass {
-    /// A custody-lifecycle method (`wallet.*`, §18.20) or a node-managed unlock-auth method
-    /// (`auth.*`, §18.24) — GATED.
-    Custody,
+    /// A method under a RETIRED node-side USER custody namespace
+    /// ([`RETIRED_CUSTODY_PREFIXES`]) — REFUSED outright. No token authorizes it.
+    Retired,
     /// A wallet MUTATION (sign/spend/offer/mint/transfer + state-changing actions) — GATED to the
     /// master token OR a valid paired token.
     Mutation,
@@ -161,13 +152,12 @@ pub fn master_tier_control_equivalent(method: &str) -> Option<&'static str> {
 }
 
 /// Classify a method against the wallet-authorization policy. PURE.
-// Frozen-surface call site (dig_ecosystem#1701): `AUTH_PREFIX` is deprecated to stop NEW
-// consumers, and this is the authorization gate the freeze must keep enforcing unchanged. The
-// allow sits on the function because an attribute on a tail `if` expression is not stable Rust.
-#[allow(deprecated)]
 pub fn classify(method: &str) -> WalletMethodClass {
-    if method.starts_with(CUSTODY_PREFIX) || method.starts_with(AUTH_PREFIX) {
-        WalletMethodClass::Custody
+    if RETIRED_CUSTODY_PREFIXES
+        .iter()
+        .any(|p| method.starts_with(p))
+    {
+        WalletMethodClass::Retired
     } else if master_tier_control_equivalent(method).is_some() {
         WalletMethodClass::MasterOnly
     } else if GATED_WALLET_MUTATIONS.contains(&method) {
@@ -177,12 +167,12 @@ pub fn classify(method: &str) -> WalletMethodClass {
     }
 }
 
-/// Whether `method` requires the master or a paired token over the authorized surface (§7.12) —
-/// true for every custody-lifecycle and wallet-mutation method.
+/// Whether `method` is subject to this gate at all (§7.12) — true for every wallet mutation, every
+/// master-tier parity alias, and every retired custody name.
 pub fn requires_authorization(method: &str) -> bool {
     matches!(
         classify(method),
-        WalletMethodClass::Custody | WalletMethodClass::Mutation | WalletMethodClass::MasterOnly
+        WalletMethodClass::Retired | WalletMethodClass::Mutation | WalletMethodClass::MasterOnly
     )
 }
 
@@ -190,8 +180,11 @@ pub fn requires_authorization(method: &str) -> bool {
 ///
 /// - A method that does NOT require authorization (a read / non-wallet method) is always
 ///   authorized here — other gates (the read plane, the `control.*` gate) apply their own policy.
-/// - A GATED (custody/mutation) method is authorized ONLY when the presented token is the master
-///   control token (constant-time) OR a valid paired token (`is_paired`). No token → denied.
+/// - A [`WalletMethodClass::Retired`] method is NEVER authorized. The node-side USER custody it
+///   named no longer exists (dig_ecosystem#1701), and a retired namespace must not become open by
+///   omission.
+/// - A gated MUTATION is authorized ONLY when the presented token is the master control token
+///   (constant-time) OR a valid paired token (`is_paired`). No token → denied.
 /// - A [`WalletMethodClass::MasterOnly`] method — a parity alias for a master-tier control
 ///   capability — is authorized by the MASTER token alone; a paired token is refused here exactly
 ///   as `control::requires_master_token` refuses it on the control plane.
@@ -207,6 +200,11 @@ pub fn authorize(
     let class = classify(method);
     if class == WalletMethodClass::Other {
         return true;
+    }
+    // A retired namespace is refused before any token is even looked at, so the refusal cannot be
+    // weakened by a token, a pairing, or a master-token bug.
+    if class == WalletMethodClass::Retired {
+        return false;
     }
     // Fail CLOSED on an unusable master token (empty in-memory fallback after a CSPRNG
     // mint / persist failure — see `control::is_authorized`). `ct_eq("", "")` is `true`,
@@ -235,56 +233,88 @@ mod tests {
         tok == PAIRED
     }
 
+    /// Every name the removed node-side USER custody surface served, plus one name under each
+    /// prefix that never existed.
+    ///
+    /// The never-existed names are the point. The methods are gone, so a test listing only the old
+    /// names could be satisfied by an implementation that enumerated exactly those nine and left
+    /// the PREFIX open — which is the regression this gate exists to prevent, because the next
+    /// `wallet.*` method anyone adds would then be unauthenticated by default.
+    const RETIRED_METHODS: &[&str] = &[
+        "wallet.create",
+        "wallet.import",
+        "wallet.restore",
+        "wallet.unlock",
+        "wallet.lock",
+        "wallet.status",
+        "wallet.list",
+        "wallet.select",
+        "wallet.delete",
+        "wallet.a_name_that_never_existed",
+        "auth.status",
+        "auth.get_method",
+        "auth.set_method",
+        "auth.set_mode",
+        "auth.enroll_totp",
+        "auth.enroll_passkey_begin",
+        "auth.enroll_passkey_finish",
+        "auth.unlock",
+        "auth.sign_unlock",
+        "auth.lock",
+        "auth.a_name_that_never_existed",
+    ];
+
+    /// **Proves (dig_ecosystem#1701, step 4):** no token authorizes a retired custody name.
+    ///
+    /// Stronger than the gate this replaces, deliberately. The old gate answered "master or paired
+    /// allows it"; the removal must not turn that into "anything allows it", and the way it could
+    /// have is by falling through to [`WalletMethodClass::Other`], whose whole meaning is "not my
+    /// problem" — which for a name with no handler reads as open.
+    ///
+    /// Reverting `classify` to leave the prefixes unmatched reddens the `Other` assertion; reverting
+    /// only `authorize`'s early return reddens the master/paired ones.
     #[test]
-    fn custody_methods_are_gated() {
-        for m in [
-            "wallet.create",
-            "wallet.import",
-            "wallet.restore",
-            "wallet.unlock",
-            "wallet.lock",
-            "wallet.status",
-            "wallet.list",
-            "wallet.select",
-            "wallet.delete",
-        ] {
-            assert_eq!(classify(m), WalletMethodClass::Custody, "{m}");
-            assert!(requires_authorization(m), "{m} must be gated");
+    fn every_retired_custody_name_is_refused_with_any_token() {
+        for m in RETIRED_METHODS {
+            assert_eq!(classify(m), WalletMethodClass::Retired, "{m}");
+            assert_ne!(
+                classify(m),
+                WalletMethodClass::Other,
+                "{m} fell through to the OPEN class - a retired namespace must never do that"
+            );
+            assert!(requires_authorization(m), "{m} must reach this gate at all");
+            for token in [None, Some("nope"), Some(MASTER), Some(PAIRED)] {
+                assert!(
+                    !authorize(m, token, MASTER, is_paired),
+                    "{m}: refused with {token:?} - node-side USER custody was removed by \
+                     dig_ecosystem#1701 and no credential reinstates it"
+                );
+            }
         }
     }
 
+    /// **Proves the refusal is narrow:** the light-client chain reads are NOT caught by it.
+    ///
+    /// `control.wallet.balance` shares six characters with `wallet.balance`. A retirement written as
+    /// a substring match rather than a prefix match would refuse the light client outright, and the
+    /// node would stop answering for money while every custody test still passed.
     #[test]
-    fn auth_methods_are_gated_and_no_token_is_denied() {
-        for m in [
-            "auth.status",
-            "auth.get_method",
-            "auth.set_method",
-            "auth.set_mode",
-            "auth.enroll_totp",
-            "auth.enroll_passkey_begin",
-            "auth.enroll_passkey_finish",
-            "auth.unlock",
-            "auth.sign_unlock",
-            "auth.lock",
-        ] {
-            assert_eq!(classify(m), WalletMethodClass::Custody, "{m}");
-            assert!(requires_authorization(m), "{m} must be gated");
-            // No token / wrong token → denied; master or paired → allowed.
-            assert!(
-                !authorize(m, None, MASTER, is_paired),
-                "{m}: no token denied"
-            );
-            assert!(
-                !authorize(m, Some("nope"), MASTER, is_paired),
-                "{m}: wrong token denied"
-            );
-            assert!(
-                authorize(m, Some(MASTER), MASTER, is_paired),
-                "{m}: master ok"
-            );
-            assert!(
-                authorize(m, Some(PAIRED), MASTER, is_paired),
-                "{m}: paired ok"
+    fn the_retirement_does_not_catch_the_control_plane_wallet_reads() {
+        let reads: Vec<&&str> = crate::control::CONTROL_METHODS
+            .iter()
+            .filter(|n| n.starts_with("control.wallet."))
+            .collect();
+        assert!(
+            reads.len() >= 5,
+            "expected the five light-client chain reads in CONTROL_METHODS; found {} - this guard \
+             would otherwise pass vacuously",
+            reads.len()
+        );
+        for m in &reads {
+            assert_ne!(
+                classify(m),
+                WalletMethodClass::Retired,
+                "{m} is a light-client chain read and must not be refused as retired"
             );
         }
     }
@@ -378,7 +408,6 @@ mod tests {
     fn master_or_paired_token_authorizes_a_gated_mutation() {
         assert!(authorize("send_xch", Some(MASTER), MASTER, is_paired));
         assert!(authorize("send_xch", Some(PAIRED), MASTER, is_paired));
-        assert!(authorize("wallet.unlock", Some(PAIRED), MASTER, is_paired));
     }
 
     #[test]

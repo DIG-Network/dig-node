@@ -21,7 +21,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::auth::UnlockAuth;
 use super::chain::ChainTransport;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
@@ -143,14 +142,10 @@ impl WalletService {
     pub async fn build_with(config_dir: &Path, cfg: WalletServiceConfig) -> WalletService {
         let events = Arc::new(EventBus::default());
         let db = open_db(config_dir).await;
-        // MULTI-wallet custody (#427) rooted at the node config dir: seeds live under
-        // `<config_dir>/wallets/`, and a legacy single `<config_dir>/wallet-seed.bin` is adopted.
-        let custody = WalletCustody::mainnet(config_dir.to_path_buf());
-        // The node-managed unlock authority (#431/#432, §18.24): it GATES the sign/broadcast path so
-        // signing is SAFE BY DEFAULT (per-transaction re-auth; the key is not resident between
-        // signatures). It shares the SAME custody state (a `WalletCustody` clone shares its inner
-        // Arcs), so decrypting a seed for a one-shot sign always uses the on-disk seed + password.
-        let auth = Arc::new(UnlockAuth::new(custody.clone(), config_dir.to_path_buf()));
+        // The read-only view of any wallet already enrolled on this device (dig_ecosystem#1701).
+        // It contributes that wallet's PUBLIC addresses to the subscription set and nothing else:
+        // the node cannot open a seed, so it cannot sign for those addresses (§908).
+        let custody = WalletCustody::open(config_dir.to_path_buf());
         // The addresses this node was ASKED to follow, alongside the ones it custodies. On a
         // §908-correct install (the account lives in dig-app, the node holds no seed) this is the
         // ONLY source of a subscription set, so without it the replica can never sync
@@ -257,7 +252,6 @@ impl WalletService {
         let mut base = WalletBackend::new(db, fallback, WalletConfig::default())
             .with_events(events.clone())
             .with_custody(custody)
-            .with_auth(auth)
             .with_tip_events(tip_events.clone())
             .with_pusher(chain.clone())
             .with_node_custodied_spending(cfg.enable_live_broadcast)
@@ -422,20 +416,15 @@ mod tests {
         dir
     }
 
-    /// Derived test custody password — replaces a hard-coded literal that triggered CodeQL's
-    /// rust/hard-coded-cryptographic-value alert. The test only needs a stable, deterministic
-    /// passphrase, not a specific one.
-    fn test_custody_password() -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        b"dig-wallet-service-test".hash(&mut hasher);
-        format!("{:x}", hasher.finish())
-    }
-
     /// **Proves (#368):** the production assembler builds a served backend that answers
-    /// `get_version` over the transport-independent dispatch, carries the node custody lifecycle
-    /// (`wallet.status` = `none` on a fresh dir), and shares one event bus.
+    /// `get_version` over the transport-independent dispatch and shares one event bus.
+    ///
+    /// **Proves (dig_ecosystem#1701, step 4):** the same assembler no longer serves node-side USER
+    /// custody. This runs against the PRODUCTION assembler rather than a hand-built backend, which
+    /// is what makes it the strongest single statement that the plane is gone rather than merely
+    /// unwired in some other configuration. `wallet.status` is included deliberately — it was the
+    /// most innocuous name in the namespace, a read, so an implementation that removed only the
+    /// dangerous-looking ones would still redden here.
     #[tokio::test]
     async fn build_assembles_a_served_backend() {
         let dir = scratch();
@@ -445,10 +434,18 @@ mod tests {
         assert_eq!(status, 200, "{body}");
         assert!(body.contains(env!("CARGO_PKG_VERSION")));
 
-        // Custody is attached and reports a fresh (no-seed) wallet.
-        let (status, body) = svc.backend.dispatch("wallet.status", "{}").await;
-        assert_eq!(status, 200);
-        assert!(body.contains("none"), "fresh dir has no wallet: {body}");
+        for retired in [
+            "wallet.status",
+            "wallet.create",
+            "auth.status",
+            "auth.sign_unlock",
+        ] {
+            let (status, body) = svc.backend.dispatch(retired, "{}").await;
+            assert_eq!(
+                status, 404,
+                "{retired} must reach no handler after the custody carve-out: {body}"
+            );
+        }
 
         // The backend shares the service's event bus (a publish is visible to a subscriber).
         assert_eq!(svc.backend.events().subscriber_count(), 0);
@@ -493,28 +490,38 @@ mod tests {
         assert_eq!(body.trim(), "[]");
     }
 
-    /// **Proves:** the DB persists across two builds over the same dir (a created wallet is still
-    /// present) — the served backend is durable, not in-memory, in the normal case.
+    /// **Proves:** the served backend's on-disk state survives a rebuild over the same dir — it is
+    /// durable, not in-memory, in the normal case.
+    ///
+    /// The probe is the WATCH LIST rather than a custodied wallet (dig_ecosystem#1701 removed the
+    /// latter), and it is the better probe anyway: on a §908 install the registered keys are the
+    /// ONLY source of a subscription set, so losing them across a restart would silently stop the
+    /// node following the user's coins while it still reported itself healthy.
     #[tokio::test]
-    async fn on_disk_db_and_seed_persist_across_builds() {
+    async fn on_disk_state_persists_across_builds() {
         let dir = scratch();
+        let key = {
+            let mut seed = [0u8; 64];
+            seed[0] = 7;
+            chia::bls::SecretKey::from_seed(&seed).public_key()
+        };
         {
             let svc = build_offline(&dir).await;
-            let (s, _b) = svc
-                .backend
-                .dispatch(
-                    "wallet.create",
-                    &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
-                )
-                .await;
-            assert_eq!(s, 200);
+            assert!(
+                svc.watchlist.is_empty(),
+                "a fresh dir must start with nothing registered, or persistence proves nothing"
+            );
+            assert_eq!(
+                svc.backend.watch_keys(&[key]),
+                Some(1),
+                "the registration must go through the single enrolment door"
+            );
         }
-        // A second build over the same dir sees the persisted (locked) wallet.
         let svc2 = build_offline(&dir).await;
-        let (_s, body) = svc2.backend.dispatch("wallet.status", "{}").await;
-        assert!(
-            body.contains("locked"),
-            "the persisted seed must reopen as locked: {body}"
+        assert_eq!(
+            svc2.watchlist.registered(),
+            vec![key],
+            "the registered watch key must reopen from disk"
         );
     }
 }

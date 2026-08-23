@@ -1380,13 +1380,17 @@ mod tests {
         assert_eq!(doc["endpoints"]["ws_status"], json!("/ws/status"));
     }
 
-    /// The namespaces frozen by dig_ecosystem#1701: node-side USER custody (`wallet.*`) and its
+    /// The namespaces RETIRED by dig_ecosystem#1701: node-side USER custody (`wallet.*`) and its
     /// unlock-auth gate (`auth.*`).
     ///
-    /// `control.wallet.*` is deliberately NOT frozen and must keep appearing — those are the
-    /// light-client CHAIN READS, which hold no key. Matching on the bare prefixes below is what
-    /// keeps the two apart: a control read is named `control.wallet.balance`, not `wallet.balance`.
-    const FROZEN_DISCOVERY_PREFIXES: [&str; 2] = ["auth.", "wallet."];
+    /// Taken from the authorization gate rather than restated here, so discovery and authorization
+    /// cannot come to disagree about which names are retired — a name this guard forgot would be
+    /// both discoverable and, per that gate, refusable, which is the worst of both.
+    ///
+    /// `control.wallet.*` is deliberately NOT retired and must keep appearing — those are the
+    /// light-client CHAIN READS, which hold no key. Matching on the bare prefixes is what keeps the
+    /// two apart: a control read is named `control.wallet.balance`, not `wallet.balance`.
+    use crate::wallet_authz::RETIRED_CUSTODY_PREFIXES;
 
     /// Every method name a caller can learn from `doc`, wherever the document carries one.
     ///
@@ -1412,15 +1416,15 @@ mod tests {
         found
     }
 
-    /// **Proves (dig_ecosystem#1701, step 1):** the frozen node-side USER custody surface is
-    /// absent from EVERY discovery artifact, so no new consumer can find it.
+    /// **Proves (dig_ecosystem#1701, step 4):** the RETIRED node-side USER custody surface is
+    /// absent from EVERY discovery artifact.
     ///
-    /// This is the half of the freeze a future change can silently undo. The surface was already
-    /// absent when the freeze landed — nothing was removed here — so the guard, not a deletion, is
-    /// what makes the absence hold. Reinstating an `auth.status` entry in any of the three layers
-    /// reddens this test by name.
+    /// The methods are gone, so a name reappearing here would advertise a handler that does not
+    /// exist — and, since the authorization gate refuses the whole prefix, one that could never be
+    /// reached even if it did. Reinstating an `auth.status` entry in any of the four layers reddens
+    /// this test by name.
     #[test]
-    fn the_frozen_custody_surface_is_absent_from_every_discovery_artifact() {
+    fn the_retired_custody_surface_is_absent_from_every_discovery_artifact() {
         let openrpc = openrpc_document();
         let well_known = well_known_document("127.0.0.1:9778", "https://rpc.dig.net", 1024, 0);
 
@@ -1451,14 +1455,13 @@ mod tests {
                 "{layer} disclosed no method names at all - this guard cannot see it"
             );
             for name in names {
-                for prefix in FROZEN_DISCOVERY_PREFIXES {
+                for prefix in RETIRED_CUSTODY_PREFIXES {
                     assert!(
                         !name.starts_with(prefix),
                         concat!(
-                            "{} discloses `{}`, under the frozen `{}*` namespace. Node-side ",
-                            "USER custody is superseded by the #1500 ratification ",
-                            "(dig_ecosystem#1701) and must stay undiscoverable so no NEW ",
-                            "consumer arrives before it is removed."
+                            "{} discloses `{}`, under the retired `{}*` namespace. Node-side ",
+                            "USER custody was removed by dig_ecosystem#1701; there is no handler ",
+                            "behind that name and the wallet gate refuses the prefix outright."
                         ),
                         layer,
                         name,
@@ -1471,13 +1474,13 @@ mod tests {
 
     /// **Proves the guard above can SEE the light-client reads it must not flag.**
     ///
-    /// The frozen prefixes are bare (`wallet.`), while the live chain reads are
+    /// The retired prefixes are bare (`wallet.`), while the live chain reads are
     /// `control.wallet.*`. If the guard were widened to match `wallet.` anywhere in the name it
     /// would flag the light client, and the only honest way to make it pass again would be to stop
     /// disclosing reads that hold no key. This pins the distinction so that widening reddens here
     /// rather than quietly degrading discovery.
     #[test]
-    fn the_freeze_guard_leaves_the_control_plane_wallet_chain_reads_discoverable() {
+    fn the_retirement_guard_leaves_the_control_plane_wallet_chain_reads_discoverable() {
         // The haystack is the PRODUCTION control-method list, not a literal written here: a
         // fixture that spells out the names it then checks can only confirm itself.
         let control_wallet_reads: Vec<&&str> = crate::control::CONTROL_METHODS
@@ -1491,10 +1494,10 @@ mod tests {
         );
 
         for name in &control_wallet_reads {
-            for prefix in FROZEN_DISCOVERY_PREFIXES {
+            for prefix in RETIRED_CUSTODY_PREFIXES {
                 assert!(
                     !name.starts_with(prefix),
-                    "`{name}` is a light-client chain read and must stay discoverable, but the                      frozen prefix `{prefix}` matches it"
+                    "`{name}` is a light-client chain read and must stay discoverable, but the                      retired prefix `{prefix}` matches it"
                 );
             }
         }

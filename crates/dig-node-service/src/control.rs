@@ -3865,6 +3865,55 @@ mod tests {
         );
     }
 
+    /// The five light-client CHAIN READS the dig-app and `dign` depend on (dig_ecosystem#1701).
+    ///
+    /// Named individually rather than by prefix because the carve-out that removed node-side USER
+    /// custody had to leave EXACTLY these untouched, and a prefix check would keep passing if four
+    /// of the five were dropped.
+    const LIGHT_CLIENT_READS: [&str; 5] = [
+        "control.wallet.balance",
+        "control.wallet.coins",
+        "control.wallet.peak",
+        "control.wallet.syncStatus",
+        "control.wallet.broadcast",
+    ];
+
+    /// **Proves (dig_ecosystem#1701, step 4):** removing node-side USER custody left the light
+    /// client served.
+    ///
+    /// Two facts, and both are needed. Membership in `CONTROL_METHODS` is what makes a method
+    /// DISCOVERABLE; membership in `OWNED_CONTROL_METHODS` is what routes it to a real arm of
+    /// `dispatch_owned` — whose `_` arm is `unreachable!()` by construction, so
+    /// `control_methods_partition_into_owned_and_delegated` below turns red if any owned name lost
+    /// its handler. Asserting discovery alone would pass over a method that resolves to nothing.
+    #[test]
+    fn the_light_client_chain_reads_survive_the_custody_carve_out() {
+        for m in LIGHT_CLIENT_READS {
+            assert!(
+                CONTROL_METHODS.contains(&m),
+                "{m} left the published control surface - the light client cannot find it"
+            );
+            assert!(
+                OWNED_CONTROL_METHODS.contains(&m),
+                "{m} is published but no longer routed to a handler in this shell"
+            );
+        }
+    }
+
+    /// **Proves the guard above is not blind to a removal**, by checking a name that is genuinely
+    /// absent behaves the way a dropped read would.
+    ///
+    /// Without this, `LIGHT_CLIENT_READS` could be quietly emptied or misspelled and the loop would
+    /// iterate over nothing (or over names no list was ever meant to hold) while reporting success.
+    #[test]
+    fn the_light_client_guard_would_notice_a_missing_read() {
+        assert_eq!(LIGHT_CLIENT_READS.len(), 5, "the guard must check all five");
+        assert!(
+            !CONTROL_METHODS.contains(&"control.wallet.aReadThatDoesNotExist"),
+            "the haystack must not contain arbitrary names, or the guard proves nothing"
+        );
+    }
+
     /// LOCKSTEP GATE (#711): [`dispatch_control`] resolves EXACTLY [`CONTROL_METHODS`] — the
     /// owned set it routes to `dispatch_owned` ([`OWNED_CONTROL_METHODS`]) plus the set it
     /// delegates to the node ([`DELEGATED_CONTROL_METHODS`]) — the two disjoint, and their union

@@ -60,7 +60,6 @@
 
 pub mod actions;
 pub mod arrivals;
-pub mod auth;
 pub mod chain;
 pub mod coverage;
 pub mod custody;
