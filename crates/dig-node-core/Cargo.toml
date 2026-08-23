@@ -23,7 +23,7 @@ name = "dig-node-core"
 # out-of-workspace implementor; this crate is consumed in-workspace only and is pre-1.0, so it is a
 # MINOR bump under SemVer's 0.x rule -- recorded here rather than letting the number imply the trait
 # surface held still.
-version = "0.51.0"
+version = "0.52.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -114,7 +114,7 @@ chia-query = "=0.5.1"
 # path keys + orders candidate addresses via `dig_ip::Family` and aggregates them source-tagged +
 # de-duplicated via `dig_ip::PeerCandidates` — never a hand-rolled family sort (epic #1020, #1032).
 # A leaf crate (no transitive DIG deps), so the crates.io release is used directly.
-dig-ip = "0.1"
+dig-ip = "0.1.2"
 # The canonical dig-app ⇄ dig-node IPC session/signing contract (engine role-half + wire types +
 # domain builders + frame bounds). SSOT shared with dig-app so the two halves can never drift (#1080).
 dig-ipc-protocol = "0.2"
@@ -132,7 +132,7 @@ serde_json = "1"
 # per-method tier) and the mTLS peer-reachability allowlist. dig-node-core reads its
 # method names + the peer allowlist from HERE (never hand-rolled) so the contract
 # cannot drift from the other node implementation or the discovery document (#1075).
-dig-rpc-protocol = "0.10"
+dig-rpc-protocol = "0.10.1"
 # The directed-message base protocol (epic #793/#796): the e2e seal/open pipeline + the typed envelope
 # the chat subsystem seals into. dig-node is the TRANSPORT — it seals an app-supplied opaque DIGCHAT1
 # envelope to the recipient's 0x0010 BLS identity key and dig-gossip directed-sends the sealed bytes.
@@ -312,7 +312,7 @@ dig-dht = "0.11.1"
 # to ONE copy across the graph; resolved to the tracked rev via the lockfile. dig-pex keeps a minimal
 # dependency surface (serde/serde_json/tokio/rand — it mirrors the address shape rather than importing
 # the transport crates), so there is no cross-crate type-unification concern here.
-dig-pex = "0.1"
+dig-pex = "0.1.1"
 # -- Multi-source content fetch (#164) + redirect-on-miss (#165) --------------------------------------
 # The node-side download orchestrator: locate holders via dig-dht `find_providers`, confirm with
 # `dig.getAvailability`, fan byte ranges across MULTIPLE providers simultaneously (`dig.fetchRange`
@@ -364,6 +364,10 @@ dig-peer = "0.11"
 # dig-nat/dig-dht types). The selector mirrors `dig_gossip::PoolEvent` LOCALLY (it does not depend on
 # dig-gossip, which lags as a git dep), so the node maps `dig_gossip::PoolEvent` → the selector's local
 # `PoolEvent` 1:1 (see `download.rs::pool_event_to_selector`).
+# NOT bumped to 0.9.1: that release moves onto `dig-tls` 0.4, and this crate still resolves 0.3
+# through `dig-nat`/`dig-gossip`, so the graph would carry TWO `dig_tls::PeerId` types that do not
+# unify (dig_ecosystem#3129 WU2 measured the split at `download.rs:4435`). It moves with the chia-0.36
+# cascade, not before it.
 dig-peer-selector = "0.9"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
@@ -381,7 +385,7 @@ dig-tls = "0.3"
 #
 # It also re-exports the ONE `CapsuleIdentity` the ecosystem speaks, so this crate never declares its
 # own and never pulls a second major of `dig-store` into the graph.
-dig-sex = "0.4"
+dig-sex = "0.5"
 # The cache/eviction SEAM `dig_sex::TieredPolicy` implements. Declared DIRECTLY rather than reached
 # through `dig-sex`, which re-exports `CapsuleIdentity` alone — naming `EvictionEntry`,
 # `EvictionContext` and the `EvictionPolicy` trait (whose `select_evictions` must be in scope to call)

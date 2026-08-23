@@ -3108,6 +3108,27 @@ can point at it. No new verb, address struct or result type is introduced — th
   **LEAF COUNT of the last hop only** and MUST NOT be quoted as the recruitment or the disclosure
   radius — it understates both by the intermediate hops. Against a full relay burst
   (`DEFAULT_RELAY_ASK_BURST` = 4) the figure for one requestor is `4 x 12` = **48**.
+- **WHICH peers are asked MUST be RANKED, never a prefix of the pool (dig_ecosystem#3129).** The
+  fan-out is selected by `dig_sex::routing::select_fan_out` from this node's own observations of how
+  each pool peer has answered previous forwarded asks. Taking a prefix of the connected-pool map is
+  forbidden: the map's iteration order is arbitrary but STABLE, so a prefix is a fixed arbitrary
+  sample and the same handful of peers would absorb every forwarded ask for the life of the process.
+  A slot in each fan-out of two or more is reserved for a peer this node has never observed, so every
+  pool member can earn a score.
+
+  **The routing identity MUST be the VERIFIED mTLS session identity** — `SHA-256(peer-cert SPKI DER)`,
+  the `peer_id` this node's own handshake produced — and MUST NOT be derived from any value a peer
+  supplied: not an address, not a provider record, not a dig-dht `Contact`, not any field of any
+  frame. **The observations MUST be caller-observed**: the outcome and the latency of an exchange THIS
+  node issued and saw complete, never a quality a peer asserted about itself. A router that rewards
+  novelty while letting a peer choose its own identity or its own score is an eclipse attack — a
+  hostile peer claims a neighbourhood engineered to look maximally novel and attracts every query
+  (NC-12).
+
+  Observations are node-local: never gossiped, never persisted across a restart, and keyed ONLY by
+  peers presently in the connected pool. Pool membership is the liveness gate, so they carry no TTL
+  and are dropped the moment the pool drops the peer — which is also what keeps the store from being
+  keyed by untrusted input.
 - **Self MUST be excluded from the ANSWER as well as from the fan-out.** These are two rules, and the
   fan-out exclusion does not imply the other: a peer is free to ANSWER with a record naming this node.
   Every source feeding the merged answer — DHT and forwarded alike — MUST be filtered against this
