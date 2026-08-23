@@ -368,7 +368,9 @@ impl UnlockAuth {
     /// and HOLDS the signer for the session (bound to its wallet). In the DEFAULT `per_transaction`
     /// mode NO signer is loaded. A wrong/expired/replayed credential is denied (`401`), leaves the
     /// state unchanged, and loads nothing.
-    #[deprecated(note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers.")]
+    #[deprecated(
+        note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers."
+    )]
     pub fn unlock(&self, id: Option<&str>, cred: &Credential) -> Result<AuthStatus> {
         self.verify(id, cred)?;
         let mode = self.mode();
@@ -392,7 +394,9 @@ impl UnlockAuth {
     /// ([`Self::consume_sign_grant`] drops it after one op). Required for every signature in the
     /// DEFAULT `per_transaction` mode. A wrong/expired/replayed credential is denied (`401`) and arms
     /// nothing.
-    #[deprecated(note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers.")]
+    #[deprecated(
+        note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers."
+    )]
     pub fn sign_unlock(&self, id: Option<&str>, cred: &Credential) -> Result<AuthStatus> {
         self.verify(id, cred)?;
         let grant = self.build_bound_signer(id, &cred.password)?;

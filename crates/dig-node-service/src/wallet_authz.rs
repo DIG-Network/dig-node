@@ -58,7 +58,9 @@ pub const CUSTODY_PREFIX: &str = "wallet.";
 /// `auth.lock`, `auth.get_method`. EVERY `auth.*` method is paired-token gated (§7.12) — even the
 /// reads reveal the auth posture (mode/method/session state), and `unlock`/`sign_unlock` gate the
 /// node-custodied signer — so a new auth method is gated the moment it lands under `auth.*`.
-#[deprecated(note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers.")]
+#[deprecated(
+    note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers."
+)]
 pub const AUTH_PREFIX: &str = "auth.";
 
 /// Wallet MUTATION methods that MUST be authorized (§7.12): they sign, spend, broadcast, or change

@@ -1431,7 +1431,10 @@ mod tests {
             ),
             (
                 "public_method_names() (the rpc.dig.net-facing view)",
-                public_method_names().iter().map(|n| n.to_string()).collect(),
+                public_method_names()
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect(),
             ),
             ("the OpenRPC document", method_names_disclosed_by(&openrpc)),
             (
