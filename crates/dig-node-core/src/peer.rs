@@ -3295,6 +3295,7 @@ pub(crate) mod tests {
             root: root.to_string(),
             size_bytes: size,
             last_used_unix_ms: mtime,
+            provenance: crate::CapsuleProvenance::Held,
         }
     }
 

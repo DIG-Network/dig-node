@@ -10,4 +10,8 @@ pub(crate) mod push_capsule;
 
 pub use capsule_download::{download_capsule_via_rpc, CAPSULE_WINDOW_BYTES, MAX_CAPSULE_BYTES};
 pub use capsule_store::CapsuleStore;
+/// The inventory scan itself, so a test can drive the REAL disk-to-announce-set derivation rather
+/// than a re-implementation of it.
+#[cfg(test)]
+pub(crate) use capsule_store::list_cached_capsules;
 pub(crate) use push_capsule::{push_open_enabled, PUSH_CAPSULE_METHOD};

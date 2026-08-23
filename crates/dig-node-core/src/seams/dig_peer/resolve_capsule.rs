@@ -189,6 +189,7 @@ mod tests {
             root: hex::encode(root),
             size_bytes,
             last_used_unix_ms: 0,
+            provenance: crate::CapsuleProvenance::Held,
         }
     }
 
@@ -304,6 +305,7 @@ mod tests {
                 root: "garbage".to_string(),
                 size_bytes: 1,
                 last_used_unix_ms: 0,
+                provenance: crate::CapsuleProvenance::Held,
             },
             held(store, root, 5),
         ];

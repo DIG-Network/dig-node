@@ -363,11 +363,24 @@ fn malformed_request_response(e: &serde_json::Error) -> DhtResponse {
 /// Returns 64-hex-keyed [`dig_dht::ContentId`]s; a malformed (non-64-hex) store/root in the inventory
 /// is skipped (it can never be a valid content key). Pure over the cached list so it is unit-tested
 /// without a node or a disk.
+///
+/// # RELAYED capsules are dropped here, and this is the only place they need to be
+///
+/// A [`CapsuleProvenance::Relayed`](crate::CapsuleProvenance) capsule is held on a stranger's behalf and
+/// must never be advertised (dig-node#276). This function is the ONE mapping from inventory to
+/// announceable ids — the DHT reconcile ([`reconcile_provider_records`]), the bring-up announce, and the
+/// opcode-222 holdings flood all derive their ids from it — so filtering here suppresses a relayed
+/// capsule across every announce cause, including causes that know nothing about the relay and causes
+/// that do not exist yet. Suppressing the CALL that happened to follow a relayed pull would not: the
+/// announce set is rebuilt from disk, so the next unrelated reconcile would advertise it anyway.
 pub fn inventory_content_ids(cached: &[CachedCapsule]) -> Vec<dig_dht::ContentId> {
     use std::collections::BTreeSet;
     let mut out = Vec::new();
     let mut seen_stores: BTreeSet<[u8; 32]> = BTreeSet::new();
     for c in cached {
+        if c.provenance == crate::CapsuleProvenance::Relayed {
+            continue; // held for a stranger: servable, never advertised
+        }
         let (Some(store), Some(root)) = (hex64(&c.store_id), hex64(&c.root)) else {
             continue; // skip a malformed inventory entry (never a valid content key)
         };
@@ -926,11 +939,17 @@ mod tests {
     }
 
     fn cap(store: &str, root: &str) -> CachedCapsule {
+        cap_with(store, root, crate::CapsuleProvenance::Held)
+    }
+
+    /// A cached capsule with an explicit provenance — the relay-suppression cases need `Relayed`.
+    fn cap_with(store: &str, root: &str, provenance: crate::CapsuleProvenance) -> CachedCapsule {
         CachedCapsule {
             store_id: store.to_string(),
             root: root.to_string(),
             size_bytes: 1,
             last_used_unix_ms: 1,
+            provenance,
         }
     }
 

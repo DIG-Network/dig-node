@@ -62,6 +62,39 @@ pub(crate) const CACHED_MODULE_EXT: &str = "dig";
 /// the fallback is only ever exercised on a not-yet-migrated cache.
 pub(crate) const LEGACY_MODULE_EXT: &str = "module";
 
+/// The extension of the sidecar that marks a cached capsule as RELAYED — held on a stranger's behalf,
+/// never advertised (dig-node#276).
+///
+/// A SIDECAR rather than a field inside the capsule, because the capsule's bytes are content-addressed:
+/// they are byte-identical whether this node pulled them for itself or for someone else, so the
+/// distinction cannot live inside them. It sits beside the module as `<root>.relay`, which
+/// [`cached_root_stem`] does not accept — so the marker is invisible to the inventory scan as a capsule
+/// while being visible to it as a PROPERTY of one.
+pub(crate) const RELAY_MARKER_EXT: &str = "relay";
+
+/// The relay-marker sidecar that belongs beside the cached capsule at `module_path`.
+///
+/// Derived from the module path rather than from a [`CapsuleKey`] so the disk scan — which has a path
+/// and no key — and the writer — which has a key and no scan — compute the SAME name from one authority.
+/// Extension-independent: a legacy `.module` capsule and a current `.dig` one share the marker name, so
+/// the #1896 migration can never orphan a suppression.
+pub(crate) fn relay_marker_beside(module_path: &Path) -> Option<PathBuf> {
+    let stem = cached_root_stem(module_path.file_name()?.to_str()?)?;
+    Some(module_path.with_file_name(format!("{stem}.{RELAY_MARKER_EXT}")))
+}
+
+/// Delete the relay marker beside `module_path`, if there is one.
+///
+/// Called wherever a cached module is unlinked, so a marker can never outlive the capsule it describes.
+/// An orphan marker would silently suppress the announce of a LATER, genuinely-held acquisition of the
+/// same generation; binding the two lifetimes together makes that state unreachable rather than merely
+/// unlikely. Best-effort: a failed unlink is not worth failing an eviction over.
+pub(crate) fn discard_relay_marker_beside(module_path: &Path) {
+    if let Some(marker) = relay_marker_beside(module_path) {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
 /// Strip the cached-capsule extension — the current `.dig` or the legacy `.module` (#1896) — from a
 /// file name, yielding its `<root_hex>` stem, or `None` if the name is not a cached capsule.
 ///

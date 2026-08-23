@@ -400,6 +400,7 @@ async fn startup_announce_publishes_every_held_capsule() {
         root: root.clone(),
         size_bytes: 10,
         last_used_unix_ms: 1,
+        provenance: dig_node_core::CapsuleProvenance::Held,
     }];
     let ids = inventory_content_ids(&cached);
     let n = announce_inventory_ids(&holder, &ids, INITIAL_ANNOUNCE_CONCURRENCY).await;
@@ -487,6 +488,7 @@ fn caller_contact_and_inventory_helpers_are_consistent() {
         root: "dd".repeat(32),
         size_bytes: 1,
         last_used_unix_ms: 1,
+        provenance: dig_node_core::CapsuleProvenance::Held,
     }];
     assert_eq!(inventory_content_ids(&cached).len(), 2);
 }

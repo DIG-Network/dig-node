@@ -2163,6 +2163,8 @@ impl Node {
                 .map(|(_, _, s)| *s)
                 .unwrap_or(0);
             if std::fs::remove_file(&victim).is_ok() {
+                // A relay marker never outlives its capsule (dig-node#276).
+                crate::capsule_key::discard_relay_marker_beside(&victim);
                 // #279 telemetry: record the LRU eviction (count + reclaimed bytes).
                 CACHE_EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 CACHE_EVICTED_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
@@ -2373,6 +2375,8 @@ impl Node {
             };
             let (victim, store_hex, size) = (&module.path, &module.store_hex, module.size_bytes);
             if std::fs::remove_file(victim).is_ok() {
+                // A relay marker never outlives its capsule (dig-node#276).
+                crate::capsule_key::discard_relay_marker_beside(victim);
                 CACHE_EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 CACHE_EVICTED_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
                 // Drop any decoded content for the evicted generation so a removed module is never
@@ -4076,6 +4080,27 @@ struct CachedModule {
     size_bytes: u64,
 }
 
+/// WHY this node holds a cached capsule — and therefore whether it may advertise it (dig-node#276).
+///
+/// Holding and ADVERTISING are different claims, and only this distinguishes them. A relay pulls a whole
+/// capsule on a stranger's behalf: the bytes are as verified as any other (same chain anchor, same merkle
+/// proof, same promote-recheck), and they are cached so the relayed windows are served from the ordinary
+/// holder path. What must never follow is this node telling the network it is a source of content a
+/// stranger chose — that is the amplification primitive the `origin != Local` reshare refusal exists to
+/// close, reopened one level up.
+///
+/// An enum rather than a `bool`, and a REQUIRED field rather than a defaulted one, so every construction
+/// site has to name which of the two it is. A future inventory producer cannot inherit "announce me" by
+/// omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CapsuleProvenance {
+    /// Pulled for this node's own sake. A genuine, willing holder — announceable.
+    Held,
+    /// Pulled on a stranger's behalf. Cached and servable, but NEVER advertised.
+    Relayed,
+}
+
 /// One cached capsule, as returned by [`Node::cache_list_cached`]. Identity is the
 /// `(store_id, root)` capsule (`digstore_core::Capsule`, `storeId:rootHash`).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -4088,6 +4113,12 @@ pub struct CachedCapsule {
     pub size_bytes: u64,
     /// Last-used time (file mtime, the LRU recency stamp) in Unix epoch ms.
     pub last_used_unix_ms: u64,
+    /// Whether this node may ADVERTISE the capsule, or merely serve it (dig-node#276).
+    ///
+    /// Read from the durable `<root>.relay` sidecar by the one disk scan that produces this type, so it
+    /// describes the ARTIFACT and not the call that happened to produce this list. That is what makes
+    /// suppression survive across unrelated announce causes — see [`CapsuleProvenance`].
+    pub provenance: CapsuleProvenance,
 }
 
 /// Bump a file's mtime to "now" so the LRU treats it as freshly used.

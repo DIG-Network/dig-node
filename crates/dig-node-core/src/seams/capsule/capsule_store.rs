@@ -25,7 +25,7 @@ use crate::{module_exists, CachedCapsule, Node};
 /// async worker: on a network-mounted cache each of those is a round trip. It reads only directory
 /// metadata (name, size, mtime) and never opens a capsule's bytes, so its cost is exactly one `stat`
 /// per held generation.
-fn list_cached_capsules(modules_root: &std::path::Path) -> Vec<CachedCapsule> {
+pub(crate) fn list_cached_capsules(modules_root: &std::path::Path) -> Vec<CachedCapsule> {
     let mut out = Vec::new();
     // Outer level: one directory per store id (hex). Inner: `<root>.dig` (or a legacy `<root>.module`).
     let Ok(stores) = std::fs::read_dir(modules_root) else {
@@ -61,11 +61,20 @@ fn list_cached_capsules(modules_root: &std::path::Path) -> Vec<CachedCapsule> {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            // Provenance is read HERE, from the durable `<root>.relay` sidecar beside the module, and
+            // nowhere else: this scan is the only producer of `CachedCapsule` in production, so every
+            // consumer of the inventory — every announce cause, whatever triggered it — sees the same
+            // answer the artifact itself carries (dig-node#276).
+            let provenance = match crate::capsule_key::relay_marker_beside(&path) {
+                Some(marker) if marker.exists() => crate::CapsuleProvenance::Relayed,
+                _ => crate::CapsuleProvenance::Held,
+            };
             out.push(CachedCapsule {
                 store_id: store_hex.clone(),
                 root: root_hex,
                 size_bytes: md.len(),
                 last_used_unix_ms,
+                provenance,
             });
         }
     }
@@ -236,6 +245,9 @@ impl CapsuleStore for Node {
             return Err("refusing to remove a path outside the cache dir".to_string());
         }
         std::fs::remove_file(&canon).map_err(|e| e.to_string())?;
+        // The marker's lifetime is the module's (dig-node#276): left behind, it would suppress the
+        // announce of a later, genuinely-held re-acquisition of this same generation.
+        crate::capsule_key::discard_relay_marker_beside(&canon);
         // Drop any in-memory decoded content for this capsule so a removed module can never still be
         // served from the content cache (audit #179).
         self.invalidate_content_cache(store_id_hex, root_hex);
