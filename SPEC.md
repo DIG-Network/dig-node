@@ -6311,7 +6311,18 @@ convergence only — it is NOT a change to the immutable `.dig` byte format (§5
   would withhold nothing while breaking the requestor's own fetch. The resolve answer is therefore
   derived from the CACHE INVENTORY, which is deliberately broader than the announce set; a key this
   node does not hold MUST be absent from the answer rather than an error.
-- A failed pull MUST leave no staging artifact behind that a later run could mistake for progress.
+- **A failed pull's staging is kept or erased BY FAILURE KIND, never unconditionally.** A pull that
+  failed VERIFICATION — the whole-blob hash gate or the chain-anchor gate — MUST erase its staging
+  artifacts: those bytes are attributable only to a descriptor that has been proven false, and leaving
+  them would let a hostile holder plant bytes that a later honest range completes around. A pull that
+  failed for any other reason — a severed link, a stalled or exhausted holder set, a local disk or
+  state-store fault — MUST PRESERVE its staging artifacts and its resume checkpoint together, so the
+  next pull of the same generation re-fetches only the missing chunks. Preserving them is safe because
+  every staged chunk is re-attributed against the descriptor's per-chunk hash before it is adopted on
+  resume and re-fetched if it fails; erasing them unconditionally makes resume unreachable, which is
+  measurable only as a byte count, since the retry still succeeds while paying for the whole capsule
+  again. A partial that is preserved MUST NOT be promoted, announced, or counted as progress by any
+  path other than a resume of the same generation.
 - **Abandoned staging MUST be reaped, and total staging MUST be bounded in bytes.** A pull whose process
   dies mid-flight cannot clean up after itself, so the node MUST sweep the capsule-staging directory
   (`<downloads>/modules`, a SUBDIRECTORY — a sweep of the parent directory alone does not reach it) on

@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.144.1] - 2026-08-23
+
+### Features
+- **custody:** Carve node-side USER custody out of dig-node (#326)
+
+### Bug Fixes
+- **reshare:** Keep a severed capsule pull's partial so the retry resumes (#330)
+
 ## [0.143.1] - 2026-08-23
 
 ### Features
