@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.142.0] - 2026-08-23
+
+### Bug Fixes
+- **warm:** Surface the pull's real cause and bound the descriptor ask with a ladder (#319)
+
 ## [0.141.0] - 2026-08-23
 
 ### Features
