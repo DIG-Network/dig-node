@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.138.1] - 2026-08-23
+
+### Build
+- **deps:** Uplift dig-wallet onto chia-wallet-sdk 0.34 / chia 0.36.1 (#309)
+
 ## [0.138.0] - 2026-08-22
 
 ### Features
