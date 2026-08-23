@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.140.0] - 2026-08-23
+
+### Features
+- **routing:** Rank the forwarded ask by locally-observed answer quality (#311)- **relay:** Module-granularity onion relay leg + absence-safe locator readers (#299)
+
 ## [0.138.1] - 2026-08-23
 
 ### Build
