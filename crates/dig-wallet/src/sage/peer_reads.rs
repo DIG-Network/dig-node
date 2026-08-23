@@ -64,7 +64,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chia::protocol::Bytes32;
+use chia_protocol::Bytes32;
 
 use super::db::{ChainReadCacheRow, ChainSpendCacheRow, WalletDb};
 use super::fallback::{FallbackCoin, FallbackCoinSpend};
@@ -457,7 +457,7 @@ fn bind_fields_to_key(
     key: &str,
     what: &str,
 ) -> Result<()> {
-    let coin = chia::protocol::Coin {
+    let coin = chia_protocol::Coin {
         parent_coin_info: parse_coin_id(&normalized(parent_coin_info))?,
         puzzle_hash: parse_coin_id(&normalized(puzzle_hash))?,
         amount,

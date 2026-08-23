@@ -3445,7 +3445,7 @@ fn parse_vault_config(
 
 /// Parse a 33-byte secp256k1 (K1) public key from hex (`0x`-prefixed or bare). Pure so
 /// the parse/validation is unit-tested independently of HTTP.
-fn parse_k1_pubkey(s: &str) -> Result<chia::secp::K1PublicKey, (StatusCode, String)> {
+fn parse_k1_pubkey(s: &str) -> Result<chia_secp::K1PublicKey, (StatusCode, String)> {
     let hex = s.trim().trim_start_matches("0x");
     let bytes = hex::decode(hex).map_err(|_| {
         wc_err(
@@ -3459,7 +3459,7 @@ fn parse_k1_pubkey(s: &str) -> Result<chia::secp::K1PublicKey, (StatusCode, Stri
             format!("K1 pubkey must be 33 bytes: {s}"),
         )
     })?;
-    chia::secp::K1PublicKey::from_bytes(&arr)
+    chia_secp::K1PublicKey::from_bytes(&arr)
         .map_err(|e| wc_err(StatusCode::BAD_REQUEST, format!("invalid K1 pubkey: {e}")))
 }
 
@@ -3553,7 +3553,7 @@ fn parse_mint_spec(
     params: &serde_json::Value,
     default_owner_ph: chia_protocol::Bytes32,
 ) -> Result<digstore_chain::nft::MintSpec, (StatusCode, String)> {
-    use chia::puzzles::nft::NftMetadata;
+    use chia_puzzle_types::nft::NftMetadata;
     use chia_wallet_sdk::driver::SpendContext;
 
     let md = params

@@ -19,8 +19,8 @@
 //! wallet). Because Chia enforces conservation over the whole bundle, the launcher value
 //! flows from the funding coin through the aggregate.
 
-use chia::puzzles::nft::NftMetadata;
-use chia::puzzles::Memos;
+use chia_puzzle_types::nft::NftMetadata;
+use chia_puzzle_types::Memos;
 use chia_protocol::{Bytes32, Coin, CoinSpend};
 use chia_wallet_sdk::driver::{
     Did, IntermediateLauncher, Launcher, Nft, NftMint as SdkNftMint, SingletonInfo, SpendContext,
@@ -324,7 +324,7 @@ mod tests {
     use chia_wallet_sdk::driver::SpendContext as Ctx;
     use chia_wallet_sdk::types::TESTNET11_CONSTANTS;
 
-    fn signer_for(sk: chia::bls::SecretKey) -> WalletSigner {
+    fn signer_for(sk: chia_bls::SecretKey) -> WalletSigner {
         WalletSigner::new(vec![sk], TESTNET11_CONSTANTS.agg_sig_me_additional_data)
     }
 
@@ -406,7 +406,7 @@ mod tests {
     /// then build+validate+broadcast a transfer to a second address.
     #[test]
     fn transfer_nft_builds_validates_and_broadcasts_on_simulator() {
-        use chia::traits::Streamable;
+        use chia_traits::Streamable;
         let mut sim = Simulator::new();
         let alice = sim.bls(2);
         let signer = signer_for(alice.sk.clone());

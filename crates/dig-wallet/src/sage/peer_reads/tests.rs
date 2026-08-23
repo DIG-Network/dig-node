@@ -36,7 +36,7 @@ const FIXTURE_PUZZLE_HASH: &str = "cc";
 /// the real check is a fixture that hides the check going missing.
 fn coin_id_for(amount: u64) -> String {
     hex::encode(
-        chia::protocol::Coin {
+        chia_protocol::Coin {
             parent_coin_info: hex32(&FIXTURE_PARENT.repeat(32)),
             puzzle_hash: hex32(&FIXTURE_PUZZLE_HASH.repeat(32)),
             amount,
@@ -49,7 +49,7 @@ fn coin_id_for(amount: u64) -> String {
 /// records' `cc..`, so it is a different coin.
 fn spend_coin_id() -> String {
     hex::encode(
-        chia::protocol::Coin {
+        chia_protocol::Coin {
             parent_coin_info: hex32(&FIXTURE_PARENT.repeat(32)),
             puzzle_hash: hex32(&reveal_tree_hash(REVEAL)),
             amount: 1,
@@ -119,7 +119,7 @@ const REVEAL: &str = "80";
 /// either half is edited, and the drift shows up as an unrelated-looking parse failure.
 fn reveal_tree_hash(reveal: &str) -> String {
     let bytes = hex::decode(reveal).expect("the fixture reveal is hex");
-    let hash = chia::clvm_utils::tree_hash_from_bytes(&bytes).expect("the fixture reveal is CLVM");
+    let hash = clvm_utils::tree_hash_from_bytes(&bytes).expect("the fixture reveal is CLVM");
     hex::encode(hash.to_bytes())
 }
 

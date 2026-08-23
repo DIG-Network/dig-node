@@ -19,7 +19,7 @@ use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use serde::Serialize;
 use serde_json::Value;
 
-use chia::bls::PublicKey;
+use chia_bls::PublicKey;
 use chia_wallet_sdk::driver::Cat;
 use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
 
@@ -5109,16 +5109,16 @@ mod tests {
     ///
     /// Deliberately NOT `owned_ph`'s key: the enrolled address and the derivation-backed address
     /// must never coincide, or the control test below could pass for the wrong reason.
-    fn enrolled_key() -> chia::bls::PublicKey {
+    fn enrolled_key() -> chia_bls::PublicKey {
         let mut seed = [0u8; 64];
         seed[0] = 77;
-        chia::bls::SecretKey::from_seed(&seed).public_key()
+        chia_bls::SecretKey::from_seed(&seed).public_key()
     }
 
     /// A registry holding exactly `key`, backed by a temp dir the caller must keep alive — the
     /// registry persists to a file, so a dropped dir would take the registration with it.
     fn registry_with_key(
-        key: &chia::bls::PublicKey,
+        key: &chia_bls::PublicKey,
     ) -> (super::super::watchlist::WatchRegistry, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let registry = super::super::watchlist::WatchRegistry::new(dir.path());
@@ -5678,13 +5678,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A second enrollable key, distinct from [`enrolled_key`] — the K2 of the ticket's sequence.
-    fn second_enrolled_key() -> chia::bls::PublicKey {
+    fn second_enrolled_key() -> chia_bls::PublicKey {
         let mut seed = [0u8; 64];
         seed[0] = 91;
-        chia::bls::SecretKey::from_seed(&seed).public_key()
+        chia_bls::SecretKey::from_seed(&seed).public_key()
     }
 
-    fn address_of(key: &chia::bls::PublicKey) -> String {
+    fn address_of(key: &chia_bls::PublicKey) -> String {
         let ph = normalize_ph(&hex::encode(
             super::super::sync_supervisor::puzzle_hash_for(key),
         ));
@@ -5697,7 +5697,7 @@ mod tests {
     /// There is deliberately no helper that latches the flag WITHOUT a covered set. That
     /// combination is the defect, and a fixture able to express it invites a test that pins the old
     /// behaviour back into place.
-    async fn complete_catch_up_over(db: &WalletDb, covered: &[chia::bls::PublicKey]) {
+    async fn complete_catch_up_over(db: &WalletDb, covered: &[chia_bls::PublicKey]) {
         let phs: Vec<_> = covered
             .iter()
             .map(super::super::sync_supervisor::puzzle_hash_for)
@@ -7512,7 +7512,7 @@ mod tests {
 
     // ---- the node's own money stays behind the live-broadcast flag (18.12) ----------
 
-    use chia::puzzles::Memos;
+    use chia_puzzle_types::Memos;
     use chia_sdk_test::Simulator;
     use chia_wallet_sdk::driver::{Cat as SdkCat, Launcher, SpendContext, StandardLayer};
     use chia_wallet_sdk::types::Conditions;
@@ -7528,7 +7528,7 @@ mod tests {
 
     /// The standard p2 puzzle hash a coin owned by `pk` sits at.
     fn p2_hash(pk: PublicKey) -> Bytes32 {
-        Bytes32::from(chia::puzzles::standard::StandardArgs::curry_tree_hash(pk).to_bytes())
+        Bytes32::from(chia_puzzle_types::standard::StandardArgs::curry_tree_hash(pk).to_bytes())
     }
 
     /// Render built [`CoinSpend`]s in the JSON form `sign_coin_spends` takes.
@@ -7628,7 +7628,7 @@ mod tests {
     /// Signs for testnet11 because the wrapped fixtures are built on the simulator, whose
     /// consensus verifies the aggregate signature — so a bundle that reaches the guard here is one
     /// the network would really have accepted, not one that merely looks like a spend.
-    async fn push_backend(sk: chia::bls::SecretKey, pusher: Arc<FakePusher>) -> WalletBackend {
+    async fn push_backend(sk: chia_bls::SecretKey, pusher: Arc<FakePusher>) -> WalletBackend {
         let signer = Arc::new(WalletSigner::new(
             vec![sk],
             TESTNET11_CONSTANTS.agg_sig_me_additional_data,
@@ -7753,7 +7753,7 @@ mod tests {
             super::super::chain::decode_signed_bundle(&own)
                 .unwrap()
                 .aggregated_signature,
-            chia::bls::Signature::default(),
+            chia_bls::Signature::default(),
             "the node really signed it -- an unsigned bundle would refute nothing"
         );
         assert_eq!(
@@ -9410,7 +9410,7 @@ mod tests {
     #[tokio::test]
     async fn get_cats_returns_cat_tail_after_synced_cat_coin() {
         use super::super::singleton::{reconstruct_coins, LineageSource, ParentSpend};
-        use chia::traits::Streamable;
+        use chia_traits::Streamable;
         use chia_sdk_test::Simulator;
         use chia_wallet_sdk::driver::{
             Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer,
@@ -9549,7 +9549,7 @@ mod tests {
         use super::super::fallback::ChainFallback;
         use super::super::singleton::{LineageSource, ParentSpend};
         use super::super::spend::{self, MockBroadcaster, WalletSigner};
-        use chia::traits::Streamable;
+        use chia_traits::Streamable;
         use chia_sdk_test::Simulator;
         use chia_wallet_sdk::driver::{
             Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer,

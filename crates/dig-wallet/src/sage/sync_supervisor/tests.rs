@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use chia::protocol::{Message, NewPeakWallet, ProtocolMessageTypes, RespondPuzzleState};
+use chia_protocol::{Message, NewPeakWallet, ProtocolMessageTypes, RespondPuzzleState};
 
 use super::*;
 use crate::sage::fallback::ChainPeerTier;
@@ -686,7 +686,7 @@ fn peak_message(height: u32) -> Message {
     Message {
         msg_type: ProtocolMessageTypes::NewPeakWallet,
         id: None,
-        data: chia::traits::Streamable::to_bytes(&peak).unwrap().into(),
+        data: chia_traits::Streamable::to_bytes(&peak).unwrap().into(),
     }
 }
 
@@ -3482,10 +3482,10 @@ async fn repeated_contradiction_climbs_the_existing_backoff() {
 // ---------------------------------------------------------------------------
 
 /// A distinct, valid G1 key per `tag`, standing in for a key dig-app registered.
-fn registered_key(tag: u8) -> chia::bls::PublicKey {
+fn registered_key(tag: u8) -> chia_bls::PublicKey {
     let mut seed = [0u8; 64];
     seed[0] = tag;
-    chia::bls::SecretKey::from_seed(&seed).public_key()
+    chia_bls::SecretKey::from_seed(&seed).public_key()
 }
 
 /// **Proves (#2823):** the §908 install — an account in dig-app, NO seed on the node — reaches a

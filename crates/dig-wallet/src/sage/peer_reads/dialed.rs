@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use chia::protocol::Bytes32;
+use chia_protocol::Bytes32;
 
 use super::super::fallback::{FallbackCoin, FallbackCoinSpend};
 use super::super::quorum;
@@ -68,7 +68,7 @@ impl ChiaCoinPeer {
     /// The `false` is `include_spent_coins`-as-subscription: this asks for the coin's state
     /// without subscribing to it, which is what an arbitrary read wants — a subscription would
     /// make every coin a profile walk touches a permanent obligation of the peer.
-    async fn coin_state(&self, coin_id: Bytes32) -> Result<Option<chia::protocol::CoinState>> {
+    async fn coin_state(&self, coin_id: Bytes32) -> Result<Option<chia_protocol::CoinState>> {
         let response = tokio::time::timeout(
             PEER_TIMEOUT,
             self.peer

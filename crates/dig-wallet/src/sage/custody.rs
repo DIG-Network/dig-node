@@ -58,12 +58,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chia::bls::{
+use chia_bls::{
     master_to_wallet_hardened_intermediate, master_to_wallet_unhardened_intermediate, DerivableKey,
     PublicKey, SecretKey,
 };
-use chia::puzzles::standard::StandardArgs;
-use chia::puzzles::DeriveSynthetic;
+use chia_puzzle_types::standard::StandardArgs;
+use chia_puzzle_types::DeriveSynthetic;
 use chia_protocol::Bytes32;
 use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
 use digstore_chain::keys::{derive_wallet_keys, owner_address};
@@ -1166,7 +1166,7 @@ fn restrict_permissions(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia::bls::master_to_wallet_hardened;
+    use chia_bls::master_to_wallet_hardened;
     use digstore_chain::keys::derive_indexed_keys;
 
     /// The canonical BIP-39 test vector ("abandon…art") — a KNOWN mnemonic so an import→unlock
@@ -1884,7 +1884,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement, not an assertion; run with --ignored --nocapture to re-check"]
     fn measure_derivation_breakdown() {
-        use chia::bls::{
+        use chia_bls::{
             master_to_wallet_hardened_intermediate, master_to_wallet_unhardened_intermediate,
             DerivableKey,
         };

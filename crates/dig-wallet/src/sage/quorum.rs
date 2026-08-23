@@ -765,7 +765,7 @@ pub enum SelfVerifying {
 /// computes `coin.coin_id()` — so this is a check the code satisfies structurally. It exists as a
 /// named function so the property is pinned by a test instead of relying on nobody ever
 /// introducing a `claimed_id` field.
-pub fn coin_id_is_derived_not_trusted(coin: &chia::protocol::Coin, claimed: Bytes32) -> bool {
+pub fn coin_id_is_derived_not_trusted(coin: &chia_protocol::Coin, claimed: Bytes32) -> bool {
     coin.coin_id() == claimed
 }
 

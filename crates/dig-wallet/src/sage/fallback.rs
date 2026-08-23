@@ -36,7 +36,7 @@ pub(crate) fn verified_reveal_hex(puzzle_reveal: &str, puzzle_hash: &str) -> Res
     let reveal_hex = norm(puzzle_reveal);
     let bytes = hex::decode(&reveal_hex)
         .map_err(|e| Error::internal(format!("spend read: puzzle_reveal hex: {e}")))?;
-    let tree_hash = chia::clvm_utils::tree_hash_from_bytes(&bytes).map_err(|e| {
+    let tree_hash = clvm_utils::tree_hash_from_bytes(&bytes).map_err(|e| {
         Error::internal(format!(
             "spend read: puzzle_reveal is not a parseable CLVM program: {e}"
         ))

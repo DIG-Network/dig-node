@@ -48,8 +48,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use chia::bls::PublicKey;
-use chia::puzzles::standard::StandardArgs;
+use chia_bls::PublicKey;
+use chia_puzzle_types::standard::StandardArgs;
 use chia_protocol::Bytes32;
 
 use super::custody::WalletCustody;
@@ -2069,7 +2069,7 @@ where
 /// HEIGHTS — to exclude the badly-lagged, and to settle the height everyone is then asked about —
 /// and never reaches the replica.
 async fn await_peak(
-    mut receiver: tokio::sync::mpsc::Receiver<chia::protocol::Message>,
+    mut receiver: tokio::sync::mpsc::Receiver<chia_protocol::Message>,
     timeout: Duration,
 ) -> Option<quorum::PeakClaim> {
     let deadline = tokio::time::sleep(timeout);
@@ -2079,9 +2079,9 @@ async fn await_peak(
             () = &mut deadline => return None,
             message = receiver.recv() => {
                 let message = message?;
-                if message.msg_type == chia::protocol::ProtocolMessageTypes::NewPeakWallet {
+                if message.msg_type == chia_protocol::ProtocolMessageTypes::NewPeakWallet {
                     let peak =
-                        <chia::protocol::NewPeakWallet as chia::traits::Streamable>::from_bytes(
+                        <chia_protocol::NewPeakWallet as chia_traits::Streamable>::from_bytes(
                             &message.data,
                         )
                         .ok()?;
@@ -2174,7 +2174,7 @@ async fn header_hash_from(
     peer: &chia_wallet_sdk::client::Peer,
     height: u32,
 ) -> Result<Option<Bytes32>, SyncError> {
-    use chia::protocol::{RejectHeaderRequest, RequestBlockHeader, RespondBlockHeader};
+    use chia_protocol::{RejectHeaderRequest, RequestBlockHeader, RespondBlockHeader};
 
     let response = peer
         .request_fallible::<RespondBlockHeader, RejectHeaderRequest, _>(RequestBlockHeader::new(
@@ -2198,7 +2198,7 @@ struct ChiaPeerSession {
     trust: PeerTrust,
     /// Taken by [`SyncSession::run`]. Behind a mutex only because the trait's `catch_up` takes
     /// `&self`; exactly one `run` ever consumes it.
-    receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<chia::protocol::Message>>>,
+    receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<chia_protocol::Message>>>,
 }
 
 #[async_trait::async_trait]
