@@ -135,7 +135,7 @@ impl DiscoveryCache for RecordingCache {
 
 /// A provider record for the peer numbered `n`, keyed to `content` — the same shape dig-download's
 /// testkit mints, but for an arbitrary content id.
-fn provider(n: u8, content: &ContentId) -> ProviderRecord {
+pub(crate) fn provider(n: u8, content: &ContentId) -> ProviderRecord {
     ProviderRecord::new(
         &content.to_key(),
         &PeerId::from_bytes([n; 32]),
@@ -144,8 +144,20 @@ fn provider(n: u8, content: &ContentId) -> ProviderRecord {
     )
 }
 
-fn content() -> ContentId {
+pub(crate) fn content() -> ContentId {
     ContentId::resource([0xC0; 32], [0xC1; 32], [0xC2; 32])
+}
+
+/// An engine wired for a ROUTING test: no DHT findings at all, so the answer is whatever the
+/// forwarded leg produces, and a pool of `pool_peers` to route among.
+///
+/// Shares this module's builder rather than restating it, so the two test modules cannot drift into
+/// exercising differently-configured nodes and reporting the difference as a behaviour change.
+pub(crate) fn engine_for_routing(
+    pool_peers: &[u8],
+    ask: Arc<dyn ForwardedAsk>,
+) -> (Arc<NodeContent>, tempfile::TempDir) {
+    engine(Vec::new(), pool_peers, Some(ask))
 }
 
 /// An engine whose DHT discovery answers with `dht_providers`, connected to `pool_peers`, and (when
