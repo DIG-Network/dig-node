@@ -776,34 +776,50 @@ mod tests {
         assert_eq!(relayed["proxy"], serde_json::json!(true));
     }
 
-    /// **Proves:** the ledger stays bounded, and eviction costs one extra plain round rather than
-    /// silently disabling the escalation for everything after it.
+    /// **Proves:** the ledger stays bounded by evicting the OLDEST entry only — everything else
+    /// keeps its escalation.
     ///
-    /// **Fixture design:** the bound is taken from `RelayEscalation::MAX_ENTRIES` rather than
-    /// restated, so the test moves with the constant instead of pinning a copy. The pair inserted
-    /// FIRST is the one evicted, and the pair inserted LAST must still escalate — an implementation
-    /// that cleared the whole ledger on overflow would pass a check of the evicted pair alone.
+    /// **Fixture design — the survivor must be inserted BEFORE the overflow, not after it.** The
+    /// first version of this test filled past the cap and then checked the LAST pair inserted, which
+    /// a `clear()`-on-overflow implementation passes trivially: the clear happens at the overflowing
+    /// insert, and every entry added afterwards is present again regardless. Confirmed by mutation —
+    /// swapping the FIFO `pop_front` for a wholesale clear left that version green. The pair that
+    /// distinguishes them is one added early enough to be inside the ledger at the moment of
+    /// overflow and NOT the single entry FIFO removes; so the fixture inserts `oldest`, then
+    /// `survivor`, fills to exactly the cap, and overflows by ONE.
+    ///
+    /// The bound is read from `RelayEscalation::MAX_ENTRIES` rather than restated, so the test moves
+    /// with the constant instead of pinning a private copy of it.
+    ///
+    /// **Assertion ORDER is load-bearing too.** `escalate_for` RECORDS on a miss, so checking
+    /// `oldest` re-inserts it, overflows the ledger a second time, and evicts `survivor` — the
+    /// survivor assertion has to run first, or it measures the damage the line above it did.
     #[test]
-    fn the_ledger_evicts_oldest_first_and_keeps_the_rest() {
+    fn the_ledger_evicts_only_the_oldest_entry() {
         let escalation = RelayEscalation::default();
         let (store, root) = (store(), root());
-        let oldest = peer_hex(0);
+        let oldest = format!("{:064x}", 0);
+        let survivor = format!("{:064x}", 1);
+
         assert!(!escalation.escalate_for(&store, &root, &oldest));
-        for n in 1..=RelayEscalation::MAX_ENTRIES {
-            let peer = format!("{n:064x}");
-            assert!(!escalation.escalate_for(&store, &root, &peer));
+        assert!(!escalation.escalate_for(&store, &root, &survivor));
+        // Fill to EXACTLY the cap (the two above included), then overflow by one.
+        for n in 2..RelayEscalation::MAX_ENTRIES {
+            assert!(!escalation.escalate_for(&store, &root, &format!("{n:064x}")));
         }
+        let overflowing = format!("{:064x}", RelayEscalation::MAX_ENTRIES);
+        assert!(!escalation.escalate_for(&store, &root, &overflowing));
 
         assert!(
-            !escalation.escalate_for(&store, &root, &oldest),
-            "the oldest pair was evicted, so it starts plain again - one wasted plain round for a \
-             capsule this node stopped working on, never an unbounded map"
+            escalation.escalate_for(&store, &root, &survivor),
+            "a pair that was in the ledger at the moment of overflow and is not the oldest must \
+             keep its escalation; discarding the whole ledger would disable the second pass for \
+             every live pull at once"
         );
-        let newest = format!("{:064x}", RelayEscalation::MAX_ENTRIES);
         assert!(
-            escalation.escalate_for(&store, &root, &newest),
-            "everything the eviction did NOT reach must still escalate; clearing the whole ledger \
-             on overflow would disable the second pass for every live pull at once"
+            !escalation.escalate_for(&store, &root, &oldest),
+            "the OLDEST pair is the one evicted, so it starts plain again - one wasted plain round \
+             for a capsule this node stopped working on, never an unbounded map"
         );
     }
 }
