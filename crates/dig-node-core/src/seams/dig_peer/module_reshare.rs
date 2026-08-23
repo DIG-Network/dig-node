@@ -364,6 +364,10 @@ const RELAY_MARKER_BODY: &[u8] =
     b"relayed: held on another node's behalf; this node is not a holder (dig-node#276)
 ";
 
+/// How often [`CapsuleWarmer::await_landing`] re-checks the cache while its grace runs. Short enough
+/// that a capsule landing early is served promptly, long enough that the wait is not a spin.
+const LANDING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// A discarded pull's whole on-disk footprint, so the two halves cannot be erased separately.
 ///
 /// A partial capsule is stored as TWO facts in two places — the staged bytes under the staging dir,
@@ -583,6 +587,67 @@ impl CapsuleWarmer {
     /// The capsule still lands in the cache, because that is what lets the relayed module windows be
     /// served from the same code path a genuine holder serves from, byte-identically. What it does not
     /// do is make a stranger's choice of content into this node's advertised inventory.
+    /// Whether this node can serve `(store_hex, root_hex)` from its cache RIGHT NOW.
+    ///
+    /// The cache path's existence IS the answer everywhere else in this module (it is what a holder
+    /// claim is made of), so this asks the same question the same way rather than adding a second,
+    /// driftable notion of "landed".
+    pub(crate) fn holds(&self, store_hex: &str, root_hex: &str) -> bool {
+        CapsuleKey::parse(store_hex, root_hex)
+            .is_some_and(|capsule| self.paths.cached_module(&capsule).exists())
+    }
+
+    /// How many bytes of `(store_hex, root_hex)` are staged on disk — this node's own honest
+    /// measure of how far an in-flight pull has got.
+    ///
+    /// Zero for a pull that has not started, has staged nothing yet, or names a non-canonical
+    /// generation. It is a LIVENESS signal for a waiting requestor and nothing else: it says how far
+    /// this hop has got, never that any byte is correct — that is settled by the merkle verification
+    /// every one of these bytes must still pass (NC-12).
+    pub(crate) fn staged_bytes(&self, store_hex: &str, root_hex: &str) -> u64 {
+        let Some(capsule) = CapsuleKey::parse(store_hex, root_hex) else {
+            return 0;
+        };
+        let staged = self.paths.staged_module(&capsule);
+        let in_progress = dig_download::staging_path_for(&staged);
+        // The in-progress file is where a running pull writes; the finalized one appears only at the
+        // very end. Whichever exists is the pull's current extent.
+        [in_progress, staged]
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Wait up to `grace` for a background pull of `(store_hex, root_hex)` to reach the cache,
+    /// reporting whether it did.
+    ///
+    /// # Why a grace at all, rather than answering immediately
+    ///
+    /// A capsule small enough to land inside the grace is answered by the hop in ONE round trip,
+    /// exactly as it was before dig-node#333 — so the case that already worked keeps working and no
+    /// requestor pays a poll interval for it. The grace is deliberately far inside the requestor's
+    /// own descriptor rungs; what it must never do is stretch to cover a bulk transfer, which is the
+    /// held-slot cost the rungs exist to bound.
+    pub(crate) async fn await_landing(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        grace: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if self.holds(store_hex, root_hex) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(LANDING_POLL_INTERVAL.min(grace)).await;
+        }
+    }
+
     pub async fn warm_relayed(self: &Arc<Self>, store_hex: &str, root_hex: &str) -> WarmOutcome {
         self.warm_claiming(store_hex, root_hex, HolderClaim::Suppress)
             .await
@@ -807,6 +872,22 @@ impl CapsuleWarmer {
 pub fn spawn_capsule_warm(warmer: Arc<CapsuleWarmer>, store_hex: String, root_hex: String) {
     tokio::spawn(async move {
         warmer.warm(&store_hex, &root_hex).await;
+    });
+}
+
+/// [`spawn_capsule_warm`]'s relay twin: pull `(store_hex, root_hex)` ON A REQUESTOR'S BEHALF, in the
+/// background, claiming nothing.
+///
+/// The claim is the whole difference — a relayed capsule is cached so the hop can serve its windows
+/// and is NOT announced, so relaying never turns this node into an advertised holder of a stranger's
+/// choosing ([`HolderClaim::Suppress`]).
+///
+/// Spawned rather than awaited because the requestor's ask must not be held open for the length of a
+/// third-party transfer (dig-node#333). Re-entrant: [`WarmRegistry`] admits one warm per generation,
+/// so a second request for the same capsule joins the running pull instead of starting a rival one.
+pub fn spawn_relayed_capsule_warm(warmer: Arc<CapsuleWarmer>, store_hex: String, root_hex: String) {
+    tokio::spawn(async move {
+        warmer.warm_relayed(&store_hex, &root_hex).await;
     });
 }
 
