@@ -371,6 +371,76 @@ fn discard_staging(staged: &Path) {
     let _ = std::fs::remove_file(dig_download::staging_path_for(staged));
 }
 
+/// What a FAILED pull leaves behind in the staging area.
+///
+/// A partially-staged capsule is either *the bytes so far* or *evidence of a lie*, and the two demand
+/// opposite treatment. Discarding both is what dig-node#328 measured in the field: a 135 MB capsule cut
+/// at 34.6 MB re-downloaded 182 MB on the retry — 0.02% MORE than fetching it from scratch — because the
+/// only thing that survived the failure was the resume checkpoint, never the bytes it described. Keeping
+/// both would be the opposite defect: a hostile hop's bytes surviving on disk for a later honest range to
+/// complete around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingDisposition {
+    /// The staged bytes are still the best evidence available, so the next warm resumes from them.
+    ///
+    /// Safe for EVERY non-verification failure because dig-download re-attributes each staged chunk
+    /// against the descriptor's `chunk_hashes` before adopting it on resume (`read_back_verified_chunk`)
+    /// and re-fetches anything that fails — so preserving bytes can cost a re-fetch, never a wrong
+    /// artifact.
+    Preserve,
+    /// The staged bytes are attributable only to a source that has been PROVEN false, so they are
+    /// erased rather than left for a later pull to resume around.
+    Discard,
+}
+
+impl StagingDisposition {
+    /// What to do with `staged` after a pull failed with `error`.
+    ///
+    /// Deliberately an EXHAUSTIVE match with no `_` arm: `dig_download::DownloadError` is not
+    /// `#[non_exhaustive]`, so a new failure mode upstream breaks this build and forces the
+    /// keep-or-erase question to be answered, instead of defaulting silently to whichever branch a
+    /// wildcard happened to name. That is the whole point of naming the disposition as a type — the
+    /// only place the choice can be made is here, once, per error kind.
+    fn for_failure(error: &dig_download::DownloadError) -> Self {
+        use dig_download::DownloadError as E;
+        match error {
+            // VERIFICATION failed. The staged bytes verified against a descriptor the final gates then
+            // proved false (a whole-blob `module_hash` mismatch, or a blob the chain does not anchor),
+            // so every one of them is a hostile hop's authorship. NC-12: a hop's bytes may be garbage,
+            // and garbage that survives on disk is garbage a later honest range completes around.
+            E::Verify(_) => StagingDisposition::Discard,
+
+            // TRANSPORT failed, in one of its several shapes: the link dropped, the source stalled, the
+            // holder set was exhausted mid-capsule, discovery or the metadata probe came back empty, or
+            // a holder's paged prologue ended short. In every one of these the bytes already staged are
+            // bytes that MATCHED the descriptor's per-chunk hash before being written, and no gate has
+            // contradicted them. They are exactly what a resume exists to reuse.
+            E::Transport { .. }
+            | E::Timeout { .. }
+            | E::NoProviders { .. }
+            | E::NotFound { .. }
+            | E::MetadataProbeFailed { .. }
+            | E::PagedPrologueUnsupported { .. }
+            | E::Cancelled => StagingDisposition::Preserve,
+
+            // LOCAL failures — this node's disk, its state store, a malformed request, or an
+            // orchestrator that ended without a verdict. Nothing here impeaches the bytes; a disk that
+            // failed mid-write leaves the chunk uncheckpointed, so the resume re-fetches it anyway.
+            E::State(_) | E::Sink(_) | E::NotDownloadable | E::TaskEnded => {
+                StagingDisposition::Preserve
+            }
+        }
+    }
+
+    /// Apply this disposition to `staged`.
+    fn apply(self, staged: &Path) {
+        match self {
+            StagingDisposition::Preserve => {}
+            StagingDisposition::Discard => discard_staging(staged),
+        }
+    }
+}
+
 /// Everything a capsule warm needs, resolved once at composition time.
 ///
 /// `anchor_resolver` is what makes the whole reshare path trustworthy: the generation root the pull is
@@ -599,12 +669,17 @@ impl CapsuleWarmer {
         let bytes = match pulled {
             Ok(bytes) => bytes,
             Err(error) => {
-                discard_staging(&staged);
+                // NOT an unconditional discard. Erasing the partial here is what made dig-download's
+                // resume machinery structurally unreachable for capsule warms (#328): the checkpoint
+                // survived while the bytes it described did not, so every retry restarted from offset 0.
+                let disposition = StagingDisposition::for_failure(&error);
+                disposition.apply(&staged);
                 tracing::info!(
                     store = %super::serve_log::SafeId::new(store_hex),
                     root = %super::serve_log::SafeId::new(root_hex),
                     outcome = "refused",
                     reason = %error,
+                    staging = ?disposition,
                     "capsule warm: pull did not complete; this node is NOT a holder"
                 );
                 return WarmOutcome::Refused(WarmFailure::PullFailed {
@@ -1253,6 +1328,325 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- resume across a severed transfer (dig-node#328) --------------------------------------------
+
+    /// A holder that serves a bounded number of range fetches and then goes silent, counting the bytes
+    /// it actually put on the wire — and that can be REOPENED so a second warm sees the same holder
+    /// answering again, exactly as a peer does once a network partition heals.
+    ///
+    /// It delegates every honest answer to dig-download's own mock, so the descriptor, the chunk hashes
+    /// and the served windows are the production shapes; the ONLY thing varied is when the link dies.
+    /// That is deliberate: a fixture in which the holder also lied could not tell a resume apart from a
+    /// re-fetch forced by a failed re-attribution.
+    struct SeveringHolder {
+        inner: dig_download::testkit::MockModuleTransport,
+        /// How many more `fetchModuleRange` calls this holder will answer before the link is severed.
+        budget: AtomicUsize,
+        /// Total bytes this holder has put on the wire across every attempt.
+        served: std::sync::atomic::AtomicU64,
+    }
+
+    impl SeveringHolder {
+        fn severing_after(
+            inner: dig_download::testkit::MockModuleTransport,
+            fetches: usize,
+        ) -> Self {
+            SeveringHolder {
+                inner,
+                budget: AtomicUsize::new(fetches),
+                served: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        /// The partition heals: the holder answers freely again.
+        fn reopen(&self) {
+            self.budget.store(usize::MAX, Ordering::SeqCst);
+        }
+
+        fn served_bytes(&self) -> u64 {
+            self.served.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl dig_download::ModuleTransport for SeveringHolder {
+        async fn get_module_info(
+            &self,
+            provider_peer_id: &str,
+            store_id: &str,
+            root: &str,
+        ) -> Result<dig_download::ModuleInfo, dig_download::DownloadError> {
+            self.inner
+                .get_module_info(provider_peer_id, store_id, root)
+                .await
+        }
+
+        async fn fetch_module_range(
+            &self,
+            provider_peer_id: &str,
+            store_id: &str,
+            root: &str,
+            offset: u64,
+            length: u64,
+        ) -> Result<Vec<u8>, dig_download::DownloadError> {
+            let spend = self
+                .budget
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    (left > 0).then(|| left.saturating_sub(1))
+                });
+            if spend.is_err() {
+                return Err(dig_download::DownloadError::transport(
+                    provider_peer_id,
+                    "link severed mid-transfer",
+                ));
+            }
+            let bytes = self
+                .inner
+                .fetch_module_range(provider_peer_id, store_id, root, offset, length)
+                .await?;
+            self.served.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            Ok(bytes)
+        }
+    }
+
+    /// The chunk size every #328 fixture serves at. The resume unit is a CHUNK, not a byte, so the
+    /// fixture is sized in chunks: this splits the capsule into ~25 of them, which leaves room to sever
+    /// the link strictly INSIDE the capsule (neither at offset 0, where a resume is indistinguishable
+    /// from a restart, nor after the last chunk, where there is nothing left to resume).
+    const RESUME_CHUNK_BYTES: usize = 8;
+
+    /// Build a warmer over ONE [`SeveringHolder`], sharing `state` so two successive warms see the same
+    /// resume checkpoints — the cross-attempt persistence the real node has via `FileStateStore`.
+    fn severing_warmer(
+        dir: &Path,
+        transport: &Arc<SeveringHolder>,
+        state: &Arc<dyn dig_download::StateStore>,
+    ) -> Arc<CapsuleWarmer> {
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        let content = dig_download::module_content_id(&store_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+        CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            Arc::clone(transport) as Arc<dyn dig_download::ModuleTransport>,
+            Arc::clone(state),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        )
+    }
+
+    /// The staging path a warm of `(STORE, chain_root())` under `dir` writes through.
+    fn staged_module_path(dir: &Path) -> PathBuf {
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        dir.join("staging")
+            .join("modules")
+            .join(format!("{store_hex}-{root_hex}.dig"))
+    }
+
+    /// **Proves (dig-node#328):** a warm whose transfer is severed mid-capsule keeps what it staged, so
+    /// the NEXT warm fetches only the missing bytes.
+    ///
+    /// **The assertion is a BYTE COUNT, not completion.** That distinction is the whole ticket: the
+    /// broken code completed the second attempt too — it just paid for the entire capsule again. Field
+    /// measurement on v0.143.1 (a 134,968,945-byte capsule cut at 34,603,008 staged bytes) had attempt 2
+    /// transfer 182,219,987 bytes against an uninterrupted control of 182,184,850 — 0.02% MORE than
+    /// starting from scratch. A test asserting `Held` passes against exactly that.
+    ///
+    /// **Why the fixture is shaped this way:**
+    /// - the second attempt uses the SAME holder, healed, rather than a second honest peer: a fresh
+    ///   holder would make "attempt 2 was cheap" explainable by source selection instead of by resume;
+    /// - the state store is shared across both warms, because a checkpoint that did not survive would
+    ///   make the resume impossible for a reason that has nothing to do with the staged bytes;
+    /// - the control assertions require attempt 1 to have staged SOMETHING and attempt 2 to have fetched
+    ///   SOMETHING. Without them a fixture that served nothing at all, or one that had already completed
+    ///   in attempt 1, would satisfy "attempt 2 < whole capsule" vacuously.
+    #[tokio::test]
+    async fn a_severed_warm_resumes_from_its_partial_instead_of_refetching_the_capsule() {
+        let dir = temp_dir("resume-after-sever");
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        let module = module_committing(STORE, chain_root());
+        let capsule_bytes = module.len() as u64;
+        let chunks = module.len().div_ceil(RESUME_CHUNK_BYTES);
+        assert!(
+            chunks >= 4,
+            "the fixture must have several chunks or a partial cannot exist ({chunks} chunk(s))"
+        );
+
+        let transport = Arc::new(SeveringHolder::severing_after(
+            dig_download::testkit::MockModuleTransport::serving(
+                &store_hex,
+                &root_hex,
+                module.clone(),
+                RESUME_CHUNK_BYTES,
+            ),
+            chunks / 2,
+        ));
+        let state: Arc<dyn dig_download::StateStore> =
+            Arc::new(dig_download::InMemoryStateStore::new());
+        let warmer = severing_warmer(&dir, &transport, &state);
+
+        // ATTEMPT 1 — the link dies half way through the capsule.
+        let severed = warmer.warm(&store_hex, &root_hex).await;
+        let staged_in_attempt_1 = transport.served_bytes();
+
+        assert!(
+            matches!(
+                severed,
+                WarmOutcome::Refused(WarmFailure::PullFailed { .. })
+            ),
+            "a severed transfer must refuse the warm, not land a partial capsule: {severed:?}"
+        );
+        assert!(
+            staged_in_attempt_1 > 0 && staged_in_attempt_1 < capsule_bytes,
+            "the control: attempt 1 must stage a genuine PARTIAL ({staged_in_attempt_1} of \
+             {capsule_bytes} bytes)"
+        );
+        let partial = dig_download::staging_path_for(&staged_module_path(&dir));
+        assert_eq!(
+            std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0),
+            staged_in_attempt_1,
+            "the partial must SURVIVE the failed warm — this is the byte-for-byte fact #328 measured \
+             absent in the field"
+        );
+
+        // ATTEMPT 2 — the partition heals and the same holder answers again.
+        transport.reopen();
+        let outcome = warmer.warm(&store_hex, &root_hex).await;
+        let served_in_attempt_2 = transport.served_bytes() - staged_in_attempt_1;
+
+        assert_eq!(
+            outcome,
+            WarmOutcome::Held {
+                bytes: capsule_bytes
+            },
+            "the resumed warm must land the whole capsule"
+        );
+        assert!(
+            served_in_attempt_2 > 0,
+            "the control: attempt 2 must actually fetch the missing bytes, or this proves nothing"
+        );
+        assert!(
+            served_in_attempt_2 < capsule_bytes,
+            "attempt 2 transferred {served_in_attempt_2} of {capsule_bytes} bytes — a whole-capsule \
+             re-download, which is the #328 defect exactly"
+        );
+        assert_eq!(
+            served_in_attempt_2,
+            capsule_bytes - staged_in_attempt_1,
+            "attempt 2 must fetch the missing bytes and ONLY the missing bytes"
+        );
+        assert_eq!(
+            std::fs::read(cached_module_path(&dir)).expect("the capsule is cached"),
+            module,
+            "the capsule assembled from a partial plus a resume is byte-identical to the real one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Proves (dig-node#328, the security half):** a pull that fails VERIFICATION still erases what it
+    /// staged. Those bytes verified only against a descriptor the final gates proved false, so leaving
+    /// them would let a hostile hop plant bytes a later honest range completes around (NC-12).
+    ///
+    /// **Why this is a separate test on a DIFFERENT holder behaviour:** the fix is a two-branch
+    /// decision, and a suite proving only the keep branch is satisfied by deleting `discard_staging`
+    /// outright. The holder here serves honest chunk bytes and honest per-chunk hashes — so every chunk
+    /// is genuinely STAGED and there is something on disk to erase — and lies only in the whole-blob
+    /// `module_hash`. A holder that served nothing could not exhibit the property at all.
+    #[tokio::test]
+    async fn a_verification_failure_still_discards_what_it_staged() {
+        let dir = temp_dir("verify-fail-discards");
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        let module = module_committing(STORE, chain_root());
+        let content = dig_download::module_content_id(&store_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+
+        let transport = Arc::new(
+            dig_download::testkit::MockModuleTransport::serving(
+                &store_hex,
+                &root_hex,
+                module.clone(),
+                RESUME_CHUNK_BYTES,
+            )
+            .with_corrupt_module_hash(),
+        );
+        let warmer = CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            transport,
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        );
+
+        let outcome = warmer.warm(&store_hex, &root_hex).await;
+
+        assert!(
+            matches!(
+                outcome,
+                WarmOutcome::Refused(WarmFailure::PullFailed { .. })
+            ),
+            "a blob that fails the whole-module hash gate must be refused: {outcome:?}"
+        );
+        let staged = staged_module_path(&dir);
+        assert!(
+            !staged.exists() && !dig_download::staging_path_for(&staged).exists(),
+            "bytes attributable only to a proven-false descriptor must not survive the failure"
+        );
+        assert!(
+            !cached_module_path(&dir).exists(),
+            "nothing may reach the cache path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Proves:** the keep-or-erase decision is made per FAILURE KIND — the unit-level companion to the
+    /// two behavioural tests above, so a future error variant's disposition is readable without
+    /// reconstructing a whole pull.
+    #[test]
+    fn only_a_verification_failure_erases_the_partial() {
+        use dig_download::DownloadError as E;
+        assert_eq!(
+            StagingDisposition::for_failure(&E::Verify(dig_download::VerifyError::Metadata(
+                "assembled module_hash mismatch".into()
+            ))),
+            StagingDisposition::Discard,
+            "a proven-false descriptor's bytes are erased"
+        );
+        for transport_failure in [
+            E::transport(hex32(STORE), "connection reset"),
+            E::Timeout {
+                provider: hex32(STORE),
+            },
+            E::NoProviders { needed: 3 },
+            E::Cancelled,
+        ] {
+            assert_eq!(
+                StagingDisposition::for_failure(&transport_failure),
+                StagingDisposition::Preserve,
+                "a transport failure leaves verified partial bytes to resume from: \
+                 {transport_failure}"
+            );
+        }
     }
 
     /// Build a warmer over a REAL, answering holder for `(STORE, chain_root())`, staging + caching
