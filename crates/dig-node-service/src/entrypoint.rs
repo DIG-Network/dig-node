@@ -26,7 +26,9 @@
 //! documented in [`crate::cli`] and the README.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::seed_export_cli;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
@@ -363,6 +365,21 @@ enum WalletCommand {
     },
     /// Print the public keys this node is currently following (READ-ONLY).
     Watched,
+    /// Print the recovery phrase of a wallet this node still holds, so you can move it
+    /// into the DIG app before node-side wallet custody is removed.
+    ///
+    /// LOCAL AND OFFLINE. It reads the seed file on this machine and needs that wallet's
+    /// password; it contacts no node, opens no port, and adds nothing to the node's network
+    /// surface. It prints the phrase to the console, so run it where nobody can read your
+    /// screen, and never into a file or a log.
+    ///
+    /// A phrase is the whole wallet: anyone who reads it can spend those funds.
+    ExportSeed {
+        /// Read this seed file instead of the default location. An older build may have
+        /// written yours elsewhere; the error text names the path that was tried.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }
 
 /// `dig-node profile` sub-actions — the two halves of profile-body custody on this node.
@@ -654,9 +671,22 @@ pub fn run() -> std::process::ExitCode {
         Command::Sync { action: cmd } => {
             render(control_cli::run(&config, sync_action(cmd)), action, json)
         }
-        Command::Wallet { action: cmd } => {
-            render(control_cli::run(&config, wallet_action(cmd)), action, json)
-        }
+        // `export-seed` is the one wallet verb that reaches no node: it is a local,
+        // offline read of the seed file, so it never goes near `control_cli`.
+        Command::Wallet {
+            action: WalletCommand::ExportSeed { path },
+        } => seed_export_cli::run(path, json),
+        Command::Wallet { action: cmd } => match wallet_action(cmd) {
+            Some(control) => render(control_cli::run(&config, control), action, json),
+            // Every LOCAL wallet verb must be routed in an arm above. Today `export-seed`
+            // is the only one and it is, so this cannot fire; it degrades to a usage error
+            // rather than a panic so that adding a local verb and forgetting to route it
+            // misbehaves visibly instead of aborting the process.
+            None => {
+                eprintln!("error: this wallet verb is local-only and was not routed");
+                ExitCode::Usage
+            }
+        },
         Command::Profile { action: cmd } => {
             render(control_cli::run(&config, profile_action(cmd)), action, json)
         }
@@ -725,8 +755,8 @@ fn sync_action(cmd: Option<SyncCommand>) -> ControlAction {
 }
 
 /// Map the `wallet` subcommand to its [`ControlAction`] (#1851, dig_ecosystem#2376).
-fn wallet_action(cmd: WalletCommand) -> ControlAction {
-    match cmd {
+fn wallet_action(cmd: WalletCommand) -> Option<ControlAction> {
+    Some(match cmd {
         WalletCommand::Balance { address, asset } => {
             ControlAction::WalletBalance { address, asset }
         }
@@ -753,7 +783,9 @@ fn wallet_action(cmd: WalletCommand) -> ControlAction {
         WalletCommand::Watch { public_keys } => ControlAction::WalletWatch { public_keys },
         WalletCommand::Unwatch { public_keys } => ControlAction::WalletUnwatch { public_keys },
         WalletCommand::Watched => ControlAction::WalletWatched,
-    }
+        // Handled locally before this mapping is reached; it names no control method.
+        WalletCommand::ExportSeed { .. } => return None,
+    })
 }
 
 /// Map the `profile` subcommand to its [`ControlAction`].
@@ -1123,7 +1155,7 @@ mod tests {
     /// that is the whole point of these tests (see below).
     fn method_for_argv(argv: &[&str]) -> Option<&'static str> {
         match Cli::try_parse_from(argv).ok()?.command? {
-            Command::Wallet { action } => Some(wallet_action(action).method()),
+            Command::Wallet { action } => Some(wallet_action(action)?.method()),
             _ => None,
         }
     }
@@ -1304,7 +1336,9 @@ mod tests {
             panic!("parsed to something other than `wallet`");
         };
         assert_eq!(
-            wallet_action(action).wire_params(),
+            wallet_action(action)
+                .expect("a control-plane wallet verb maps to an action")
+                .wire_params(),
             serde_json::json!({ "address": address, "asset": "dig" }),
             "the address and the non-default asset must both survive the mapping"
         );
@@ -1323,7 +1357,9 @@ mod tests {
             panic!("parsed to something other than `wallet`");
         };
         assert_eq!(
-            wallet_action(action).wire_params(),
+            wallet_action(action)
+                .expect("a control-plane wallet verb maps to an action")
+                .wire_params(),
             serde_json::json!({ "after_seq": 17, "limit": 3 }),
             "the cursor the caller resumed from must be the cursor that is asked for"
         );
@@ -1334,7 +1370,9 @@ mod tests {
             panic!("parsed to something other than `wallet`");
         };
         assert_eq!(
-            wallet_action(action).wire_params(),
+            wallet_action(action)
+                .expect("a control-plane wallet verb maps to an action")
+                .wire_params(),
             serde_json::json!({ "signed_bundle_hex": "0xfeed" }),
             "the bundle the operator typed must be the bundle that is pushed"
         );

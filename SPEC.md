@@ -2428,6 +2428,16 @@ on-disk master token = local-machine control), never an unauthenticated backdoor
   `control.wallet.peak`; `wallet broadcast <signed_bundle_hex>` → `control.wallet.broadcast`. The
   open chain reads (everything above except `broadcast` and `arrivals`) need no token; `broadcast` is token-gated like every
   other mutation, and carries only already-signed bytes (§908).
+- `wallet export-seed [--path <file>]` reaches NO control method. It is a LOCAL, OFFLINE read of
+  this node's encrypted seed file: it decrypts the file under the wallet password supplied on the
+  terminal and prints the recovery phrase to stdout. It opens no socket, adds no `control.*` method
+  and adds no loopback endpoint, so it grants nothing beyond what local filesystem access plus the
+  password already grant. It accepts BOTH on-disk seed formats: the current `dig-keystore` container
+  and the legacy `EncryptedSeed` layout (leading version byte `1`) that pre-migration files use.
+  `--path` overrides the default location, because a file written by an older build can sit under a
+  base directory the current build no longer resolves. `--json` is REFUSED: a recovery phrase must
+  not be emitted as machine-readable output. The command exists only to let a user move a
+  node-custodied wallet out before node-side user custody is removed, and is deleted with it.
 - `updater [status]` → `control.updater.status`; `updater set-channel <ch>` / `pause [--until <s>]`
   / `resume` / `check-now` → the matching `control.updater.*`.
 - `subscriptions [list]` → `control.listSubscriptions`; `subscriptions add|remove <store_id>` →
