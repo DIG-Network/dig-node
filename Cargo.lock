@@ -2782,9 +2782,9 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.19.0"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2902186e65eb2360bd0ccff741b67f4af95d6e78b43052c01df6775ddcf3b741"
+checksum = "3677ea834b43e91713ce56ea0a84b0ff9618b8466ca854f9fd03be7b46310171"
 dependencies = [
  "async-trait",
  "dig-constants 0.10.1",
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.54.0"
+version = "0.54.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3073,7 +3073,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.143.0"
+version = "0.143.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3281,9 +3281,9 @@ dependencies = [
 
 [[package]]
 name = "dig-tls"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a853f98aa9ceb10251c33ae7abf9c263d403ab8dab229267e35aaeb5f7183c"
+checksum = "c674c6b506310d879a0dfc8874d60c193416c4bd42538961527698b9d681c4d3"
 dependencies = [
  "blst",
  "chia-bls 0.26.0",
