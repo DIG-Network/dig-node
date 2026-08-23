@@ -188,7 +188,18 @@ pub enum WarmFailure {
     NoChainAnchor,
     /// The pull itself failed (no holders, holders exhausted, or a fail-closed gate rejected the
     /// assembled module).
-    PullFailed,
+    ///
+    /// The `reason` is dig-download's own error text, carried in the VALUE rather than only written
+    /// to a log. A reason that exists only in a log is exactly what failed here: the shipped
+    /// `let...else` could not bind the `Err`, four live diagnostic rounds produced no cause at all
+    /// (dig_ecosystem#3128), and a test asserting on the log alone is hostage to whichever subscriber
+    /// happened to observe the callsite first. dig-download composes the text from this node's own
+    /// vocabulary plus SENTINELLED peer ids, so carrying it cannot let a peer author what this node
+    /// records (#1603).
+    PullFailed {
+        /// dig-download's terminal error for this pull, as an operator would read it.
+        reason: String,
+    },
     /// `download()` returned `Ok`, but the artifact on disk is NOT the one the anchor verifier admitted.
     /// The capsule is discarded and NOT announced.
     PromotedArtifactMismatch,
@@ -578,16 +589,28 @@ impl CapsuleWarmer {
 
         // 3. ONLY `Ok` may lead to a holder claim. Not finalize-observed, not partial staging, not an
         //    `Err` that happened to leave bytes behind.
-        let Ok(bytes) = pulled else {
-            discard_staging(&staged);
-            tracing::info!(
-                store = %super::serve_log::SafeId::new(store_hex),
-                root = %super::serve_log::SafeId::new(root_hex),
-                outcome = "refused",
-                reason = "pull failed",
-                "capsule warm: pull did not complete; this node is NOT a holder"
-            );
-            return WarmOutcome::Refused(WarmFailure::PullFailed);
+        // `match`, NOT `let…else`: a `let…else` cannot bind the `Err`, so every failed warm in the
+        // field reported the one constant string "pull failed" and the download error — the only thing
+        // that says WHICH holder refused, timed out, or served an unverifiable chunk — was dropped on
+        // the floor. Four live diagnostic rounds produced no error text for exactly that reason
+        // (dig_ecosystem#3128). The reason logged here is the pull's own `Display`, which dig-download
+        // composes from this node's vocabulary plus SENTINELLED peer ids, so surfacing it cannot let a
+        // peer author what this node logs (#1603).
+        let bytes = match pulled {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                discard_staging(&staged);
+                tracing::info!(
+                    store = %super::serve_log::SafeId::new(store_hex),
+                    root = %super::serve_log::SafeId::new(root_hex),
+                    outcome = "refused",
+                    reason = %error,
+                    "capsule warm: pull did not complete; this node is NOT a holder"
+                );
+                return WarmOutcome::Refused(WarmFailure::PullFailed {
+                    reason: error.to_string(),
+                });
+            }
         };
 
         // 4. Promote into the cache, re-proving the artifact is the admitted one, THEN announce.
@@ -1013,6 +1036,105 @@ mod tests {
         );
     }
 
+    // -- the failure reason an operator actually reads ---------------------------------------------
+
+    /// A locator that offers exactly ONE holder, so the pull reaches the transport and fails THERE —
+    /// the shape a real capsule warm takes. `NoHolders` above cannot exercise this: it fails at the
+    /// locate step, before any holder-attributed reason exists to surface.
+    struct OneHolder;
+
+    #[async_trait::async_trait]
+    impl dig_download::ProviderLocator for OneHolder {
+        async fn find_providers(
+            &self,
+            _content: &dig_download::ContentId,
+        ) -> Result<Vec<dig_download::ProviderRecord>, dig_download::DownloadError> {
+            Ok(vec![dig_download::ProviderRecord {
+                content_key: "cc".repeat(32),
+                provider_peer_id: "dd".repeat(32),
+                addresses: vec![],
+                expires_at: u64::MAX,
+            }])
+        }
+    }
+
+    /// A holder that refuses the descriptor with a reason only THIS test can produce, so the assertion
+    /// below cannot be satisfied by any other string the warm path might log.
+    struct RefusingHolder;
+
+    /// The refusal text. Distinctive on purpose: an assertion on a generic word like "failed" would
+    /// also match the constant the fix removes.
+    const REFUSAL: &str = "holder-refused-the-descriptor-sentinel";
+
+    #[async_trait::async_trait]
+    impl dig_download::ModuleTransport for RefusingHolder {
+        async fn get_module_info(
+            &self,
+            peer: &str,
+            _store_id: &str,
+            _root: &str,
+        ) -> Result<dig_download::ModuleInfo, dig_download::DownloadError> {
+            Err(dig_download::DownloadError::transport(peer, REFUSAL))
+        }
+        async fn fetch_module_range(
+            &self,
+            peer: &str,
+            _store_id: &str,
+            _root: &str,
+            _offset: u64,
+            _length: u64,
+        ) -> Result<Vec<u8>, dig_download::DownloadError> {
+            Err(dig_download::DownloadError::transport(peer, REFUSAL))
+        }
+    }
+
+    /// **Proves:** a failed warm carries the pull's OWN holder-attributed error into its outcome,
+    /// rather than a constant.
+    ///
+    /// **Catches:** the shipped `let Ok(bytes) = pulled else { ... reason = "pull failed" }`. A
+    /// `let...else` cannot bind the `Err`, so every failed warm in the field reported one fixed
+    /// string and four live diagnostic rounds produced no error text at all (dig_ecosystem#3128).
+    ///
+    /// **Why the VALUE and not the log:** an earlier version of this test read a captured log, and it
+    /// passed in isolation while failing in the full suite — `tracing` caches per-callsite interest,
+    /// so a scoped subscriber never sees a callsite an earlier global subscriber already registered
+    /// as disabled. A cause that lives only in a log is also the shape of the original defect. It now
+    /// lives in the return value, where nothing can filter it away.
+    ///
+    /// **Non-vacuous:** the needle is a sentinel this test's own transport authors and nothing else
+    /// in the crate emits, and `NoHolders` above cannot exercise this at all — it fails at the locate
+    /// step, before any holder-attributed reason exists.
+    #[tokio::test]
+    async fn a_failed_warm_carries_the_underlying_cause_not_a_constant() {
+        let dir = temp_dir("failure-reason");
+        let warmer = CapsuleWarmer::new(
+            Arc::new(OneHolder),
+            Arc::new(RefusingHolder),
+            Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        );
+
+        let outcome = warmer.warm(&hex32(STORE), &hex32(chain_root())).await;
+
+        let WarmOutcome::Refused(WarmFailure::PullFailed { reason }) = outcome else {
+            panic!("the fixture must drive a failed pull, or this proves nothing; got {outcome:?}");
+        };
+        assert!(
+            reason.contains(REFUSAL),
+            "the refusal the holder produced must survive into the warm's own outcome, not be              discarded by a `let...else`; got: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **Proves:** a pull that ends in `Err` announces NOTHING and leaves no module at the cache path.
     /// **Catches:** announcing on finalize-observed / partial staging / a failed pull — which, because
     /// the announce is driven off cache inventory (#1586), would advertise this node network-wide as an
@@ -1025,7 +1147,10 @@ mod tests {
 
         let outcome = warmer.warm(&hex32(STORE), &hex32(chain_root())).await;
 
-        assert_eq!(outcome, WarmOutcome::Refused(WarmFailure::PullFailed));
+        assert!(matches!(
+            outcome,
+            WarmOutcome::Refused(WarmFailure::PullFailed { .. })
+        ));
         assert_eq!(
             spy.calls.load(Ordering::SeqCst),
             0,
@@ -1512,7 +1637,10 @@ mod tests {
 
         let outcome = warmer.warm(&hex32(STORE), &hex32(chain_root())).await;
 
-        assert_eq!(outcome, WarmOutcome::Refused(WarmFailure::PullFailed));
+        assert!(matches!(
+            outcome,
+            WarmOutcome::Refused(WarmFailure::PullFailed { .. })
+        ));
         assert_eq!(
             evictor.sweeps.load(Ordering::SeqCst),
             0,
