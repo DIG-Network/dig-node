@@ -1,4 +1,8 @@
 //! Supervisor tests (dig_ecosystem#2501).
+
+// These tests EXERCISE the frozen custody surface on purpose: a freeze must not break custody for
+// whoever currently depends on it (dig_ecosystem#1701).
+#![allow(deprecated)]
 //!
 //! The doubles here stop at the PEER boundary and nowhere else: `catch_up` runs the real
 //! [`sync::initial_sync_with_authority`] (so the empty-set guard is genuinely in the path) and `run` runs

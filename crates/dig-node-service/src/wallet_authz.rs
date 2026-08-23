@@ -7,6 +7,17 @@
 //! token) is rejected with `-32030 UNAUTHORIZED` before the method runs. Wallet READ methods stay
 //! open to local consumers (the read plane, §7.2).
 //!
+//! # The `auth.*` half is DEPRECATED - frozen for removal (dig_ecosystem#1701)
+//!
+//! The `auth.*` namespace ([`AUTH_PREFIX`]) gates node-side USER custody, which the #1500
+//! ratification (2026-07-22T03:27:48Z) superseded: the node holds no user spend key, and
+//! `dig-account`'s `PolicyAuthorizer` is the only enforcing custody gate from here. The gate below
+//! is kept EXACTLY as strict for the consumers that already exist - a freeze must not weaken an
+//! authorization check on the way out - but no new `auth.*` method may be added, and the namespace
+//! is absent from OpenRPC discovery ([`crate::meta`]) so no new consumer can find it.
+//!
+//! Removal is step 4 of dig_ecosystem#1701 and is deliberately not part of the freeze.
+//!
 //! Gated wallet methods are ALSO never relayed upstream — a signing/custody request must never
 //! leave the loopback node (the server enforces that, [`crate::server`]).
 //!
@@ -47,6 +58,7 @@ pub const CUSTODY_PREFIX: &str = "wallet.";
 /// `auth.lock`, `auth.get_method`. EVERY `auth.*` method is paired-token gated (§7.12) — even the
 /// reads reveal the auth posture (mode/method/session state), and `unlock`/`sign_unlock` gate the
 /// node-custodied signer — so a new auth method is gated the moment it lands under `auth.*`.
+#[deprecated(note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers.")]
 pub const AUTH_PREFIX: &str = "auth.";
 
 /// Wallet MUTATION methods that MUST be authorized (§7.12): they sign, spend, broadcast, or change
@@ -147,6 +159,10 @@ pub fn master_tier_control_equivalent(method: &str) -> Option<&'static str> {
 }
 
 /// Classify a method against the wallet-authorization policy. PURE.
+// Frozen-surface call site (dig_ecosystem#1701): `AUTH_PREFIX` is deprecated to stop NEW
+// consumers, and this is the authorization gate the freeze must keep enforcing unchanged. The
+// allow sits on the function because an attribute on a tail `if` expression is not stable Rust.
+#[allow(deprecated)]
 pub fn classify(method: &str) -> WalletMethodClass {
     if method.starts_with(CUSTODY_PREFIX) || method.starts_with(AUTH_PREFIX) {
         WalletMethodClass::Custody

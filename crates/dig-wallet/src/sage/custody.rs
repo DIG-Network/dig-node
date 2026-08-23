@@ -7,6 +7,18 @@
 //! (§18.21). The extension's multi-wallet registry (`WalletEntry[]`) is migrated IN one wallet at a
 //! time (#374); this manager is the node-side multi-wallet custodian that makes that possible.
 //!
+//! # DEPRECATED - frozen for removal (dig_ecosystem#1701)
+//!
+//! Node-side USER custody is SUPERSEDED. The #1500 ratification (2026-07-22T03:27:48Z) settled that
+//! the node holds no user spend key: the key lives in the user application, and `dig-account`'s
+//! `PolicyAuthorizer` is the ONLY enforcing custody gate from here. The lifecycle below serves
+//! EXISTING consumers only - add none.
+//!
+//! It is FROZEN rather than deleted because #370's migration purged the extension's local key
+//! material once the node confirmed it could sign, so the blob this module writes could have been a
+//! user's last copy of their spend key. That population has since been measured at ZERO; removal is
+//! step 4 of dig_ecosystem#1701 and is deliberately NOT part of the freeze.
+//!
 //! # Wallet identity (§18.20a)
 //!
 //! Each wallet's stable id is the decimal string of its seed's Chia BLS **master public-key
@@ -366,6 +378,7 @@ impl WalletCustody {
     /// persist it, record its manifest entry (making it active if none is), and load the signer.
     /// Returns ONLY the id + receive address — the mnemonic is NEVER returned (§18.20: back it up
     /// via the node-local [`Self::reveal_mnemonic`]). Refuses if that wallet already exists.
+    #[deprecated(note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers.")]
     pub fn create(&self, password: &str, label: Option<String>) -> Result<WalletRef> {
         self.check_password(password)?;
         let mnemonic = generate_mnemonic(24)
@@ -377,6 +390,7 @@ impl WalletCustody {
     /// fingerprint id, encrypt + persist it under `password`, record the manifest entry, and load
     /// the signer. Refuses if a wallet with that key already exists (no double-custody). Returns the
     /// id + receive address.
+    #[deprecated(note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers.")]
     pub fn import(
         &self,
         mnemonic: &str,
@@ -391,6 +405,8 @@ impl WalletCustody {
 
     /// Restore a wallet from a mnemonic. Behaviourally identical to [`Self::import`]; a distinct
     /// name so the lifecycle surface reads naturally (§18.20).
+    #[deprecated(note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers.")]
+    #[allow(deprecated)] // delegates to the frozen `import` (dig_ecosystem#1701).
     pub fn restore(
         &self,
         mnemonic: &str,
@@ -474,6 +490,7 @@ impl WalletCustody {
     /// seed-egress path and MUST NOT be exposed over the paired authorized boundary (§7.12/§18.20) —
     /// it exists for the self-origin backup UI / a `dig-node wallet backup` CLI. Wrong password
     /// fails closed.
+    #[deprecated(note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers.")]
     pub fn reveal_mnemonic(&self, id: Option<&str>, password: &str) -> Result<Zeroizing<String>> {
         let id = self.resolve_id(id)?;
         self.read_seed(&id, password)
@@ -507,6 +524,7 @@ impl WalletCustody {
     /// (§18.24 per-transaction sign). The returned `Arc<WalletSigner>` is the ONLY strong reference;
     /// when the caller drops it (after one signing operation) the decrypted-key allocation is released
     /// — the key is not retained. Wrong password fails closed (`401`); a missing wallet is `404`.
+    #[deprecated(note = "node-side USER custody is superseded by the #1500 ratification (2026-07-22): dig-account's PolicyAuthorizer is the enforcing custody gate. FROZEN for removal by dig_ecosystem#1701 - no new consumers.")]
     pub fn sign_once(&self, id: Option<&str>, password: &str) -> Result<Arc<WalletSigner>> {
         let id = self.resolve_id(id)?;
         let mnemonic = self.read_seed(&id, password)?;
@@ -1165,6 +1183,10 @@ fn restrict_permissions(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    // These tests EXERCISE the frozen surface on purpose: a freeze must not break custody for
+    // whoever currently depends on it (dig_ecosystem#1701).
+    #![allow(deprecated)]
+
     use super::*;
     use chia::bls::master_to_wallet_hardened;
     use digstore_chain::keys::derive_indexed_keys;
