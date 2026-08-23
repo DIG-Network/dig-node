@@ -6400,6 +6400,18 @@ convergence only — it is NOT a change to the immutable `.dig` byte format (§5
   capsules whose recorded claim is a genuine holding. The record MUST NOT outlive the capsule it describes,
   and a later pull of the same generation for the node's OWN sake MUST clear it, so relaying never
   permanently excludes a generation from reshare.
+- **Suppression bounds what this node ANNOUNCES, not what it can RESOLVE.** A relayed capsule is
+  withheld from the announce set yet MUST remain answerable over the peer capsule-resolve RPC
+  (`dig.resolveCapsule`, dig-node-core `SPEC.md` §7.4), which maps a content-key to the
+  `(store_id, root, size)` preimage. The two clauses are consistent because the harms differ: an announce PUSHES a holder claim to strangers
+  who never asked, which is the amplification this suppression closes, whereas a resolve is PULL-shaped
+  — it requires an established peer session and a content-key the caller already holds, and that key is
+  a one-way digest the caller can only have obtained from the DHT or from the preimage itself. A node
+  MUST NOT filter its resolve answer by holder-claim provenance: a relaying node serves the relayed
+  capsule's bytes over the ordinary holder path, so refusing to name content it demonstrably serves
+  would withhold nothing while breaking the requestor's own fetch. The resolve answer is therefore
+  derived from the CACHE INVENTORY, which is deliberately broader than the announce set; a key this
+  node does not hold MUST be absent from the answer rather than an error.
 - A failed pull MUST leave no staging artifact behind that a later run could mistake for progress.
 - **Abandoned staging MUST be reaped, and total staging MUST be bounded in bytes.** A pull whose process
   dies mid-flight cannot clean up after itself, so the node MUST sweep the capsule-staging directory
