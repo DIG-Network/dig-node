@@ -242,9 +242,7 @@ impl RpcDispatch for Node {
             // (§6.2) without implementing the frame protocol.
             Some(Method::FetchModuleRange) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
-                return node
-                    .fetch_module_range_frame(&params, id, &requestor)
-                    .await;
+                return node.fetch_module_range_frame(&params, id, &requestor).await;
             }
             // dig.stage (#95 Pass C): turn a local folder into a capsule (.dig module) IN
             // PROCESS — the staging/compile half of a local deploy. The DIG Browser's

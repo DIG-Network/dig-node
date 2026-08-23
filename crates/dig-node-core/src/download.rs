@@ -1130,12 +1130,18 @@ pub struct BestEffort<T> {
 impl<T> BestEffort<T> {
     /// The source answered. An empty `items` here is a real "nobody holds this".
     pub fn found(items: Vec<T>) -> Self {
-        Self { items, source_failed: false }
+        Self {
+            items,
+            source_failed: false,
+        }
     }
 
     /// The source could not be consulted. Empty, and NOT an absence.
     pub fn source_failed() -> Self {
-        Self { items: Vec::new(), source_failed: true }
+        Self {
+            items: Vec::new(),
+            source_failed: true,
+        }
     }
 
     /// The items, for a caller that is FINDING — dialling, counting, enriching a candidate set.

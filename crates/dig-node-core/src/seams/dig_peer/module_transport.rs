@@ -41,8 +41,8 @@ use dig_download::{
 use dig_peer::DigPeer;
 use dig_rpc_protocol::types::{FetchModuleRangeParams, GetModuleInfoParams, ModuleInfo};
 
-use crate::download::BestEffort;
 use super::pool_locator::ConnectedPool;
+use crate::download::BestEffort;
 
 /// The peer-RPC transport the module pull rides.
 ///

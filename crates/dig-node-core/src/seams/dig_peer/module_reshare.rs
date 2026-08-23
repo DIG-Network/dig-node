@@ -412,11 +412,7 @@ impl CapsuleWarmer {
     /// The capsule still lands in the cache, because that is what lets the relayed module windows be
     /// served from the same code path a genuine holder serves from, byte-identically. What it does not
     /// do is make a stranger's choice of content into this node's advertised inventory.
-    pub async fn warm_relayed(
-        self: &Arc<Self>,
-        store_hex: &str,
-        root_hex: &str,
-    ) -> WarmOutcome {
+    pub async fn warm_relayed(self: &Arc<Self>, store_hex: &str, root_hex: &str) -> WarmOutcome {
         self.warm_claiming(store_hex, root_hex, HolderClaim::Suppress)
             .await
     }

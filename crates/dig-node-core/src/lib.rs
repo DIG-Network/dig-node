@@ -7079,8 +7079,8 @@ mod tests {
             None,
             td.path(),
         );
-        let content = dig_download::module_content_id(store, root)
-            .expect("canonical ids yield a content id");
+        let content =
+            dig_download::module_content_id(store, root).expect("canonical ids yield a content id");
         pc.set_capsule_warmer(crate::seams::dig_peer::CapsuleWarmer::new(
             Arc::new(dig_download::testkit::MockProviderLocator::fixed(
                 dig_download::testkit::mock_providers(1, &content),
