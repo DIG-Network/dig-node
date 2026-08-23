@@ -6353,6 +6353,15 @@ always large enough to keep the chunk count at or below 512 — so the descripto
 CONSTRUCTION and no capsule is made unpullable by a framing limit unrelated to its content. A single
 `fetchModuleRange` window is clamped to 4 MiB, so one request never sizes the server's work.
 
+**Descriptor cost and the ask deadline (normative).** Answering `dig.getModuleInfo` costs a full read
+of the module plus a SHA-256 of every chunk, so its latency scales with the capsule, not with the
+request. A requestor MUST therefore bound each descriptor ask and MUST re-ask under a longer bound
+rather than treating one elapsed bound as an absent holder: a 135 MB capsule measures ~4 s and a 1 GB
+capsule ~30 s on the same host. A server MUST complete a describe it has begun even if the requesting
+stream is closed, so that its descriptor memo is populated and the re-ask is answered from memory. The
+total a requestor spends on one holder MUST be bounded; an ask that is ANSWERED negatively MUST NOT be
+re-asked, since re-asking cannot change a refusal and would delay trying the next holder.
+
 ### 21.2. The anchor verifier is the ONLY root of trust (MUST)
 
 Every check before the anchor gate compares peer-supplied bytes against peer-supplied hashes. Those
