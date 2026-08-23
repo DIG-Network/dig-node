@@ -179,6 +179,38 @@ fn resolve_miss_mode(v: Option<&str>) -> MissMode {
     }
 }
 
+/// The environment variable an operator opts the MODULE-GRANULARITY RELAY in with (dig-node#276).
+pub const ONION_RELAY_ENV: &str = "DIG_NODE_ONION_RELAY";
+
+/// Whether this node is willing to RELAY a whole `.dig` capsule on a requestor's behalf — pull it
+/// from a holder the requestor cannot reach, then serve the requestor's module windows from the
+/// result (dig-node#276). Resolved from [`ONION_RELAY_ENV`]; **unset means OFF**.
+///
+/// Off by default because this leg spends OTHER nodes' bandwidth, not only this one's: an admitted
+/// relay makes this node pull an entire capsule from a third party for a stranger. A path with that
+/// reach is not gated more loosely than the ones that spend only local egress, so the operator opts
+/// in explicitly or the leg does not exist.
+pub fn onion_relay_from_env() -> bool {
+    resolve_onion_relay(std::env::var(ONION_RELAY_ENV).ok().as_deref())
+}
+
+/// Pure core of [`onion_relay_from_env`]: `1` / `true` / `on` / `yes` (case-insensitive, trimmed)
+/// enables the relay; **everything else, including unset and anything unreadable, is OFF**.
+///
+/// The failure direction is deliberate and is the whole point of the gate: an unreadable value must
+/// never be read as consent to spend the network's bandwidth. Pure so the policy is tested without
+/// process-global env.
+fn resolve_onion_relay(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some(s)
+            if s.eq_ignore_ascii_case("1")
+                || s.eq_ignore_ascii_case("true")
+                || s.eq_ignore_ascii_case("on")
+                || s.eq_ignore_ascii_case("yes")
+    )
+}
+
 /// The [`BackfillPolicy`] this node acquires under (§5.6): when a resource read is satisfied FROM
 /// ANOTHER NODE (a redirect or a fetch-through miss for a concrete `(store, root)`), the node ALSO
 /// pulls the whole `.dig` capsule for that generation in the background and caches it, so the NEXT
@@ -786,6 +818,11 @@ pub struct NodeContent {
     /// The asks already walked here, so the same question arriving by two paths through the graph is
     /// forwarded once (dig-node#273). See [`AskSeenSet`].
     ask_seen: AskSeenSet,
+    /// Whether the operator opted this node into RELAYING whole capsules for requestors that cannot
+    /// reach a holder themselves (dig-node#276). Read from [`ONION_RELAY_ENV`] ONCE, at construction,
+    /// for the same reason the recursion config is passed in rather than re-read at decision time: the
+    /// amplification posture of a running node must not change underneath an in-flight request.
+    onion_relay: std::sync::atomic::AtomicBool,
     /// How this node's pool peers have answered its forwarded asks, and the seed its routing
     /// tiebreaks use (dig_ecosystem#3129). This is what turns [`Self::forwarded_holders`] from an
     /// arbitrary `HashMap`-order prefix into a ranked slate; see
@@ -1076,6 +1113,66 @@ impl RangeTransport for PoolConfirmTransport {
     }
 }
 
+/// A best-effort lookup result: the items a source managed to produce, plus whether that source
+/// FAILED while producing them (dig-node#296).
+///
+/// # Why this is a type and not a doc comment
+///
+/// The readers below are deliberately infallible — a dial candidate list must not be lost because a
+/// DHT walk errored, and a debug counter must not propagate an error. The hazard is that their
+/// `Vec` answers an emptiness question they were never entitled to answer: a walk that FAILED and a
+/// walk that found NOBODY collapse into the same empty vector, and a caller reading that as "this
+/// content does not exist" asserts a proven absence on the strength of its own broken network. That
+/// is not hypothetical — it is exactly the defect PR #292 took three rounds to see, because two
+/// correct `Err` arms were written above the layer that had already swallowed the failure.
+///
+/// So the failure travels WITH the items, and the only way to conclude an absence is
+/// [`Self::absence_established`], which consults it. `for_finding` names what it is for at every
+/// call site, and consumes `self` so the absence question cannot be asked afterwards.
+///
+/// This is construction, not care — but it is honest about its limit: a caller determined to read
+/// `for_finding().is_empty()` as an absence can still do so. What it makes impossible is doing it
+/// *accidentally*, which is how the original defect arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BestEffort<T> {
+    items: Vec<T>,
+    source_failed: bool,
+}
+
+impl<T> BestEffort<T> {
+    /// The source answered. An empty `items` here is a real "nobody holds this".
+    pub fn found(items: Vec<T>) -> Self {
+        Self {
+            items,
+            source_failed: false,
+        }
+    }
+
+    /// The source could not be consulted. Empty, and NOT an absence.
+    pub fn source_failed() -> Self {
+        Self {
+            items: Vec::new(),
+            source_failed: true,
+        }
+    }
+
+    /// The items, for a caller that is FINDING — dialling, counting, enriching a candidate set.
+    ///
+    /// Best-effort is right for finding: a partial answer beats no answer, and a lost DHT hint costs
+    /// one unused dial candidate rather than a wrong conclusion.
+    pub fn for_finding(self) -> Vec<T> {
+        self.items
+    }
+
+    /// Whether this result licenses the claim that the content is held by NOBODY.
+    ///
+    /// **Strict for absence.** True only when the source actually answered AND answered empty; a
+    /// failed source is unknown, never absent.
+    pub fn absence_established(&self) -> bool {
+        self.items.is_empty() && !self.source_failed
+    }
+}
+
 impl NodeContent {
     /// Build the engine from injected locate + transport seams (the constructor tests use with the
     /// dig-download [`testkit`](dig_download::testkit) mocks; production goes through
@@ -1193,6 +1290,7 @@ impl NodeContent {
             discovery_cache: std::sync::OnceLock::new(),
             holder_cache: FirstHandHolderCache::new(),
             ask_seen: AskSeenSet::new(),
+            onion_relay: std::sync::atomic::AtomicBool::new(onion_relay_from_env()),
             ask_routing,
         })
     }
@@ -1376,6 +1474,33 @@ impl NodeContent {
     /// The configured miss behavior (redirect by default; fetch-through when opted in).
     pub fn miss_mode(&self) -> MissMode {
         self.miss_mode
+    }
+
+    /// Whether this node will RELAY a whole capsule on a requestor's behalf (dig-node#276) — the
+    /// operator gate resolved once at construction. See [`onion_relay_from_env`].
+    pub(crate) fn onion_relay_enabled(&self) -> bool {
+        self.onion_relay.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Flip the relay gate. **Test-only**: production resolves it once from the environment at
+    /// construction, so a running node's amplification posture is fixed. Exposing the switch here —
+    /// rather than having the relay leg read `std::env` at decision time — is what lets the leg be
+    /// exercised in BOTH directions without a process-global mutation two parallel tests would race on.
+    #[cfg(test)]
+    pub(crate) fn set_onion_relay(&self, enabled: bool) {
+        self.onion_relay
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Admit one PROXY-class fetch for `requestor` against its separate, tighter allowance
+    /// (dig_ecosystem#2189), or refuse it. The relay leg (dig-node#276) admits through this rather
+    /// than the cheap-lookup budget: relaying a whole capsule is the costliest thing a stranger can
+    /// ask this node to do, so it draws from the bucket sized for expensive egress.
+    ///
+    /// A LOCAL requestor is exempt, mirroring [`Self::miss_outcome`]'s proxy leg — the bound targets
+    /// remote callers, and the operator's own reads are not an amplification vector.
+    pub(crate) fn allow_proxy_fetch(&self, requestor: &crate::rate_limit::RequestorId) -> bool {
+        requestor.is_local() || self.proxy_rate_limiter.check(requestor)
     }
 
     /// The staging directory downloads run in (`<cache>/downloads`).
@@ -1845,14 +1970,17 @@ impl NodeContent {
         Ok(found)
     }
 
-    /// [`Self::walk_for_providers`] for the callers that genuinely cannot act on the difference — a
-    /// failed walk reads as an empty set.
+    /// [`Self::walk_for_providers`] for the callers that genuinely cannot act on a failure — a dial
+    /// candidate set, a debug counter.
     ///
-    /// **Not for anything that reports an ABSENCE.** The only production caller is the debug log in
-    /// [`Self::fetch_resource`], which is counting candidates rather than deciding whether content
-    /// exists; a caller that must tell "found nobody" from "could not look" uses the fallible form.
-    pub async fn find_providers(&self, content: &ContentId) -> Vec<ProviderRecord> {
-        self.walk_for_providers(content).await.unwrap_or_default()
+    /// **A failed walk does not become an empty one.** The failure rides along in the returned
+    /// [`BestEffort`], so a caller gets its best-effort items via `for_finding()` and can only claim
+    /// an absence through `absence_established()`, which is false when the walk failed (dig-node#296).
+    pub async fn find_providers(&self, content: &ContentId) -> BestEffort<ProviderRecord> {
+        match self.walk_for_providers(content).await {
+            Ok(found) => BestEffort::found(found),
+            Err(_) => BestEffort::source_failed(),
+        }
     }
 
     /// The #164 content-acquisition path: multi-source download `content` (locate → confirm → fan
@@ -1886,7 +2014,7 @@ impl NodeContent {
         // re-serve — the common case — never pays this locate's cost; only an actual cache-miss
         // download does, and only when someone is watching at DEBUG.
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let located = self.find_providers(content).await.len();
+            let located = self.find_providers(content).await.for_finding().len();
             let pool_size = self
                 .connected_pool
                 .lock()
@@ -3026,6 +3154,27 @@ pub(crate) mod tests {
 
     // -- miss-mode resolution --------------------------------------------------------------------
 
+    /// **Proves (dig-node#276):** the capsule-relay operator gate is OFF unless the operator wrote a
+    /// recognised affirmative, and is ON for each of the four accepted spellings.
+    /// **Catches:** the failure direction being inverted — an unset, empty, or unreadable value read
+    /// as consent. This leg spends OTHER nodes' bandwidth, so "I could not tell" must mean OFF; a
+    /// default-on relay would make every stock node a capsule-scale amplifier for strangers.
+    #[test]
+    fn the_capsule_relay_gate_is_off_unless_explicitly_enabled() {
+        assert!(!resolve_onion_relay(None), "unset → OFF (opt-in)");
+        assert!(!resolve_onion_relay(Some("")), "empty → OFF");
+        assert!(!resolve_onion_relay(Some("0")));
+        assert!(!resolve_onion_relay(Some("false")));
+        assert!(!resolve_onion_relay(Some("off")));
+        assert!(
+            !resolve_onion_relay(Some("maybe")),
+            "an unreadable value is not consent"
+        );
+        for enabled in ["1", "true", "TRUE", " on ", "Yes"] {
+            assert!(resolve_onion_relay(Some(enabled)), "{enabled}");
+        }
+    }
+
     #[test]
     fn miss_mode_defaults_to_redirect_and_opts_into_fetch_through() {
         assert_eq!(
@@ -3973,6 +4122,75 @@ pub(crate) mod tests {
             .is_err());
     }
 
+    /// A locator whose walk cannot be performed at all — the network is down, not the content absent.
+    struct UnreachableLocator;
+
+    #[async_trait::async_trait]
+    impl dig_download::ProviderLocator for UnreachableLocator {
+        async fn find_providers(
+            &self,
+            _content: &ContentId,
+        ) -> Result<Vec<ProviderRecord>, DownloadError> {
+            Err(DownloadError::NotDownloadable)
+        }
+    }
+
+    /// **Proves (dig-node#296):** a locator whose walk FAILS and a locator that genuinely holds
+    /// nothing produce results that are equal as candidate lists and OPPOSITE as absence claims. The
+    /// reader stays infallible — a dial candidate set must never be lost to a DHT error — but it no
+    /// longer silently licenses the absence.
+    ///
+    /// **Catches:** the exact shape of the defect PR #292 took three rounds to see. A failed DHT walk
+    /// was swallowed into `Ok(vec![])` two layers below the decision, so the node reported content
+    /// that exists as proven-absent, with no forged message and no red anywhere. Two correct `Err`
+    /// arms were written above the swallowing layer and BOTH were unreachable — which is why the
+    /// answer is a type that carries the failure, not a third `Err` arm.
+    ///
+    /// **Why the fixture varies exactly one thing:** both halves ask about the same content and both
+    /// come back with zero candidates. Asserting only `for_finding()` would pass with a broken flag;
+    /// asserting `absence_established()` only on the failing locator would pass with a flag hardwired
+    /// to `false`. The empty-but-honest locator is the control that rules that out — it MUST answer
+    /// `true`, or the flag carries no information at all.
+    #[tokio::test]
+    async fn a_failed_walk_yields_no_candidates_and_establishes_no_absence() {
+        let td = tempfile::tempdir().unwrap();
+        let cid = mock_content_id();
+
+        let engine = |locator: Arc<dyn dig_download::ProviderLocator>| {
+            NodeContent::new(
+                locator,
+                Arc::new(MockRangeTransport::new(MockContent::even(10, 1))),
+                MissMode::Redirect,
+                None,
+                td.path(),
+            )
+        };
+
+        // The source could not be consulted at all.
+        let unreachable = engine(Arc::new(UnreachableLocator))
+            .find_providers(&cid)
+            .await;
+        // The source answered, and the answer is that nobody holds it.
+        let empty = engine(Arc::new(MockProviderLocator::fixed(Vec::new())))
+            .find_providers(&cid)
+            .await;
+
+        assert!(
+            !unreachable.absence_established(),
+            "a walk that FAILED proves nothing about whether the content exists"
+        );
+        assert!(
+            empty.absence_established(),
+            "a walk that COMPLETED and found nobody is a genuine absence — without this half the flag \
+             could be hardwired to `false` and still pass"
+        );
+        assert!(
+            unreachable.for_finding().is_empty() && empty.for_finding().is_empty(),
+            "both are empty as CANDIDATE lists — precisely why a bare `Vec` could not tell them \
+             apart, and why the distinction had to move into the type"
+        );
+    }
+
     #[tokio::test]
     async fn find_providers_excludes_self() {
         let td = tempfile::tempdir().unwrap();
@@ -3988,6 +4206,7 @@ pub(crate) mod tests {
             td.path(),
         );
         let got = pc.find_providers(&cid).await;
+        let got = got.for_finding();
         assert_eq!(got.len(), 1, "own record excluded");
         assert_eq!(got[0].provider_peer_id, mock_peer_hex(2));
     }

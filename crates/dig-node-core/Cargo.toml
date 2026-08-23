@@ -23,7 +23,14 @@ name = "dig-node-core"
 # out-of-workspace implementor; this crate is consumed in-workspace only and is pre-1.0, so it is a
 # MINOR bump under SemVer's 0.x rule -- recorded here rather than letting the number imply the trait
 # surface held still.
-version = "0.52.0"
+# 0.53.0 adds the module-granularity capsule relay leg (`seams/dig_peer/module_relay.rs`, gated OFF
+# by default) and makes the provider/candidate locator readers absence-safe: `NodeContent::find_providers`
+# and `NatModuleTransport::discovered_candidates` now return `BestEffort<T>` rather than a bare `Vec<T>`,
+# so a source that could not be consulted can no longer be read as a proven absence (dig_ecosystem#3128,
+# dig-node#276/#296). Changing a public return type is BREAKING for an out-of-workspace implementor;
+# this crate is consumed in-workspace only and is pre-1.0, so it is a MINOR bump under SemVer's 0.x
+# rule -- recorded here rather than letting the number imply the locator surface held still.
+version = "0.53.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."

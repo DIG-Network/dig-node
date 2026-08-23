@@ -439,6 +439,7 @@ fn cached_capsule(store: u8, root: u8) -> dig_node_core::CachedCapsule {
         root: hex::encode([root; 32]),
         size_bytes: 4_096,
         last_used_unix_ms: 1_782_000_000_000,
+        provenance: dig_node_core::CapsuleProvenance::Held,
     }
 }
 

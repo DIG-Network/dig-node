@@ -4604,6 +4604,7 @@ mod tests {
             root: "bb".repeat(32),
             size_bytes: 4096,
             last_used_unix_ms: 1_700_000_000_000,
+            provenance: dig_node_core::CapsuleProvenance::Held,
         };
         let j = cached_capsule_json(&c);
         assert_eq!(

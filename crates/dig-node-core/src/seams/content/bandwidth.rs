@@ -200,7 +200,10 @@ impl crate::Node {
         if depth >= crate::download::REDIRECT_HOP_CAP {
             return None;
         }
-        let providers = pc.find_providers(content).await;
+        // FINDING, not deciding: this picks somebody else to serve from. An unreachable DHT means
+        // "no alternate known", which falls through to serving over budget rather than dropping the
+        // caller — the graceful direction. It must never read as "this content exists nowhere".
+        let providers = pc.find_providers(content).await.for_finding();
         if providers.is_empty() {
             return None;
         }

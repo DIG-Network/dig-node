@@ -2165,6 +2165,8 @@ impl Node {
                 .map(|(_, _, s)| *s)
                 .unwrap_or(0);
             if std::fs::remove_file(&victim).is_ok() {
+                // A relay marker never outlives its capsule (dig-node#276).
+                crate::capsule_key::discard_relay_marker_beside(&victim);
                 // #279 telemetry: record the LRU eviction (count + reclaimed bytes).
                 CACHE_EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 CACHE_EVICTED_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
@@ -2375,6 +2377,8 @@ impl Node {
             };
             let (victim, store_hex, size) = (&module.path, &module.store_hex, module.size_bytes);
             if std::fs::remove_file(victim).is_ok() {
+                // A relay marker never outlives its capsule (dig-node#276).
+                crate::capsule_key::discard_relay_marker_beside(victim);
                 CACHE_EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 CACHE_EVICTED_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
                 // Drop any decoded content for the evicted generation so a removed module is never
@@ -2725,6 +2729,47 @@ impl Node {
         }
     }
 
+    /// The transfer descriptor for a `.dig` module at the CACHE path, or `None` if this node does not
+    /// hold it. The blocking read + per-chunk hashing runs on a `spawn_blocking` thread (a `.dig` is
+    /// large; hashing it must never stall the async runtime).
+    ///
+    /// Extracted because the relay leg (dig-node#276) reads the SAME cache TWICE — once to discover
+    /// the miss, once after the relayed pull has landed — and a relayed answer that came from a second
+    /// reader would be a second thing to keep byte-identical with the held one.
+    async fn describe_held_module(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+    ) -> Option<dig_rpc_protocol::types::ModuleInfo> {
+        let cache_dir = self.cache_dir.clone();
+        let (store, root) = (store_hex.to_string(), root_hex.to_string());
+        tokio::task::spawn_blocking(move || {
+            seams::dig_peer::module_serve::describe_module(&cache_dir, &store, &root)
+        })
+        .await
+        .unwrap_or(None)
+    }
+
+    /// One window of a `.dig` module at the CACHE path, or `None` if this node does not hold it. The
+    /// companion of [`Self::describe_held_module`]; see there for why it is its own function.
+    async fn read_held_module_window(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        offset: u64,
+        length: u64,
+    ) -> Option<Vec<u8>> {
+        let cache_dir = self.cache_dir.clone();
+        let (store, root) = (store_hex.to_string(), root_hex.to_string());
+        tokio::task::spawn_blocking(move || {
+            seams::dig_peer::module_serve::read_module_window(
+                &cache_dir, &store, &root, offset, length,
+            )
+        })
+        .await
+        .unwrap_or(None)
+    }
+
     /// `dig.getModuleInfo` (#1576, the reshare leg): the transfer descriptor for a whole `.dig` module
     /// this node HOLDS — the handshake a peer reads before range-pulling the entire capsule so it can
     /// become a resharer of it.
@@ -2737,7 +2782,12 @@ impl Node {
     /// - Module NOT held (or a 0-byte file, which is not a module) → the same
     ///   `RESOURCE_UNAVAILABLE` code `dig.fetchRange` reports on a miss. Declining is the honest answer:
     ///   describing a module this node cannot serve would advertise a capsule it does not have.
-    async fn get_module_info(&self, params: &Value, id: Value) -> Value {
+    async fn get_module_info(
+        &self,
+        params: &Value,
+        id: Value,
+        requestor: &crate::rate_limit::RequestorId,
+    ) -> Value {
         let store_hex = params
             .get("store_id")
             .and_then(Value::as_str)
@@ -2755,13 +2805,19 @@ impl Node {
                 "dig.getModuleInfo requires store_id + root (64-hex each)",
             );
         }
-        let cache_dir = self.cache_dir.clone();
-        let (store, root) = (store_hex.clone(), root_hex.clone());
-        let info = tokio::task::spawn_blocking(move || {
-            seams::dig_peer::module_serve::describe_module(&cache_dir, &store, &root)
-        })
-        .await
-        .unwrap_or(None);
+        let mut info = self.describe_held_module(&store_hex, &root_hex).await;
+        // MISS -> the RELAY leg (dig-node#276). A requestor that asked for a relay, on a node whose
+        // operator opted in and within its proxy allowance, makes this node pull the whole capsule
+        // from a holder and describe it from its own cache. Every gate is inside `relay_capsule`; a
+        // refusal simply leaves `info` as `None` and the honest not-held answer below stands.
+        if info.is_none()
+            && seams::dig_peer::module_relay::relay_capsule(
+                self, &store_hex, &root_hex, params, requestor,
+            )
+            .await
+        {
+            info = self.describe_held_module(&store_hex, &root_hex).await;
+        }
         // The serve log records both outcomes with sentinelled ids, so "was this holder asked for the
         // descriptor, and did it have it?" is answerable from the log alone (#1595).
         seams::dig_peer::module_serve::module_info_answered(
@@ -2794,7 +2850,12 @@ impl Node {
     ///
     /// Params `{store_id, root, offset?, length}`; the window is clamped to the serve cap. A module this
     /// node does not hold answers the same `RESOURCE_UNAVAILABLE` code the streaming form reports.
-    async fn fetch_module_range_frame(&self, params: &Value, id: Value) -> Value {
+    async fn fetch_module_range_frame(
+        &self,
+        params: &Value,
+        id: Value,
+        requestor: &crate::rate_limit::RequestorId,
+    ) -> Value {
         use seams::dig_peer::module_serve;
 
         let store_hex = params
@@ -2820,13 +2881,22 @@ impl Node {
             .and_then(Value::as_u64)
             .unwrap_or(module_serve::MAX_MODULE_WINDOW);
 
-        let cache_dir = self.cache_dir.clone();
-        let (store, root) = (store_hex.clone(), root_hex.clone());
-        let window = tokio::task::spawn_blocking(move || {
-            module_serve::read_module_window(&cache_dir, &store, &root, offset, length)
-        })
-        .await
-        .unwrap_or(None);
+        let mut window = self
+            .read_held_module_window(&store_hex, &root_hex, offset, length)
+            .await;
+        // MISS -> the RELAY leg (dig-node#276), exactly as on the descriptor above: a relayed window
+        // is read from the same cache, through the same reader, so it is byte-identical to the one a
+        // genuine holder would have served and the requestor needs no second code path.
+        if window.is_none()
+            && seams::dig_peer::module_relay::relay_capsule(
+                self, &store_hex, &root_hex, params, requestor,
+            )
+            .await
+        {
+            window = self
+                .read_held_module_window(&store_hex, &root_hex, offset, length)
+                .await;
+        }
 
         match window {
             Some(bytes) => {
@@ -4012,6 +4082,27 @@ struct CachedModule {
     size_bytes: u64,
 }
 
+/// WHY this node holds a cached capsule — and therefore whether it may advertise it (dig-node#276).
+///
+/// Holding and ADVERTISING are different claims, and only this distinguishes them. A relay pulls a whole
+/// capsule on a stranger's behalf: the bytes are as verified as any other (same chain anchor, same merkle
+/// proof, same promote-recheck), and they are cached so the relayed windows are served from the ordinary
+/// holder path. What must never follow is this node telling the network it is a source of content a
+/// stranger chose — that is the amplification primitive the `origin != Local` reshare refusal exists to
+/// close, reopened one level up.
+///
+/// An enum rather than a `bool`, and a REQUIRED field rather than a defaulted one, so every construction
+/// site has to name which of the two it is. A future inventory producer cannot inherit "announce me" by
+/// omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CapsuleProvenance {
+    /// Pulled for this node's own sake. A genuine, willing holder — announceable.
+    Held,
+    /// Pulled on a stranger's behalf. Cached and servable, but NEVER advertised.
+    Relayed,
+}
+
 /// One cached capsule, as returned by [`Node::cache_list_cached`]. Identity is the
 /// `(store_id, root)` capsule (`digstore_core::Capsule`, `storeId:rootHash`).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -4024,6 +4115,12 @@ pub struct CachedCapsule {
     pub size_bytes: u64,
     /// Last-used time (file mtime, the LRU recency stamp) in Unix epoch ms.
     pub last_used_unix_ms: u64,
+    /// Whether this node may ADVERTISE the capsule, or merely serve it (dig-node#276).
+    ///
+    /// Read from the durable `<root>.relay` sidecar by the one disk scan that produces this type, so it
+    /// describes the ARTIFACT and not the call that happened to produce this list. That is what makes
+    /// suppression survive across unrelated announce causes — see [`CapsuleProvenance`].
+    pub provenance: CapsuleProvenance,
 }
 
 /// Bump a file's mtime to "now" so the LRU treats it as freshly used.
@@ -6992,6 +7089,150 @@ mod tests {
         let decoded: dig_nat::RangeFrame =
             serde_json::from_value(frame.clone()).expect("decodes as a RangeFrame");
         assert_eq!(decoded.bytes, bytes[100..150]);
+    }
+
+    /// Wire node `b` as a RELAY for `(store, root)`: a P2P content engine with the relay gate open,
+    /// plus a capsule warmer whose only holder serves `module`.
+    ///
+    /// `b` holds nothing of its own — the capsule can reach its cache only through the relay leg, so
+    /// every assertion below about what `b` serves is an assertion about the relay and nothing else.
+    fn wire_relay_hop(
+        b: &Node,
+        store: &str,
+        root: &str,
+        module: Vec<u8>,
+        td: &tempfile::TempDir,
+    ) -> Arc<NodeContent> {
+        let pc = NodeContent::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(Vec::new())),
+            Arc::new(dig_download::testkit::MockRangeTransport::new(
+                dig_download::testkit::MockContent::even(8, 1),
+            )),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let content =
+            dig_download::module_content_id(store, root).expect("canonical ids yield a content id");
+        pc.set_capsule_warmer(crate::seams::dig_peer::CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                store, root, module, 8,
+            )),
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            MockResolver::one(store, Bytes32::from_hex(root).expect("64-hex root")),
+            crate::seams::dig_peer::WarmPaths {
+                staging_dir: td.path().join("relay-staging"),
+                cache_dir: b.cache_dir.clone(),
+            },
+            Arc::new(SilentAnnounce),
+            Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        ));
+        b.set_p2p_content(Arc::clone(&pc));
+        pc
+    }
+
+    /// One `dig.getModuleInfo` against `node`, with or without the relay opt-in.
+    async fn ask_module_info(node: &Node, store: &str, root: &str, proxy: bool) -> Value {
+        let mut params = json!({"store_id": store, "root": root});
+        if proxy {
+            params["proxy"] = json!(true);
+        }
+        handle_rpc(
+            node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getModuleInfo","params":params}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await
+    }
+
+    /// **Proves (dig-node#276, units 1-3):** a node that holds NOTHING answers a relay-flagged
+    /// `dig.getModuleInfo` + `dig.fetchModuleRange` with the real capsule — pulled through the hop from
+    /// the only holder — and the served window is byte-identical to what that holder would have served.
+    /// And it refuses, exactly as it did before this leg existed, when EITHER gate is shut: the operator
+    /// has not opted in, or the requestor did not ask for a relay.
+    ///
+    /// **Catches:** the two failure directions that matter in opposite ways. A relay that never fires
+    /// leaves requirement 4 of the recursive-download epic unimplemented at the granularity a `.dig`
+    /// download actually uses — which is the state this ticket found. A relay that fires REGARDLESS of
+    /// the gates turns every stock node into a capsule-scale amplifier a stranger can aim at a third
+    /// party, which is strictly worse than the gap.
+    ///
+    /// **Why all three cases run against the SAME node and the SAME wiring:** a refusal asserted on a
+    /// separately-built node is satisfied identically by a working gate and by a fixture whose holder
+    /// never answers, whose chain never confirms, or whose warmer was never wired — and each of those
+    /// would also silence a legitimate relay. Here the ONLY thing that varies between the refusals and
+    /// the success is one boolean on the request and one boolean on the node, and the success case runs
+    /// LAST, so it proves the same fixture that just refused twice is fully capable of answering.
+    #[tokio::test]
+    async fn a_relay_serves_a_capsule_it_does_not_hold_only_when_both_gates_are_open() {
+        let (b, _bd) = test_node(None);
+        let staging = tempfile::tempdir().unwrap();
+        let store_raw = [0x7au8; 32];
+        let (module, root) = chain_anchored_module(store_raw, [0x7bu8; 32]);
+        let (store, root) = (hex::encode(store_raw), root.to_hex());
+        let pc = wire_relay_hop(&b, &store, &root, module.clone(), &staging);
+
+        let held_path = module_path(&b.cache_dir, &store, &root);
+        assert!(
+            !held_path.exists(),
+            "the relay hop must start out holding nothing, or it is not relaying anything"
+        );
+
+        // GATE 1 SHUT — the operator has not opted in. The default posture of every stock node.
+        pc.set_onion_relay(false);
+        assert_eq!(
+            ask_module_info(&b, &store, &root, true).await["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "a node whose operator did not opt in must answer exactly as it did before this leg"
+        );
+        assert!(
+            !held_path.exists(),
+            "a refused relay must not have pulled the capsule anyway"
+        );
+
+        // GATE 2 SHUT — the operator opted in, but this requestor did not ask for a relay. Relaying is
+        // never automatic: a requestor that can reach holders itself should, and does.
+        pc.set_onion_relay(true);
+        assert_eq!(
+            ask_module_info(&b, &store, &root, false).await["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "an unflagged request is answered from local holdings only"
+        );
+        assert!(
+            !held_path.exists(),
+            "an unflagged request must not provoke a capsule pull"
+        );
+
+        // BOTH OPEN — the capsule arrives THROUGH the hop.
+        let described = ask_module_info(&b, &store, &root, true).await;
+        assert_eq!(
+            described["result"]["total_size"],
+            json!(module.len() as u64),
+            "the relayed descriptor describes the real capsule, not a placeholder"
+        );
+
+        let framed = handle_rpc(
+            &b,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.fetchModuleRange",
+                   "params":{"store_id":store,"root":root,"offset":16,"length":32,"proxy":true}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let decoded: dig_nat::RangeFrame = serde_json::from_value(framed["result"].clone())
+            .expect("a relayed window decodes as a RangeFrame, exactly like a held one");
+        assert_eq!(
+            decoded.bytes,
+            module[16..48],
+            "the relayed window is byte-identical to the holder's own bytes — the requestor cannot \
+             tell it was relayed, and so needs no second code path"
+        );
     }
 
     /// **Proves:** a non-canonical id on either module method is a -32602 that never reaches the

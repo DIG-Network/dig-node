@@ -22,13 +22,27 @@
 //!
 //! # Why this discloses no NEW privacy surface
 //!
-//! A node answers a resolve ONLY for capsules it already announces as a public provider in the DHT (the
-//! same inventory `dig.getProviderSnapshot` reports the COUNTS of). The preimage `(store_id, root)` of a
-//! capsule this node publicly serves is already learnable — `dig.getAvailability` / `dig.fetchRange`
-//! serve its bytes to anyone. Keeping it a SEPARATE method from `getProviderSnapshot` is deliberate: the
-//! snapshot stays strictly counts-only (it never names a store), while this method — asked only for keys
-//! a caller already sampled — trades the preimage of THIS node's own public holdings. No provider
-//! identity of any OTHER node is ever revealed, and no node state is mutated.
+//! The answer is drawn from this node's cache inventory, which is BROADER than its announce set: a
+//! capsule cached on another node's behalf is deliberately withheld from the DHT announce set (§21.3,
+//! [`crate::seams::dig_peer::dht`]) yet REMAINS resolvable here. That is intentional, and the
+//! justification is the resolve's PULL shape rather than any claim about what this node advertises.
+//!
+//! A resolve reveals nothing a caller cannot already obtain, because reaching this method at all
+//! requires both an established peer session and a content-key `H` the caller ALREADY holds — `H` is a
+//! one-way digest, so it can only have come from the DHT or from knowing the preimage outright. Given
+//! such an `H`, the preimage `(store_id, root)` is already learnable from this node by ordinary means:
+//! it serves the capsule's bytes to any peer over `dig.getAvailability` / `dig.fetchRange`, and a
+//! relaying node MUST be able to resolve exactly the content it is serving. A key this node does not
+//! hold is simply ABSENT, the same not-held-implies-absent idiom as `getAvailability`, so the method
+//! answers only about content already reachable through this node.
+//!
+//! Announce suppression targets a DIFFERENT harm: an announce PUSHES a holder claim to strangers who
+//! never asked, turning relayed traffic into unbounded amplification. A pull answered to a peer that
+//! is already connected and already knows `H` adds no such reach. Keeping this a SEPARATE method from
+//! `getProviderSnapshot` is deliberate: the snapshot stays strictly counts-only (it never names a
+//! store), while this method — asked only for keys a caller already sampled — trades the preimage of
+//! content this node already serves. No provider identity of any OTHER node is ever revealed, and no
+//! node state is mutated.
 //!
 //! # Bounds — one cheap request cannot become unbounded work
 //!
@@ -189,6 +203,7 @@ mod tests {
             root: hex::encode(root),
             size_bytes,
             last_used_unix_ms: 0,
+            provenance: crate::CapsuleProvenance::Held,
         }
     }
 
@@ -304,6 +319,7 @@ mod tests {
                 root: "garbage".to_string(),
                 size_bytes: 1,
                 last_used_unix_ms: 0,
+                provenance: crate::CapsuleProvenance::Held,
             },
             held(store, root, 5),
         ];

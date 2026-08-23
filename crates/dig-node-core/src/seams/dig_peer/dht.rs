@@ -363,11 +363,24 @@ fn malformed_request_response(e: &serde_json::Error) -> DhtResponse {
 /// Returns 64-hex-keyed [`dig_dht::ContentId`]s; a malformed (non-64-hex) store/root in the inventory
 /// is skipped (it can never be a valid content key). Pure over the cached list so it is unit-tested
 /// without a node or a disk.
+///
+/// # RELAYED capsules are dropped here, and this is the only place they need to be
+///
+/// A [`CapsuleProvenance::Relayed`](crate::CapsuleProvenance) capsule is held on a stranger's behalf and
+/// must never be advertised (dig-node#276). This function is the ONE mapping from inventory to
+/// announceable ids — the DHT reconcile ([`reconcile_provider_records`]), the bring-up announce, and the
+/// opcode-222 holdings flood all derive their ids from it — so filtering here suppresses a relayed
+/// capsule across every announce cause, including causes that know nothing about the relay and causes
+/// that do not exist yet. Suppressing the CALL that happened to follow a relayed pull would not: the
+/// announce set is rebuilt from disk, so the next unrelated reconcile would advertise it anyway.
 pub fn inventory_content_ids(cached: &[CachedCapsule]) -> Vec<dig_dht::ContentId> {
     use std::collections::BTreeSet;
     let mut out = Vec::new();
     let mut seen_stores: BTreeSet<[u8; 32]> = BTreeSet::new();
     for c in cached {
+        if c.provenance == crate::CapsuleProvenance::Relayed {
+            continue; // held for a stranger: servable, never advertised
+        }
         let (Some(store), Some(root)) = (hex64(&c.store_id), hex64(&c.root)) else {
             continue; // skip a malformed inventory entry (never a valid content key)
         };
@@ -926,11 +939,17 @@ mod tests {
     }
 
     fn cap(store: &str, root: &str) -> CachedCapsule {
+        cap_with(store, root, crate::CapsuleProvenance::Held)
+    }
+
+    /// A cached capsule with an explicit provenance — the relay-suppression cases need `Relayed`.
+    fn cap_with(store: &str, root: &str, provenance: crate::CapsuleProvenance) -> CachedCapsule {
         CachedCapsule {
             store_id: store.to_string(),
             root: root.to_string(),
             size_bytes: 1,
             last_used_unix_ms: 1,
+            provenance,
         }
     }
 
@@ -1021,6 +1040,48 @@ mod tests {
     #[test]
     fn inventory_content_ids_empty_for_empty_inventory() {
         assert!(inventory_content_ids(&[]).is_empty());
+    }
+
+    /// **Proves (dig-node#276):** a `Relayed` capsule contributes NO announceable content id — neither
+    /// its capsule id nor its store id — while a `Held` capsule in the same inventory contributes both.
+    ///
+    /// **Catches:** the store-granularity half of the leak. Dropping only the capsule id would still
+    /// advertise "this node serves store X", which is enough for a finder to dial this node for a
+    /// stranger's content — the same amplification, one granularity up. It also pins the filter to the
+    /// funnel every announce cause reads, rather than to any one caller.
+    #[test]
+    fn inventory_content_ids_never_announces_a_relayed_capsule() {
+        let relayed = "aa".repeat(32);
+        let held = "bb".repeat(32);
+        let root = "11".repeat(32);
+        let ids = inventory_content_ids(&[
+            cap_with(&relayed, &root, crate::CapsuleProvenance::Relayed),
+            cap_with(&held, &root, crate::CapsuleProvenance::Held),
+        ]);
+
+        let (rb, hb, rt) = (
+            hex64(&relayed).unwrap(),
+            hex64(&held).unwrap(),
+            hex64(&root).unwrap(),
+        );
+        // The truthful control first: an empty result would otherwise satisfy every claim below.
+        assert!(
+            ids.contains(&ContentId::store(hb)) && ids.contains(&ContentId::capsule(hb, rt)),
+            "the honestly-held capsule is still announced at both granularities"
+        );
+        assert!(
+            !ids.contains(&ContentId::capsule(rb, rt)),
+            "a relayed capsule is never announced"
+        );
+        assert!(
+            !ids.contains(&ContentId::store(rb)),
+            "nor is its store — a store-granularity record is the same leak one level up"
+        );
+        assert_eq!(
+            ids.len(),
+            2,
+            "exactly the held capsule's store + capsule ids"
+        );
     }
 
     // -- inventory_diff (on-change reaction) ---------------------------------------------------
