@@ -6757,3 +6757,5 @@ seed, private key, signature or unsigned-spend field on any profile method, and 
 
 
 <!-- dig_ecosystem#2870: trusted Chia peer add/list/remove (WIP) -->
+
+<!-- WIP marker for dig-node#325 / dig_ecosystem#1701 step 4. Removed before the PR is squashed. -->
