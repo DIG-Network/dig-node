@@ -1963,4 +1963,51 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// **Proves (dig_ecosystem#1701, step 1):** the FROZEN custody surface is still fully
+    /// functional. A freeze must not break custody for whoever currently depends on it - the
+    /// deprecation exists to stop NEW consumers arriving, and step 4 removes the code once the
+    /// population is confirmed safe.
+    ///
+    /// The whole key-touching path is walked, not just one entry point, because a partial freeze
+    /// that left (say) `sign_once` unreachable would still let an import/unlock test pass while a
+    /// real custodian could no longer spend.
+    #[test]
+    fn the_frozen_custody_surface_is_still_functional_end_to_end() {
+        let (c, dir) = fresh();
+        let password = "correcthorse";
+
+        let imported = c.import(ABANDON, password, None).expect("import must work");
+        assert_eq!(imported.id, abandon_id(), "import must custody the ABANDON key");
+
+        let unlocked = c.unlock(None, password).expect("unlock must work");
+        assert_eq!(unlocked.id, imported.id);
+        assert_eq!(
+            unlocked.address, imported.address,
+            "unlock must resolve to the same wallet import created"
+        );
+
+        // The signing grant: one-shot, and the thing a custodian actually needs to spend.
+        c.sign_once(None, password)
+            .expect("sign_once must still issue a signing grant");
+
+        // The only sanctioned seed egress, and the one that would matter to a stranded user.
+        let revealed = c
+            .reveal_mnemonic(None, password)
+            .expect("reveal_mnemonic must still return the custodied seed");
+        assert_eq!(
+            revealed.as_str(),
+            ABANDON,
+            "the frozen surface must return the SAME seed it was given, byte for byte"
+        );
+
+        // A wrong password must still fail closed - a freeze that quietly relaxed the gate on the
+        // way out would be worse than the surface it retires.
+        assert!(
+            c.reveal_mnemonic(None, "wrongpassword").is_err(),
+            "the frozen surface must still refuse a wrong password"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
