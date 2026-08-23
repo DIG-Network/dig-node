@@ -1985,7 +1985,10 @@ mod tests {
     #[test]
     fn the_frozen_custody_surface_is_still_functional_end_to_end() {
         let (c, dir) = fresh();
-        let password = "correcthorse";
+        // Derived, not a literal: a hard-coded password in a test trips the secret scanner and
+        // teaches the wrong pattern. This is the module's established test-password helper.
+        let password = test_custody_password();
+        let password = password.as_str();
 
         let imported = c.import(ABANDON, password, None).expect("import must work");
         assert_eq!(
@@ -2018,7 +2021,7 @@ mod tests {
         // A wrong password must still fail closed - a freeze that quietly relaxed the gate on the
         // way out would be worse than the surface it retires.
         assert!(
-            c.reveal_mnemonic(None, "wrongpassword").is_err(),
+            c.reveal_mnemonic(None, &format!("not-{password}")).is_err(),
             "the frozen surface must still refuse a wrong password"
         );
 
