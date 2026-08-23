@@ -62,6 +62,8 @@ pub mod rate_limit;
 pub mod store_exchange;
 
 #[cfg(test)]
+mod ask_routing_tests;
+#[cfg(test)]
 mod forwarded_ask_tests;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
 /// W1b sub-PR sequence. Modules re-exported below at their ORIGINAL crate-root path keep

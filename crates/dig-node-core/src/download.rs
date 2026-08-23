@@ -57,10 +57,10 @@ use digstore_core::codec::Decode;
 use crate::dht::hex64;
 pub(crate) use crate::seams::dig_peer::MAX_CONCURRENT_FORWARDED_ASKS;
 use crate::seams::dig_peer::{
-    ask_budget, retain_excluding_self, AskId, AskOutcome, AskSeenSet, CapsuleFallbackLocator,
-    ConnectedPool, EmptyLocator, FirstHandHolderCache, ForwardedAsk, NatForwardedAsk,
-    PoolProviderLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
-    MAX_FORWARDED_ASK_BUDGET,
+    ask_budget, retain_excluding_self, AskId, AskOutcome, AskRoutingState, AskSeenSet,
+    CapsuleFallbackLocator, ConnectedPool, EmptyLocator, FirstHandHolderCache, ForwardedAsk,
+    NatForwardedAsk, PoolProviderLocator, RoutedPeer, SelectorAdapter, SelfExcludingLocator,
+    UnionLocator, MAX_FORWARDED_ASK_BUDGET,
 };
 
 /// JSON-RPC error code: the content is NOT held by this node, but the DHT located peers that DO
@@ -823,6 +823,18 @@ pub struct NodeContent {
     /// for the same reason the recursion config is passed in rather than re-read at decision time: the
     /// amplification posture of a running node must not change underneath an in-flight request.
     onion_relay: std::sync::atomic::AtomicBool,
+    /// How this node's pool peers have answered its forwarded asks, and the seed its routing
+    /// tiebreaks use (dig_ecosystem#3129). This is what turns [`Self::forwarded_holders`] from an
+    /// arbitrary `HashMap`-order prefix into a ranked slate; see
+    /// [`AskRoutingState`](crate::seams::dig_peer::ask_routing) for why the identity it ranks by MUST
+    /// be the verified mTLS one and nothing else.
+    ///
+    /// Deliberately NOT the [`FirstHandHolderCache`] one field above, despite both remembering
+    /// something about peers. That cache answers "who holds this content" and is keyed by content with
+    /// a TTL (#3128 requirement 7); this answers "who answers well" and is keyed by peer with no TTL
+    /// at all, because pool membership is its liveness gate. Folding them together would make one
+    /// structure whose key, lifetime and eviction rule all mean two different things at once.
+    ask_routing: AskRoutingState,
 }
 
 /// What a holder search ESTABLISHED — the records it found AND whether an empty result is a fact.
@@ -1253,6 +1265,8 @@ impl NodeContent {
             state_store.clone(),
             config,
         );
+        // Built before the struct literal because it reads `self_peer_id`, which the literal moves.
+        let ask_routing = AskRoutingState::new(self_peer_id.as_deref());
         Arc::new(NodeContent {
             locator,
             selector,
@@ -1277,6 +1291,7 @@ impl NodeContent {
             holder_cache: FirstHandHolderCache::new(),
             ask_seen: AskSeenSet::new(),
             onion_relay: std::sync::atomic::AtomicBool::new(onion_relay_from_env()),
+            ask_routing,
         })
     }
 
@@ -1736,26 +1751,41 @@ impl NodeContent {
         let config = self.recursion_config.get().copied().unwrap_or_default();
         let pool = self.dialable_pool();
 
-        // `decide_forward` compares peers by identity, and both exclusions are stated over the SAME
-        // hex-string space the pool is keyed by. A requestor that is not a peer (a local caller) and
-        // an unresolved self-identity have no such string; the empty string stands in for both,
-        // because no pool key is ever empty and so it excludes nothing — which is the honest reading
-        // of "there is nobody here to exclude".
+        // `decide_forward` compares peers by identity, and every identity crossing this boundary is a
+        // [`RoutedPeer`] — the 32 bytes of the VERIFIED mTLS `peer_id`, minted from nothing else. That
+        // is the property `dig-sex` cannot enforce for itself (it is generic over `Peer`) and the one
+        // that stops a hostile peer choosing where it lands in this node's ranking; see
+        // [`ask_routing`](crate::seams::dig_peer::ask_routing).
+        //
+        // A requestor that is not a peer (a local caller) and an unresolved self-identity have no such
+        // identity, and [`RoutedPeer::nobody`] stands in for both: an all-zero digest no pool member
+        // can hold, so the exclusion never fires — the honest reading of "there is nobody here to
+        // exclude". A pool key that will not decode drops out of routing entirely rather than being
+        // routed to under a fabricated one.
         let asker = match requestor {
-            crate::rate_limit::RequestorId::Peer(id) => id.as_str(),
-            _ => "",
-        };
-        let me = self.self_peer_id.as_deref().unwrap_or("");
-        let peer_keys: Vec<&str> = pool.iter().map(|(peer, _)| peer.as_str()).collect();
+            crate::rate_limit::RequestorId::Peer(id) => RoutedPeer::from_pool_key(id.as_str()),
+            _ => None,
+        }
+        .unwrap_or_else(RoutedPeer::nobody);
+        let me = self
+            .self_peer_id
+            .as_deref()
+            .and_then(RoutedPeer::from_pool_key)
+            .unwrap_or_else(RoutedPeer::nobody);
+        let routable: Vec<RoutedPeer> = pool
+            .iter()
+            .filter_map(|(peer, _)| RoutedPeer::from_pool_key(peer))
+            .collect();
 
-        let decision = dig_sex::discovery::decide_forward(
+        // Ranked by what THIS node has observed, not by the pool `HashMap`'s arbitrary order — and the
+        // observations of peers no longer in `routable` are dropped in the same call, so a cycled-away
+        // peer leaves this node's memory when it leaves the pool.
+        let decision = self.ask_routing.decide(
             &config,
-            &dig_sex::discovery::InboundAsk {
-                requestor: asker,
-                hops_remaining: budget.remaining(config.hop_cap),
-            },
-            &me,
-            &peer_keys,
+            asker,
+            budget.remaining(config.hop_cap),
+            me,
+            &routable,
             self.relay_rate_limiter.check(requestor),
         );
 
@@ -1810,8 +1840,9 @@ impl NodeContent {
         let deadline = tokio::time::Instant::now() + total;
 
         let mut answers = ForwardedAnswers::asked();
-        for peer in peers {
-            let Some((_, addrs)) = pool.iter().find(|(known, _)| known == peer) else {
+        for routed in peers {
+            let peer = routed.to_pool_key();
+            let Some((_, addrs)) = pool.iter().find(|(known, _)| *known == peer) else {
                 continue;
             };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1825,9 +1856,23 @@ impl NodeContent {
             // The identity travels WITH the ask, because the far end reads it off the wire: an ask
             // issued without it makes every hop beyond this one mint a fresh id, and the diamond
             // dedup that bounds this whole recursion never fires (dig-node#273).
+            // Timed on THIS node's own clock, around this node's own exchange. Nothing a peer sends
+            // contributes to the latency it is scored on, for the same reason nothing it sends
+            // contributes to its identity.
+            let started = tokio::time::Instant::now();
             let outcome = ask
-                .ask(peer, addrs, content, next_depth, remaining, budget.ask_id())
+                .ask(
+                    &peer,
+                    addrs,
+                    content,
+                    next_depth,
+                    remaining,
+                    budget.ask_id(),
+                )
                 .await;
+            // The ONLY writer of this node's routing memory, fed an outcome this node classified from
+            // an exchange it issued and saw complete (dig_ecosystem#3129).
+            self.ask_routing.record(routed, &outcome, started.elapsed());
             match outcome {
                 AskOutcome::Answered(records) => answers.records.extend(records),
                 // The peer answered and told us its OWN subtree did not finish. Its records are
@@ -1862,6 +1907,15 @@ impl NodeContent {
             .filter(|(_, addrs)| !addrs.is_empty())
             .map(|(peer, addrs)| (peer.clone(), addrs.clone()))
             .collect()
+    }
+
+    /// This node's routing memory, so a test can drive the forwarded ask and then ask what the ask
+    /// LEFT BEHIND. Without it the recording leg would only be observable through its effect on a
+    /// later round, and a test that could not see the write directly could not tell a missing write
+    /// from a ranking that happened to agree with it.
+    #[cfg(test)]
+    pub(crate) fn ask_routing(&self) -> &AskRoutingState {
+        &self.ask_routing
     }
 
     /// [`Self::forget_stale_discovery`], reachable from the tests that drive the caches directly.

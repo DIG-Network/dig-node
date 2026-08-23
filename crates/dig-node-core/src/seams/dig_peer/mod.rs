@@ -11,6 +11,7 @@
 //! (matching W1b-0's pattern) but is out of scope for this trait carve.
 
 pub mod address_book;
+pub mod ask_routing;
 pub mod bootstrap;
 pub mod capsule_fallback;
 // The self-verifying tier-0 preimage resolver (#2033, PR-2). Its surface is exercised by its own
@@ -47,6 +48,7 @@ pub mod session;
 pub mod store_melted;
 pub mod union_locator;
 
+pub(crate) use ask_routing::{AskRoutingState, RoutedPeer};
 pub(crate) use capsule_fallback::CapsuleFallbackLocator;
 /// Test-only: production builds the request inside `NatForwardedAsk::ask`, so nothing outside this
 /// module may construct one — a second construction site is a second place the wire shape can drift.
