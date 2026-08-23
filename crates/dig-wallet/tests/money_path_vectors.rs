@@ -90,7 +90,10 @@ fn dig_cat_puzzle_hash_is_byte_identical() {
 #[test]
 fn indexed_derivation_is_byte_identical() {
     let ks = derive_indexed_keys(ABANDON, 0..3).unwrap();
-    let got: Vec<String> = ks.iter().map(|k| hex::encode(k.owner_puzzle_hash)).collect();
+    let got: Vec<String> = ks
+        .iter()
+        .map(|k| hex::encode(k.owner_puzzle_hash))
+        .collect();
     assert_eq!(got, IDX_PH);
 }
 
@@ -121,6 +124,8 @@ fn signature_is_byte_identical() {
 #[test]
 fn signature_varies_with_the_message() {
     let k = derive_wallet_keys(ABANDON).unwrap();
-    let other = digstore_chain::chip0002::sign_message_with(&k.synthetic_sk, b"a different message").unwrap();
+    let other =
+        digstore_chain::chip0002::sign_message_with(&k.synthetic_sk, b"a different message")
+            .unwrap();
     assert_ne!(other, SIG);
 }
