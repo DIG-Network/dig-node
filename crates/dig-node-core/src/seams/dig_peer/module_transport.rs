@@ -832,6 +832,59 @@ mod tests {
         )
     }
 
+    /// A locator that never answers, so a `get_module_info` hangs inside its own dial preparation.
+    ///
+    /// The hang is placed in a SEAM this test owns rather than in the network: a real dial to a
+    /// black-holed address is a race (a routable-but-closed port answers `ECONNREFUSED` in
+    /// milliseconds, which is a REFUSAL and correctly spends one rung), and a test whose meaning
+    /// depends on which error a CI host's network stack happens to produce is not a test of this
+    /// call site.
+    struct HangingLocator;
+
+    #[async_trait]
+    impl ProviderLocator for HangingLocator {
+        async fn find_providers(
+            &self,
+            _content: &ContentId,
+        ) -> Result<Vec<ProviderRecord>, DownloadError> {
+            std::future::pending().await
+        }
+    }
+
+    /// **Proves:** the PRODUCTION entry point — `ModuleTransport::get_module_info`, the method
+    /// dig-download actually calls — climbs the whole ladder. An unanswerable holder costs exactly
+    /// the sum of [`DESCRIPTOR_ASK_DEADLINES`], which no single-deadline call site can produce.
+    ///
+    /// **Catches:** the call site being rewired to one fixed deadline while `ask_within_deadlines`
+    /// stays perfectly correct and perfectly unused. That is the same class as the defect this whole
+    /// change fixes, and this repo has already paid for it once: `download.rs:1397-1401` records a
+    /// warm whose every test built its own mock locator, none of which sat on production's path.
+    ///
+    /// **Non-vacuous:** the assertion is on ELAPSED VIRTUAL TIME through the real method, so it
+    /// cannot be satisfied by the helper being correct in isolation. A bypassed ladder yields one
+    /// deadline; a missing ladder yields ~zero.
+    ///
+    /// **Why it terminates:** under `start_paused` the runtime advances the clock whenever no task is
+    /// runnable, so the pending locator never blocks the wall clock — only the virtual one.
+    #[tokio::test(start_paused = true)]
+    async fn the_production_get_module_info_climbs_the_whole_ladder() {
+        let peer = peer_hex(1);
+        let t = transport(pool_of(&[]), Arc::new(HangingLocator));
+        let started = tokio::time::Instant::now();
+
+        let result = t.get_module_info(&peer, &store(), &root()).await;
+
+        assert!(
+            result.is_err(),
+            "an unanswerable holder yields no descriptor"
+        );
+        assert_eq!(
+            started.elapsed(),
+            DESCRIPTOR_ASK_DEADLINES.iter().sum::<std::time::Duration>(),
+            "`get_module_info` must spend every rung of the ladder, not one fixed deadline"
+        );
+    }
+
     /// **Proves:** an IPv6 candidate becomes a dialable target with its address BRACKETED — the exact
     /// bug that blocked the entire read leg, where `format!("{host}:{port}")` + `parse::<SocketAddr>()`
     /// failed with "invalid socket address syntax" before a socket was ever opened (#1593).
