@@ -1234,5 +1234,4 @@ mod tests {
              hearsay entry advertises — a connection-verified address beats a self-advertised one"
         );
     }
-
 }
