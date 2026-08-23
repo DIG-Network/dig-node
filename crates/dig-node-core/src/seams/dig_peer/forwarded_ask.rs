@@ -253,15 +253,16 @@ pub(crate) fn forwarded_request(
 /// dig-node#273 fixes and it lived in this function.
 pub(crate) async fn awaited_outcome<F>(
     content: &ContentId,
-    peer: &str,
+    responder: Responder<'_>,
     budget: Duration,
     exchange: F,
 ) -> AskOutcome
 where
     F: std::future::Future<Output = Option<Value>>,
 {
+    let peer = responder.peer_hex;
     match tokio::time::timeout(budget, exchange).await {
-        Ok(Some(response)) => parse_forwarded_answer(content, &response),
+        Ok(Some(response)) => parse_forwarded_answer(content, &response, responder),
         // Reached, but the exchange failed: a dial refused, a stream that would not open, a frame
         // that would not read. Nothing was established about the content.
         Ok(None) => {
@@ -277,6 +278,25 @@ where
     }
 }
 
+/// The peer this node ASKED, carried into the answer parser so the peer's OWN claim to hold the
+/// content becomes a candidate.
+///
+/// # Why the parser needs to know who answered
+///
+/// `dig.getAvailability` says "I hold it" with `available: true`, and says "I do not, but these
+/// others might" with a `providers` array. The parser used to read only the second, so the single
+/// most valuable answer on the network — the peer we asked IS the holder — produced zero candidates
+/// (dig-node#313). A holder does not put itself in `providers`; there would be nobody to address the
+/// entry to. Its identity is the connection the answer arrived over, which only the caller knows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Responder<'a> {
+    /// The 64-hex `peer_id` this node dialled and pinned on the mTLS handshake.
+    pub(crate) peer_hex: &'a str,
+    /// The addresses the dial was attempted over — connection-verified reachability for a record
+    /// minted from a self-claim, because a holder naming no address cannot be redialled.
+    pub(crate) addrs: &'a [SocketAddr],
+}
+
 /// Read a `dig.getAvailability` response as an [`AskOutcome`].
 ///
 /// A JSON-RPC **error frame** - what a peer at its hop cap, over its rate limit, or with recursion
@@ -289,14 +309,43 @@ where
 /// A frame that is neither is a peer that did not answer the question it was asked, which establishes
 /// nothing: [`Unreachable`](AskOutcome::Unreachable). Reading it as an empty answer would hand any
 /// peer a one-field way to manufacture an authoritative absence.
-pub(crate) fn parse_forwarded_answer(content: &ContentId, response: &Value) -> AskOutcome {
+pub(crate) fn parse_forwarded_answer(
+    content: &ContentId,
+    response: &Value,
+    responder: Responder<'_>,
+) -> AskOutcome {
     if response.get("error").is_some() {
         return AskOutcome::Refused;
     }
     if response.get("result").is_none() {
         return AskOutcome::Unreachable;
     }
-    let records = parse_forwarded_providers(content, response);
+    // The responder's OWN claim leads: it is first-hand ("I have this"), where every entry in
+    // `providers` is hearsay about a third party. Deduped by `peer_id`, so a peer that also lists
+    // itself yields one record rather than two of the same holder.
+    let held = responder_holds(response);
+    let mut records: Vec<ProviderRecord> = held
+        .then(|| responder_record(content, responder))
+        .flatten()
+        .into_iter()
+        .collect();
+    records.extend(
+        parse_forwarded_providers(content, response)
+            .into_iter()
+            .filter(|record| record.provider_peer_id != responder.peer_hex),
+    );
+
+    // A HOLDER ANSWERED. The question was "who holds this?" and it has been answered first-hand, so
+    // the absence taxonomy below does not apply — there is no absence left to prove or leave unproven.
+    //
+    // Without this arm a holder's answer read as INCONCLUSIVE, because a held answer legitimately
+    // OMITS `absence_established`: the responder ran no absence search, so it has nothing to report
+    // about one. `NoClaim` then downgraded the best answer on the network to "this peer did not
+    // finish looking", and the requestor learned no holder for a capsule sitting on that peer's disk
+    // (dig-node#313, measured on real hardware — 134 MB held, answered unproven).
+    if held && !records.is_empty() {
+        return AskOutcome::Answered(records);
+    }
     match subtree_claim(response) {
         SubtreeClaim::Established => AskOutcome::Answered(records),
         // A peer that cannot describe its search has not told this node the search succeeded, so
@@ -305,6 +354,51 @@ pub(crate) fn parse_forwarded_answer(content: &ContentId, response: &Value) -> A
             AskOutcome::AnsweredInconclusive(records)
         }
     }
+}
+
+/// Whether the responder claimed, for ANY item, to hold the content itself.
+///
+/// A forwarded ask carries one item today, so "any" and "the" coincide; written as `any` because a
+/// batch answer is positionally aligned with a batch request and a held item anywhere in one is
+/// still a holder claim.
+fn responder_holds(response: &Value) -> bool {
+    response
+        .get("result")
+        .and_then(|result| result.get("items"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| item.get("available").and_then(Value::as_bool) == Some(true))
+}
+
+/// Mint the candidate record for a responder claiming to hold `content`, from the addresses this
+/// node actually dialled it over.
+///
+/// `None` when the peer id is unparseable or no address is known: a candidate with nowhere to dial
+/// would spend one of the requestor's few redirect slots on something it cannot try, exactly as an
+/// addressless `providers` entry would.
+///
+/// The claim is still a claim (NC-12) — a lying peer costs one wasted dial, and the merkle bind
+/// catches the bytes — but it is the STRONGEST class available here, made by a peer about itself
+/// over a connection whose identity is mTLS-pinned.
+fn responder_record(content: &ContentId, responder: Responder<'_>) -> Option<ProviderRecord> {
+    let peer = PeerId::from_hex(responder.peer_hex)?;
+    let addresses: Vec<CandidateAddr> = responder
+        .addrs
+        .iter()
+        .map(|addr| CandidateAddr::direct(addr.ip().to_string(), addr.port()))
+        .collect();
+    if addresses.is_empty() {
+        return None;
+    }
+    // `u64::MAX` says "for this answer" — the record is merged into one reply and never stored,
+    // matching how a parsed `providers` entry and the pool locator both mint theirs.
+    Some(ProviderRecord::new(
+        &content.to_key(),
+        &peer,
+        addresses,
+        u64::MAX,
+    ))
 }
 
 /// What a peer's answer claims about its OWN subtree, kept as the THREE states the wire carries.
@@ -504,7 +598,16 @@ impl ForwardedAsk for NatForwardedAsk {
             crate::peer::read_framed(&mut stream).await.ok()?
         };
 
-        awaited_outcome(content, peer, budget, exchange).await
+        awaited_outcome(
+            content,
+            Responder {
+                peer_hex: peer,
+                addrs,
+            },
+            budget,
+            exchange,
+        )
+        .await
     }
 }
 
@@ -514,6 +617,39 @@ mod tests {
 
     fn content() -> ContentId {
         ContentId::resource([1; 32], [2; 32], [3; 32])
+    }
+
+    /// The 64-hex identity of the peer a fixture answers as.
+    fn responder_hex() -> String {
+        PeerId::from_bytes([0x5d; 32]).to_hex()
+    }
+
+    /// One dialled address for the responder, so a self-claim has somewhere to be dialled back.
+    fn responder_addrs() -> Vec<SocketAddr> {
+        vec!["[2001:db8::5d]:9444".parse().expect("test addr")]
+    }
+
+    /// The fixture responder, borrowed from caller-owned parts (a `Responder` borrows, so the hex
+    /// and the address vector have to outlive it at the call site).
+    fn asked_peer<'a>(hex: &'a str, addrs: &'a [SocketAddr]) -> Responder<'a> {
+        Responder {
+            peer_hex: hex,
+            addrs,
+        }
+    }
+
+    /// Parse `response` as though it arrived from the fixture responder over `responder_addrs()`.
+    fn parsed(response: &Value) -> AskOutcome {
+        let hex = responder_hex();
+        let addrs = responder_addrs();
+        parse_forwarded_answer(
+            &content(),
+            response,
+            Responder {
+                peer_hex: &hex,
+                addrs: &addrs,
+            },
+        )
     }
 
     /// A miss answer from a peer that DID complete its search, naming `providers`.
@@ -628,7 +764,7 @@ mod tests {
             "error": { "code": -32003, "message": "miss lookup rate limit exceeded" },
         });
 
-        let outcome = parse_forwarded_answer(&content(), &response);
+        let outcome = parsed(&response);
 
         assert!(
             outcome.records().is_empty(),
@@ -651,7 +787,7 @@ mod tests {
     /// every miss on the network report as inconclusive.
     #[test]
     fn a_result_frame_naming_nobody_is_a_conclusive_answer() {
-        let outcome = parse_forwarded_answer(&content(), &answer_with(json!([])));
+        let outcome = parsed(&answer_with(json!([])));
 
         assert_eq!(outcome, AskOutcome::Answered(Vec::new()));
         assert!(
@@ -667,7 +803,7 @@ mod tests {
     /// manufacture an authoritative absence by replying with any well-formed JSON object at all.
     #[test]
     fn a_frame_that_is_neither_result_nor_error_establishes_nothing() {
-        let outcome = parse_forwarded_answer(&content(), &json!({"jsonrpc": "2.0", "id": 1}));
+        let outcome = parsed(&json!({"jsonrpc": "2.0", "id": 1}));
 
         assert_eq!(outcome, AskOutcome::Unreachable);
         assert!(!outcome.is_conclusive());
@@ -692,7 +828,14 @@ mod tests {
             Some(answer_with(json!([])))
         };
 
-        let outcome = awaited_outcome(&content(), "peer", Duration::from_secs(1), slow).await;
+        let (hex, addrs) = (responder_hex(), responder_addrs());
+        let outcome = awaited_outcome(
+            &content(),
+            asked_peer(&hex, &addrs),
+            Duration::from_secs(1),
+            slow,
+        )
+        .await;
 
         assert!(
             !outcome.is_conclusive(),
@@ -711,7 +854,14 @@ mod tests {
     async fn an_exchange_that_finishes_inside_its_budget_is_answered_on_its_content() {
         let prompt = async { Some(answer_with(json!([]))) };
 
-        let outcome = awaited_outcome(&content(), "peer", Duration::from_secs(1), prompt).await;
+        let (hex, addrs) = (responder_hex(), responder_addrs());
+        let outcome = awaited_outcome(
+            &content(),
+            asked_peer(&hex, &addrs),
+            Duration::from_secs(1),
+            prompt,
+        )
+        .await;
 
         assert!(
             outcome.is_conclusive(),
@@ -725,7 +875,14 @@ mod tests {
     async fn a_failed_exchange_is_unreachable_and_not_an_answer() {
         let broken = async { None };
 
-        let outcome = awaited_outcome(&content(), "peer", Duration::from_secs(1), broken).await;
+        let (hex, addrs) = (responder_hex(), responder_addrs());
+        let outcome = awaited_outcome(
+            &content(),
+            asked_peer(&hex, &addrs),
+            Duration::from_secs(1),
+            broken,
+        )
+        .await;
 
         assert!(!outcome.is_conclusive());
         assert_eq!(outcome, AskOutcome::Unreachable);
@@ -895,15 +1052,15 @@ mod tests {
         // The consequence the three states exist for: only Established may become a conclusive
         // answer this node is willing to relay as proof.
         assert!(
-            parse_forwarded_answer(&content(), &miss_answer(Some(true))).is_conclusive(),
+            parsed(&miss_answer(Some(true))).is_conclusive(),
             "an established absence is the ONE case a not-found may be built on"
         );
         assert!(
-            !parse_forwarded_answer(&content(), &miss_answer(None)).is_conclusive(),
+            !parsed(&miss_answer(None)).is_conclusive(),
             "an unknown must not become a proven absence"
         );
         assert!(
-            !parse_forwarded_answer(&content(), &miss_answer(Some(false))).is_conclusive(),
+            !parsed(&miss_answer(Some(false))).is_conclusive(),
             "nor may a search the peer itself called incomplete"
         );
     }
@@ -961,8 +1118,121 @@ mod tests {
             "the control: a real established item still establishes, so the guard above narrowed              the empty case and nothing else"
         );
         assert!(
-            !parse_forwarded_answer(&content(), &empty).is_conclusive(),
+            !parsed(&empty).is_conclusive(),
             "and the consequence - an empty batch may not become a not-found this node relays"
         );
     }
+
+    /// One `dig.getAvailability` answer from a peer that HOLDS the content: `available: true`, no
+    /// `providers` array, and no `absence_established`.
+    ///
+    /// **Fixture design.** All three omissions are the real holder shape, not a convenience. A
+    /// holder does not list itself in `providers` (there is nobody to address the entry to), and it
+    /// omits `absence_established` because it ran no absence search — `Node::availability_answer`
+    /// inserts that field only on the not-available branch. A fixture that supplied either field
+    /// would be testing a peer this network does not produce, and would pass against the very code
+    /// that shipped dig-node#313.
+    fn held_answer() -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "items": [{ "available": true, "total_length": 134_968_945 }] },
+        })
+    }
+
+    /// **Proves:** a peer that answers "I hold this" becomes a dialable candidate, named by the
+    /// identity and addresses this node reached it over.
+    ///
+    /// **Catches:** dig-node#313 exactly — the parser reading `providers` and never `available`, so
+    /// the one peer on the network that definitely had the capsule contributed nothing. Measured on
+    /// real hardware: node C held 134 MB of the asked capsule and the requestor learned no holder.
+    #[test]
+    fn a_peer_that_says_it_holds_the_content_becomes_a_candidate() {
+        let outcome = parsed(&held_answer());
+
+        let records = outcome.records();
+        assert_eq!(records.len(), 1, "the holder itself is the candidate");
+        assert_eq!(records[0].provider_peer_id, responder_hex());
+        assert_eq!(
+            records[0].content_key,
+            content().to_key().to_hex(),
+            "keyed to what WE asked about, never to anything the answer claims"
+        );
+        assert_eq!(records[0].addresses[0].host, "2001:db8::5d");
+        assert_eq!(records[0].addresses[0].port, 9444);
+    }
+
+    /// **Proves:** a held answer is CONCLUSIVE, even though it carries no `absence_established`.
+    ///
+    /// **Catches:** the half-fix. Minting the record while still reading the absent field as
+    /// `NoClaim` leaves the outcome `AnsweredInconclusive`, which cascades this node into reporting
+    /// an unproven absence upward — and reproduces the exact log line the field run captured
+    /// ("peer reports its own subtree unproven") for a peer that just said it holds the content.
+    ///
+    /// The control below it is the load-bearing half: the SAME omission on a NOT-held answer must
+    /// stay inconclusive, so this cannot be passed by making every silent answer conclusive.
+    #[test]
+    fn a_held_answer_is_conclusive_while_the_same_silence_on_a_miss_is_not() {
+        assert!(
+            parsed(&held_answer()).is_conclusive(),
+            "the peer answered the question first-hand: it holds the content. There is no absence \
+             left to prove, so an omitted absence_established says nothing against it"
+        );
+
+        let silent_miss = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "items": [{ "available": false }] },
+        });
+        assert!(
+            !parsed(&silent_miss).is_conclusive(),
+            "CONTROL: an identical omission on a NOT-held answer is still unproven — a peer that \
+             describes its search not at all has not told us the search succeeded"
+        );
+    }
+
+    /// **Proves:** a holder that ALSO names third-party providers yields the holder FIRST and once.
+    ///
+    /// **Fixture design.** Two actors, and the responder appears in both roles — its own
+    /// `available: true` and its own entry in `providers`. A single-actor fixture cannot see either
+    /// defect this pins: appending the self-record after the hearsay (the requestor then dials a
+    /// stranger before the peer it is already connected to), or emitting it twice (one holder
+    /// consuming two of the requestor's few redirect slots).
+    #[test]
+    fn the_holder_leads_the_candidates_and_is_not_duplicated() {
+        let stranger = PeerId::from_bytes([7; 32]).to_hex();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "items": [{
+                "available": true,
+                "providers": [
+                    { "peer_id": responder_hex(),
+                      "addresses": [{ "host": "10.0.0.1", "port": 9444, "kind": "direct" }] },
+                    { "peer_id": stranger,
+                      "addresses": [{ "host": "10.0.0.7", "port": 9444, "kind": "direct" }] },
+                ],
+            }] },
+        });
+
+        let outcome = parsed(&response);
+        let ids: Vec<&str> = outcome
+            .records()
+            .iter()
+            .map(|record| record.provider_peer_id.as_str())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![responder_hex().as_str(), stranger.as_str()],
+            "first-hand before hearsay, and the holder exactly once"
+        );
+        assert_eq!(
+            outcome.records()[0].addresses[0].host,
+            "2001:db8::5d",
+            "the holder is reached over the address this node DIALLED it on, not the one its own \
+             hearsay entry advertises — a connection-verified address beats a self-advertised one"
+        );
+    }
+
 }
