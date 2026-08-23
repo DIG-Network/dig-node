@@ -364,11 +364,57 @@ const RELAY_MARKER_BODY: &[u8] =
     b"relayed: held on another node's behalf; this node is not a holder (dig-node#276)
 ";
 
-/// Discard a warm's staging artifacts, so a failed pull leaves nothing behind that a later run (or a
-/// GC sweep) could mistake for progress.
-fn discard_staging(staged: &Path) {
-    let _ = std::fs::remove_file(staged);
-    let _ = std::fs::remove_file(dig_download::staging_path_for(staged));
+/// A discarded pull's whole on-disk footprint, so the two halves cannot be erased separately.
+///
+/// A partial capsule is stored as TWO facts in two places — the staged bytes under the staging dir,
+/// and the resume checkpoint in the [`StateStore`](dig_download::StateStore) — and they are only ever
+/// true together. Passing them as one value is what stops a caller erasing one and leaving the other,
+/// which is precisely the state dig-node#332 measured: a checkpoint claiming chunks that no longer
+/// existed on disk.
+struct StagedPull<'a> {
+    /// The path dig-download's `FileSink` finalizes onto (its in-progress bytes live beside it, at
+    /// [`staging_path_for`](dig_download::staging_path_for)).
+    staged: &'a Path,
+    /// Where the resume checkpoint lives.
+    state_store: &'a dyn dig_download::StateStore,
+    /// The checkpoint's key — dig-download's own, never a second derivation of it.
+    key: String,
+}
+
+impl<'a> StagedPull<'a> {
+    /// Name the pull of `(store_hex, root_hex)` staging at `staged`.
+    fn new(
+        staged: &'a Path,
+        state_store: &'a dyn dig_download::StateStore,
+        store_hex: &str,
+        root_hex: &str,
+    ) -> Self {
+        StagedPull {
+            staged,
+            state_store,
+            key: dig_download::module_download_key(store_hex, root_hex),
+        }
+    }
+
+    /// Erase a warm's staging artifacts — bytes AND checkpoint — so a failed pull leaves nothing
+    /// behind that a later run (or a GC sweep) could mistake for progress.
+    ///
+    /// # Why the checkpoint goes with the bytes
+    ///
+    /// A surviving checkpoint describes chunks that are no longer on disk, so the next warm resumes
+    /// against them, fails to read them back, and re-attributes each one. That is harmless to
+    /// correctness — the re-attribution re-fetches — but it emits the per-chunk warning an operator
+    /// reads as *a peer served me bytes that did not match*, i.e. an attack indicator, on a routine
+    /// discard. A monitoring signal that fires on a benign path is worse than none, because the real
+    /// event stops being distinguishable from the noise (dig-node#332).
+    ///
+    /// Every step is best-effort: this runs on a path that is ALREADY failing, and a cleanup error
+    /// must not replace the failure the caller has to report.
+    async fn erase(&self) {
+        let _ = std::fs::remove_file(self.staged);
+        let _ = std::fs::remove_file(dig_download::staging_path_for(self.staged));
+        let _ = self.state_store.clear(&self.key).await;
+    }
 }
 
 /// What a FAILED pull leaves behind in the staging area.
@@ -432,11 +478,15 @@ impl StagingDisposition {
         }
     }
 
-    /// Apply this disposition to `staged`.
-    fn apply(self, staged: &Path) {
+    /// Apply this disposition to `pull`.
+    ///
+    /// [`Preserve`](Self::Preserve) touches NOTHING — not the bytes and not the checkpoint. The two
+    /// are what a resume is made of, and dropping either half is what made the resume machinery
+    /// structurally unreachable in the field (dig-node#328).
+    async fn apply(self, pull: &StagedPull<'_>) {
         match self {
             StagingDisposition::Preserve => {}
-            StagingDisposition::Discard => discard_staging(staged),
+            StagingDisposition::Discard => pull.erase().await,
         }
     }
 }
@@ -646,6 +696,8 @@ impl CapsuleWarmer {
         //    `truncate` + `read_at` the engine's promotion probe requires, so there is no bespoke sink
         //    here to accidentally inherit a default from.
         let staged = self.paths.staged_module(&capsule);
+        // Bytes + checkpoint as ONE value, so no failure path below can erase half of a partial.
+        let pull = StagedPull::new(&staged, self.state_store.as_ref(), store_hex, root_hex);
         let sink = dig_download::FileSink::new(&staged);
         let downloader = dig_download::ModuleDownloader::new(
             Arc::clone(&self.locator),
@@ -673,7 +725,7 @@ impl CapsuleWarmer {
                 // resume machinery structurally unreachable for capsule warms (#328): the checkpoint
                 // survived while the bytes it described did not, so every retry restarted from offset 0.
                 let disposition = StagingDisposition::for_failure(&error);
-                disposition.apply(&staged);
+                disposition.apply(&pull).await;
                 tracing::info!(
                     store = %super::serve_log::SafeId::new(store_hex),
                     root = %super::serve_log::SafeId::new(root_hex),
@@ -692,7 +744,7 @@ impl CapsuleWarmer {
         let cached = self.paths.cached_module(&capsule);
         match promote_into_cache(&staged, &cached, &verifier, claim) {
             Ok(promoted) => {
-                discard_staging(&staged);
+                pull.erase().await;
                 // The ONE step a relayed warm skips. Everything above it — the chain anchor, the
                 // merkle verification, the promote-recheck — ran identically, so the bytes are equally
                 // trustworthy; what differs is whether this node CLAIMS them (see [`HolderClaim`]).
@@ -710,7 +762,7 @@ impl CapsuleWarmer {
                 WarmOutcome::Held { bytes: promoted }
             }
             Err(failure) => {
-                discard_staging(&staged);
+                pull.erase().await;
                 tracing::warn!(
                     store = %super::serve_log::SafeId::new(store_hex),
                     root = %super::serve_log::SafeId::new(root_hex),
@@ -1580,12 +1632,16 @@ mod tests {
             )
             .with_corrupt_module_hash(),
         );
+        // Held, not inlined: dig-node#332 is about what SURVIVES in this store after the failure, and
+        // an inlined store cannot be read back.
+        let state: Arc<dyn dig_download::StateStore> =
+            Arc::new(dig_download::InMemoryStateStore::new());
         let warmer = CapsuleWarmer::new(
             Arc::new(dig_download::testkit::MockProviderLocator::fixed(
                 dig_download::testkit::mock_providers(1, &content),
             )),
             transport,
-            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::clone(&state),
             Arc::new(ConfirmingResolver),
             WarmPaths {
                 staging_dir: dir.join("staging"),
@@ -1614,6 +1670,17 @@ mod tests {
         assert!(
             !cached_module_path(&dir).exists(),
             "nothing may reach the cache path"
+        );
+        // dig-node#332: the checkpoint is the OTHER half of the same partial. Left behind, it claims
+        // chunks that are no longer on disk, so the next warm re-attributes each one and logs the
+        // per-chunk warning an operator reads as hostile content — on a routine discard.
+        assert!(
+            state
+                .load(&dig_download::module_download_key(&store_hex, &root_hex))
+                .await
+                .expect("the state store is readable")
+                .is_none(),
+            "a discarded partial must leave no resume checkpoint behind"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
