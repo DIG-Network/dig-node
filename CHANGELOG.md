@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.143.1] - 2026-08-23
+
+### Features
+- **custody:** Freeze node-side USER custody for removal (step 1 of #1701) (#321)
+
+### Bug Fixes
+- **deps:** Adopt dig-download 0.19.1 so capsule checkpoints fit NAME_MAX (#324)
+
 ## [0.142.0] - 2026-08-23
 
 ### Bug Fixes
