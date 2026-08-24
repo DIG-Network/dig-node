@@ -16,15 +16,22 @@
 //!
 //! # What the container buys today, stated without overselling it
 //!
-//! The seed is sealed with [`opaque::seal`] (Argon2id + AES-256-GCM, `DIGOP1`) under a
-//! per-install random wrapping secret, and both records live in a [`HardwareBoundBackend`] over a
-//! [`FileBackend`]. **No platform hardware provider ships yet**, so on every real host the tier
-//! resolves to `Software(NotRequested)` and the two records are protected by the owner-only file
-//! mode alone — *the same protection the plaintext file it replaces had*. The wrapping secret
-//! sits beside the blob because an unattended service has no operator to type a passphrase, and a
-//! passphrase the node can always recover by itself is not a secret from anyone who can read the
-//! node's own directory. This module does not pretend otherwise, and neither does
-//! [`MachineKeyStore::protection_summary`].
+//! The seed is sealed with [`opaque::seal`] (Argon2id + AES-256-GCM, `DIGOP1`) under a 32-byte
+//! CSPRNG **device key**, exactly the shape dig-node `SPEC.md` §16.4 already specifies for the
+//! wallet host's unattended `autoseed` — same container, same key model, so the node has ONE
+//! at-rest primitive rather than two rival ones.
+//!
+//! **The device key lives in a SIBLING directory, never beside the sealed blob** (§16.4: "that
+//! separation IS the partial-exfiltration boundary"). An unattended service has no operator to
+//! type a passphrase, so the key it seals under must be on disk somewhere; putting it in the same
+//! directory would mean any copy of that directory — a backup, a synced folder, a support bundle,
+//! a container image layer — carries both halves and the container protects nothing. Split, the
+//! common single-directory grab yields ciphertext.
+//!
+//! **No platform hardware provider ships yet**, so on every real host the tier resolves to
+//! `Software(NotRequested)`: the two halves are protected by the owner-only file mode and their
+//! separation, not by a trusted component. [`MachineKeyStore::protection_summary`] says exactly
+//! that and never implies otherwise.
 //!
 //! What it does buy is the shape: once a provider exists, [`HardwareBoundBackend::bind`] wraps
 //! both records in place, and the pair stops opening on any other machine — with no format change
@@ -53,13 +60,13 @@ use zeroize::Zeroizing;
 /// Storage key of the sealed `DIGOP1` blob holding the 32-byte identity seed.
 const SEED_RECORD: &str = "machine-identity";
 
-/// Storage key of the per-install random secret the seed blob is sealed under. A separate record
-/// so a future [`HardwareBoundBackend::bind`] wraps it too, rather than leaving the opening secret
-/// portable beside a bound blob.
-const WRAP_RECORD: &str = "machine-identity-wrap";
+/// Storage key of the per-install device key the seed blob is sealed under. Held in the SIBLING
+/// device directory, never beside the blob — see the module doc, and dig-node `SPEC.md` §16.4,
+/// which specifies the same split for the wallet host.
+const DEVICE_KEY_RECORD: &str = "device";
 
-/// Bytes of the per-install wrapping secret.
-const WRAP_SECRET_LEN: usize = 32;
+/// Bytes of the per-install device key. Matches §16.4's `device.key`: 32 raw CSPRNG bytes.
+const DEVICE_KEY_LEN: usize = 32;
 
 /// The legacy plaintext file this module supersedes, written by
 /// `digstore_remote::identity::load_or_create_seed`. Read once, migrated, then removed.
@@ -110,7 +117,11 @@ impl From<std::io::Error> for MachineKeyError {
 
 /// The node's sealed machine-identity seed, over one directory.
 pub struct MachineKeyStore {
+    /// Holds the sealed `DIGOP1` seed blob.
     backend: HardwareBoundBackend,
+    /// Holds the device key the blob is sealed under, in a sibling directory. Separate backend
+    /// because it is a separate DIRECTORY, and that separation is the whole point.
+    device: HardwareBoundBackend,
     kdf: KdfParams,
 }
 
@@ -129,9 +140,15 @@ impl MachineKeyStore {
         dir: impl AsRef<Path>,
         provider: Option<Arc<dyn HardwareProvider>>,
     ) -> Result<Self, MachineKeyError> {
+        let dir = dir.as_ref();
         Ok(Self {
             backend: HardwareBoundBackend::new(
-                FileBackend::new(dir.as_ref()),
+                FileBackend::new(dir),
+                provider.clone(),
+                HardwarePolicy::Optional,
+            )?,
+            device: HardwareBoundBackend::new(
+                FileBackend::new(device_dir(dir)?),
                 provider,
                 HardwarePolicy::Optional,
             )?,
@@ -223,9 +240,9 @@ impl MachineKeyStore {
 
     /// Unseal an already-stored seed blob.
     fn unseal_stored(&self, seed_key: &BackendKey) -> Result<Zeroizing<[u8; 32]>, MachineKeyError> {
-        let wrap = self.read_wrap_secret()?;
+        let device_key = self.read_device_key()?;
         let blob = self.backend.read(seed_key)?;
-        let plain = opaque::open(&Password::new(wrap.as_slice()), &blob)?;
+        let plain = opaque::open(&Password::new(device_key.as_slice()), &blob)?;
         exactly_32(SEED_RECORD, &plain)
     }
 
@@ -235,10 +252,14 @@ impl MachineKeyStore {
         seed_key: &BackendKey,
         seed: &Zeroizing<[u8; 32]>,
     ) -> Result<(), MachineKeyError> {
-        let wrap = Zeroizing::new(random_bytes::<WRAP_SECRET_LEN>());
-        self.backend
-            .write(&BackendKey::new(WRAP_RECORD), wrap.as_slice())?;
-        let blob = opaque::seal(&Password::new(wrap.as_slice()), seed.as_slice(), self.kdf)?;
+        let device_key = Zeroizing::new(random_bytes::<DEVICE_KEY_LEN>());
+        self.device
+            .write(&BackendKey::new(DEVICE_KEY_RECORD), device_key.as_slice())?;
+        let blob = opaque::seal(
+            &Password::new(device_key.as_slice()),
+            seed.as_slice(),
+            self.kdf,
+        )?;
         self.backend.write(seed_key, &blob)?;
 
         // Prove the round trip from STORAGE, not from the value just computed. A seal this host
@@ -254,12 +275,12 @@ impl MachineKeyStore {
         Ok(())
     }
 
-    /// The per-install wrapping secret.
-    fn read_wrap_secret(&self) -> Result<Zeroizing<Vec<u8>>, MachineKeyError> {
-        let bytes = self.backend.read(&BackendKey::new(WRAP_RECORD))?;
-        if bytes.len() != WRAP_SECRET_LEN {
+    /// The per-install device key, from the sibling device directory.
+    fn read_device_key(&self) -> Result<Zeroizing<Vec<u8>>, MachineKeyError> {
+        let bytes = self.device.read(&BackendKey::new(DEVICE_KEY_RECORD))?;
+        if bytes.len() != DEVICE_KEY_LEN {
             return Err(MachineKeyError::Malformed {
-                record: WRAP_RECORD,
+                record: DEVICE_KEY_RECORD,
                 len: bytes.len(),
             });
         }
@@ -293,6 +314,29 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     getrandom::getrandom(&mut out)
         .expect("operating system CSPRNG must be available to generate key material");
     out
+}
+
+/// The SIBLING directory holding the device key for the identity blobs in `dir`.
+///
+/// `<config_dir>/dig` -> `<config_dir>/dig-device`, mirroring dig-node `SPEC.md` §16.4's
+/// `<user_base>/DigWallet/` -> `<user_base>/DigNode/device/`. A sibling, never a child: a child
+/// would travel inside every copy of the identity directory and the split would buy nothing.
+///
+/// # Errors
+/// [`MachineKeyError::Io`] if `dir` has no parent or no final component -- a filesystem root
+/// cannot have a sibling, and silently falling back to a child would quietly remove the boundary.
+fn device_dir(dir: &Path) -> Result<std::path::PathBuf, MachineKeyError> {
+    match (dir.parent(), dir.file_name()) {
+        (Some(parent), Some(name)) => {
+            let mut sibling = name.to_os_string();
+            sibling.push("-device");
+            Ok(parent.join(sibling))
+        }
+        _ => Err(MachineKeyError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("identity dir {} has no sibling to hold the device key", dir.display()),
+        ))),
+    }
 }
 
 /// The user-global DIG identity directory the node's machine key lives in:
@@ -348,6 +392,12 @@ mod tests {
     use dig_keystore::hardware::double::FakeDevice;
     use dig_keystore::hardware::{DegradeReason, HardwareKind};
 
+    /// The identity dir for a test, as a CHILD of `root` so its sibling device dir also lands
+    /// inside the tempdir and is cleaned up with it.
+    fn identity_dir(root: &tempfile::TempDir) -> std::path::PathBuf {
+        root.path().join("dig")
+    }
+
     /// A store over `dir` with no hardware provider — what every real host resolves today.
     fn software_store(dir: &Path) -> MachineKeyStore {
         MachineKeyStore::open(dir, None)
@@ -370,12 +420,18 @@ mod tests {
         .with_fast_kdf()
     }
 
-    /// Every byte at rest under `dir`, concatenated — the view an attacker with read access has.
+    /// Every byte in every file under `dir`, recursively — the view an attacker holding a copy of
+    /// that directory has.
     fn all_bytes_at_rest(dir: &Path) -> Vec<u8> {
         let mut out = Vec::new();
-        for entry in std::fs::read_dir(dir).expect("store dir") {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries {
             let path = entry.expect("dir entry").path();
-            if path.is_file() {
+            if path.is_dir() {
+                out.extend_from_slice(&all_bytes_at_rest(&path));
+            } else {
                 out.extend_from_slice(&std::fs::read(&path).expect("record"));
             }
         }
@@ -395,9 +451,10 @@ mod tests {
     /// one it already had, silently changing its `peer_id`.
     #[test]
     fn the_identity_dir_override_is_honoured() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
         let previous = std::env::var_os("DIG_IDENTITY_DIR");
-        std::env::set_var("DIG_IDENTITY_DIR", dir.path());
+        std::env::set_var("DIG_IDENTITY_DIR", &dir);
 
         let resolved = identity_store_dir().expect("override resolves");
 
@@ -407,7 +464,7 @@ mod tests {
         }
         assert_eq!(
             resolved,
-            dir.path(),
+            dir,
             "DIG_IDENTITY_DIR must win, exactly as it does for the legacy plaintext seed"
         );
     }
@@ -416,8 +473,9 @@ mod tests {
     /// other test here needs in order to mean anything.
     #[test]
     fn a_sealed_seed_reopens_to_the_same_bytes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = software_store(dir.path());
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let store = software_store(&dir);
 
         let minted = store.load_or_create(None).expect("mint");
         let reopened = store.load_or_create(None).expect("reopen");
@@ -438,10 +496,11 @@ mod tests {
     /// a restart does.
     #[test]
     fn a_restart_over_the_same_directory_recovers_the_same_seed() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
 
-        let first = software_store(dir.path()).load_or_create(None).expect("mint");
-        let after_restart = software_store(dir.path())
+        let first = software_store(&dir).load_or_create(None).expect("mint");
+        let after_restart = software_store(&dir)
             .load_or_create(None)
             .expect("restart");
 
@@ -460,14 +519,21 @@ mod tests {
     /// into a sibling record would still be caught.
     #[test]
     fn the_seed_never_appears_verbatim_in_any_record() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = software_store(dir.path());
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let store = software_store(&dir);
         let seed = store.load_or_create(None).expect("mint");
 
-        let at_rest = all_bytes_at_rest(dir.path());
+        // The tempdir ROOT, so BOTH halves are in scope: scanning only the identity
+        // directory would miss a regression that parked the plaintext in the device dir.
+        let at_rest = all_bytes_at_rest(root.path());
         assert!(
             !at_rest.is_empty(),
             "control: the store must actually have written something to scan"
+        );
+        assert!(
+            !all_bytes_at_rest(&device_dir(&dir).expect("sibling")).is_empty(),
+            "control: the device half must be inside the scanned tree, or this sees one of two files"
         );
         assert!(
             contains_run(&at_rest, &at_rest[..8]),
@@ -487,12 +553,13 @@ mod tests {
     /// the whole change cosmetic. Both are asserted, because either alone passes over the other.
     #[test]
     fn a_legacy_plaintext_seed_is_adopted_and_its_file_removed() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
         let legacy = tempfile::tempdir().expect("legacy dir");
         let legacy_seed = [0xA7u8; 32];
         std::fs::write(legacy.path().join(LEGACY_SEED_FILE), legacy_seed).expect("legacy seed");
 
-        let adopted = software_store(dir.path())
+        let adopted = software_store(&dir)
             .load_or_create(Some(legacy.path()))
             .expect("migrate");
 
@@ -506,12 +573,53 @@ mod tests {
             "the plaintext seed must not survive the migration"
         );
         assert_eq!(
-            software_store(dir.path())
+            software_store(&dir)
                 .load_or_create(None)
                 .expect("restart after migration")
                 .as_slice(),
             &legacy_seed,
             "the migrated seed must be recoverable from the sealed copy alone"
+        );
+    }
+
+    /// **Proves:** the device key is NOT in the identity directory, and the sealed blob alone
+    /// does not open without it.
+    ///
+    /// This is the partial-exfiltration boundary dig-node `SPEC.md` §16.4 specifies, and it is the
+    /// only confidentiality this key has on a host with no hardware provider — which is every host
+    /// today. Asserting merely that the seed is absent from the identity dir would pass on an
+    /// implementation that stored the device key right beside it, so the second half opens a store
+    /// over a copy of the identity half ALONE and requires it to refuse.
+    #[test]
+    fn the_device_key_lives_outside_the_identity_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let seed = software_store(&dir).load_or_create(None).expect("mint");
+
+        let device = device_dir(&dir).expect("sibling");
+        assert!(
+            !device.starts_with(&dir),
+            "the device key must not be a child of the identity dir it protects: {device:?}"
+        );
+        assert!(
+            !contains_run(&all_bytes_at_rest(&dir), seed.as_slice()),
+            "control: the identity half must not hold the seed in the clear either"
+        );
+
+        // Exfiltrate the identity half only, the way copying one directory does.
+        let stolen_root = tempfile::tempdir().expect("stolen");
+        let stolen = identity_dir(&stolen_root);
+        std::fs::create_dir_all(&stolen).expect("stolen dir");
+        for entry in std::fs::read_dir(&dir).expect("identity dir") {
+            let from = entry.expect("entry").path();
+            std::fs::copy(&from, stolen.join(from.file_name().expect("name"))).expect("copy");
+        }
+
+        let opened = software_store(&stolen).load_or_create(None);
+        assert!(
+            opened.is_err(),
+            "the identity half alone must not yield the seed -- and must not mint a new one: {:?}",
+            opened.as_ref().map(|s| hex::encode(s.as_slice()))
         );
     }
 
@@ -528,13 +636,14 @@ mod tests {
     /// while an assertion written only as "the returned set is empty" would not notice.
     #[test]
     fn a_seed_sealed_by_one_machine_does_not_open_on_another() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sealed = hardware_store(dir.path(), 1)
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let sealed = hardware_store(&dir, 1)
             .load_or_create(None)
             .expect("seal on machine 1");
-        let blob_before = all_bytes_at_rest(dir.path());
+        let blob_before = all_bytes_at_rest(&dir);
 
-        let foreign = hardware_store(dir.path(), 2).load_or_create(None);
+        let foreign = hardware_store(&dir, 2).load_or_create(None);
 
         assert!(
             foreign.is_err(),
@@ -542,12 +651,12 @@ mod tests {
             foreign.as_ref().map(|s| hex::encode(s.as_slice()))
         );
         assert_eq!(
-            all_bytes_at_rest(dir.path()),
+            all_bytes_at_rest(&dir),
             blob_before,
             "the refusal must leave the stored identity byte-identical"
         );
         assert_eq!(
-            hardware_store(dir.path(), 1)
+            hardware_store(&dir, 1)
                 .load_or_create(None)
                 .expect("the sealing machine still opens it")
                 .as_slice(),
@@ -564,8 +673,9 @@ mod tests {
     /// user would actually be misled by.
     #[test]
     fn a_host_with_no_provider_reports_software_and_says_so() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = software_store(dir.path());
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let store = software_store(&dir);
         store.load_or_create(None).expect("mint");
 
         // The two tiers answer different questions and are pinned separately on purpose: the HOST
@@ -604,10 +714,11 @@ mod tests {
     /// the outcome on a matched pair.
     #[test]
     fn an_unwrapped_blob_on_a_capable_host_is_reported_as_software() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        software_store(dir.path()).load_or_create(None).expect("mint unwrapped");
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        software_store(&dir).load_or_create(None).expect("mint unwrapped");
 
-        let capable = hardware_store(dir.path(), 1);
+        let capable = hardware_store(&dir, 1);
 
         assert!(
             capable.backend.tier().is_hardware_bound(),
@@ -628,10 +739,11 @@ mod tests {
     /// reassure — this pins the words that would do so.
     #[test]
     fn an_unopenable_blob_is_described_without_a_recovery_promise() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        hardware_store(dir.path(), 1).load_or_create(None).expect("seal");
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        hardware_store(&dir, 1).load_or_create(None).expect("seal");
 
-        let summary = software_store(dir.path()).protection_summary();
+        let summary = software_store(&dir).protection_summary();
 
         for banned in ["recoverable", "will open", "simply", "safe to"] {
             assert!(
