@@ -440,9 +440,15 @@ impl PullLifecycle for NatModuleTransport {
     }
 }
 
-/// A [`PullLifecycle`] that does nothing, for a transport with no per-pull state to release.
+/// A [`PullLifecycle`] that does nothing.
+///
+/// TEST-ONLY, and deliberately so: production has exactly one warmer wiring and it MUST report pull
+/// boundaries, so a no-op available to production code would be a way to switch the budget off by
+/// accident. Tests use it because most of them are not about the budget at all.
+#[cfg(test)]
 pub(crate) struct NoPullState;
 
+#[cfg(test)]
 impl PullLifecycle for NoPullState {
     fn pull_finished(&self, _store_id: &str, _root: &str) {}
 }
