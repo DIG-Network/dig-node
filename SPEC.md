@@ -3426,6 +3426,14 @@ boolean, default `false`). It MUST NOT trigger on `push` to `main`.
   The guard MUST be falsifiable — a self-test MUST assert that it FAILS an asset list carrying only
   the native packages.
 
+  **"Verified complete" is a statement about BYTES, not about names.** An asset is complete only when
+  it is present AND its upload state reports it as fully uploaded (GitHub: `state == "uploaded"`); an
+  asset still being written reports `state == "starting"`. The row is created when the upload BEGINS,
+  so every expected asset name can be present while bytes are still in flight, and a verification that
+  counts names alone promotes a release whose binaries are truncated or absent. A reimplementation that
+  reads only the name list satisfies the letter of the clause above and reintroduces exactly the race
+  it exists to prevent, which is why the state is stated here rather than left to the implementation.
+
 11.1a. **Doc-only commits never release** (the version is unchanged → the tag exists → the stable
 job is a no-op). The manual-dispatch `workflow_dispatch` on `release.yml` is a build-only "does main
 still build?" canary — it never publishes (publish is gated on a tag ref).
