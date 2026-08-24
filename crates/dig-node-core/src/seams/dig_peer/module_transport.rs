@@ -1226,7 +1226,10 @@ mod tests {
 
     /// Record the `proxy` phase of every round an escalation drives, so the SEQUENCE is the assertion
     /// rather than a count that a single escalated round would also satisfy.
-    async fn phases_of(already_escalated: bool, endings: &[LadderEnd<DescriptorAnswer>]) -> Vec<bool> {
+    async fn phases_of(
+        already_escalated: bool,
+        endings: &[LadderEnd<DescriptorAnswer>],
+    ) -> Vec<bool> {
         let seen = std::cell::RefCell::new(Vec::new());
         let round = std::cell::Cell::new(0usize);
         let _ = descriptor_via_rounds(already_escalated, |proxy| {
