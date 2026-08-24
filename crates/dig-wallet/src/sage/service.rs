@@ -92,11 +92,6 @@ struct LiveWallet {
     confirmer: Arc<dyn Confirmer>,
     /// The live lineage source (CAT/singleton parent-spend reads).
     lineage: Arc<dyn LineageSource>,
-    /// The ONE `chia_query` client every field above is built on — the wallet transport's own.
-    ///
-    /// Held rather than dropped so the "one shared client" claim in this struct's docs is a fact a
-    /// test can check, instead of a comment that a later refactor could silently falsify.
-    client: Arc<chia_query::ChiaQuery>,
 }
 
 /// A fully-assembled, ready-to-serve wallet: the dispatch backend, the shared event bus the WS
@@ -338,7 +333,6 @@ async fn build_live_wallet(chain: &ChainTransport) -> Option<LiveWallet> {
                 general_broadcaster: general,
                 confirmer,
                 lineage,
-                client: query,
             })
         }
         Err(e) => {
@@ -550,10 +544,10 @@ mod tests {
 /// wiring now takes the client from the transport, so the second pool is not merely unused but
 /// unexpressible: `build_live_wallet` has no way to construct one.
 ///
-/// The fixture SEEDS the transport with a known client and asserts the wiring hands back that exact
-/// `Arc`. Pointer identity is the property under test — asserting that reads merely agree would
-/// pass just as well against two pools that happened to pick the same peers, which is the
-/// coincidence this ticket exists to remove.
+/// The fixture SEEDS the transport with a known client and watches that client's reference count.
+/// Sharing is the property under test — asserting that reads merely AGREE would pass just as well
+/// against two pools that happened to pick the same peers, which is the coincidence this ticket
+/// exists to remove.
 #[cfg(test)]
 mod one_pool_tests {
     use super::*;
@@ -579,13 +573,27 @@ mod one_pool_tests {
         let seeded = offline_client().await;
         let chain = ChainTransport::with_client(seeded.clone());
 
+        // Two holders so far: this binding, and the transport's own slot. A wiring that built its
+        // own pool would leave the count exactly here.
+        let before = Arc::strong_count(&seeded);
+        assert_eq!(before, 2, "fixture: only the test and the transport hold the client");
+
         let live = build_live_wallet(&chain)
             .await
             .expect("an already-built client makes the live wiring infallible");
 
         assert!(
-            Arc::ptr_eq(&live.client, &seeded),
-            "the live wiring opened its OWN chia_query pool: a node with live broadcast on would              hold two independent sets of full-node sessions with two notions of the peak"
+            Arc::strong_count(&seeded) > before,
+            "the live wiring opened its OWN chia_query pool rather than taking the transport's: a              node with live broadcast on would hold two independent sets of full-node sessions              with two notions of the peak"
+        );
+
+        // Guards the assertion above against passing for the wrong reason: it must be the LIVE
+        // wiring holding the extra references, so they go away with it.
+        drop(live);
+        assert_eq!(
+            Arc::strong_count(&seeded),
+            before,
+            "the extra references outlived the live wiring, so they were not its clones"
         );
     }
 
