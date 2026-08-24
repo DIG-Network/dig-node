@@ -112,10 +112,15 @@ dig-chainsource-interface = "0.1"
 # The two `ChainSourceProvider` traits then fail to unify and `registry.register` stops
 # compiling, so a caret `0.5` silently breaks this crate the moment the lock refreshes.
 # 0.5.1 is the last version whose `dig-chainsource-interface` agrees with chia-peer's.
-# Unpinning (to 0.6, alongside dig-wallet) needs a `chia-peer` release built against
-# dig-chainsource-interface 0.2 FIRST (release-first, §4.1) — a separate repo, tracked
-# separately. dig-wallet is on chia-query 0.6 meanwhile: it does not exchange `chia_query`
-# types across this crate boundary, so the two lines coexist without unifying.
+# THE BLOCKER NAMED HERE UNTIL 2026-08-23 WAS WRONG, AND THE WRONG NAME IS WHY NOBODY UNPINNED.
+# It said the unpin awaited a `chia-peer` release built against dig-chainsource-interface 0.2.
+# No such release was ever needed: `chia-peer` 0.2.0 skipped 0.2 entirely and is built against
+# dci ^0.3 + chia-protocol ^0.36.1, and `chia-query` (now 0.15.0) is on the same dci ^0.3 /
+# chia 0.36 line. The two `ChainSourceProvider` traits therefore ALREADY unify again.
+# What actually blocks the unpin is that they unify at CHIA 0.36, while this crate is still on
+# the 0.26 line — so adopting them is the chia-0.36 cascade (dig_ecosystem#3152), not a
+# one-line bump. Verify against the index before acting on this comment; a stale blocker is
+# worse than none, because it stops people looking.
 chia-query = "=0.5.1"
 # The ecosystem's canonical address-family / IPv6-first primitive (CLAUDE.md §5.2). The advertise
 # path keys + orders candidate addresses via `dig_ip::Family` and aggregates them source-tagged +

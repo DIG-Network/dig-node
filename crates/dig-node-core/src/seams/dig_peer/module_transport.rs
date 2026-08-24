@@ -619,6 +619,11 @@ where
     let mut best = staged_at_first_ask;
     let mut last_advance = started;
     loop {
+        // The ceiling is checked FIRST, before any further waiting, so a hop that keeps answering can
+        // never buy one more poll past it.
+        if started.elapsed() >= RELAY_MAX_WAIT {
+            return Err(RelayWaitEnd::Ceiling);
+        }
         tokio::time::sleep(RELAY_POLL_INTERVAL).await;
         match ask().await {
             LadderEnd::Answered(DescriptorAnswer::Descriptor(info)) => return Ok(*info),
