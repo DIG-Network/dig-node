@@ -1599,7 +1599,16 @@ mod tests {
         let t = transport(pool_of(&[]), Arc::new(HangingLocator));
         let started = tokio::time::Instant::now();
 
-        let result = t.get_module_info(&peer, &store(), &root()).await;
+        // Bounded at twice the ladder so a REGRESSION FAILS rather than hangs. A call site that
+        // stops going through [`descriptor_ask`] has no ladder at all, so it waits on the pending
+        // locator forever -- measured, when the gate's bypass was reproduced here. A test that hangs
+        // on regression reads in CI as a stuck job rather than a failed assertion.
+        let ladder: std::time::Duration = DESCRIPTOR_ASK_DEADLINES.iter().sum();
+        let result = tokio::time::timeout(ladder * 2, t.get_module_info(&peer, &store(), &root()))
+            .await
+            .expect(
+                "`get_module_info` must be BOUNDED by the ladder; an unbounded ask is the defect",
+            );
 
         assert!(
             result.is_err(),
@@ -1609,6 +1618,65 @@ mod tests {
             started.elapsed(),
             DESCRIPTOR_ASK_DEADLINES.iter().sum::<std::time::Duration>(),
             "`get_module_info` must spend every rung of the ladder, not one fixed deadline"
+        );
+    }
+
+    /// Counts how many times the production path asked discovery for this capsule's providers.
+    ///
+    /// The count is the ROUND count seen from outside: every descriptor round dials, every dial
+    /// resolves candidates, and every resolution consults the locator exactly once. So a locator that
+    /// counts is an observer of the production method's round structure that needs no peer, no
+    /// socket and no injected seam.
+    #[derive(Default)]
+    struct CountingLocator {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProviderLocator for CountingLocator {
+        async fn find_providers(
+            &self,
+            _content: &ContentId,
+        ) -> Result<Vec<ProviderRecord>, DownloadError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // No providers and no error: an ANSWER of "nobody", so the round is refused rather than
+            // exhausted -- which is exactly the condition dig-node#322 says must escalate.
+            Ok(Vec::new())
+        }
+    }
+
+    /// **Proves (dig-node#322, at the PRODUCTION entry point):** one call to the real
+    /// `ModuleTransport::get_module_info` drives TWO descriptor rounds when the first is refused —
+    /// the plain round and the escalated one — so the documented single command can relay.
+    ///
+    /// **Catches what the unit-level escalation tests structurally cannot:** a call site that stops
+    /// driving [`descriptor_ask`] at all. The gate proved that was possible — replacing this method's
+    /// body with a direct one-shot ask deleted both the escalation and the relay wait from the
+    /// shipped path with every test still green, because every test drove the helper rather than the
+    /// method. This one drives the method.
+    ///
+    /// **Non-vacuous:** the assertion is TWO, not "at least one". A bypass that keeps a single round
+    /// yields one; a fixture that never reached the transport at all yields zero. Only the escalation
+    /// produces two, and the companion above pins that the rounds are a plain one then a relay one.
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_first_invocation_escalates_through_the_production_transport() {
+        let peer = peer_hex(1);
+        let locator = Arc::new(CountingLocator::default());
+        let t = transport(
+            pool_of(&[]),
+            Arc::clone(&locator) as Arc<dyn ProviderLocator>,
+        );
+
+        let result = t.get_module_info(&peer, &store(), &root()).await;
+
+        assert!(
+            result.is_err(),
+            "no holder answered, so there is no descriptor"
+        );
+        assert_eq!(
+            locator.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a refused plain round must be followed by an ESCALATED round inside the same call;              one round means the call site is no longer driving the escalation"
         );
     }
 
