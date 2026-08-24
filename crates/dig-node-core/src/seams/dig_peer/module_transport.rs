@@ -362,6 +362,29 @@ impl RelayWaitBudget {
         RELAY_WAIT_BUDGET_PER_PULL.saturating_sub(spent)
     }
 
+    /// Release `(store_id, root)`'s entry, because its PULL is over.
+    ///
+    /// Called by whoever drove `ModuleDownloader::download` — see [`PullLifecycle`]. Without it the
+    /// key would be the capsule for the DAEMON's lifetime rather than the pull's, and a capsule whose
+    /// first honest pull spent the budget could never take the relay path again until restart. Worse,
+    /// the refusal would be composed as a transport error naming a PEER, blaming that peer for this
+    /// node's own earlier spend.
+    fn release(&self, store_id: &str, root: &str) {
+        let key = Self::key(store_id, root);
+        if self
+            .spent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key)
+            .is_some()
+        {
+            self.order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|k| k != &key);
+        }
+    }
+
     /// Charge `waited` against `(store_id, root)`.
     ///
     /// A zero charge records nothing: the overwhelming majority of descriptor asks involve no relay
@@ -384,6 +407,44 @@ impl RelayWaitBudget {
         let entry = spent.entry(key).or_insert(std::time::Duration::ZERO);
         *entry = entry.saturating_add(waited);
     }
+}
+
+/// Told when a whole-capsule pull has ENDED, so state scoped to that pull can be released.
+///
+/// # Why the transport cannot work this out for itself
+///
+/// [`ModuleTransport`] is asked about ONE HOLDER at a time. It sees `get_module_info` for holder A,
+/// then B, then C, and nothing distinguishes "C is the next holder of the same pull" from "C is the
+/// first holder of a new pull of the same capsule". Only the caller driving
+/// `ModuleDownloader::download` knows where the boundary is, so only the caller can say.
+///
+/// # Why a TTL was rejected rather than being simpler
+///
+/// A relay wait is charged when it ENDS, so during a wait — up to the whole per-hop ceiling — nothing
+/// is charged and the entry looks idle. Any idle-TTL shorter than that ceiling can therefore expire a
+/// LIVE pull's budget mid-wait, which silently restores the `holders × ceiling` multiplication the
+/// budget exists to remove; and a TTL at or above the ceiling leaves a finished pull's spend blocking
+/// the next one for exactly as long as the harm it was meant to fix. There is no safe window, so the
+/// boundary has to be reported rather than guessed.
+pub(crate) trait PullLifecycle: Send + Sync {
+    /// The pull of `(store_id, root)` has finished, in success or failure.
+    ///
+    /// MUST be called on EVERY exit from the pull, including failures — a pull that ends badly is
+    /// exactly the one that spent budget on hops that did not deliver.
+    fn pull_finished(&self, store_id: &str, root: &str);
+}
+
+impl PullLifecycle for NatModuleTransport {
+    fn pull_finished(&self, store_id: &str, root: &str) {
+        self.relay_budget.release(store_id, root);
+    }
+}
+
+/// A [`PullLifecycle`] that does nothing, for a transport with no per-pull state to release.
+pub(crate) struct NoPullState;
+
+impl PullLifecycle for NoPullState {
+    fn pull_finished(&self, _store_id: &str, _root: &str) {}
 }
 
 /// The largest framed JSON body accepted for a module DESCRIPTOR answer.
@@ -512,16 +573,17 @@ const DESCRIPTOR_ASK_DEADLINES: [std::time::Duration; 3] = [
 /// from the parent -- and replacing the call site's body with a direct call to that helper deleted
 /// BOTH the escalation and the relay wait from the shipped path with **968 tests still passing**.
 ///
-/// The ladder lives in here and is PRIVATE, so the parent has no way to climb it except through
-/// [`descriptor_for_holder`]. The parent supplies only a single one-shot ask, which carries no
-/// policy at all. A bypass is therefore not merely untested, it does not compile -- and the one
-/// remaining way to write it, re-implementing the ladder inline, is caught by
+/// The ladder lives in here and is PRIVATE, so no code OUTSIDE this file can climb it: the only way
+/// in is [`descriptor_for_holder`], and the parent supplies only a single one-shot ask carrying no
+/// policy at all. Rust privacy is module-scoped, so this is a boundary against the rest of the crate
+/// and NOT against an edit made inside this file — an in-file bypass is still expressible, it is
+/// merely detected rather than prevented. What catches that remaining case is
 /// `the_production_get_module_info_climbs_the_whole_ladder` (which pins the elapsed ladder time
 /// through the real method) together with
 /// `a_cold_first_invocation_escalates_through_the_production_transport` (which pins the second round
-/// through the real method's own locator).
+/// through the real method's own locator). Both fail, bounded, in milliseconds.
 ///
-/// Prefer making a defect unexpressible over asserting that it is absent.
+/// Prefer narrowing what a defect can be expressed in over asserting that it is absent.
 mod descriptor_ask {
     use super::{ModuleInfo, DESCRIPTOR_ASK_DEADLINES};
 
@@ -1772,6 +1834,70 @@ mod tests {
             budget.remaining(&store, &root),
             std::time::Duration::ZERO,
             "an overrun must leave nothing, never wrap"
+        );
+    }
+
+    /// **Proves (dig-node#333 re-gate):** the ledger's lifetime is the PULL's, not the daemon's — a
+    /// SECOND pull of the same capsule starts with its whole budget.
+    ///
+    /// **Catches the shipped shape of the previous revision**, in which the transport was built once
+    /// at node wiring and the ledger only ever grew. A capsule whose first honest pull spent the
+    /// budget could then never take the relay path again until the process restarted — and the
+    /// refusal was composed as a transport error naming a PEER, blaming that peer for this node's own
+    /// earlier spend. That is the mis-attribution class this repo has already paid for twice.
+    ///
+    /// **Why the fixture must be TWO pulls:** the sibling test above exercises many hops of ONE pull
+    /// and passes identically whether or not the entry is ever released, because within a pull the
+    /// entry is supposed to persist. Only a second pull can tell a per-pull ledger from a permanent
+    /// one, and the assertion is that the second gets the FULL budget rather than merely a non-zero
+    /// one — a partial release would satisfy "more than nothing" while still charging pull two for
+    /// pull one.
+    #[test]
+    fn a_second_pull_of_the_same_capsule_gets_its_own_budget() {
+        let budget = RelayWaitBudget::default();
+        let (store, root) = (store(), root());
+        let full = RELAY_WAIT_BUDGET_PER_PULL;
+
+        // PULL ONE spends every second of it — an honest hop relaying a large capsule.
+        budget.charge(&store, &root, full);
+        assert_eq!(
+            budget.remaining(&store, &root),
+            std::time::Duration::ZERO,
+            "the control: pull one must genuinely exhaust the budget, or pull two proves nothing"
+        );
+
+        // The pull ends. Whoever drove `download` says so.
+        budget.release(&store, &root);
+
+        assert_eq!(
+            budget.remaining(&store, &root),
+            full,
+            "pull two must start with the WHOLE budget; a ledger keyed to the capsule for the              daemon's lifetime would still read zero here and would refuse the relay path forever,              while naming a peer as the cause"
+        );
+    }
+
+    /// **Proves:** releasing a pull leaves OTHER pulls' budgets alone, so the release is scoped and
+    /// not a global reset.
+    ///
+    /// Without this, `release` could be implemented as "clear everything" and still pass the test
+    /// above — which would hand every concurrent pull a fresh budget whenever any one of them ended,
+    /// restoring the multiplication under a different name.
+    #[test]
+    fn releasing_one_pull_does_not_refund_another() {
+        let budget = RelayWaitBudget::default();
+        let (store, root) = (store(), root());
+        let other_root = id_of(0x77);
+        let full = RELAY_WAIT_BUDGET_PER_PULL;
+
+        budget.charge(&store, &root, full / 2);
+        budget.charge(&store, &other_root, full / 2);
+
+        budget.release(&store, &root);
+
+        assert_eq!(
+            budget.remaining(&store, &other_root),
+            full / 2,
+            "the OTHER pull keeps what it has spent; a release that refunds it is a global reset"
         );
     }
 

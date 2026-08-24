@@ -505,6 +505,12 @@ pub struct CapsuleWarmer {
     locator: Arc<dyn dig_download::ProviderLocator>,
     /// Talks `dig.getModuleInfo` / `dig.fetchModuleRange` to them.
     transport: Arc<dyn dig_download::ModuleTransport>,
+    /// Told when each pull ends, so the transport can release state scoped to that pull.
+    ///
+    /// Usually the SAME object as `transport`, handed over twice under its two roles. It is a
+    /// separate field because the pull boundary is this warmer's knowledge and the state is the
+    /// transport's, and neither can see the other's half.
+    pull_lifecycle: Arc<dyn super::PullLifecycle>,
     /// Resume checkpoints, so an interrupted warm does not restart from zero.
     state_store: Arc<dyn dig_download::StateStore>,
     /// The CHAIN's view of each store's anchored root — the pull's only root of trust.
@@ -542,6 +548,7 @@ impl CapsuleWarmer {
     pub(crate) fn new(
         locator: Arc<dyn dig_download::ProviderLocator>,
         transport: Arc<dyn dig_download::ModuleTransport>,
+        pull_lifecycle: Arc<dyn super::PullLifecycle>,
         state_store: Arc<dyn dig_download::StateStore>,
         anchor_resolver: Arc<dyn crate::shared::AnchoredRootResolver>,
         paths: WarmPaths,
@@ -553,6 +560,7 @@ impl CapsuleWarmer {
         Arc::new(CapsuleWarmer {
             locator,
             transport,
+            pull_lifecycle,
             state_store,
             anchor_resolver,
             paths,
@@ -787,6 +795,11 @@ impl CapsuleWarmer {
         );
 
         let pulled = downloader.download(store_hex, root_hex, &sink).await;
+        // The pull is over, whatever it returned. Reported BEFORE the outcome is inspected, so no
+        // early return below can skip it: a failed pull is exactly the one that spent relay budget on
+        // hops that did not deliver, and leaving its ledger entry behind would charge the NEXT pull of
+        // this capsule for it (dig-node#333 review).
+        self.pull_lifecycle.pull_finished(store_hex, root_hex);
 
         // 3. ONLY `Ok` may lead to a holder claim. Not finalize-observed, not partial staging, not an
         //    `Err` that happened to leave bytes behind.
@@ -1215,6 +1228,7 @@ mod tests {
         CapsuleWarmer::new(
             Arc::new(NoHolders),
             Arc::new(UnusedTransport),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
             resolver,
             WarmPaths {
@@ -1241,6 +1255,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             Arc::new(NoHolders),
             Arc::new(UnusedTransport),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1332,6 +1347,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             Arc::new(OneHolder),
             Arc::new(RefusingHolder),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1418,6 +1434,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             locator,
             transport,
+            Arc::new(crate::seams::dig_peer::NoPullState),
             // In-memory, not `FileStateStore`: the resume-checkpoint backing store is orthogonal to
             // what this test proves (staged->cache promotion + announce-once), and `FileStateStore`'s
             // hex-doubled `module:<64hex>:<64hex>` key exceeds Windows' ~255-char filename limit
@@ -1579,6 +1596,7 @@ mod tests {
                 dig_download::testkit::mock_providers(1, &content),
             )),
             Arc::clone(transport) as Arc<dyn dig_download::ModuleTransport>,
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::clone(state),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1736,6 +1754,7 @@ mod tests {
                 dig_download::testkit::mock_providers(1, &content),
             )),
             transport,
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::clone(&state),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1828,6 +1847,7 @@ mod tests {
             Arc::new(dig_download::testkit::MockModuleTransport::serving(
                 &store_hex, &root_hex, module, 8,
             )),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1848,6 +1868,118 @@ mod tests {
             .join("modules")
             .join(&store_hex)
             .join(format!("{root_hex}.dig"))
+    }
+
+    /// Records every pull boundary the warmer reports, so a test can assert the CALL rather than the
+    /// ledger it happens to drive.
+    #[derive(Default)]
+    struct RecordingLifecycle {
+        finished: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::seams::dig_peer::PullLifecycle for RecordingLifecycle {
+        fn pull_finished(&self, store_id: &str, root: &str) {
+            self.finished
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((store_id.to_string(), root.to_string()));
+        }
+    }
+
+    /// **Proves (dig-node#333 re-gate):** the WARMER reports the end of every pull — the succeeding
+    /// one and, more importantly, the failing one.
+    ///
+    /// **Why this test and not only the ledger's own:** `RelayWaitBudget::release` being correct says
+    /// nothing about whether anything calls it, and a per-pull ledger nobody ends is exactly the
+    /// daemon-lifetime bug this fixes. This drives the real `warm` entry point and asserts the seam is
+    /// invoked, with the capsule's own ids.
+    ///
+    /// **Why the FAILING pull is the load-bearing half:** a failed pull is precisely the one that
+    /// spent relay budget on hops that did not deliver, so an implementation that reports only on
+    /// success leaves the worst case unreleased. It is also the easy mistake — a `?` or an early
+    /// return placed above the report.
+    #[tokio::test]
+    async fn a_warmer_reports_the_end_of_every_pull_including_a_failed_one() {
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+
+        // FAILING pull: no holder can be located at all.
+        let failed_dir = temp_dir("lifecycle-failed");
+        let failed_spy = Arc::new(RecordingLifecycle::default());
+        let failed = CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(Vec::new())),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                &store_hex,
+                &root_hex,
+                Vec::new(),
+                8,
+            )),
+            Arc::clone(&failed_spy) as Arc<dyn crate::seams::dig_peer::PullLifecycle>,
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: failed_dir.join("staging"),
+                cache_dir: failed_dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        );
+
+        let outcome = failed.warm(&store_hex, &root_hex).await;
+        assert!(
+            matches!(outcome, WarmOutcome::Refused(_)),
+            "the control: this pull must genuinely FAIL, or the report below is the success path in              disguise: {outcome:?}"
+        );
+        assert_eq!(
+            failed_spy
+                .finished
+                .lock()
+                .expect("lifecycle lock")
+                .as_slice(),
+            &[(store_hex.clone(), root_hex.clone())],
+            "a FAILED pull must still report its end, naming the capsule — it is the pull most              likely to have spent relay budget on hops that delivered nothing"
+        );
+
+        // SUCCEEDING pull: the same report, so the seam is not failure-only either.
+        let ok_dir = temp_dir("lifecycle-ok");
+        let ok_spy = Arc::new(RecordingLifecycle::default());
+        let module = module_committing(STORE, chain_root());
+        let content = dig_download::module_content_id(&store_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+        let succeeded = CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                &store_hex, &root_hex, module, 8,
+            )),
+            Arc::clone(&ok_spy) as Arc<dyn crate::seams::dig_peer::PullLifecycle>,
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: ok_dir.join("staging"),
+                cache_dir: ok_dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        );
+
+        let outcome = succeeded.warm(&store_hex, &root_hex).await;
+        assert!(
+            matches!(outcome, WarmOutcome::Held { .. }),
+            "the control: this pull must genuinely SUCCEED: {outcome:?}"
+        );
+        assert_eq!(
+            ok_spy.finished.lock().expect("lifecycle lock").len(),
+            1,
+            "a successful pull reports its end exactly once"
+        );
+
+        let _ = std::fs::remove_dir_all(&failed_dir);
+        let _ = std::fs::remove_dir_all(&ok_dir);
     }
 
     /// **Proves (dig-node#276, unit 4):** a capsule pulled ON A STRANGER'S BEHALF lands in the cache —
@@ -1946,6 +2078,7 @@ mod tests {
             Arc::new(dig_download::testkit::MockModuleTransport::serving(
                 &store_hex, &root_hex, module, 8,
             )),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -2144,6 +2277,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             locator,
             transport,
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -2179,6 +2313,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             Arc::new(NoHolders),
             Arc::new(UnusedTransport),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
             Arc::new(ConfirmingResolver),
             WarmPaths {

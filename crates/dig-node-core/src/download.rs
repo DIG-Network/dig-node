@@ -2249,7 +2249,11 @@ impl NodeContent {
         ));
         self.set_capsule_warmer(crate::seams::dig_peer::CapsuleWarmer::new(
             self.warm_provider_locator(),
-            transport,
+            // The SAME transport, handed over under both of its roles: the thing that talks to
+            // holders, and the thing holding state whose lifetime is one pull. Two different objects
+            // here would leave the relay-wait ledger never released.
+            Arc::clone(&transport) as Arc<dyn dig_download::ModuleTransport>,
+            transport as Arc<dyn crate::seams::dig_peer::PullLifecycle>,
             self.state_store.clone(),
             anchor_resolver,
             crate::seams::dig_peer::WarmPaths {
@@ -4783,6 +4787,7 @@ pub(crate) mod tests {
                 vec![],
                 8,
             )),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(FileStateStore::new(td.path().join("warm-state"))),
             Arc::new(HangingResolver),
             crate::seams::dig_peer::WarmPaths {

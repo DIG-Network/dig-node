@@ -6279,6 +6279,7 @@ mod tests {
                 module.clone(),
                 8,
             )),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             MockResolver::one(&store_a_hex, Bytes32(root)),
             crate::seams::dig_peer::WarmPaths {
@@ -7249,6 +7250,7 @@ mod tests {
             Arc::new(dig_download::testkit::MockModuleTransport::serving(
                 store, root, module, 8,
             )),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             MockResolver::one(store, Bytes32::from_hex(root).expect("64-hex root")),
             crate::seams::dig_peer::WarmPaths {

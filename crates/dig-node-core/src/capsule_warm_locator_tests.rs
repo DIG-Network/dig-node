@@ -153,6 +153,7 @@ fn warmer_over(
     CapsuleWarmer::new(
         content.warm_provider_locator(),
         transport,
+        Arc::new(crate::seams::dig_peer::NoPullState),
         Arc::new(dig_download::InMemoryStateStore::new()),
         Arc::new(AnchoringChain),
         WarmPaths {
