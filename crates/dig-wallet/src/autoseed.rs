@@ -497,30 +497,10 @@ fn password_str(key: &DeviceKey) -> Zeroizing<String> {
 ///   is removed and the error propagates. A secret is never left at a path whose permissions could
 ///   not be proven.
 fn write_new_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-
-    let mut file = opts.open(path)?;
-
-    if let Err(e) = harden_owner_only(path).and_then(|()| {
-        use io::Write as _;
-        file.write_all(bytes)?;
-        file.sync_all()
-    }) {
-        drop(file);
-        let _ = fs::remove_file(path);
-        return Err(e);
-    }
-    Ok(())
+    // Delegates to the ONE create-new implementation in `dig-node-core`, passing this crate
+    // Windows DACL installer as the hardening step. Keeping a second copy here is what let the
+    // two drift; the DACL stays because only this crate has the Windows FFI for it.
+    dig_node_core::shared::at_rest::write_new_hardened(path, bytes, harden_owner_only)
 }
 
 /// Replace `path`'s inherited ACL with a protected, owner-only one.

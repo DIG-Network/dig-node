@@ -70,6 +70,28 @@ pub fn presence(path: &Path) -> io::Result<Presence> {
 /// [`io::ErrorKind::AlreadyExists`] if `path` is already there — a normal, expected outcome that
 /// the caller resolves by reading it — or any other I/O error from creating or writing the file.
 pub fn write_new_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_new_hardened(path, bytes, |_| Ok(()))
+}
+
+/// As [`write_new_owner_only`], with an extra platform hardening step run on the created file
+/// BEFORE any secret bytes are written to it.
+///
+/// The parameter exists so there is exactly ONE implementation of the create-new write rather than
+/// one per consumer. `dig-wallet` passes its Windows `D:P(A;;FA;;;<user>)` DACL installer through
+/// here; `dig-node-core` has no Windows FFI of its own and passes a no-op, which is why its own
+/// files inherit the profile ACL on Windows and why nothing may claim otherwise.
+///
+/// `harden` runs before the write so a failure leaves an EMPTY file to clean up rather than a
+/// secret at a path whose permissions could not be established.
+///
+/// # Errors
+/// [`io::ErrorKind::AlreadyExists`] if `path` is already there, or any error from `harden` or the
+/// write. On any failure the partially-created file is removed.
+pub fn write_new_hardened(
+    path: &Path,
+    bytes: &[u8],
+    harden: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -83,11 +105,12 @@ pub fn write_new_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 
     let mut file = opts.open(path)?;
-    let written = {
+    let outcome = harden(path).and_then(|()| {
         use io::Write as _;
-        file.write_all(bytes).and_then(|()| file.sync_all())
-    };
-    if let Err(e) = written {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    if let Err(e) = outcome {
         drop(file);
         // Never leave a truncated secret at a path a later read would treat as complete.
         let _ = fs::remove_file(path);

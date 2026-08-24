@@ -29,9 +29,12 @@
 //! common single-directory grab yields ciphertext.
 //!
 //! **No platform hardware provider ships yet**, so on every real host the tier resolves to
-//! `Software(NotRequested)`: the two halves are protected by the owner-only file mode and their
-//! separation, not by a trusted component. [`MachineKeyStore::protection_summary`] says exactly
-//! that and never implies otherwise.
+//! `Software(NotRequested)`: what protects the two halves is their SEPARATION, plus whatever file
+//! permissions the platform gives them -- which is NOT the same on both. On Unix each is mode
+//! `0600`, set at `open` time. **On Windows both inherit the profile ACL**: dig-keystore
+//! `FileBackend`s `enforce_owner_only` is `#[cfg(unix)]`, and this module installs no explicit
+//! DACL either, unlike `SPEC.md` §16.4s wallet files. [`at_rest_floor`] is the ONE place that
+//! sentence is written, so [`MachineKeyStore::protection_summary`] cannot drift from it.
 //!
 //! What it does buy is the shape: once a provider exists, [`HardwareBoundBackend::bind`] wraps
 //! both records in place, and the pair stops opening on any other machine — with no format change
@@ -128,6 +131,21 @@ pub enum MachineKeyError {
         /// What went wrong.
         detail: String,
     },
+    /// The device key is THERE but could not be read right now.
+    ///
+    /// Split from [`Self::DeviceKeyUnusable`] because the two carry opposite instructions and
+    /// only one of them is safe to act on. A sharing violation from an on-access scanner, a
+    /// roaming-profile sync, or a transient I/O error all surface here — and every one of them
+    /// resolves by itself. Folding them into the mismatch variant asserted a false cause about a
+    /// file that was present and intact, and told the operator to REMOVE BOTH HALVES, which
+    /// destroys the identity this module exists to protect. Undeterminable means retry, never
+    /// remove.
+    DeviceKeyUnreadable {
+        /// Where the device key is.
+        path: std::path::PathBuf,
+        /// Why this read failed. Says nothing about whether the key is correct.
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for MachineKeyError {
@@ -141,8 +159,26 @@ impl std::fmt::Display for MachineKeyError {
             ),
             Self::ExistenceUndeterminable { path, source } => write!(
                 f,
-                "cannot determine whether the machine identity already exists at {} ({source});                  refusing to mint a new one, because minting over an existing identity would                  destroy it permanently. Resolve the access error and restart.",
-                path.display()
+                concat!(
+                    "cannot determine whether the machine identity already exists at {} ({}). ",
+                    "Refusing to mint a new one, because minting over an existing identity would ",
+                    "destroy it permanently. This is usually transient: resolve the access error ",
+                    "and restart. Do not remove anything."
+                ),
+                path.display(),
+                source
+            ),
+            Self::DeviceKeyUnreadable { path, source } => write!(
+                f,
+                concat!(
+                    "the machine identity device key at {} is present but could not be read ",
+                    "({}). This says NOTHING about whether it is the right key -- a locked or ",
+                    "temporarily unreadable file is not a wrong one. It is usually transient ",
+                    "(an on-access scanner, a profile sync, a busy volume): retry, and do not ",
+                    "remove either half."
+                ),
+                path.display(),
+                source
             ),
             Self::DeviceKeyUnusable {
                 device_key,
@@ -150,9 +186,22 @@ impl std::fmt::Display for MachineKeyError {
                 detail,
             } => write!(
                 f,
-                "the machine identity in {} cannot be opened by the device key at {} ({detail}).                  The two are a matched pair and one is missing or from a different install.                  Restore {} from the same backup as {}; if it is gone, the identity is                  unrecoverable and a new one must be minted deliberately by removing both.",
+                concat!(
+                    "the machine identity in {} could not be opened by the device key at {} ",
+                    "({}).
+KNOWN: the two do not currently match.
+UNDETERMINED: which of them ",
+                    "is the wrong one, and whether the matching half still exists somewhere. ",
+                    "Nothing here can tell you.
+DO FIRST: restore {} from the same backup as {}, ",
+                    "and confirm the node starts.
+ONLY IF you are certain no matching device key ",
+                    "exists anywhere does removing both halves become the remedy -- that mints a ",
+                    "new identity and permanently discards the old peer_id."
+                ),
                 blob_dir.display(),
                 device_key.display(),
+                detail,
                 device_key.display(),
                 blob_dir.display()
             ),
@@ -191,6 +240,14 @@ pub struct MachineKeyStore {
     /// naming both halves in [`MachineKeyError::DeviceKeyUnusable`].
     blob_dir: std::path::PathBuf,
     kdf: KdfParams,
+    /// Runs between the blob write and the read-back in [`Self::seal_new`]. Tests only.
+    ///
+    /// The read-back exists so the LOSING racer adopts the winner identity, and that property is
+    /// unobservable without a way to make another writer land inside the window -- which is
+    /// exactly how a mutation replacing the read-back with the value just computed stayed green.
+    /// This hook is the seam that makes the window reachable from a test.
+    #[cfg(test)]
+    after_blob_write: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl MachineKeyStore {
@@ -218,6 +275,8 @@ impl MachineKeyStore {
             device_key_path: device_dir(dir)?.join(DEVICE_KEY_FILE),
             blob_dir: dir.to_path_buf(),
             kdf: KdfParams::DEFAULT,
+            #[cfg(test)]
+            after_blob_write: None,
         })
     }
 
@@ -315,8 +374,12 @@ impl MachineKeyStore {
                  is intact"
             ),
             Ok(tier @ ProtectionTier::Software(_)) => format!(
-                "machine identity key is {tier}: protected by owner-only file permissions, not by \
-                 hardware, and it would open on another machine"
+                concat!(
+                    "machine identity key is {}: not hardware-backed, and it would open on ",
+                    "another machine. At rest it is protected by {}."
+                ),
+                tier,
+                at_rest_floor()
             ),
             Err(e) => format!("machine identity key protection is unknown: {e}"),
         }
@@ -361,6 +424,10 @@ impl MachineKeyStore {
             self.kdf,
         )?;
         self.backend.write(seed_key, &blob)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.after_blob_write {
+            hook();
+        }
 
         // Read back from STORAGE, not from the value just computed. A seal this host cannot
         // reopen has replaced the only copy of the node identity with unreadable bytes, and a
@@ -385,16 +452,33 @@ impl MachineKeyStore {
 
     /// The per-install device key, from the sibling device directory.
     ///
-    /// A missing or wrong-length device key beside an existing blob is the ONE state the
-    /// no-re-mint rule cannot heal on its own, so it is reported as
-    /// [`MachineKeyError::DeviceKeyUnusable`] -- which names both halves and the remedy -- rather
-    /// than as a bare I/O or decrypt failure the operator cannot act on.
+    /// **Three-valued, exactly like [`Self::seed_presence`] and [`Self::read_legacy`]** — and this
+    /// is the read where getting it wrong is worst, because its failure message carries a
+    /// DESTRUCTIVE instruction. A bare `fs::read` folds a transient sharing violation (os error
+    /// 32, what any on-access scanner produces) into the same variant as a genuine mismatch, so
+    /// the node asserts a false cause about a present, intact file and tells the operator to
+    /// remove both halves. Measured: both halves intact, the same seed opening the instant the
+    /// lock released.
+    ///
+    /// So: **absent** is a real mismatch ([`MachineKeyError::DeviceKeyUnusable`]); **present but
+    /// unreadable** is [`MachineKeyError::DeviceKeyUnreadable`], which says retry and never
+    /// remove; **undeterminable existence** refuses like every other read here.
     fn read_device_key(&self) -> Result<Zeroizing<Vec<u8>>, MachineKeyError> {
-        let bytes =
-            std::fs::read(&self.device_key_path).map_err(|e| self.device_key_unusable(e))?;
+        let path = &self.device_key_path;
+        let found = presence(path).map_err(|source| MachineKeyError::ExistenceUndeterminable {
+            path: path.clone(),
+            source,
+        })?;
+        if found == Presence::Absent {
+            return Err(self.device_key_unusable("it is not there"));
+        }
+        let bytes = std::fs::read(path).map_err(|source| MachineKeyError::DeviceKeyUnreadable {
+            path: path.clone(),
+            source,
+        })?;
         if bytes.len() != DEVICE_KEY_LEN {
             return Err(self.device_key_unusable(format!(
-                "it is {} bytes, not {DEVICE_KEY_LEN}",
+                "it is {} bytes, not the {DEVICE_KEY_LEN} a device key must be",
                 bytes.len()
             )));
         }
@@ -494,6 +578,26 @@ pub fn identity_store_dir() -> Result<std::path::PathBuf, MachineKeyError> {
                 "no OS config directory available for the dig identity key",
             ))
         })
+}
+
+/// What actually protects the two halves at rest on THIS platform, in one clause.
+///
+/// Exists so the operator-facing sentence and the enforcement cannot drift apart. Saying
+/// "owner-only file permissions" unconditionally was a false claim on Windows, where neither
+/// dig-keystore `FileBackend` (whose `enforce_owner_only` is `#[cfg(unix)]`) nor this module
+/// installs an explicit DACL -- both halves simply inherit the profile ACL.
+fn at_rest_floor() -> &'static str {
+    #[cfg(unix)]
+    {
+        "owner-only file permissions (mode 0600) and their separate directories"
+    }
+    #[cfg(not(unix))]
+    {
+        concat!(
+            "their separate directories, plus the permissions inherited from your user profile ",
+            "-- this build installs no explicit owner-only ACL on Windows"
+        )
+    }
 }
 
 /// This host's hardware key-wrapping provider.
@@ -610,6 +714,142 @@ mod tests {
     /// metadata call. Borrowed from `dig-wallet`'s `autoseed` tests, which established the shape.
     fn undeterminable_dir(root: &tempfile::TempDir) -> std::path::PathBuf {
         std::path::PathBuf::from(format!("{}\0dig", root.path().display()))
+    }
+
+    /// A device-key path that EXISTS but cannot be read, portably and deterministically.
+    ///
+    /// A directory: `try_exists` says `Present`, and `fs::read` fails on every platform
+    /// (`IsADirectory` on Unix, access denied on Windows). It stands in for the real cause the
+    /// gate measured -- a `share_mode(0)` lock from an on-access scanner, os error 32 -- which is
+    /// only expressible on Windows. What matters is the SHAPE both produce: present, intact, and
+    /// momentarily unreadable.
+    fn unreadable_device_key(dir: &Path) {
+        let path = device_dir(dir).expect("sibling").join(DEVICE_KEY_FILE);
+        std::fs::create_dir_all(&path).expect("a present but unreadable device key");
+    }
+
+    /// **Proves:** a device key that is present but momentarily unreadable is NOT reported as a
+    /// mismatch, and carries no instruction to remove anything.
+    ///
+    /// **Catches the gating finding.** A bare `fs::read` folds a transient sharing violation into
+    /// `DeviceKeyUnusable`, which asserts a false cause about a present, intact file and tells the
+    /// operator to remove BOTH halves -- destroying the identity this module exists to protect.
+    /// The gate measured exactly that with both halves intact and the seed opening again the
+    /// moment the lock released.
+    ///
+    /// The fixture varies ONE thing (the device key becomes unreadable while everything else is
+    /// untouched) and the assertions pin the VARIANT plus the WORDS, because a correct variant
+    /// rendered into a remove-both sentence would mislead identically.
+    #[test]
+    fn a_present_but_unreadable_device_key_is_not_reported_as_a_mismatch() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        software_store(&dir).load_or_create(None).expect("mint");
+        std::fs::remove_file(device_dir(&dir).expect("sibling").join(DEVICE_KEY_FILE))
+            .expect("clear the real key");
+        unreadable_device_key(&dir);
+
+        let outcome = software_store(&dir).load_or_create(None);
+
+        let Err(e @ MachineKeyError::DeviceKeyUnreadable { .. }) = outcome else {
+            panic!("a present-but-unreadable device key must not read as a mismatch: {outcome:?}");
+        };
+        let message = e.to_string().to_lowercase();
+        assert!(
+            message.contains("retry"),
+            "an undeterminable read must tell the operator to retry: {message}"
+        );
+        for destructive in ["removing both", "remove both", "minted deliberately"] {
+            assert!(
+                !message.contains(destructive),
+                "a transient read must never carry a destructive instruction ({destructive}): {message}"
+            );
+        }
+    }
+
+    /// **Proves:** a wrong-length device key is a real mismatch and still reads honestly.
+    ///
+    /// **Catches:** the branch B7 found untested, which shared its message with the genuine
+    /// mismatch. It must NOT be reclassified as merely unreadable while fixing the finding above
+    /// -- a truncated key really is unusable -- so this is the control that keeps that fix from
+    /// over-reaching.
+    #[test]
+    fn a_wrong_length_device_key_is_a_mismatch_that_names_what_is_undetermined() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        software_store(&dir).load_or_create(None).expect("mint");
+        std::fs::write(
+            device_dir(&dir).expect("sibling").join(DEVICE_KEY_FILE),
+            [0x22u8; DEVICE_KEY_LEN - 1],
+        )
+        .expect("truncated device key");
+
+        let outcome = software_store(&dir).load_or_create(None);
+
+        let Err(e @ MachineKeyError::DeviceKeyUnusable { .. }) = outcome else {
+            panic!("a truncated device key is a genuine mismatch: {outcome:?}");
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains(&format!("not the {DEVICE_KEY_LEN}")),
+            "the detail must say what was actually wrong: {message}"
+        );
+        assert!(
+            message.contains("KNOWN:") && message.contains("UNDETERMINED:"),
+            "the message must separate what is known from what it cannot establish: {message}"
+        );
+        assert!(
+            message.find("DO FIRST:") < message.find("ONLY IF"),
+            "restoring must be offered BEFORE the irreversible option: {message}"
+        );
+    }
+
+    /// **Proves:** `seal_new` returns the seed that is on DISK, not the one it just minted.
+    ///
+    /// **Catches the mutation that stayed green (B6):** replacing the read-back with the computed
+    /// value. That is what makes a losing racer adopt the winner identity instead of returning an
+    /// identity no longer stored anywhere -- two processes would otherwise disagree about the
+    /// node `peer_id` while only one blob survives.
+    ///
+    /// The property is unobservable unless another writer lands INSIDE the write/read-back window,
+    /// so the fixture uses the test-only hook to put one there. Asserting on an ordinary mint
+    /// cannot see it: there, the computed value and the stored value are equal by construction.
+    #[test]
+    fn seal_new_adopts_the_seed_a_racing_writer_left_on_disk() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let winner = [0x99u8; 32];
+
+        let mut store = software_store(&dir);
+        // Install the device key first, so the "racer" seals under the same one -- which is what
+        // `ensure_device_key` guarantees in production.
+        let device_key = store.ensure_device_key().expect("install");
+        let racing_blob = opaque::seal(
+            &Password::new(device_key.as_slice()),
+            &winner,
+            KdfParams::FAST_TEST,
+        )
+        .expect("the racer seals its own seed");
+        let blob_path = store.seed_blob_path();
+        store.after_blob_write = Some(Box::new(move || {
+            std::fs::write(&blob_path, &racing_blob).expect("the racer wins the write");
+        }));
+
+        let settled = store.load_or_create(None).expect("mint and settle");
+
+        assert_eq!(
+            settled.as_slice(),
+            &winner,
+            "the loser must adopt the identity actually on disk, not the one it minted"
+        );
+        assert_eq!(
+            software_store(&dir)
+                .load_or_create(None)
+                .expect("restart")
+                .as_slice(),
+            &winner,
+            "control: that is genuinely the identity a later start reads"
+        );
     }
 
     /// **Proves:** an identity that cannot be READ is never treated as an identity that is not
@@ -740,7 +980,7 @@ mod tests {
         for expected in [
             device.display().to_string(),
             dir.display().to_string(),
-            "Restore".to_string(),
+            "restore".to_string(),
         ] {
             assert!(
                 message.contains(&expected),
@@ -973,13 +1213,33 @@ mod tests {
 
         let summary = store.protection_summary();
         assert!(
-            summary.contains("not by hardware"),
+            summary.contains("not hardware-backed"),
             "summary must not leave hardware backing implied: {summary}"
         );
         assert!(
             summary.contains("would open on another machine"),
             "summary must state the copy-resistance this key does NOT have: {summary}"
         );
+
+        // The at-rest floor is NOT the same on both platforms, and the sentence must say which
+        // one the operator actually has. Asserted per platform against concrete words rather than
+        // against `at_rest_floor()` itself, which would pass for any string that function returns.
+        #[cfg(unix)]
+        assert!(
+            summary.contains("0600"),
+            "on Unix the summary must name the owner-only mode it really sets: {summary}"
+        );
+        #[cfg(not(unix))]
+        {
+            assert!(
+                summary.contains("inherited from your user profile"),
+                "on Windows the summary must say permissions are inherited: {summary}"
+            );
+            assert!(
+                !summary.contains("owner-only file permissions"),
+                "on Windows nothing installs an owner-only ACL, so claiming one is false: {summary}"
+            );
+        }
     }
 
     /// **Proves:** the blob's OWN tier is reported, not the host's.

@@ -8,7 +8,7 @@
 //! deferred to a later wave, once a seam trait actually needs them).
 //!
 //! - [`at_rest`] — the at-rest decision primitives every seam that mints key material shares:
-//!   [`presence`] (an unreadable path is NOT an absent one) and [`write_new_owner_only`] (the
+//!   [`presence`] (an unreadable path is NOT an absent one) and [`write_new_owner_only`] /
 //!   atomic create-new that makes two concurrent starts safe).
 //! - [`chain_view`] — the injectable on-chain root resolver ([`AnchoredRootResolver`],
 //!   [`AnchoredStoreState`]) the read-path pin and the chain-watch loop both depend on.

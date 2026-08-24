@@ -5653,7 +5653,9 @@ Both are owner-only **on Unix** — mode `0600` set at `open` time, not by a lat
 Windows both inherit the profile ACL**; neither the keystore's `FileBackend` (whose
 `enforce_owner_only` is `#[cfg(unix)]`) nor this node installs an explicit `D:P(A;;FA;;;<user>)`
 DACL for them. §16.4's wallet files DO install that DACL. A surface MUST NOT claim owner-only
-enforcement for the machine key on Windows; bringing it to §16.4's floor is tracked separately.
+enforcement for the machine key on Windows — it MUST state the floor the running platform actually
+gives it. Bringing Windows to §16.4's floor is recorded as finding 3 on
+https://github.com/DIG-Network/dig_ecosystem/issues/2168 and is NOT satisfied by this section.
 
 The device key is a raw file rather than a keystore record deliberately: it is written with
 `create_new`, and that atomicity is load-bearing (below). `FileBackend::write` is tmp-plus-rename,
@@ -5676,7 +5678,8 @@ the co-installed `digs` CLI reads it. Removing it therefore causes `digs` to min
 **plaintext** seed into the same directory on its next run, silently changing its §21.9 operator
 identity — the node's identity is preserved, `digs`'s is not. The removal is still correct for the
 node, whose seed must not remain in plaintext; the coherent end state is `digs` reading the sealed
-store through this same module, which is tracked separately and is NOT satisfied by this section.
+store through this same module, recorded as finding 2 on
+https://github.com/DIG-Network/dig_ecosystem/issues/2168 and NOT satisfied by this section.
 
 **Existence MUST be answered by `try_exists`, never `Path::exists`.** `exists()` is
 `fs::metadata(..).is_ok()`, so it reports a locked, permission-denied or otherwise unreadable path
@@ -5693,9 +5696,20 @@ that no longer matches, which the no-re-mint rule below then prevents from ever 
 OS atomic test-and-set makes that state unreachable rather than merely unlikely, because exactly
 one racer creates the key and the other adopts it, so both seal under the same key.
 
+**The three-valued rule binds EVERY read on this path, including the device key.** A device key
+that is present but momentarily unreadable — an on-access scanner holding it with `share_mode(0)`,
+a profile sync, a busy volume — MUST NOT be reported as a mismatch. That is the read whose failure
+message carries a destructive instruction, so misclassifying it tells an operator to delete a
+present, intact identity. An undeterminable read MUST say *retry* and MUST NOT propose removing
+either half.
+
 **A mismatched or missing device key MUST be reported as a NAMED state** that identifies both
 halves by path and states the remedy. It is the one state the no-re-mint rule cannot heal, so a
-bare decrypt failure leaves an operator with a permanently dead node and nothing to act on.
+bare decrypt failure leaves an operator with a permanently dead node and nothing to act on. The
+message MUST separate what is **known** (the two do not currently match) from what is
+**undetermined** (which half is wrong, and whether the matching half still exists), per
+dig-keystore `SPEC.md` §17.5b's discipline, and MUST offer restoring before the irreversible
+option.
 
 **A stored seed that will not open is an ERROR, never a re-mint.** The node MUST report the failure
 and continue with authenticated §21 sync disabled. Minting over it would hand the node a new
