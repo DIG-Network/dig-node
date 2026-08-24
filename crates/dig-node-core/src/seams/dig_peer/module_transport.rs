@@ -1115,6 +1115,67 @@ mod descriptor_ask {
             );
         }
 
+        /// **Proves (finding 2):** the ceiling handed in is the ceiling USED — a hop gets only what the
+        /// pull has left, never a fresh [`RELAY_MAX_WAIT`].
+        ///
+        /// **Catches the shape of a half-applied budget:** a parameter that is accepted, threaded, and
+        /// then ignored in favour of the constant. That version passes every other test in this module,
+        /// because every other test hands in exactly `RELAY_MAX_WAIT`.
+        ///
+        /// **Fixture design:** the hop is the SAME endless-progress liar as the ceiling test above, so the
+        /// only thing that varies is the budget it is granted. Its ending is identical; only the elapsed
+        /// time distinguishes the two, which is precisely the property under test.
+        #[tokio::test(start_paused = true)]
+        async fn a_hop_gets_only_what_the_pull_has_left() {
+            let hop = RelayingHop::new(1, None);
+            let nearly_spent = RELAY_POLL_INTERVAL * 3;
+            let started = tokio::time::Instant::now();
+
+            let answer = descriptor_for_holder(true, nearly_spent, |_proxy| hop.ask()).await;
+
+            assert_eq!(
+                answer.descriptor.unwrap_err(),
+                DescriptorFailure::RelayWait(RelayWaitEnd::Ceiling)
+            );
+            assert!(
+            started.elapsed() < nearly_spent + RELAY_POLL_INTERVAL * 2,
+            "the wait must end at the budget it was GIVEN, not at the per-hop maximum -- elapsed              {:?} against a budget of {nearly_spent:?}",
+            started.elapsed()
+        );
+            assert!(
+                started.elapsed() < RELAY_MAX_WAIT,
+                "the control: a ceiling that was ignored would run to {RELAY_MAX_WAIT:?}"
+            );
+        }
+
+        /// **Proves:** the relay wait is REPORTED, so a caller can charge it — and reported as zero when
+        /// no hop relayed, so an ordinary ask never consumes a pull's budget.
+        ///
+        /// **Why both halves:** a report that is always zero would silently disable the budget, and a
+        /// report that is never zero would exhaust it on ordinary asks. Neither is visible from the
+        /// outcome alone.
+        #[tokio::test(start_paused = true)]
+        async fn only_a_relaying_hop_costs_the_pull_any_relay_time() {
+            let relaying = RelayingHop::new(FIELD_RELAY_BYTES_PER_POLL, Some(FIELD_CAPSULE_BYTES));
+            let waited = descriptor_for_holder(true, RELAY_MAX_WAIT, |_proxy| relaying.ask())
+                .await
+                .relay_waited;
+            assert!(
+                waited > std::time::Duration::ZERO,
+                "a hop that relayed must report the time it cost"
+            );
+
+            let holder = RelayingHop::new(u64::MAX, Some(1));
+            let none = descriptor_for_holder(true, RELAY_MAX_WAIT, |_proxy| holder.ask())
+                .await
+                .relay_waited;
+            assert_eq!(
+                none,
+                std::time::Duration::ZERO,
+                "a holder that simply answered must cost the pull no relay budget at all"
+            );
+        }
+
         /// **Proves:** a hop that stops answering ends the wait immediately, rather than being polled to
         /// the ceiling. A relay that died is not a relay in progress.
         #[tokio::test(start_paused = true)]
@@ -1677,6 +1738,48 @@ mod tests {
             locator.calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "a refused plain round must be followed by an ESCALATED round inside the same call;              one round means the call site is no longer driving the escalation"
+        );
+    }
+
+    /// **Proves (finding 2):** the relay-wait budget is spent per CAPSULE, drains, and saturates —
+    /// so many hops on one pull share one allowance while a different pull is untouched.
+    ///
+    /// **Catches:** a budget keyed by peer, or one that resets, either of which restores the
+    /// `holders × ceiling` multiplication the budget exists to remove.
+    #[test]
+    fn the_relay_budget_is_spent_per_capsule_and_saturates() {
+        let budget = RelayWaitBudget::default();
+        let (store, root) = (store(), root());
+        let full = RELAY_WAIT_BUDGET_PER_PULL;
+
+        assert_eq!(
+            budget.remaining(&store, &root),
+            full,
+            "a fresh pull has all of it"
+        );
+
+        // Two different HOPS of the same pull, charged separately, draw down the same allowance.
+        budget.charge(&store, &root, full / 4);
+        budget.charge(&store, &root, full / 4);
+        assert_eq!(
+            budget.remaining(&store, &root),
+            full / 2,
+            "hops of one pull SHARE the budget; a per-peer allowance would still read as full here"
+        );
+
+        // A different capsule is a different pull.
+        assert_eq!(
+            budget.remaining(&store, &id_of(0x77)),
+            full,
+            "the control: another capsule must be unaffected, or the ledger is global rather than              per pull"
+        );
+
+        // Overrun saturates instead of wrapping into a fresh allowance.
+        budget.charge(&store, &root, full);
+        assert_eq!(
+            budget.remaining(&store, &root),
+            std::time::Duration::ZERO,
+            "an overrun must leave nothing, never wrap"
         );
     }
 
