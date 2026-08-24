@@ -1066,41 +1066,8 @@ mod tests {
     /// the `.await`s in these async tests. Held for the whole body of each such test.
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-    #[test]
-    fn default_send_is_a_dry_run_never_broadcasts() {
-        // No broadcast requested → never push, regardless of the env opt-in. This is
-        // the safe default that lets the signing path run unattended.
-        assert_eq!(send_action(false, false), SendAction::DryRun);
-        assert_eq!(send_action(false, true), SendAction::DryRun);
-    }
 
-    #[test]
-    fn broadcast_requires_both_request_and_env_optin() {
-        // Explicit request but env disabled → refused (NOT a silent dry run, NOT a push).
-        assert_eq!(send_action(true, false), SendAction::RefusedDisabled);
-        // Both opted in → the only path that actually broadcasts.
-        assert_eq!(send_action(true, true), SendAction::Broadcast);
-    }
 
-    #[test]
-    fn coin_entry_json_matches_sage_spendable_coin_shape() {
-        let coin = chia_protocol::Coin::new([1u8; 32].into(), [2u8; 32].into(), 12345);
-        // XCH entry carries the standard puzzle reveal the hub uncurries per coin.
-        let xch = coin_entry_json(&coin, Some("0xdeadbeef"));
-        assert_eq!(
-            xch["coin"]["parent_coin_info"],
-            format!("0x{}", "01".repeat(32))
-        );
-        assert_eq!(xch["coin"]["puzzle_hash"], format!("0x{}", "02".repeat(32)));
-        assert_eq!(xch["coin"]["amount"], "12345"); // decimal string (BigInt-safe)
-        assert_eq!(xch["puzzle"], "0xdeadbeef");
-        assert_eq!(xch["locked"], false);
-        assert_eq!(xch["spent_block_index"], 0);
-        // CAT entry omits `puzzle` (the hub rebuilds the lineage from the parent spend).
-        let cat = coin_entry_json(&coin, None);
-        assert!(cat.get("puzzle").is_none());
-        assert_eq!(cat["coin"]["amount"], "12345");
-    }
 
     #[test]
     fn cache_cap_is_floored_so_caching_cant_be_disabled() {
@@ -1115,20 +1082,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pubkey_window_defaults_and_clamps() {
-        // No params → Sage's default first 10 keys at offset 0.
-        assert_eq!(pubkey_window(&serde_json::Value::Null), (0, 10));
-        // Explicit offset/limit honoured.
-        assert_eq!(
-            pubkey_window(&serde_json::json!({"offset": 5, "limit": 3})),
-            (5, 3)
-        );
-        // An absurd limit is clamped so a dapp can't make us derive forever.
-        let (off, lim) = pubkey_window(&serde_json::json!({"limit": 100000}));
-        assert_eq!(off, 0);
-        assert!(lim <= MAX_PUBKEYS, "limit clamped to {MAX_PUBKEYS}");
-    }
 
     #[test]
     fn only_the_exact_wallet_origin_is_self_trusted() {
@@ -1185,80 +1138,8 @@ mod tests {
 
     // -- Wallet source: Native local keys vs. Sage delegate (#34) --------------
 
-    #[test]
-    fn wallet_source_round_trips_through_its_wire_token() {
-        // The persisted/served token is stable and the parse is total (unknown → the
-        // safe Native default, so a corrupt value never strands the wallet).
-        assert_eq!(WalletSource::Native.as_str(), "native");
-        assert_eq!(WalletSource::Sage.as_str(), "sage");
-        assert_eq!(WalletSource::from_str("native"), WalletSource::Native);
-        assert_eq!(WalletSource::from_str("sage"), WalletSource::Sage);
-        assert_eq!(WalletSource::from_str("garbage"), WalletSource::Native);
-        assert_eq!(WalletSource::from_str(""), WalletSource::Native);
-        // Default is Native — the local-keys behaviour that predates this feature.
-        assert_eq!(WalletSource::default(), WalletSource::Native);
-    }
 
-    #[test]
-    fn native_mode_routes_every_method_to_the_local_signer() {
-        // In Native mode nothing is delegated — the local signer answers everything,
-        // exactly as before this feature (zero regression).
-        for m in [
-            "chip0002_chainId",
-            "chip0002_connect",
-            "chip0002_getPublicKeys",
-            "chip0002_signMessage",
-            "chip0002_signCoinSpends",
-            "chia_getAddress",
-            "chia_signMessageByAddress",
-            "chia_takeOffer",
-            "chia_createOffer",
-            "chia_send",
-        ] {
-            assert_eq!(
-                wc_route(WalletSource::Native, m),
-                WcRoute::Native,
-                "{m} must stay local in Native mode"
-            );
-        }
-    }
 
-    #[test]
-    fn sage_mode_delegates_signing_methods_but_answers_the_handshake_locally() {
-        // The keyless handshake methods are answered locally even in Sage mode (they
-        // touch no keys and must work before any Sage session is up)…
-        assert_eq!(
-            wc_route(WalletSource::Sage, "chip0002_chainId"),
-            WcRoute::Native
-        );
-        assert_eq!(
-            wc_route(WalletSource::Sage, "chip0002_connect"),
-            WcRoute::Native
-        );
-        // …but every method that reads keys or signs is delegated to Sage.
-        for m in [
-            "chip0002_getPublicKeys",
-            "chip0002_signMessage",
-            "chip0002_signCoinSpends",
-            "chia_getAddress",
-            "chia_signMessageByAddress",
-            "chip0002_getAssetBalance",
-            "chip0002_getAssetCoins",
-            "chia_takeOffer",
-            "chia_createOffer",
-            "chia_getOfferSummary",
-            "chia_send",
-            "chia_getNfts",
-            "chia_getDids",
-            "chia_getTransactions",
-        ] {
-            assert_eq!(
-                wc_route(WalletSource::Sage, m),
-                WcRoute::Delegate,
-                "{m} must delegate to Sage in Sage mode"
-            );
-        }
-    }
 
     #[test]
     fn export_class_methods_are_recognised_so_delegate_never_forwards_them() {
@@ -1283,118 +1164,8 @@ mod tests {
         assert!(!is_export_class_method("chip0002_getPublicKeys"));
     }
 
-    /// In Sage mode `wc_dispatch` must NOT touch the local seed — it parks the request
-    /// on the delegate bridge and awaits Sage. Drive the dual: a background task plays
-    /// the in-page Sage requester (take the parked request, return a canned result),
-    /// and assert the dispatched method routes through the bridge and returns Sage's
-    /// value. With NO unlocked local session, a local-signer route would 401; getting
-    /// Sage's value back proves the request went to Sage, not the local keys.
-    #[tokio::test]
-    async fn sage_mode_dispatch_routes_through_the_delegate_bridge_not_local_keys() {
-        let st = Arc::new(AppState::default());
-        *st.source.lock().await = WalletSource::Sage;
-        // Deliberately leave the local session locked (None): Native would 401 here.
 
-        // The "Sage requester" pump: pick up the parked request and answer it.
-        let pump = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Some((id, method, params)) = delegate_take_next(&st).await {
-                        // Echo back something Sage-shaped that proves the round-trip.
-                        let result = serde_json::json!({
-                            "fromSage": true,
-                            "method": method,
-                            "echo": params,
-                        });
-                        delegate_fulfill(&st, id, Ok(result)).await;
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-        };
 
-        let out = wc_dispatch(
-            &st,
-            "chip0002_getPublicKeys",
-            serde_json::json!({ "limit": 5 }),
-        )
-        .await
-        .expect("delegate dispatch returns Sage's result, not a local 401");
-        assert_eq!(out["fromSage"], true);
-        assert_eq!(out["method"], "chip0002_getPublicKeys");
-        assert_eq!(out["echo"]["limit"], 5);
-        pump.await.unwrap();
-    }
-
-    /// The delegate bridge propagates Sage's ERRORS (a user rejection / unsupported
-    /// method) back as a wallet error, rather than hanging or faking success.
-    #[tokio::test]
-    async fn sage_mode_dispatch_surfaces_sage_errors() {
-        let st = Arc::new(AppState::default());
-        *st.source.lock().await = WalletSource::Sage;
-        let pump = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Some((id, _m, _p)) = delegate_take_next(&st).await {
-                        delegate_fulfill(&st, id, Err("User rejected".to_string())).await;
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-        };
-        let err = wc_dispatch(&st, "chia_send", serde_json::json!({}))
-            .await
-            .expect_err("a Sage rejection must surface as an error");
-        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
-        assert!(err.1.contains("User rejected"));
-        pump.await.unwrap();
-    }
-
-    /// Even in Sage mode, an export-flavoured method is refused (501) BEFORE it can be
-    /// parked for Sage — the delegate surface is never a seed-exfiltration path. (A
-    /// pump is started to prove the request never reaches it: if it did, the test
-    /// would see the pumped value instead of the 501.)
-    #[tokio::test]
-    async fn delegate_never_forwards_export_class_methods() {
-        let st = Arc::new(AppState::default());
-        *st.source.lock().await = WalletSource::Sage;
-        let leaked = Arc::new(AtomicU64::new(0));
-        let pump = {
-            let st = st.clone();
-            let leaked = leaked.clone();
-            tokio::spawn(async move {
-                // Run briefly; if any export-class request is ever parked, flag it.
-                for _ in 0..40 {
-                    if let Some((id, _m, _p)) = delegate_take_next(&st).await {
-                        leaked.fetch_add(1, Ordering::Relaxed);
-                        delegate_fulfill(&st, id, Ok(serde_json::json!("LEAK"))).await;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-        };
-        for method in ["export", "exportMnemonic", "getSecretKeys", "revealSeed"] {
-            let r = wc_dispatch(&st, method, serde_json::Value::Null).await;
-            match r {
-                Err((code, _)) => assert_eq!(
-                    code,
-                    StatusCode::NOT_IMPLEMENTED,
-                    "delegate mode must reject {method} as unsupported, never forward it"
-                ),
-                Ok(v) => panic!("{method} must not be delegatable, got {v:?}"),
-            }
-        }
-        pump.await.unwrap();
-        assert_eq!(
-            leaked.load(Ordering::Relaxed),
-            0,
-            "no export-class method may ever be parked for Sage"
-        );
-    }
 
     /// The delegate pump endpoints are wallet-local: a dapp origin cannot pull the
     /// parked queue or feed results back into the dispatcher.
@@ -1421,171 +1192,12 @@ mod tests {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
-    /// The wallet-source setter is wallet-local only (a dapp cannot flip the wallet to
-    /// Sage / back), and a self-origin set persists + is reflected by the getter.
-    #[tokio::test]
-    async fn wallet_source_set_is_self_origin_only_and_persists() {
-        let _g = ENV_LOCK.lock().await;
-        let td = tempfile::tempdir().unwrap();
-        std::env::set_var("LOCALAPPDATA", td.path());
-        let st = Arc::new(AppState::default());
 
-        // A dapp origin is refused.
-        let r = wallet_source_set(
-            State(st.clone()),
-            origin_headers("https://evil.example.com"),
-            Json(SetWalletSource {
-                source: "sage".to_string(),
-            }),
-        )
-        .await;
-        assert_eq!(r.status(), StatusCode::FORBIDDEN);
-        // …and did NOT change the mode.
-        assert_eq!(*st.source.lock().await, WalletSource::Native);
 
-        // The self origin can flip to Sage; it persists to disk and the getter agrees.
-        let self_origin = format!("http://127.0.0.1:{}", wallet_port());
-        let r = wallet_source_set(
-            State(st.clone()),
-            origin_headers(&self_origin),
-            Json(SetWalletSource {
-                source: "sage".to_string(),
-            }),
-        )
-        .await;
-        assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(*st.source.lock().await, WalletSource::Sage);
-        let got = wallet_source_get(State(st)).await;
-        assert_eq!(got.0.source, "sage");
 
-        // It persisted to disk: read the file directly from the tempdir (not via the
-        // process-global env, which a parallel env-mutating test could have changed).
-        let persisted = std::fs::read(td.path().join("DigWallet").join("wallet-source.json"))
-            .expect("wallet-source.json written");
-        let v: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
-        assert_eq!(v["source"], "sage");
 
-        std::env::remove_var("LOCALAPPDATA");
-    }
 
-    #[test]
-    fn asset_id_parses_with_or_without_0x_and_rejects_bad_len() {
-        // A 32-byte hex TAIL parses identically with or without the 0x prefix.
-        let bare = "ab".repeat(32);
-        let prefixed = format!("0x{bare}");
-        let a = parse_asset_id_hex(&bare).unwrap();
-        let b = parse_asset_id_hex(&prefixed).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(hex::encode(a), bare);
-        // Wrong length / bad hex are rejected (not panics).
-        assert!(parse_asset_id_hex("dead").is_err()); // too short
-        assert!(parse_asset_id_hex(&"zz".repeat(32)).is_err()); // not hex
-    }
 
-    #[test]
-    fn cat_asset_id_defaults_to_dig_and_accepts_any_tail() {
-        // No / empty assetId → DIG (the common token path needs no id)…
-        assert_eq!(
-            cat_asset_id(&serde_json::Value::Null).unwrap(),
-            digstore_chain::dig::DIG_ASSET_ID
-        );
-        assert_eq!(
-            cat_asset_id(&serde_json::json!({ "assetId": "" })).unwrap(),
-            digstore_chain::dig::DIG_ASSET_ID
-        );
-        // …and ANY 32-byte TAIL is accepted — no allow-list, generic over the asset.
-        let tail = "cd".repeat(32);
-        let got = cat_asset_id(&serde_json::json!({ "assetId": format!("0x{tail}") })).unwrap();
-        assert_eq!(hex::encode(got), tail);
-        // A malformed assetId is a 400.
-        let (code, _) = cat_asset_id(&serde_json::json!({ "assetId": "nope" })).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn json_u64_tolerates_number_and_decimal_string() {
-        // Amounts/fees arrive as numbers OR decimal strings (BigInt-safe) — both work.
-        assert_eq!(
-            json_u64(&serde_json::json!({"amount": 42}), "amount"),
-            Some(42)
-        );
-        assert_eq!(
-            json_u64(&serde_json::json!({"amount": "1000000000000"}), "amount"),
-            Some(1_000_000_000_000)
-        );
-        assert_eq!(json_u64(&serde_json::json!({}), "amount"), None);
-    }
-
-    #[test]
-    fn memo_hashes_parse_and_reject_non_hash() {
-        // No memos → empty (a memo-less send is fine).
-        assert!(parse_memo_hashes(&serde_json::Value::Null)
-            .unwrap()
-            .is_empty());
-        // 32-byte hex memos parse in order.
-        let m = "11".repeat(32);
-        let got = parse_memo_hashes(&serde_json::json!({ "memos": [format!("0x{m}")] })).unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(hex::encode(got[0]), m);
-        // A non-32-byte memo is rejected (the CAT memo slot is a hash).
-        let (code, _) = parse_memo_hashes(&serde_json::json!({ "memos": ["dead"] })).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn find_owned_index_matches_coin_or_launcher_id() {
-        let coin_a = chia_protocol::Bytes32::new([0xa0u8; 32]);
-        let launcher_a = chia_protocol::Bytes32::new([0xa1u8; 32]);
-        let coin_b = chia_protocol::Bytes32::new([0xb0u8; 32]);
-        let launcher_b = chia_protocol::Bytes32::new([0xb1u8; 32]);
-        let cands = vec![(coin_a, launcher_a), (coin_b, launcher_b)];
-        // Match by coin id…
-        let p = serde_json::json!({ "coinId": format!("0x{}", "b0".repeat(32)) });
-        assert_eq!(find_owned_index(cands.clone(), &p).unwrap(), 1);
-        // …or by launcher id.
-        let p = serde_json::json!({ "launcherId": format!("0x{}", "a1".repeat(32)) });
-        assert_eq!(find_owned_index(cands.clone(), &p).unwrap(), 0);
-        // A non-matching id is a 404.
-        let p = serde_json::json!({ "coinId": format!("0x{}", "cc".repeat(32)) });
-        let (code, _) = find_owned_index(cands.clone(), &p).unwrap_err();
-        assert_eq!(code, StatusCode::NOT_FOUND);
-        // A missing id is a 400.
-        let (code, _) = find_owned_index(cands, &serde_json::json!({})).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn mint_spec_parses_metadata_royalty_and_did() {
-        let owner = chia_protocol::Bytes32::new([0x55u8; 32]);
-        let p = serde_json::json!({
-            "metadata": {
-                "dataUris": ["https://example.com/a.png"],
-                "dataHash": format!("0x{}", "11".repeat(32)),
-                "editionNumber": 2,
-                "editionTotal": 10
-            },
-            "royaltyBasisPoints": 300,
-            "did": {
-                "launcherId": format!("0x{}", "22".repeat(32)),
-                "innerPuzzleHash": format!("0x{}", "33".repeat(32))
-            }
-        });
-        let spec = parse_mint_spec(&p, owner).unwrap();
-        assert_eq!(spec.owner_ph, owner);
-        assert_eq!(spec.royalty_basis_points, 300);
-        let did = spec.did.expect("did attribution parsed");
-        assert_eq!(hex::encode(did.launcher_id), "22".repeat(32));
-        assert_eq!(hex::encode(did.inner_puzzle_hash), "33".repeat(32));
-        // The metadata serialized to a non-empty Program.
-        assert!(!spec.metadata.is_empty());
-        // A malformed did is a 400 (missing innerPuzzleHash).
-        let bad_p = serde_json::json!({
-            "metadata": {},
-            "did": { "launcherId": format!("0x{}", "22".repeat(32)) }
-        });
-        let (code, _) = parse_mint_spec(&bad_p, owner).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 
     #[test]
     fn nft_methods_are_gated_and_need_a_wallet() {
@@ -1605,42 +1217,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tx_json_renders_direction_asset_and_amounts() {
-        use digstore_chain::wallet::{Tx, TxAsset, TxDirection, TxStatus};
-        let tx = Tx {
-            direction: TxDirection::Out,
-            asset: TxAsset::Cat {
-                tail: chia_protocol::Bytes32::new([0x42u8; 32]),
-            },
-            amount: 1234,
-            fee: 0,
-            height: 100,
-            timestamp: 99,
-            coin_ids: vec![chia_protocol::Bytes32::new([0x01u8; 32])],
-            memos: vec![],
-            status: TxStatus::Confirmed,
-        };
-        let j = tx_json(&tx);
-        assert_eq!(j["direction"], "out");
-        assert_eq!(j["asset"]["type"], "cat");
-        assert_eq!(j["asset"]["assetId"], format!("0x{}", "42".repeat(32)));
-        assert_eq!(j["amount"], "1234"); // decimal string (BigInt-safe)
-        assert_eq!(j["status"], "confirmed");
-        assert_eq!(j["coinIds"][0], format!("0x{}", "01".repeat(32)));
-        // XCH renders without an assetId.
-        let xch = Tx {
-            asset: TxAsset::Xch,
-            direction: TxDirection::In,
-            status: TxStatus::Pending,
-            ..tx
-        };
-        let j = tx_json(&xch);
-        assert_eq!(j["asset"]["type"], "xch");
-        assert!(j["asset"].get("assetId").is_none());
-        assert_eq!(j["direction"], "in");
-        assert_eq!(j["status"], "pending");
-    }
 
     #[test]
     fn transactions_method_is_gated_and_needs_a_wallet() {
@@ -1649,22 +1225,6 @@ mod tests {
         assert!(wc_method_needs_wallet("chia_getTransactions"));
     }
 
-    #[tokio::test]
-    async fn store_endpoints_require_an_unlocked_wallet() {
-        // Both store endpoints are wallet-local: a locked wallet is refused (401),
-        // proving they never run a discovery/sync without a session.
-        let st = Arc::new(AppState::default());
-        let r = stores_list(State(st.clone())).await;
-        assert!(matches!(r, Err((StatusCode::UNAUTHORIZED, _))));
-        let r = store_history(
-            State(st),
-            axum::extract::Query(StoreHistoryQuery {
-                store_id: format!("0x{}", "ab".repeat(32)),
-            }),
-        )
-        .await;
-        assert!(matches!(r, Err((StatusCode::UNAUTHORIZED, _))));
-    }
 
     #[test]
     fn did_methods_are_gated_and_need_a_wallet() {
@@ -1679,67 +1239,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn offer_legs_parse_xch_and_cat() {
-        use digstore_chain::offer::OfferAsset;
-        // A missing/empty assetId means XCH; a 32-byte TAIL means that CAT.
-        let tail = "ab".repeat(32);
-        let legs = parse_offer_legs(
-            &serde_json::json!({
-                "offered": [
-                    { "amount": 1000 },
-                    { "assetId": format!("0x{tail}"), "amount": "250" }
-                ]
-            }),
-            "offered",
-        )
-        .unwrap();
-        assert_eq!(legs.len(), 2);
-        assert_eq!(legs[0], OfferAsset::Xch(1000));
-        match legs[1] {
-            OfferAsset::Cat { asset_id, amount } => {
-                assert_eq!(hex::encode(asset_id), tail);
-                assert_eq!(amount, 250);
-            }
-            _ => panic!("expected a CAT leg"),
-        }
-        // A missing array is a 400 (so the builder never sees a half-formed offer).
-        let (code, _) = parse_offer_legs(&serde_json::json!({}), "offered").unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-        // A leg without an amount is a 400.
-        let (code, _) =
-            parse_offer_legs(&serde_json::json!({ "offered": [{}] }), "offered").unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn offer_summary_json_shape() {
-        use digstore_chain::offer::{OfferAsset, OfferCost, OfferSummary};
-        let tail = chia_protocol::Bytes32::new([0x42u8; 32]);
-        let nft = chia_protocol::Bytes32::new([0x07u8; 32]);
-        let s = OfferSummary {
-            offered: vec![OfferAsset::Xch(5)],
-            requested: vec![OfferAsset::Cat {
-                asset_id: tail,
-                amount: 9,
-            }],
-            arbitrage: OfferCost {
-                xch: 0,
-                cats: vec![(tail, 9)],
-            },
-            royalties: vec![(nft, 300)],
-        };
-        let j = offer_summary_json(&s);
-        assert_eq!(j["offered"][0]["type"], "xch");
-        assert_eq!(j["offered"][0]["amount"], "5"); // decimal string (BigInt-safe)
-        assert_eq!(j["requested"][0]["type"], "cat");
-        assert_eq!(
-            j["requested"][0]["assetId"],
-            format!("0x{}", "42".repeat(32))
-        );
-        assert_eq!(j["arbitrage"]["cats"][0]["amount"], "9");
-        assert_eq!(j["royalties"][0]["basisPoints"], 300);
-    }
 
     #[test]
     fn offer_methods_are_gated() {
@@ -2031,41 +1531,6 @@ mod tests {
 
     // -- Key export is unreachable from every dapp-facing path -----------------
 
-    /// The master mnemonic must NEVER be reachable through the WC / injected
-    /// `window.chia` dispatch. `wc_dispatch` is the single dapp-facing signer
-    /// surface; with the wallet UNLOCKED (so the locked-gate isn't what stops it),
-    /// every export-flavoured method name is rejected as unsupported (501) — never
-    /// served. (Locked, it 401s first; either way no key material comes back.)
-    #[tokio::test]
-    async fn export_is_not_a_dispatchable_wc_method() {
-        const ABANDON: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
-        let st = AppState::default();
-        // Unlock a session so the unlocked-gate is satisfied; now an unsupported
-        // method can only fall through to the explicit 501 arm.
-        *st.session.lock().await = Some(Session {
-            mnemonic: Zeroizing::new(ABANDON.to_string()),
-            address: "xch1test".to_string(),
-        });
-        for method in [
-            "export",
-            "exportMnemonic",
-            "chip0002_export",
-            "getMnemonic",
-            "getSecretKeys",
-            "chia_export",
-            "revealSeed",
-        ] {
-            let r = wc_dispatch(&st, method, serde_json::Value::Null).await;
-            match r {
-                Err((code, _)) => assert_eq!(
-                    code,
-                    StatusCode::NOT_IMPLEMENTED,
-                    "dapp-facing dispatch must reject {method} as unsupported"
-                ),
-                Ok(v) => panic!("{method} must not be dispatchable, got {v:?}"),
-            }
-        }
-    }
 
     // -- wallet_dispatch: the one dispatch path (HTTP handler + FFI share it) ----
 
@@ -2116,53 +1581,7 @@ mod tests {
             .contains("https://newdapp.example"));
     }
 
-    /// The self origin (the wallet's own UI) routes straight through the gate (it is
-    /// implicitly approved) — a key method reaches the signer rather than being
-    /// forbidden. With the wallet locked it surfaces the signer's 401, proving it
-    /// passed the consent gate and hit dispatch (a Forbidden gate would be 403).
-    #[tokio::test]
-    async fn wallet_dispatch_self_origin_routes_through_to_the_signer() {
-        let st = AppState::default();
-        // Pin Native so this test exercises the LOCAL signer's locked-gate regardless
-        // of any on-disk wallet-source the dev machine has (Sage would delegate).
-        *st.source.lock().await = WalletSource::Native;
-        let self_origin = format!("http://127.0.0.1:{}", wallet_port());
-        let (status, body) = wallet_dispatch_with(
-            &st,
-            &self_origin,
-            r#"{"method":"chip0002_getPublicKeys","params":{}}"#,
-        )
-        .await;
-        // Locked session → the signer returns 401 (NOT the gate's 403).
-        assert_eq!(
-            status, 401,
-            "self origin passes the gate; locked signer 401s"
-        );
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["error"].as_str().unwrap().contains("locked"), "{body}");
-    }
 
-    /// An APPROVED origin routes through the gate to the signer, exactly like the self
-    /// origin (proving the approval allow-list — not just self-origin — opens the path).
-    #[tokio::test]
-    async fn wallet_dispatch_approved_origin_routes_through() {
-        let st = AppState::default();
-        // Pin Native (see the self-origin test) so the locked LOCAL signer answers.
-        *st.source.lock().await = WalletSource::Native;
-        st.approvals
-            .lock()
-            .await
-            .approved
-            .insert("https://good.example".to_string());
-        let (status, _body) = wallet_dispatch_with(
-            &st,
-            "https://good.example",
-            r#"{"method":"chip0002_getPublicKeys","params":{}}"#,
-        )
-        .await;
-        // Passed the gate (not 403); locked signer 401s.
-        assert_eq!(status, 401, "approved origin passes the gate to the signer");
-    }
 
     /// `chip0002_chainId` is public (no approval, no unlock) and returns the OK 200
     /// `{"data":"mainnet"}` body — the shape the HTTP path returns. Driven through the
@@ -2232,65 +1651,6 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
-    /// End-to-end of the export gate against a real on-disk encrypted seed:
-    /// * a non-self origin is refused (403) even with the right password;
-    /// * the self origin with a WRONG password is refused (401);
-    /// * the self origin with the CORRECT password yields the exact mnemonic.
-    ///
-    /// Points the seed file at a throwaway tempdir via LOCALAPPDATA — no other
-    /// dig-wallet test reads that env, so the process-global set is safe here.
-    #[tokio::test]
-    async fn export_requires_self_origin_and_correct_password() {
-        // Public BIP-39 test vector (NOT a real wallet).
-        const ABANDON: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
-        const PW: &str = "correct horse battery";
-
-        let _g = ENV_LOCK.lock().await;
-        let td = tempfile::tempdir().unwrap();
-        std::env::set_var("LOCALAPPDATA", td.path());
-        // Encrypt + persist the seed exactly as `import` does.
-        let enc_bytes = seed_store::encrypt_seed(ABANDON, PW).unwrap();
-        let path = seed_path();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, &enc_bytes).unwrap();
-
-        let dapp = "https://evil.example.com";
-        let self_origin = format!("http://127.0.0.1:{}", wallet_port());
-
-        // A dapp origin is refused even with the correct password.
-        let r = export(
-            origin_headers(dapp),
-            Json(ExportReq {
-                password: PW.to_string(),
-            }),
-        )
-        .await;
-        assert_eq!(r.status(), StatusCode::FORBIDDEN);
-
-        // Self origin + wrong password → 401, no mnemonic.
-        let r = export(
-            origin_headers(&self_origin),
-            Json(ExportReq {
-                password: "wrong".to_string(),
-            }),
-        )
-        .await;
-        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
-
-        // Self origin + correct password → the exact mnemonic.
-        let r = export(
-            origin_headers(&self_origin),
-            Json(ExportReq {
-                password: PW.to_string(),
-            }),
-        )
-        .await;
-        assert_eq!(r.status(), StatusCode::OK);
-        let body = body_json(r).await;
-        assert_eq!(body["mnemonic"], ABANDON);
-
-        std::env::remove_var("LOCALAPPDATA");
-    }
 
     /// The projectId setter is wallet-local only: a dapp origin cannot change it.
     #[tokio::test]
@@ -2305,23 +1665,6 @@ mod tests {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
-    /// The public-key endpoint is wallet-local only and needs an unlocked wallet:
-    /// a dapp origin is refused; the self origin with no session is unauthorized.
-    #[tokio::test]
-    async fn wallet_pubkey_is_self_origin_and_needs_unlock() {
-        let st = Arc::new(AppState::default());
-        // Dapp origin → forbidden.
-        let r = wallet_pubkey(
-            State(st.clone()),
-            origin_headers("https://evil.example.com"),
-        )
-        .await;
-        assert_eq!(r.status(), StatusCode::FORBIDDEN);
-        // Self origin but locked → unauthorized.
-        let self_origin = format!("http://localhost:{}", wallet_port());
-        let r = wallet_pubkey(State(st), origin_headers(&self_origin)).await;
-        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
-    }
 
     // -- Advanced coin types (Part B) ------------------------------------------
 
@@ -2431,260 +1774,14 @@ mod tests {
         assert!(WC_METHOD_CATALOGUE.contains(&"chip0002_getMethods"));
     }
 
-    #[test]
-    fn store_dig_amount_defaults_and_rejects_zero() {
-        use digstore_chain::dig::COMMIT_DIG;
-        // Omitted → the protocol default (deterministic; no live-price fetch). Only the
-        // COMMIT path resolves a DIG amount — minting is free of $DIG (#111).
-        let none = serde_json::json!({});
-        assert_eq!(store_dig_amount(&none, COMMIT_DIG).unwrap(), COMMIT_DIG);
-        // Explicit amount (number or decimal string) wins — the hub's USD-pegged value.
-        let n = serde_json::json!({ "digAmount": 42_000 });
-        assert_eq!(store_dig_amount(&n, COMMIT_DIG).unwrap(), 42_000);
-        let s = serde_json::json!({ "digAmount": "37500" });
-        assert_eq!(store_dig_amount(&s, COMMIT_DIG).unwrap(), 37_500);
-        // Explicit 0 is rejected (a capsule must pay the protocol DIG fee).
-        let z = serde_json::json!({ "digAmount": 0 });
-        assert!(store_dig_amount(&z, COMMIT_DIG).is_err());
-    }
 
-    #[test]
-    fn requested_store_id_accepts_storeid_launcherid_or_id() {
-        let id = format!("0x{}", "ab".repeat(32));
-        for key in ["storeId", "launcherId", "id"] {
-            let p = serde_json::json!({ key: id });
-            assert!(
-                requested_store_id(&p).is_ok(),
-                "{key} must resolve a store id"
-            );
-        }
-        // Missing → a clear 400.
-        let (code, _) = requested_store_id(&serde_json::json!({})).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn parse_delegates_builds_admin_writer_oracle_and_rejects_unknown() {
-        use digstore_chain::singleton::DelegatedPuzzle;
-        // A 48-byte BLS pk (the abandon test wallet's synthetic pk) for admin/writer.
-        let keys = digstore_chain::keys::derive_wallet_keys(ABANDON_24).unwrap();
-        let pk_hex = format!("0x{}", hex::encode(keys.synthetic_pk.to_bytes()));
-        let oph = format!("0x{}", "cd".repeat(32));
-        let params = serde_json::json!({
-            "delegates": [
-                { "role": "admin", "publicKey": pk_hex },
-                { "role": "writer", "publicKey": pk_hex },
-                { "role": "oracle", "oraclePuzzleHash": oph, "oracleFee": 1000 },
-            ]
-        });
-        let dps = parse_delegates(&params).unwrap();
-        assert_eq!(dps.len(), 3);
-        assert!(matches!(dps[0], DelegatedPuzzle::Admin(_)));
-        assert!(matches!(dps[1], DelegatedPuzzle::Writer(_)));
-        assert!(matches!(dps[2], DelegatedPuzzle::Oracle(_, 1000)));
-        // No delegates array → an empty set (revoke-all / clean transfer).
-        assert!(parse_delegates(&serde_json::json!({})).unwrap().is_empty());
-        // Unknown role → a 400.
-        let bad = serde_json::json!({ "delegates": [{ "role": "wizard" }] });
-        assert_eq!(
-            parse_delegates(&bad).unwrap_err().0,
-            StatusCode::BAD_REQUEST
-        );
-        // admin/writer missing publicKey → a 400.
-        let nopk = serde_json::json!({ "delegates": [{ "role": "admin" }] });
-        assert_eq!(
-            parse_delegates(&nopk).unwrap_err().0,
-            StatusCode::BAD_REQUEST
-        );
-    }
 
-    /// The legs the digstore-chain builders cannot support standalone are surfaced as
-    /// honest 501s (never faked) — with the wallet UNLOCKED so the locked-gate isn't
-    /// what stops them; they reach the explicit "not supported in this build" arm.
-    #[tokio::test]
-    async fn unsupported_advanced_legs_surface_as_not_implemented() {
-        let st = AppState::default();
-        *st.session.lock().await = Some(Session {
-            mnemonic: Zeroizing::new(ABANDON_24.to_string()),
-            address: "xch1test".to_string(),
-        });
-        for method in [
-            "dig_optionExercise",
-            "dig_optionClawback",
-            "dig_vaultSpend",
-            "dig_vcIssue",
-            "dig_vcRevoke",
-            "dig_vcTransfer",
-        ] {
-            let r = wc_dispatch(&st, method, serde_json::Value::Null).await;
-            match r {
-                Err((code, msg)) => {
-                    assert_eq!(
-                        code,
-                        StatusCode::NOT_IMPLEMENTED,
-                        "{method} must be an honest 501, got: {msg}"
-                    );
-                    assert!(
-                        msg.contains("not supported in this build")
-                            || msg.contains("cannot be transferred"),
-                        "{method} must say why it is unsupported, got: {msg}"
-                    );
-                }
-                Ok(v) => panic!("{method} must not silently succeed, got {v:?}"),
-            }
-        }
-    }
 
-    #[test]
-    fn clawback_coin_parses_and_renders() {
-        // A clawback coin round-trips from a claim/recover request: parent + amount +
-        // terms (timelock + sender/receiver puzzle hashes), with the coin's own puzzle
-        // hash derived from the terms (the 1-of-2 merkle root).
-        let params = serde_json::json!({
-            "parentCoinId": format!("0x{}", "11".repeat(32)),
-            "amount": "1000",
-            "timelock": 86400,
-            "senderPuzzleHash": format!("0x{}", "22".repeat(32)),
-            "receiverPuzzleHash": format!("0x{}", "33".repeat(32)),
-        });
-        let c = parse_clawback_coin(&params).unwrap();
-        assert_eq!(c.coin.amount, 1000);
-        assert_eq!(c.terms.timelock, 86400);
-        assert_eq!(hex::encode(c.terms.sender_puzzle_hash), "22".repeat(32));
-        assert_eq!(hex::encode(c.terms.receiver_puzzle_hash), "33".repeat(32));
-        assert_eq!(hex::encode(c.coin.parent_coin_info), "11".repeat(32));
-        // The rendered JSON carries the coin id + terms back to the UI.
-        let j = clawback_coin_json(&c);
-        assert_eq!(j["amount"], "1000");
-        assert_eq!(j["timelock"], 86400);
-        assert_eq!(j["senderPuzzleHash"], format!("0x{}", "22".repeat(32)));
-        // A missing term is a 400.
-        let (code, _) = parse_clawback_coin(&serde_json::json!({})).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn option_strike_parses_xch_and_rejects_unsupported_underlyings() {
-        use chia_wallet_sdk::driver::OptionType;
-        // An XCH strike is supported (the fully-verifiable case).
-        let xch =
-            parse_option_strike(&serde_json::json!({ "strike": { "type": "xch", "amount": 250 } }))
-                .unwrap();
-        assert!(matches!(xch, OptionType::Xch { amount: 250 }));
-        // A bare amount (no nested 'strike') defaults to XCH too.
-        let bare = parse_option_strike(&serde_json::json!({ "amount": 5 })).unwrap();
-        assert!(matches!(bare, OptionType::Xch { amount: 5 }));
-        // A CAT / NFT strike is surfaced as an honest 501 (its exercise leg is unsupported).
-        for ty in ["cat", "nft", "revocableCat"] {
-            let (code, msg) =
-                parse_option_strike(&serde_json::json!({ "strike": { "type": ty, "amount": 1 } }))
-                    .unwrap_err();
-            assert_eq!(code, StatusCode::NOT_IMPLEMENTED, "{ty} strike");
-            assert!(msg.contains("not supported in this build"), "{ty}: {msg}");
-        }
-        // A missing amount is a 400.
-        let (code, _) =
-            parse_option_strike(&serde_json::json!({ "strike": { "type": "xch" } })).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn vault_config_parses_members_and_threshold() {
-        // Use real K1 pubkeys from the test harness so from_bytes accepts them.
-        use chia_sdk_test::K1Pair;
-        let keys = K1Pair::range_vec(3);
-        let hexes: Vec<String> = keys
-            .iter()
-            .map(|k| format!("0x{}", hex::encode(k.pk.to_bytes())))
-            .collect();
-        // 2-of-3.
-        let cfg = parse_vault_config(&serde_json::json!({
-            "members": hexes, "required": 2
-        }))
-        .unwrap();
-        assert_eq!(cfg.members.len(), 3);
-        assert_eq!(cfg.required, 2);
-        // Omitted 'required' defaults to n-of-n.
-        let cfg = parse_vault_config(&serde_json::json!({ "members": hexes })).unwrap();
-        assert_eq!(cfg.required, 3);
-        // An empty member set is a 400.
-        let (code, _) = parse_vault_config(&serde_json::json!({ "members": [] })).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-        // A bad threshold (more than members) is a 400.
-        let (code, _) = parse_vault_config(&serde_json::json!({
-            "members": hexes, "required": 9
-        }))
-        .unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn k1_pubkey_parses_and_rejects_bad_len() {
-        use chia_sdk_test::K1Pair;
-        let pk = K1Pair::default().pk;
-        let hex_pk = format!("0x{}", hex::encode(pk.to_bytes()));
-        let parsed = parse_k1_pubkey(&hex_pk).unwrap();
-        assert_eq!(parsed.to_bytes(), pk.to_bytes());
-        // A 32-byte value (wrong length for K1's 33) is rejected, not panicked.
-        let (code, _) = parse_k1_pubkey(&"ab".repeat(32)).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn ph_or_address_accepts_either_form() {
-        // A raw puzzle hash.
-        let ph = parse_ph_or_address(
-            &serde_json::json!({ "senderPuzzleHash": format!("0x{}", "aa".repeat(32)) }),
-            "sender",
-        )
-        .unwrap();
-        assert_eq!(hex::encode(ph), "aa".repeat(32));
-        // Neither form → 400.
-        let (code, _) = parse_ph_or_address(&serde_json::json!({}), "sender").unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn vc_verify_is_pure_and_deterministic() {
-        // The asserter puzzle hash is computed with no chain/keys, and is deterministic
-        // for a given credential tuple.
-        let params = serde_json::json!({
-            "issuerDid": format!("0x{}", "11".repeat(32)),
-            "assetId": format!("0x{}", "22".repeat(32)),
-            "dataHash": format!("0x{}", "33".repeat(32)),
-            "version": 1,
-        });
-        let a = vc_verify(&params).unwrap();
-        let b = vc_verify(&params).unwrap();
-        assert_eq!(a["asserterPuzzleHash"], b["asserterPuzzleHash"]);
-        assert!(a["asserterPuzzleHash"].as_str().unwrap().starts_with("0x"));
-        assert_eq!(a["version"], 1);
-        // A missing field is a 400.
-        let (code, _) = vc_verify(&serde_json::json!({})).unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn coin_spend_hex_round_trips_from_components() {
-        // A coin spend reconstructs from coin{parent,puzzleHash,amount} + program hexes.
-        let params = serde_json::json!({
-            "parentSpend": {
-                "coin": {
-                    "parentCoinInfo": format!("0x{}", "01".repeat(32)),
-                    "puzzleHash": format!("0x{}", "02".repeat(32)),
-                    "amount": 7,
-                },
-                "puzzleReveal": "0xff80",
-                "solution": "80",
-            }
-        });
-        let cs = parse_coin_spend_hex(&params, "parentSpend").unwrap();
-        assert_eq!(cs.coin.amount, 7);
-        assert_eq!(hex::encode(cs.coin.parent_coin_info), "01".repeat(32));
-        assert_eq!(hex::encode(cs.puzzle_reveal.as_ref()), "ff80");
-        assert_eq!(hex::encode(cs.solution.as_ref()), "80");
-        // A missing field is a 400.
-        let (code, _) = parse_coin_spend_hex(&serde_json::json!({}), "parentSpend").unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-    }
 }

@@ -3090,6 +3090,7 @@ dependencies = [
  "dig-rpc-protocol",
  "dig-urn-resolver",
  "dig-wallet",
+ "digstore-chain",
  "digstore-core 0.19.2",
  "digstore-crypto",
  "digstore-stage",
