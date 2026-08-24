@@ -6269,7 +6269,17 @@ not, and MUST abandon it at a hard ceiling however healthy the progress appears.
 
 Both bounds are required and the ceiling is a SECURITY bound. `relay_staged_bytes` is a hop's claim
 about itself, so a hostile hop can fabricate a counter that rises forever and would never stall; only
-the ceiling makes the worst case finite. A requestor MUST NOT treat the count as evidence about the
+the ceiling makes the worst case finite.
+
+**The ceiling MUST be accompanied by a per-PULL budget.** A ceiling bounds a wait on ONE hop, and a
+pull asks many: a puller's worst case is `descriptor attempts × holders × the per-ask bound`, so
+raising the per-ask bound from the descriptor ladder to the relay ceiling multiplies by the holder
+count. Where the provider set includes merely-CONNECTED peers rather than only announced holders, that
+count is the whole connected pool, and hops each fabricating a byte of progress per poll would hold one
+pull open for hours while every one of them stayed inside its individual ceiling. A requestor MUST
+therefore charge relay waiting against a budget scoped to the CAPSULE being pulled, and MUST NOT grant
+each hop a fresh allowance. Shrinking the per-hop ceiling is NOT an acceptable substitute: an honest hop
+relaying a large capsule genuinely needs the full ceiling, and that case is what this path exists for. A requestor MUST NOT treat the count as evidence about the
 bytes: the capsule that eventually arrives is verified against the chain-anchored root exactly as a
 direct holder's would be (§21.2), so a hop that fabricates its way through a wait still cannot produce
 content that passes.
