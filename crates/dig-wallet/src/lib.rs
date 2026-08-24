@@ -1560,6 +1560,255 @@ mod tests {
         );
     }
 
+    // -- Ported guards -------------------------------------------------------------
+    //
+    // These six properties predate dig-node#327 and SURVIVE it. Their original tests
+    // referenced `WalletSource` / `Session`, which the removal deleted, so a
+    // compile-driven prune would have taken them out as "tests of removed code" — they
+    // are not. Losing them would have left the export-class refusal, the unknown-method
+    // 501, and the handshake/delegate split with no coverage at all, which is the exact
+    // shape of a security guard quietly becoming untested.
+    //
+    // Each is re-expressed against what the code does NOW. Two get stronger in the port:
+    // the routing split was a pure-function assertion over a routing table that no longer
+    // exists, and is now a behavioural check that the request actually reaches the Sage
+    // queue — placement, not policy.
+
+    /// Drive `method` from `origin` and report whether it was PARKED for Sage.
+    ///
+    /// Returns `Ok(true)` when the request reached the delegate queue, `Ok(false)` when it
+    /// was answered locally, and `Err(status)` when it was refused. The distinction is the
+    /// whole point of these tests: "refused" and "answered locally" are indistinguishable
+    /// from a caller that only looks at whether an error came back.
+    async fn park_outcome(method: &str) -> Result<bool, StatusCode> {
+        let st = Arc::new(AppState::default());
+        let caller = {
+            let st = st.clone();
+            let method = method.to_string();
+            tokio::spawn(async move { wc_dispatch(&st, &method, serde_json::json!({})).await })
+        };
+        // Give the dispatch a moment to either answer or park, then look at the queue.
+        for _ in 0..100 {
+            if let Some((id, _m, _p)) = delegate_take_next(&st).await {
+                delegate_fulfill(&st, id, Ok(serde_json::json!("ok"))).await;
+                let _ = caller.await;
+                return Ok(true);
+            }
+            if caller.is_finished() {
+                return match caller.await.expect("dispatch task") {
+                    Ok(_) => Ok(false),
+                    Err((code, _)) => Err(code),
+                };
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{method} neither answered nor parked");
+    }
+
+    /// An export-flavoured method is refused BEFORE it can be parked for Sage.
+    ///
+    /// The pump is the load-bearing part. Asserting only the 501 cannot tell a refusal
+    /// from a request that was forwarded to Sage and happened to come back as an error —
+    /// and forwarding is the failure that matters, because it would make the delegate
+    /// surface a seed-exfiltration path through any Sage that implemented such a method.
+    /// The counter proves nothing was ever parked; the control below proves the pump
+    /// would have caught it if something had been.
+    #[tokio::test]
+    async fn delegate_never_forwards_export_class_methods() {
+        let st = Arc::new(AppState::default());
+        let leaked = Arc::new(AtomicU64::new(0));
+        let pump = {
+            let st = st.clone();
+            let leaked = leaked.clone();
+            tokio::spawn(async move {
+                for _ in 0..80 {
+                    if let Some((id, _m, _p)) = delegate_take_next(&st).await {
+                        leaked.fetch_add(1, Ordering::Relaxed);
+                        delegate_fulfill(&st, id, Ok(serde_json::json!("LEAK"))).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        };
+        for method in ["export", "exportMnemonic", "getSecretKeys", "revealSeed"] {
+            match wc_dispatch(&st, method, serde_json::Value::Null).await {
+                Err((code, _)) => assert_eq!(
+                    code,
+                    StatusCode::NOT_IMPLEMENTED,
+                    "{method} must be refused as unsupported, never forwarded"
+                ),
+                Ok(v) => panic!("{method} must not be delegatable, got {v:?}"),
+            }
+        }
+        pump.await.unwrap();
+        assert_eq!(
+            leaked.load(Ordering::Relaxed),
+            0,
+            "no export-class method may ever be parked for Sage"
+        );
+        // CONTROL: an ordinary catalogue method DOES reach the queue. Without this the
+        // counter above would read zero just as happily against a build where nothing is
+        // ever parked — a broken pump and a working guard look identical.
+        assert_eq!(
+            park_outcome("chip0002_signMessage").await,
+            Ok(true),
+            "the pump must be able to observe a parked request"
+        );
+    }
+
+    /// The master mnemonic is not reachable through the dapp-facing dispatch under any
+    /// spelling. There is no session gate left to stop these first, so a 501 here is the
+    /// export guard or the catalogue check and nothing else.
+    #[tokio::test]
+    async fn export_is_not_a_dispatchable_wc_method() {
+        let st = AppState::default();
+        for method in [
+            "export",
+            "exportMnemonic",
+            "chip0002_export",
+            "getMnemonic",
+            "getSecretKeys",
+            "chia_export",
+            "revealSeed",
+        ] {
+            match wc_dispatch(&st, method, serde_json::Value::Null).await {
+                Err((code, _)) => assert_eq!(
+                    code,
+                    StatusCode::NOT_IMPLEMENTED,
+                    "dapp-facing dispatch must reject {method} as unsupported"
+                ),
+                Ok(v) => panic!("{method} must not be dispatchable, got {v:?}"),
+            }
+        }
+    }
+
+    /// A method outside the advertised catalogue is refused, never forwarded blind.
+    ///
+    /// These legs used to hit explicit "not supported in this build" arms in the local
+    /// signer. With the signer gone the tempting shortcut is to forward anything to Sage
+    /// and let Sage decide — which would silently widen this surface to whatever the
+    /// user's wallet happens to implement, and would make the advertised catalogue a lie.
+    #[tokio::test]
+    async fn unsupported_advanced_legs_surface_as_not_implemented() {
+        for method in [
+            "dig_optionExercise",
+            "dig_optionClawback",
+            "dig_vaultSpend",
+            "dig_vcIssue",
+            "dig_vcRevoke",
+            "dig_vcTransfer",
+        ] {
+            assert_eq!(
+                park_outcome(method).await,
+                Err(StatusCode::NOT_IMPLEMENTED),
+                "{method} is not in the catalogue and must not be forwarded to Sage"
+            );
+        }
+    }
+
+    /// Sage's ERRORS reach the dapp, rather than hanging or being dressed up as success.
+    #[tokio::test]
+    async fn dispatch_surfaces_sage_errors() {
+        let st = Arc::new(AppState::default());
+        let pump = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Some((id, _m, _p)) = delegate_take_next(&st).await {
+                        delegate_fulfill(&st, id, Err("User rejected".to_string())).await;
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        };
+        let err = wc_dispatch(&st, "chia_send", serde_json::json!({}))
+            .await
+            .expect_err("a Sage rejection must surface as an error");
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("User rejected"));
+        pump.await.unwrap();
+    }
+
+    /// The handshake is answered here; everything that touches a key goes to Sage.
+    ///
+    /// This replaces a pure-function assertion over the old `wc_route` table. Checking a
+    /// table only ever proved the table said the right thing — it could not see whether
+    /// dispatch consulted it, and a table is exactly what this change deleted. Driving
+    /// `wc_dispatch` and watching the queue tests the placement instead, and both halves
+    /// are needed: the handshake must NOT park (it has to work before Sage exists), and
+    /// every key/sign method MUST park (it cannot be answered here at all).
+    #[tokio::test]
+    async fn the_handshake_is_local_and_every_key_method_goes_to_sage() {
+        for m in [
+            "chip0002_chainId",
+            "chip0002_connect",
+            "chip0002_getMethods",
+        ] {
+            assert_eq!(
+                park_outcome(m).await,
+                Ok(false),
+                "{m} touches no key and must be answered without Sage"
+            );
+        }
+        for m in [
+            "chip0002_getPublicKeys",
+            "chip0002_signMessage",
+            "chip0002_signCoinSpends",
+            "chia_getAddress",
+            "chia_signMessageByAddress",
+            "chip0002_getAssetBalance",
+            "chip0002_getAssetCoins",
+            "chia_takeOffer",
+            "chia_createOffer",
+            "chia_getOfferSummary",
+            "chia_send",
+            "chia_getNfts",
+            "chia_getDids",
+            "chia_getTransactions",
+        ] {
+            assert_eq!(park_outcome(m).await, Ok(true), "{m} must be asked of Sage");
+        }
+    }
+
+    /// The wallet's own UI passes the consent gate implicitly, and lands on the Sage
+    /// queue like any approved origin.
+    ///
+    /// The original asserted a `401 locked` from the local signer to prove the request had
+    /// cleared the gate rather than been forbidden by it. There is no signer and no locked
+    /// state now, so the equivalent evidence is that the request reaches the delegate
+    /// queue: a `403` would mean the gate rejected it, and being answered locally would
+    /// mean it never reached dispatch at all.
+    #[tokio::test]
+    async fn wallet_dispatch_self_origin_routes_through_to_sage() {
+        let st = Arc::new(AppState::default());
+        let self_origin = format!("http://127.0.0.1:{}", wallet_port());
+        let caller = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                wallet_dispatch_with(
+                    &st,
+                    &self_origin,
+                    r#"{"method":"chip0002_getPublicKeys","params":{}}"#,
+                )
+                .await
+            })
+        };
+        let parked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(t) = delegate_take_next(&st).await {
+                    return t;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the wallet's own origin must clear the gate and reach the Sage queue");
+        delegate_fulfill(&st, parked.0, Ok(serde_json::json!(["0xpk"]))).await;
+        let (status, body) = caller.await.expect("dispatch task");
+        assert_eq!(status, 200, "self origin is implicitly approved: {body}");
+    }
+
     /// An APPROVED origin's sign request is PARKED FOR SAGE — never answered here.
     ///
     /// This is the positive half of the pair whose negative half is
