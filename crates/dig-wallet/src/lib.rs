@@ -72,8 +72,8 @@ pub mod seed_export;
 // under a machine-held device key. Every failure arm is fail-closed and writes nothing.
 pub mod autoseed;
 
-/// One wallet request awaiting Sage. When the wallet source is `Sage`, `wc_dispatch`
-/// cannot reach the relay itself (the live WalletConnect requester SignClient lives
+/// One wallet request awaiting Sage. `wc_dispatch` cannot reach the relay itself (the
+/// live WalletConnect requester SignClient lives
 /// in the wallet UI page, the one tab that stays open), so it parks the call here and
 /// `await`s `tx`. The page long-polls `/api/wc/delegate/next`, forwards `{method,
 /// params}` to Sage over the session, and POSTs Sage's result/error back to
@@ -493,9 +493,11 @@ struct WcRequest {
     params: serde_json::Value,
 }
 
-/// Whether a WC method requires an unlocked wallet. The handshake + introspection
-/// methods (`chainId`, `connect`, `getMethods`) are answered without one; anything
-/// that reads keys or signs requires an unlocked session.
+/// Whether a WC method needs a wallet behind it.
+///
+/// The handshake + introspection methods (`chainId`, `connect`, `getMethods`) do not: they
+/// touch no key and must answer before any Sage session exists. Everything else does, and
+/// since the wallet is Sage, "needs a wallet" now means "must be delegated".
 fn wc_method_needs_wallet(method: &str) -> bool {
     !matches!(
         method,
@@ -686,8 +688,9 @@ fn unsupported(method: &str) -> (StatusCode, String) {
 // process directly via the C-ABI FFI `dig_wallet_rpc` in `dig-runtime` (which has
 // no HTTP server in the path — it knows the calling page's origin first-hand and is
 // thus UNSPOOFABLE). Both share ONE process-global `AppState` (`shared_state`) so
-// the per-origin approval allow-list, the unlocked session, and the wallet source
-// are consistent no matter which entrypoint is used.
+// the per-origin approval allow-list and the Sage delegate queue are consistent no
+// matter which entrypoint is used. There is no session or signer state to share: this
+// process holds neither (§18.20).
 
 /// The process-global wallet state, shared by the loopback HTTP server (`run`) and
 /// the native FFI dispatch (`wallet_dispatch`). Built once, lazily — the wallet has
@@ -770,9 +773,9 @@ pub async fn wallet_dispatch(origin: &str, request_json: &str) -> (u16, String) 
 
 // ---- Sage delegate bridge (requester role, #34) -----------------------------
 //
-// When the wallet source is `Sage`, `wc_dispatch` cannot reach the relay from Rust:
-// the live WalletConnect *requester* SignClient (the dual of the responder) runs in
-// the wallet UI page, the one tab that stays open. So a delegated method is parked in
+// `wc_dispatch` cannot reach the relay from Rust: the live WalletConnect *requester*
+// SignClient (the dual of the responder) runs in the wallet UI page, the one tab that
+// stays open. So every key/sign method — which is now all of them — is parked in
 // `AppState::delegate` and the call `await`s a oneshot; the page long-polls for it,
 // forwards it to Sage over the session, and POSTs the result back — which fulfils the
 // oneshot. This keeps `window.chia` and the per-origin consent gate untouched; only
@@ -786,9 +789,9 @@ pub async fn wallet_dispatch(origin: &str, request_json: &str) -> (u16, String) 
 const DELEGATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Park `{method, params}` for the in-page Sage requester and await Sage's reply.
-/// Returns the bare result Sage returns (already normalized by the page to the same
-/// shapes the local signer returns, mirroring the hub's `sage.js`), or a wallet error
-/// if Sage rejects / the page is gone / it times out.
+/// Returns the bare result Sage returns (already normalized by the page to the CHIP-0002
+/// response shapes, mirroring the hub's `sage.js`), or a wallet error if Sage rejects /
+/// the page is gone / it times out.
 async fn delegate_to_sage(
     st: &AppState,
     method: &str,
@@ -1021,12 +1024,15 @@ async fn wc_revoke(
 /// Serve the DIG wallet (loopback only) to completion. Driven either by the
 /// standalone `dig-wallet` binary OR in-process by `dig-runtime` on the browser's
 /// tokio runtime (no sidecar). The wallet UI is an interactive web page, so it is
-/// served over loopback HTTP (never reachable off-host); native BLS signing runs
-/// in this same process.
+/// served over loopback HTTP, never reachable off-host.
+///
+/// No signing happens in this process. The routes served here are the page, the consent
+/// allow-list, the local cache/settings surface, and the bridge that carries a dapp's
+/// request out to the user's Sage wallet (§18.20).
 pub async fn run() {
     // Share the ONE process-global state with the native FFI dispatch
-    // (`wallet_dispatch`), so an approval granted over either entrypoint is honoured
-    // by both, and the unlocked session / wallet source are consistent.
+    // (`wallet_dispatch`), so an approval granted over either entrypoint is honoured by
+    // both and both draw on the same Sage delegate queue.
     let state = shared_state().clone();
     let app = Router::new()
         .route("/", get(index))
@@ -1150,7 +1156,7 @@ mod tests {
         assert_eq!(wc_gate("chia_takeOffer", true), Gate::Allowed);
     }
 
-    // -- Wallet source: Native local keys vs. Sage delegate (#34) --------------
+    // -- Delegation to Sage ----------------------------------------------------
 
     #[test]
     fn export_class_methods_are_recognised_so_delegate_never_forwards_them() {
