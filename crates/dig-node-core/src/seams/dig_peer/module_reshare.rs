@@ -580,13 +580,6 @@ impl CapsuleWarmer {
             .await
     }
 
-    /// [`warm`](Self::warm) for a capsule pulled on ANOTHER node's behalf (dig-node#276): identical in
-    /// every trust step — chain anchor, merkle verification, promote-recheck, cache bound — except that
-    /// this node does **not** announce itself as a holder of the result.
-    ///
-    /// The capsule still lands in the cache, because that is what lets the relayed module windows be
-    /// served from the same code path a genuine holder serves from, byte-identically. What it does not
-    /// do is make a stranger's choice of content into this node's advertised inventory.
     /// Whether this node can serve `(store_hex, root_hex)` from its cache RIGHT NOW.
     ///
     /// The cache path's existence IS the answer everywhere else in this module (it is what a holder
@@ -648,6 +641,27 @@ impl CapsuleWarmer {
         }
     }
 
+    /// [`warm`](Self::warm) for a capsule pulled on ANOTHER node's behalf (dig-node#276): identical in
+    /// every trust step — chain anchor, merkle verification, promote-recheck, cache bound — except that
+    /// this node does **not** announce itself as a holder of the result.
+    ///
+    /// The capsule still lands in the cache, because that is what lets the relayed module windows be
+    /// served from the same code path a genuine holder serves from, byte-identically. What it does not
+    /// do is make a stranger's choice of content into this node's advertised inventory.
+    ///
+    /// # This competes with local warms for the same slots
+    ///
+    /// The pull runs under the SHARED [`WarmRegistry`], which admits
+    /// [`DEFAULT_MAX_CONCURRENT_WARMS`] generations across this whole node — relayed and local alike.
+    /// So a relay started for a stranger occupies a slot this node's own reads would otherwise use,
+    /// and since dig-node#333 the pull is SPAWNED rather than awaited, meaning it keeps that slot even
+    /// after the requestor that asked for it has given up and disconnected.
+    ///
+    /// That is bounded and deliberate rather than a hole — the cap is global, the leg is opt-in
+    /// (`DIG_NODE_ONION_RELAY`, default OFF), and the requestor must additionally be inside its
+    /// proxy-class allowance — but it IS a real cost of enabling the relay, and an operator who
+    /// enables it should know that a peer which abandons its request can still hold a warm slot until
+    /// the pull finishes or fails.
     pub async fn warm_relayed(self: &Arc<Self>, store_hex: &str, root_hex: &str) -> WarmOutcome {
         self.warm_claiming(store_hex, root_hex, HolderClaim::Suppress)
             .await
@@ -2261,6 +2275,46 @@ mod tests {
         assert!(
             registry.claim("s:r".into()).is_some(),
             "the generation is warmable again once the claim is released"
+        );
+    }
+
+    /// **Proves (dig-node#333 review, finding 3):** a RELAYED warm and this node's OWN warm draw from
+    /// the SAME bounded pool of concurrent-warm slots, so a relay started for a stranger can deny a
+    /// slot to a local read.
+    ///
+    /// **Why this is worth a test rather than a comment:** the relay pull changed from awaited to
+    /// SPAWNED, so it now outlives the request that asked for it — a peer that gives up leaves the
+    /// slot held. The behaviour is bounded and opt-in and is not a hole, but "relaying for strangers
+    /// can starve your own warms" is a property an operator enabling the leg needs to be able to
+    /// discover, and an undocumented, untested property is one that quietly changes.
+    ///
+    /// **Fixture design:** the cap is filled by RELAY-shaped claims and the local warm is the one
+    /// refused, which is the direction that matters. Asserting the reverse — that a local warm can
+    /// deny a relay — would be satisfied by any shared cap and would not distinguish the two pools
+    /// being one from the two pools merely both existing.
+    #[test]
+    fn a_relayed_warm_and_a_local_warm_compete_for_the_same_slots() {
+        let registry = Arc::new(WarmRegistry::new());
+
+        // Every slot taken by capsules a STRANGER asked this node to relay.
+        let relayed: Vec<_> = (0..DEFAULT_MAX_CONCURRENT_WARMS)
+            .map(|n| {
+                registry
+                    .claim(format!("relayed:{n}"))
+                    .expect("a relay claim within the cap is granted")
+            })
+            .collect();
+
+        assert!(
+            registry.claim("local:mine".into()).is_none(),
+            "this node's OWN warm was refused a slot because relays hold them all — the two share              one cap, which is the cost of running the relay leg"
+        );
+
+        // A finished relay hands the slot back; nothing about the claim is relay-specific.
+        drop(relayed.into_iter().next().expect("at least one claim"));
+        assert!(
+            registry.claim("local:mine".into()).is_some(),
+            "the control: the local warm must succeed once a relay slot frees, or the refusal above              proves only that the registry was broken"
         );
     }
 
