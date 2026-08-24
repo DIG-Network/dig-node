@@ -25,13 +25,20 @@
 //! derives a secret key, or builds a [`super::spend::WalletSigner`] from user material. The
 //! Sage-parity plane cannot sign on a user's behalf because it can no longer obtain the material.
 //!
-//! The at-rest primitive those methods used, [`crate::seed_store`], survives for TWO other callers.
-//! One is [`crate::autoseed`], the node's own `DIGOP1`/`DIGVK1` OPERATOR identity, which no
-//! ratification retires. The other is [`crate::lib`]'s self-origin wallet UI, which still seals and
-//! opens a USER seed and still signs — a rival implementation of exactly what was removed here,
-//! never covered by the #1701 freeze, and outside this carve-out because the zero-population count
-//! that justified this removal was taken over the custody manifest and not over its seed path.
-//! §908 is therefore satisfied on this plane and not yet on that one.
+//! The at-rest primitive those methods used, [`crate::seed_store`], survives for ONE caller:
+//! [`crate::autoseed`], the node's own `DIGOP1`/`DIGVK1` OPERATOR identity, which no ratification
+//! retires. That identity is the node's own machine credential, not a user's custody, and deleting
+//! it would break the node's auth rather than tighten it.
+//!
+//! The rival implementation this module used to name — [`crate::lib`]'s self-origin wallet UI, which
+//! sealed and opened a USER seed and signed with it — is GONE (dig-node#327). Its removal needed a
+//! separate population count because the zero the #1701 freeze measured ranged over the custody
+//! manifest and not over `seed_path()`; that count was taken, and the surface was removed. **§908 is
+//! now satisfied on both planes.** `seed_store::encrypt_seed` is `#[cfg(test)]` as a result, so no
+//! production code in this crate can seal a user seed at all.
+//!
+//! A seed a previous build already wrote stays recoverable offline via `dign wallet export-seed`
+//! ([`crate::seed_export`]), which is why removing the surface strands nobody.
 //!
 //! # Back-compatibility, and why it is nearly moot
 //!

@@ -193,8 +193,10 @@ pub unsafe extern "C" fn dig_rpc(request_json: *const c_char) -> *mut c_char {
 /// calls it to drive the per-origin wallet surface (the CHIP-0002 / chia methods)
 /// DIRECTLY, with no loopback HTTP hop. It runs the SAME dispatch the loopback
 /// `/api/wc/request` handler runs (`dig_wallet::wallet_dispatch`) against the same
-/// process-global wallet state, so the per-origin approval gate, the unlocked
-/// session, and the wallet source are shared with the loopback wallet UI. The wallet
+/// process-global wallet state, so the per-origin approval gate and the Sage delegate
+/// queue are shared with the loopback wallet UI. There is no session or local signer
+/// behind either entrypoint — every key/sign method is forwarded to the user's Sage
+/// wallet (dig-wallet §18.20). The wallet
 /// is present in BOTH runtime modes, so this works after [`dig_runtime_start_wallet`].
 ///
 /// `origin` is the calling page's web origin (supplied first-hand by the browser, so
@@ -932,7 +934,7 @@ mod tests {
     }
 
     // The wallet FFI counterpart, needing no network: `chip0002_chainId` is a public
-    // method (no origin approval, no unlocked session) that the wallet always answers
+    // method (no origin approval, no Sage session needed) that the wallet always answers
     // `mainnet`. Proves dig_wallet_rpc returns a well-formed {status, body} envelope
     // with the body embedded as RAW JSON (not double-encoded), and that dig_free frees
     // it without UB — the browser-side wallet path with no loopback server.

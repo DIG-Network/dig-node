@@ -251,6 +251,10 @@ futures-util = "0.3"
 # public `.dig` module and seeds it into the node's cache to exercise the `GET /s/...` surface
 # end-to-end over HTTP. It builds the fixture with the SAME digstore stage/compile engine the node
 # depends on, pinned to the SAME rev as dig-node-core's store-lib git deps (kept in lockstep).
+# Builds the LEGACY `EncryptedSeed` fixture `seed_export_rescue.rs` needs. That layout has no
+# writer left in production (nothing here seals a user seed any more), so the only way to
+# produce the exact on-disk shape a pre-existing install carries is the crate that wrote it.
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }

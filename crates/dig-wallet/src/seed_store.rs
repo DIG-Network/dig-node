@@ -40,7 +40,7 @@
 //! writes the legacy format anymore, but every code path that reads a seed file goes through
 //! [`decrypt_seed`], so a file written before this change keeps unlocking.
 
-use dig_keystore::{opaque, KdfParams, KeystoreError, Password};
+use dig_keystore::{opaque, KeystoreError, Password};
 use digstore_chain::seed::{decrypt_seed as legacy_decrypt, EncryptedSeed};
 use zeroize::Zeroizing;
 
@@ -55,12 +55,22 @@ fn is_dig_keystore_blob(bytes: &[u8]) -> bool {
 }
 
 /// Encrypt `mnemonic` at rest under `password`, using the CURRENT (`dig-keystore` `opaque`)
-/// format. Returns the complete on-disk file bytes — write them verbatim to `seed_path()`.
+/// format. Returns the complete on-disk file bytes.
+///
+/// # Test-only, and that gate is the §908 guarantee
+///
+/// dig_ecosystem#1701 removed every path that wrote a USER seed on this node, so nothing in
+/// production seals one any more — the node's own operator identity seals through
+/// [`dig_keystore::opaque`] directly in [`crate::autoseed`], not through here. Keeping the
+/// function `#[cfg(test)]` makes a new production caller a **compile error** rather than a
+/// policy someone can quietly re-add, and it is still needed to build the fixtures that
+/// prove [`decrypt_seed`] and [`crate::seed_export`] can still open a pre-existing file.
+#[cfg(test)]
 pub fn encrypt_seed(mnemonic: &str, password: &str) -> Result<Vec<u8>, String> {
     opaque::seal(
         &Password::from(password),
         mnemonic.as_bytes(),
-        KdfParams::default(),
+        dig_keystore::KdfParams::default(),
     )
     .map_err(|e| e.to_string())
 }

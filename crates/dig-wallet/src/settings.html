@@ -133,65 +133,32 @@ table.ctable .rm:hover{background:rgba(255,107,149,.08)}
     <!-- ===== KEYS ===== -->
     <div class="sechead"><div class="kick">Keys</div><h2>Your keys</h2></div>
 
-    <!-- Wallet identity (public key + address) -->
     <div class="card">
-      <h3>Wallet identity <span class="chip">&#9679; Public</span></h3>
-      <p class="desc">Your wallet's public key and receive address. These are safe to share — they identify your wallet but cannot move funds. (Unlock your wallet at <a href="dig://wallet">dig://wallet</a> to see them.)</p>
-      <div id="idLoaded" class="hidden">
-        <div class="lblc">Public key</div>
-        <div class="kv"><span id="pubKey">—</span><button class="btn g sm copy" id="copyPub" style="padding:6px 12px;font-size:12px;border-radius:8px">Copy</button></div>
-        <div class="lblc">Address</div>
-        <div class="kv"><span id="addr">—</span><button class="btn g sm copy" id="copyAddr" style="padding:6px 12px;font-size:12px;border-radius:8px">Copy</button></div>
-      </div>
-      <div id="idLocked" class="note hidden">Wallet is locked — open <a href="dig://wallet">dig://wallet</a> and unlock to view your public key.</div>
+      <h3>This browser holds no wallet keys <span class="chip">&#9679; By design</span></h3>
+      <p class="desc">DIG never stores your recovery phrase and never signs on your behalf. Your keys live in your <a href="https://www.chia.net/downloads/" target="_blank" rel="noopener">Sage</a> wallet, and every balance, send, offer and signature is asked of Sage over WalletConnect &mdash; so there is nothing here to back up, unlock, or lose.</p>
+      <p class="note">Reading DIG content never needs a wallet at all. You only connect Sage when an app asks you to sign something.</p>
     </div>
 
-    <!-- Backup & restore (export / import the recovery phrase) -->
-    <div class="card">
-      <h3>Backup &amp; restore <span class="chip warn">&#9679; Sensitive</span></h3>
-      <p class="desc">Your 24-word recovery phrase is the master key to your wallet. Back it up to move your wallet to another device, or restore a wallet from its phrase.</p>
-
-      <div class="lblc">Reveal recovery phrase</div>
-      <p class="warn"><span>&#9888;</span>Anyone with these 24 words controls your funds. Never share them, and only reveal them somewhere private.</p>
-      <div id="exportGate">
-        <input class="field" id="exportPw" type="password" placeholder="Re-enter your wallet password" autocomplete="current-password">
-        <div class="row"><button class="btn p" id="btnReveal">Reveal phrase</button></div>
-      </div>
-      <div id="exportShow" class="hidden">
-        <div class="seedreveal" id="seedWords"></div>
-        <div class="row"><button class="btn g" id="btnHide">Hide</button><button class="btn p" id="btnCopySeed">Copy phrase</button></div>
-      </div>
-      <div class="status" id="exportStatus"></div>
-
-      <div class="lblc" style="margin-top:26px">Restore from recovery phrase</div>
-      <p class="note">Restoring replaces the wallet on this device with the one for the phrase you enter.</p>
-      <textarea class="field" id="importPhrase" placeholder="word1 word2 word3 …" spellcheck="false" autocomplete="off" style="margin-top:8px"></textarea>
-      <input class="field" id="importPw" type="password" placeholder="Set a password (min 8 characters)" autocomplete="new-password" style="margin-top:8px">
-      <div class="row"><button class="btn danger" id="btnImport">Restore wallet</button></div>
-      <div class="status" id="importStatus"></div>
+    <!-- Shown only when a seed from an older, key-holding build is still on disk. -->
+    <div class="card hidden" id="residualSeed">
+      <h3>A wallet from an earlier version is still on this device <span class="chip warn">&#9679; Action needed</span></h3>
+      <p class="desc">An older build of DIG kept an encrypted recovery phrase on this machine. This version cannot use it and will never sign with it &mdash; but the file is still there, and if it is your only copy you should move it somewhere you control.</p>
+      <p class="warn"><span>&#9888;</span>Anyone with those 24 words controls the funds. Recover them somewhere private, and never paste them into a web page.</p>
+      <div class="lblc">Recover it from a terminal</div>
+      <p class="note">The phrase is deliberately not revealed in the browser: a page that can display it is a page that can be tricked into sending it. Run this instead &mdash; it will prompt for your wallet password.</p>
+      <div class="kv"><span id="exportCmd">dign wallet export-seed</span><button class="btn g sm copy" id="copyExportCmd" style="padding:6px 12px;font-size:12px;border-radius:8px">Copy</button></div>
+      <p class="note">Import the phrase into Sage and confirm the address matches before you rely on it.</p>
     </div>
 
-    <!-- ===== WALLET SOURCE ===== -->
-    <div class="sechead"><div class="kick">Wallet</div><h2>Wallet source</h2></div>
+    <!-- ===== WALLET ===== -->
+    <div class="sechead"><div class="kick">Wallet</div><h2>Your wallet</h2></div>
     <div class="card">
-      <h3>Where your wallet lives <span class="chip" id="srcChip">&#9679; Native</span></h3>
-      <p class="desc">Choose how this browser's wallet signs. <b>Native</b> keeps your keys on this device (the built-in wallet). <b>Sage</b> hands every wallet action — balances, sending, signing, offers — to your <a href="https://www.chia.net/downloads/" target="_blank" rel="noopener">Sage</a> wallet over WalletConnect; your keys never leave Sage. Apps you visit don't change — only who signs does.</p>
-
-      <div class="srcopts">
-        <label class="srcopt" id="srcOptNative">
-          <input type="radio" name="walletSource" value="native" id="srcNative">
-          <div><div class="srctitle">Native (local keys)</div><div class="srcsub">Sign with the wallet built into this browser. Your encrypted keys stay on this device.</div></div>
-        </label>
-        <label class="srcopt" id="srcOptSage">
-          <input type="radio" name="walletSource" value="sage" id="srcSage">
-          <div><div class="srctitle">Sage (WalletConnect)</div><div class="srcsub">Delegate to your Sage wallet. This browser holds no keys — Sage signs everything.</div></div>
-        </label>
-      </div>
+      <h3>Connected through Sage <span class="chip" id="srcChip">&#9679; Sage</span></h3>
+      <p class="desc">Every wallet action an app asks for &mdash; balances, sending, signing, offers &mdash; goes to your <a href="https://www.chia.net/downloads/" target="_blank" rel="noopener">Sage</a> wallet over WalletConnect. Your keys never leave Sage, and DIG never sees them. The apps you visit are unchanged; Sage is simply who signs.</p>
       <div class="status" id="srcStatus"></div>
 
-      <!-- Sage connect flow (shown only when Sage is selected) -->
-      <div id="sageConnect" class="subcard hidden">
-        <div id="sageNoPid" class="warn hidden"><span>&#9888;</span>Set a WalletConnect <b>projectId</b> below first — the relay needs it to reach Sage.</div>
+      <div id="sageConnect" class="subcard">
+        <div id="sageNoPid" class="warn hidden"><span>&#9888;</span>Set a WalletConnect <b>projectId</b> below first &mdash; the relay needs it to reach Sage.</div>
 
         <div id="sageDisconnected">
           <div class="lblc" style="margin-top:0">Connect Sage</div>
@@ -199,7 +166,7 @@ table.ctable .rm:hover{background:rgba(255,107,149,.08)}
           <div class="row"><button class="btn p" id="btnSageConnect">Connect Sage</button></div>
           <div id="sagePairing" class="hidden">
             <div id="sageQr" style="margin:14px auto 0;width:220px;height:220px;background:#fff;border-radius:12px;padding:10px;display:grid;place-items:center"></div>
-            <div class="kv"><span id="sageUri" style="font-size:11px">—</span><button class="btn g sm copy" id="btnCopyUri" style="padding:6px 12px;font-size:12px;border-radius:8px">Copy</button></div>
+            <div class="kv"><span id="sageUri" style="font-size:11px">&mdash;</span><button class="btn g sm copy" id="btnCopyUri" style="padding:6px 12px;font-size:12px;border-radius:8px">Copy</button></div>
             <a class="note" id="sageUriLink" href="#" style="display:inline-block;margin-top:6px">Open in Sage on this device</a>
           </div>
         </div>
@@ -394,45 +361,11 @@ $('btnWcClear').addEventListener('click', async () => {
   }catch(e){ setStatus('wcStatus','Clear failed: '+e.message, true); }
 });
 
-// --- Wallet source: Native (local keys) vs. Sage (WalletConnect delegate), #34 ---
-// Native signs with the on-device keys; Sage delegates the whole wallet surface to the
-// user's Sage wallet over a WalletConnect *requester* session (this wallet is the
-// client, the dual of "Connect a dapp"). The connect flow lives here; the live session
-// it pairs is restorable in the wallet page (same loopback origin) where the delegate
-// pump forwards each request to Sage. window.chia is unchanged either way.
-let _curSource = 'native', _reqReady = false;
-
-function renderSource(source){
-  _curSource = source;
-  $('srcNative').checked = source === 'native';
-  $('srcSage').checked   = source === 'sage';
-  $('srcOptNative').classList.toggle('on', source === 'native');
-  $('srcOptSage').classList.toggle('on', source === 'sage');
-  const chip = $('srcChip');
-  chip.textContent = source === 'sage' ? '● Sage' : '● Native';
-  $('sageConnect').classList.toggle('hidden', source !== 'sage');
-  if(source === 'sage') refreshSageState();
-}
-
-async function loadSource(){
-  try{ const r = await fetch('/api/wallet/source'); renderSource((await r.json()).source || 'native'); }
-  catch(e){ renderSource('native'); }
-}
-
-async function setSource(source){
-  setStatus('srcStatus','Saving…');
-  try{
-    const r = await fetch('/api/wallet/source', {method:'POST',headers:{'content-type':'application/json'},
-      body: JSON.stringify({source})});
-    if(!r.ok) throw new Error(await r.text());
-    renderSource((await r.json()).source || source);
-    setStatus('srcStatus', source === 'sage'
-      ? 'Sage selected — connect your Sage wallet below.'
-      : 'Using this browser’s built-in wallet.');
-  }catch(e){ setStatus('srcStatus','Could not change wallet source: '+e.message, true); }
-}
-$('srcNative').addEventListener('change', () => setSource('native'));
-$('srcSage').addEventListener('change',   () => setSource('sage'));
+// --- Your wallet: the Sage (WalletConnect) delegate session ---
+// Sage holds the keys; this page holds none. The connect flow lives here, and the live
+// session it pairs is restorable in the wallet page (same loopback origin) where the
+// delegate pump forwards each request to Sage. window.chia is unchanged.
+let _reqReady = false;
 
 // Init the WC requester (reuses the bundled SignClient + the configured projectId).
 async function ensureRequester(){
@@ -477,58 +410,19 @@ $('btnSageDisconnect').addEventListener('click', async () => {
   refreshSageState(); setStatus('srcStatus','Disconnected from Sage.');
 });
 
-// --- Wallet identity: public key + address ---
-async function loadIdentity(){
+// --- Residual seed notice ---
+// A seed from an older, key-holding build may still sit on disk. This page cannot use it
+// and deliberately offers no way to reveal it in the browser (see the card copy); it only
+// surfaces the fact and points at the offline `dign wallet export-seed` command.
+async function loadResidualSeed(){
   try{
-    const r = await fetch('/api/wallet/pubkey');
-    if(r.status === 401){ $('idLocked').classList.remove('hidden'); $('idLoaded').classList.add('hidden'); return; }
-    if(!r.ok) throw new Error(await r.text());
-    const k = await r.json();
-    $('pubKey').textContent = k.public_key;
-    $('addr').textContent = k.address;
-    $('idLoaded').classList.remove('hidden'); $('idLocked').classList.add('hidden');
-  }catch(e){ $('idLocked').classList.remove('hidden'); }
+    const r = await fetch('/api/status');
+    if(!r.ok) return;
+    const s = await r.json();
+    $('residualSeed').classList.toggle('hidden', s.state !== 'custodied');
+  }catch(e){ /* Absent status is not evidence of a seed; leave the notice hidden. */ }
 }
-$('copyPub').addEventListener('click', e => copyBtn(e.target, $('pubKey').textContent));
-$('copyAddr').addEventListener('click', e => copyBtn(e.target, $('addr').textContent));
-
-// --- Backup: reveal recovery phrase (export) ---
-$('btnReveal').addEventListener('click', async () => {
-  setStatus('exportStatus','');
-  const pw = $('exportPw').value;
-  if(!pw){ setStatus('exportStatus','Enter your wallet password.', true); return; }
-  try{
-    const r = await fetch('/api/export', {method:'POST',headers:{'content-type':'application/json'},
-      body: JSON.stringify({password: pw})});
-    if(!r.ok){ let m='reveal failed'; try{m=await r.text()}catch(e){} throw new Error(m); }
-    const d = await r.json();
-    $('seedWords').textContent = d.mnemonic;
-    $('exportGate').classList.add('hidden'); $('exportShow').classList.remove('hidden');
-    $('exportPw').value = '';
-  }catch(e){ setStatus('exportStatus', e.message, true); }
-});
-$('btnHide').addEventListener('click', () => {
-  $('seedWords').textContent = '';   // drop it from the DOM
-  $('exportShow').classList.add('hidden'); $('exportGate').classList.remove('hidden');
-});
-$('btnCopySeed').addEventListener('click', e => copyBtn(e.target, $('seedWords').textContent));
-
-// --- Restore from recovery phrase (import) ---
-$('btnImport').addEventListener('click', async () => {
-  setStatus('importStatus','');
-  const mnemonic = $('importPhrase').value.trim();
-  const pw = $('importPw').value;
-  if(!mnemonic){ setStatus('importStatus','Enter your recovery phrase.', true); return; }
-  if(pw.length < 8){ setStatus('importStatus','Password must be at least 8 characters.', true); return; }
-  try{
-    const r = await fetch('/api/import', {method:'POST',headers:{'content-type':'application/json'},
-      body: JSON.stringify({mnemonic, password: pw})});
-    if(!r.ok){ let m='restore failed'; try{m=(await r.json()).error||m}catch(e){} throw new Error(m); }
-    $('importPhrase').value=''; $('importPw').value='';
-    setStatus('importStatus','Wallet restored. Open dig://wallet to use it.');
-    loadIdentity();
-  }catch(e){ setStatus('importStatus', e.message, true); }
-});
+$('copyExportCmd').addEventListener('click', e => copyBtn(e.target, $('exportCmd').textContent));
 
 // --- Cached stores: per-capsule local-cache manager (#32) ---
 const HEX64 = /^[0-9a-fA-F]{64}$/;
@@ -611,8 +505,8 @@ $('btnFetchCap').addEventListener('click', async () => {
 
 load();
 loadWcPid();
-loadSource();
-loadIdentity();
+refreshSageState();
+loadResidualSeed();
 loadCapsules();
 </script>
 </body>
