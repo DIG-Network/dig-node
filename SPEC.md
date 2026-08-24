@@ -6279,7 +6279,21 @@ count is the whole connected pool, and hops each fabricating a byte of progress 
 pull open for hours while every one of them stayed inside its individual ceiling. A requestor MUST
 therefore charge relay waiting against a budget scoped to the CAPSULE being pulled, and MUST NOT grant
 each hop a fresh allowance. Shrinking the per-hop ceiling is NOT an acceptable substitute: an honest hop
-relaying a large capsule genuinely needs the full ceiling, and that case is what this path exists for. A requestor MUST NOT treat the count as evidence about the
+relaying a large capsule genuinely needs the full ceiling, and that case is what this path exists for.
+
+**The budget's lifetime MUST be the PULL's.** It MUST be released when the pull ends — in success or
+failure — so that a later pull of the same capsule starts with the whole of it. A budget that persists
+beyond its pull makes a capsule whose first pull spent it permanently ineligible for the relay path,
+and, because the exhaustion is reported as a failure against whichever peer was being asked, it
+attributes this node's own earlier spend to that peer. A requestor MUST NOT report a budget exhaustion
+in a form that names a peer as its cause.
+
+An idle timeout MUST NOT be used in place of the release. Relay time is charged when a wait ENDS, so a
+wait in progress is indistinguishable from an idle entry for up to the whole per-hop ceiling: a timeout
+shorter than that ceiling can expire a live pull's budget mid-wait and silently restore the
+per-hop multiplication, while one at or above it withholds the budget from the next pull for as long as
+the condition it was meant to prevent. The pull boundary is therefore reported by the caller that
+drives the pull, never inferred. A requestor MUST NOT treat the count as evidence about the
 bytes: the capsule that eventually arrives is verified against the chain-anchored root exactly as a
 direct holder's would be (§21.2), so a hop that fabricates its way through a wait still cannot produce
 content that passes.
