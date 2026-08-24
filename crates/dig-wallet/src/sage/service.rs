@@ -576,7 +576,10 @@ mod one_pool_tests {
         // Two holders so far: this binding, and the transport's own slot. A wiring that built its
         // own pool would leave the count exactly here.
         let before = Arc::strong_count(&seeded);
-        assert_eq!(before, 2, "fixture: only the test and the transport hold the client");
+        assert_eq!(
+            before, 2,
+            "fixture: only the test and the transport hold the client"
+        );
 
         let live = build_live_wallet(&chain)
             .await
