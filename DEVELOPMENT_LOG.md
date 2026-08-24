@@ -289,13 +289,22 @@ nothing, and the answer sat in that string. Diagnostics in this repo go through 
 `dig-logging` sink, never a raw stream. Adopting 0.6 removed the most common reason to reach that
 line but not the others (no network, coinset outage), so the log route matters independently.
 
-Sharp edge — **`chia-query` and `chia-peer` disagree about `dig-chainsource-interface`.**
-chia-query 0.5.2+ moved to dci 0.2 while `chia-peer` 0.1.3 is still on 0.1, and the two
-`ChainSourceProvider` traits then fail to unify where dig-node-core registers the light client into
-the `ProviderRegistry`. dig-node-core is pinned `=0.5.1` (an exact requirement, deliberately: a
-caret `0.5` breaks the build the moment the lock refreshes) until a `chia-peer` release built
-against dci 0.2 exists. dig-wallet is on 0.6 meanwhile — safe only because no `chia_query` type
-crosses the crate boundary between them.
+Sharp edge — **a load-bearing version pin can be held in place by code nothing calls.**
+dig-node-core pinned `chia-query = "=0.5.1"` for years of commits, with a manifest comment
+explaining that `chia-peer` 0.1.3 was still on `dig-chainsource-interface` 0.1 while chia-query
+0.5.2+ had moved to 0.2, so the two `ChainSourceProvider` traits would not unify where the crate
+registered its light client into a `ProviderRegistry`. Every sentence of that was true about the
+types, and it made the pin look like a real constraint on a real integration. It was not: **nothing
+ever constructed that light client.** There was no production `ProviderRegistry` in the crate at
+all — the symbol appeared only in the dead module's own `use`, one function signature, and its
+`mod tests`. Deleting the module dropped `chia-peer`, `chia-query` and `dig-chainsource-interface`
+from dig-node-core outright and collapsed the lock's two `chia-query` lines to one.
+
+The general lesson: before treating a version pin as a constraint, check that the code it protects
+has a caller. A pin defended by an articulate comment reads as more load-bearing than one with no
+comment, which is precisely backwards when the comment describes an integration that was never
+wired. Verify a blocker against the resolved lock and a reference search, never against the note
+explaining it — a wrong blocker is worse than none, because it stops people looking.
 
 ## The `dig.fetchRange` peer-serve arm was the MISSING half of the chain-anchor invariant (#1764/#1765)
 
