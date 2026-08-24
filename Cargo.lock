@@ -2863,6 +2863,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-keystore"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62ec63fabddd73c796b9224dd42906386ffa422383258102cc41fdce37ffd088"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "chia-bls 0.36.1",
+ "crc32fast",
+ "hex",
+ "parking_lot",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "dig-logging"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2981,6 +2999,7 @@ dependencies = [
  "dig-identity 0.4.0",
  "dig-ip",
  "dig-ipc-protocol",
+ "dig-keystore 0.10.0",
  "dig-message",
  "dig-nat",
  "dig-peer",
@@ -3018,6 +3037,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -3299,7 +3319,7 @@ dependencies = [
  "chia-wallet-sdk 0.30.0",
  "clvmr 0.14.0",
  "dig-clvm",
- "dig-keystore",
+ "dig-keystore 0.9.0",
  "dig-node-control-interface",
  "dig-node-core",
  "dig-offers",

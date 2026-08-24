@@ -136,6 +136,20 @@ fs4 = { version = "1.1.0", features = ["sync"] }
 directories = "6.0.0"
 # OS CSPRNG for the per-stage content-authoring BLS key (#95 Pass C dig.stage).
 getrandom = "0.2"
+# -- dig_ecosystem#2168: the node MACHINE key at rest --------------------------------------
+# The canonical DIG keystore. Consumed with `custody` OFF (it is off by default) because this
+# crate seals only the node's OWN machine identity seed and must never be able to name the
+# user-custody API -- the #908 boundary expressed in the dependency graph rather than in prose
+# (dig-keystore SPEC.md 18.2, which names this engine as the intended opaque-only consumer).
+# 0.10 rather than 0.9: 0.10 is a BREAKING release that moves the crate's re-exported chia-bls
+# onto the ecosystem 0.36.1 line. That line is ALREADY in this lock (six chia-bls lines resolve
+# here today), and the `opaque` surface this crate uses is bytes + Password with no BLS type on
+# it at all, so nothing crosses between lines -- and adopting 0.10 now avoids routing the node's
+# identity onto a type identity that was about to change under it.
+dig-keystore = "0.10"
+# Keeps the unsealed seed off the heap after use, matching what dig-keystore hands back.
+zeroize = "1"
+
 # -- L7 DIG Node peer network (PHASE-2b, #162) -------------------------------------------------------
 # The NAT-traversal + connected-peer-pool layer. The bespoke in-node relay client (formerly relay.rs)
 # is RETIRED: the relay connection now lives inside dig-nat (the `connect()` ladder's last-resort tier
@@ -418,6 +432,10 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 
 [dev-dependencies]
 tempfile = "3"
+# `dig_keystore::hardware::double::FakeDevice` -- the only way to exercise the hardware-bound
+# tier, since no platform provider ships (dig_ecosystem#1693). Test-only: `testing` is never
+# enabled for the library build.
+dig-keystore = { version = "0.10", features = ["testing"] }
 # Same git rev as the normal dependency above, with dig-gossip's `test-util` feature added. That
 # feature gates `__connect_stub_peer_with_direction`, which registers a connected peer without real
 # TLS — the only way to assert what a broadcast ACTUALLY put on the wire from a test. Declared here
