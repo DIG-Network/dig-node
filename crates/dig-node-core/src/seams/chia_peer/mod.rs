@@ -9,17 +9,24 @@
 //! is this seam's OWN boundary: it composes/exposes the shared resolver rather than duplicating
 //! its contract, so `Node` (implementing `ChainSource`) hands out the SAME `Arc<dyn
 //! AnchoredRootResolver>` every other seam already consumes.
+//!
+//! # There is no light client here, and adding one back belongs in `chia-query`
+//!
+//! This seam used to carry a `chia-peer`-backed subscribing light client (#1314), registered as a
+//! `ChainSourceProvider` into a `chia_query::ProviderRegistry`. Nothing ever constructed it: there
+//! was no production registry, no caller, and no way to reach it from a running node. It was a
+//! third Chia dialling stack on paper only, and the `chia-query = "=0.5.1"` pin it forced was what
+//! held this crate off the chia 0.36 line (dig_ecosystem#2761, #3152).
+//!
+//! The node's real Chia peer tier lives in `dig-wallet`'s `ChainTransport`. If the subscribing
+//! light client is wanted again, its home is `chia_query::peer::light_client` — `chia-peer` is a
+//! deprecated re-export facade over exactly that — and it should be wired to the transport's
+//! existing pool rather than dialling a set of full nodes of its own.
 
 mod coinset_resolver;
-pub mod light_client;
 
 pub use coinset_resolver::CoinsetResolver;
 pub(crate) use coinset_resolver::{default_anchored_resolver, resolution_coinset};
-
-pub use light_client::{
-    confirmation_depth, connect_light_client, register_light_client_provider, submit_spend,
-    ChiaPeerSubscriptions, CHIA_PEER_INDEPENDENCE_GROUP,
-};
 
 use std::sync::Arc;
 

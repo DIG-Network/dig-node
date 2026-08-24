@@ -136,6 +136,31 @@ impl ChainTransport {
         Ok(built)
     }
 
+    /// The one shared client, for a consumer that needs the client ITSELF rather than a read.
+    ///
+    /// This exists so the live-broadcast wiring (§18.12) can be built on the SAME pool that serves
+    /// the wallet's reads. It used to build its own, which gave a live node two independent sets of
+    /// full-node sessions with two notions of the peak (dig_ecosystem#2761).
+    ///
+    /// It is the lazy build, not a second one: the first caller to need a client — a read or the
+    /// live wiring — is the one that dials, and every later caller gets that same client.
+    pub(crate) async fn shared_client(&self) -> Result<Arc<chia_query::ChiaQuery>> {
+        self.client().await
+    }
+
+    /// A transport that already HAS its client, so nothing in the test dials.
+    ///
+    /// Seeding the client is what makes pointer identity assertable: a consumer that quietly built
+    /// its own pool returns a different `Arc`, which no agreement-based assertion could distinguish
+    /// from sharing.
+    #[cfg(test)]
+    pub(crate) fn with_client(client: Arc<chia_query::ChiaQuery>) -> Self {
+        Self {
+            client: Mutex::new(Some(client)),
+            peer_reads: None,
+        }
+    }
+
     /// The chain's current peak height, or `Ok(None)` when the source tracks none.
     ///
     /// `Ok(None)` is an honest "no height known" — never height zero, which every block is
