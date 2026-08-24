@@ -39,6 +39,24 @@
 //! the host's, because a capable host does not retroactively protect bytes already at rest
 //! (dig-keystore `SPEC.md` §17.5b).
 //!
+//! # Two failure behaviours, both carried over from `SPEC.md` §16.4
+//!
+//! Sealing RAISES the cost of getting these wrong. The artifact this replaced was a single
+//! plaintext file, so a spurious "it is not there" minted a new seed *beside a recoverable
+//! original*. With two coupled sealed halves the same misread destroys the identity permanently,
+//! because both halves are replaced at once. So:
+//!
+//! - **Existence is answered by [`presence`], never `Path::exists`.** `exists()` reports a locked,
+//!   permission-denied or otherwise unreadable path as ABSENT, and the next thing this module does
+//!   with an absent answer is MINT. An undeterminable read refuses
+//!   ([`MachineKeyError::ExistenceUndeterminable`]) instead of guessing.
+//! - **The device key is installed with `create_new`, the OS atomic test-and-set.** Two starts
+//!   racing -- a service restart overlapping the outgoing process, or a manual run beside the
+//!   service -- cannot each install a different device key, so the state "process B key beside
+//!   process A blob" is unreachable rather than merely unlikely. Where the two halves are
+//!   nonetheless mismatched (a half-restored backup), that state has a NAME and a stated remedy
+//!   ([`MachineKeyError::DeviceKeyUnusable`]), because the no-re-mint rule cannot heal it.
+//!
 //! # Binding this key is the sanctioned case, and it is not a seed backup
 //!
 //! dig-keystore `SPEC.md` §17.5b requires an off-device backup before binding a *recovery seed*,
@@ -55,15 +73,17 @@ use dig_keystore::hardware::{
     HardwareBoundBackend, HardwarePolicy, HardwareProvider, ProtectionTier,
 };
 use dig_keystore::{opaque, KdfParams, KeystoreError, Password};
+
+use crate::shared::at_rest::{presence, write_new_owner_only, Presence};
 use zeroize::Zeroizing;
 
 /// Storage key of the sealed `DIGOP1` blob holding the 32-byte identity seed.
 const SEED_RECORD: &str = "machine-identity";
 
-/// Storage key of the per-install device key the seed blob is sealed under. Held in the SIBLING
+/// Filename of the per-install device key the seed blob is sealed under. Held in the SIBLING
 /// device directory, never beside the blob — see the module doc, and dig-node `SPEC.md` §16.4,
 /// which specifies the same split for the wallet host.
-const DEVICE_KEY_RECORD: &str = "device";
+const DEVICE_KEY_FILE: &str = "device.key";
 
 /// Bytes of the per-install device key. Matches §16.4's `device.key`: 32 raw CSPRNG bytes.
 const DEVICE_KEY_LEN: usize = 32;
@@ -86,6 +106,28 @@ pub enum MachineKeyError {
         /// How many bytes it held.
         len: usize,
     },
+    /// Whether the identity is already on disk could not be DETERMINED, so nothing was minted.
+    ///
+    /// Refusing is the whole point. Treating an unreadable path as an absent one would mint a new
+    /// seed over a real identity whose two halves are then both gone.
+    ExistenceUndeterminable {
+        /// The path whose existence could not be read.
+        path: std::path::PathBuf,
+        /// Why the metadata read failed.
+        source: std::io::Error,
+    },
+    /// The seed blob is on disk but its device key is missing or does not open it.
+    ///
+    /// Named, rather than surfaced as a bare decrypt failure, because it is the ONE state the
+    /// no-re-mint rule cannot heal by itself and the operator has to act on.
+    DeviceKeyUnusable {
+        /// Where the device key is expected.
+        device_key: std::path::PathBuf,
+        /// Where the sealed blob lives.
+        blob_dir: std::path::PathBuf,
+        /// What went wrong.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for MachineKeyError {
@@ -96,6 +138,23 @@ impl std::fmt::Display for MachineKeyError {
             Self::Malformed { record, len } => write!(
                 f,
                 "machine key record {record} is {len} bytes, not the expected length"
+            ),
+            Self::ExistenceUndeterminable { path, source } => write!(
+                f,
+                "cannot determine whether the machine identity already exists at {} ({source});                  refusing to mint a new one, because minting over an existing identity would                  destroy it permanently. Resolve the access error and restart.",
+                path.display()
+            ),
+            Self::DeviceKeyUnusable {
+                device_key,
+                blob_dir,
+                detail,
+            } => write!(
+                f,
+                "the machine identity in {} cannot be opened by the device key at {} ({detail}).                  The two are a matched pair and one is missing or from a different install.                  Restore {} from the same backup as {}; if it is gone, the identity is                  unrecoverable and a new one must be minted deliberately by removing both.",
+                blob_dir.display(),
+                device_key.display(),
+                device_key.display(),
+                blob_dir.display()
             ),
         }
     }
@@ -119,9 +178,18 @@ impl From<std::io::Error> for MachineKeyError {
 pub struct MachineKeyStore {
     /// Holds the sealed `DIGOP1` seed blob.
     backend: HardwareBoundBackend,
-    /// Holds the device key the blob is sealed under, in a sibling directory. Separate backend
-    /// because it is a separate DIRECTORY, and that separation is the whole point.
-    device: HardwareBoundBackend,
+    /// Path of the device key the blob is sealed under, in a sibling directory.
+    ///
+    /// A raw 32-byte file rather than a keystore record, matching `SPEC.md` §16.4's `device.key`
+    /// exactly. The reason is atomicity, not layering: it is written with `create_new`, the OS's
+    /// own test-and-set, so two concurrent starts cannot each install a different device key and
+    /// leave one process's key beside the other's blob. `FileBackend::write` is
+    /// tmp-plus-rename, i.e. REPLACE semantics, which is precisely the operation that produces
+    /// that mismatch.
+    device_key_path: std::path::PathBuf,
+    /// The identity directory the sealed blob lives in, for the path-level presence check and for
+    /// naming both halves in [`MachineKeyError::DeviceKeyUnusable`].
+    blob_dir: std::path::PathBuf,
     kdf: KdfParams,
 }
 
@@ -144,14 +212,11 @@ impl MachineKeyStore {
         Ok(Self {
             backend: HardwareBoundBackend::new(
                 FileBackend::new(dir),
-                provider.clone(),
-                HardwarePolicy::Optional,
-            )?,
-            device: HardwareBoundBackend::new(
-                FileBackend::new(device_dir(dir)?),
                 provider,
                 HardwarePolicy::Optional,
             )?,
+            device_key_path: device_dir(dir)?.join(DEVICE_KEY_FILE),
+            blob_dir: dir.to_path_buf(),
             kdf: KdfParams::DEFAULT,
         })
     }
@@ -179,20 +244,39 @@ impl MachineKeyStore {
         legacy_dir: Option<&Path>,
     ) -> Result<Zeroizing<[u8; 32]>, MachineKeyError> {
         let seed_key = BackendKey::new(SEED_RECORD);
-        if self.backend.exists(&seed_key)? {
+        // `presence`, never `Path::exists`. `exists()` reports a locked, permission-denied or
+        // otherwise unreadable path as ABSENT, and the very next thing this function does with an
+        // "absent" answer is MINT — overwriting both halves of a real identity that was merely
+        // unreadable for a moment. Before this seed was sealed that misread cost a recoverable
+        // duplicate; now both halves would be gone, so the read has to refuse instead.
+        if self.seed_presence()? == Presence::Present {
             return self.unseal_stored(&seed_key);
         }
         let seed = match legacy_dir.map(Self::read_legacy).transpose()?.flatten() {
             Some(seed) => seed,
             None => Zeroizing::new(random_bytes::<32>()),
         };
-        self.seal_new(&seed_key, &seed)?;
+        let settled = self.seal_new(&seed_key, &seed)?;
         if let Some(dir) = legacy_dir {
             // Only reached once `seal_new` has proven the sealed copy reads back from storage:
             // removing the one plaintext copy before that would destroy the node's identity.
             let _ = std::fs::remove_file(dir.join(LEGACY_SEED_FILE));
         }
-        Ok(seed)
+        Ok(settled)
+    }
+
+    /// Whether a sealed seed blob is already stored, refusing to guess.
+    ///
+    /// # Errors
+    /// [`MachineKeyError::ExistenceUndeterminable`] if the metadata read fails.
+    fn seed_presence(&self) -> Result<Presence, MachineKeyError> {
+        let path = self.seed_blob_path();
+        presence(&path).map_err(|source| MachineKeyError::ExistenceUndeterminable { path, source })
+    }
+
+    /// Where the keystore keeps the sealed blob. Mirrors `FileBackend`'s `<key>.dks` layout.
+    fn seed_blob_path(&self) -> std::path::PathBuf {
+        self.blob_dir.join(format!("{SEED_RECORD}.dks"))
     }
 
     /// What protects **this node's stored seed** — read from the blob, not inferred from the host.
@@ -242,19 +326,35 @@ impl MachineKeyStore {
     fn unseal_stored(&self, seed_key: &BackendKey) -> Result<Zeroizing<[u8; 32]>, MachineKeyError> {
         let device_key = self.read_device_key()?;
         let blob = self.backend.read(seed_key)?;
-        let plain = opaque::open(&Password::new(device_key.as_slice()), &blob)?;
+        // A device key that is present but does not open the blob beside it is the mismatch
+        // state, not a corrupt-file state. Reporting it as a bare `DecryptFailed` would hand the
+        // operator the one message that names neither the cause nor the remedy.
+        let plain = opaque::open(&Password::new(device_key.as_slice()), &blob)
+            .map_err(|e| self.device_key_unusable(e))?;
         exactly_32(SEED_RECORD, &plain)
     }
 
-    /// Seal `seed` under a fresh wrapping secret, proving it reads back before reporting success.
+    /// Seal `seed` under the install device key and return the seed actually SETTLED on disk
+    /// afterwards -- which is not always the one passed in.
+    ///
+    /// # Why this returns a seed instead of the unit type
+    ///
+    /// Two starts can reach here at once: a service restart racing the outgoing process, or a
+    /// manual run beside the service. The device key is installed with `create_new`, the atomic
+    /// test-and-set the OS already provides, so exactly one racer creates it and the other
+    /// ADOPTS it rather than installing a second. That single decision is what makes the mismatch
+    /// state -- process B device key beside process A blob, neither able to open the other --
+    /// unreachable rather than merely unlikely.
+    ///
+    /// Both racers then seal under the SAME device key, so whichever blob write lands last is
+    /// openable. The loser reads back a seed it did not mint; that is a correct outcome, not an
+    /// error, and adopting it is what makes both processes agree on one `peer_id`.
     fn seal_new(
         &self,
         seed_key: &BackendKey,
         seed: &Zeroizing<[u8; 32]>,
-    ) -> Result<(), MachineKeyError> {
-        let device_key = Zeroizing::new(random_bytes::<DEVICE_KEY_LEN>());
-        self.device
-            .write(&BackendKey::new(DEVICE_KEY_RECORD), device_key.as_slice())?;
+    ) -> Result<Zeroizing<[u8; 32]>, MachineKeyError> {
+        let device_key = self.ensure_device_key()?;
         let blob = opaque::seal(
             &Password::new(device_key.as_slice()),
             seed.as_slice(),
@@ -262,38 +362,67 @@ impl MachineKeyStore {
         )?;
         self.backend.write(seed_key, &blob)?;
 
-        // Prove the round trip from STORAGE, not from the value just computed. A seal this host
-        // cannot reopen has replaced the only copy of the node's identity with unreadable bytes,
-        // and a success returned over that is the worst outcome this module has.
-        let reopened = self.unseal_stored(seed_key)?;
-        if reopened.as_slice() != seed.as_slice() {
-            return Err(MachineKeyError::Malformed {
-                record: SEED_RECORD,
-                len: reopened.len(),
-            });
+        // Read back from STORAGE, not from the value just computed. A seal this host cannot
+        // reopen has replaced the only copy of the node identity with unreadable bytes, and a
+        // success returned over that is the worst outcome this module has.
+        self.unseal_stored(seed_key)
+    }
+
+    /// The install device key: create it atomically, or adopt the one a concurrent start won.
+    ///
+    /// `create_new` is the whole mechanism. A [`presence`] check followed by a write would be a
+    /// TOCTOU race whose window is exactly a concurrent start -- the case this defends.
+    fn ensure_device_key(&self) -> Result<Zeroizing<Vec<u8>>, MachineKeyError> {
+        let fresh = Zeroizing::new(random_bytes::<DEVICE_KEY_LEN>());
+        match write_new_owner_only(&self.device_key_path, fresh.as_slice()) {
+            Ok(()) => Ok(Zeroizing::new(fresh.to_vec())),
+            // Another process installed one first. Adopt it -- installing a second would strand
+            // whichever blob was sealed under the first.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => self.read_device_key(),
+            Err(e) => Err(MachineKeyError::Io(e)),
         }
-        Ok(())
     }
 
     /// The per-install device key, from the sibling device directory.
+    ///
+    /// A missing or wrong-length device key beside an existing blob is the ONE state the
+    /// no-re-mint rule cannot heal on its own, so it is reported as
+    /// [`MachineKeyError::DeviceKeyUnusable`] -- which names both halves and the remedy -- rather
+    /// than as a bare I/O or decrypt failure the operator cannot act on.
     fn read_device_key(&self) -> Result<Zeroizing<Vec<u8>>, MachineKeyError> {
-        let bytes = self.device.read(&BackendKey::new(DEVICE_KEY_RECORD))?;
+        let bytes =
+            std::fs::read(&self.device_key_path).map_err(|e| self.device_key_unusable(e))?;
         if bytes.len() != DEVICE_KEY_LEN {
-            return Err(MachineKeyError::Malformed {
-                record: DEVICE_KEY_RECORD,
-                len: bytes.len(),
-            });
+            return Err(self.device_key_unusable(format!(
+                "it is {} bytes, not {DEVICE_KEY_LEN}",
+                bytes.len()
+            )));
         }
         Ok(Zeroizing::new(bytes))
+    }
+
+    /// Name the device-key/blob mismatch state, with both paths and the recovery path.
+    fn device_key_unusable(&self, detail: impl std::fmt::Display) -> MachineKeyError {
+        MachineKeyError::DeviceKeyUnusable {
+            device_key: self.device_key_path.clone(),
+            blob_dir: self.blob_dir.clone(),
+            detail: detail.to_string(),
+        }
     }
 
     /// The legacy plaintext seed, if `dir` holds one.
     fn read_legacy(dir: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, MachineKeyError> {
         let path = dir.join(LEGACY_SEED_FILE);
-        if !path.exists() {
-            return Ok(None);
+        // Same refusal as the mint decision: an unreadable legacy path reported as absent would
+        // mint a NEW identity while the real one sat right there, unreadable for a moment.
+        let found = presence(&path).map_err(|source| MachineKeyError::ExistenceUndeterminable {
+            path: path.clone(),
+            source,
+        })?;
+        match found {
+            Presence::Absent => Ok(None),
+            Presence::Present => exactly_32(LEGACY_SEED_FILE, &std::fs::read(&path)?).map(Some),
         }
-        exactly_32(LEGACY_SEED_FILE, &std::fs::read(&path)?).map(Some)
     }
 }
 
@@ -469,6 +598,155 @@ mod tests {
             resolved, dir,
             "DIG_IDENTITY_DIR must win, exactly as it does for the legacy plaintext seed"
         );
+    }
+
+    /// A path whose *existence cannot be determined*, while every other path stays writable.
+    ///
+    /// An interior NUL byte is rejected by the platform path conversion itself -- `InvalidInput`
+    /// from `CString::new` on Unix and from the UTF-16 conversion on Windows -- so `try_exists`
+    /// returns `Err` on both, deterministically, without a permission fixture only one platform
+    /// can express. It stands in for the real causes (an AV/EDR sharing violation, roaming-profile
+    /// sync, a changed ACL, `EIO`, `EMFILE`) which all arrive the same way: as an `Err` from the
+    /// metadata call. Borrowed from `dig-wallet`'s `autoseed` tests, which established the shape.
+    fn undeterminable_dir(root: &tempfile::TempDir) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}\0dig", root.path().display()))
+    }
+
+    /// **Proves:** an identity that cannot be READ is never treated as an identity that is not
+    /// THERE.
+    ///
+    /// **Catches the HIGH finding this module was gated on.** `FileBackend::exists` is
+    /// `path.exists()`, i.e. `fs::metadata(..).is_ok()`, so one transient metadata failure in
+    /// post-migration steady state returns `false`, falls through to `random_bytes`, and
+    /// overwrites BOTH halves -- changing `peer_id` silently and irrecoverably, with no attacker
+    /// and no malformed input involved.
+    ///
+    /// The fixture makes the *existence read itself* fail while nothing else is wrong, which is
+    /// the only way to distinguish "refused because it could not tell" from "failed because the
+    /// directory was broken". Asserting merely that the call errored would not: a store over a
+    /// genuinely unusable directory errors under the buggy code too. So this pins the VARIANT.
+    #[test]
+    fn an_undeterminable_existence_read_refuses_instead_of_minting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = software_store(&undeterminable_dir(&root));
+
+        let outcome = store.load_or_create(None);
+
+        assert!(
+            matches!(
+                outcome,
+                Err(MachineKeyError::ExistenceUndeterminable { .. })
+            ),
+            "an unreadable path must refuse, not mint over a possibly-real identity: {:?}",
+            outcome.as_ref().map(|s| hex::encode(s.as_slice()))
+        );
+    }
+
+    /// **Proves:** the same refusal guards the MIGRATION read, not only the steady-state one.
+    ///
+    /// **Catches:** fixing `load_or_create` while leaving `read_legacy` on `Path::exists`. That
+    /// version mints a brand-new identity while the node's real plaintext seed sits right there,
+    /// unreadable for a moment -- and then, because the mint succeeds, deletes nothing and leaves
+    /// two identities. The control keeps a truthful comparison: with a READABLE legacy dir the
+    /// same call adopts the existing seed rather than minting.
+    #[test]
+    fn an_undeterminable_legacy_read_refuses_instead_of_minting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let legacy_root = tempfile::tempdir().expect("legacy");
+
+        let outcome = software_store(&dir).load_or_create(Some(&undeterminable_dir(&legacy_root)));
+        assert!(
+            matches!(
+                outcome,
+                Err(MachineKeyError::ExistenceUndeterminable { .. })
+            ),
+            "an unreadable legacy path must refuse: {:?}",
+            outcome.as_ref().map(|s| hex::encode(s.as_slice()))
+        );
+
+        // Control: the identical call over a READABLE legacy dir adopts the seed that is there.
+        let readable = tempfile::tempdir().expect("readable legacy");
+        std::fs::write(readable.path().join(LEGACY_SEED_FILE), [0x5Cu8; 32]).expect("legacy seed");
+        assert_eq!(
+            software_store(&dir)
+                .load_or_create(Some(readable.path()))
+                .expect("readable legacy adopts")
+                .as_slice(),
+            &[0x5Cu8; 32],
+            "control: a readable legacy seed must still be adopted"
+        );
+    }
+
+    /// **Proves:** a second start cannot install a second device key over the first.
+    ///
+    /// **Catches the other HIGH finding.** With `FileBackend::write` (tmp + rename, i.e. REPLACE)
+    /// on the device key, two overlapping starts leave process B key beside process A blob --
+    /// neither opens the other, and the no-re-mint rule then prevents self-healing forever.
+    ///
+    /// The fixture is the observable consequence rather than the timing: it drives the device-key
+    /// install twice and requires the SECOND to adopt the first key rather than replace it, then
+    /// proves the blob sealed under the first still opens afterwards. A test that only raced two
+    /// threads would be nondeterministic and would usually pass on the broken code.
+    #[test]
+    fn a_second_start_adopts_the_device_key_rather_than_replacing_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let store = software_store(&dir);
+
+        let first = store.ensure_device_key().expect("install");
+        let seed = store
+            .load_or_create(None)
+            .expect("seal under the first key");
+
+        let second = store.ensure_device_key().expect("adopt");
+
+        assert_eq!(
+            first.as_slice(),
+            second.as_slice(),
+            "the second start must ADOPT the installed device key, never install a second one"
+        );
+        assert_eq!(
+            software_store(&dir)
+                .load_or_create(None)
+                .expect("the blob must still open after a second start")
+                .as_slice(),
+            seed.as_slice(),
+            "a blob sealed under the first key must survive a second start"
+        );
+    }
+
+    /// **Proves:** a device key that does not match the blob is a NAMED state with a remedy.
+    ///
+    /// **Catches:** surfacing the mismatch as a bare `DecryptFailed`, which names neither the
+    /// cause nor the recovery and leaves an operator with a permanently dead node and one
+    /// uninformative log line. Also pins that it is not silently re-minted.
+    #[test]
+    fn a_mismatched_device_key_is_named_with_both_halves_and_a_remedy() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        software_store(&dir).load_or_create(None).expect("mint");
+
+        // A half-restored backup: the blob from one install, the device key from another.
+        let device = device_dir(&dir).expect("sibling").join(DEVICE_KEY_FILE);
+        std::fs::write(&device, [0x11u8; DEVICE_KEY_LEN]).expect("foreign device key");
+
+        let outcome = software_store(&dir).load_or_create(None);
+
+        let Err(e @ MachineKeyError::DeviceKeyUnusable { .. }) = outcome else {
+            panic!("a mismatched device key must be named, got {outcome:?}");
+        };
+        let message = e.to_string();
+        for expected in [
+            device.display().to_string(),
+            dir.display().to_string(),
+            "Restore".to_string(),
+        ] {
+            assert!(
+                message.contains(&expected),
+                "the message must name both halves and the remedy ({expected}): {message}"
+            );
+        }
     }
 
     /// **Proves:** the seed survives a round trip through the container at all — the control every
