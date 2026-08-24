@@ -63,7 +63,7 @@ permissions:
 
 jobs:
   verify:
-    name: Verify ${{ inputs.tag }} carries every consumer-resolvable asset
+    name: Verify the release carries every consumer-resolvable asset
     # The self-test trigger supplies no tag; it exercises `selftest` instead.
     if: inputs.tag != ''
     runs-on: ubuntu-latest
@@ -88,9 +88,10 @@ jobs:
   #   * the complete v0.145.0 set MUST pass — a guard that rejects a good release is just as
   #     broken, and this is the control that keeps the expectation from drifting into something
   #     unsatisfiable;
-  #   * a set missing every `dign-*` binary — EXACTLY the shape `releases/latest` had at
-  #     2026-08-24T01:47:49Z — MUST fail. `continue-on-error` lets the step run to completion, and
-  #     the assertion afterwards turns a PASS into a red job.
+  #   * a set of the four native packages and nothing else — EXACTLY the asset list
+  #     `releases/latest` carried at 2026-08-24T01:47:49Z, missing all five `dig-node-*` and all
+  #     five `dign-*` binaries — MUST fail. `continue-on-error` lets the step run to completion,
+  #     and the assertion afterwards turns a PASS into a red job.
   #
   # The failing case deliberately omits a whole consumer's set rather than one stray file, because
   # the defect was categorical: an entire class of asset was outside the guard's vocabulary.
