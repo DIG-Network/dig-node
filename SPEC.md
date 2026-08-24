@@ -5642,12 +5642,22 @@ node MUST consume `dig-keystore` with its `custody` feature OFF, so the user-cus
 nameable from the engine (dig-keystore `SPEC.md` §18.2). A raw, unsealed seed file MUST NOT be
 written.
 
-**File layout.** Both files are created owner-only by the keystore's `FileBackend`.
+**File layout.**
 
 | Path | Contents |
 |---|---|
-| `<identity_dir>/machine-identity` | the sealed `DIGOP1` seed blob |
-| `<identity_dir>-device/device` | 32 raw CSPRNG bytes, no header |
+| `<identity_dir>/machine-identity.dks` | the sealed `DIGOP1` seed blob |
+| `<identity_dir>-device/device.key` | 32 raw CSPRNG bytes, no header |
+
+Both are owner-only **on Unix** — mode `0600` set at `open` time, not by a later `chmod`. **On
+Windows both inherit the profile ACL**; neither the keystore's `FileBackend` (whose
+`enforce_owner_only` is `#[cfg(unix)]`) nor this node installs an explicit `D:P(A;;FA;;;<user>)`
+DACL for them. §16.4's wallet files DO install that DACL. A surface MUST NOT claim owner-only
+enforcement for the machine key on Windows; bringing it to §16.4's floor is tracked separately.
+
+The device key is a raw file rather than a keystore record deliberately: it is written with
+`create_new`, and that atomicity is load-bearing (below). `FileBackend::write` is tmp-plus-rename,
+i.e. REPLACE semantics.
 
 `<identity_dir>` is `$DIG_IDENTITY_DIR`, else `<config_dir>/dig` — byte-identical to the path the
 legacy plaintext seed used, so migration finds the existing identity. The device directory is a
@@ -5658,7 +5668,34 @@ directory alone MUST NOT yield the seed.
 **Migration.** On first start after upgrade, a legacy plaintext `<identity_dir>/identity_key.bin`
 MUST be adopted as the seed — never replaced by a fresh one, which would change the node's
 `peer_id` — sealed, and only then removed. The plaintext file MUST NOT be removed before the sealed
-copy has been read back from storage and compared.
+copy has been read back from storage and compared. The legacy existence check is bound by the same
+`try_exists` rule above: an unreadable legacy path MUST refuse, not mint.
+
+**`identity_key.bin` is a CROSS-TOOL artifact.** `digstore_remote::identity` owns the same path and
+the co-installed `digs` CLI reads it. Removing it therefore causes `digs` to mint a fresh
+**plaintext** seed into the same directory on its next run, silently changing its §21.9 operator
+identity — the node's identity is preserved, `digs`'s is not. The removal is still correct for the
+node, whose seed must not remain in plaintext; the coherent end state is `digs` reading the sealed
+store through this same module, which is tracked separately and is NOT satisfied by this section.
+
+**Existence MUST be answered by `try_exists`, never `Path::exists`.** `exists()` is
+`fs::metadata(..).is_ok()`, so it reports a locked, permission-denied or otherwise unreadable path
+as ABSENT — and the next thing the node does with an absent answer is MINT, which overwrites both
+halves. The node MUST distinguish present / absent / **undeterminable** and MUST refuse on the
+third rather than minting. This matters more after sealing than before it: the artifact this
+replaced was a single plaintext file, so the same misread produced a recoverable duplicate; with
+two coupled sealed halves it destroys the identity permanently.
+
+**The device key MUST be installed with `create_new`, and an existing one ADOPTED.** Two starts can
+overlap — a service restart racing the outgoing process, or a manual run beside the service. With
+replace semantics they can leave one process's device key beside the other's blob: a matched pair
+that no longer matches, which the no-re-mint rule below then prevents from ever self-healing. The
+OS atomic test-and-set makes that state unreachable rather than merely unlikely, because exactly
+one racer creates the key and the other adopts it, so both seal under the same key.
+
+**A mismatched or missing device key MUST be reported as a NAMED state** that identifies both
+halves by path and states the remedy. It is the one state the no-re-mint rule cannot heal, so a
+bare decrypt failure leaves an operator with a permanently dead node and nothing to act on.
 
 **A stored seed that will not open is an ERROR, never a re-mint.** The node MUST report the failure
 and continue with authenticated §21 sync disabled. Minting over it would hand the node a new

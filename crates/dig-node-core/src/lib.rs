@@ -4417,6 +4417,12 @@ impl Node {
                         Ok(store) => println!("dig-node: {}", store.protection_summary()),
                         Err(e) => eprintln!("dig-node: machine key protection unknown: {e}"),
                     }
+                    // NOTE: this copies the seed out of its `Zeroizing` wrapper, because
+                    // `Node::identity_seed` is a plain `Option<[u8; 32]>` that seam 7's
+                    // `KeyManager::identity_seed_for_peer` returns by value. Narrowing that type
+                    // is a seam-wide change, tracked separately -- it is not made cheaper by
+                    // doing it here, and doing it here would widen this diff across the peer
+                    // seam. The copy lives as long as the node does either way.
                     Some(*seed)
                 }
                 Err(e) => {

@@ -124,31 +124,14 @@ fn sibling(path: &Path, name: &str) -> PathBuf {
 
 // -- Presence ------------------------------------------------------------------------------------
 
-/// Whether an artifact is on disk. Deliberately not `bool`: the third answer — *we could not tell*
-/// — is the one that matters, and it lives in the `Err` of [`presence`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Presence {
-    Present,
-    Absent,
-}
-
-/// Answer whether `path` exists, treating "the question could not be answered" as an ERROR rather
-/// than as "no".
+/// Whether an artifact is on disk, and the refusal that goes with it.
 ///
-/// This exists because [`Path::exists`] does not. `exists()` collapses every metadata failure —
-/// permission denied, a locked file, a transient I/O error, an unmounted volume, an ACL that
-/// changed under an OS update — into a plain `false`. That was harmless while the answer only
-/// chose which screen to render. It stops being harmless the moment a `false` causes a wallet to
-/// be *minted*, because the seed IS the wallet: overwriting one is unrecoverable, unundoable, and
-/// the funds are gone. An unreadable path is not an absent one, and this function refuses to say
-/// it is.
-pub fn presence(path: &Path) -> io::Result<Presence> {
-    if path.try_exists()? {
-        Ok(Presence::Present)
-    } else {
-        Ok(Presence::Absent)
-    }
-}
+/// **Re-exported, not defined here.** The canonical definitions now live in
+/// [`dig_node_core::shared::at_rest`], so the node and the wallet host share ONE implementation of
+/// the rule rather than two copies that can drift. This module established the shape and its
+/// threat model; the definitions moved down because `dig-wallet` depends on `dig-node-core` and
+/// not the other way round.
+pub use dig_node_core::shared::at_rest::{presence, Presence};
 
 // -- Device key ----------------------------------------------------------------------------------
 
