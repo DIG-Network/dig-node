@@ -869,28 +869,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chia-peer"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c88dfecdddc7c1f65acadcacd2b89941991c1e4c59e79102e3e185ed73be233c"
-dependencies = [
- "async-trait",
- "chia",
- "chia-protocol 0.26.0",
- "chia-wallet-sdk 0.30.0",
- "dig-chainsource-interface 0.1.0",
- "futures-util",
- "hex",
- "log",
- "openssl",
- "openssl-sys",
- "rand 0.8.7",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
-]
-
-[[package]]
 name = "chia-protocol"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -969,32 +947,6 @@ checksum = "553363ce9550cfde0ae1306a0a79bf9afd36ea09e0222b874b6287b44ad9d178"
 dependencies = [
  "hex",
  "hex-literal",
-]
-
-[[package]]
-name = "chia-query"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f5c159fa038efe011e17cf30ed5500a43fa738e617440e0af74d4f8ce05219f"
-dependencies = [
- "chia",
- "chia-protocol 0.26.0",
- "chia-wallet-sdk 0.30.0",
- "clvmr 0.14.0",
- "dig-chainsource-interface 0.1.0",
- "futures-util",
- "hex",
- "log",
- "openssl",
- "openssl-sys",
- "rand 0.8.7",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]
@@ -3017,12 +2969,9 @@ dependencies = [
  "axum",
  "base64",
  "chia-bls 0.26.0",
- "chia-peer",
  "chia-protocol 0.26.0",
- "chia-query 0.5.1",
  "chia-sdk-utils 0.30.0",
  "chia-traits 0.26.0",
- "dig-chainsource-interface 0.1.0",
  "dig-chat-protocol",
  "dig-constants 0.11.0",
  "dig-constants 0.9.0",
@@ -3343,7 +3292,7 @@ dependencies = [
  "bip39",
  "chia",
  "chia-protocol 0.26.0",
- "chia-query 0.6.2",
+ "chia-query",
  "chia-sdk-test 0.30.0",
  "chia-sha2 0.26.0",
  "chia-traits 0.26.0",
