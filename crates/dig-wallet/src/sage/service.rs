@@ -587,7 +587,11 @@ mod one_pool_tests {
 
         assert!(
             Arc::strong_count(&seeded) > before,
-            "the live wiring opened its OWN chia_query pool rather than taking the transport's: a              node with live broadcast on would hold two independent sets of full-node sessions              with two notions of the peak"
+            concat!(
+                "the live wiring opened its OWN chia_query pool rather than taking the ",
+                "transport's: a node with live broadcast on would hold two independent sets ",
+                "of full-node sessions with two notions of the peak",
+            )
         );
 
         // Guards the assertion above against passing for the wrong reason: it must be the LIVE
