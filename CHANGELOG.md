@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.145.0] - 2026-08-24
+
+### Features
+- **custody:** Offline seed-export CLI so a custodied wallet survives custody removal (#331)
+
 ## [0.144.1] - 2026-08-23
 
 ### Features
