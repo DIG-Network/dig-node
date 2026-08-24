@@ -1466,9 +1466,10 @@ impl NatModuleTransport {
     /// hang-up, and nothing else.
     ///
     /// This carries NO policy: no ladder, no escalation, no waiting. Every one of those lives in
-    /// [`descriptor_ask`], which drives this. Keeping the primitive policy-free is what makes the
-    /// policy unbypassable — there is nothing here a call site could use to get a descriptor
-    /// "almost" the right way.
+    /// [`descriptor_ask`], which drives this. Keeping the primitive policy-free is what leaves a call
+    /// site nothing to get a descriptor "almost" the right way WITH — outside this file there is no
+    /// partial path to reach at all, and inside it a bypass is caught by the two production tests
+    /// named on [`descriptor_ask`] rather than by the compiler.
     ///
     /// Each round re-dials: an abandoned round's connection is gone, and the holder's descriptor memo
     /// -- not the connection -- is what makes the re-ask cheap. See [`DESCRIPTOR_ASK_DEADLINES`].
