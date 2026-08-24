@@ -117,7 +117,22 @@ runs:
           else
             # A missing release is a legitimate "not yet" while the release workflow is still
             # running, so it is treated the same as a missing asset rather than aborting early.
-            assets="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+            #
+            # `select(.state == "uploaded")` IS LOAD-BEARING. GitHub creates the asset row when an
+            # upload STARTS, in state `starting`, so a name becomes visible before its bytes are.
+            # Only `uploaded` means the file can actually be downloaded.
+            #
+            # Without it this guard would NARROW the dig-node#335 race rather than close it. The
+            # calling job is `needs: publish`, which orders it after release.yml's OWN upload —
+            # but package.yml is a separate workflow with no ordering relationship to it at all.
+            # So the poll could observe all fourteen names while a `.msi` or `.pkg` was still
+            # uploading, and `promote` would move `latest` onto a release whose download is
+            # incomplete: the same observable failure as #335, through a shorter window.
+            #
+            # A `sleep` is NOT an acceptable substitute. It would shrink the window without
+            # removing it and could not be shown to fail, so the release would LOOK guarded while
+            # still racing. Ask for the state; do not wait and hope.
+            assets="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[] | select(.state == "uploaded") | .name' 2>/dev/null || true)"
           fi
 
           missing=()

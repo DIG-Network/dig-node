@@ -1,11 +1,13 @@
 # STABLE binary release. On a `vX.Y.Z` tag (cut by the nightly-release orchestrator's stable job
 # — nightly-release.yml — either from the midnight cron detecting a version bump or from a manual
 # `workflow_dispatch`), this workflow builds the `dig-node` service binary + its `dign` alias for
-# every OS/arch (via the reusable build workflow) and publishes them to a STABLE GitHub Release:
-# `prerelease: false`, marked `latest`. Every per-OS/arch binary is published under the canonical
-# `dig-node-*` name (+ the `dign-*` alias) — SPEC §11.2; the duplicate legacy `dig-companion-*`
-# copy was dropped in #585. The changelog is already
-# inside the tag (the orchestrator committed it before tagging), so the notes carry the changelog.
+# every OS/arch (via the reusable build workflow) and publishes them to a STABLE GitHub Release
+# with `prerelease: false`. It is then marked `latest` by the `promote` job at the bottom of this
+# file — never by the upload itself — and only after the asset guard has confirmed the release
+# carries everything both of its consumers resolve (dig-node#335). Every per-OS/arch binary is
+# published under the canonical `dig-node-*` name (+ the `dign-*` alias) — SPEC §11.2; the
+# duplicate legacy `dig-companion-*` copy was dropped in #585. The changelog is already inside the
+# tag (the orchestrator committed it before tagging), so the notes carry the changelog.
 #
 # This is intentionally tag-ONLY: merges to main no longer build or release here (dig_ecosystem
 # #590 batches releases to the nightly cron + manual dispatch). Pre-merge coverage comes from
