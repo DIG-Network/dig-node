@@ -24,7 +24,8 @@
 //! Every file is embedded at compile time so these run hermetically.
 
 /// Owns the expected asset set the release is verified against.
-const CHECK_ACTION_YML: &str = include_str!("../../../.github/actions/check-release-assets/action.yml");
+const CHECK_ACTION_YML: &str =
+    include_str!("../../../.github/actions/check-release-assets/action.yml");
 
 /// Owns the platform matrix the binaries are actually built for.
 const BUILD_YML: &str = include_str!("../../../.github/workflows/build-binaries.yml");
