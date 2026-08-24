@@ -336,4 +336,10 @@ jobs:
           # Do NOT regenerate notes — release.yml (the binary release) owns the notes; this job
           # only appends the native-package assets to the same tag's release.
           generate_release_notes: false
+          # Nor does it own `latest` (dig-node#335). This job attaches FOUR of a stable release's
+          # fourteen assets; softprops promotes to `latest` by default, so on v0.145.0 this job
+          # made a release with no binaries at all the one dig-installer fetched from, five
+          # minutes before release.yml attached them. Promotion belongs to release.yml's
+          # `promote` job, which runs after the asset guard has confirmed BOTH publishers landed.
+          make_latest: "false"
           fail_on_unmatched_files: true

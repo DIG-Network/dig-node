@@ -84,8 +84,19 @@ Actions → **Nightly + stable release** → **Run workflow** → `channel: nigh
 
 ## Verify a release went live
 
-- **Stable:** `gh release view vX.Y.Z --repo DIG-Network/dig-node` — 4 OS/arch × (`dig-node-*` +
-  `dign-*`), `prerelease: false`, marked latest. Watch: `gh run watch <id>`.
+- **Stable:** `gh release view vX.Y.Z --repo DIG-Network/dig-node` — 5 platforms × (`dig-node-*` +
+  `dign-*`) plus the 4 native packages, 14 assets, `prerelease: false`, marked latest. Watch:
+  `gh run watch <id>`.
+- **A stable release is marked `latest` LAST, by `release.yml`'s `promote` job, and only after the
+  asset guard has read the real asset list.** So a stable release that is published but NOT latest
+  means the guard has not passed yet — either a build is still running, or a publisher never
+  landed. That is working as designed: the previous complete release keeps serving installs rather
+  than a half-built one taking over. Read the guard's step summary before doing anything by hand.
+- **Gotcha — re-running `package.yml` by hand after a release is already latest will DEMOTE it.**
+  Both publishers deliberately set `make_latest: false` (dig-node#335), so an out-of-band re-run
+  un-marks `latest`. Re-promote with
+  `gh release edit vX.Y.Z --repo DIG-Network/dig-node --latest`, or re-dispatch `release.yml`
+  against the tag, which verifies and promotes in the right order.
 - **Nightly:** `gh release view nightly --repo DIG-Network/dig-node` (rolling) or
   `gh release view nightly-YYYYMMDD` — `prerelease: true`.
 - **The native packages, on EITHER channel** — the single check that tells you the update system can
@@ -95,8 +106,18 @@ Actions → **Nightly + stable release** → **Run workflow** → `channel: nigh
   gh release view nightly --repo DIG-Network/dig-node --json assets --jq '[.assets[].name | select(endswith(".deb") or endswith(".pkg") or endswith(".msi"))]'
   ```
 
-  Expect three names. Fewer means dig-updater's `Feed` workflow will fail that channel with
-  `no matching release assets` — the failure mode dig_ecosystem#618 fixed.
+  Expect three names on nightly (four on stable, which also carries `arm64.deb`). Fewer means
+  dig-updater's `Feed` workflow will fail that channel with `no matching release assets` — the
+  failure mode dig_ecosystem#618 fixed.
+- **The raw binaries, on stable** — the check dig-installer depends on, and the one whose absence
+  caused dig-node#335:
+
+  ```bash
+  gh release view vX.Y.Z --repo DIG-Network/dig-node --json assets --jq '[.assets[].name | select(startswith("dign-") or test("^dig-node-[0-9].*(linux|macos|windows)"))] | length'
+  ```
+
+  Expect ten. Fewer means a fresh install 404s, because `dig-installer` resolves both the
+  `dig-node` and `dign` stems through `releases/latest`.
 
 ## Gotcha — moving a Windows host from `nightly` back to `stable`
 
@@ -120,10 +141,10 @@ a bug in the beacon:
 | File | Trigger | Role |
 |---|---|---|
 | `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator: stable (changelog + tag) + nightly (build + pre-release + prune). |
-| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag. |
+| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag, then verifies the asset set and promotes it to `latest`. Attaching assets never moves `latest` by itself. |
 | `build-binaries.yml` | `workflow_call` | Reusable cross-OS build, dual-named + `dign` (both channels call it). |
 | `package.yml` | PR + `push: tags: v*` + `workflow_call` | Builds the `.deb`/`.pkg`/`.msi`. Attaches them itself on a `v*` tag; on a `workflow_call` (the nightly channel) it leaves them as run artifacts for the caller to publish. |
-| `verify-release-assets.yml` | `workflow_call` (stable path) + `workflow_dispatch` | Asserts a `vX.Y.Z` release carries the four native install packages dig-updater's feedsign resolves dig-node by. Dispatch it at any tag to check a release by hand — a package-less release freezes the stable signed feed for every product. |
+| `verify-release-assets.yml` | `workflow_call` (stable path) + `workflow_dispatch` + PR self-test | Asserts a `vX.Y.Z` release carries all fourteen consumer-resolvable assets: the four native install packages dig-updater's feedsign resolves dig-node by, plus the five `dig-node-*` and five `dign-*` raw binaries dig-installer fetches through `releases/latest`. `release.yml` waits on it before promoting the release to `latest`, so an incomplete release never becomes the one users install from. Dispatch it at any tag to check a release by hand. The expected set lives in `.github/actions/check-release-assets`; a PR self-test drives that same action over a deliberately incomplete list and requires it to fail. |
 | `ci.yml` | PR + push to main | fmt/clippy + `cargo llvm-cov nextest --workspace` (pre-merge). NOTE: `ubuntu-latest` only — Windows/macOS build breaks are first caught by the nightly channel, not PR CI (SPEC §11 / follow-up). |
 
 ## Local build (dev)

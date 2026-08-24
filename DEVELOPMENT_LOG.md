@@ -4,6 +4,37 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## Two workflows assemble one release, so whichever finishes first used to publish it half-built (#335)
+
+A stable `vX.Y.Z` release of dig-node is built by **two** workflows that neither know about nor wait
+for each other: `release.yml` attaches the ten raw binaries (`dig-node-*`, `dign-*`) and
+`package.yml` attaches the four native install packages (`.deb`/`.pkg`/`.msi`). Both used
+`softprops/action-gh-release`, **whose `make_latest` defaults to true**, so *attaching assets* was
+also *promoting the release* — and the promotion was won by whichever job finished first.
+
+On v0.145.0 that was `package.yml`, at `01:47:49Z`. The binaries landed at `01:52:52Z`. For those
+five minutes `releases/latest` was a release carrying four packages and no binaries at all, and
+dig-installer resolves both the `dig-node` and `dign` stems through `releases/latest`
+(`dig-installer/src/release.rs:187`), so **every fresh install 404'd** — with no red anywhere,
+because both workflows genuinely succeeded at the job each was given.
+
+Two durable lessons:
+
+- **`releases/latest` is a user-facing pointer, not a bookkeeping detail.** The instant it moves,
+  users are served that release. It must be moved by ONE step that runs last and knows the whole
+  asset set — never as a side effect of an upload. `make_latest: false` on both publishers plus a
+  `promote` job gated on the asset guard is the shape.
+- **A guard is only as wide as the consumer list it was written against.** The asset guard existed
+  and reported success on this release, because it had been written for dig-updater's feedsign and
+  knew only the four package names. dig-installer was a second consumer nobody had told it about.
+  When a check enumerates what a release must carry, enumerate *per consumer*, and make the guard
+  falsifiable — the self-test in `verify-release-assets.yml` fails the build if the guard ever again
+  passes an asset list carrying only the packages.
+
+Corollary for diagnosis: a release asset set is a **race**, so measuring it once during a release
+run tells you the state at that instant and nothing about the outcome. Read the assets'
+`created_at` against the release's `published_at` before concluding assets were never attached.
+
 ## `initial_sync_complete` can NEVER latch on a default install — so it cannot mean "synced" (dig_ecosystem#2609)
 
 `sync_state.initial_sync_complete` is written by exactly one statement, `WalletDb::complete_catch_up`,
