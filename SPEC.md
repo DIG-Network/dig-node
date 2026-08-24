@@ -5627,6 +5627,53 @@ exactly one signature, a factor re-verified before it can be replaced — are al
 user key. Not holding one is the stronger guarantee, and it is the one the node now makes.
 
 
+## 18.25. Machine identity key at rest (dig_ecosystem#2168)
+
+The node's §21.9 identity seed is the node **authenticating itself**: it derives the BLS key the
+CA-signed `NodeCert` is bound to, and therefore the stable `peer_id = SHA-256(SPKI DER)` the peer
+network knows the node by (§19). It is **NOT user custody** — §18.20 retired the node-side user
+custody plane and MUST NOT be read as retiring this. A user's spend key never enters the node; this
+key never leaves it.
+
+**At-rest format.** The seed MUST be sealed in a `dig_keystore::opaque` `DIGOP1` container
+(AES-256-GCM, Argon2id) under a 32-byte CSPRNG **device key** — the same container and key model
+§16.4 specifies for the wallet host, so the node has ONE at-rest primitive rather than two. The
+node MUST consume `dig-keystore` with its `custody` feature OFF, so the user-custody API is not
+nameable from the engine (dig-keystore `SPEC.md` §18.2). A raw, unsealed seed file MUST NOT be
+written.
+
+**File layout.** Both files are created owner-only by the keystore's `FileBackend`.
+
+| Path | Contents |
+|---|---|
+| `<identity_dir>/machine-identity` | the sealed `DIGOP1` seed blob |
+| `<identity_dir>-device/device` | 32 raw CSPRNG bytes, no header |
+
+`<identity_dir>` is `$DIG_IDENTITY_DIR`, else `<config_dir>/dig` — byte-identical to the path the
+legacy plaintext seed used, so migration finds the existing identity. The device directory is a
+**SIBLING**, never a child: that separation IS the partial-exfiltration boundary (§16.4), and it is
+the only confidentiality this key has on a host with no hardware provider. A copy of the identity
+directory alone MUST NOT yield the seed.
+
+**Migration.** On first start after upgrade, a legacy plaintext `<identity_dir>/identity_key.bin`
+MUST be adopted as the seed — never replaced by a fresh one, which would change the node's
+`peer_id` — sealed, and only then removed. The plaintext file MUST NOT be removed before the sealed
+copy has been read back from storage and compared.
+
+**A stored seed that will not open is an ERROR, never a re-mint.** The node MUST report the failure
+and continue with authenticated §21 sync disabled. Minting over it would hand the node a new
+identity in exactly the situation where the real key is most likely still intact on the machine
+that sealed it.
+
+**Reporting protection honestly.** No platform hardware provider ships today (dig_ecosystem#1693),
+so every host resolves `Software(NotRequested)` and the node MUST say so rather than implying
+hardware backing. A surface reporting what protects the key MUST read the **blob's** tier, not the
+host's — a hardware-capable host does not retroactively protect bytes already at rest. On a blob
+this host cannot open, the node MUST NOT make a recovery promise: per dig-keystore `SPEC.md`
+§17.5b the envelope records a hardware *class* and carries no device identity, so the same error is
+returned for a blob copied off its machine (recoverable) and for the original machine with its
+trusted component wiped (permanent). The node MAY state that condition; it MUST NOT resolve it.
+
 ## 19. Peer network — NAT traversal, discovery, address book, and content location
 
 The standalone `dig-node` binary runs an L7 peer network (the in-process FFI/browser host does not —

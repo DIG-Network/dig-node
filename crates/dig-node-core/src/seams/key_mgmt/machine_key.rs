@@ -334,7 +334,10 @@ fn device_dir(dir: &Path) -> Result<std::path::PathBuf, MachineKeyError> {
         }
         _ => Err(MachineKeyError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("identity dir {} has no sibling to hold the device key", dir.display()),
+            format!(
+                "identity dir {} has no sibling to hold the device key",
+                dir.display()
+            ),
         ))),
     }
 }
@@ -463,8 +466,7 @@ mod tests {
             None => std::env::remove_var("DIG_IDENTITY_DIR"),
         }
         assert_eq!(
-            resolved,
-            dir,
+            resolved, dir,
             "DIG_IDENTITY_DIR must win, exactly as it does for the legacy plaintext seed"
         );
     }
@@ -500,9 +502,7 @@ mod tests {
         let dir = identity_dir(&root);
 
         let first = software_store(&dir).load_or_create(None).expect("mint");
-        let after_restart = software_store(&dir)
-            .load_or_create(None)
-            .expect("restart");
+        let after_restart = software_store(&dir).load_or_create(None).expect("restart");
 
         assert_eq!(
             first.as_slice(),
@@ -716,7 +716,9 @@ mod tests {
     fn an_unwrapped_blob_on_a_capable_host_is_reported_as_software() {
         let root = tempfile::tempdir().expect("tempdir");
         let dir = identity_dir(&root);
-        software_store(&dir).load_or_create(None).expect("mint unwrapped");
+        software_store(&dir)
+            .load_or_create(None)
+            .expect("mint unwrapped");
 
         let capable = hardware_store(&dir, 1);
 
