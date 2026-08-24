@@ -452,8 +452,16 @@ where
     LadderEnd::Exhausted
 }
 
-/// Ask for the descriptor at the pair's current phase, and escalate to a RELAY ask within the same
-/// invocation if the plain round was answered with a no.
+/// Obtain the descriptor for one holder: ask at the pair's current phase, escalate to a RELAY ask
+/// within the same invocation if the plain round was answered with a no, and wait out a hop that
+/// answers that it is relaying.
+///
+/// # Why all three steps live in ONE function
+///
+/// They are one decision -- what this node does about a holder that did not simply hand over the
+/// descriptor -- and splitting them would leave a caller free to take the first step and skip the
+/// rest. That is not hypothetical: a helper extracted purely for testability is a helper a call
+/// site can quietly stop using, and its tests keep passing while the behaviour is gone.
 ///
 /// # Why the escalation happens here rather than on the next invocation (dig-node#322)
 ///
@@ -472,19 +480,50 @@ where
 /// either -- it travels the same stream to the same process. Escalating an exhausted ladder would
 /// double this method's wall clock in precisely the case where the extra time buys nothing, so
 /// [`LadderEnd::Exhausted`] ends the invocation and [`LadderEnd::Refused`] is what licenses phase two.
-async fn descriptor_with_escalation<A, F>(
+async fn descriptor_via_rounds<A, F>(
     already_escalated: bool,
     mut round: A,
-) -> LadderEnd<DescriptorAnswer>
+) -> Result<ModuleInfo, DescriptorFailure>
 where
     A: FnMut(bool) -> F,
     F: std::future::Future<Output = LadderEnd<DescriptorAnswer>>,
 {
-    let first = round(already_escalated).await;
-    if already_escalated || !matches!(first, LadderEnd::Refused) {
-        return first;
+    let mut answer = round(already_escalated).await;
+    if !already_escalated && matches!(answer, LadderEnd::Refused) {
+        answer = round(true).await;
     }
-    round(true).await
+    match answer {
+        LadderEnd::Answered(DescriptorAnswer::Descriptor(info)) => Ok(*info),
+        // The hop is FETCHING the capsule for us, so the ask is not over -- see
+        // [`wait_for_relayed_descriptor`] for why the wait that follows is bounded by PROGRESS.
+        LadderEnd::Answered(DescriptorAnswer::RelayPending { staged_bytes }) => {
+            wait_for_relayed_descriptor(staged_bytes, || round(true))
+                .await
+                .map_err(DescriptorFailure::RelayWait)
+        }
+        LadderEnd::Refused | LadderEnd::Exhausted => Err(DescriptorFailure::NoAnswer),
+    }
+}
+
+/// Why a descriptor ask produced no descriptor. Named so the caller composes ONE transport error in
+/// this node's own vocabulary, and so the relay endings stay distinguishable in a log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescriptorFailure {
+    /// No holder answered, or the answer was no.
+    NoAnswer,
+    /// A hop was relaying and the wait on it ended without a descriptor.
+    RelayWait(RelayWaitEnd),
+}
+
+impl DescriptorFailure {
+    /// This node's own words for the failure. Never the peer's -- the crate sanitizes at its
+    /// `Display` layer and upstream must not defeat it (#1603).
+    fn reason(self) -> &'static str {
+        match self {
+            DescriptorFailure::NoAnswer => "getModuleInfo failed",
+            DescriptorFailure::RelayWait(end) => end.reason(),
+        }
+    }
 }
 
 /// What a descriptor ask came back with.
@@ -580,9 +619,6 @@ where
     let mut best = staged_at_first_ask;
     let mut last_advance = started;
     loop {
-        if started.elapsed() >= RELAY_MAX_WAIT {
-            return Err(RelayWaitEnd::Ceiling);
-        }
         tokio::time::sleep(RELAY_POLL_INTERVAL).await;
         match ask().await {
             LadderEnd::Answered(DescriptorAnswer::Descriptor(info)) => return Ok(*info),
@@ -725,29 +761,13 @@ impl ModuleTransport for NatModuleTransport {
             .escalation
             .escalate_for(store_id, root, provider_peer_id);
 
-        let answer = descriptor_with_escalation(already_escalated, |proxy| {
+        // The reason names the STEP and the sentinelled peer; the peer's own answer text is never
+        // embedded (#1603).
+        descriptor_via_rounds(already_escalated, |proxy| {
             self.descriptor_round(provider_peer_id, store_id, root, proxy)
         })
-        .await;
-
-        match answer {
-            LadderEnd::Answered(DescriptorAnswer::Descriptor(info)) => Ok(*info),
-            // The hop is FETCHING the capsule for us. Waiting on its progress is the whole of
-            // dig-node#333 -- see [`wait_for_relayed_descriptor`].
-            LadderEnd::Answered(DescriptorAnswer::RelayPending { staged_bytes }) => {
-                let ask = || self.descriptor_round(provider_peer_id, store_id, root, true);
-                wait_for_relayed_descriptor(staged_bytes, ask)
-                    .await
-                    .map_err(|end| DownloadError::transport(provider_peer_id, end.reason()))
-            }
-            // The reason names the STEP and the sentinelled peer; the peer's own answer text is never
-            // embedded (#1603) -- the crate sanitizes at its Display layer and upstream must not
-            // defeat it.
-            LadderEnd::Refused | LadderEnd::Exhausted => Err(DownloadError::transport(
-                provider_peer_id,
-                "getModuleInfo failed",
-            )),
-        }
+        .await
+        .map_err(|failure| DownloadError::transport(provider_peer_id, failure.reason()))
     }
 
     async fn fetch_module_range(
@@ -1085,7 +1105,10 @@ mod tests {
         let ladder: std::time::Duration = DESCRIPTOR_ASK_DEADLINES.iter().sum();
         let started = tokio::time::Instant::now();
 
-        let answer = wait_for_relayed_descriptor(0, || hop.ask()).await;
+        // Driven through `descriptor_via_rounds` -- the function `get_module_info` itself calls --
+        // rather than through the wait in isolation. A wait that is correct and no longer reached is
+        // exactly the shape a revert-proof misses.
+        let answer = descriptor_via_rounds(true, |_proxy| hop.ask()).await;
 
         assert!(
             answer.is_ok(),
@@ -1114,9 +1137,12 @@ mod tests {
         let hop = RelayingHop::new(0, None);
         let started = tokio::time::Instant::now();
 
-        let answer = wait_for_relayed_descriptor(0, || hop.ask()).await;
+        let answer = descriptor_via_rounds(true, |_proxy| hop.ask()).await;
 
-        assert_eq!(answer.unwrap_err(), RelayWaitEnd::Stalled);
+        assert_eq!(
+            answer.unwrap_err(),
+            DescriptorFailure::RelayWait(RelayWaitEnd::Stalled)
+        );
         assert!(
             started.elapsed() < RELAY_STALL_WINDOW + RELAY_POLL_INTERVAL * 2,
             "a frozen hop must be dropped at the stall window, not held to the ceiling -- elapsed              {:?}",
@@ -1138,9 +1164,12 @@ mod tests {
         let hop = RelayingHop::new(1, None);
         let started = tokio::time::Instant::now();
 
-        let answer = wait_for_relayed_descriptor(0, || hop.ask()).await;
+        let answer = descriptor_via_rounds(true, |_proxy| hop.ask()).await;
 
-        assert_eq!(answer.unwrap_err(), RelayWaitEnd::Ceiling);
+        assert_eq!(
+            answer.unwrap_err(),
+            DescriptorFailure::RelayWait(RelayWaitEnd::Ceiling)
+        );
         assert!(
             started.elapsed() >= RELAY_MAX_WAIT,
             "the wait must run to the ceiling before ending"
@@ -1156,11 +1185,26 @@ mod tests {
     /// the ceiling. A relay that died is not a relay in progress.
     #[tokio::test(start_paused = true)]
     async fn a_hop_that_stops_answering_ends_the_wait() {
-        let answer =
-            wait_for_relayed_descriptor(0, || async { LadderEnd::<DescriptorAnswer>::Refused })
-                .await;
+        // First round: relaying. Every round after: silence. Only the SECOND round can produce the
+        // abandonment, so a fixture that was silent from the start could not exhibit it.
+        let rounds = std::cell::Cell::new(0usize);
+        let answer = descriptor_via_rounds(true, |_proxy| {
+            let ix = rounds.get();
+            rounds.set(ix + 1);
+            async move {
+                if ix == 0 {
+                    LadderEnd::Answered(DescriptorAnswer::RelayPending { staged_bytes: 1 })
+                } else {
+                    LadderEnd::Exhausted
+                }
+            }
+        })
+        .await;
 
-        assert_eq!(answer.unwrap_err(), RelayWaitEnd::Abandoned);
+        assert_eq!(
+            answer.unwrap_err(),
+            DescriptorFailure::RelayWait(RelayWaitEnd::Abandoned)
+        );
     }
 
     // -- dig-node#322: escalating within one invocation -----------------------------------------------
@@ -1170,7 +1214,7 @@ mod tests {
     async fn phases_of(already_escalated: bool, endings: &[LadderEnd<DescriptorAnswer>]) -> Vec<bool> {
         let seen = std::cell::RefCell::new(Vec::new());
         let round = std::cell::Cell::new(0usize);
-        descriptor_with_escalation(already_escalated, |proxy| {
+        let _ = descriptor_via_rounds(already_escalated, |proxy| {
             seen.borrow_mut().push(proxy);
             let ix = round.get();
             round.set(ix + 1);
