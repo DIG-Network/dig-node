@@ -295,6 +295,31 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     out
 }
 
+/// The user-global DIG identity directory the node's machine key lives in:
+/// `$DIG_IDENTITY_DIR`, else `<config_dir>/dig` (`~/.config/dig`, `%APPDATA%\dig`).
+///
+/// This is deliberately the SAME directory `digstore_remote::identity` used for the plaintext
+/// `identity_key.bin`, so the migration finds the existing seed in place and the node keeps its
+/// `peer_id`. The path is reproduced here rather than imported because digstore keeps its
+/// `identity_dir` private; the `DIG_IDENTITY_DIR` override must stay byte-identical to it, or a
+/// node started under that variable would silently mint a second identity.
+///
+/// # Errors
+/// [`MachineKeyError::Io`] if the platform exposes no config directory.
+pub fn identity_store_dir() -> Result<std::path::PathBuf, MachineKeyError> {
+    if let Some(dir) = std::env::var_os("DIG_IDENTITY_DIR") {
+        return Ok(std::path::PathBuf::from(dir));
+    }
+    dirs::config_dir()
+        .map(|base| base.join("dig"))
+        .ok_or_else(|| {
+            MachineKeyError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no OS config directory available for the dig identity key",
+            ))
+        })
+}
+
 /// This host's hardware key-wrapping provider.
 ///
 /// **`None` on every host today.** `dig-keystore` ships no platform binding — its `hardware`
@@ -360,6 +385,31 @@ mod tests {
     /// Whether `haystack` contains `needle` as a contiguous run.
     fn contains_run(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// **Proves:** `DIG_IDENTITY_DIR` still selects the identity directory.
+    ///
+    /// **Catches:** dropping the override while reproducing digstore's private `identity_dir`.
+    /// That regression is invisible on a developer machine — the default branch works fine — and
+    /// shows up only as a node started under the variable minting a SECOND identity beside the
+    /// one it already had, silently changing its `peer_id`.
+    #[test]
+    fn the_identity_dir_override_is_honoured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("DIG_IDENTITY_DIR");
+        std::env::set_var("DIG_IDENTITY_DIR", dir.path());
+
+        let resolved = identity_store_dir().expect("override resolves");
+
+        match previous {
+            Some(v) => std::env::set_var("DIG_IDENTITY_DIR", v),
+            None => std::env::remove_var("DIG_IDENTITY_DIR"),
+        }
+        assert_eq!(
+            resolved,
+            dir.path(),
+            "DIG_IDENTITY_DIR must win, exactly as it does for the legacy plaintext seed"
+        );
     }
 
     /// **Proves:** the seed survives a round trip through the container at all — the control every
@@ -518,10 +568,19 @@ mod tests {
         let store = software_store(dir.path());
         store.load_or_create(None).expect("mint");
 
+        // The two tiers answer different questions and are pinned separately on purpose: the HOST
+        // has no provider, and the BLOB is therefore an unwrapped software envelope. Asserting
+        // only one of them is how a summary ends up rendering the wrong one (see
+        // `an_unwrapped_blob_on_a_capable_host_is_reported_as_software`, where they disagree).
+        assert_eq!(
+            store.backend.tier(),
+            &ProtectionTier::Software(DegradeReason::NotRequested),
+            "no platform provider ships today, so this is the honest HOST tier"
+        );
         assert_eq!(
             store.protection().expect("tier"),
-            ProtectionTier::Software(DegradeReason::NotRequested),
-            "no provider ships today, so this is the honest tier"
+            ProtectionTier::Software(DegradeReason::BlobNotWrapped),
+            "with no hardware to wrap it, the stored blob is the bare passphrase envelope"
         );
 
         let summary = store.protection_summary();

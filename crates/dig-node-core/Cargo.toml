@@ -147,6 +147,10 @@ getrandom = "0.2"
 # it at all, so nothing crosses between lines -- and adopting 0.10 now avoids routing the node's
 # identity onto a type identity that was about to change under it.
 dig-keystore = "0.10"
+# The machine key lives in the SAME user-global identity dir digstore_remote used for the
+# plaintext seed (`<config_dir>/dig`), so the #2168 migration finds it in place and the node
+# keeps its peer_id. digstore keeps its own `identity_dir` private, so the path is reproduced.
+dirs = "5"
 # Keeps the unsealed seed off the heap after use, matching what dig-keystore hands back.
 zeroize = "1"
 
