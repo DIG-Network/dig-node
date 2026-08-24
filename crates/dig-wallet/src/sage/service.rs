@@ -92,6 +92,11 @@ struct LiveWallet {
     confirmer: Arc<dyn Confirmer>,
     /// The live lineage source (CAT/singleton parent-spend reads).
     lineage: Arc<dyn LineageSource>,
+    /// The ONE `chia_query` client every field above is built on — the wallet transport's own.
+    ///
+    /// Held rather than dropped so the "one shared client" claim in this struct's docs is a fact a
+    /// test can check, instead of a comment that a later refactor could silently falsify.
+    client: Arc<chia_query::ChiaQuery>,
 }
 
 /// A fully-assembled, ready-to-serve wallet: the dispatch backend, the shared event bus the WS
@@ -153,15 +158,6 @@ impl WalletService {
         let watchlist = WatchRegistry::new(config_dir);
         let tip_events = Arc::new(TipEventBus::default());
 
-        // Live-broadcast wiring (§18.12), gated on the config flag. A construction failure (no peer
-        // reachable / offline) is NON-FATAL and DISABLES live broadcast — a half-built client must
-        // never send. Default OFF: `None` here reproduces the offline-safe shipped behaviour.
-        let live = if cfg.enable_live_broadcast {
-            build_live_wallet().await
-        } else {
-            None
-        };
-
         // The chain transport (dig_ecosystem#2376) serves the wallet's chain READS and the push of
         // an already-signed bundle on EVERY install, live-broadcast or not. Those two need no key,
         // so they are not the question `enable_live_broadcast` answers -- that flag governs whether
@@ -181,6 +177,19 @@ impl WalletService {
         // read a profile at all — while holding five peers that could have answered.
         let chain = Arc::new(ChainTransport::new().with_peer_reads(db.clone()));
         let fallback: Arc<dyn ChainFallback> = chain.clone();
+
+        // Live-broadcast wiring (§18.12), gated on the config flag. A construction failure (no peer
+        // reachable / offline) is NON-FATAL and DISABLES live broadcast — a half-built client must
+        // never send. Default OFF: `None` here reproduces the offline-safe shipped behaviour.
+        //
+        // Built AFTER the transport, and from it: the broadcaster, confirmer and lineage source all
+        // ride the transport's single peer pool. Building it first is what gave a live node two
+        // independent pools (dig_ecosystem#2761).
+        let live = if cfg.enable_live_broadcast {
+            build_live_wallet(&chain).await
+        } else {
+            None
+        };
 
         // Hold Chia peers because the node is RUNNING, not because somebody asked
         // (dig_ecosystem#2806).
@@ -301,15 +310,20 @@ impl WalletService {
     }
 }
 
-/// Build the live-broadcast wiring (§18.12): ONE shared `chia_query` client backing a real
-/// broadcaster, a confirming broadcaster, a confirmer and a lineage source.
+/// Build the live-broadcast wiring (§18.12) on `chain`'s client: ONE shared `chia_query` client
+/// backing a real broadcaster, a confirming broadcaster, a confirmer and a lineage source.
+///
+/// The client is TAKEN from the transport rather than built here, so the live sender and the
+/// wallet's reads speak to the same set of full nodes. Building one here gave a live node two
+/// independent peer pools with two notions of the peak (dig_ecosystem#2761); taking it as a
+/// parameter makes that second pool unexpressible rather than merely unused.
+///
 /// Returns `None` (non-fatally, with a logged warning) when the client cannot start — so
 /// `enable_live_broadcast` on an offline/peerless host degrades to no-broadcast (never a
 /// half-built live sender). Mainnet only (the node's wallet is mainnet custody).
-async fn build_live_wallet() -> Option<LiveWallet> {
-    match chia_query::ChiaQuery::new(chia_query::ChiaQueryConfig::default()).await {
-        Ok(q) => {
-            let query = Arc::new(q);
+async fn build_live_wallet(chain: &ChainTransport) -> Option<LiveWallet> {
+    match chain.shared_client().await {
+        Ok(query) => {
             let raw: Arc<dyn Broadcaster> = Arc::new(ChiaQueryBroadcaster::new(query.clone()));
             let confirmer: Arc<dyn Confirmer> = Arc::new(ChiaQueryConfirmer::new(query.clone()));
             let general: Arc<dyn Broadcaster> =
@@ -324,6 +338,7 @@ async fn build_live_wallet() -> Option<LiveWallet> {
                 general_broadcaster: general,
                 confirmer,
                 lineage,
+                client: query,
             })
         }
         Err(e) => {
@@ -522,6 +537,71 @@ mod tests {
             svc2.watchlist.registered(),
             vec![key],
             "the registered watch key must reopen from disk"
+        );
+    }
+}
+
+/// The live-broadcast wiring and the wallet's chain reads MUST share ONE `chia_query` client
+/// (dig_ecosystem#2761, dig-node#249).
+///
+/// `build_live_wallet` used to call `ChiaQuery::new` itself, so a node with live broadcast enabled
+/// held TWO independent five-peer pools — two sets of TLS sessions to two independently-chosen sets
+/// of full nodes, each with its own notion of the peak, and nothing able to reconcile them. The
+/// wiring now takes the client from the transport, so the second pool is not merely unused but
+/// unexpressible: `build_live_wallet` has no way to construct one.
+///
+/// The fixture SEEDS the transport with a known client and asserts the wiring hands back that exact
+/// `Arc`. Pointer identity is the property under test — asserting that reads merely agree would
+/// pass just as well against two pools that happened to pick the same peers, which is the
+/// coincidence this ticket exists to remove.
+#[cfg(test)]
+mod one_pool_tests {
+    use super::*;
+
+    /// A `ChiaQuery` that dials nothing: `max_peers: 0` leaves the peer tier with nothing to draw,
+    /// so it performs no DNS and no TLS. The coinset tier stays enabled only because chia-query
+    /// derives `PeerRequirement::Optional` from it, which is what lets a zero-peer client construct
+    /// at all.
+    async fn offline_client() -> Arc<chia_query::ChiaQuery> {
+        Arc::new(
+            chia_query::ChiaQuery::new(chia_query::ChiaQueryConfig {
+                max_peers: 0,
+                coinset_fallback_enabled: true,
+                ..Default::default()
+            })
+            .await
+            .expect("a zero-peer client with the coinset tier enabled always constructs"),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_live_wiring_reuses_the_transports_client_instead_of_opening_a_second_pool() {
+        let seeded = offline_client().await;
+        let chain = ChainTransport::with_client(seeded.clone());
+
+        let live = build_live_wallet(&chain)
+            .await
+            .expect("an already-built client makes the live wiring infallible");
+
+        assert!(
+            Arc::ptr_eq(&live.client, &seeded),
+            "the live wiring opened its OWN chia_query pool: a node with live broadcast on would              hold two independent sets of full-node sessions with two notions of the peak"
+        );
+    }
+
+    /// The transport itself hands out ONE client, not one per caller — the same property from the
+    /// other side. Without it, sharing the transport would still yield a pool per consumer.
+    #[tokio::test]
+    async fn the_transport_hands_every_caller_the_same_client() {
+        let seeded = offline_client().await;
+        let chain = ChainTransport::with_client(seeded.clone());
+
+        let first = chain.shared_client().await.expect("seeded");
+        let second = chain.shared_client().await.expect("seeded");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two calls returned two clients, so each consumer would hold its own peer pool"
         );
     }
 }
