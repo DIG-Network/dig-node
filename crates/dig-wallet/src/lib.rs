@@ -642,15 +642,24 @@ async fn wc_dispatch(
         });
     }
 
-    // Defence in depth: a Sage that implemented an export-flavoured method must never
-    // become a seed-exfiltration path through the dapp surface. Refused before the request
-    // can reach the relay.
+    // Defence in depth against a FUTURE catalogue, not against today's input.
+    //
+    // Measured: this block is currently UNREACHABLE. Every export-class spelling is
+    // already absent from `WC_METHOD_CATALOGUE`, so the check below refuses all of them
+    // with the identical 501 and deleting this one changes nothing observable — a
+    // mutation that removes it leaves the whole suite green. It is kept, and kept FIRST,
+    // because the ordering is what survives the change that makes it matter: the day an
+    // export-flavoured method is added to the catalogue, this is the check that still
+    // refuses it. `export_class_methods_are_absent_from_the_catalogue` pins the
+    // disjointness that makes the claim true today, and is the test that actually fails
+    // if someone breaks it.
     if is_export_class_method(method) {
         return Err(unsupported(method));
     }
 
     // Unknown methods keep answering 501 rather than being forwarded blind, so the
-    // advertised catalogue and the dispatchable set stay the same set.
+    // advertised catalogue and the dispatchable set stay the same set. THIS is the check
+    // that is load-bearing today.
     if !WC_METHOD_CATALOGUE.contains(&method) {
         return Err(unsupported(method));
     }
@@ -1613,6 +1622,12 @@ mod tests {
     /// surface a seed-exfiltration path through any Sage that implemented such a method.
     /// The counter proves nothing was ever parked; the control below proves the pump
     /// would have caught it if something had been.
+    ///
+    /// **What this does NOT prove, measured rather than assumed:** it cannot tell which of
+    /// `wc_dispatch`'s two refusals fired. Removing the export-class guard leaves this
+    /// green, because the catalogue check refuses the same names identically. The outcome
+    /// is pinned here; the ordering that will matter later is pinned by
+    /// `export_class_methods_are_absent_from_the_catalogue`.
     #[tokio::test]
     async fn delegate_never_forwards_export_class_methods() {
         let st = Arc::new(AppState::default());
@@ -1654,6 +1669,27 @@ mod tests {
             Ok(true),
             "the pump must be able to observe a parked request"
         );
+    }
+
+    /// No export-class spelling may appear in the advertised catalogue.
+    ///
+    /// This is the invariant the export-class guard's redundancy rests on, and the only
+    /// assertion in this file that fails if someone breaks it. Adding, say,
+    /// `chip0002_export` to `WC_METHOD_CATALOGUE` would make the catalogue check wave it
+    /// through to Sage; the guard ordered before it is what still refuses, and this test
+    /// is what says the situation ever arose.
+    ///
+    /// It is written over the catalogue constant rather than over dispatch on purpose:
+    /// dispatch answers 501 either way, so a behavioural check cannot see the difference.
+    #[test]
+    fn export_class_methods_are_absent_from_the_catalogue() {
+        for m in WC_METHOD_CATALOGUE {
+            assert!(
+                !is_export_class_method(m),
+                "{m} is advertised as dispatchable AND is export-class — the catalogue \
+                 check would forward it, and only the guard ordered before it refuses"
+            );
+        }
     }
 
     /// The master mnemonic is not reachable through the dapp-facing dispatch under any
