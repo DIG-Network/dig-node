@@ -1302,17 +1302,9 @@ mod descriptor_ask {
             assert_eq!(phases, vec![true]);
         }
 
-        /// A canonical 64-hex id built from a repeated byte, so a test id can never be the wrong length.
-        fn id_of(byte: u8) -> String {
-            [byte; 32].iter().map(|b| format!("{b:02x}")).collect()
-        }
-
-        fn store() -> String {
-            id_of(0xAB)
-        }
-
+        /// A canonical 64-hex id, so a fixture descriptor's `module_hash` is the right shape.
         fn root() -> String {
-            id_of(0xCD)
+            [0xCDu8; 32].iter().map(|b| format!("{b:02x}")).collect()
         }
     }
 }
