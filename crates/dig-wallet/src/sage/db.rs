@@ -5766,3 +5766,5 @@ mod stored_hex_is_case_insensitive {
         );
     }
 }
+
+// dig_ecosystem#3127 (WIP): standalone client coin reservations served over the control interface.
