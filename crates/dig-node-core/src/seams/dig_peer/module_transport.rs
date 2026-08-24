@@ -1169,7 +1169,17 @@ mod tests {
         let hop = RelayingHop::new(1, None);
         let started = tokio::time::Instant::now();
 
-        let answer = descriptor_via_rounds(true, |_proxy| hop.ask()).await;
+        // Bounded at twice the ceiling so a REGRESSION FAILS rather than hangs. Without it the
+        // absent-ceiling case loops forever burning CPU on virtual time, which reads in CI as a stuck
+        // job rather than a failed assertion -- and a test that hangs on regression is a landmine for
+        // whoever trips it. Measured: this test's own revert-proof spun for 659 CPU-seconds before it
+        // was killed.
+        let answer = tokio::time::timeout(
+            RELAY_MAX_WAIT * 2,
+            descriptor_via_rounds(true, |_proxy| hop.ask()),
+        )
+        .await
+        .expect("the wait MUST end at the ceiling; an unbounded wait is the NC-12 defect itself");
 
         assert_eq!(
             answer.unwrap_err(),
