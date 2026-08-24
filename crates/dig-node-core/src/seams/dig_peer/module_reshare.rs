@@ -495,6 +495,49 @@ impl StagingDisposition {
     }
 }
 
+/// Reports the end of a pull when it goes out of scope, so the boundary is reported on EVERY exit —
+/// including an unwinding panic.
+///
+/// # Why a guard and not a statement after the `await`
+///
+/// A plain call after `downloader.download(...).await` is skipped when that await PANICS, and a
+/// panic here is reachable rather than theoretical: the tier-0 precache path runs
+/// `run_round -> fetch_and_cache -> warm_capped -> download` inside a real
+/// [`catch_unwind`](crate::shared::panic_guard) added precisely so a panic there is survived, and this
+/// crate does not build with `panic = "abort"`. So the task continues and the ledger entry leaks.
+///
+/// The leak is not a tidiness matter — it restores the two defects this budget exists to remove: the
+/// capsule becomes permanently ineligible for the relay path, and the resulting exhaustion is composed
+/// into a transport error NAMING A PEER, which `SPEC.md` §21.1 forbids in as many words.
+///
+/// `Drop` runs during unwinding, so the guard reports on the panic path and the returning paths
+/// through one mechanism. That is the same lesson this file has already paid for twice: prefer making
+/// the omission unexpressible over asserting that it does not occur.
+struct PullBoundary<'a> {
+    /// Told the pull is over. Borrowed, so the guard cannot outlive the warmer driving the pull.
+    lifecycle: &'a dyn super::PullLifecycle,
+    /// The capsule whose pull this is.
+    store_hex: &'a str,
+    root_hex: &'a str,
+}
+
+impl<'a> PullBoundary<'a> {
+    /// Open the boundary. It closes when the value drops.
+    fn new(lifecycle: &'a dyn super::PullLifecycle, store_hex: &'a str, root_hex: &'a str) -> Self {
+        PullBoundary {
+            lifecycle,
+            store_hex,
+            root_hex,
+        }
+    }
+}
+
+impl Drop for PullBoundary<'_> {
+    fn drop(&mut self) {
+        self.lifecycle.pull_finished(self.store_hex, self.root_hex);
+    }
+}
+
 /// Everything a capsule warm needs, resolved once at composition time.
 ///
 /// `anchor_resolver` is what makes the whole reshare path trustworthy: the generation root the pull is
@@ -794,12 +837,14 @@ impl CapsuleWarmer {
             config,
         );
 
-        let pulled = downloader.download(store_hex, root_hex, &sink).await;
-        // The pull is over, whatever it returned. Reported BEFORE the outcome is inspected, so no
-        // early return below can skip it: a failed pull is exactly the one that spent relay budget on
-        // hops that did not deliver, and leaving its ledger entry behind would charge the NEXT pull of
-        // this capsule for it (dig-node#333 review).
-        self.pull_lifecycle.pull_finished(store_hex, root_hex);
+        // The boundary is scoped to the download and nothing else, so it is reported the moment the
+        // pull ends — on success, on failure, and on a PANIC that unwinds through it. A failed pull is
+        // exactly the one that spent relay budget on hops that did not deliver, and leaving its ledger
+        // entry behind would charge the NEXT pull of this capsule for it (dig-node#333 review).
+        let pulled = {
+            let _boundary = PullBoundary::new(self.pull_lifecycle.as_ref(), store_hex, root_hex);
+            downloader.download(store_hex, root_hex, &sink).await
+        };
 
         // 3. ONLY `Ok` may lead to a holder claim. Not finalize-observed, not partial staging, not an
         //    `Err` that happened to leave bytes behind.
@@ -1980,6 +2025,96 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&failed_dir);
         let _ = std::fs::remove_dir_all(&ok_dir);
+    }
+
+    /// A holder whose descriptor ask PANICS — the shape a real bug in the pull takes.
+    struct PanickingHolder;
+
+    #[async_trait::async_trait]
+    impl dig_download::ModuleTransport for PanickingHolder {
+        async fn get_module_info(
+            &self,
+            _provider_peer_id: &str,
+            _store_id: &str,
+            _root: &str,
+        ) -> Result<dig_download::ModuleInfo, dig_download::DownloadError> {
+            panic!("a bug inside the pull");
+        }
+
+        async fn fetch_module_range(
+            &self,
+            _provider_peer_id: &str,
+            _store_id: &str,
+            _root: &str,
+            _offset: u64,
+            _length: u64,
+        ) -> Result<Vec<u8>, dig_download::DownloadError> {
+            unreachable!("the descriptor panics first");
+        }
+    }
+
+    /// **Proves (dig-node#333 re-gate 3):** a pull that PANICS still reports its end, so the relay-wait
+    /// ledger cannot leak an entry.
+    ///
+    /// **Why this is reachable rather than theoretical:** the tier-0 precache path runs
+    /// `run_round -> fetch_and_cache -> warm_capped -> download` inside
+    /// [`crate::shared::panic_guard::catch_iteration`], added so a panic there is SURVIVED, and this
+    /// crate does not build with `panic = "abort"`. A plain statement after the `.await` is skipped by
+    /// the unwind, the task then continues, and the entry is never released.
+    ///
+    /// **What the leak costs, which is why this is not tidiness:** the capsule becomes permanently
+    /// ineligible for the relay path, and the resulting exhaustion is composed into a transport error
+    /// NAMING A PEER — which `SPEC.md` §21.1, as amended by this same change, says MUST NOT happen.
+    ///
+    /// **The fixture is the production guard, driven by a production panic**, through the same
+    /// `AssertUnwindSafe(...).catch_unwind()` the tier-0 loop uses, so it exercises the unwind rather
+    /// than simulating it.
+    #[tokio::test]
+    async fn a_pull_that_panics_still_reports_its_end() {
+        use futures::FutureExt;
+
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        let dir = temp_dir("lifecycle-panic");
+        let spy = Arc::new(RecordingLifecycle::default());
+        let content = dig_download::module_content_id(&store_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+        let warmer = CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            Arc::new(PanickingHolder),
+            Arc::clone(&spy) as Arc<dyn crate::seams::dig_peer::PullLifecycle>,
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        );
+
+        // The panic message is expected; keep it out of the test log so a real panic stays visible.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::AssertUnwindSafe(warmer.warm(&store_hex, &root_hex))
+            .catch_unwind()
+            .await;
+        std::panic::set_hook(previous);
+
+        assert!(
+            outcome.is_err(),
+            "the control: the pull must genuinely PANIC and be caught, or the report below is just              the ordinary return path"
+        );
+        assert_eq!(
+            spy.finished.lock().expect("lifecycle lock").as_slice(),
+            &[(store_hex.clone(), root_hex.clone())],
+            "an unwinding pull must still report its end — a statement after the await is skipped by              the unwind, and the tier-0 catch_unwind then continues with the entry leaked"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **Proves (dig-node#276, unit 4):** a capsule pulled ON A STRANGER'S BEHALF lands in the cache —

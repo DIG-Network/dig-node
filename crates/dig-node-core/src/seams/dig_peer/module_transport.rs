@@ -327,8 +327,16 @@ const RELAY_WAIT_BUDGET_PER_PULL: std::time::Duration = descriptor_ask::RELAY_MA
 ///
 /// Keyed by `(store_id, root)` — the generation, which is exactly what one `ModuleDownloader::download`
 /// call is about, so the key IS the pull. Entries are this node's own pulls, so growth tracks its own
-/// activity and not anything a peer controls; it is still capped, and evicting the oldest merely
-/// refreshes the budget of a capsule this node stopped working on long ago.
+/// activity and not anything a peer controls.
+///
+/// # The FIFO cap is a backstop, not the working mechanism
+///
+/// Entries are released when their pull ends ([`PullLifecycle`]), and `WarmRegistry` admits at most
+/// [`DEFAULT_MAX_CONCURRENT_WARMS`](super::module_reshare::DEFAULT_MAX_CONCURRENT_WARMS) generations
+/// node-wide, so only a handful of entries are ever LIVE at once. Reaching [`Self::MAX_ENTRIES`] would
+/// therefore take a release path that had stopped working, and evicting a LIVE entry would need the
+/// 1023 older ones to be live too — which the warm cap makes impossible. The cap exists so that a
+/// future leak is bounded, not because entries are expected to accumulate.
 #[derive(Default)]
 struct RelayWaitBudget {
     /// Relay time already spent per capsule.
