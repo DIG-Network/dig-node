@@ -80,11 +80,60 @@ jobs:
       - name: Create / update the STABLE release and attach binaries
         uses: softprops/action-gh-release@v2
         with:
-          # `prerelease: false` + `make_latest: true`: a stable release is the one that moves
-          # `latest`. Nightlies (nightly-release.yml) are always prerelease + never latest, so a
-          # nightly can never masquerade as this stable download.
+          # `prerelease: false` marks this a stable release. `make_latest: false` is DELIBERATE
+          # and is the dig-node#335 fix: attaching assets must not be what moves `latest`.
+          #
+          # A stable release is assembled by TWO workflows. This one attaches the binaries;
+          # package.yml attaches the native install packages. Whichever finished first used to
+          # promote the half-built release, and on v0.145.0 that was package.yml at 01:47:49Z —
+          # five minutes and three seconds before the binaries landed at 01:52:52Z. For that
+          # window `releases/latest` was a release with no `dig-node-*` or `dign-*` binary at all,
+          # and dig-installer resolves both stems through `releases/latest`, so every fresh
+          # install 404'd.
+          #
+          # Promotion now happens in the `promote` job below, gated on the asset guard, so
+          # `latest` can only ever name a release a user can actually install from. Nightlies
+          # (nightly-release.yml) remain prerelease + never latest, so a nightly still cannot
+          # masquerade as this stable download.
           prerelease: false
-          make_latest: "true"
+          make_latest: "false"
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  # The release is complete only when BOTH publishers have finished, and this is the only job that
+  # knows when that is: the guard polls the published asset list until it holds every asset
+  # dig-updater feedsign and dig-installer resolve, or fails.
+  verify:
+    name: Verify the release is complete
+    needs: publish
+    if: github.ref_type == 'tag'
+    uses: ./.github/workflows/verify-release-assets.yml
+    with:
+      tag: ${{ github.ref_name }}
+
+  # PROMOTION IS THE LAST STEP, NOT A SIDE EFFECT OF UPLOADING (dig-node#335).
+  #
+  # `releases/latest` is a user-facing pointer: dig-installer fetches through it, so the moment it
+  # moves is the moment users are served that release. Moving it only after the guard has read the
+  # real asset list means an incomplete release is never `latest` — the previous complete release
+  # keeps serving installs, which is the correct failure mode. A release that never completes
+  # simply never gets promoted, and stays visible as a non-latest release for diagnosis.
+  promote:
+    name: Promote the release to latest
+    needs: verify
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Mark the verified release as latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$REPO" --latest
+          echo "$TAG is now releases/latest — verified to carry every asset dig-installer and dig-updater resolve."

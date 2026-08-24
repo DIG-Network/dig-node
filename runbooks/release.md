@@ -120,10 +120,10 @@ a bug in the beacon:
 | File | Trigger | Role |
 |---|---|---|
 | `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator: stable (changelog + tag) + nightly (build + pre-release + prune). |
-| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag. |
+| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag, then verifies the asset set and promotes it to `latest`. Attaching assets never moves `latest` by itself. |
 | `build-binaries.yml` | `workflow_call` | Reusable cross-OS build, dual-named + `dign` (both channels call it). |
 | `package.yml` | PR + `push: tags: v*` + `workflow_call` | Builds the `.deb`/`.pkg`/`.msi`. Attaches them itself on a `v*` tag; on a `workflow_call` (the nightly channel) it leaves them as run artifacts for the caller to publish. |
-| `verify-release-assets.yml` | `workflow_call` (stable path) + `workflow_dispatch` | Asserts a `vX.Y.Z` release carries the four native install packages dig-updater's feedsign resolves dig-node by. Dispatch it at any tag to check a release by hand — a package-less release freezes the stable signed feed for every product. |
+| `verify-release-assets.yml` | `workflow_call` (stable path) + `workflow_dispatch` + PR self-test | Asserts a `vX.Y.Z` release carries all fourteen consumer-resolvable assets: the four native install packages dig-updater's feedsign resolves dig-node by, plus the five `dig-node-*` and five `dign-*` raw binaries dig-installer fetches through `releases/latest`. `release.yml` waits on it before promoting the release to `latest`, so an incomplete release never becomes the one users install from. Dispatch it at any tag to check a release by hand. The expected set lives in `.github/actions/check-release-assets`; a PR self-test drives that same action over a deliberately incomplete list and requires it to fail. |
 | `ci.yml` | PR + push to main | fmt/clippy + `cargo llvm-cov nextest --workspace` (pre-merge). NOTE: `ubuntu-latest` only — Windows/macOS build breaks are first caught by the nightly channel, not PR CI (SPEC §11 / follow-up). |
 
 ## Local build (dev)

@@ -1,30 +1,31 @@
-# The RELEASE ASSET GUARD (dig_ecosystem#2290).
+# The RELEASE ASSET GUARD (dig_ecosystem#2290, widened by dig-node#335).
 #
-# A `vX.Y.Z` release of dig-node is not shippable just because its binaries exist. dig-updater's
-# feedsign resolves dig-node by the NATIVE INSTALL PACKAGE file names — the beacon installs
-# dig-node by handing a package to msiexec/installer/dpkg, it never places a bare binary — and it
-# FAILS CLOSED on the whole signed manifest when even one component cannot be resolved. So a
-# stable release that carries binaries but no `.msi`/`.pkg`/`.deb` does not merely ship an
-# incomplete dig-node: it freezes auto-update for EVERY product on the stable channel.
+# A `vX.Y.Z` release of dig-node is not shippable just because a release object exists. Two
+# separate consumers resolve assets out of it, and a release that satisfies one and not the other
+# is broken for real users:
 #
-# That is not hypothetical. `v0.99.9` shipped binaries only, feedsign failed closed on four
-# consecutive runs, and the stable manifest sat frozen and then EXPIRED for ~15 hours while every
-# individual workflow run in this repo reported success. Nothing was red, because nothing was
-# asking the one question that mattered: does the published release actually carry the assets the
-# feed needs?
+#   * dig-updater's feedsign resolves dig-node by the NATIVE INSTALL PACKAGE file names and FAILS
+#     CLOSED on the whole signed manifest when one cannot be resolved. `v0.99.9` shipped binaries
+#     only, and the stable manifest sat frozen and then EXPIRED for ~15 hours while every
+#     individual workflow run in this repo reported success.
+#   * dig-installer resolves the RAW `dig-node` and `dign` binaries through `releases/latest`.
+#     `v0.145.0` became `latest` carrying only the four native packages, five minutes before its
+#     binaries were attached, and every fresh install 404'd for that window (dig-node#335).
 #
-# This workflow asks it, and is the only place that does.
+# The expected set for BOTH consumers lives in one place —
+# `.github/actions/check-release-assets` — and this workflow is how it gets asked.
 #
-#   * workflow_call — the stable release path (nightly-release.yml) waits on this after cutting a
-#     tag, so a package-less stable release reddens the release run itself rather than surfacing
-#     hours later as a feed failure in another repo.
-#   * workflow_dispatch — point it at ANY tag on demand. This is what makes the guard falsifiable:
-#     dispatching it at a release known to lack packages MUST fail, and at a complete release MUST
-#     pass. A guard that cannot be shown to go red is not a guard.
+#   * workflow_call — the stable release paths (nightly-release.yml after cutting the tag, and
+#     release.yml before promoting the release to `latest`) wait on this, so an incomplete release
+#     reddens the release run itself rather than surfacing hours later as a feed failure in
+#     another repo or a 404 on a user's machine.
+#   * workflow_dispatch — point it at ANY tag on demand.
+#   * pull_request — the SELF-TEST below, which is what makes the guard falsifiable without
+#     needing a broken release to exist.
 #
-# It polls rather than sampling once, because the binary build and the package build are separate
-# workflows that finish at different times; a single sample would race them and produce a red that
-# only means "not finished yet".
+# It polls rather than sampling once, because the binaries and the packages are attached by
+# separate workflows that finish at different times; a single sample would race them and produce a
+# red that only means "not finished yet".
 name: Verify release assets
 
 on:
@@ -52,95 +53,97 @@ on:
         type: number
         required: false
         default: 5
+  pull_request:
+    paths:
+      - ".github/actions/check-release-assets/**"
+      - ".github/workflows/verify-release-assets.yml"
 
 permissions:
   contents: read
 
 jobs:
   verify:
-    name: Verify ${{ inputs.tag }} carries the native install packages
+    name: Verify ${{ inputs.tag }} carries every consumer-resolvable asset
+    # The self-test trigger supplies no tag; it exercises `selftest` instead.
+    if: inputs.tag != ''
     runs-on: ubuntu-latest
     steps:
-      - name: Assert the feed-resolvable assets are present
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/check-release-assets
+        with:
+          tag: ${{ inputs.tag }}
+          timeout_minutes: ${{ inputs.timeout_minutes }}
+          github_token: ${{ github.token }}
+
+  # THE GUARD'S OWN REGRESSION TEST (dig-node#335).
+  #
+  # The reason #335 shipped is that the previous guard checked only the four native packages, so
+  # it reported success on a release missing all ten binaries. Nothing could have caught that,
+  # because nothing ever asked the guard to fail.
+  #
+  # This job asks. It drives the SAME action the release path uses, over literal asset lists:
+  #
+  #   * the complete v0.145.0 set MUST pass — a guard that rejects a good release is just as
+  #     broken, and this is the control that keeps the expectation from drifting into something
+  #     unsatisfiable;
+  #   * a set missing every `dign-*` binary — EXACTLY the shape `releases/latest` had at
+  #     2026-08-24T01:47:49Z — MUST fail. `continue-on-error` lets the step run to completion, and
+  #     the assertion afterwards turns a PASS into a red job.
+  #
+  # The failing case deliberately omits a whole consumer's set rather than one stray file, because
+  # the defect was categorical: an entire class of asset was outside the guard's vocabulary.
+  selftest:
+    name: Self-test — the guard passes a complete release and FAILS an incomplete one
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: A complete asset set PASSES
+        uses: ./.github/actions/check-release-assets
+        with:
+          tag: v0.145.0
+          assets: |
+            dig-node_0.145.0_amd64.deb
+            dig-node_0.145.0_arm64.deb
+            dig-node-0.145.0-macos.pkg
+            dig-node-0.145.0-windows-x64.msi
+            dig-node-0.145.0-linux-arm64
+            dig-node-0.145.0-linux-x64
+            dig-node-0.145.0-macos-arm64
+            dig-node-0.145.0-macos-x64
+            dig-node-0.145.0-windows-x64.exe
+            dign-0.145.0-linux-arm64
+            dign-0.145.0-linux-x64
+            dign-0.145.0-macos-arm64
+            dign-0.145.0-macos-x64
+            dign-0.145.0-windows-x64.exe
+
+      - name: An incomplete asset set is checked (expected to fail)
+        id: incomplete
+        continue-on-error: true
+        uses: ./.github/actions/check-release-assets
+        with:
+          # The four native packages and nothing else — the exact asset list `releases/latest`
+          # carried while dig-installer was 404ing (dig-node#335). The PREVIOUS guard passed this.
+          tag: v0.145.0
+          assets: |
+            dig-node_0.145.0_amd64.deb
+            dig-node_0.145.0_arm64.deb
+            dig-node-0.145.0-macos.pkg
+            dig-node-0.145.0-windows-x64.msi
+
+      - name: Require that it FAILED
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag }}
-          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          OUTCOME: ${{ steps.incomplete.outcome }}
         run: |
           set -euo pipefail
-
-          # The version as it appears in asset names: the tag without its leading `v`.
-          VERSION="${TAG#v}"
-
-          # EXACTLY the names dig-updater's feedsign looks for. Kept as a literal list rather than
-          # derived from a glob: a glob would happily accept a `.deb` for the wrong arch or a
-          # stale version and call the release complete, which is the failure this guard exists to
-          # catch.
-          #
-          # THIS IS THE THIRD COPY OF A CROSS-REPO CONTRACT, and a shell step cannot import the
-          # Rust constant that owns it. Producer: `package.yml` in this repo. Consumer:
-          # `dig-updater/crates/dig-updater-feedsign/src/resolve.rs` (`asset_name_parts`).
-          # Verifier: here. Nothing enforces that the three agree, so they are held together by
-          # `SYSTEM.md` (dig-updater section, "dig-node release-asset file names") and the
-          # `canonical` skill (beacon/update trust anchors). Change one, change all three.
-          #
-          # Note macOS contributes ONE name, not two: the `.pkg` is universal and carries no arch
-          # token, so `macos/arm64` and `macos/x64` both resolve to it — feedsign's five platforms
-          # yield four distinct file names.
-          #
-          # `arm64.deb` is required here DELIBERATELY, and this is stricter than feedsign's own
-          # failure condition. feedsign fails closed only when a component resolves ZERO assets, so
-          # a release missing just `arm64.deb` would still publish — silently dropping linux/arm64
-          # hosts from auto-update rather than reddening anything. That silent drop is exactly the
-          # arm64 platform floor (#1741/#1736/#2126), so the stable channel treats a missing arm64
-          # package as a failed release. Do not relax this to match feedsign.
-          EXPECTED=(
-            "dig-node_${VERSION}_amd64.deb"
-            "dig-node_${VERSION}_arm64.deb"
-            "dig-node-${VERSION}-macos.pkg"
-            "dig-node-${VERSION}-windows-x64.msi"
-          )
-
-          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
-          attempt=0
-
-          while :; do
-            attempt=$(( attempt + 1 ))
-
-            # A missing release is a legitimate "not yet" while the release workflow is still
-            # running, so it is treated the same as a missing asset rather than aborting early.
-            assets="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)"
-
-            missing=()
-            for name in "${EXPECTED[@]}"; do
-              printf '%s\n' "$assets" | grep -qxF "$name" || missing+=("$name")
-            done
-
-            if [ ${#missing[@]} -eq 0 ]; then
-              echo "$TAG carries all ${#EXPECTED[@]} native install packages — feedsign can resolve dig-node."
-              {
-                echo "### Release assets verified — \`$TAG\`"
-                echo
-                for name in "${EXPECTED[@]}"; do echo "- \`$name\`"; done
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              {
-                echo "### Release assets MISSING — \`$TAG\`"
-                echo
-                echo "dig-updater's feedsign cannot resolve dig-node from this release, so the"
-                echo "STABLE signed feed will fail closed for every component until it is fixed."
-                echo
-                echo "Missing:"
-                for name in "${missing[@]}"; do echo "- \`$name\`"; done
-              } >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::release $TAG is missing ${#missing[@]} native install package(s): ${missing[*]}. dig-updater feedsign resolves dig-node by these names and fails closed on the ENTIRE stable manifest when they are absent. Attach them (dispatch package.yml against the $TAG ref) before this release is allowed to stand as latest."
-              exit 1
-            fi
-
-            echo "attempt $attempt: still missing ${#missing[@]} of ${#EXPECTED[@]} (${missing[*]}); retrying…"
-            sleep 30
-          done
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::the release-asset guard PASSED a release carrying only the four native install packages. That is the dig-node#335 defect verbatim: dig-installer resolves the raw dig-node and dign binaries through releases/latest, so this asset set 404s every fresh install. The guard is not guarding."
+            exit 1
+          fi
+          echo "The guard failed the incomplete asset set, as required."

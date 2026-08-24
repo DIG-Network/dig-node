@@ -1,0 +1,155 @@
+# THE EXPECTED RELEASE-ASSET MATRIX, and the only place that knows it (dig-node#335).
+#
+# A `vX.Y.Z` release of dig-node has TWO independent consumers, and until #335 the release gate
+# only knew about one of them:
+#
+#   * dig-updater's feedsign resolves dig-node by the NATIVE INSTALL PACKAGE names — it hands a
+#     package to msiexec/installer/dpkg and never places a bare binary — and it fails CLOSED on the
+#     whole signed manifest when one component cannot be resolved (dig_ecosystem#2290).
+#   * dig-installer resolves BOTH `dig-node` and `dign` as RAW BINARIES through `releases/latest`
+#     (`dig-installer/src/release.rs:187`, stems at `:59` / `:78`). A release that is `latest`
+#     without those binaries makes every fresh install 404.
+#
+# The two sets are produced by two DIFFERENT workflows that finish at different times —
+# `package.yml` attaches the packages, `release.yml` attaches the binaries — so "the release
+# exists" and "the release is usable" are not the same statement. This action expresses the second
+# one, over both sets at once.
+#
+# It is a composite action rather than an inline `run:` block so that the SAME code path can be
+# driven from a literal asset list. That is what makes the guard falsifiable: the self-test in
+# `verify-release-assets.yml` feeds it a deliberately incomplete list on every PR and requires it
+# to fail. A guard that has never been observed going red is a hope, not a gate.
+name: Check release assets
+description: >-
+  Assert a dig-node release carries every asset its two consumers resolve — the native install
+  packages (dig-updater feedsign) and the raw dig-node/dign binaries (dig-installer). Polls,
+  because the packages and the binaries are attached by separate workflows.
+
+inputs:
+  tag:
+    description: "The release tag to check (e.g. v0.145.0)."
+    required: true
+  repo:
+    description: "OWNER/NAME of the repository holding the release."
+    required: false
+    default: ${{ github.repository }}
+  timeout_minutes:
+    description: "How long to wait for the assets to appear before failing."
+    required: false
+    default: "75"
+  assets:
+    description: >-
+      A newline-separated literal asset list to check INSTEAD of querying the release. For the
+      self-test only — when set, the action makes exactly one pass and never polls, so a
+      deliberately incomplete list fails immediately rather than burning the timeout.
+    required: false
+    default: ""
+  github_token:
+    description: "Token used to read the release. Unused when `assets` is supplied."
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Assert every consumer-resolvable asset is present
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ inputs.repo }}
+        TAG: ${{ inputs.tag }}
+        TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        ASSETS_OVERRIDE: ${{ inputs.assets }}
+      run: |
+        set -euo pipefail
+
+        # The version as it appears in asset names: the tag without its leading `v`.
+        VERSION="${TAG#v}"
+
+        # Kept as a literal list rather than derived from a glob: a glob would happily accept a
+        # `.deb` for the wrong arch or a stale version and call the release complete, which is the
+        # failure this guard exists to catch.
+        #
+        # THIS IS ONE COPY OF A CROSS-REPO CONTRACT. Producers: `package.yml` (packages) and
+        # `build-binaries.yml` (binaries), both in this repo. Consumers:
+        # `dig-updater/crates/dig-updater-feedsign/src/resolve.rs` (`asset_name_parts`) and
+        # `dig-installer/src/release.rs`. Verifier: here. Nothing enforces that they agree, so they
+        # are held together by `SYSTEM.md` (dig-updater section, "dig-node release-asset file
+        # names") and the `canonical` skill. Change one, change all of them.
+        #
+        # macOS contributes ONE PACKAGE name, not two: the `.pkg` is universal and carries no arch
+        # token, so `macos/arm64` and `macos/x64` both resolve to it. The raw binaries below are
+        # per-arch and do carry the token.
+        #
+        # `arm64.deb` is required DELIBERATELY, and this is stricter than feedsign's own failure
+        # condition. feedsign fails closed only when a component resolves ZERO assets, so a release
+        # missing just `arm64.deb` would still publish — silently dropping linux/arm64 hosts from
+        # auto-update rather than reddening anything. That silent drop is exactly the arm64
+        # platform floor (dig_ecosystem#1741/#1736/#2126), so the stable channel treats a missing
+        # arm64 package as a failed release. Do not relax this to match feedsign.
+        PLATFORMS=(linux-arm64 linux-x64 macos-arm64 macos-x64 windows-x64.exe)
+
+        EXPECTED=(
+          # Native install packages — dig-updater feedsign.
+          "dig-node_${VERSION}_amd64.deb"
+          "dig-node_${VERSION}_arm64.deb"
+          "dig-node-${VERSION}-macos.pkg"
+          "dig-node-${VERSION}-windows-x64.msi"
+        )
+        # Raw binaries — dig-installer, which resolves the `dig-node` and `dign` stems separately
+        # and 404s on either one being absent. `dign` is not an optional extra: it is the CLI, and
+        # an install that lands the daemon without it leaves a node with no command
+        # (dig_ecosystem#857).
+        for p in "${PLATFORMS[@]}"; do
+          EXPECTED+=("dig-node-${VERSION}-${p}")
+          EXPECTED+=("dign-${VERSION}-${p}")
+        done
+
+        deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+        attempt=0
+
+        while :; do
+          attempt=$(( attempt + 1 ))
+
+          if [ -n "$ASSETS_OVERRIDE" ]; then
+            # Self-test mode: one pass over a literal list, no polling and no network.
+            assets="$ASSETS_OVERRIDE"
+          else
+            # A missing release is a legitimate "not yet" while the release workflow is still
+            # running, so it is treated the same as a missing asset rather than aborting early.
+            assets="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+          fi
+
+          missing=()
+          for name in "${EXPECTED[@]}"; do
+            printf '%s\n' "$assets" | grep -qxF "$name" || missing+=("$name")
+          done
+
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "$TAG carries all ${#EXPECTED[@]} consumer-resolvable assets — feedsign can resolve dig-node, and dig-installer can fetch dig-node + dign."
+            {
+              echo "### Release assets verified — \`$TAG\`"
+              echo
+              for name in "${EXPECTED[@]}"; do echo "- \`$name\`"; done
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -n "$ASSETS_OVERRIDE" ] || [ "$(date +%s)" -ge "$deadline" ]; then
+            {
+              echo "### Release assets MISSING — \`$TAG\`"
+              echo
+              echo "This release is NOT shippable. dig-updater feedsign fails closed on the whole"
+              echo "STABLE signed feed when a native package is absent, and dig-installer 404s on a"
+              echo "fresh install when a raw \`dig-node\`/\`dign\` binary is absent."
+              echo
+              echo "Missing:"
+              for name in "${missing[@]}"; do echo "- \`$name\`"; done
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::release $TAG is missing ${#missing[@]} of ${#EXPECTED[@]} consumer-resolvable asset(s): ${missing[*]}. Attach them (dispatch package.yml and/or release.yml against the $TAG ref) before this release is allowed to stand as latest."
+            exit 1
+          fi
+
+          echo "attempt $attempt: still missing ${#missing[@]} of ${#EXPECTED[@]} (${missing[*]}); retrying…"
+          sleep 30
+        done
