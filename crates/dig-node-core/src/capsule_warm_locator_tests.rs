@@ -153,6 +153,7 @@ fn warmer_over(
     CapsuleWarmer::new(
         content.warm_provider_locator(),
         transport,
+        Arc::new(crate::seams::dig_peer::NoPullState),
         Arc::new(dig_download::InMemoryStateStore::new()),
         Arc::new(AnchoringChain),
         WarmPaths {
@@ -187,9 +188,17 @@ async fn a_warm_reaches_a_holder_that_only_the_connected_pool_can_name() {
 
     warmer.warm(&hex32(STORE), &hex32(ROOT)).await;
 
+    // The assertion is on the SET of peers asked, not on the sequence. Both halves of the property
+    // survive that: a pull that asked NOBODY leaves the set empty, and a pull that reached past the
+    // pool puts a second id in it. What the set deliberately does NOT pin is HOW MANY TIMES the
+    // holder was asked, because that is dig-download's retry budget and not this test's subject --
+    // 0.19.2 added an across-round descriptor re-ask (dig-download#37), so this holder, which never
+    // answers, is now asked `MAX_DESCRIPTOR_ATTEMPTS` times. Pinning the count made a legitimate
+    // downstream retry fix look like a locator regression here.
+    let asked: std::collections::BTreeSet<String> = transport.asked().into_iter().collect();
     assert_eq!(
-        transport.asked(),
-        vec![holder],
+        asked,
+        std::collections::BTreeSet::from([holder]),
         "the connected pool peer is the ONLY candidate the DHT could not name, so a pull that \
          asked it proves the warm locator unioned the pool - and a pull that asked nobody is the \
          shipped defect"

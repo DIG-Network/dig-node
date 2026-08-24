@@ -49,58 +49,103 @@ use serde_json::Value;
 
 use crate::download::proxy_requested;
 use crate::rate_limit::RequestorId;
-use crate::seams::dig_peer::module_reshare::WarmOutcome;
 use crate::Node;
 
-/// Try to make this node able to serve `(store_hex, root_hex)` on `requestor`'s behalf, returning
-/// whether the capsule is now in the local cache and may be read from.
+/// What a relay ask can honestly be told about `(store_hex, root_hex)`.
 ///
-/// Awaited, not spawned: the caller has a module window to answer RIGHT NOW, and the answer depends
-/// on the pull. This is the store-and-forward cost, paid once per capsule — a second window of the
-/// same capsule finds it cached and returns immediately.
+/// Three outcomes, because the two that used to be one — *this node will not relay* and *this node is
+/// relaying and has not finished* — carry OPPOSITE instructions to the requestor. Collapsing them into
+/// a single `false` is what made a cold relayed fetch look like a settled miss while the hop was in
+/// the middle of answering it (dig-node#333).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayStatus {
+    /// The capsule is in this node's cache and its windows may be read now.
+    Landed,
+    /// A relay pull is RUNNING and has staged this many bytes so far. The requestor may wait.
+    ///
+    /// The byte count is this node's own measurement of its own staging file, offered as a liveness
+    /// signal so a waiting requestor can tell progress from a stall. It says nothing about
+    /// correctness: every one of those bytes still has to pass the requestor's merkle verification
+    /// against the chain-anchored root, exactly as a direct holder's would (NC-12).
+    Pending { staged_bytes: u64 },
+    /// No relay: the requestor did not ask, the operator did not opt in, the requestor is outside its
+    /// proxy allowance, or this build has no capsule warmer. Indistinguishable to the requestor from
+    /// a plain miss, deliberately — a refusal must not narrate which gate refused.
+    Refused,
+}
+
+/// How long a hop waits for its own relay pull before answering [`RelayStatus::Pending`].
 ///
-/// Every refusal is silent and returns `false`; the caller's own `RESOURCE_UNAVAILABLE` then stands.
-/// Never a silent success, and never an unbounded fetch: the pull is the ordinary
-/// [`CapsuleWarmer`](super::CapsuleWarmer) one, byte-capped and chain-anchored, and it does NOT make
-/// this node a holder ([`HolderClaim::Suppress`](super::module_reshare::HolderClaim)).
+/// Sized to be comfortably INSIDE the requestor's first descriptor rung (5 s), so a capsule that
+/// lands quickly is still answered in one round trip and the pre-#333 behaviour is preserved for the
+/// case that already worked. It must never grow toward the length of a bulk transfer: a hop that
+/// holds a requestor's stream for minutes is the held-slot cost the descriptor ladder exists to bound,
+/// and lengthening it here would simply move that cost rather than remove it.
+const RELAY_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Try to make this node able to serve `(store_hex, root_hex)` on `requestor`'s behalf.
+///
+/// The pull runs in the BACKGROUND and this call waits only [`RELAY_GRACE`] for it. That is the whole
+/// of dig-node#333: awaiting a 135 MB third-party transfer inside the requestor's descriptor ask meant
+/// the ask always expired first, so the relay completed minutes after the only caller who wanted it
+/// had given up. A hop that ACKs instead of blocking lets the requestor wait on this node's PROGRESS
+/// rather than on a wall clock it has no way to size.
+///
+/// Every refusal is silent and returns [`RelayStatus::Refused`]; the caller's own
+/// `RESOURCE_UNAVAILABLE` then stands. Never a silent success, and never an unbounded fetch: the pull
+/// is the ordinary [`CapsuleWarmer`](super::CapsuleWarmer) one, byte-capped and chain-anchored, and it
+/// does NOT make this node a holder ([`HolderClaim::Suppress`](super::module_reshare::HolderClaim)).
 pub(crate) async fn relay_capsule(
     node: &Node,
     store_hex: &str,
     root_hex: &str,
     params: &Value,
     requestor: &RequestorId,
-) -> bool {
+) -> RelayStatus {
     // (1) The requestor must ASK. Checked first because it is free and because it is the only gate
     //     whose absence means "this request never wanted a relay" rather than "this node refuses".
     if !proxy_requested(params) {
-        return false;
+        return RelayStatus::Refused;
     }
     let Some(content) = node.p2p_content() else {
-        return false;
+        return RelayStatus::Refused;
     };
     // (2) The OPERATOR must have opted in.
     if !content.onion_relay_enabled() {
-        return false;
+        return RelayStatus::Refused;
     }
     // (3) The requestor must be inside its PROXY-class allowance — the expensive-egress bucket.
     if !content.allow_proxy_fetch(requestor) {
-        return false;
+        return RelayStatus::Refused;
     }
-    let Some(warmer) = content.capsule_warmer() else {
+    let Some(warmer) = content.capsule_warmer().cloned() else {
         // No warmer wired (the FFI/base path): there is no whole-capsule pull to drive, so there is
         // no relay. A read behaves identically with or without the leg.
-        return false;
+        return RelayStatus::Refused;
     };
     tracing::debug!(
         store = %super::serve_log::SafeId::new(store_hex),
         root = %super::serve_log::SafeId::new(root_hex),
         "module relay: pulling a capsule this node does not hold, on a requestor's behalf"
     );
-    // `AlreadyHeld` is admitted alongside `Held` because a concurrent warm may have landed the
-    // capsule between the caller's miss and this call — the question this function answers is "can the
-    // window be read now?", not "did I personally pull it?".
-    matches!(
-        warmer.warm_relayed(store_hex, root_hex).await,
-        WarmOutcome::Held { .. } | WarmOutcome::AlreadyHeld
-    )
+    // Re-entrant by construction: `WarmRegistry` admits one warm per generation, so a second requestor
+    // — or this same requestor polling — joins the running pull rather than starting a rival one.
+    //
+    // SPAWNED, not awaited, and that changes who bears the cost. An awaited pull died with the
+    // request; a spawned one outlives it, so a requestor that gives up leaves this node still
+    // pulling. The registry's cap is GLOBAL and SHARED with this node's own `spawn_capsule_warm`,
+    // so an abandoning peer can hold a warm slot that a local read wanted. Bounded (the cap), opt-in
+    // (gate 2) and allowance-limited (gate 3) — but a real cost of running the leg, recorded on
+    // `CapsuleWarmer::warm_relayed` as well so it is visible from either end.
+    super::module_reshare::spawn_relayed_capsule_warm(
+        std::sync::Arc::clone(&warmer),
+        store_hex.to_string(),
+        root_hex.to_string(),
+    );
+    if warmer.await_landing(store_hex, root_hex, RELAY_GRACE).await {
+        return RelayStatus::Landed;
+    }
+    RelayStatus::Pending {
+        staged_bytes: warmer.staged_bytes(store_hex, root_hex),
+    }
 }

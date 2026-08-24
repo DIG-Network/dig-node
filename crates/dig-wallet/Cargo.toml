@@ -83,8 +83,13 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 # `ChainSourceProvider` traits will not unify (`dig-node-core/src/seams/chia_peer/light_client.rs`).
 # So the lock carries TWO chia-query lines and two dci lines, on purpose. That is sound here only
 # because no `chia_query` type crosses the dig-wallet -> dig-node-core boundary; do NOT "align them"
-# on sight -- doing so breaks dig-node-core. Collapsing to one version is dig_ecosystem#2227, which
-# needs a chia-peer release against dci 0.2 first.
+# on sight -- doing so breaks dig-node-core. Collapsing to one version is dig_ecosystem#2227.
+#
+# ITS BLOCKER IS NOT WHAT THIS COMMENT SAID UNTIL 2026-08-23. It named "a chia-peer release
+# against dci 0.2", which was never the path: chia-peer 0.2.0 skipped dci 0.2 and went straight
+# to dci ^0.3 + chia-protocol ^0.36.1, where chia-query 0.15.0 also sits. They unify again
+# already -- at CHIA 0.36. So collapsing the two lines means moving dig-node-core off the 0.26
+# line, i.e. the chia-0.36 cascade (dig_ecosystem#3152).
 chia-query = "0.6.2"
 # Diagnostics MUST go through `tracing`, never stderr. dig-node installs the `dig-logging`
 # subscriber process-globally (dig-node-service::logging), and a Windows service has no stderr

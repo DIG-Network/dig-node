@@ -3012,6 +3012,7 @@ method runs, and it MUST NOT be conflated with the wallet's own `-32043` egress 
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
 | -32015 | `METADATA_TOO_LARGE` | node | `dig.getMetadata` refused: the publisher metadata section is too large or too complex to render safely. Refused when the ENCODED section exceeds `METADATA_SECTION_MAX_BYTES` (3 MiB) or its `custom` exceeds `MAX_CUSTOM_ENTRIES`/`MAX_CUSTOM_JSON_DEPTH`/`MAX_CUSTOM_JSON_ELEMENTS` (both checked BEFORE decode, #2160), or the RENDERED body exceeds `METADATA_RESPONSE_MAX_BYTES` (3 MiB, #2145). This section is rendered WHOLE — it cannot be windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so an oversized/hostile capsule is refused with this bounded error rather than expanded ~16× in memory or blasted into a ~100 MB response (§5.5.1). A normal (kilobyte) metadata section is served unchanged. |
 | -32017 | `CONTENT_MISS_INCONCLUSIVE` | peer | No holder was named AND the search could not establish that there is none: a consulted leg timed out, was unreachable, or refused uninformatively (§10.4.5). The OPPOSITE instruction to a plain not-found — a not-found says stop looking, this says the question was not answered and the request MAY be retried. Collapsing the two let ONE slow peer manufacture an authoritative absence and, since a hop relays its answer, propagate it downwards. DEFINED by `dig-rpc-protocol` as `ErrorCode::ContentMissInconclusive` with origin `Peer` — the failure arises in the discovery layer from an unconsultable hop, mirroring `PeerUnreachable`. dig-node adopts the variant and does not assign the number. |
+| -32017 | `ContentMissInconclusive` | — | Availability not ESTABLISHED. Also the answer a hop gives while it is still RELAYING a capsule on the requestor's behalf, in which case `error.data.relay_staged_bytes` carries the hop's staged byte count (§21.1). The field is ADDITIVE: a reader that ignores it sees an ordinary inconclusive miss and retries. |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
 | -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
 | -32022 | *(reserved: onion `onion_hops_out_of_range`)* | — | Reserved for the onion-routing contract. |
@@ -3424,6 +3425,14 @@ boolean, default `false`). It MUST NOT trigger on `push` to `main`.
   `latest`: the previous complete release keeps serving installs, which is the required failure mode.
   The guard MUST be falsifiable — a self-test MUST assert that it FAILS an asset list carrying only
   the native packages.
+
+  **"Verified complete" is a statement about BYTES, not about names.** An asset is complete only when
+  it is present AND its upload state reports it as fully uploaded (GitHub: `state == "uploaded"`); an
+  asset still being written reports `state == "starting"`. The row is created when the upload BEGINS,
+  so every expected asset name can be present while bytes are still in flight, and a verification that
+  counts names alone promotes a release whose binaries are truncated or absent. A reimplementation that
+  reads only the name list satisfies the letter of the clause above and reintroduces exactly the race
+  it exists to prevent, which is why the state is stated here rather than left to the implementation.
 
 11.1a. **Doc-only commits never release** (the version is unchanged → the tag exists → the stable
 job is a no-op). The manual-dispatch `workflow_dispatch` on `release.yml` is a build-only "does main
@@ -6237,6 +6246,67 @@ capsule ~30 s on the same host. A server MUST complete a describe it has begun e
 stream is closed, so that its descriptor memo is populated and the re-ask is answered from memory. The
 total a requestor spends on one holder MUST be bounded; an ask that is ANSWERED negatively MUST NOT be
 re-asked, since re-asking cannot change a refusal and would delay trying the next holder.
+
+**A hop that is RELAYING MUST acknowledge, not block (MUST, dig-node#333).** A node asked with
+`proxy: true` for a capsule it does not hold pulls that capsule from a holder on the requestor's
+behalf. That pull is a whole-capsule transfer and takes arbitrarily long — minutes for a 135 MB
+capsule on an ordinary link — while the descriptor ask that triggered it is bounded in tens of
+seconds. A hop MUST NOT hold the ask open for the length of the transfer: it MUST answer within a
+short grace, and if the capsule has not landed by then it MUST answer
+`ContentMissInconclusive` (`-32017`) carrying `error.data.relay_staged_bytes`, its own count of the
+bytes it has staged so far, and MUST leave the pull running. A capsule that lands inside the grace is
+answered with the ordinary descriptor, indistinguishably from a holder's.
+
+The code is the taxonomy's existing inconclusive-miss code and MUST NOT be a new number: a running
+relay is exactly the condition that code names — the availability answer is UNKNOWN and a retry is
+meaningful — as opposed to `RESOURCE_UNAVAILABLE`, which settles the question. A requestor that does
+not understand `relay_staged_bytes` therefore behaves correctly by default: it retries later.
+
+**A requestor MUST bound a relay wait by PROGRESS and by a ceiling (MUST).** On receiving that answer
+a requestor MAY wait, re-asking the same hop on an interval. It MUST continue only while the reported
+staged count STRICTLY ADVANCES, MUST abandon the hop after a bounded stall window in which it does
+not, and MUST abandon it at a hard ceiling however healthy the progress appears.
+
+Both bounds are required and the ceiling is a SECURITY bound. `relay_staged_bytes` is a hop's claim
+about itself, so a hostile hop can fabricate a counter that rises forever and would never stall; only
+the ceiling makes the worst case finite.
+
+**The ceiling MUST be accompanied by a per-PULL budget.** A ceiling bounds a wait on ONE hop, and a
+pull asks many: a puller's worst case is `descriptor attempts × holders × the per-ask bound`, so
+raising the per-ask bound from the descriptor ladder to the relay ceiling multiplies by the holder
+count. Where the provider set includes merely-CONNECTED peers rather than only announced holders, that
+count is the whole connected pool, and hops each fabricating a byte of progress per poll would hold one
+pull open for hours while every one of them stayed inside its individual ceiling. A requestor MUST
+therefore charge relay waiting against a budget scoped to the CAPSULE being pulled, and MUST NOT grant
+each hop a fresh allowance. Shrinking the per-hop ceiling is NOT an acceptable substitute: an honest hop
+relaying a large capsule genuinely needs the full ceiling, and that case is what this path exists for.
+
+**The budget's lifetime MUST be the PULL's.** It MUST be released when the pull ends — in success or
+failure — so that a later pull of the same capsule starts with the whole of it. A budget that persists
+beyond its pull makes a capsule whose first pull spent it permanently ineligible for the relay path,
+and, because the exhaustion is reported as a failure against whichever peer was being asked, it
+attributes this node's own earlier spend to that peer. A requestor MUST NOT report a budget exhaustion
+in a form that names a peer as its cause.
+
+An idle timeout MUST NOT be used in place of the release. Relay time is charged when a wait ENDS, so a
+wait in progress is indistinguishable from an idle entry for up to the whole per-hop ceiling: a timeout
+shorter than that ceiling can expire a live pull's budget mid-wait and silently restore the
+per-hop multiplication, while one at or above it withholds the budget from the next pull for as long as
+the condition it was meant to prevent. The pull boundary is therefore reported by the caller that
+drives the pull, never inferred. A requestor MUST NOT treat the count as evidence about the
+bytes: the capsule that eventually arrives is verified against the chain-anchored root exactly as a
+direct holder's would be (§21.2), so a hop that fabricates its way through a wait still cannot produce
+content that passes.
+
+**A relay ask is a SECOND-PASS escalation, and both passes MUST fit in one request (MUST,
+dig-node#322).** A requestor MUST spend a PLAIN descriptor round on a `(capsule, peer)` pair before it
+sets `proxy: true` for that pair — asking every connected peer to fetch a capsule on this node's
+behalf before establishing that no reachable holder exists is the amplification the two-phase design
+exists to bound. When that plain round is ANSWERED and the answer is no, the requestor MUST escalate
+within the SAME invocation rather than deferring to a later one; a user issuing the documented single
+command MUST NOT have to issue it twice. A plain round that was never answered at all MUST NOT be
+escalated: a peer that could not answer a plain ask will not answer a relay ask, and re-asking it
+doubles the invocation's bound for nothing.
 
 ### 21.2. The anchor verifier is the ONLY root of trust (MUST)
 

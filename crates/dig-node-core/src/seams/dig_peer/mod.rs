@@ -66,6 +66,9 @@ pub use module_reshare::{
     WarmRegistry,
 };
 pub use module_transport::NatModuleTransport;
+#[cfg(test)]
+pub(crate) use module_transport::NoPullState;
+pub(crate) use module_transport::PullLifecycle;
 pub use peer_network::PeerNetwork;
 pub(crate) use pool_locator::{ConnectedPool, PoolProviderLocator};
 pub(crate) use selector_adapter::SelectorAdapter;

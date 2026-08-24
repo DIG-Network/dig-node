@@ -1445,26 +1445,33 @@ impl PeerRpcResponder for NodeResponder {
         // and serves the window from its own cache. All three gates live in `relay_capsule`; a refusal
         // leaves the not-held frame below exactly as it was, so the requestor stays free to ask
         // another hop (NC-12: a hop's "not found" may be a lie, including ours).
-        if window.is_none()
-            && crate::seams::dig_peer::module_relay::relay_capsule(
+        let mut relay = crate::seams::dig_peer::module_relay::RelayStatus::Refused;
+        if window.is_none() {
+            relay = crate::seams::dig_peer::module_relay::relay_capsule(
                 &self.node,
                 &store,
                 &root,
                 &params,
                 &crate::rate_limit::RequestorId::Peer(conn_key.to_string()),
             )
-            .await
-        {
-            window = read_window().await;
+            .await;
+            if relay == crate::seams::dig_peer::module_relay::RelayStatus::Landed {
+                window = read_window().await;
+            }
         }
 
         let Some(window) = window else {
             module_serve::module_range_outcome(conn_key, &store, &root, offset, None);
-            return write_framed(
-                out,
-                &module_serve::module_unavailable_frame(crate::download::RESOURCE_UNAVAILABLE),
-            )
-            .await;
+            // A relay STILL RUNNING is not a miss: the availability question is unsettled and this
+            // node is the reason, so the requestor is told to wait rather than to look elsewhere
+            // (dig-node#333).
+            let frame = match relay {
+                crate::seams::dig_peer::module_relay::RelayStatus::Pending { staged_bytes } => {
+                    module_serve::module_relay_pending_frame(staged_bytes)
+                }
+                _ => module_serve::module_unavailable_frame(crate::download::RESOURCE_UNAVAILABLE),
+            };
+            return write_framed(out, &frame).await;
         };
 
         // OUTGOING-BANDWIDTH THROTTLE (#30/#1616): the module-range serve is the whole-capsule pull —

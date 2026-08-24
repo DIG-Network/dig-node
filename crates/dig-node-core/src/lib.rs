@@ -2812,13 +2812,15 @@ impl Node {
         // operator opted in and within its proxy allowance, makes this node pull the whole capsule
         // from a holder and describe it from its own cache. Every gate is inside `relay_capsule`; a
         // refusal simply leaves `info` as `None` and the honest not-held answer below stands.
-        if info.is_none()
-            && seams::dig_peer::module_relay::relay_capsule(
+        let mut relay = seams::dig_peer::module_relay::RelayStatus::Refused;
+        if info.is_none() {
+            relay = seams::dig_peer::module_relay::relay_capsule(
                 self, &store_hex, &root_hex, params, requestor,
             )
-            .await
-        {
-            info = self.describe_held_module(&store_hex, &root_hex).await;
+            .await;
+            if relay == seams::dig_peer::module_relay::RelayStatus::Landed {
+                info = self.describe_held_module(&store_hex, &root_hex).await;
+            }
         }
         // The serve log records both outcomes with sentinelled ids, so "was this holder asked for the
         // descriptor, and did it have it?" is answerable from the log alone (#1595).
@@ -2833,11 +2835,18 @@ impl Node {
                 Ok(value) => json!({"jsonrpc":"2.0","id":id,"result": value}),
                 Err(_) => rpc_err(&id, -32000, "could not encode the module descriptor"),
             },
-            None => rpc_err(
-                &id,
-                download::RESOURCE_UNAVAILABLE,
-                "module not held locally at the requested root",
-            ),
+            // A relay this node is still RUNNING is not a miss, and answering it as one is what made
+            // the capability unreachable (dig-node#333). See [`relay_pending_err`].
+            None => match relay {
+                seams::dig_peer::module_relay::RelayStatus::Pending { staged_bytes } => {
+                    relay_pending_err(&id, staged_bytes)
+                }
+                _ => rpc_err(
+                    &id,
+                    download::RESOURCE_UNAVAILABLE,
+                    "module not held locally at the requested root",
+                ),
+            },
         }
     }
 
@@ -2889,15 +2898,17 @@ impl Node {
         // MISS -> the RELAY leg (dig-node#276), exactly as on the descriptor above: a relayed window
         // is read from the same cache, through the same reader, so it is byte-identical to the one a
         // genuine holder would have served and the requestor needs no second code path.
-        if window.is_none()
-            && seams::dig_peer::module_relay::relay_capsule(
+        let mut relay = seams::dig_peer::module_relay::RelayStatus::Refused;
+        if window.is_none() {
+            relay = seams::dig_peer::module_relay::relay_capsule(
                 self, &store_hex, &root_hex, params, requestor,
             )
-            .await
-        {
-            window = self
-                .read_held_module_window(&store_hex, &root_hex, offset, length)
-                .await;
+            .await;
+            if relay == seams::dig_peer::module_relay::RelayStatus::Landed {
+                window = self
+                    .read_held_module_window(&store_hex, &root_hex, offset, length)
+                    .await;
+            }
         }
 
         match window {
@@ -2917,11 +2928,16 @@ impl Node {
             }
             None => {
                 module_serve::module_range_outcome("", &store_hex, &root_hex, offset, None);
-                rpc_err(
-                    &id,
-                    download::RESOURCE_UNAVAILABLE,
-                    "module not held locally at the requested root",
-                )
+                match relay {
+                    seams::dig_peer::module_relay::RelayStatus::Pending { staged_bytes } => {
+                        relay_pending_err(&id, staged_bytes)
+                    }
+                    _ => rpc_err(
+                        &id,
+                        download::RESOURCE_UNAVAILABLE,
+                        "module not held locally at the requested root",
+                    ),
+                }
             }
         }
     }
@@ -4255,6 +4271,46 @@ pub async fn handle_rpc_json(
 fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
+
+/// The answer a hop gives while it is STILL RELAYING the capsule it was asked for (dig-node#333):
+/// the availability question is genuinely unsettled, and this node is the reason it is unsettled.
+///
+/// # Why this reuses the inconclusive-miss code rather than declaring a new one
+///
+/// The error taxonomy is owned by `dig-rpc-protocol` and adopted, never restated
+/// (`SYSTEM.md`) — a node that invents a number is one release away from disagreeing with the
+/// taxonomy it claims to speak, which this repo has already paid for twice (see
+/// [`content_miss_inconclusive`](download::content_miss_inconclusive)). `ContentMissInconclusive`
+/// already means exactly what a running relay means: the answer is UNKNOWN and a retry is
+/// meaningful, as opposed to a settled not-found that tells the caller to stop. So the CODE is the
+/// canonical one and the new fact rides in `error.data`, which is additive and needs no cascade.
+///
+/// # What is in `data`, and what it is worth
+///
+/// [`RELAY_PROGRESS_FIELD`] carries this node's staged byte count. A requestor uses it to tell
+/// PROGRESS from a STALL while it waits, and for nothing else — it is this hop's claim about itself,
+/// so it can be inflated at will. The bytes it describes still have to pass the requestor's own
+/// merkle verification against the chain-anchored root before any of them count (NC-12), and a
+/// requestor that waits on it must bound that wait independently.
+///
+/// A requestor too old to read the field sees an inconclusive miss and retries later — which is
+/// correct, and is what the field observations of #333 recorded people doing by hand.
+fn relay_pending_err(id: &Value, staged_bytes: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": download::content_miss_inconclusive(),
+            "message": "relaying the requested capsule on your behalf; not yet complete",
+            "data": { RELAY_PROGRESS_FIELD: staged_bytes },
+        }
+    })
+}
+
+/// The `error.data` key a relaying hop reports its staged byte count under, and the key a waiting
+/// requestor reads to tell a progressing relay from a stalled one. Named once, because a producer and
+/// a consumer that spell a wire key separately are one typo away from a silent mismatch.
+pub(crate) const RELAY_PROGRESS_FIELD: &str = "relay_staged_bytes";
 
 /// Core JSON-RPC dispatch — the actual DIG node. Takes the request Value and
 /// returns the response Value. This is the single source of truth shared by the
@@ -6223,6 +6279,7 @@ mod tests {
                 module.clone(),
                 8,
             )),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             MockResolver::one(&store_a_hex, Bytes32(root)),
             crate::seams::dig_peer::WarmPaths {
@@ -7193,6 +7250,7 @@ mod tests {
             Arc::new(dig_download::testkit::MockModuleTransport::serving(
                 store, root, module, 8,
             )),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             MockResolver::one(store, Bytes32::from_hex(root).expect("64-hex root")),
             crate::seams::dig_peer::WarmPaths {

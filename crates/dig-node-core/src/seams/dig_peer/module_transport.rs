@@ -41,6 +41,8 @@ use dig_download::{
 use dig_peer::DigPeer;
 use dig_rpc_protocol::types::{FetchModuleRangeParams, GetModuleInfoParams, ModuleInfo};
 
+use descriptor_ask::DescriptorAnswer;
+
 use super::pool_locator::ConnectedPool;
 use crate::download::BestEffort;
 
@@ -66,6 +68,9 @@ pub struct NatModuleTransport {
     /// Which `(capsule, peer)` pairs have already had a plain descriptor round, so the relay opt-in
     /// is an escalation rather than a default. See [`RelayEscalation`].
     escalation: RelayEscalation,
+    /// How much relay waiting each CAPSULE has already cost, so the bound is per pull rather than
+    /// per peer. See [`RelayWaitBudget`].
+    relay_budget: RelayWaitBudget,
 }
 
 impl NatModuleTransport {
@@ -86,6 +91,7 @@ impl NatModuleTransport {
             connected,
             locator,
             escalation: RelayEscalation::default(),
+            relay_budget: RelayWaitBudget::default(),
         }
     }
 
@@ -293,6 +299,168 @@ impl RelayEscalation {
     }
 }
 
+/// How much total relay WAITING one pull of one capsule may spend, across every hop it asks.
+///
+/// # Why the bound has to be per PULL and not per peer (the amplification the ceiling alone misses)
+///
+/// [`descriptor_ask::RELAY_MAX_WAIT`] bounds a wait on ONE hop, which is the right instrument for
+/// the question it answers — how long to believe a single peer that says it is fetching. It is the
+/// wrong instrument for the question the PULL asks, because the pull asks many peers.
+///
+/// dig-download documents its own worst case as
+/// `MAX_DESCRIPTOR_ATTEMPTS × holders × the transport's per-ask timeout`, and this leg raises that
+/// last term from the descriptor ladder's 65 s to the relay ceiling's 30 minutes. The warm locator
+/// unions the CONNECTED POOL into the provider set, so "holders" is every connected peer rather than
+/// every announced one — and ten peers each fabricating one byte of progress per poll would hold a
+/// single pull for roughly fifteen hours, with each peer individually inside its ceiling the whole
+/// time. Nothing is provably lying; the pull simply never ends.
+///
+/// **Shrinking the per-hop ceiling is NOT the fix** and would undo dig-node#333: an honest hop
+/// relaying a large capsule over a slow link genuinely needs minutes, and that case is the entire
+/// reason this path exists. So the per-hop ceiling stays exactly as it is, and the PULL gets its own
+/// budget which every hop draws from. One honest hop may still spend the whole of it — the large
+/// capsule keeps working — while ten liars share it rather than each being granted it.
+const RELAY_WAIT_BUDGET_PER_PULL: std::time::Duration = descriptor_ask::RELAY_MAX_WAIT;
+
+/// Tracks relay waiting already spent per capsule, so the budget above is enforced across the hops
+/// of one pull rather than granted afresh to each.
+///
+/// Keyed by `(store_id, root)` — the generation, which is exactly what one `ModuleDownloader::download`
+/// call is about, so the key IS the pull. Entries are this node's own pulls, so growth tracks its own
+/// activity and not anything a peer controls.
+///
+/// # The FIFO cap is a backstop, not the working mechanism
+///
+/// Entries are released when their pull ends ([`PullLifecycle`]), and `WarmRegistry` admits at most
+/// [`DEFAULT_MAX_CONCURRENT_WARMS`](super::module_reshare::DEFAULT_MAX_CONCURRENT_WARMS) generations
+/// node-wide, so only a handful of entries are ever LIVE at once. Reaching [`Self::MAX_ENTRIES`] would
+/// therefore take a release path that had stopped working, and evicting a LIVE entry would need the
+/// 1023 older ones to be live too — which the warm cap makes impossible. The cap exists so that a
+/// future leak is bounded, not because entries are expected to accumulate.
+#[derive(Default)]
+struct RelayWaitBudget {
+    /// Relay time already spent per capsule.
+    spent: std::sync::Mutex<std::collections::HashMap<String, std::time::Duration>>,
+    /// Insertion order, so eviction is FIFO without a timestamp per entry.
+    order: std::sync::Mutex<std::collections::VecDeque<String>>,
+}
+
+impl RelayWaitBudget {
+    /// The ledger ceiling, matching [`RelayEscalation::MAX_ENTRIES`]: both track this node's own
+    /// concurrent pulls, so one bound serves both.
+    const MAX_ENTRIES: usize = 1024;
+
+    /// The capsule's key in this ledger.
+    fn key(store_id: &str, root: &str) -> String {
+        format!("{store_id}:{root}")
+    }
+
+    /// How much of the pull's relay-wait budget is LEFT for `(store_id, root)`.
+    ///
+    /// Saturating, so an over-charge (a wait that overran its own ceiling by a scheduling margin)
+    /// yields zero rather than wrapping into a fresh budget.
+    fn remaining(&self, store_id: &str, root: &str) -> std::time::Duration {
+        let spent = self
+            .spent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&Self::key(store_id, root))
+            .copied()
+            .unwrap_or(std::time::Duration::ZERO);
+        RELAY_WAIT_BUDGET_PER_PULL.saturating_sub(spent)
+    }
+
+    /// Release `(store_id, root)`'s entry, because its PULL is over.
+    ///
+    /// Called by whoever drove `ModuleDownloader::download` — see [`PullLifecycle`]. Without it the
+    /// key would be the capsule for the DAEMON's lifetime rather than the pull's, and a capsule whose
+    /// first honest pull spent the budget could never take the relay path again until restart. Worse,
+    /// the refusal would be composed as a transport error naming a PEER, blaming that peer for this
+    /// node's own earlier spend.
+    fn release(&self, store_id: &str, root: &str) {
+        let key = Self::key(store_id, root);
+        if self
+            .spent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key)
+            .is_some()
+        {
+            self.order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|k| k != &key);
+        }
+    }
+
+    /// Charge `waited` against `(store_id, root)`.
+    ///
+    /// A zero charge records nothing: the overwhelming majority of descriptor asks involve no relay
+    /// at all, and an entry per ask would evict the entries that matter.
+    fn charge(&self, store_id: &str, root: &str, waited: std::time::Duration) {
+        if waited.is_zero() {
+            return;
+        }
+        let key = Self::key(store_id, root);
+        let mut spent = self.spent.lock().unwrap_or_else(|p| p.into_inner());
+        let mut order = self.order.lock().unwrap_or_else(|p| p.into_inner());
+        if !spent.contains_key(&key) {
+            if order.len() >= Self::MAX_ENTRIES {
+                if let Some(oldest) = order.pop_front() {
+                    spent.remove(&oldest);
+                }
+            }
+            order.push_back(key.clone());
+        }
+        let entry = spent.entry(key).or_insert(std::time::Duration::ZERO);
+        *entry = entry.saturating_add(waited);
+    }
+}
+
+/// Told when a whole-capsule pull has ENDED, so state scoped to that pull can be released.
+///
+/// # Why the transport cannot work this out for itself
+///
+/// [`ModuleTransport`] is asked about ONE HOLDER at a time. It sees `get_module_info` for holder A,
+/// then B, then C, and nothing distinguishes "C is the next holder of the same pull" from "C is the
+/// first holder of a new pull of the same capsule". Only the caller driving
+/// `ModuleDownloader::download` knows where the boundary is, so only the caller can say.
+///
+/// # Why a TTL was rejected rather than being simpler
+///
+/// A relay wait is charged when it ENDS, so during a wait — up to the whole per-hop ceiling — nothing
+/// is charged and the entry looks idle. Any idle-TTL shorter than that ceiling can therefore expire a
+/// LIVE pull's budget mid-wait, which silently restores the `holders × ceiling` multiplication the
+/// budget exists to remove; and a TTL at or above the ceiling leaves a finished pull's spend blocking
+/// the next one for exactly as long as the harm it was meant to fix. There is no safe window, so the
+/// boundary has to be reported rather than guessed.
+pub(crate) trait PullLifecycle: Send + Sync {
+    /// The pull of `(store_id, root)` has finished, in success or failure.
+    ///
+    /// MUST be called on EVERY exit from the pull, including failures — a pull that ends badly is
+    /// exactly the one that spent budget on hops that did not deliver.
+    fn pull_finished(&self, store_id: &str, root: &str);
+}
+
+impl PullLifecycle for NatModuleTransport {
+    fn pull_finished(&self, store_id: &str, root: &str) {
+        self.relay_budget.release(store_id, root);
+    }
+}
+
+/// A [`PullLifecycle`] that does nothing.
+///
+/// TEST-ONLY, and deliberately so: production has exactly one warmer wiring and it MUST report pull
+/// boundaries, so a no-op available to production code would be a way to switch the budget off by
+/// accident. Tests use it because most of them are not about the budget at all.
+#[cfg(test)]
+pub(crate) struct NoPullState;
+
+#[cfg(test)]
+impl PullLifecycle for NoPullState {
+    fn pull_finished(&self, _store_id: &str, _root: &str) {}
+}
+
 /// The largest framed JSON body accepted for a module DESCRIPTOR answer.
 ///
 /// The generic peer-request reader ([`crate::peer::read_framed`]) caps at 64 KiB, which is right for
@@ -408,31 +576,813 @@ const DESCRIPTOR_ASK_DEADLINES: [std::time::Duration; 3] = [
     std::time::Duration::from_secs(45),
 ];
 
-/// Run `ask` under each of `deadlines` in turn, returning the first answer.
+/// The descriptor ask, as ONE indivisible unit: the deadline ladder, the second-pass relay
+/// escalation, and the progress-bounded wait on a relaying hop.
 ///
-/// `None` means every rung elapsed or every attempt failed — the caller turns that into ONE transport
-/// error in this node's own vocabulary. Extracted from the dial so the LADDER's behaviour is testable
-/// on simulated time without a peer, a socket, or a capsule.
-async fn ask_within_deadlines<A, F, T>(deadlines: &[std::time::Duration], mut ask: A) -> Option<T>
-where
-    A: FnMut() -> F,
-    F: std::future::Future<Output = Option<T>>,
-{
-    for (rung, deadline) in deadlines.iter().enumerate() {
-        match tokio::time::timeout(*deadline, ask()).await {
-            Ok(Some(answer)) => return Some(answer),
-            // An attempt that ANSWERED "no" is a refusal, not slowness: re-asking cannot change it,
-            // and spending the remaining rungs on it would make every genuine miss cost the full
-            // ladder. Only an elapsed rung is retried.
-            Ok(None) => return None,
-            Err(_elapsed) => tracing::debug!(
-                rung = rung + 1,
-                deadline_secs = deadline.as_secs(),
-                "module pull: descriptor ask exceeded its deadline; re-asking on the next rung"
-            ),
+/// # Why this is a MODULE and not three functions in the parent
+///
+/// Because a call site that can reach the middle of a decision will eventually be rewritten to do
+/// exactly that. Measured on this very PR: an earlier revision unified the three steps into one
+/// function, which made them inseparable from EACH OTHER but left the inner ladder helper reachable
+/// from the parent -- and replacing the call site's body with a direct call to that helper deleted
+/// BOTH the escalation and the relay wait from the shipped path with **968 tests still passing**.
+///
+/// The ladder lives in here and is PRIVATE, so no code OUTSIDE this file can climb it: the only way
+/// in is [`descriptor_for_holder`], and the parent supplies only a single one-shot ask carrying no
+/// policy at all. Rust privacy is module-scoped, so this is a boundary against the rest of the crate
+/// and NOT against an edit made inside this file — an in-file bypass is still expressible, it is
+/// merely detected rather than prevented. What catches that remaining case is
+/// `the_production_get_module_info_climbs_the_whole_ladder` (which pins the elapsed ladder time
+/// through the real method) together with
+/// `a_cold_first_invocation_escalates_through_the_production_transport` (which pins the second round
+/// through the real method's own locator). Both fail, bounded, in milliseconds.
+///
+/// Prefer narrowing what a defect can be expressed in over asserting that it is absent.
+mod descriptor_ask {
+    use super::{ModuleInfo, DESCRIPTOR_ASK_DEADLINES};
+
+    /// How a climb of the deadline ladder ended.
+    ///
+    /// The two failures are kept apart because they license different NEXT moves. A peer that answered
+    /// has proved it can answer, so asking it a different question is worth a round trip; a peer that
+    /// never answered has proved nothing except that it is unresponsive.
+    #[derive(Debug, PartialEq, Eq)]
+    enum LadderEnd<T> {
+        /// The peer answered within a rung.
+        Answered(T),
+        /// The peer ANSWERED, and the answer was no.
+        Refused,
+        /// Every rung elapsed, or every attempt failed before it could answer.
+        Exhausted,
+    }
+
+    /// Run `ask` under each of `deadlines` in turn, returning the first answer.
+    ///
+    /// Extracted from the dial so the LADDER's behaviour is testable on simulated time without a peer, a
+    /// socket, or a capsule.
+    async fn ask_within_deadlines<A, F, T>(
+        deadlines: &[std::time::Duration],
+        mut ask: A,
+    ) -> LadderEnd<T>
+    where
+        A: FnMut() -> F,
+        F: std::future::Future<Output = Option<T>>,
+    {
+        for (rung, deadline) in deadlines.iter().enumerate() {
+            match tokio::time::timeout(*deadline, ask()).await {
+                Ok(Some(answer)) => return LadderEnd::Answered(answer),
+                // An attempt that ANSWERED "no" is a refusal, not slowness: re-asking cannot change it,
+                // and spending the remaining rungs on it would make every genuine miss cost the full
+                // ladder. Only an elapsed rung is retried.
+                Ok(None) => return LadderEnd::Refused,
+                Err(_elapsed) => tracing::debug!(
+                    rung = rung + 1,
+                    deadline_secs = deadline.as_secs(),
+                    "module pull: descriptor ask exceeded its deadline; re-asking on the next rung"
+                ),
+            }
+        }
+        LadderEnd::Exhausted
+    }
+
+    /// Obtain the descriptor for one holder: ask at the pair's current phase, escalate to a RELAY ask
+    /// within the same invocation if the plain round was answered with a no, and wait out a hop that
+    /// answers that it is relaying.
+    ///
+    /// # Why all three steps live in ONE function
+    ///
+    /// They are one decision -- what this node does about a holder that did not simply hand over the
+    /// descriptor -- and splitting them would leave a caller free to take the first step and skip the
+    /// rest. That is not hypothetical: a helper extracted purely for testability is a helper a call
+    /// site can quietly stop using, and its tests keep passing while the behaviour is gone.
+    ///
+    /// # Why the escalation happens here rather than on the next invocation (dig-node#322)
+    ///
+    /// The two-phase escalation itself is deliberate and stays: a requestor must not ask the whole
+    /// connected pool to fetch a capsule on its behalf before establishing that no reachable holder
+    /// exists, and that bound is what keeps the relay from being an amplification primitive. What was
+    /// wrong was where the second phase happened. A cold requestor spent its FIRST invocation entirely on
+    /// the plain round, so the documented single command could never relay and only an identical second
+    /// command worked -- which a user reads as flakiness, with nothing in the output to say otherwise.
+    /// Escalating here preserves the bound exactly (the plain round still goes first, and it is its
+    /// emptiness that unlocks the second) while making one command sufficient.
+    ///
+    /// # Why only a REFUSAL escalates
+    ///
+    /// A peer that could not answer a plain ask within the whole ladder will not answer a relay ask
+    /// either -- it travels the same stream to the same process. Escalating an exhausted ladder would
+    /// double this method's wall clock in precisely the case where the extra time buys nothing, so
+    /// [`LadderEnd::Exhausted`] ends the invocation and [`LadderEnd::Refused`] is what licenses phase two.
+    pub(super) async fn descriptor_for_holder<A, F>(
+        already_escalated: bool,
+        relay_ceiling: std::time::Duration,
+        mut ask_once: A,
+    ) -> DescriptorOutcome
+    where
+        A: FnMut(bool) -> F,
+        F: std::future::Future<Output = Option<DescriptorAnswer>>,
+    {
+        let mut answer =
+            ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || ask_once(already_escalated)).await;
+        if !already_escalated && matches!(answer, LadderEnd::Refused) {
+            answer = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || ask_once(true)).await;
+        }
+        match answer {
+            LadderEnd::Answered(DescriptorAnswer::Descriptor(info)) => DescriptorOutcome {
+                descriptor: Ok(*info),
+                relay_waited: std::time::Duration::ZERO,
+            },
+            // The hop is FETCHING the capsule for us, so the ask is not over -- see
+            // [`wait_for_relayed_descriptor`] for why the wait that follows is bounded by PROGRESS.
+            LadderEnd::Answered(DescriptorAnswer::RelayPending { staged_bytes }) => {
+                let started = tokio::time::Instant::now();
+                let waited =
+                    wait_for_relayed_descriptor(staged_bytes, relay_ceiling, ask_once).await;
+                DescriptorOutcome {
+                    descriptor: waited.map_err(DescriptorFailure::RelayWait),
+                    relay_waited: started.elapsed(),
+                }
+            }
+            LadderEnd::Refused | LadderEnd::Exhausted => DescriptorOutcome {
+                descriptor: Err(DescriptorFailure::NoAnswer),
+                relay_waited: std::time::Duration::ZERO,
+            },
         }
     }
-    None
+
+    /// What one holder's descriptor ask produced, and what it COST in relay waiting.
+    ///
+    /// The cost is reported rather than inferred because the caller charges it against a per-PULL budget
+    /// (see `RelayWaitBudget`), and only this function can tell relay waiting apart from ladder time.
+    pub(super) struct DescriptorOutcome {
+        /// The descriptor, or this node's own name for why there is none.
+        pub(super) descriptor: Result<ModuleInfo, DescriptorFailure>,
+        /// How long was spent waiting on a RELAYING hop -- zero when no hop was relaying.
+        pub(super) relay_waited: std::time::Duration,
+    }
+
+    /// Why a descriptor ask produced no descriptor. Named so the caller composes ONE transport error in
+    /// this node's own vocabulary, and so the relay endings stay distinguishable in a log.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum DescriptorFailure {
+        /// No holder answered, or the answer was no.
+        NoAnswer,
+        /// A hop was relaying and the wait on it ended without a descriptor.
+        RelayWait(RelayWaitEnd),
+    }
+
+    impl DescriptorFailure {
+        /// This node's own words for the failure. Never the peer's -- the crate sanitizes at its
+        /// `Display` layer and upstream must not defeat it (#1603).
+        pub(super) fn reason(self) -> &'static str {
+            match self {
+                DescriptorFailure::NoAnswer => "getModuleInfo failed",
+                DescriptorFailure::RelayWait(end) => end.reason(),
+            }
+        }
+    }
+
+    /// What a descriptor ask came back with.
+    ///
+    /// The two are different FACTS, not two spellings of failure: a descriptor ends the ask, while a
+    /// relay in progress says the hop is mid-way through answering it and the requestor may wait. Before
+    /// dig-node#333 the second was indistinguishable from a miss, so a requestor abandoned a hop that was
+    /// actively fetching on its behalf.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum DescriptorAnswer {
+        /// The holder (or a hop that has finished relaying) described the capsule.
+        ///
+        /// Boxed because a [`ModuleInfo`] carries one hash and one length per chunk and is far larger
+        /// than the other variant; an unboxed enum would pay that size on every ask.
+        Descriptor(Box<ModuleInfo>),
+        /// A hop is RELAYING the capsule for us and has staged this many bytes so far.
+        RelayPending { staged_bytes: u64 },
+    }
+
+    /// How often a waiting requestor re-asks a relaying hop. Each poll is one small round trip, so this
+    /// is chosen to keep the wait responsive without making a multi-minute relay expensive to observe.
+    const RELAY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// How long a relay may report NO forward progress before the requestor gives up on it.
+    ///
+    /// Sized well above [`RELAY_POLL_INTERVAL`] so ordinary jitter -- a poll that lands between two of
+    /// the hop's staging writes -- never reads as a stall.
+    const RELAY_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The hard ceiling on a single relay wait, however healthy the progress looks.
+    ///
+    /// **This is a security bound, not a tuning knob (NC-12).** The progress figure is a HOP'S CLAIM
+    /// about itself, so a hostile hop can fabricate a counter that rises forever and a stall window alone
+    /// would never catch it. The ceiling is what makes the worst case finite: a lying hop can waste this
+    /// much of one pull's time from one peer, and no more. It is generous because an honest hop pulling a
+    /// large capsule over a slow link is the case this whole path exists to serve, and the cost of that
+    /// generosity is bounded -- the requestor is waiting on ONE peer, which it chose.
+    pub(super) const RELAY_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    /// Why a relay wait ended without producing a descriptor.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum RelayWaitEnd {
+        /// The hop kept answering but stopped making progress.
+        Stalled,
+        /// The hop kept making progress for longer than any wait may last.
+        Ceiling,
+        /// The hop stopped answering, or answered something that is neither a descriptor nor progress.
+        Abandoned,
+    }
+
+    impl RelayWaitEnd {
+        /// This node's own vocabulary for the failure. Composed here rather than from anything the peer
+        /// said, so a hop can never author what this node logs (#1603).
+        pub(super) fn reason(self) -> &'static str {
+            match self {
+                RelayWaitEnd::Stalled => "the relaying hop stopped making progress",
+                RelayWaitEnd::Ceiling => "the relay exceeded the maximum a single wait may last",
+                RelayWaitEnd::Abandoned => "the relaying hop stopped answering",
+            }
+        }
+    }
+
+    /// Wait for a hop that is relaying a capsule for us, re-asking with `ask` until it produces the
+    /// descriptor or one of [`RelayWaitEnd`]'s three endings.
+    ///
+    /// # Why the bound is PROGRESS and not a wall clock
+    ///
+    /// The descriptor ladder ([`DESCRIPTOR_ASK_DEADLINES`]) bounds a BLOCKING ask, where the cost of
+    /// waiting is a held stream on both ends -- so a tight cap is exactly right for it, and dig-node#333
+    /// is not a case of that cap being too small. The relay ask is no longer blocking: the hop ACKs and
+    /// keeps pulling, so each further poll costs one small round trip. That changes which instrument is
+    /// correct. A wall-clock cap on a transfer whose size the requestor cannot know before the descriptor
+    /// arrives is either too short for a large capsule or a blanket licence for a slow one; forward
+    /// PROGRESS needs no size, and a hop that is genuinely moving bytes is exactly the hop worth waiting
+    /// for.
+    ///
+    /// Two bounds keep that honest, and both are required. [`RELAY_STALL_WINDOW`] ends a wait on a hop
+    /// that has stopped moving. [`RELAY_MAX_WAIT`] ends it regardless, because the progress figure is the
+    /// hop's own claim and a stall window cannot catch a liar who keeps counting (NC-12).
+    ///
+    /// **Progress never authorises a byte.** It decides only how long to keep waiting; the capsule that
+    /// eventually arrives is verified against the chain-anchored root exactly as a direct holder's would
+    /// be, and a hop that fabricated its way through this wait still cannot produce content that passes.
+    async fn wait_for_relayed_descriptor<A, F>(
+        staged_at_first_ask: u64,
+        ceiling: std::time::Duration,
+        mut ask_once: A,
+    ) -> Result<ModuleInfo, RelayWaitEnd>
+    where
+        A: FnMut(bool) -> F,
+        F: std::future::Future<Output = Option<DescriptorAnswer>>,
+    {
+        let started = tokio::time::Instant::now();
+        let mut best = staged_at_first_ask;
+        let mut last_advance = started;
+        loop {
+            // The ceiling is checked FIRST, before any further waiting, so a hop that keeps answering can
+            // never buy one more poll past it.
+            if started.elapsed() >= ceiling {
+                return Err(RelayWaitEnd::Ceiling);
+            }
+            tokio::time::sleep(RELAY_POLL_INTERVAL).await;
+            // Every poll is a full ladder climb, for the same reason the first ask was: a hop that
+            // is mid-relay is doing real work and may answer slowly.
+            match ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || ask_once(true)).await {
+                LadderEnd::Answered(DescriptorAnswer::Descriptor(info)) => return Ok(*info),
+                LadderEnd::Answered(DescriptorAnswer::RelayPending { staged_bytes }) => {
+                    if staged_bytes > best {
+                        best = staged_bytes;
+                        last_advance = tokio::time::Instant::now();
+                    } else if last_advance.elapsed() >= RELAY_STALL_WINDOW {
+                        return Err(RelayWaitEnd::Stalled);
+                    }
+                    tracing::debug!(
+                        staged_bytes,
+                        "module pull: the hop is still relaying; waiting on its progress"
+                    );
+                }
+                LadderEnd::Refused | LadderEnd::Exhausted => return Err(RelayWaitEnd::Abandoned),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The bound the FIELD behaved as if it had: three asks 2.00 s apart, the last abandoned one
+        /// millisecond before the holder answered (the three-machine run behind dig_ecosystem#3128). The
+        /// tests below use it as the BEFORE case, so "the new bound is better" is measured against what
+        /// was actually observed rather than against a bound this file invented.
+        const FIELD_DEADLINE: [std::time::Duration; 1] = [std::time::Duration::from_secs(2)];
+
+        /// The measured cold-describe cost of the 135 MB capsule that failed: ~4.0 s on a host whose
+        /// whole-file `cat` took 0.01 s, so it is compute, not disk.
+        const COLD_135MB: std::time::Duration = std::time::Duration::from_millis(4_000);
+
+        /// The same describe throughput (~34 MB/s) applied to a 1 GB capsule: ~30 s. Chosen FROM the
+        /// measurement rather than picked, because the whole question the ladder answers is what happens
+        /// when the capsule is larger than the one that was measured.
+        const COLD_1GB: std::time::Duration = std::time::Duration::from_secs(30);
+
+        /// A holder whose FIRST descriptor ask takes `cold` and whose later asks are answered from its
+        /// memo in ~0 s — the real serve-side shape, because a cold describe runs under `spawn_blocking`
+        /// on the holder ([`crate::Node::describe_held_module`]) and a blocking task is not cancelled when
+        /// the requestor's stream drops, so an ABANDONED ask still warms the memo.
+        ///
+        /// It counts asks, so a test can distinguish "the ladder re-asked" from "the first ask was simply
+        /// given longer".
+        struct MemoizingHolder {
+            warm_at: tokio::time::Instant,
+            asks: std::cell::Cell<usize>,
+        }
+
+        impl MemoizingHolder {
+            fn new(cold: std::time::Duration) -> Self {
+                MemoizingHolder {
+                    // The describe starts when the holder is first built, and finishes `cold` later
+                    // whether or not anyone is still waiting — that is the non-cancellable property.
+                    warm_at: tokio::time::Instant::now() + cold,
+                    asks: std::cell::Cell::new(0),
+                }
+            }
+
+            async fn ask(&self) -> Option<&'static str> {
+                self.asks.set(self.asks.get() + 1);
+                tokio::time::sleep_until(self.warm_at).await;
+                Some("descriptor")
+            }
+        }
+
+        /// **Proves:** the capsule that actually failed in the field is obtained under the new bound.
+        ///
+        /// **Catches:** the shipped behaviour — an ask abandoned before a legitimately-slow holder can
+        /// answer, with nothing asking again.
+        ///
+        /// **Non-vacuous:** the companion below runs the SAME fixture under the bound the field behaved as
+        /// if it had, and must fail. The fixture cannot pass by being fast — `COLD_135MB` is the measured
+        /// cost and exceeds `FIELD_DEADLINE`.
+        #[tokio::test(start_paused = true)]
+        async fn the_capsule_that_failed_in_the_field_is_obtained_under_the_new_bound() {
+            let holder = MemoizingHolder::new(COLD_135MB);
+
+            let answer = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || holder.ask()).await;
+
+            assert_eq!(answer, LadderEnd::Answered("descriptor"));
+        }
+
+        /// **Proves:** the same 135 MB describe is LOST under the bound the field behaved as if it had —
+        /// so the test above is load-bearing on the change, not on a generous fixture.
+        #[tokio::test(start_paused = true)]
+        async fn the_same_capsule_is_lost_under_the_field_deadline() {
+            assert!(
+                COLD_135MB > FIELD_DEADLINE[0],
+                "the fixture must exceed the observed bound or it proves nothing"
+            );
+            let holder = MemoizingHolder::new(COLD_135MB);
+
+            let answer = ask_within_deadlines(&FIELD_DEADLINE, || holder.ask()).await;
+
+            assert_eq!(
+                answer,
+                LadderEnd::Exhausted,
+                "the observed bound cannot outlast a 4.0 s describe"
+            );
+        }
+
+        /// **Proves:** the LADDER, not merely a larger first rung, is what makes the bound scale — a
+        /// capsule whose describe costs ~30 s is obtained, and it takes THREE asks to get it.
+        ///
+        /// **Catches:** collapsing `DESCRIPTOR_ASK_DEADLINES` back to one rung of any size. A single rung
+        /// sized for 135 MB loses a 1 GB capsule (the companion below), and a single rung sized for 1 GB
+        /// would let one unanswerable holder hold a descriptor slot for 30 s before the next is tried.
+        ///
+        /// **Non-vacuous:** the ask COUNT is asserted, so a fixture answered on rung 1 could not pass.
+        #[tokio::test(start_paused = true)]
+        async fn a_capsule_an_order_of_magnitude_larger_needs_the_later_rungs() {
+            let holder = MemoizingHolder::new(COLD_1GB);
+
+            let answer = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || holder.ask()).await;
+
+            assert_eq!(answer, LadderEnd::Answered("descriptor"));
+            assert_eq!(
+                holder.asks.get(),
+                3,
+                "rungs 1 and 2 must elapse and rung 3 must re-ask onto the warmed memo"
+            );
+        }
+
+        /// **Proves:** a single rung sized for the measured capsule loses the order-of-magnitude-larger
+        /// one — the reason the fix is a ladder rather than a bigger number.
+        #[tokio::test(start_paused = true)]
+        async fn one_rung_sized_for_the_measured_capsule_loses_the_larger_one() {
+            let holder = MemoizingHolder::new(COLD_1GB);
+
+            let answer =
+                ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES[..1], || holder.ask()).await;
+
+            assert_eq!(answer, LadderEnd::Exhausted);
+        }
+
+        /// **Proves:** a holder that ANSWERS "no" spends exactly one rung. A refusal is not slowness, and
+        /// re-asking it would make every genuine miss cost the whole ladder before the next holder is
+        /// tried.
+        #[tokio::test(start_paused = true)]
+        async fn a_refusal_does_not_climb_the_ladder() {
+            let asks = std::cell::Cell::new(0usize);
+
+            let answer: LadderEnd<&str> =
+                ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || async {
+                    asks.set(asks.get() + 1);
+                    None
+                })
+                .await;
+
+            // REFUSED, not exhausted: the two endings are kept apart because only the first licenses the
+            // escalated re-ask dig-node#322 adds, and reading a silent peer as a refusal would double
+            // every unanswerable holder's cost.
+            assert_eq!(answer, LadderEnd::Refused);
+            assert_eq!(asks.get(), 1, "a refused ask must not be retried");
+        }
+
+        /// **Proves:** the ladder is BOUNDED — an unanswerable holder costs the sum of the rungs and no
+        /// more, so a slow or hostile peer cannot hold a descriptor slot indefinitely.
+        #[tokio::test(start_paused = true)]
+        async fn an_unanswerable_holder_costs_exactly_the_ladder() {
+            let started = tokio::time::Instant::now();
+
+            let answer: LadderEnd<&str> =
+                ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || async {
+                    std::future::pending::<()>().await;
+                    None
+                })
+                .await;
+
+            assert_eq!(answer, LadderEnd::Exhausted);
+            assert_eq!(
+                started.elapsed(),
+                DESCRIPTOR_ASK_DEADLINES.iter().sum::<std::time::Duration>(),
+                "the total wait must be exactly the ladder, never unbounded"
+            );
+        }
+
+        // -- dig-node#333: waiting on a relaying hop -----------------------------------------------------
+
+        /// The capsule the field run failed on: 134,968,945 bytes, measured on a three-machine
+        /// `A -> B -> C` (dig_ecosystem#3128). Every relay fixture below is sized from it rather than
+        /// from a round number, because the whole question is what happens to a REAL capsule.
+        const FIELD_CAPSULE_BYTES: u64 = 134_968_945;
+
+        /// A hop pulling [`FIELD_CAPSULE_BYTES`] at 1 MB/s -- an unremarkable rate for a residential
+        /// uplink, and the one that makes the relay take the "minutes" the field observed.
+        ///
+        /// Chosen so the fixture DECISIVELY exceeds the descriptor ladder rather than merely brushing it:
+        /// at ~135 s it is more than twice the ladder's 65 s total, so a test that passes cannot be
+        /// explained by the ladder having been slightly generous.
+        const FIELD_RELAY_BYTES_PER_POLL: u64 = 1_000_000 * 10;
+
+        /// A hop that answers every ask with its staged progress, and finally with a descriptor once it
+        /// has staged `completes_at` bytes.
+        ///
+        /// `advance_per_ask` is what varies between the tests below: a hop that is genuinely moving, one
+        /// that has frozen, and one that fabricates motion it will never finish. Everything else is held
+        /// constant, so a passing test cannot be explained by two differently-built fixtures.
+        struct RelayingHop {
+            staged: std::cell::Cell<u64>,
+            advance_per_ask: u64,
+            completes_at: Option<u64>,
+            asks: std::cell::Cell<usize>,
+        }
+
+        impl RelayingHop {
+            fn new(advance_per_ask: u64, completes_at: Option<u64>) -> Self {
+                RelayingHop {
+                    staged: std::cell::Cell::new(0),
+                    advance_per_ask,
+                    completes_at,
+                    asks: std::cell::Cell::new(0),
+                }
+            }
+
+            async fn ask(&self) -> Option<DescriptorAnswer> {
+                self.asks.set(self.asks.get() + 1);
+                self.staged.set(self.staged.get() + self.advance_per_ask);
+                let staged = self.staged.get();
+                match self.completes_at {
+                    Some(target) if staged >= target => {
+                        Some(DescriptorAnswer::Descriptor(Box::new(ModuleInfo {
+                            total_size: FIELD_CAPSULE_BYTES,
+                            module_hash: root(),
+                            chunk_hashes: Vec::new(),
+                            chunk_lens: Vec::new(),
+                        })))
+                    }
+                    _ => Some(DescriptorAnswer::RelayPending {
+                        staged_bytes: staged,
+                    }),
+                }
+            }
+        }
+
+        /// **Proves (dig-node#333):** a requestor waits out a hop that is genuinely relaying, and gets the
+        /// descriptor -- across a span the descriptor ladder could never have covered.
+        ///
+        /// **Catches:** the shipped behaviour exactly. The field run had the requestor abandon at 65 s
+        /// while the hop went on to cache 134,968,945 bytes minutes later, so the capability was real and
+        /// no first attempt could ever use it.
+        ///
+        /// **Non-vacuous:** the assertion is on ELAPSED VIRTUAL TIME as well as on the descriptor. A wait
+        /// that merely returned the descriptor could be satisfied by a hop that answered immediately; the
+        /// elapsed check requires the wait to have outlasted the whole ladder, which is the thing the old
+        /// code structurally could not do.
+        #[tokio::test(start_paused = true)]
+        async fn a_requestor_waits_out_a_hop_that_is_genuinely_relaying() {
+            let hop = RelayingHop::new(FIELD_RELAY_BYTES_PER_POLL, Some(FIELD_CAPSULE_BYTES));
+            let ladder: std::time::Duration = DESCRIPTOR_ASK_DEADLINES.iter().sum();
+            let started = tokio::time::Instant::now();
+
+            // Driven through `descriptor_via_rounds` -- the function `get_module_info` itself calls --
+            // rather than through the wait in isolation. A wait that is correct and no longer reached is
+            // exactly the shape a revert-proof misses.
+            let answer = descriptor_for_holder(true, RELAY_MAX_WAIT, |_proxy| hop.ask())
+                .await
+                .descriptor;
+
+            assert!(
+                answer.is_ok(),
+                "a hop that is moving bytes must be waited for: {answer:?}"
+            );
+            assert!(
+                started.elapsed() > ladder,
+                "the fixture must outlast the {ladder:?} descriptor ladder or it proves nothing --              elapsed {:?}",
+                started.elapsed()
+            );
+            assert!(
+                started.elapsed() < RELAY_MAX_WAIT,
+                "an honest relay must finish well inside the ceiling"
+            );
+        }
+
+        /// **Proves:** a hop that has STOPPED making progress is abandoned after
+        /// [`RELAY_STALL_WINDOW`], not waited on until the ceiling.
+        ///
+        /// **Why this is a separate test on a different hop behaviour:** the wait is a two-branch
+        /// decision, and a suite proving only the keep-waiting branch is satisfied by a wait that never
+        /// gives up at all. This hop answers every ask -- so it is not silent, and only the FROZEN counter
+        /// distinguishes it -- and never advances.
+        #[tokio::test(start_paused = true)]
+        async fn a_frozen_relay_is_abandoned_after_the_stall_window() {
+            let hop = RelayingHop::new(0, None);
+            let started = tokio::time::Instant::now();
+
+            let answer = descriptor_for_holder(true, RELAY_MAX_WAIT, |_proxy| hop.ask())
+                .await
+                .descriptor;
+
+            assert_eq!(
+                answer.unwrap_err(),
+                DescriptorFailure::RelayWait(RelayWaitEnd::Stalled)
+            );
+            assert!(
+                started.elapsed() < RELAY_STALL_WINDOW + RELAY_POLL_INTERVAL * 2,
+                "a frozen hop must be dropped at the stall window, not held to the ceiling -- elapsed              {:?}",
+                started.elapsed()
+            );
+        }
+
+        /// **Proves (NC-12):** a hop that FABRICATES endless progress is bounded by [`RELAY_MAX_WAIT`].
+        ///
+        /// **Catches the nearest wrong implementation of this whole change:** a wait bounded only by
+        /// forward progress. That version passes both tests above and hangs forever here, because the
+        /// staged byte count is the hop's claim about itself and a liar who keeps counting never stalls.
+        ///
+        /// **Why the fixture cannot pass by accident:** this hop advances by ONE byte per ask and never
+        /// completes, so it is indistinguishable from an honest, very slow relay by progress alone. Only
+        /// the ceiling can end it.
+        #[tokio::test(start_paused = true)]
+        async fn a_hop_that_fabricates_endless_progress_is_bounded_by_the_ceiling() {
+            let hop = RelayingHop::new(1, None);
+            let started = tokio::time::Instant::now();
+
+            // Bounded at twice the ceiling so a REGRESSION FAILS rather than hangs. Without it the
+            // absent-ceiling case loops forever burning CPU on virtual time, which reads in CI as a stuck
+            // job rather than a failed assertion -- and a test that hangs on regression is a landmine for
+            // whoever trips it. Measured: this test's own revert-proof spun for 659 CPU-seconds before it
+            // was killed.
+            let answer = tokio::time::timeout(
+                RELAY_MAX_WAIT * 2,
+                descriptor_for_holder(true, RELAY_MAX_WAIT, |_proxy| hop.ask()),
+            )
+            .await
+            .expect(
+                "the wait MUST end at the ceiling; an unbounded wait is the NC-12 defect itself",
+            )
+            .descriptor;
+
+            assert_eq!(
+                answer.unwrap_err(),
+                DescriptorFailure::RelayWait(RelayWaitEnd::Ceiling)
+            );
+            assert!(
+                started.elapsed() >= RELAY_MAX_WAIT,
+                "the wait must run to the ceiling before ending"
+            );
+            assert!(
+                started.elapsed() < RELAY_MAX_WAIT + RELAY_POLL_INTERVAL * 2,
+                "and must end AT the ceiling, not merely somewhere after it -- elapsed {:?}",
+                started.elapsed()
+            );
+        }
+
+        /// **Proves (finding 2):** the ceiling handed in is the ceiling USED — a hop gets only what the
+        /// pull has left, never a fresh [`RELAY_MAX_WAIT`].
+        ///
+        /// **Catches the shape of a half-applied budget:** a parameter that is accepted, threaded, and
+        /// then ignored in favour of the constant. That version passes every other test in this module,
+        /// because every other test hands in exactly `RELAY_MAX_WAIT`.
+        ///
+        /// **Fixture design:** the hop is the SAME endless-progress liar as the ceiling test above, so the
+        /// only thing that varies is the budget it is granted. Its ending is identical; only the elapsed
+        /// time distinguishes the two, which is precisely the property under test.
+        #[tokio::test(start_paused = true)]
+        async fn a_hop_gets_only_what_the_pull_has_left() {
+            let hop = RelayingHop::new(1, None);
+            let nearly_spent = RELAY_POLL_INTERVAL * 3;
+            let started = tokio::time::Instant::now();
+
+            let answer = descriptor_for_holder(true, nearly_spent, |_proxy| hop.ask()).await;
+
+            assert_eq!(
+                answer.descriptor.unwrap_err(),
+                DescriptorFailure::RelayWait(RelayWaitEnd::Ceiling)
+            );
+            assert!(
+            started.elapsed() < nearly_spent + RELAY_POLL_INTERVAL * 2,
+            "the wait must end at the budget it was GIVEN, not at the per-hop maximum -- elapsed              {:?} against a budget of {nearly_spent:?}",
+            started.elapsed()
+        );
+            assert!(
+                started.elapsed() < RELAY_MAX_WAIT,
+                "the control: a ceiling that was ignored would run to {RELAY_MAX_WAIT:?}"
+            );
+        }
+
+        /// **Proves:** the relay wait is REPORTED, so a caller can charge it — and reported as zero when
+        /// no hop relayed, so an ordinary ask never consumes a pull's budget.
+        ///
+        /// **Why both halves:** a report that is always zero would silently disable the budget, and a
+        /// report that is never zero would exhaust it on ordinary asks. Neither is visible from the
+        /// outcome alone.
+        #[tokio::test(start_paused = true)]
+        async fn only_a_relaying_hop_costs_the_pull_any_relay_time() {
+            let relaying = RelayingHop::new(FIELD_RELAY_BYTES_PER_POLL, Some(FIELD_CAPSULE_BYTES));
+            let waited = descriptor_for_holder(true, RELAY_MAX_WAIT, |_proxy| relaying.ask())
+                .await
+                .relay_waited;
+            assert!(
+                waited > std::time::Duration::ZERO,
+                "a hop that relayed must report the time it cost"
+            );
+
+            let holder = RelayingHop::new(u64::MAX, Some(1));
+            let none = descriptor_for_holder(true, RELAY_MAX_WAIT, |_proxy| holder.ask())
+                .await
+                .relay_waited;
+            assert_eq!(
+                none,
+                std::time::Duration::ZERO,
+                "a holder that simply answered must cost the pull no relay budget at all"
+            );
+        }
+
+        /// **Proves:** a hop that stops answering ends the wait immediately, rather than being polled to
+        /// the ceiling. A relay that died is not a relay in progress.
+        #[tokio::test(start_paused = true)]
+        async fn a_hop_that_stops_answering_ends_the_wait() {
+            // First round: relaying. Every round after: silence. Only the SECOND round can produce the
+            // abandonment, so a fixture that was silent from the start could not exhibit it.
+            let rounds = std::cell::Cell::new(0usize);
+            let answer = descriptor_for_holder(true, RELAY_MAX_WAIT, |_proxy| {
+                let ix = rounds.get();
+                rounds.set(ix + 1);
+                async move {
+                    if ix == 0 {
+                        Some(DescriptorAnswer::RelayPending { staged_bytes: 1 })
+                    } else {
+                        None
+                    }
+                }
+            })
+            .await
+            .descriptor;
+
+            assert_eq!(
+                answer.unwrap_err(),
+                DescriptorFailure::RelayWait(RelayWaitEnd::Abandoned)
+            );
+        }
+
+        // -- dig-node#322: escalating within one invocation -----------------------------------------------
+
+        /// Record the `proxy` phase of every round an escalation drives, so the SEQUENCE is the assertion
+        /// rather than a count that a single escalated round would also satisfy.
+        /// How a fixture holder ends a ROUND, expressed at the one-shot level the production closure
+        /// actually supplies.
+        #[derive(Clone, Copy)]
+        enum RoundEnding {
+            /// Answers, and the answer is no. One rung is spent and the ladder stops.
+            Refuses,
+            /// Never answers at all, so every rung of the ladder elapses.
+            Silent,
+        }
+
+        /// The sequence of ROUNDS a descriptor ask drives, by phase, with each round ending as named.
+        ///
+        /// The ending is chosen BY PHASE rather than by call index, because a round is not one ask -- a
+        /// silent holder is asked once per rung, so an index-keyed fixture serves round two's ending to
+        /// round one's second rung and manufactures an escalation that never happened. That mistake made
+        /// this exact test report `[false, false, true]`; keying on the phase is what makes the fixture
+        /// describe rounds instead of asks.
+        ///
+        /// Consecutive asks at the same phase collapse into the one round they belong to, so the result
+        /// is the round sequence and never a rung count.
+        async fn phases_of(
+            already_escalated: bool,
+            plain: RoundEnding,
+            escalated: RoundEnding,
+        ) -> Vec<bool> {
+            let seen = std::cell::RefCell::new(Vec::new());
+            let _ = descriptor_for_holder(already_escalated, RELAY_MAX_WAIT, |proxy| {
+                seen.borrow_mut().push(proxy);
+                let ending = if proxy { escalated } else { plain };
+                async move {
+                    match ending {
+                        RoundEnding::Refuses => None,
+                        // Pending forever: under `start_paused` the runtime advances the virtual clock,
+                        // so every rung elapses and the ladder ends Exhausted -- the real shape of an
+                        // unresponsive peer, rather than a value standing in for one.
+                        RoundEnding::Silent => std::future::pending().await,
+                    }
+                }
+            })
+            .await;
+            let mut rounds: Vec<bool> = Vec::new();
+            for phase in seen.into_inner() {
+                if rounds.last() != Some(&phase) {
+                    rounds.push(phase);
+                }
+            }
+            rounds
+        }
+
+        /// **Proves (dig-node#322):** a cold requestor's FIRST invocation escalates, once its plain round
+        /// has been answered with a no -- so the documented single command can relay.
+        ///
+        /// **The assertion is the PHASE SEQUENCE, not a round count.** A count of two is satisfied by two
+        /// plain rounds, and a count of one by an implementation that escalated immediately -- which would
+        /// remove the amplification bound this change must preserve. `[false, true]` is the only sequence
+        /// that is both fixed and correct.
+        #[tokio::test(start_paused = true)]
+        async fn a_cold_first_invocation_spends_a_plain_round_then_escalates() {
+            let phases = phases_of(false, RoundEnding::Refuses, RoundEnding::Refuses).await;
+
+            assert_eq!(
+                phases,
+                vec![false, true],
+                "the plain round must come FIRST and the relay ask must follow it in the same invocation"
+            );
+        }
+
+        /// **Proves:** an EXHAUSTED plain round is not escalated, so an unresponsive holder still costs
+        /// exactly one ladder.
+        ///
+        /// **Catches the obvious over-broad version of the #322 fix** -- escalate whenever the round
+        /// produced no descriptor -- which doubles `get_module_info`'s wall clock on every silent peer.
+        /// Its production-path companion is
+        /// [`the_production_get_module_info_climbs_the_whole_ladder`], which pins the same fact in
+        /// virtual seconds through the real method.
+        #[tokio::test(start_paused = true)]
+        async fn an_unresponsive_holder_is_not_escalated() {
+            let phases = phases_of(false, RoundEnding::Silent, RoundEnding::Refuses).await;
+
+            assert_eq!(
+                phases,
+                vec![false],
+                "a peer that could not answer a plain ask must not be asked to relay as well"
+            );
+        }
+
+        /// **Proves:** a pair that has ALREADY spent its plain round asks once, escalated. The escalation
+        /// is a second pass per `(capsule, peer)` pair, never a second pass per invocation.
+        #[tokio::test(start_paused = true)]
+        async fn an_already_escalated_pair_asks_once() {
+            let phases = phases_of(true, RoundEnding::Refuses, RoundEnding::Refuses).await;
+
+            assert_eq!(phases, vec![true]);
+        }
+
+        /// A canonical 64-hex id, so a fixture descriptor's `module_hash` is the right shape.
+        fn root() -> String {
+            [0xCDu8; 32].iter().map(|b| format!("{b:02x}")).collect()
+        }
+    }
 }
 
 /// One `dig.getModuleInfo` over `peer`, decoded into a [`ModuleInfo`]. `proxy` declares whether this
@@ -446,7 +1396,7 @@ async fn descriptor_over(
     store_id: &str,
     root: &str,
     proxy: bool,
-) -> Option<ModuleInfo> {
+) -> Option<DescriptorAnswer> {
     let params = serde_json::to_value(GetModuleInfoParams {
         store_id: store_id.to_string(),
         root: root.to_string(),
@@ -462,7 +1412,29 @@ async fn descriptor_over(
     .await
     .ok()?;
     let response = read_response_frame(&mut stream).await.ok()?;
-    serde_json::from_value(response.get("result")?.clone()).ok()
+    if let Some(result) = response.get("result") {
+        return serde_json::from_value(result.clone())
+            .ok()
+            .map(|info: ModuleInfo| DescriptorAnswer::Descriptor(Box::new(info)));
+    }
+    relay_progress_in(&response).map(|staged_bytes| DescriptorAnswer::RelayPending { staged_bytes })
+}
+
+/// The staged byte count a RELAY-IN-PROGRESS answer carries, or `None` for any other answer.
+///
+/// Keyed on the `data` FIELD rather than on the error code alone, and deliberately so: the code is
+/// the taxonomy's ordinary inconclusive miss, which an honest non-relaying node also returns when its
+/// own lookup was unsettled. Only a node that is relaying reports the field, so only the field
+/// distinguishes "wait for me" from "I could not find out".
+fn relay_progress_in(response: &serde_json::Value) -> Option<u64> {
+    let error = response.get("error")?;
+    if error.get("code")?.as_i64()? != crate::download::content_miss_inconclusive() {
+        return None;
+    }
+    error
+        .get("data")?
+        .get(crate::RELAY_PROGRESS_FIELD)?
+        .as_u64()
 }
 
 /// Open a `dig.fetchModuleRange` frame stream over `peer`, at the phase `proxy` names.
@@ -497,6 +1469,32 @@ async fn window_stream_over(
     Some(stream)
 }
 
+impl NatModuleTransport {
+    /// ONE descriptor ask of `provider_peer_id` at the phase `proxy` names -- a dial, a question, a
+    /// hang-up, and nothing else.
+    ///
+    /// This carries NO policy: no ladder, no escalation, no waiting. Every one of those lives in
+    /// [`descriptor_ask`], which drives this. Keeping the primitive policy-free is what leaves a call
+    /// site nothing to get a descriptor "almost" the right way WITH — outside this file there is no
+    /// partial path to reach at all, and inside it a bypass is caught by the two production tests
+    /// named on [`descriptor_ask`] rather than by the compiler.
+    ///
+    /// Each round re-dials: an abandoned round's connection is gone, and the holder's descriptor memo
+    /// -- not the connection -- is what makes the re-ask cheap. See [`DESCRIPTOR_ASK_DEADLINES`].
+    async fn ask_descriptor_once(
+        &self,
+        provider_peer_id: &str,
+        store_id: &str,
+        root: &str,
+        proxy: bool,
+    ) -> Option<descriptor_ask::DescriptorAnswer> {
+        let mut peer = self.connect(provider_peer_id, store_id, root).await.ok()?;
+        let answer = descriptor_over(&mut peer, store_id, root, proxy).await;
+        peer.disconnect().await;
+        answer
+    }
+}
+
 #[async_trait]
 impl ModuleTransport for NatModuleTransport {
     async fn get_module_info(
@@ -505,21 +1503,29 @@ impl ModuleTransport for NatModuleTransport {
         store_id: &str,
         root: &str,
     ) -> Result<ModuleInfo, DownloadError> {
-        // Each rung re-dials: the abandoned rung's connection is gone, and the holder's memo — not the
-        // connection — is what makes the re-ask cheap. See [`DESCRIPTOR_ASK_DEADLINES`].
-        let result = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || async {
-            let mut peer = self.connect(provider_peer_id, store_id, root).await.ok()?;
-            let proxy = self
-                .escalation
-                .escalate_for(store_id, root, provider_peer_id);
-            let answer = descriptor_over(&mut peer, store_id, root, proxy).await;
-            peer.disconnect().await;
-            answer
-        })
+        // The pair's phase, decided ONCE per invocation rather than re-read inside the ladder, so the
+        // rounds below say plainly which is which. `escalate_for` records the pair, so this is `false`
+        // exactly on the pair's first invocation.
+        let already_escalated = self
+            .escalation
+            .escalate_for(store_id, root, provider_peer_id);
+
+        // The ceiling handed down is what is LEFT of this PULL's relay-wait budget, not a fresh
+        // per-peer allowance. See [`RelayWaitBudget`] for why the difference is the whole point.
+        let outcome = descriptor_ask::descriptor_for_holder(
+            already_escalated,
+            self.relay_budget.remaining(store_id, root),
+            |proxy| self.ask_descriptor_once(provider_peer_id, store_id, root, proxy),
+        )
         .await;
+        self.relay_budget
+            .charge(store_id, root, outcome.relay_waited);
+
         // The reason names the STEP and the sentinelled peer; the peer's own answer text is never
-        // embedded (#1603) — the crate sanitizes at its Display layer and upstream must not defeat it.
-        result.ok_or_else(|| DownloadError::transport(provider_peer_id, "getModuleInfo failed"))
+        // embedded (#1603).
+        outcome
+            .descriptor
+            .map_err(|failure| DownloadError::transport(provider_peer_id, failure.reason()))
     }
 
     async fn fetch_module_range(
@@ -629,155 +1635,6 @@ pub(crate) fn pool_of(entries: &[(&str, &str)]) -> ConnectedPool {
 mod tests {
     use super::*;
 
-    /// The bound the FIELD behaved as if it had: three asks 2.00 s apart, the last abandoned one
-    /// millisecond before the holder answered (the three-machine run behind dig_ecosystem#3128). The
-    /// tests below use it as the BEFORE case, so "the new bound is better" is measured against what
-    /// was actually observed rather than against a bound this file invented.
-    const FIELD_DEADLINE: [std::time::Duration; 1] = [std::time::Duration::from_secs(2)];
-
-    /// The measured cold-describe cost of the 135 MB capsule that failed: ~4.0 s on a host whose
-    /// whole-file `cat` took 0.01 s, so it is compute, not disk.
-    const COLD_135MB: std::time::Duration = std::time::Duration::from_millis(4_000);
-
-    /// The same describe throughput (~34 MB/s) applied to a 1 GB capsule: ~30 s. Chosen FROM the
-    /// measurement rather than picked, because the whole question the ladder answers is what happens
-    /// when the capsule is larger than the one that was measured.
-    const COLD_1GB: std::time::Duration = std::time::Duration::from_secs(30);
-
-    /// A holder whose FIRST descriptor ask takes `cold` and whose later asks are answered from its
-    /// memo in ~0 s — the real serve-side shape, because a cold describe runs under `spawn_blocking`
-    /// on the holder ([`crate::Node::describe_held_module`]) and a blocking task is not cancelled when
-    /// the requestor's stream drops, so an ABANDONED ask still warms the memo.
-    ///
-    /// It counts asks, so a test can distinguish "the ladder re-asked" from "the first ask was simply
-    /// given longer".
-    struct MemoizingHolder {
-        warm_at: tokio::time::Instant,
-        asks: std::cell::Cell<usize>,
-    }
-
-    impl MemoizingHolder {
-        fn new(cold: std::time::Duration) -> Self {
-            MemoizingHolder {
-                // The describe starts when the holder is first built, and finishes `cold` later
-                // whether or not anyone is still waiting — that is the non-cancellable property.
-                warm_at: tokio::time::Instant::now() + cold,
-                asks: std::cell::Cell::new(0),
-            }
-        }
-
-        async fn ask(&self) -> Option<&'static str> {
-            self.asks.set(self.asks.get() + 1);
-            tokio::time::sleep_until(self.warm_at).await;
-            Some("descriptor")
-        }
-    }
-
-    /// **Proves:** the capsule that actually failed in the field is obtained under the new bound.
-    ///
-    /// **Catches:** the shipped behaviour — an ask abandoned before a legitimately-slow holder can
-    /// answer, with nothing asking again.
-    ///
-    /// **Non-vacuous:** the companion below runs the SAME fixture under the bound the field behaved as
-    /// if it had, and must fail. The fixture cannot pass by being fast — `COLD_135MB` is the measured
-    /// cost and exceeds `FIELD_DEADLINE`.
-    #[tokio::test(start_paused = true)]
-    async fn the_capsule_that_failed_in_the_field_is_obtained_under_the_new_bound() {
-        let holder = MemoizingHolder::new(COLD_135MB);
-
-        let answer = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || holder.ask()).await;
-
-        assert_eq!(answer, Some("descriptor"));
-    }
-
-    /// **Proves:** the same 135 MB describe is LOST under the bound the field behaved as if it had —
-    /// so the test above is load-bearing on the change, not on a generous fixture.
-    #[tokio::test(start_paused = true)]
-    async fn the_same_capsule_is_lost_under_the_field_deadline() {
-        assert!(
-            COLD_135MB > FIELD_DEADLINE[0],
-            "the fixture must exceed the observed bound or it proves nothing"
-        );
-        let holder = MemoizingHolder::new(COLD_135MB);
-
-        let answer = ask_within_deadlines(&FIELD_DEADLINE, || holder.ask()).await;
-
-        assert_eq!(
-            answer, None,
-            "the observed bound cannot outlast a 4.0 s describe"
-        );
-    }
-
-    /// **Proves:** the LADDER, not merely a larger first rung, is what makes the bound scale — a
-    /// capsule whose describe costs ~30 s is obtained, and it takes THREE asks to get it.
-    ///
-    /// **Catches:** collapsing `DESCRIPTOR_ASK_DEADLINES` back to one rung of any size. A single rung
-    /// sized for 135 MB loses a 1 GB capsule (the companion below), and a single rung sized for 1 GB
-    /// would let one unanswerable holder hold a descriptor slot for 30 s before the next is tried.
-    ///
-    /// **Non-vacuous:** the ask COUNT is asserted, so a fixture answered on rung 1 could not pass.
-    #[tokio::test(start_paused = true)]
-    async fn a_capsule_an_order_of_magnitude_larger_needs_the_later_rungs() {
-        let holder = MemoizingHolder::new(COLD_1GB);
-
-        let answer = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || holder.ask()).await;
-
-        assert_eq!(answer, Some("descriptor"));
-        assert_eq!(
-            holder.asks.get(),
-            3,
-            "rungs 1 and 2 must elapse and rung 3 must re-ask onto the warmed memo"
-        );
-    }
-
-    /// **Proves:** a single rung sized for the measured capsule loses the order-of-magnitude-larger
-    /// one — the reason the fix is a ladder rather than a bigger number.
-    #[tokio::test(start_paused = true)]
-    async fn one_rung_sized_for_the_measured_capsule_loses_the_larger_one() {
-        let holder = MemoizingHolder::new(COLD_1GB);
-
-        let answer = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES[..1], || holder.ask()).await;
-
-        assert_eq!(answer, None);
-    }
-
-    /// **Proves:** a holder that ANSWERS "no" spends exactly one rung. A refusal is not slowness, and
-    /// re-asking it would make every genuine miss cost the whole ladder before the next holder is
-    /// tried.
-    #[tokio::test(start_paused = true)]
-    async fn a_refusal_does_not_climb_the_ladder() {
-        let asks = std::cell::Cell::new(0usize);
-
-        let answer: Option<&str> = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || async {
-            asks.set(asks.get() + 1);
-            None
-        })
-        .await;
-
-        assert_eq!(answer, None);
-        assert_eq!(asks.get(), 1, "a refused ask must not be retried");
-    }
-
-    /// **Proves:** the ladder is BOUNDED — an unanswerable holder costs the sum of the rungs and no
-    /// more, so a slow or hostile peer cannot hold a descriptor slot indefinitely.
-    #[tokio::test(start_paused = true)]
-    async fn an_unanswerable_holder_costs_exactly_the_ladder() {
-        let started = tokio::time::Instant::now();
-
-        let answer: Option<&str> = ask_within_deadlines(&DESCRIPTOR_ASK_DEADLINES, || async {
-            std::future::pending::<()>().await;
-            None
-        })
-        .await;
-
-        assert_eq!(answer, None);
-        assert_eq!(
-            started.elapsed(),
-            DESCRIPTOR_ASK_DEADLINES.iter().sum::<std::time::Duration>(),
-            "the total wait must be exactly the ladder, never unbounded"
-        );
-    }
-
     /// A canonical 64-hex id built from a repeated byte, so a test id can never be the wrong length.
     fn id_of(byte: u8) -> String {
         [byte; 32].iter().map(|b| format!("{b:02x}")).collect()
@@ -872,7 +1729,16 @@ mod tests {
         let t = transport(pool_of(&[]), Arc::new(HangingLocator));
         let started = tokio::time::Instant::now();
 
-        let result = t.get_module_info(&peer, &store(), &root()).await;
+        // Bounded at twice the ladder so a REGRESSION FAILS rather than hangs. A call site that
+        // stops going through [`descriptor_ask`] has no ladder at all, so it waits on the pending
+        // locator forever -- measured, when the gate's bypass was reproduced here. A test that hangs
+        // on regression reads in CI as a stuck job rather than a failed assertion.
+        let ladder: std::time::Duration = DESCRIPTOR_ASK_DEADLINES.iter().sum();
+        let result = tokio::time::timeout(ladder * 2, t.get_module_info(&peer, &store(), &root()))
+            .await
+            .expect(
+                "`get_module_info` must be BOUNDED by the ladder; an unbounded ask is the defect",
+            );
 
         assert!(
             result.is_err(),
@@ -882,6 +1748,171 @@ mod tests {
             started.elapsed(),
             DESCRIPTOR_ASK_DEADLINES.iter().sum::<std::time::Duration>(),
             "`get_module_info` must spend every rung of the ladder, not one fixed deadline"
+        );
+    }
+
+    /// Counts how many times the production path asked discovery for this capsule's providers.
+    ///
+    /// The count is the ROUND count seen from outside: every descriptor round dials, every dial
+    /// resolves candidates, and every resolution consults the locator exactly once. So a locator that
+    /// counts is an observer of the production method's round structure that needs no peer, no
+    /// socket and no injected seam.
+    #[derive(Default)]
+    struct CountingLocator {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProviderLocator for CountingLocator {
+        async fn find_providers(
+            &self,
+            _content: &ContentId,
+        ) -> Result<Vec<ProviderRecord>, DownloadError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // No providers and no error: an ANSWER of "nobody", so the round is refused rather than
+            // exhausted -- which is exactly the condition dig-node#322 says must escalate.
+            Ok(Vec::new())
+        }
+    }
+
+    /// **Proves (dig-node#322, at the PRODUCTION entry point):** one call to the real
+    /// `ModuleTransport::get_module_info` drives TWO descriptor rounds when the first is refused —
+    /// the plain round and the escalated one — so the documented single command can relay.
+    ///
+    /// **Catches what the unit-level escalation tests structurally cannot:** a call site that stops
+    /// driving [`descriptor_ask`] at all. The gate proved that was possible — replacing this method's
+    /// body with a direct one-shot ask deleted both the escalation and the relay wait from the
+    /// shipped path with every test still green, because every test drove the helper rather than the
+    /// method. This one drives the method.
+    ///
+    /// **Non-vacuous:** the assertion is TWO, not "at least one". A bypass that keeps a single round
+    /// yields one; a fixture that never reached the transport at all yields zero. Only the escalation
+    /// produces two, and the companion above pins that the rounds are a plain one then a relay one.
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_first_invocation_escalates_through_the_production_transport() {
+        let peer = peer_hex(1);
+        let locator = Arc::new(CountingLocator::default());
+        let t = transport(
+            pool_of(&[]),
+            Arc::clone(&locator) as Arc<dyn ProviderLocator>,
+        );
+
+        let result = t.get_module_info(&peer, &store(), &root()).await;
+
+        assert!(
+            result.is_err(),
+            "no holder answered, so there is no descriptor"
+        );
+        assert_eq!(
+            locator.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a refused plain round must be followed by an ESCALATED round inside the same call;              one round means the call site is no longer driving the escalation"
+        );
+    }
+
+    /// **Proves (finding 2):** the relay-wait budget is spent per CAPSULE, drains, and saturates —
+    /// so many hops on one pull share one allowance while a different pull is untouched.
+    ///
+    /// **Catches:** a budget keyed by peer, or one that resets, either of which restores the
+    /// `holders × ceiling` multiplication the budget exists to remove.
+    #[test]
+    fn the_relay_budget_is_spent_per_capsule_and_saturates() {
+        let budget = RelayWaitBudget::default();
+        let (store, root) = (store(), root());
+        let full = RELAY_WAIT_BUDGET_PER_PULL;
+
+        assert_eq!(
+            budget.remaining(&store, &root),
+            full,
+            "a fresh pull has all of it"
+        );
+
+        // Two different HOPS of the same pull, charged separately, draw down the same allowance.
+        budget.charge(&store, &root, full / 4);
+        budget.charge(&store, &root, full / 4);
+        assert_eq!(
+            budget.remaining(&store, &root),
+            full / 2,
+            "hops of one pull SHARE the budget; a per-peer allowance would still read as full here"
+        );
+
+        // A different capsule is a different pull.
+        assert_eq!(
+            budget.remaining(&store, &id_of(0x77)),
+            full,
+            "the control: another capsule must be unaffected, or the ledger is global rather than              per pull"
+        );
+
+        // Overrun saturates instead of wrapping into a fresh allowance.
+        budget.charge(&store, &root, full);
+        assert_eq!(
+            budget.remaining(&store, &root),
+            std::time::Duration::ZERO,
+            "an overrun must leave nothing, never wrap"
+        );
+    }
+
+    /// **Proves (dig-node#333 re-gate):** the ledger's lifetime is the PULL's, not the daemon's — a
+    /// SECOND pull of the same capsule starts with its whole budget.
+    ///
+    /// **Catches the shipped shape of the previous revision**, in which the transport was built once
+    /// at node wiring and the ledger only ever grew. A capsule whose first honest pull spent the
+    /// budget could then never take the relay path again until the process restarted — and the
+    /// refusal was composed as a transport error naming a PEER, blaming that peer for this node's own
+    /// earlier spend. That is the mis-attribution class this repo has already paid for twice.
+    ///
+    /// **Why the fixture must be TWO pulls:** the sibling test above exercises many hops of ONE pull
+    /// and passes identically whether or not the entry is ever released, because within a pull the
+    /// entry is supposed to persist. Only a second pull can tell a per-pull ledger from a permanent
+    /// one, and the assertion is that the second gets the FULL budget rather than merely a non-zero
+    /// one — a partial release would satisfy "more than nothing" while still charging pull two for
+    /// pull one.
+    #[test]
+    fn a_second_pull_of_the_same_capsule_gets_its_own_budget() {
+        let budget = RelayWaitBudget::default();
+        let (store, root) = (store(), root());
+        let full = RELAY_WAIT_BUDGET_PER_PULL;
+
+        // PULL ONE spends every second of it — an honest hop relaying a large capsule.
+        budget.charge(&store, &root, full);
+        assert_eq!(
+            budget.remaining(&store, &root),
+            std::time::Duration::ZERO,
+            "the control: pull one must genuinely exhaust the budget, or pull two proves nothing"
+        );
+
+        // The pull ends. Whoever drove `download` says so.
+        budget.release(&store, &root);
+
+        assert_eq!(
+            budget.remaining(&store, &root),
+            full,
+            "pull two must start with the WHOLE budget; a ledger keyed to the capsule for the              daemon's lifetime would still read zero here and would refuse the relay path forever,              while naming a peer as the cause"
+        );
+    }
+
+    /// **Proves:** releasing a pull leaves OTHER pulls' budgets alone, so the release is scoped and
+    /// not a global reset.
+    ///
+    /// Without this, `release` could be implemented as "clear everything" and still pass the test
+    /// above — which would hand every concurrent pull a fresh budget whenever any one of them ended,
+    /// restoring the multiplication under a different name.
+    #[test]
+    fn releasing_one_pull_does_not_refund_another() {
+        let budget = RelayWaitBudget::default();
+        let (store, root) = (store(), root());
+        let other_root = id_of(0x77);
+        let full = RELAY_WAIT_BUDGET_PER_PULL;
+
+        budget.charge(&store, &root, full / 2);
+        budget.charge(&store, &other_root, full / 2);
+
+        budget.release(&store, &root);
+
+        assert_eq!(
+            budget.remaining(&store, &other_root),
+            full / 2,
+            "the OTHER pull keeps what it has spent; a release that refunds it is a global reset"
         );
     }
 

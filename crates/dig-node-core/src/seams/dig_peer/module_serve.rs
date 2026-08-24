@@ -253,6 +253,24 @@ pub fn module_unavailable_frame(code: i64) -> Value {
     json!({"error": {"code": code, "message": "this node does not hold the requested .dig module"}})
 }
 
+/// The frame a hop sends while it is STILL RELAYING the requested capsule (dig-node#333).
+///
+/// Same shape as [`module_unavailable_frame`] — an `error` object with a canonical code — because a
+/// requestor decodes exactly one refusal shape. What differs is the CODE and the `data`: the code is
+/// the taxonomy's inconclusive miss (the answer is unknown, a retry is meaningful) rather than a
+/// settled not-held, and the data carries how far this hop has got.
+///
+/// The byte count is this node's claim about its own staging file. A requestor may use it to tell a
+/// progressing relay from a stalled one; it is never evidence about the bytes themselves, which are
+/// merkle-verified against the chain-anchored root like every other peer's (NC-12).
+pub fn module_relay_pending_frame(staged_bytes: u64) -> Value {
+    json!({"error": {
+        "code": crate::download::content_miss_inconclusive(),
+        "message": "relaying the requested capsule on your behalf; not yet complete",
+        "data": { crate::RELAY_PROGRESS_FIELD: staged_bytes },
+    }})
+}
+
 /// Lower-case hex of 32 raw bytes.
 fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

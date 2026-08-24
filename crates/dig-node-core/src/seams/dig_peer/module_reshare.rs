@@ -364,11 +364,61 @@ const RELAY_MARKER_BODY: &[u8] =
     b"relayed: held on another node's behalf; this node is not a holder (dig-node#276)
 ";
 
-/// Discard a warm's staging artifacts, so a failed pull leaves nothing behind that a later run (or a
-/// GC sweep) could mistake for progress.
-fn discard_staging(staged: &Path) {
-    let _ = std::fs::remove_file(staged);
-    let _ = std::fs::remove_file(dig_download::staging_path_for(staged));
+/// How often [`CapsuleWarmer::await_landing`] re-checks the cache while its grace runs. Short enough
+/// that a capsule landing early is served promptly, long enough that the wait is not a spin.
+const LANDING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A discarded pull's whole on-disk footprint, so the two halves cannot be erased separately.
+///
+/// A partial capsule is stored as TWO facts in two places — the staged bytes under the staging dir,
+/// and the resume checkpoint in the [`StateStore`](dig_download::StateStore) — and they are only ever
+/// true together. Passing them as one value is what stops a caller erasing one and leaving the other,
+/// which is precisely the state dig-node#332 measured: a checkpoint claiming chunks that no longer
+/// existed on disk.
+struct StagedPull<'a> {
+    /// The path dig-download's `FileSink` finalizes onto (its in-progress bytes live beside it, at
+    /// [`staging_path_for`](dig_download::staging_path_for)).
+    staged: &'a Path,
+    /// Where the resume checkpoint lives.
+    state_store: &'a dyn dig_download::StateStore,
+    /// The checkpoint's key — dig-download's own, never a second derivation of it.
+    key: String,
+}
+
+impl<'a> StagedPull<'a> {
+    /// Name the pull of `(store_hex, root_hex)` staging at `staged`.
+    fn new(
+        staged: &'a Path,
+        state_store: &'a dyn dig_download::StateStore,
+        store_hex: &str,
+        root_hex: &str,
+    ) -> Self {
+        StagedPull {
+            staged,
+            state_store,
+            key: dig_download::module_download_key(store_hex, root_hex),
+        }
+    }
+
+    /// Erase a warm's staging artifacts — bytes AND checkpoint — so a failed pull leaves nothing
+    /// behind that a later run (or a GC sweep) could mistake for progress.
+    ///
+    /// # Why the checkpoint goes with the bytes
+    ///
+    /// A surviving checkpoint describes chunks that are no longer on disk, so the next warm resumes
+    /// against them, fails to read them back, and re-attributes each one. That is harmless to
+    /// correctness — the re-attribution re-fetches — but it emits the per-chunk warning an operator
+    /// reads as *a peer served me bytes that did not match*, i.e. an attack indicator, on a routine
+    /// discard. A monitoring signal that fires on a benign path is worse than none, because the real
+    /// event stops being distinguishable from the noise (dig-node#332).
+    ///
+    /// Every step is best-effort: this runs on a path that is ALREADY failing, and a cleanup error
+    /// must not replace the failure the caller has to report.
+    async fn erase(&self) {
+        let _ = std::fs::remove_file(self.staged);
+        let _ = std::fs::remove_file(dig_download::staging_path_for(self.staged));
+        let _ = self.state_store.clear(&self.key).await;
+    }
 }
 
 /// What a FAILED pull leaves behind in the staging area.
@@ -432,12 +482,59 @@ impl StagingDisposition {
         }
     }
 
-    /// Apply this disposition to `staged`.
-    fn apply(self, staged: &Path) {
+    /// Apply this disposition to `pull`.
+    ///
+    /// [`Preserve`](Self::Preserve) touches NOTHING — not the bytes and not the checkpoint. The two
+    /// are what a resume is made of, and dropping either half is what made the resume machinery
+    /// structurally unreachable in the field (dig-node#328).
+    async fn apply(self, pull: &StagedPull<'_>) {
         match self {
             StagingDisposition::Preserve => {}
-            StagingDisposition::Discard => discard_staging(staged),
+            StagingDisposition::Discard => pull.erase().await,
         }
+    }
+}
+
+/// Reports the end of a pull when it goes out of scope, so the boundary is reported on EVERY exit —
+/// including an unwinding panic.
+///
+/// # Why a guard and not a statement after the `await`
+///
+/// A plain call after `downloader.download(...).await` is skipped when that await PANICS, and a
+/// panic here is reachable rather than theoretical: the tier-0 precache path runs
+/// `run_round -> fetch_and_cache -> warm_capped -> download` inside a real
+/// [`catch_unwind`](crate::shared::panic_guard) added precisely so a panic there is survived, and this
+/// crate does not build with `panic = "abort"`. So the task continues and the ledger entry leaks.
+///
+/// The leak is not a tidiness matter — it restores the two defects this budget exists to remove: the
+/// capsule becomes permanently ineligible for the relay path, and the resulting exhaustion is composed
+/// into a transport error NAMING A PEER, which `SPEC.md` §21.1 forbids in as many words.
+///
+/// `Drop` runs during unwinding, so the guard reports on the panic path and the returning paths
+/// through one mechanism. That is the same lesson this file has already paid for twice: prefer making
+/// the omission unexpressible over asserting that it does not occur.
+struct PullBoundary<'a> {
+    /// Told the pull is over. Borrowed, so the guard cannot outlive the warmer driving the pull.
+    lifecycle: &'a dyn super::PullLifecycle,
+    /// The capsule whose pull this is.
+    store_hex: &'a str,
+    root_hex: &'a str,
+}
+
+impl<'a> PullBoundary<'a> {
+    /// Open the boundary. It closes when the value drops.
+    fn new(lifecycle: &'a dyn super::PullLifecycle, store_hex: &'a str, root_hex: &'a str) -> Self {
+        PullBoundary {
+            lifecycle,
+            store_hex,
+            root_hex,
+        }
+    }
+}
+
+impl Drop for PullBoundary<'_> {
+    fn drop(&mut self) {
+        self.lifecycle.pull_finished(self.store_hex, self.root_hex);
     }
 }
 
@@ -451,6 +548,12 @@ pub struct CapsuleWarmer {
     locator: Arc<dyn dig_download::ProviderLocator>,
     /// Talks `dig.getModuleInfo` / `dig.fetchModuleRange` to them.
     transport: Arc<dyn dig_download::ModuleTransport>,
+    /// Told when each pull ends, so the transport can release state scoped to that pull.
+    ///
+    /// Usually the SAME object as `transport`, handed over twice under its two roles. It is a
+    /// separate field because the pull boundary is this warmer's knowledge and the state is the
+    /// transport's, and neither can see the other's half.
+    pull_lifecycle: Arc<dyn super::PullLifecycle>,
     /// Resume checkpoints, so an interrupted warm does not restart from zero.
     state_store: Arc<dyn dig_download::StateStore>,
     /// The CHAIN's view of each store's anchored root — the pull's only root of trust.
@@ -488,6 +591,7 @@ impl CapsuleWarmer {
     pub(crate) fn new(
         locator: Arc<dyn dig_download::ProviderLocator>,
         transport: Arc<dyn dig_download::ModuleTransport>,
+        pull_lifecycle: Arc<dyn super::PullLifecycle>,
         state_store: Arc<dyn dig_download::StateStore>,
         anchor_resolver: Arc<dyn crate::shared::AnchoredRootResolver>,
         paths: WarmPaths,
@@ -499,6 +603,7 @@ impl CapsuleWarmer {
         Arc::new(CapsuleWarmer {
             locator,
             transport,
+            pull_lifecycle,
             state_store,
             anchor_resolver,
             paths,
@@ -526,6 +631,67 @@ impl CapsuleWarmer {
             .await
     }
 
+    /// Whether this node can serve `(store_hex, root_hex)` from its cache RIGHT NOW.
+    ///
+    /// The cache path's existence IS the answer everywhere else in this module (it is what a holder
+    /// claim is made of), so this asks the same question the same way rather than adding a second,
+    /// driftable notion of "landed".
+    pub(crate) fn holds(&self, store_hex: &str, root_hex: &str) -> bool {
+        CapsuleKey::parse(store_hex, root_hex)
+            .is_some_and(|capsule| self.paths.cached_module(&capsule).exists())
+    }
+
+    /// How many bytes of `(store_hex, root_hex)` are staged on disk — this node's own honest
+    /// measure of how far an in-flight pull has got.
+    ///
+    /// Zero for a pull that has not started, has staged nothing yet, or names a non-canonical
+    /// generation. It is a LIVENESS signal for a waiting requestor and nothing else: it says how far
+    /// this hop has got, never that any byte is correct — that is settled by the merkle verification
+    /// every one of these bytes must still pass (NC-12).
+    pub(crate) fn staged_bytes(&self, store_hex: &str, root_hex: &str) -> u64 {
+        let Some(capsule) = CapsuleKey::parse(store_hex, root_hex) else {
+            return 0;
+        };
+        let staged = self.paths.staged_module(&capsule);
+        let in_progress = dig_download::staging_path_for(&staged);
+        // The in-progress file is where a running pull writes; the finalized one appears only at the
+        // very end. Whichever exists is the pull's current extent.
+        [in_progress, staged]
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Wait up to `grace` for a background pull of `(store_hex, root_hex)` to reach the cache,
+    /// reporting whether it did.
+    ///
+    /// # Why a grace at all, rather than answering immediately
+    ///
+    /// A capsule small enough to land inside the grace is answered by the hop in ONE round trip,
+    /// exactly as it was before dig-node#333 — so the case that already worked keeps working and no
+    /// requestor pays a poll interval for it. The grace is deliberately far inside the requestor's
+    /// own descriptor rungs; what it must never do is stretch to cover a bulk transfer, which is the
+    /// held-slot cost the rungs exist to bound.
+    pub(crate) async fn await_landing(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        grace: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if self.holds(store_hex, root_hex) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(LANDING_POLL_INTERVAL.min(grace)).await;
+        }
+    }
+
     /// [`warm`](Self::warm) for a capsule pulled on ANOTHER node's behalf (dig-node#276): identical in
     /// every trust step — chain anchor, merkle verification, promote-recheck, cache bound — except that
     /// this node does **not** announce itself as a holder of the result.
@@ -533,6 +699,20 @@ impl CapsuleWarmer {
     /// The capsule still lands in the cache, because that is what lets the relayed module windows be
     /// served from the same code path a genuine holder serves from, byte-identically. What it does not
     /// do is make a stranger's choice of content into this node's advertised inventory.
+    ///
+    /// # This competes with local warms for the same slots
+    ///
+    /// The pull runs under the SHARED [`WarmRegistry`], which admits
+    /// [`DEFAULT_MAX_CONCURRENT_WARMS`] generations across this whole node — relayed and local alike.
+    /// So a relay started for a stranger occupies a slot this node's own reads would otherwise use,
+    /// and since dig-node#333 the pull is SPAWNED rather than awaited, meaning it keeps that slot even
+    /// after the requestor that asked for it has given up and disconnected.
+    ///
+    /// That is bounded and deliberate rather than a hole — the cap is global, the leg is opt-in
+    /// (`DIG_NODE_ONION_RELAY`, default OFF), and the requestor must additionally be inside its
+    /// proxy-class allowance — but it IS a real cost of enabling the relay, and an operator who
+    /// enables it should know that a peer which abandons its request can still hold a warm slot until
+    /// the pull finishes or fails.
     pub async fn warm_relayed(self: &Arc<Self>, store_hex: &str, root_hex: &str) -> WarmOutcome {
         self.warm_claiming(store_hex, root_hex, HolderClaim::Suppress)
             .await
@@ -646,6 +826,8 @@ impl CapsuleWarmer {
         //    `truncate` + `read_at` the engine's promotion probe requires, so there is no bespoke sink
         //    here to accidentally inherit a default from.
         let staged = self.paths.staged_module(&capsule);
+        // Bytes + checkpoint as ONE value, so no failure path below can erase half of a partial.
+        let pull = StagedPull::new(&staged, self.state_store.as_ref(), store_hex, root_hex);
         let sink = dig_download::FileSink::new(&staged);
         let downloader = dig_download::ModuleDownloader::new(
             Arc::clone(&self.locator),
@@ -655,7 +837,14 @@ impl CapsuleWarmer {
             config,
         );
 
-        let pulled = downloader.download(store_hex, root_hex, &sink).await;
+        // The boundary is scoped to the download and nothing else, so it is reported the moment the
+        // pull ends — on success, on failure, and on a PANIC that unwinds through it. A failed pull is
+        // exactly the one that spent relay budget on hops that did not deliver, and leaving its ledger
+        // entry behind would charge the NEXT pull of this capsule for it (dig-node#333 review).
+        let pulled = {
+            let _boundary = PullBoundary::new(self.pull_lifecycle.as_ref(), store_hex, root_hex);
+            downloader.download(store_hex, root_hex, &sink).await
+        };
 
         // 3. ONLY `Ok` may lead to a holder claim. Not finalize-observed, not partial staging, not an
         //    `Err` that happened to leave bytes behind.
@@ -673,7 +862,7 @@ impl CapsuleWarmer {
                 // resume machinery structurally unreachable for capsule warms (#328): the checkpoint
                 // survived while the bytes it described did not, so every retry restarted from offset 0.
                 let disposition = StagingDisposition::for_failure(&error);
-                disposition.apply(&staged);
+                disposition.apply(&pull).await;
                 tracing::info!(
                     store = %super::serve_log::SafeId::new(store_hex),
                     root = %super::serve_log::SafeId::new(root_hex),
@@ -692,7 +881,7 @@ impl CapsuleWarmer {
         let cached = self.paths.cached_module(&capsule);
         match promote_into_cache(&staged, &cached, &verifier, claim) {
             Ok(promoted) => {
-                discard_staging(&staged);
+                pull.erase().await;
                 // The ONE step a relayed warm skips. Everything above it — the chain anchor, the
                 // merkle verification, the promote-recheck — ran identically, so the bytes are equally
                 // trustworthy; what differs is whether this node CLAIMS them (see [`HolderClaim`]).
@@ -710,7 +899,7 @@ impl CapsuleWarmer {
                 WarmOutcome::Held { bytes: promoted }
             }
             Err(failure) => {
-                discard_staging(&staged);
+                pull.erase().await;
                 tracing::warn!(
                     store = %super::serve_log::SafeId::new(store_hex),
                     root = %super::serve_log::SafeId::new(root_hex),
@@ -755,6 +944,22 @@ impl CapsuleWarmer {
 pub fn spawn_capsule_warm(warmer: Arc<CapsuleWarmer>, store_hex: String, root_hex: String) {
     tokio::spawn(async move {
         warmer.warm(&store_hex, &root_hex).await;
+    });
+}
+
+/// [`spawn_capsule_warm`]'s relay twin: pull `(store_hex, root_hex)` ON A REQUESTOR'S BEHALF, in the
+/// background, claiming nothing.
+///
+/// The claim is the whole difference — a relayed capsule is cached so the hop can serve its windows
+/// and is NOT announced, so relaying never turns this node into an advertised holder of a stranger's
+/// choosing ([`HolderClaim::Suppress`]).
+///
+/// Spawned rather than awaited because the requestor's ask must not be held open for the length of a
+/// third-party transfer (dig-node#333). Re-entrant: [`WarmRegistry`] admits one warm per generation,
+/// so a second request for the same capsule joins the running pull instead of starting a rival one.
+pub fn spawn_relayed_capsule_warm(warmer: Arc<CapsuleWarmer>, store_hex: String, root_hex: String) {
+    tokio::spawn(async move {
+        warmer.warm_relayed(&store_hex, &root_hex).await;
     });
 }
 
@@ -1068,6 +1273,7 @@ mod tests {
         CapsuleWarmer::new(
             Arc::new(NoHolders),
             Arc::new(UnusedTransport),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
             resolver,
             WarmPaths {
@@ -1094,6 +1300,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             Arc::new(NoHolders),
             Arc::new(UnusedTransport),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1185,6 +1392,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             Arc::new(OneHolder),
             Arc::new(RefusingHolder),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1271,6 +1479,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             locator,
             transport,
+            Arc::new(crate::seams::dig_peer::NoPullState),
             // In-memory, not `FileStateStore`: the resume-checkpoint backing store is orthogonal to
             // what this test proves (staged->cache promotion + announce-once), and `FileStateStore`'s
             // hex-doubled `module:<64hex>:<64hex>` key exceeds Windows' ~255-char filename limit
@@ -1432,6 +1641,7 @@ mod tests {
                 dig_download::testkit::mock_providers(1, &content),
             )),
             Arc::clone(transport) as Arc<dyn dig_download::ModuleTransport>,
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::clone(state),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1580,12 +1790,17 @@ mod tests {
             )
             .with_corrupt_module_hash(),
         );
+        // Held, not inlined: dig-node#332 is about what SURVIVES in this store after the failure, and
+        // an inlined store cannot be read back.
+        let state: Arc<dyn dig_download::StateStore> =
+            Arc::new(dig_download::InMemoryStateStore::new());
         let warmer = CapsuleWarmer::new(
             Arc::new(dig_download::testkit::MockProviderLocator::fixed(
                 dig_download::testkit::mock_providers(1, &content),
             )),
             transport,
-            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(crate::seams::dig_peer::NoPullState),
+            Arc::clone(&state),
             Arc::new(ConfirmingResolver),
             WarmPaths {
                 staging_dir: dir.join("staging"),
@@ -1614,6 +1829,17 @@ mod tests {
         assert!(
             !cached_module_path(&dir).exists(),
             "nothing may reach the cache path"
+        );
+        // dig-node#332: the checkpoint is the OTHER half of the same partial. Left behind, it claims
+        // chunks that are no longer on disk, so the next warm re-attributes each one and logs the
+        // per-chunk warning an operator reads as hostile content — on a routine discard.
+        assert!(
+            state
+                .load(&dig_download::module_download_key(&store_hex, &root_hex))
+                .await
+                .expect("the state store is readable")
+                .is_none(),
+            "a discarded partial must leave no resume checkpoint behind"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1666,6 +1892,7 @@ mod tests {
             Arc::new(dig_download::testkit::MockModuleTransport::serving(
                 &store_hex, &root_hex, module, 8,
             )),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1686,6 +1913,208 @@ mod tests {
             .join("modules")
             .join(&store_hex)
             .join(format!("{root_hex}.dig"))
+    }
+
+    /// Records every pull boundary the warmer reports, so a test can assert the CALL rather than the
+    /// ledger it happens to drive.
+    #[derive(Default)]
+    struct RecordingLifecycle {
+        finished: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::seams::dig_peer::PullLifecycle for RecordingLifecycle {
+        fn pull_finished(&self, store_id: &str, root: &str) {
+            self.finished
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((store_id.to_string(), root.to_string()));
+        }
+    }
+
+    /// **Proves (dig-node#333 re-gate):** the WARMER reports the end of every pull — the succeeding
+    /// one and, more importantly, the failing one.
+    ///
+    /// **Why this test and not only the ledger's own:** `RelayWaitBudget::release` being correct says
+    /// nothing about whether anything calls it, and a per-pull ledger nobody ends is exactly the
+    /// daemon-lifetime bug this fixes. This drives the real `warm` entry point and asserts the seam is
+    /// invoked, with the capsule's own ids.
+    ///
+    /// **Why the FAILING pull is the load-bearing half:** a failed pull is precisely the one that
+    /// spent relay budget on hops that did not deliver, so an implementation that reports only on
+    /// success leaves the worst case unreleased. It is also the easy mistake — a `?` or an early
+    /// return placed above the report.
+    #[tokio::test]
+    async fn a_warmer_reports_the_end_of_every_pull_including_a_failed_one() {
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+
+        // FAILING pull: no holder can be located at all.
+        let failed_dir = temp_dir("lifecycle-failed");
+        let failed_spy = Arc::new(RecordingLifecycle::default());
+        let failed = CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(Vec::new())),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                &store_hex,
+                &root_hex,
+                Vec::new(),
+                8,
+            )),
+            Arc::clone(&failed_spy) as Arc<dyn crate::seams::dig_peer::PullLifecycle>,
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: failed_dir.join("staging"),
+                cache_dir: failed_dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        );
+
+        let outcome = failed.warm(&store_hex, &root_hex).await;
+        assert!(
+            matches!(outcome, WarmOutcome::Refused(_)),
+            "the control: this pull must genuinely FAIL, or the report below is the success path in              disguise: {outcome:?}"
+        );
+        assert_eq!(
+            failed_spy
+                .finished
+                .lock()
+                .expect("lifecycle lock")
+                .as_slice(),
+            &[(store_hex.clone(), root_hex.clone())],
+            "a FAILED pull must still report its end, naming the capsule — it is the pull most              likely to have spent relay budget on hops that delivered nothing"
+        );
+
+        // SUCCEEDING pull: the same report, so the seam is not failure-only either.
+        let ok_dir = temp_dir("lifecycle-ok");
+        let ok_spy = Arc::new(RecordingLifecycle::default());
+        let module = module_committing(STORE, chain_root());
+        let content = dig_download::module_content_id(&store_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+        let succeeded = CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                &store_hex, &root_hex, module, 8,
+            )),
+            Arc::clone(&ok_spy) as Arc<dyn crate::seams::dig_peer::PullLifecycle>,
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: ok_dir.join("staging"),
+                cache_dir: ok_dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        );
+
+        let outcome = succeeded.warm(&store_hex, &root_hex).await;
+        assert!(
+            matches!(outcome, WarmOutcome::Held { .. }),
+            "the control: this pull must genuinely SUCCEED: {outcome:?}"
+        );
+        assert_eq!(
+            ok_spy.finished.lock().expect("lifecycle lock").len(),
+            1,
+            "a successful pull reports its end exactly once"
+        );
+
+        let _ = std::fs::remove_dir_all(&failed_dir);
+        let _ = std::fs::remove_dir_all(&ok_dir);
+    }
+
+    /// A holder whose descriptor ask PANICS — the shape a real bug in the pull takes.
+    struct PanickingHolder;
+
+    #[async_trait::async_trait]
+    impl dig_download::ModuleTransport for PanickingHolder {
+        async fn get_module_info(
+            &self,
+            _provider_peer_id: &str,
+            _store_id: &str,
+            _root: &str,
+        ) -> Result<dig_download::ModuleInfo, dig_download::DownloadError> {
+            panic!("a bug inside the pull");
+        }
+
+        async fn fetch_module_range(
+            &self,
+            _provider_peer_id: &str,
+            _store_id: &str,
+            _root: &str,
+            _offset: u64,
+            _length: u64,
+        ) -> Result<Vec<u8>, dig_download::DownloadError> {
+            unreachable!("the descriptor panics first");
+        }
+    }
+
+    /// **Proves (dig-node#333 re-gate 3):** a pull that PANICS still reports its end, so the relay-wait
+    /// ledger cannot leak an entry.
+    ///
+    /// **Why this is reachable rather than theoretical:** the tier-0 precache path runs
+    /// `run_round -> fetch_and_cache -> warm_capped -> download` inside
+    /// [`crate::shared::panic_guard::catch_iteration`], added so a panic there is SURVIVED, and this
+    /// crate does not build with `panic = "abort"`. A plain statement after the `.await` is skipped by
+    /// the unwind, the task then continues, and the entry is never released.
+    ///
+    /// **What the leak costs, which is why this is not tidiness:** the capsule becomes permanently
+    /// ineligible for the relay path, and the resulting exhaustion is composed into a transport error
+    /// NAMING A PEER — which `SPEC.md` §21.1, as amended by this same change, says MUST NOT happen.
+    ///
+    /// **The fixture is the production guard, driven by a production panic**, through the same
+    /// `AssertUnwindSafe(...).catch_unwind()` the tier-0 loop uses, so it exercises the unwind rather
+    /// than simulating it.
+    #[tokio::test]
+    async fn a_pull_that_panics_still_reports_its_end() {
+        use futures::FutureExt;
+
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        let dir = temp_dir("lifecycle-panic");
+        let spy = Arc::new(RecordingLifecycle::default());
+        let content = dig_download::module_content_id(&store_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+        let warmer = CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            Arc::new(PanickingHolder),
+            Arc::clone(&spy) as Arc<dyn crate::seams::dig_peer::PullLifecycle>,
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        );
+
+        // The panic message is expected; keep it out of the test log so a real panic stays visible.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::AssertUnwindSafe(warmer.warm(&store_hex, &root_hex))
+            .catch_unwind()
+            .await;
+        std::panic::set_hook(previous);
+
+        assert!(
+            outcome.is_err(),
+            "the control: the pull must genuinely PANIC and be caught, or the report below is just              the ordinary return path"
+        );
+        assert_eq!(
+            spy.finished.lock().expect("lifecycle lock").as_slice(),
+            &[(store_hex.clone(), root_hex.clone())],
+            "an unwinding pull must still report its end — a statement after the await is skipped by              the unwind, and the tier-0 catch_unwind then continues with the entry leaked"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **Proves (dig-node#276, unit 4):** a capsule pulled ON A STRANGER'S BEHALF lands in the cache —
@@ -1784,6 +2213,7 @@ mod tests {
             Arc::new(dig_download::testkit::MockModuleTransport::serving(
                 &store_hex, &root_hex, module, 8,
             )),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -1982,6 +2412,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             locator,
             transport,
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -2017,6 +2448,7 @@ mod tests {
         let warmer = CapsuleWarmer::new(
             Arc::new(NoHolders),
             Arc::new(UnusedTransport),
+            Arc::new(crate::seams::dig_peer::NoPullState),
             Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
             Arc::new(ConfirmingResolver),
             WarmPaths {
@@ -2113,6 +2545,46 @@ mod tests {
         assert!(
             registry.claim("s:r".into()).is_some(),
             "the generation is warmable again once the claim is released"
+        );
+    }
+
+    /// **Proves (dig-node#333 review, finding 3):** a RELAYED warm and this node's OWN warm draw from
+    /// the SAME bounded pool of concurrent-warm slots, so a relay started for a stranger can deny a
+    /// slot to a local read.
+    ///
+    /// **Why this is worth a test rather than a comment:** the relay pull changed from awaited to
+    /// SPAWNED, so it now outlives the request that asked for it — a peer that gives up leaves the
+    /// slot held. The behaviour is bounded and opt-in and is not a hole, but "relaying for strangers
+    /// can starve your own warms" is a property an operator enabling the leg needs to be able to
+    /// discover, and an undocumented, untested property is one that quietly changes.
+    ///
+    /// **Fixture design:** the cap is filled by RELAY-shaped claims and the local warm is the one
+    /// refused, which is the direction that matters. Asserting the reverse — that a local warm can
+    /// deny a relay — would be satisfied by any shared cap and would not distinguish the two pools
+    /// being one from the two pools merely both existing.
+    #[test]
+    fn a_relayed_warm_and_a_local_warm_compete_for_the_same_slots() {
+        let registry = Arc::new(WarmRegistry::new());
+
+        // Every slot taken by capsules a STRANGER asked this node to relay.
+        let relayed: Vec<_> = (0..DEFAULT_MAX_CONCURRENT_WARMS)
+            .map(|n| {
+                registry
+                    .claim(format!("relayed:{n}"))
+                    .expect("a relay claim within the cap is granted")
+            })
+            .collect();
+
+        assert!(
+            registry.claim("local:mine".into()).is_none(),
+            "this node's OWN warm was refused a slot because relays hold them all — the two share              one cap, which is the cost of running the relay leg"
+        );
+
+        // A finished relay hands the slot back; nothing about the claim is relay-specific.
+        drop(relayed.into_iter().next().expect("at least one claim"));
+        assert!(
+            registry.claim("local:mine".into()).is_some(),
+            "the control: the local warm must succeed once a relay slot frees, or the refusal above              proves only that the registry was broken"
         );
     }
 
