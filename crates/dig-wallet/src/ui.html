@@ -272,55 +272,19 @@ html[data-motion="off"] *{animation:none!important;transition:none!important}
 <div class="sky"></div><div class="stars" id="stars"></div>
 <svg width="0" height="0" style="position:absolute"><defs><linearGradient id="tg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5800D6"/><stop offset="1" stop-color="#FF00DE"/></linearGradient></defs></svg>
 
-<!-- ============ AUTH GATE (welcome / create / restore / unlock) ============ -->
+<!-- ============ CONNECT GATE ============ -->
 <div class="gate" id="gate">
-  <!-- WELCOME -->
-  <div class="gatecard hidden" id="view-welcome">
+  <!-- The only gate left. This build holds no keys, so there is nothing to create,
+       restore or unlock — there is only a wallet to connect. -->
+  <div class="gatecard" id="view-connect">
     <div class="gmark">&#208;</div>
-    <h1>Your keys, your Chia.</h1>
-    <p class="gsub">A built-in, self-custodial Chia wallet. Create a new wallet or restore one from its 24-word recovery phrase. DIG never sees your keys.</p>
-    <button class="btn p full" id="btnCreate">Create new wallet</button>
-    <button class="btn g full" id="btnRestore">Restore from recovery phrase</button>
-  </div>
-
-  <!-- CREATE: show seed -->
-  <div class="gatecard hidden" id="view-create">
-    <div class="gmark">&#208;</div>
-    <h1>Your recovery phrase</h1>
-    <p class="gsub">Write these 24 words down and keep them safe and offline. Anyone with them controls your funds. DIG never sees them.</p>
-    <div class="seed" id="seedWords"></div>
-    <div class="warnline"><span>&#9888;</span>This phrase is shown once. Store it before continuing.</div>
-    <div class="lblc">Set a password (encrypts your wallet on this device)</div>
-    <input type="password" id="createPw" class="field" placeholder="At least 8 characters" autocomplete="new-password">
-    <div class="err" id="createErr"></div>
-    <button class="btn p full" id="btnSavedSeed">I've saved it — create wallet</button>
-    <button class="btn g full" id="btnBackWelcome1">Back</button>
-  </div>
-
-  <!-- RESTORE -->
-  <div class="gatecard hidden" id="view-restore">
-    <div class="gmark">&#208;</div>
-    <h1>Restore wallet</h1>
-    <p class="gsub">Enter your 12/24-word recovery phrase, separated by spaces.</p>
-    <textarea id="restoreInput" class="field" placeholder="word1 word2 word3 …" spellcheck="false" autocomplete="off"></textarea>
-    <div class="lblc">Set a password (encrypts your wallet on this device)</div>
-    <input type="password" id="restorePw" class="field" placeholder="At least 8 characters" autocomplete="new-password">
-    <div class="err" id="restoreErr"></div>
-    <button class="btn p full" id="btnRestoreGo">Open wallet</button>
-    <button class="btn g full" id="btnBackWelcome2">Back</button>
-  </div>
-
-  <!-- UNLOCK -->
-  <div class="gatecard hidden" id="view-unlock">
-    <div class="gmark">&#208;</div>
-    <h1>Welcome back</h1>
-    <p class="gsub">Enter your password to unlock your DIG Wallet on this device.</p>
-    <input type="password" id="unlockPw" class="field" placeholder="Password" autocomplete="current-password">
-    <div class="err" id="unlockErr"></div>
-    <button class="btn p full" id="btnUnlock">Unlock</button>
+    <h1>Connect your wallet.</h1>
+    <p class="lede">DIG never holds your keys and never signs on your behalf. Connect your <a href="https://www.chia.net/downloads/" target="_blank" rel="noopener">Sage</a> wallet once, and Sage signs everything you do here.</p>
+    <a class="btn p full" href="/settings">Connect Sage in Settings</a>
+    <p class="lede" style="margin-top:18px">Just reading DIG content? You don't need a wallet at all &mdash; <a href="dig://">keep browsing</a>.</p>
+    <div class="err hidden" id="gateResidual">A wallet from an earlier version of DIG is still stored on this device. This version will never sign with it. If it is your only copy, recover it from a terminal with <b>dign wallet export-seed</b>, then import it into Sage.</div>
   </div>
 </div>
-
 <!-- ============ WALLET (unlocked) ============ -->
 <div class="app hidden" id="app">
   <aside class="rail">
@@ -663,13 +627,17 @@ html[data-motion="off"] *{animation:none!important;transition:none!important}
 <script src="/wc-bundle.js"></script>
 <script>
 /* ============================================================================
-   DIG Wallet — luxury re-skin over the real signer logic.
-   Every endpoint call below is the SAME contract the prior UI used:
-     - HTTP routes:  /api/status /api/generate /api/import /api/unlock
-                     /api/balance /api/lock /api/stores /api/stores/history
+   DIG Wallet — the page, delegated to Sage.
+
+   This page has no signer behind it. Every key or signing request goes out over
+   /api/wc/request, which forwards it to the user's Sage wallet; the seed-holding routes
+   this UI once called (/api/generate, /api/import, /api/unlock, /api/lock, /api/export,
+   /api/balance, /api/stores) were removed with the custody plane (dig_ecosystem#1701).
+     - HTTP routes:  /api/status
                      /api/wc/project-id /api/wc/connections|approve|reject|revoke
-                     /api/wc/request  (the native signer dispatch)
-     - WC methods (via /api/wc/request): chip0002_getAssetBalance, chia_send,
+                     /api/wc/request  (forwarded to Sage)
+                     /api/wc/delegate/next|result  (the pump that carries it there)
+     - WC methods (via /api/wc/request): chia_getAddress, chip0002_getAssetBalance, chia_send,
        chia_getNfts/transferNft/mintNft, chia_getOfferSummary/createOffer/
        takeOffer/cancelOffer, chia_getDids/createDidWallet/transferDid,
        chia_getTransactions, and the dig_ advanced legs (clawback, option,
@@ -681,9 +649,9 @@ const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 async function api(path, opts){ const r = await fetch(path, opts); if(!r.ok){ let m='request failed'; try{m=(await r.json()).error||m}catch(e){} throw new Error(m);} return r.status===204?null:r.json(); }
 function esc(s){ return String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
 
-// Call a WalletConnect/chia method through the native signer (self-origin, so the
-// wallet's own UI is auto-approved). State-changing methods honour the broadcast
-// gate: by default they are SIGNED but not pushed (a safe dry run).
+// Call a WalletConnect/chia method. The wallet's own UI is self-origin, so it is
+// auto-approved by the consent gate; the request is then forwarded to Sage, which holds
+// the keys and decides whether to sign. Nothing is signed in this process.
 async function wc(method, params){
   const r = await api('/api/wc/request', {method:'POST',headers:{'content-type':'application/json'},
     body:JSON.stringify({method, params: params||{}})});
@@ -701,10 +669,6 @@ function dryNote(status){ return status==='broadcast' ? '(broadcast).' : '(signe
 var toastTimer;
 function toast(msg, isErr){ var t=$('#toast'); $('#toastMsg').textContent=msg; t.classList.toggle('err',!!isErr); t.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(function(){t.classList.remove('show');},2600); }
 function copy(text){ try{ navigator.clipboard.writeText(text); }catch(e){} }
-
-// ---- gate (auth) views ----
-function showGate(id){ $('#app').classList.add('hidden'); $('#tabbar').classList.remove('show'); $('#gate').style.display='flex';
-  document.querySelectorAll('.gatecard').forEach(function(c){c.classList.add('hidden');}); if(id) $('#'+id).classList.remove('hidden'); }
 
 // ---- rail / page navigation ----
 let _address = '';
@@ -733,25 +697,39 @@ function flipOrb(){ $('#orb').classList.toggle('flip'); }
 function showReceive(){ go('home'); if(!$('#orb').classList.contains('flip')) flipOrb(); toast('Receive address shown — tap the orb to copy'); }
 $('#orb').addEventListener('click', function(){ if($('#orb').classList.contains('flip') && _address){ copy(_address); toast('Address copied'); } else { flipOrb(); } });
 
-// ---- balance (the canonical /api/balance route) ----
+// ---- balance (asked of Sage, which holds the keys) ----
+// A balance Sage did not answer is UNKNOWN, and is shown as unknown. It must never fall
+// back to zero: an empty wallet and an unreachable one render identically as "0", and this
+// is the figure a user decides whether to spend against.
 async function refreshBalance(){
-  $('#liveDot').classList.remove('off'); $('#syncText').textContent='Mainnet · syncing via coinset.org';
+  $('#liveDot').classList.remove('off'); $('#syncText').textContent='Mainnet · asking Sage';
   $('#orbSub').textContent='syncing…';
   try{
-    const b = await api('/api/balance');
-    _address = b.address;
-    $('#railAddrText').textContent = short(b.address);
-    $('#orbAddr').textContent = short(b.address);
-    $('#setAddr').textContent = b.address;
-    const xch = fmtXch(b.xch_mojos), dig = fmtDig(b.dig_units);
+    const addr = await wc('chia_getAddress');
+    _address = (addr && addr.address) || _address;
+    $('#railAddrText').textContent = short(_address);
+    $('#orbAddr').textContent = short(_address);
+    $('#setAddr').textContent = _address;
+    const bal = await wc('chip0002_getAssetBalance', {type:null, assetId:null});
+    const mojos = Number((bal && (bal.confirmed ?? bal.balance)) ?? NaN);
+    if(!Number.isFinite(mojos)) throw new Error('Sage did not report a balance');
+    const xch = fmtXch(mojos);
     $('#heroXch').innerHTML = esc(xch)+' <small>XCH</small>';
-    $('#heroDig').innerHTML = esc(dig)+' <small>DIG</small>';
+    $('#heroDig').innerHTML = '<small>DIG — ask Sage</small>';
     $('#orbTotal').textContent = xch;
-    $('#orbSub').innerHTML = esc(xch)+' XCH · '+esc(dig)+' DIG';
+    $('#orbSub').innerHTML = esc(xch)+' XCH';
     // Orb shows XCH as the headline figure (no fiat oracle in this build).
-    if(reduce){ $('#orbTotal').textContent = xch; } else { countUpText($('#orbTotal'), Number(b.xch_mojos)/1e12); }
-    $('#syncText').textContent='Mainnet · synced via coinset.org';
-  }catch(e){ $('#liveDot').classList.add('off'); $('#syncText').textContent='Could not reach the chain'; $('#orbSub').textContent='offline'; toast(e.message,true); }
+    if(reduce){ $('#orbTotal').textContent = xch; } else { countUpText($('#orbTotal'), mojos/1e12); }
+    $('#syncText').textContent='Mainnet · via Sage';
+  }catch(e){
+    $('#liveDot').classList.add('off');
+    $('#syncText').textContent='Sage did not answer';
+    $('#heroXch').innerHTML = '<small>unknown</small>';
+    $('#heroDig').innerHTML = '<small>unknown</small>';
+    $('#orbTotal').textContent = '—';
+    $('#orbSub').textContent='balance unknown';
+    toast(e.message,true);
+  }
 }
 // Count-up for a plain number (no $ prefix — balance is XCH, not fiat).
 function countUpText(el, target){
@@ -1003,69 +981,13 @@ async function loadTxs(){
 $('#btnTxPrev').onclick = () => { if(_txPage>0){ _txPage--; loadTxs(); } };
 $('#btnTxNext').onclick = () => { _txPage++; loadTxs(); };
 
-// ---- MY STORES (Certificate of Permanence) ----
-async function loadStores(){
-  const wrap=$('#storeList'); wrap.innerHTML='<div class="cert"><div class="skel" style="border:0;padding:0"><div class="sq"></div><div style="flex:1"><div class="ln" style="width:35%"></div><div class="ln" style="width:65%;margin-top:10px"></div></div></div></div>';
-  try{
-    const r = await api('/api/stores');
-    const stores = r.stores||[];
-    if(!stores.length){ wrap.innerHTML='<div class="empty">No stores found for this wallet. Publish one at <a href="https://hub.dig.net/" style="color:var(--gold)">hub.dig.net</a>.</div>'; return; }
-    wrap.innerHTML = stores.map(s=>{
-      const cap = esc(s.current_capsule);
-      const sid = esc(s.store_id);
-      return `<div class="cert">`+
-        `<div class="ch"><div class="gem"><div class="stone s1">◆</div><div class="stone s2">◇</div></div>`+
-        `<div class="ti"><div class="nm">Store</div><div class="nmsub">addr #${esc(String(s.hd_index))} · published to Chia mainnet</div></div>`+
-        `<div class="gen">Capsule</div></div>`+
-        `<div class="cap">${cap}</div>`+
-        `<div class="own">✓ You own this capsule, permanently.<span class="mintchip">yours forever</span></div>`+
-        `<details class="disc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Show history (all generations)</summary>`+
-        `<div class="body" id="hist-${sid}"><button class="btn g sm" data-store-history="${sid}">Load history</button></div></details>`+
-      `</div>`;
-    }).join('');
-  }catch(e){ wrap.innerHTML=`<div class="empty">Could not load: ${esc(e.message)}</div>`; }
-}
-document.addEventListener('click', async e => {
-  const b=e.target.closest('[data-store-history]'); if(!b) return;
-  const sid=b.dataset.storeHistory; const box=$('#hist-'+sid);
-  box.innerHTML='<div class="empty" style="padding:10px 0">Loading history…</div>';
-  try{
-    const r = await api('/api/stores/history?store_id='+encodeURIComponent(sid));
-    const caps = r.capsules||[];
-    // Constellation: one star per generation, current (last) is bright.
-    let constel = '<div class="constel"><span class="tlb">History</span>';
-    caps.forEach((c,i)=>{ const last=i===caps.length-1; if(i>0) constel+='<span class="carc'+(last?'':' dim')+'"></span>'; constel+='<span class="cstar'+(last?'':' dim')+'" title="'+esc(c)+'"></span>'; });
-    constel += '<span class="ct">'+caps.length+' capsule'+(caps.length===1?'':'s')+'</span></div>';
-    box.innerHTML = constel + caps.map((c,i)=>kvRow('Generation '+(i+1), c)).join('');
-  }catch(err){ box.innerHTML=`<div class="empty" style="padding:10px 0">${esc(err.message)}</div>`; }
-});
-// Home: curated stores (first cert) reusing the same renderer shape.
-async function loadHomeStores(){
-  const wrap=$('#homeStores'); wrap.innerHTML='';
-  try{
-    const r = await api('/api/stores'); const stores=r.stores||[];
-    if(!stores.length){ wrap.innerHTML='<div class="empty">No capsules yet. Publish a store at <a href="https://hub.dig.net/" style="color:var(--gold)">hub.dig.net</a>.</div>'; return; }
-    const s = stores[0];
-    wrap.innerHTML = `<div class="cert"><div class="ch"><div class="gem"><div class="stone s1">◆</div><div class="stone s2">◇</div></div>`+
-      `<div class="ti"><div class="nm">Store</div><div class="nmsub">addr #${esc(String(s.hd_index))} · published to Chia mainnet</div></div>`+
-      `<div class="gen">Capsule</div></div><div class="cap">${esc(s.current_capsule)}</div>`+
-      `<div class="own">✓ You own this capsule, permanently.<span class="mintchip">yours forever</span></div></div>`+
-      (stores.length>1?`<div class="sechead" style="margin-top:0"><div class="l"></div><a data-go="stores">+ ${stores.length-1} more →</a></div>`:'');
-  }catch(e){ wrap.innerHTML=''; }
-}
-async function loadHomeNfts(){
-  const wrap=$('#homeNfts'); wrap.innerHTML='';
-  try{
-    const r = await wc('chia_getNfts', {}); const nfts=(r.nfts||[]).slice(0,4);
-    if(!nfts.length){ wrap.innerHTML=`<div class="mintcard" id="homeMintTile" style="grid-column:1/-1;min-height:120px"><div><div class="plus">＋</div>Mint your first collectible</div></div>`; return; }
-    wrap.innerHTML = nfts.map((n,i)=>{
-      const hue=['radial-gradient(circle at 30% 25%,#FF3DF5,transparent 52%),linear-gradient(135deg,#5800D6,#0c0a22)','radial-gradient(circle at 70% 30%,#46E0B0,transparent 55%),linear-gradient(160deg,#191248,#5800D6)','radial-gradient(circle at 40% 70%,#E6CC93,transparent 52%),linear-gradient(135deg,#221a59,#101132)','radial-gradient(circle at 60% 40%,#B98CFF,transparent 55%),linear-gradient(160deg,#5800D6,#FF00DE)'][i%4];
-      return `<div class="work" data-go="nfts"><div class="matte"><div class="fill" style="background:${hue}"></div>${i===0?'<div class="sheen"></div>':''}</div>`+
-        `<div class="plaque"><div><div class="bt">Collectible</div><div class="bs">${esc(short(n.launcherId))}</div></div></div></div>`;
-    }).join('');
-  }catch(e){ wrap.innerHTML=''; }
-}
-document.addEventListener('click', function(e){ if(e.target.closest('#homeMintTile')) openMint(); });
+// ---- MY STORES ----
+// The store list was derived from the seed this node used to hold (dig_ecosystem#1701).
+// With no seed there is no set to enumerate, and inventing an empty one would assert
+// that the user owns nothing — a different and false claim. Both surfaces say so.
+function loadStores(){ $('#storeList').innerHTML = STORES_UNAVAILABLE; }
+function loadHomeStores(){ $('#homeStores').innerHTML = STORES_UNAVAILABLE; }
+const STORES_UNAVAILABLE = '<div class="empty">Listing your stores needed a wallet on this device, and DIG no longer keeps one. Manage and publish your stores at <a href="https://hub.dig.net/" style="color:var(--gold)">hub.dig.net</a>.</div>';
 
 // ---- ADVANCED (power-user coin types) ----
 function advStatus(id, msg, isErr){ const el=$('#'+id); if(!el) return; el.className='status'+(isErr?' err':''); el.textContent=msg; }
@@ -1215,9 +1137,11 @@ $('#tglMotion').onclick = () => setMotion(document.documentElement.getAttribute(
 $('#railAddr').onclick = () => { if(_address){ copy(_address); toast('Address copied'); } };
 $('#btnSetCopyAddr').onclick = () => { copy(_address); toast('Address copied'); };
 $('#btnRefresh').onclick = () => { refreshBalance(); refreshConnections(); loadHome(); };
-async function doLock(){ await api('/api/lock',{method:'POST'}); showGate('view-welcome'); }
-$('#btnLock').onclick = doLock;
-$('#btnSetLock').onclick = doLock;
+// "Lock" used to clear a local unlocked seed. There is none, so the honest action is to
+// send the user to the one place the session actually lives: the Sage connection.
+function doDisconnect(){ window.location.href = '/settings'; }
+$('#btnLock').onclick = doDisconnect;
+$('#btnSetLock').onclick = doDisconnect;
 
 // ---- Connected dapps (CHIP-0002 / window.chia injected approvals) ----
 async function refreshConnections(){
@@ -1335,60 +1259,61 @@ async function pumpOnce(){
 }
 async function startSagePump(){
   if(_pumpRunning) return; _pumpRunning = true;
-  // Continuous loop: drain parked delegate requests while the page is open. Only does
-  // real work when the source is Sage AND a session exists; otherwise it idles cheaply.
+  // Continuous loop: drain parked delegate requests while the page is open. Does real
+  // work only once a Sage session exists; otherwise it idles cheaply.
   while(true){
     try{
-      const src = await api('/api/wallet/source').catch(()=>({source:'native'}));
-      if(src.source==='sage'){ await initSageRequester(); if(_sageReady) await pumpOnce(); }
+      await initSageRequester();
+      if(_sageReady) await pumpOnce();
     }catch(e){ /* keep the loop alive */ }
     await new Promise(r=>setTimeout(r, 700));
   }
 }
 
-// ---- wallet lifecycle (create / restore / unlock) ----
-$('#btnCreate').onclick = async () => {
-  try{ const g = await api('/api/generate',{method:'POST'}); $('#seedWords').textContent=g.mnemonic; window._seed=g.mnemonic; showGate('view-create'); }
-  catch(e){ toast(e.message,true); }
-};
-$('#btnRestore').onclick = () => showGate('view-restore');
-$('#btnBackWelcome1').onclick = () => showGate('view-welcome');
-$('#btnBackWelcome2').onclick = () => showGate('view-welcome');
-$('#btnSavedSeed').onclick = async () => {
-  $('#createErr').textContent='';
-  const pw = $('#createPw').value;
-  if(pw.length<8){ $('#createErr').textContent='Password must be at least 8 characters'; return; }
-  try{ const r = await api('/api/import',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mnemonic:window._seed,password:pw})}); window._seed=null; enterWallet(r.address); }
-  catch(e){ $('#createErr').textContent=e.message; }
-};
-$('#btnRestoreGo').onclick = async () => {
-  $('#restoreErr').textContent='';
-  const pw = $('#restorePw').value;
-  if(pw.length<8){ $('#restoreErr').textContent='Password must be at least 8 characters'; return; }
-  try{ const r = await api('/api/import',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mnemonic:$('#restoreInput').value,password:pw})}); enterWallet(r.address); }
-  catch(e){ $('#restoreErr').textContent=e.message; }
-};
-$('#btnUnlock').onclick = async () => {
-  $('#unlockErr').textContent='';
-  try{ const r = await api('/api/unlock',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:$('#unlockPw').value})}); enterWallet(r.address); }
-  catch(e){ $('#unlockErr').textContent=e.message; }
-};
+// ---- wallet lifecycle ----
+// There is no create / restore / unlock here any more: this process holds no seed, so the
+// only states are "Sage is connected" and "it is not". `enterWallet` is entered once Sage
+// answers for an address, which is also the cheapest proof the delegate session is live.
 function enterWallet(address){
   _address = address;
   $('#gate').style.display='none';
   $('#app').classList.remove('hidden');
   $('#tabbar').classList.add('show');
   refreshBalance(); refreshConnections(); initWalletConnect(address);
-  startSagePump();
   go('home');
 }
 
+function showConnectGate(){
+  $('#app').classList.add('hidden');
+  $('#tabbar').classList.remove('show');
+  $('#gate').style.display='flex';
+  $('#view-connect').classList.remove('hidden');
+}
+
+// Poll Sage for an address until one arrives, then enter the wallet. Sage may be connected
+// later from the Settings page, so this keeps trying rather than failing once and stranding
+// the user on a gate that will never update itself.
+async function watchForSage(){
+  while(true){
+    try{
+      const r = await wc('chia_getAddress');
+      const address = r && r.address;
+      if(address){ enterWallet(address); return; }
+    }catch(e){ /* Sage is not connected yet; the gate already says so. */ }
+    await new Promise(r=>setTimeout(r, 1500));
+  }
+}
+
 (async function init(){
-  try{ const s = await api('/api/status');
-    if(s.state==='unlocked'){ enterWallet(s.address); }
-    else if(s.state==='locked'){ showGate('view-unlock'); setTimeout(()=>$('#unlockPw').focus(),60); }
-    else { showGate('view-welcome'); }
-  } catch(e){ showGate('view-welcome'); }
+  startSagePump();
+  showConnectGate();
+  // A seed left by an older, key-holding build is worth telling the user about exactly
+  // once, on the gate. It is never usable from here — see the card copy.
+  try{
+    const s = await api('/api/status');
+    if(s.state==='custodied') $('#gateResidual').classList.remove('hidden');
+  }catch(e){ /* Absent status is not evidence of a seed; leave the notice hidden. */ }
+  watchForSage();
 })();
 </script>
 </body>

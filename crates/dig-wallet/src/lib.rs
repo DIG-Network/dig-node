@@ -1399,10 +1399,14 @@ mod tests {
         assert!(UI_HTML.contains("chia_transferDid"));
         // Transactions.
         assert!(UI_HTML.contains("chia_getTransactions"));
-        // My Stores (the dedicated HTTP routes + the capsule history view).
-        assert!(UI_HTML.contains("/api/stores"));
-        assert!(UI_HTML.contains("/api/stores/history"));
-        // Goes through the native signer (self-origin auto-approved).
+        // My Stores was enumerated from the seed this node used to hold, so the page must
+        // no longer call those routes at all. Asserting their ABSENCE is what keeps a
+        // re-added listing from quietly depending on custody again.
+        // Matched as a CALL, not as a bare path: the page's own header comment names the
+        // removed routes, and a substring check would match that explanation instead of a
+        // regression — passing today and passing after the routes came back.
+        assert!(!UI_HTML.contains("api('/api/stores"));
+        // Self-origin auto-approved, then forwarded to Sage.
         assert!(UI_HTML.contains("/api/wc/request"));
     }
 
@@ -1416,10 +1420,6 @@ mod tests {
         assert!(UI_HTML.contains("class=\"rail\""), "persistent left rail");
         assert!(UI_HTML.contains("class=\"orb\""), "balance orb hero");
         assert!(UI_HTML.contains("Hold to sign"), "notary hold-to-confirm");
-        assert!(
-            UI_HTML.contains("yours forever"),
-            "ownership framing (never 'fee')"
-        );
         assert!(
             UI_HTML.contains("Show protocol detail"),
             "progressive-disclosure of protocol detail"
@@ -1463,26 +1463,37 @@ mod tests {
     }
 
     #[test]
-    fn settings_page_wires_the_new_settings_apis() {
-        // The settings page must talk to the projectId, export, import, and
-        // public-key endpoints, or those features silently no-op.
+    fn settings_page_offers_no_route_to_a_key_and_says_where_the_keys_are() {
+        // The projectId control stays — the relay needs it to reach Sage.
         assert!(SETTINGS_HTML.contains("/api/wc/project-id"));
-        assert!(SETTINGS_HTML.contains("/api/export"));
-        assert!(SETTINGS_HTML.contains("/api/import"));
-        assert!(SETTINGS_HTML.contains("/api/wallet/pubkey"));
+        // Every seed-touching control is gone. These are absence assertions on purpose:
+        // the page is where a user would look for "reveal my phrase", so a re-added
+        // control here is the most likely way the removed plane comes back.
+        for gone in [
+            "/api/export",
+            "/api/import",
+            "/api/wallet/pubkey",
+            "/api/unlock",
+            "/api/generate",
+        ] {
+            assert!(
+                !SETTINGS_HTML.contains(gone),
+                "settings must not call {gone}"
+            );
+        }
+        // Silence would read as a missing feature rather than a deliberate boundary, so
+        // the page has to SAY that the keys are Sage's and that reading needs none.
+        assert!(SETTINGS_HTML.contains("This browser holds no wallet keys"));
+        // …and a user whose seed is still on disk must be told how to get it out.
+        assert!(SETTINGS_HTML.contains("dign wallet export-seed"));
     }
 
     #[test]
-    fn settings_page_wires_the_wallet_source_control() {
-        // The "Wallet source" control must read/write the source endpoint and offer
-        // both choices, and the Sage path must load the WC bundle (requester role) +
-        // the projectId so the connect-to-Sage pairing can run, or the surface no-ops.
-        assert!(
-            SETTINGS_HTML.contains("/api/wallet/source"),
-            "reads/sets the source"
-        );
-        assert!(SETTINGS_HTML.contains("value=\"native\""), "Native option");
-        assert!(SETTINGS_HTML.contains("value=\"sage\""), "Sage option");
+    fn settings_page_wires_the_sage_connection_and_offers_no_alternative_to_it() {
+        // There is no signer choice any more, so there must be no control that implies
+        // one. Sage is not an option among two; it is where the keys are.
+        assert!(!SETTINGS_HTML.contains("/api/wallet/source"));
+        assert!(!SETTINGS_HTML.contains("value=\"native\""), "no Native option");
         // Connect-to-Sage flow: the bundle (the WC requester), projectId, the pairing
         // URI surface, and a Disconnect.
         assert!(
@@ -1502,13 +1513,14 @@ mod tests {
 
     #[test]
     fn wallet_page_runs_the_sage_delegate_pump() {
-        // When the wallet source is Sage, the wallet page must (a) host the WC
-        // requester (DigWC.sageRequest), and (b) pump the delegate bridge — pull
-        // parked requests, forward to Sage, return results — or delegate dispatch
-        // would hang. Guard the wiring the same way the responder is guarded.
+        // The wallet page must (a) host the WC requester (DigWC.sageRequest), and (b) pump
+        // the delegate bridge — pull parked requests, forward to Sage, return results — or
+        // EVERY key/sign method hangs, because delegation is now the only route there is.
+        // It must do so unconditionally: a pump still gated on a source setting would idle
+        // forever, since nothing sets one.
         assert!(
-            UI_HTML.contains("/api/wallet/source"),
-            "reads the active source"
+            !UI_HTML.contains("/api/wallet/source"),
+            "the pump must not wait on a source setting that no longer exists"
         );
         assert!(
             UI_HTML.contains("/api/wc/delegate/next"),
@@ -1555,6 +1567,87 @@ mod tests {
         assert!(
             v["error"].as_str().unwrap().contains("not connected"),
             "error body matches the HTTP path's 'origin not connected' shape: {body}"
+        );
+    }
+
+    /// An APPROVED origin's sign request is PARKED FOR SAGE — never answered here.
+    ///
+    /// This is the positive half of the pair whose negative half is
+    /// [`wallet_dispatch_gates_unapproved_origin_for_sign_methods`], and the pair is what
+    /// makes either one meaningful. Alone, the refusal test passes just as well against a
+    /// build that still holds a local signer, because an unapproved origin never reaches
+    /// the signer to begin with; the consent gate would be the only thing under test.
+    ///
+    /// dig_ecosystem#1701 is a PLACEMENT change — signing left this process — so the
+    /// observable that has to move is *where the request ends up*, not merely whether a
+    /// response is an error. Asserting a 501 or an empty result would be satisfied
+    /// identically by a local signer that happened to be locked, which is exactly the state
+    /// the old build sat in most of the time. Reaching the delegate queue cannot be.
+    #[tokio::test]
+    async fn an_approved_origins_sign_request_is_parked_for_sage_not_answered_locally() {
+        let st = Arc::new(AppState::default());
+        st.approvals
+            .lock()
+            .await
+            .approved
+            .insert("https://dapp.example.com".to_string());
+
+        let caller = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                wallet_dispatch_with(
+                    &st,
+                    "https://dapp.example.com",
+                    r#"{"method":"chip0002_signMessage","params":{"message":"hi","publicKey":"0xabc"}}"#,
+                )
+                .await
+            })
+        };
+
+        // The caller is now awaiting Sage. Poll the pump the wallet page drives; the
+        // request must be sitting on it, with its method and params intact.
+        let parked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(taken) = delegate_take_next(&st).await {
+                    return taken;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a sign request from an approved origin must reach the Sage delegate queue");
+
+        let (id, method, params) = parked;
+        assert_eq!(
+            method, "chip0002_signMessage",
+            "the method must be forwarded verbatim, not rewritten"
+        );
+        assert_eq!(params["message"], "hi", "params must survive the hop intact");
+
+        // Answer as Sage would, and confirm the answer is what the caller receives — so
+        // the delegation is a real round trip, not a request that merely leaves.
+        delegate_fulfill(&st, id, Ok(serde_json::json!("0xs1gnature"))).await;
+        let (status, body) = caller.await.expect("dispatch task");
+        assert_eq!(status, 200, "Sage's answer is returned to the dapp: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["data"], "0xs1gnature");
+    }
+
+    /// There is no wallet-source switch left to flip back to a local signer.
+    ///
+    /// The removed plane was reachable through a persisted wallet-source setting, so a
+    /// residual file from an older build must not be able to re-enable it. The settings and
+    /// wallet pages are separate files from this one, so scanning them cannot match this
+    /// test's own text — the failure mode that makes a source-scanning assertion worthless.
+    #[test]
+    fn no_persisted_setting_can_route_a_sign_method_back_into_this_process() {
+        assert!(
+            !SETTINGS_HTML.contains("/api/wallet/source"),
+            "the settings page must not offer a signer choice"
+        );
+        assert!(
+            !UI_HTML.contains("/api/wallet/source"),
+            "the wallet page must not read a signer choice"
         );
     }
 
