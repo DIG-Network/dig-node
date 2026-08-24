@@ -1,24 +1,39 @@
-//! dig-wallet — the DIG Browser's built-in Chia wallet sidecar.
+//! dig-wallet — the DIG Browser's built-in Chia wallet surface.
 //!
-//! A local axum server (loopback only) that reuses `digstore-chain` (BIP-39
-//! seed, standard Chia key derivation, the Sage-style HD wallet scan, DIG-CAT
-//! support, AND encrypted seed storage) over coinset.org, and serves a
-//! Sage-mirroring web UI the browser opens at 127.0.0.1. Native Rust, so BLS
-//! (blst) signing works — unlike a WASM wallet.
+//! A loopback-only axum server that hosts the wallet page the browser opens at 127.0.0.1, the
+//! WalletConnect responder that backs `window.chia`, the per-origin consent gate a dapp must pass,
+//! and the local cache/settings surface.
 //!
-//! This build: create/restore a 24-word wallet protected by a password; the
-//! seed is stored **encrypted at rest** (Argon2 + AES-GCM via
-//! `digstore_chain::seed`) so the wallet persists across restarts and unlocks
-//! with the password. Shows the live XCH + DIG balance scanned from coinset.org.
+//! # This process holds no user key and signs nothing (§908, dig_ecosystem#1701)
 //!
-//! Send/sign (`POST /api/send`): builds + BLS-signs a standard XCH payment via
-//! `digstore_chain::send` (AugScheme, §11.3) drawing coins across the HD wallet.
-//! Because a broadcast spends REAL mainnet funds, it is **gated twice**: the
-//! request must set `broadcast: true` AND the process must run with
-//! `DIG_WALLET_ALLOW_BROADCAST=1`. Otherwise the endpoint performs a **dry run** —
-//! it returns the fully signed bundle (proof the signing path works) and pushes
-//! NOTHING. The default is dry-run, so the flow can be exercised unattended safely.
-
+//! It used to. Earlier builds created and restored a 24-word wallet here, sealed the seed at rest,
+//! unlocked it into memory, BLS-signed payments over `POST /api/send`, and served the whole
+//! CHIP-0002 method surface from that local signer. It must not, and does not: dig-node#327 removed
+//! the surface, and the user's spend key now lives in their own Sage wallet.
+//!
+//! What remains is a ROUTER. [`wc_dispatch`] answers the three keyless handshake methods
+//! (`chip0002_chainId`, `chip0002_connect`, `chip0002_getMethods`) and forwards every other method
+//! to Sage over the WalletConnect requester session, via the delegate bridge the wallet page pumps.
+//! There is no local branch to fall through to and no setting that selects one, so a key/sign request
+//! either reaches Sage or is refused.
+//!
+//! The absences are load-bearing and are meant to be noticed:
+//!
+//! - [`AppState`] has no unlocked-session field, so a signer would have nothing to read.
+//! - [`crate::seed_store::encrypt_seed`] is `#[cfg(test)]`, so production code that sealed a user
+//!   seed would not compile.
+//! - The `DIG_WALLET_ALLOW_BROADCAST` dry-run gate is gone with the signer it gated. Sage's own
+//!   confirmation is the gate now, which is where it belongs: with the key.
+//!
+//! # A seed an older build left behind
+//!
+//! Such a file is never read, used or deleted here. `GET /api/status` reports `"custodied"` while one
+//! exists so both UI surfaces can say so, and it is recovered OFFLINE with `dign wallet export-seed`
+//! ([`crate::seed_export`]) — never through a served route.
+//!
+//! The node's OWN operator identity ([`crate::autoseed`]) is a different thing that shares the same
+//! at-rest primitive: a machine credential that never leaves the host, not custody of anyone's funds.
+//! It stays.
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -178,9 +193,6 @@ fn save_approved(approved: &BTreeSet<String>) {
     }
 }
 
-/// Path to the persisted wallet-source choice (next to the seed file). A tiny
-/// `{ "source": "native" | "sage" }` JSON — kept separate from the seed so it is
-
 /// Whether a wallet is on disk.
 ///
 /// Uses [`autoseed::presence`] rather than `Path::exists()`, and answers `true` when the question
@@ -204,7 +216,6 @@ struct StatusResp {
     state: &'static str,
     address: Option<String>,
 }
-
 
 /// A failure body, shaped the way every wallet endpoint reports one.
 #[derive(Serialize)]
@@ -481,8 +492,6 @@ struct WcRequest {
     #[serde(default)]
     params: serde_json::Value,
 }
-
-/// Resolve `{offset?, limit?}` for `chip0002_getPublicKeys`: Sage's defaults,
 
 /// Whether a WC method requires an unlocked wallet. The handshake + introspection
 /// methods (`chainId`, `connect`, `getMethods`) are answered without one; anything
@@ -1066,9 +1075,6 @@ mod tests {
     /// the `.await`s in these async tests. Held for the whole body of each such test.
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-
-
-
     #[test]
     fn cache_cap_is_floored_so_caching_cant_be_disabled() {
         // A 0 / tiny request must not disable the cache (which would defeat
@@ -1081,7 +1087,6 @@ mod tests {
             5 * 1024 * 1024 * 1024
         );
     }
-
 
     #[test]
     fn only_the_exact_wallet_origin_is_self_trusted() {
@@ -1138,9 +1143,6 @@ mod tests {
 
     // -- Wallet source: Native local keys vs. Sage delegate (#34) --------------
 
-
-
-
     #[test]
     fn export_class_methods_are_recognised_so_delegate_never_forwards_them() {
         // The seed-revealing method names the delegate router must refuse before they
@@ -1163,9 +1165,6 @@ mod tests {
         assert!(!is_export_class_method("chip0002_signMessage"));
         assert!(!is_export_class_method("chip0002_getPublicKeys"));
     }
-
-
-
 
     /// The delegate pump endpoints are wallet-local: a dapp origin cannot pull the
     /// parked queue or feed results back into the dispatcher.
@@ -1192,13 +1191,6 @@ mod tests {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
-
-
-
-
-
-
-
     #[test]
     fn nft_methods_are_gated_and_need_a_wallet() {
         for m in [
@@ -1217,14 +1209,12 @@ mod tests {
         }
     }
 
-
     #[test]
     fn transactions_method_is_gated_and_needs_a_wallet() {
         assert_eq!(wc_gate("chia_getTransactions", false), Gate::Forbidden);
         assert_eq!(wc_gate("chia_getTransactions", true), Gate::Allowed);
         assert!(wc_method_needs_wallet("chia_getTransactions"));
     }
-
 
     #[test]
     fn did_methods_are_gated_and_need_a_wallet() {
@@ -1238,8 +1228,6 @@ mod tests {
             assert!(wc_method_needs_wallet(m), "{m} needs a wallet");
         }
     }
-
-
 
     #[test]
     fn offer_methods_are_gated() {
@@ -1493,7 +1481,10 @@ mod tests {
         // There is no signer choice any more, so there must be no control that implies
         // one. Sage is not an option among two; it is where the keys are.
         assert!(!SETTINGS_HTML.contains("/api/wallet/source"));
-        assert!(!SETTINGS_HTML.contains("value=\"native\""), "no Native option");
+        assert!(
+            !SETTINGS_HTML.contains("value=\"native\""),
+            "no Native option"
+        );
         // Connect-to-Sage flow: the bundle (the WC requester), projectId, the pairing
         // URI surface, and a Disconnect.
         assert!(
@@ -1542,7 +1533,6 @@ mod tests {
     }
 
     // -- Key export is unreachable from every dapp-facing path -----------------
-
 
     // -- wallet_dispatch: the one dispatch path (HTTP handler + FFI share it) ----
 
@@ -1622,7 +1612,10 @@ mod tests {
             method, "chip0002_signMessage",
             "the method must be forwarded verbatim, not rewritten"
         );
-        assert_eq!(params["message"], "hi", "params must survive the hop intact");
+        assert_eq!(
+            params["message"], "hi",
+            "params must survive the hop intact"
+        );
 
         // Answer as Sage would, and confirm the answer is what the caller receives — so
         // the delegation is a real round trip, not a request that merely leaves.
@@ -1673,8 +1666,6 @@ mod tests {
             .pending
             .contains("https://newdapp.example"));
     }
-
-
 
     /// `chip0002_chainId` is public (no approval, no unlock) and returns the OK 200
     /// `{"data":"mainnet"}` body — the shape the HTTP path returns. Driven through the
@@ -1744,7 +1735,6 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
-
     /// The projectId setter is wallet-local only: a dapp origin cannot change it.
     #[tokio::test]
     async fn wc_project_id_set_is_self_origin_only() {
@@ -1758,11 +1748,7 @@ mod tests {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
-
     // -- Advanced coin types (Part B) ------------------------------------------
-
-    // Public BIP-39 test vector (NOT a real wallet), for the dispatch-gate tests.
-    const ABANDON_24: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
 
     #[test]
     fn advanced_methods_are_gated_and_need_a_wallet() {
@@ -1866,15 +1852,4 @@ mod tests {
         assert!(WC_METHOD_CATALOGUE.contains(&"chia_mintStore"));
         assert!(WC_METHOD_CATALOGUE.contains(&"chip0002_getMethods"));
     }
-
-
-
-
-
-
-
-
-
-
-
 }

@@ -3666,7 +3666,7 @@ ONLY automatic release trigger, a quiet repo can silently stop releasing. Detect
 | 13 | Subscription persistence | `<cache>/subscriptions.json` schema-versioned, atomic, cross-process-locked | §14.1; `subscription.rs` |
 | 14 | Autonomous sync fail-closed | chain-watch + gap-fill + read-path pin never serve/pull against an unconfirmable root | §14.2–14.4; `chainwatch.rs`, `lib.rs` |
 | 15 | FFI C-ABI | `dig_runtime_start`/`dig_runtime_start_wallet` (wallet-only vs full) + `dig_rpc`/`dig_wallet_rpc`/`dig_free` + read-crypto `dig_read_verify_decrypt`/`dig_bytes_free` (`DIG_READ_*` codes) signatures + ownership/threading | §15, §15.1; `dig-runtime/src/lib.rs` |
-| 16 | Wallet broadcast gate | dry-run default; mainnet push requires `DIG_WALLET_ALLOW_BROADCAST=1`; a dapp cannot force it | §16; `dig-wallet/src/lib.rs` |
+| 16 | Wallet signs nothing locally | every key/sign method is forwarded to the user's Sage wallet; no local signer, no session, no broadcast gate to withhold | §16.2, §18.20; `dig-wallet/src/lib.rs` |
 
 ---
 
@@ -4109,29 +4109,35 @@ A spend reaches mainnet ONLY when BOTH gates pass:
    (`chip0002_chainId`/`getMethods`) need no approval; `chip0002_connect` from an unapproved origin is
    PARKED as pending (`202`); any key/sign method from an unapproved origin is FORBIDDEN (`403`); an
    approved origin proceeds. Approvals persist to `connections.json`.
-2. **Broadcast gate (dry-run default).** A signed spend bundle is pushed to mainnet ONLY when
-   broadcasting is explicitly enabled by the process env `DIG_WALLET_ALLOW_BROADCAST=1`. The DEFAULT is
-   a DRY RUN: the bundle is built and BLS-signed but NOT pushed (response status `"signed"`), spending
-   no real funds. A dapp CANNOT force a broadcast — the request-level `broadcast` flag exists only on
-   the local `/api/send` REST path; dapp-originated spends pass broadcast-intent internally and are
-   gated SOLELY by the server-side env. With broadcasting disabled, a broadcast-intent local send is
-   refused (`403` "broadcasting is disabled — set `DIG_WALLET_ALLOW_BROADCAST=1` to spend real mainnet
-   funds") and a dapp spend degrades to a dry run.
+2. **Sage decides whether to sign.** An approved origin's key/sign request is FORWARDED to the user's
+   Sage wallet over the WalletConnect requester session; this process signs nothing and broadcasts
+   nothing (§18.20). The prior local broadcast gate (`DIG_WALLET_ALLOW_BROADCAST`, dry-run by default)
+   went with the local signer it gated — there is no longer a bundle built here for it to withhold.
+   Sage's own confirmation UI is now the second gate, which is the point: the gate lives with the key.
 
 ### 16.3. Secret custody
 
 Seed-reveal / private-key-export class methods (`export`, `exportMnemonic`, `chip0002_export`,
 `chia_export`, `getMnemonic`, `getSecretKeys`, `getPrivateKey(s)`, `revealSeed`) are HARD-BLOCKED from
 the dapp dispatch surface — they are absent from dispatch (fall to `501`) and are refused before any
-forward to a delegated signer. The mnemonic is revealed ONLY through the local, password-gated,
-self-origin `/api/export` UI route, never over the dapp/WC surface.
+forward to Sage, so a Sage that implemented one could not be reached through this surface. The refusal
+is indistinguishable on the wire from any other unknown method, so the set of export spellings cannot be
+probed.
+
+There is no local reveal route either: `POST /api/export` was removed with the rest of the custody plane
+(§18.20, dig-node#327). A seed an earlier build already wrote is recovered OFFLINE with `dign wallet
+export-seed`, which has no network surface at all.
 
 ### 16.4. Unattended wallet bootstrap (`autoseed`)
 
 On EVERY start — first install, post-update, and every ordinary boot — the node MUST determine whether
-a mnemonic seed exists and MUST mint one when there is definitely none. The path requires no user
-interaction: no prompt, no password. A user replacing the minted wallet later goes through the ordinary
-import path, which has no special case for an auto-created wallet.
+its OPERATOR seed exists and MUST mint one when there is definitely none. The path requires no user
+interaction: no prompt, no password.
+
+This seed is the node's OWN machine identity (`DIGOP1`/`DIGVK1`, sealed under a device key), NOT a user
+wallet, and §18.20 does not retire it: a user's spend key never enters the node, and this key never
+leaves it. The two are separate concerns that happen to share an at-rest primitive, and conflating them
+would break the node's auth in the name of tightening custody it does not hold.
 
 **At-rest format.** An auto-created seed is sealed in a `dig_keystore::opaque` `DIGOP1` container
 (AES-256-GCM, Argon2id) under a 32-byte CSPRNG **device key**. An imported seed is sealed under the
@@ -5442,18 +5448,35 @@ imported BIP-39 seeds, encrypted them at rest, unlocked them into an in-memory `
 must not, and the surface has been REMOVED. A node MUST NOT provide any method that generates, imports,
 restores, unlocks, deletes, reveals, or signs with a user's seed, on any transport.
 
-This is STRUCTURAL for the SAGE-PARITY plane, not a policy a future change can quietly relax: no path
+This is STRUCTURAL, not a policy a future change can quietly relax: no path
 through `crate::sage` reads a `.seed` file, decrypts one, derives a secret key, or constructs a
 `WalletSigner` from user material. The user's key lives in the user application, and `dig-account`'s
 `PolicyAuthorizer` is the only enforcing custody gate for it.
 
-**§908 is NOT yet whole, and the remainder is named.** A SECOND node-side custody surface survives in
-`crate::lib` — the self-origin wallet UI (§16.3): `POST /api/import` and `/api/unlock` seal and open a
-user seed under `seed_path()`, `POST /api/send` BLS-signs a payment, and the CHIP-0002 dapp signer serves
-`chip0002_signMessage` / `chip0002_signCoinSpends` / `chia_signMessageByAddress`. It is a RIVAL
-implementation of the capability removed here, it was never frozen, and the zero-population measurement
-that made this removal safe was taken over the custody manifest — NOT over `seed_path()`. Removing it
-therefore needs its own count first, and is tracked separately.
+**§908 is satisfied on BOTH planes.** The second surface — the self-origin wallet UI in `crate::lib`
+(§16.3) — has also been removed (dig-node#327). `POST /api/generate`, `/api/import`, `/api/unlock`,
+`/api/lock`, `/api/export`, `/api/send`, `/api/balance`, `/api/stores`, `/api/stores/history`,
+`/api/wallet/pubkey` and `/api/wallet/source` no longer exist, and the CHIP-0002 dapp signer no longer
+has a local arm: `wc_dispatch` answers only the keyless handshake methods (`chip0002_chainId`,
+`chip0002_connect`, `chip0002_getMethods`) and forwards every other method to the user's Sage wallet over
+the WalletConnect requester session. There is no wallet-source setting to route a method back into the
+process, because there is no second route to select.
+
+This too is STRUCTURAL rather than a policy check. The process holds no unlocked-session state — the
+field is gone from `AppState` — so a signer would have no material to read; and `seed_store::encrypt_seed`
+is `#[cfg(test)]`, so a production caller that sealed a user seed would not compile. A node MUST NOT
+provide any method that generates, imports, restores, unlocks, deletes, reveals, or signs with a user's
+seed, on any transport, and no code path remains that could.
+
+**A pre-existing seed stays recoverable, offline.** A file already written under `seed_path()` by an
+earlier build is NOT read, used or deleted by this one. It is recovered with `dign wallet export-seed
+[--path <file>]`, which decrypts under the user's own password in-process and prints the phrase to the
+console. That command reads BOTH on-disk formats (the current `dig-keystore` container and the legacy
+`digstore_chain::seed::EncryptedSeed` layout) and takes an explicit path, so a file written under a base
+directory this build no longer resolves is still reachable. It has no network surface: a served export
+would add a permanent seed-exfiltration capability in order to solve a one-time migration. `GET
+/api/status` reports `"custodied"` while such a file exists — `"delegated"` otherwise — and both UI
+surfaces point at that command rather than revealing anything in the browser.
 
 **What remains is a read.** `crate::sage::custody::WalletCustody` reads ONE non-secret file,
 `<config_dir>/wallets/index.json`, and answers two questions for the chain-sync supervisor (§18.6):
