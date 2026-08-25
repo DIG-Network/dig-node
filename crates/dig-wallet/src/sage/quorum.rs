@@ -566,6 +566,47 @@ pub const fn band_kept_a_majority(claimants: usize, credible: usize) -> bool {
 ///
 /// Returns `None` for an empty sample, or when the chain is younger than the margin (early
 /// testnet heights), because there is no settled height to ask about.
+/// The chain height this node may report as its own, settled from several peers' claims
+/// (dig_ecosystem#2790).
+///
+/// # What this number IS, and what it deliberately is not
+///
+/// It is **a height every credible peer in the sample has passed**, not the tip. The tip cannot be
+/// corroborated: it moves every ~18.75s and peers learn of it at different moments, so asking for
+/// it guarantees honest disagreement. Backing off by [`SETTLED_LAG`] asks a question whose answer
+/// stopped changing before anybody was asked, which is what makes agreement meaningful. The number
+/// is therefore conservative — it can lag the true tip by a few blocks, and it never leads it,
+/// which is the safe direction for every "is this coin buried yet" comparison built on top of it.
+///
+/// # Why it refuses instead of repairing
+///
+/// `None` is a refusal, and every one of its causes is a case where the node genuinely does not
+/// know the height:
+///
+/// * fewer than [`CORROBORATION_FLOOR`] peers claimed anything — one peer is not agreement, and a
+///   lone claim is exactly what a node talking to a single hostile source would see;
+/// * the credibility band did not keep a majority ([`band_kept_a_majority`]) — the claims are
+///   SPLIT, so the median has stopped being a property of the honest set and no side of the split
+///   is more believable than the other;
+/// * the chain is younger than the settling margin.
+///
+/// There is no "take the highest", no "take the most popular" and no fallback to a third party.
+/// Adopting a plurality would hide a partition behind a number that looks authoritative, and
+/// falling through to a public oracle would let one HTTPS endpoint overrule the peers precisely
+/// when they failed to agree — the single-source dependency NC-12 exists to remove.
+pub fn settled_peak(candidates: &[Candidate]) -> Option<u32> {
+    if candidates.len() < CORROBORATION_FLOOR {
+        return None;
+    }
+    let credible = eligible(candidates, PEAK_LAG_TOLERANCE);
+    if credible.len() < CORROBORATION_FLOOR
+        || !band_kept_a_majority(candidates.len(), credible.len())
+    {
+        return None;
+    }
+    common_height(&credible, SETTLED_LAG)
+}
+
 pub fn common_height(sample: &[Candidate], lag: u32) -> Option<u32> {
     sample
         .iter()
@@ -867,3 +908,128 @@ fn binomial(n: u32, k: u32) -> f64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod settled_peak_tests {
+    //! The peak this node reports must be a fact several peers agree on, and must REFUSE rather
+    //! than repair when they do not (dig_ecosystem#2790).
+    //!
+    //! Every fixture varies ONE actor against a truthful control set. A fixture in which every
+    //! peer lies is the harshest-looking case and the blindest: with no honest claim left there is
+    //! nothing a missed corroboration could have contradicted, so it cannot tell a working quorum
+    //! from one that simply believed whoever spoke.
+
+    use super::*;
+
+    /// A claimant at `height`. The header hash is derived from the id so two distinct peers never
+    /// share one by accident — a shared hash would make separate voices indistinguishable.
+    fn claimant(id: &str, height: u32) -> Candidate {
+        let mut hash = [0u8; 32];
+        hash[..id.len().min(32)].copy_from_slice(&id.as_bytes()[..id.len().min(32)]);
+        Candidate {
+            id: id.into(),
+            claim: PeakClaim {
+                height,
+                header_hash: Bytes32::from(hash),
+            },
+        }
+    }
+
+    /// The control. Without it every refusal below is satisfied by a function that always refuses.
+    #[test]
+    fn a_truthful_sample_settles_a_height_below_the_tip() {
+        let sample = [
+            claimant("a", 9_000_000),
+            claimant("b", 9_000_000),
+            claimant("c", 9_000_001),
+            claimant("d", 9_000_000),
+        ];
+        assert_eq!(
+            settled_peak(&sample),
+            Some(9_000_000 - SETTLED_LAG),
+            "four peers a block apart are ordinary lag, not disagreement, and must settle"
+        );
+    }
+
+    /// The property this whole change exists for: the answer must not survive collapsing to one
+    /// voice.
+    ///
+    /// A single peer is what a node reading from one hostile source sees, and it is also what a
+    /// node whose corroboration silently stopped working sees. Both must produce a refusal, never
+    /// a number.
+    #[test]
+    fn one_peer_alone_settles_nothing_however_confident_it_is() {
+        assert_eq!(
+            settled_peak(&[claimant("lonely", 9_000_000)]),
+            None,
+            "one claim is not agreement: a lone peer must not be able to tell this node where the \
+             chain is"
+        );
+    }
+
+    /// One liar among honest peers must be OUTVOTED, not merely survived.
+    ///
+    /// The assertion is equality with the liar-free answer rather than "some height came back":
+    /// a height that came back is produced identically by an implementation that took the maximum
+    /// claim, which is the single most attacker-friendly aggregate available and is exactly what
+    /// this must not be.
+    #[test]
+    fn a_lone_liar_cannot_move_the_settled_height() {
+        let honest = [
+            claimant("a", 9_000_000),
+            claimant("b", 9_000_000),
+            claimant("c", 9_000_000),
+        ];
+        let mut with_liar = honest.to_vec();
+        with_liar.push(claimant("liar", u32::MAX));
+
+        assert_eq!(
+            settled_peak(&with_liar),
+            settled_peak(&honest),
+            "a peer claiming an absurd tip changed this node's view of the chain"
+        );
+        assert!(
+            settled_peak(&honest).is_some(),
+            "fixture: the honest set must settle, or the equality above holds because BOTH \
+             refused and the liar was never actually outvoted"
+        );
+    }
+
+    /// A liar in the other direction is no more credible, and must not drag the answer down.
+    #[test]
+    fn a_lone_liar_claiming_genesis_cannot_move_it_either() {
+        let honest = [
+            claimant("a", 9_000_000),
+            claimant("b", 9_000_000),
+            claimant("c", 9_000_000),
+        ];
+        let mut with_liar = honest.to_vec();
+        with_liar.push(claimant("liar", 0));
+
+        assert_eq!(settled_peak(&with_liar), settled_peak(&honest));
+    }
+
+    /// A genuinely split sample is an UNKNOWN height, and unknown is reported as unknown.
+    #[test]
+    fn a_split_sample_refuses_rather_than_picking_a_side() {
+        let sample = [
+            claimant("a", 9_000_000),
+            claimant("b", 9_000_000),
+            claimant("c", 8_000_000),
+            claimant("d", 8_000_000),
+        ];
+        assert_eq!(
+            settled_peak(&sample),
+            None,
+            "half the peers on each of two chains means this node does not know which it is on; \
+             adopting either would hide a partition behind an authoritative-looking number"
+        );
+    }
+
+    /// Nothing claimed, nothing settled — and specifically not height zero, which every block is
+    /// trivially above.
+    #[test]
+    fn an_empty_sample_settles_nothing() {
+        assert_eq!(settled_peak(&[]), None);
+    }
+}
