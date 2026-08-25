@@ -196,7 +196,13 @@ getrandom = "0.2"
 # here today), and the `opaque` surface this crate uses is bytes + Password with no BLS type on
 # it at all, so nothing crosses between lines -- and adopting 0.10 now avoids routing the node's
 # identity onto a type identity that was about to change under it.
-dig-keystore = "0.10"
+dig-keystore = "0.12"
+# The platform trusted-component providers (Windows TPM 2.0 via CNG, Apple Secure Enclave, Linux
+# TPM 2.0). A SEPARATE crate because `dig-keystore` forbids `unsafe` and every one of these is FFI;
+# it is the workspace member dig_ecosystem#1693 asked for, and it landed in dig-keystore v0.12.0.
+# Without it `platform_provider` is a hardcoded `None` and the node's hardware seam -- already
+# fully composed at `machine_key.rs` -- can never report anything but `Software(NotRequested)`.
+dig-keystore-hardware = "0.1"
 # The machine key lives in the SAME user-global identity dir digstore_remote used for the
 # plaintext seed (`<config_dir>/dig`), so the #2168 migration finds it in place and the node
 # keeps its peer_id. digstore keeps its own `identity_dir` private, so the path is reproduced.
@@ -496,7 +502,7 @@ tempfile = "3"
 # `dig_keystore::hardware::double::FakeDevice` -- the only way to exercise the hardware-bound
 # tier, since no platform provider ships (dig_ecosystem#1693). Test-only: `testing` is never
 # enabled for the library build.
-dig-keystore = { version = "0.10", features = ["testing"] }
+dig-keystore = { version = "0.12", features = ["testing"] }
 # Same git rev as the normal dependency above, with dig-gossip's `test-util` feature added. That
 # feature gates `__connect_stub_peer_with_direction`, which registers a connected peer without real
 # TLS — the only way to assert what a broadcast ACTUALLY put on the wire from a test. Declared here

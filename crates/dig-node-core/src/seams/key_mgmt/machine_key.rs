@@ -253,11 +253,13 @@ pub struct MachineKeyStore {
 impl MachineKeyStore {
     /// Open the store rooted at `dir`, resolving the protection tier once.
     ///
-    /// `provider` is the host's hardware key-wrapping provider. **Production passes
-    /// [`platform_provider`], which is `None` on every host today**; tests inject a double to
-    /// exercise the bound tier. The policy is [`HardwarePolicy::Optional`] so a node on a host
-    /// with no trusted component still starts and simply reports what protects its key — refusing
-    /// to boot the peer network over absent hardware would strand every node in existence.
+    /// `provider` is a hardware key-wrapping provider chosen by the CALLER — the seam a test
+    /// injects a double through. **Production does not use this constructor**; it uses
+    /// [`Self::open_platform_bound`], which walks the real platform ladder.
+    ///
+    /// The policy is [`HardwarePolicy::Optional`] so a node on a host with no trusted component
+    /// still starts and simply reports what protects its key — refusing to boot the peer network
+    /// over absent hardware would strand every node in existence.
     ///
     /// # Errors
     /// [`MachineKeyError::Keystore`] if the tier cannot be resolved.
@@ -272,6 +274,58 @@ impl MachineKeyStore {
                 provider,
                 HardwarePolicy::Optional,
             )?,
+            device_key_path: device_dir(dir)?.join(DEVICE_KEY_FILE),
+            blob_dir: dir.to_path_buf(),
+            kdf: KdfParams::DEFAULT,
+            #[cfg(test)]
+            after_blob_write: None,
+        })
+    }
+
+    /// Open the store rooted at `dir`, bound to the strongest trusted component THIS host can
+    /// actually prove — the production constructor.
+    ///
+    /// # Why the ladder chooses, rather than this function
+    ///
+    /// [`dig_keystore_hardware::bind_strongest`] walks every platform candidate in preference
+    /// order, and a candidate is only accepted once it has passed a live wrap/unwrap self-test.
+    /// Taking `platform_candidates().next()` instead would hand over the FIRST candidate whether
+    /// or not it works, and a TPM that fails its round-trip would degrade the whole node to
+    /// software rather than falling to the next rung.
+    ///
+    /// It also distinguishes the two negatives that matter to an operator: a platform this build
+    /// ships no provider for reports *that*, where a bare `None` provider would report
+    /// `NotRequested` — "nobody asked" — when the truth is "nobody could answer".
+    ///
+    /// # Why the policy is `Optional` and not `Preferred`
+    ///
+    /// `Preferred` is `dig-keystore`'s default and it treats an **indeterminate probe as an
+    /// error**: the keystore does not open. That is right for a wallet a human is standing in
+    /// front of, and wrong here. This is a NODE's machine identity, opened unattended at boot on
+    /// every host in the network, and a TPM contended by BitLocker, Credential Guard or Windows
+    /// Hello probes as indeterminate rather than absent. Under `Preferred` that host stops
+    /// serving the peer network because a chip was busy. `Required` is worse again — it strands
+    /// every macOS and Linux host until those providers ship.
+    ///
+    /// `Optional` degrades on any negative and **always reports the distinguishing
+    /// [`DegradeReason`](dig_keystore::hardware::DegradeReason)**, so the honesty is preserved
+    /// where it belongs: in what [`Self::protection_summary`] tells the operator, not in a refusal
+    /// to boot.
+    ///
+    /// # This is the node's machine key, not user custody
+    ///
+    /// The seed sealed here is `DIGOP1`/`DIGVK1` — the identity the node dials peers under. It is
+    /// NOT a user's wallet key, and §908's boundary is untouched by this: the node still holds no
+    /// key it can spend a user's funds with, before this change or after it.
+    ///
+    /// # Errors
+    /// [`MachineKeyError::Keystore`] if the ladder cannot settle a tier.
+    pub fn open_platform_bound(dir: impl AsRef<Path>) -> Result<Self, MachineKeyError> {
+        let dir = dir.as_ref();
+        let backend =
+            dig_keystore_hardware::bind_strongest(FileBackend::new(dir), HardwarePolicy::Optional)?;
+        Ok(Self {
+            backend,
             device_key_path: device_dir(dir)?.join(DEVICE_KEY_FILE),
             blob_dir: dir.to_path_buf(),
             kdf: KdfParams::DEFAULT,
@@ -600,16 +654,6 @@ fn at_rest_floor() -> &'static str {
     }
 }
 
-/// This host's hardware key-wrapping provider.
-///
-/// **`None` on every host today.** `dig-keystore` ships no platform binding — its `hardware`
-/// module forbids `unsafe`, so the TPM / Secure-Enclave FFI lives in a future workspace member
-/// (dig_ecosystem#1693) — so every host resolves `Software(NotRequested)`. This function is the
-/// single seam that changes when that lands; nothing else in the node moves.
-pub fn platform_provider() -> Option<Arc<dyn HardwareProvider>> {
-    None
-}
-
 /// Load or mint the node's machine identity seed under `dir`, migrating a legacy plaintext
 /// `identity_key.bin` from `legacy_dir` if one is present.
 ///
@@ -619,7 +663,7 @@ pub fn load_or_create_sealed_seed(
     dir: impl AsRef<Path>,
     legacy_dir: Option<&Path>,
 ) -> Result<Zeroizing<[u8; 32]>, MachineKeyError> {
-    MachineKeyStore::open(dir, platform_provider())?.load_or_create(legacy_dir)
+    MachineKeyStore::open_platform_bound(dir)?.load_or_create(legacy_dir)
 }
 
 #[cfg(test)]
@@ -1294,6 +1338,59 @@ mod tests {
         assert!(
             summary.contains("only if"),
             "summary must state the condition it cannot verify, rather than omitting it: {summary}"
+        );
+    }
+
+    /// **The production constructor consults the platform, and `NotRequested` is the one tier it
+    /// can never report.**
+    ///
+    /// This is the whole of dig-node#367 as an assertion. `platform_provider()` used to be
+    /// `pub fn platform_provider() -> Option<_> { None }`, sitting under a doc comment stating
+    /// that `dig-keystore` shipped no platform binding — untrue since `ed9601a3` / v0.12.0. The
+    /// seam at `open` was already fully composed; one hardcoded `None` kept it dark, and the
+    /// comment explaining the `None` is what stopped anyone looking.
+    ///
+    /// # Why `NotRequested` is the right needle, and an outcome assertion is not
+    ///
+    /// The tier this host reports is a property of the HOST, so it is not assertable: this suite
+    /// runs on Windows TPM boxes, on macOS, and on Linux CI runners with no TPM at all, and the
+    /// honest answer differs on each. Pinning `Hardware(WindowsTpm20)` would fail on CI; pinning
+    /// `Software(..)` would pass on a host that never asked, which is the defect.
+    ///
+    /// `DegradeReason::NotRequested` means precisely *"the caller supplied no provider or
+    /// explicitly opted out"* — it is the fingerprint of the old hardcoded `None`, and it is
+    /// UNREACHABLE through [`MachineKeyStore::open_platform_bound`] on every host, because
+    /// `bind_strongest` either settles on hardware, or reports a confident absence, or reports
+    /// `PlatformUnsupported`. So the assertion is host-independent while still being exactly the
+    /// regression.
+    ///
+    /// Reverting the seam to `MachineKeyStore::open(dir, None)` turns this red on every platform.
+    #[test]
+    fn the_production_store_asks_the_platform_and_never_reports_notrequested() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+
+        let store = MachineKeyStore::open_platform_bound(&dir)
+            .expect("Optional policy opens on every host, including one with no provider");
+
+        assert_ne!(
+            store.backend.tier(),
+            &ProtectionTier::Software(DegradeReason::NotRequested),
+            "the production constructor reported that nobody asked for hardware binding, which \
+             is the hardcoded `None` this ticket removed -- not a fact about this host"
+        );
+
+        // The control. Without it the assertion above is satisfied by a constructor that returns
+        // any other tier for any reason at all, including one that stopped consulting the host.
+        // `open(dir, None)` is the shape being regressed AWAY from, and it must still be able to
+        // express `NotRequested` -- if it cannot, the needle has stopped naming the defect and
+        // this test has gone vacuous.
+        let opted_out = MachineKeyStore::open(&dir, None).expect("Optional policy always opens");
+        assert_eq!(
+            opted_out.backend.tier(),
+            &ProtectionTier::Software(DegradeReason::NotRequested),
+            "an explicit opt-out is what NotRequested means; if this no longer holds, the \
+             assertion above proves nothing"
         );
     }
 }
