@@ -106,15 +106,6 @@ impl ChainTransport {
         }
     }
 
-    /// A transport reading through `sources` — the node's one registry-owned fabric.
-    #[must_use]
-    pub fn with_sources(sources: Arc<super::sources::NodeChainSources>) -> Self {
-        Self {
-            sources,
-            peer_reads: None,
-        }
-    }
-
     /// Serve arbitrary coin reads from this node's OWN peers, corroborated and cached in `db`.
     ///
     /// Without this the two arbitrary reads fall through to the third-party oracle, which a node
@@ -707,5 +698,65 @@ mod corroborated_peak_tests {
             "a partition was resolved by asking a third party which side to believe"
         );
         assert_eq!(reported, None);
+    }
+
+    /// **Every oracle-first `ChainTransport` in this file is one of two NAMED constructors, and
+    /// the list is closed.**
+    ///
+    /// A transport built with `peer_reads: None` answers [`ChainTransport::peak_height`] from
+    /// `chia-query`'s router, whose first move is to ask `api.coinset.org` — one third party
+    /// deciding the node's headline chain fact. Exactly two constructors are allowed to produce
+    /// that shape and neither is reachable from production: `new`, which every real caller
+    /// immediately chains `with_peer_reads` onto, and the `#[cfg(test)]` `with_client`.
+    ///
+    /// This guard exists because `with_sources` was a THIRD one (dig-node#360) — `pub`, `#[must_use]`,
+    /// named as though it were the ordinary way to build a transport over the node's own fabric,
+    /// and silently oracle-first. It had no callers, so nothing failed; it was deleted, and this is
+    /// what makes the deletion durable rather than a one-time tidy-up.
+    ///
+    /// **Fail-closed by construction:** a new site is a FAILURE, never a silent pass. Adding a
+    /// legitimate one means naming it here, which is the review moment the ticket asks for.
+    ///
+    /// The needle is the struct-literal FIELD form (trailing comma), not the prose form, so the
+    /// doc comments that discuss this shape are not counted as sites. And it is assembled at run
+    /// time from two fragments so this test cannot match ITSELF —
+    /// a source-scanning guard that finds its own needle reports a site that does not exist and
+    /// passes for the wrong reason.
+    #[test]
+    fn the_oracle_first_constructors_are_a_closed_enumeration_of_two() {
+        const ALLOWED: [&str; 2] = ["new", "with_client"];
+
+        let source = include_str!("chain.rs");
+        let needle = ["peer_reads", ": None,"].concat();
+
+        let mut found: Vec<&str> = Vec::new();
+        for (offset, _) in source.match_indices(&needle) {
+            // Walk back to the nearest `fn ` and read the identifier that follows it. The nearest
+            // preceding `fn` is the enclosing one for every construction site in this file.
+            let before = &source[..offset];
+            let fn_at = before
+                .rfind("fn ")
+                .expect("a construction site outside any function");
+            let name = before[fn_at + 3..]
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .expect("a `fn` with no name");
+            found.push(name);
+        }
+
+        assert!(
+            !found.is_empty(),
+            "the scan matched nothing, so it proves nothing — the needle no longer describes how \
+             an oracle-first transport is written, and this guard has gone vacuous"
+        );
+
+        let unlisted: Vec<&&str> = found.iter().filter(|n| !ALLOWED.contains(n)).collect();
+        assert!(
+            unlisted.is_empty(),
+            "these constructors build an oracle-first ChainTransport and are not on the closed \
+             list {ALLOWED:?}: {unlisted:?} — a transport whose peak_height is one HTTPS \
+             endpoint's opinion (NC-12, dig-node#360). Attach peer reads, or add the name here \
+             deliberately."
+        );
     }
 }
