@@ -709,6 +709,20 @@ pub enum ErrorCode {
     /// the node and hand the bundle straight back. Retrying cannot help. Node error.
     /// (Wallet range `-3204x`.)
     WalletNodeSpendDisabled,
+    /// One or more named coins are already committed to a live in-flight spend, so NOTHING was
+    /// reserved (dig_ecosystem#3127).
+    ///
+    /// Deliberately distinct from any shortfall: the user HAS the money, it is briefly committed,
+    /// and it returns when that spend settles or its hold lapses. Reporting a shortfall would send
+    /// a person to an exchange to solve a five-minute wait. Node error.
+    WalletCoinsReserved,
+    /// The node's coin-reservation set could not be read, so what is in flight is UNKNOWN
+    /// (dig_ecosystem#3127).
+    ///
+    /// Never collapsed into an empty answer. "Nothing is reserved" and "I cannot tell you what is
+    /// reserved" demand opposite actions: the first permits a spend, the second must refuse one.
+    /// Node error.
+    WalletReservationsUnavailable,
     /// `-32060` — a `control.peers.ping` (dig_ecosystem#1985) was refused BEFORE any dial: either a
     /// ladder is already running (single-flight) or the start-rate bound for the window is spent.
     /// Distinct from a ladder that ran and reached nothing, which is a RESULT (`verdict:
@@ -757,6 +771,14 @@ impl ErrorCode {
             ErrorCode::WalletReadFailed => -32042,
             ErrorCode::WalletRateLimited => -32043,
             ErrorCode::WalletNodeSpendDisabled => -32044,
+            // Taken from the shared catalogue rather than restated, so this crate cannot drift
+            // from the contract it speaks. See `the_wallet_codes_agree_with_the_shared_catalogue`.
+            ErrorCode::WalletCoinsReserved => {
+                dig_node_control_interface::ControlErrorCode::WalletCoinsReserved.code()
+            }
+            ErrorCode::WalletReservationsUnavailable => {
+                dig_node_control_interface::ControlErrorCode::WalletReservationsUnavailable.code()
+            }
             ErrorCode::PeerPingRefused => -32060,
             ErrorCode::PushPendingLimited => -32016,
             ErrorCode::ControlIngressLimited => -32033,
@@ -781,6 +803,8 @@ impl ErrorCode {
             ErrorCode::WalletNotSynced => "WALLET_NOT_SYNCED",
             ErrorCode::WalletReadFailed => "WALLET_READ_FAILED",
             ErrorCode::WalletRateLimited => "WALLET_RATE_LIMITED",
+            ErrorCode::WalletCoinsReserved => "WALLET_COINS_RESERVED",
+            ErrorCode::WalletReservationsUnavailable => "WALLET_RESERVATIONS_UNAVAILABLE",
             ErrorCode::WalletNodeSpendDisabled => "WALLET_NODE_SPEND_DISABLED",
             ErrorCode::PeerPingRefused => "PEER_PING_REFUSED",
             ErrorCode::PushPendingLimited => "PUSH_PENDING_LIMITED",
@@ -810,6 +834,8 @@ impl ErrorCode {
             | ErrorCode::WalletReadFailed
             | ErrorCode::WalletRateLimited
             | ErrorCode::WalletNodeSpendDisabled
+            | ErrorCode::WalletCoinsReserved
+            | ErrorCode::WalletReservationsUnavailable
             // The peer ping is run BY the node's own peer network, so the refusal is the node's.
             | ErrorCode::PeerPingRefused
             // The push-reassembly bound is enforced by the node's own capsule seam.
@@ -860,6 +886,12 @@ impl ErrorCode {
                 "A push was refused: the bundle spends the node's own custodied coins and this \
                  node may not send its own money."
             }
+            ErrorCode::WalletCoinsReserved => {
+                "Coins named by this call are committed to a live in-flight spend; nothing was reserved. This is a wait, NOT a shortfall."
+            }
+            ErrorCode::WalletReservationsUnavailable => {
+                "The node's coin-reservation set could not be read, so coin selection cannot be trusted."
+            }
             ErrorCode::PeerPingRefused => {
                 "A peer ping was refused before dialing: a ladder is already running on this node, \
                  or the start-rate bound is exhausted."
@@ -893,6 +925,8 @@ impl ErrorCode {
             ErrorCode::WalletReadFailed,
             ErrorCode::WalletRateLimited,
             ErrorCode::WalletNodeSpendDisabled,
+            ErrorCode::WalletCoinsReserved,
+            ErrorCode::WalletReservationsUnavailable,
             ErrorCode::PeerPingRefused,
             ErrorCode::PushPendingLimited,
             ErrorCode::ControlIngressLimited,
@@ -1159,6 +1193,122 @@ mod tests {
         assert!(
             info.get("dig_node_version").is_none(),
             "the ambiguous `dig_node_version` alias must be gone (#586); `version` is canonical"
+        );
+    }
+
+    /// **The reciprocal half of the `-3204x` band-ownership rule (dig_ecosystem#3127).**
+    ///
+    /// `dig-node-control-interface` owns the `-3204x` wallet band and states normatively that it
+    /// MUST NOT be minted into privately. That crate cannot enforce it: it has no visibility of
+    /// this repo's sources. This side can, because dig-node already depends on the contract — so
+    /// the check lives here, and this is the only place it can live.
+    ///
+    /// **This exists because the rule was already broken once, expensively.** dig-node minted
+    /// `-32044` as `WALLET_NODE_SPEND_DISABLED` without ever declaring it in the shared catalogue.
+    /// The contract later allocated the same number to `WALLET_COINS_RESERVED`, so one integer told
+    /// a client both "retry after a wait" and "retrying cannot help" — opposite instructions, about
+    /// money moving. Nothing could see it at allocation time because the two catalogues were never
+    /// compared. This is that comparison.
+    ///
+    /// Asserts the SYMBOL as well as the number. A check that only asked whether the number is
+    /// declared would pass for a catalogue that had quietly given the same number two different
+    /// meanings, which is precisely the failure being guarded against.
+    #[test]
+    fn every_wallet_band_code_dig_node_mints_is_declared_in_the_shared_catalogue() {
+        use dig_node_control_interface::ControlErrorCode;
+
+        /// The band the contract owns, inclusive.
+        const BAND: std::ops::RangeInclusive<i64> = -32049..=-32040;
+
+        let declared: std::collections::HashMap<i64, &'static str> = ControlErrorCode::ALL
+            .iter()
+            .map(|c| (c.code(), c.name()))
+            .collect();
+
+        let mut minted_in_band = 0;
+        for e in ErrorCode::all() {
+            if !BAND.contains(&e.code()) {
+                continue;
+            }
+            minted_in_band += 1;
+            match declared.get(&e.code()) {
+                None => panic!(
+                    "dig-node mints {} = {} inside the -3204x band the control contract owns, and \
+                     the contract does not declare it. Register it there rather than here: an \
+                     undeclared code in a shared band is invisible to the allocator, which is how \
+                     -32044 came to mean two opposite things.",
+                    e.name(),
+                    e.code()
+                ),
+                Some(contract_name) => assert_eq!(
+                    *contract_name,
+                    e.name(),
+                    "the two catalogues disagree about what {} MEANS: dig-node calls it {}, the \
+                     contract calls it {}. A client branches on the symbol, so one of them is \
+                     lying to it.",
+                    e.code(),
+                    e.name(),
+                    contract_name
+                ),
+            }
+        }
+
+        // Without this the whole test passes vacuously the day a refactor moves the wallet codes
+        // out of the band, or `ErrorCode::all()` stops being exhaustive.
+        assert!(
+            minted_in_band >= 3,
+            "expected dig-node to mint several -3204x codes; found {minted_in_band}, so this guard \
+             is checking nothing"
+        );
+    }
+
+    /// The three codes this family turns on, pinned to their NUMBER **and** their meaning.
+    ///
+    /// Pinned together on purpose. Asserting only that the numbers differ would pass for a
+    /// catalogue that had given two variants the same disposition, and asserting only the name
+    /// would not notice a renumber — and a renumber is exactly what happened here: the contract
+    /// moved the two reservation codes off `-32044`/`-32045` to `-32046`/`-32047` so dig-node's
+    /// already-shipped `-32044` could keep its meaning.
+    ///
+    /// The dispositions are what a client actually branches on, and they are NOT interchangeable:
+    /// a WAIT invites a retry, a TERMINAL refusal makes retrying pointless, and an UNKNOWN must
+    /// stop a spend outright.
+    #[test]
+    fn the_reservation_codes_are_pinned_to_their_numbers_and_their_dispositions() {
+        use dig_node_control_interface::ControlErrorCode;
+
+        // dig-node's own catalogue.
+        assert_eq!(ErrorCode::WalletNodeSpendDisabled.code(), -32044);
+        assert_eq!(
+            ErrorCode::WalletNodeSpendDisabled.name(),
+            "WALLET_NODE_SPEND_DISABLED"
+        );
+        assert_eq!(ErrorCode::WalletCoinsReserved.code(), -32046);
+        assert_eq!(
+            ErrorCode::WalletCoinsReserved.name(),
+            "WALLET_COINS_RESERVED"
+        );
+        assert_eq!(ErrorCode::WalletReservationsUnavailable.code(), -32047);
+        assert_eq!(
+            ErrorCode::WalletReservationsUnavailable.name(),
+            "WALLET_RESERVATIONS_UNAVAILABLE"
+        );
+
+        // And the contract agrees, number for number. This is the half that would have caught the
+        // original collision: the numbers above are taken FROM these constants, so a silent
+        // renumber upstream cannot drift dig-node's wire without failing right here.
+        assert_eq!(ControlErrorCode::WalletCoinsReserved.code(), -32046);
+        assert_eq!(
+            ControlErrorCode::WalletReservationsUnavailable.code(),
+            -32047
+        );
+
+        // The wait and the terminal refusal must never collapse onto one number again. Retrying
+        // fixes one and can never fix the other.
+        assert_ne!(
+            ErrorCode::WalletCoinsReserved.code(),
+            ErrorCode::WalletNodeSpendDisabled.code(),
+            "a transient wait and a terminal refusal share a number"
         );
     }
 

@@ -365,6 +365,27 @@ enum WalletCommand {
     },
     /// Print the public keys this node is currently following (READ-ONLY).
     Watched,
+    /// Print the coins committed to in-flight spends (READ-ONLY).
+    ///
+    /// Takes no arguments: the node reads its own clock, because a caller-supplied instant would
+    /// be a way to make every live hold read as expired.
+    Reservations,
+    /// Hold coins against further selection -- every named coin or none.
+    ///
+    /// Bookkeeping only: a coin id is a public chain fact and this carries no key (§908).
+    Reserve {
+        /// The coin ids to hold.
+        #[arg(required = true)]
+        coin_ids: Vec<String>,
+        /// Requested lifetime in seconds. The node clamps it and reports what it APPLIED.
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+    },
+    /// Free a hold ahead of its lifetime, by the handle a reserve returned.
+    Release {
+        /// The opaque reservation handle.
+        reservation_id: String,
+    },
     /// Print the recovery phrase of a wallet this node still holds, so you can move it
     /// into the DIG app before node-side wallet custody is removed.
     ///
@@ -783,6 +804,13 @@ fn wallet_action(cmd: WalletCommand) -> Option<ControlAction> {
         WalletCommand::Watch { public_keys } => ControlAction::WalletWatch { public_keys },
         WalletCommand::Unwatch { public_keys } => ControlAction::WalletUnwatch { public_keys },
         WalletCommand::Watched => ControlAction::WalletWatched,
+        WalletCommand::Reservations => ControlAction::WalletReservationsHeld,
+        WalletCommand::Reserve { coin_ids, ttl_secs } => {
+            ControlAction::WalletReservationsReserve { coin_ids, ttl_secs }
+        }
+        WalletCommand::Release { reservation_id } => {
+            ControlAction::WalletReservationsRelease { reservation_id }
+        }
         // Handled locally before this mapping is reached; it names no control method.
         WalletCommand::ExportSeed { .. } => return None,
     })
@@ -1286,6 +1314,18 @@ mod tests {
             (
                 vec!["dig-node", "wallet", "watched"],
                 "control.wallet.watched",
+            ),
+            (
+                vec!["dig-node", "wallet", "reservations"],
+                "control.wallet.reservations.held",
+            ),
+            (
+                vec!["dig-node", "wallet", "reserve", A_COIN_ID],
+                "control.wallet.reservations.reserve",
+            ),
+            (
+                vec!["dig-node", "wallet", "release", A_COIN_ID],
+                "control.wallet.reservations.release",
             ),
         ]
     }

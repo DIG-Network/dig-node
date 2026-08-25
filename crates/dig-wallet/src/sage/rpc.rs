@@ -26,7 +26,10 @@ use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
 use super::chain::PushOutcome;
 use super::coverage::CoveredSet;
 use super::custody::WalletCustody;
-use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
+use super::db::{
+    ClientReservation, CoinRow, OfferDbRow, OptionDbRow, ReserveClientCoinsError, ReservedCoinRow,
+    WalletDb,
+};
 use super::events::EventBus;
 use super::fallback::{ChainFallback, FallbackCoin, FallbackCoinSpend};
 use super::routing::{self, Source};
@@ -780,6 +783,56 @@ impl WalletBackend {
     /// a balance of zero as the truth.
     pub fn watchlist(&self) -> Option<&super::watchlist::WatchRegistry> {
         self.watchlist.as_ref()
+    }
+
+    /// Every coin currently held out of selection, of BOTH phases, and the clock that was read.
+    ///
+    /// Serves `control.wallet.reservations.held`. The clock is returned alongside the rows because
+    /// the caller does not supply one: a caller-supplied `now` would be a lapse oracle, since a
+    /// far-future value makes every live hold read as expired. Reporting the node's own instant
+    /// lets a client SEE skew instead of imposing it.
+    ///
+    /// A failure propagates. It is never flattened into an empty list: "nothing is held" permits a
+    /// caller to spend and "I cannot tell you" must stop it, and collapsing the two restores the
+    /// double-select the set exists to prevent.
+    pub async fn reservations_held(&self) -> sqlx::Result<(Vec<ReservedCoinRow>, i64)> {
+        let now_ms = super::custody::now_ms() as i64;
+        // Retire what has lapsed before reporting, so a hold that is already over is never shown
+        // to a caller as something to wait for.
+        self.db.prune_reservations(now_ms).await?;
+        Ok((self.db.held_reservations(now_ms).await?, now_ms))
+    }
+
+    /// Atomically hold `coin_ids` against further selection — all of them or none.
+    ///
+    /// Serves `control.wallet.reservations.reserve`. §908: bookkeeping only. A coin id is a public
+    /// chain fact; this holds no key, signs nothing and authorizes nothing.
+    ///
+    /// The lifetime is clamped by [`WalletDb::reserve_client_coins`] and the APPLIED one is
+    /// returned, because a caller told its own requested figure would wait on a schedule this node
+    /// does not keep.
+    pub async fn reserve_coins(
+        &self,
+        coin_ids: &[String],
+        ttl_secs: Option<u64>,
+    ) -> std::result::Result<ClientReservation, ReserveClientCoinsError> {
+        let now_ms = super::custody::now_ms() as i64;
+        self.db.prune_reservations(now_ms).await?;
+        // `saturating_mul` rather than a cast: a caller naming a TTL near `u64::MAX` must not wrap
+        // into a negative lifetime, which would produce a hold already expired at birth and read
+        // to that caller as a grant that silently vanished.
+        let ttl_ms = ttl_secs.map(|s| (s.min(i64::MAX as u64 / 1000) as i64).saturating_mul(1000));
+        self.db.reserve_client_coins(coin_ids, ttl_ms, now_ms).await
+    }
+
+    /// Free a hold ahead of its lifetime, returning the coins released.
+    ///
+    /// Serves `control.wallet.reservations.release`. An unknown handle frees nothing and is NOT an
+    /// error — a caller releasing on confirmation cannot know whether the TTL got there first, and
+    /// making the ordinary outcome an error teaches callers to stop checking the result, which is
+    /// how a release path quietly stops being called.
+    pub async fn release_reservation(&self, reservation_id: &str) -> sqlx::Result<Vec<String>> {
+        self.db.release_client_reservation(reservation_id).await
     }
 
     /// Enrol `keys` to be followed.
