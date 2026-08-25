@@ -5729,6 +5729,122 @@ this host cannot open, the node MUST NOT make a recovery promise: per dig-keysto
 §17.5b the envelope records a hardware *class* and carries no device identity, so the same error is
 returned for a blob copied off its machine (recoverable) and for the original machine with its
 trusted component wiped (permanent). The node MAY state that condition; it MUST NOT resolve it.
+## 18.26. Coin reservations — the two phases, and who owns the truth (dig_ecosystem#3127)
+
+A **coin reservation** records that a coin is already committed to a spend that has not settled, so a
+selector will not choose it again. It is BOOKKEEPING: it holds no key, signs nothing, and authorizes
+nothing (§908). It narrows SELECTION only.
+
+**The window it closes.** Between building a spend and that spend confirming, the chain still reports
+its inputs as UNSPENT — the bundle is in a mempool, not a block. A second build in that window applies
+the same selection rule to the same coins and picks the same one. The second bundle can never be
+included, and it fails AFTER the money moved.
+
+### 18.26.1. Authority — the node's set is authoritative
+
+**Where a node is reachable, the NODE's reservation set is authoritative, and a client MUST defer to
+it.** A client-local set is a fallback for the no-node case ONLY, and a client using one MUST NOT treat
+it as covering another process.
+
+This is stated rather than implied because the alternative is a rival implementation. A wallet key may
+be in use by more than one process at once — dig-app holding the key, and a dig-node serving the same
+wallet. **Two independent reservation tables over one wallet re-create exactly the double-select each
+of them fixes locally**, and the two would disagree silently, which is worse than either being absent.
+
+The node exposes its set over `control.wallet.reservations.held` / `.reserve` / `.release`.
+
+### 18.26.2. Two phases of ONE lifecycle, not two systems
+
+A coin may be held in either of two phases. They are stored separately because they are structurally
+different, NOT because they are competing mechanisms:
+
+| Phase | Table | Taken when | Ends when |
+|---|---|---|---|
+| **Lease** | `client_coin_reservations` | a client has SELECTED coins and is building a spend | it is released, its TTL lapses, or its coin is observed spent |
+| **Broadcast** | `coin_reservations` | this node PUSHED a bundle | its parent `pending_transactions` row resolves (FK CASCADE) |
+
+A `coin_reservations` row is a child of a `pending_transactions` row and therefore **cannot express a
+hold taken before a bundle exists**, which is precisely what a client needs. The foreign key MUST NOT
+be relaxed to accommodate one: its CASCADE is what retires a post-broadcast hold when its transaction
+resolves. Nor may a lease be modelled as a synthetic `pending_transactions` row — that would make the
+node report an in-flight spend that does not exist, a claim about money it cannot support.
+
+**Both phases MUST be reported through ONE `held` answer under ONE `reservation_id` namespace.** A
+caller asked whether it may spend a coin; both phases answer no, and it must not have to know which
+phase a hold is in to get a correct answer.
+
+**A selector MUST narrow against BOTH.** Narrowing against one reopens the window the other covers.
+
+### 18.26.3. Acquisition
+
+- **All-or-none.** `reserve` MUST take every named coin or none. Read-then-select-then-reserve is
+  check-then-act, and two callers racing it both take the same coin. On a clash the node MUST have
+  written NOTHING.
+- **Atomicity is the WRITE-BEFORE-READ ordering**, not the `coin_id` PRIMARY KEY. The acquiring
+  transaction MUST perform a write (retiring lapsed rows) BEFORE it reads, so every read happens under
+  an exclusive write lock — the effect `BEGIN IMMEDIATE` would have. This is normative rather than an
+  optimisation: a DEFERRED read-then-write transaction makes a losing racer collide while UPGRADING to
+  a write lock, which surfaces as `SQLITE_BUSY` rather than a uniqueness violation, and would therefore
+  be reported as an UNREADABLE SET rather than a clash — the wrong failure direction (§18.26.5),
+  produced by contention alone.
+- **An empty `coin_ids` MUST succeed**, yielding a handle that holds nothing. An empty selection can
+  never conflict, so refusing it would make a legitimate no-op look malformed.
+- **`reservation_id` is OPAQUE and unguessable** — 256 bits of OS randomness. A handle a caller can
+  derive or guess lets it release a reservation it does not own, which is the double-select reached
+  through the front door. Clients MUST NOT parse, derive or construct one.
+
+### 18.26.4. Release — every ending, because the TTL alone is not enough
+
+**A reservation with no release path is a wallet that locks itself out of its own funds, which is worse
+than the double-select it prevents.** Four endings, all of which MUST work:
+
+1. **Explicit release.** `release` frees a hold the moment its spend is known settled or known dead,
+   rather than holding a person's coins for the rest of a window over a question already answered.
+   Releasing a handle that names no live reservation MUST be a SUCCESS reporting nothing freed — a
+   caller releasing on confirmation cannot know whether the TTL got there first, and an error there
+   teaches callers to discard the result, which is how a release path stops being called. Release MUST
+   free every coin of the handle or none.
+2. **A confirmed spend.** A coin observed spent retires its hold with no release call, because the
+   client that would have called it may be gone by the time the chain answers.
+3. **The TTL.** Every hold MUST carry a finite lifetime whether or not anyone releases it.
+4. **Process death.** The abandoned case is covered by (3) and by nothing else: nobody holds the
+   handle, so only the unconditional expiry recovers the coin.
+
+**Only a Lease is releasable on demand.** A post-broadcast hold is ended by the chain, not a caller:
+the bundle may still be included, and freeing its inputs on request would invite a second spend of a
+coin already committed.
+
+**Expiry MUST NOT resurrect a spent coin.** The reservation set is a filter layered ON the chain read,
+never a replacement for it.
+
+**The applied lifetime, not the requested one, MUST be reported.** A node clamps a requested TTL to its
+own maximum and applies its default when none is given; a caller told its own figure would wait on a
+schedule the node does not keep. This node's default is **300 s** and its ceiling **600 s** — the
+shorter figure being dig-account's default and the longer this node's own post-broadcast lifetime. The
+two crates had disagreed harmlessly while they covered disjoint phases; the reconciliation makes the
+shorter the DEFAULT and the longer the CEILING, under which neither is overruled.
+
+### 18.26.5. Fail direction — REFUSE
+
+**A node that cannot read its reservation set MUST refuse, and MUST NOT answer an empty set.**
+"Nothing is reserved" and "I cannot tell you what is reserved" demand OPPOSITE actions: the first
+permits a spend, the second must stop one. Collapsing them restores the double-select the set exists to
+prevent. A guard that fails open is not a guard.
+
+**A conflict MUST be distinct from a shortfall.** The user HAS the money; it is briefly committed and
+returns when that spend settles or its hold lapses. Reporting insufficient funds sends a person to an
+exchange to solve a five-minute wait. Over the control interface these are `-32044
+WALLET_COINS_RESERVED` and `-32045 WALLET_RESERVATIONS_UNAVAILABLE` respectively.
+
+**Where the two directions conflict, over-reserve.** An over-reserved coin costs a delayed spend; an
+under-reserved one costs an invalid bundle built after the money moved.
+
+### 18.26.6. Reservation narrows SELECTION, never BALANCE
+
+A reserved coin is still the user's money and still counts toward what they hold. Balance and display
+reads MUST keep counting it; only the spendable-set read is narrowed. Netting an in-flight send out of
+the balance reports money as gone before the chain says so — the same class of lie in the opposite
+direction.
 
 ## 19. Peer network — NAT traversal, discovery, address book, and content location
 

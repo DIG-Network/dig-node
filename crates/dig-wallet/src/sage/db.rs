@@ -2279,8 +2279,8 @@ impl WalletDb {
              UNION
              SELECT coin_id FROM client_coin_reservations",
         )
-            .fetch_all(&self.pool)
-            .await?;
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .map(|r| r.get::<String, _>("coin_id").to_ascii_lowercase())
@@ -3717,8 +3717,9 @@ impl WalletDb {
 /// cannot predict or steer.
 fn new_reservation_id() -> sqlx::Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| sqlx::Error::Protocol(format!("reservation id randomness unavailable: {e}")))?;
+    getrandom::getrandom(&mut bytes).map_err(|e| {
+        sqlx::Error::Protocol(format!("reservation id randomness unavailable: {e}"))
+    })?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -5643,7 +5644,11 @@ mod tests {
 
         match err {
             ReserveClientCoinsError::Reserved { coin_ids } => {
-                assert_eq!(coin_ids, vec!["aa".to_string()], "the clashing coin is named");
+                assert_eq!(
+                    coin_ids,
+                    vec!["aa".to_string()],
+                    "the clashing coin is named"
+                );
             }
             other => panic!("a clash must be Reserved, not {other:?}"),
         }
@@ -5962,7 +5967,11 @@ mod tests {
         let b = hold(&db, &["bb"], NOW).await;
 
         assert_ne!(a.reservation_id, b.reservation_id);
-        assert_eq!(a.reservation_id.len(), 64, "256 bits of handle, hex-encoded");
+        assert_eq!(
+            a.reservation_id.len(),
+            64,
+            "256 bits of handle, hex-encoded"
+        );
         assert!(a.reservation_id.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(
             a.reservation_id.chars().any(|c| c != '0'),
@@ -6031,10 +6040,8 @@ mod tests {
         .unwrap();
 
         let live = db.held_reservations(NOW).await.unwrap();
-        let seen: Vec<(String, ReservationPhase)> = live
-            .iter()
-            .map(|r| (r.coin_id.clone(), r.phase))
-            .collect();
+        let seen: Vec<(String, ReservationPhase)> =
+            live.iter().map(|r| (r.coin_id.clone(), r.phase)).collect();
         assert_eq!(
             seen,
             vec![
@@ -6062,12 +6069,12 @@ mod tests {
         .await
         .unwrap();
 
-        let freed = db
-            .release_client_reservation("tx-broadcast")
-            .await
-            .unwrap();
+        let freed = db.release_client_reservation("tx-broadcast").await.unwrap();
 
-        assert!(freed.is_empty(), "release must not reach a post-broadcast hold");
+        assert!(
+            freed.is_empty(),
+            "release must not reach a post-broadcast hold"
+        );
         assert_eq!(
             selectable(&db).await,
             vec!["bb".to_string()],
