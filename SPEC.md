@@ -237,6 +237,14 @@ Set-but-empty MUST mean "no anchors", distinguishably from unset. A node configu
 node that silently gains an outside peer has a peer pool that is not the one its operator configured,
 so every metric computed over pool membership is quietly wrong rather than obviously broken.
 
+An operator SHOULD write `off`, not an empty value. The two are equivalent to this node, but an
+empty value is not equivalently DURABLE across the tooling that carries it: on Windows an empty
+environment variable is deleted rather than emptied, so it arrives UNSET and therefore resolves to
+the public compiled-in anchor. The failure is silent and inverts the experiment — an "isolated"
+node reaches production and the run passes for the wrong reason. `off` is a non-empty token that
+survives every carrier and cannot degrade that way, which is why the shipped
+`/etc/dig-node/dig-node.env` uses it.
+
 The canonical set is `dig_constants::DIG_BOOTSTRAP_PEERS` and MUST NOT be re-declared here. It names
 the PEER interface host `node-rpc.dig.net:9444` — NOT `rpc.dig.net`, which is a CloudFront
 distribution that terminates HTTPS, cannot carry the mTLS peer protocol, and whose peer ports are
@@ -2966,11 +2974,30 @@ remains for manual/dev use.
   `dig-node open`; `postinstall` creates the restrictive state dir, `launchctl bootstrap`s the
   daemon, and registers the handler with LaunchServices.
 - **Ubuntu `.deb`** (`dig-node_<ver>_amd64.deb`; `Package: dig-node`, `Depends: libc6`). Installs
-  `/usr/bin/dig-node`; a systemd system unit `net.dignetwork.dig-node.service` (auto-start,
-  `Restart=on-failure`, `DIG_NODE_RUN_CONTEXT=service`); a `.desktop` with
-  `MimeType=x-scheme-handler/chia` registered as the system default handler; `postinst` creates
-  `/var/lib/dig-node` (root-owned `0700`), the hosts entry, and enables+starts the unit; `prerm`
-  stops+disables it. The filename + control metadata are **apt-correct + stable** so apt.dig.net
+  `/usr/bin/dig-node` **and `/usr/bin/dign`**, the latter a relative symlink to the former — the CLI
+  is documented ecosystem-wide as `dign`, so a package providing only `dig-node` makes every
+  documented command `command not found`. It is a symlink rather than a second copy because both
+  binaries are one-line shims over the same entrypoint and clap derives the displayed program name
+  from arg0, so the two cannot diverge. Nothing is installed at `/usr/bin/dig`, which belongs to
+  BIND's `dnsutils`. Also installed: a systemd system unit `net.dignetwork.dig-node.service`
+  (auto-start, `Restart=on-failure`, `DIG_NODE_RUN_CONTEXT=service`, reading
+  `EnvironmentFile=-/etc/dig-node/dig-node.env`); the operator-owned conffile
+  `/etc/dig-node/dig-node.env` (fully commented out, so an untouched file changes nothing); a
+  `.desktop` with `MimeType=x-scheme-handler/chia` registered as the system default handler;
+  `postinst` creates `/var/lib/dig-node` (root-owned `0700`), the hosts entry, and enables+starts
+  the unit; `prerm` stops+disables it.
+- **Configure before joining.** If `/etc/dig-node/no-autostart` exists when the package is
+  configured, `postinst` registers the unit (`daemon-reload`) and prints how to start it, but does
+  **not** enable or start it — so an operator standing up an isolated network installs without the
+  node first joining the public one, minting an identity, and leaving a provider record whose TTL
+  outlives the window. The marker is read, never written, by the package: an operator creates it
+  before installing and removes it when ready. An install with no marker is unchanged and still
+  starts the node, because a node with no configuration MUST still find peers.
+  The isolation knobs go in `/etc/dig-node/dig-node.env` and are written `off` rather than empty
+  (§ Environment): both spell "none", but an empty assignment does not survive every tool that
+  carries it, and a variable that arrives unset falls back to the public compiled-in anchor.
+  `scripts/tests/deb-contents.test.sh` builds a package and EXECUTES its `postinst` against a
+  recording `systemctl` to assert both the marker path and the unchanged default. The filename + control metadata are **apt-correct + stable** so apt.dig.net
   ingests the Release asset to build its signed apt repo (the repo is GPG-signed by apt.dig.net; the
   `.deb` itself needs no code-signing cert).
 - **Scheme registration scope.** All three register the DIG-specific **`chia://`** scheme. The
