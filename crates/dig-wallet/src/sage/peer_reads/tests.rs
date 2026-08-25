@@ -136,6 +136,12 @@ enum Voice {
 struct ScriptedPeer {
     id: String,
     voice: Voice,
+    /// What this peer claims the chain tip is, or `None` for a peer that announces none.
+    ///
+    /// Separate from [`Voice`] because a peer answers coin questions and peak questions
+    /// independently, and a double that can vary only one of them cannot express a peer that is
+    /// honest about coins while lying about the tip.
+    peak: Option<super::super::quorum::PeakClaim>,
     asked: Arc<AtomicUsize>,
 }
 
@@ -143,6 +149,10 @@ struct ScriptedPeer {
 impl CoinPeer for ScriptedPeer {
     fn id(&self) -> String {
         self.id.clone()
+    }
+
+    async fn peak_claim(&self) -> Option<super::super::quorum::PeakClaim> {
+        self.peak
     }
 
     async fn coin_record(&self, _coin_id: Bytes32) -> Result<Option<FallbackCoin>> {
@@ -167,6 +177,8 @@ impl CoinPeer for ScriptedPeer {
 /// A draw of scripted peers, each with a DISTINCT id — one voice each, never one voice repeated.
 struct ScriptedSample {
     voices: Vec<Voice>,
+    /// One claimed tip per voice, positionally. Empty means every peer announces none.
+    peaks: Vec<Option<super::super::quorum::PeakClaim>>,
     asked: Arc<AtomicUsize>,
 }
 
@@ -174,6 +186,7 @@ impl ScriptedSample {
     fn new(voices: Vec<Voice>) -> Self {
         Self {
             voices,
+            peaks: Vec::new(),
             asked: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -189,6 +202,7 @@ impl PeerSample for ScriptedSample {
                 Arc::new(ScriptedPeer {
                     id: format!("10.0.0.{i}:8444"),
                     voice: voice.clone(),
+                    peak: self.peaks.get(i).copied().flatten(),
                     asked: self.asked.clone(),
                 }) as Arc<dyn CoinPeer>
             })
@@ -931,4 +945,109 @@ async fn a_flood_of_distinct_ids_cannot_grow_the_spend_cache_past_its_budget() {
 fn the_shipped_budgets_are_what_the_docs_claim() {
     assert_eq!(super::super::db::CHAIN_READ_CACHE_MAX_ROWS, 50_000);
     assert_eq!(super::super::db::CHAIN_SPEND_CACHE_MAX_ROWS, 10_000);
+}
+
+// ---------------------------------------------------------------------------
+// The corroborated peak (dig_ecosystem#2790)
+// ---------------------------------------------------------------------------
+
+/// A claimed tip. The header hash is derived from the height so two peers claiming the same height
+/// claim the same thing, and two claiming different heights are distinguishable.
+fn tip(height: u32) -> super::super::quorum::PeakClaim {
+    let mut hash = [0u8; 32];
+    hash[..4].copy_from_slice(&height.to_be_bytes());
+    super::super::quorum::PeakClaim {
+        height,
+        header_hash: chia::protocol::Bytes32::from(hash),
+    }
+}
+
+/// Reads over peers that are silent about coins and each claim their own tip.
+///
+/// The coin voice is deliberately `Silent` throughout: it isolates the peak round, so a passing
+/// assertion cannot be explained by a coin answer.
+async fn peak_reads_over(
+    peaks: Vec<Option<super::super::quorum::PeakClaim>>,
+) -> PeerCorroboratedReads {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let sample = Arc::new(ScriptedSample {
+        voices: vec![Voice::Silent; peaks.len()],
+        peaks,
+        asked: Arc::new(AtomicUsize::new(0)),
+    });
+    PeerCorroboratedReads::new(sample, db).with_clock(Arc::new(FixedClock(NOW)))
+}
+
+/// The control. Every refusal below is otherwise satisfied by a round that always refuses.
+#[tokio::test]
+async fn several_agreeing_peers_settle_a_peak() {
+    let reads = peak_reads_over(vec![
+        Some(tip(9_000_000)),
+        Some(tip(9_000_000)),
+        Some(tip(9_000_000)),
+        Some(tip(9_000_000)),
+    ])
+    .await;
+
+    assert_eq!(
+        reads.peak_height().await,
+        Some(9_000_000 - super::super::quorum::SETTLED_LAG),
+        "four peers agreeing about the tip must produce a settled height"
+    );
+}
+
+/// The property the whole change exists for, asserted where the node actually reads it.
+///
+/// A sample that has collapsed to ONE voice is what a node reading from a single hostile source
+/// sees, and it is also what a node whose corroboration silently stopped working sees. Neither may
+/// produce a number.
+#[tokio::test]
+async fn a_peak_round_that_collapses_to_one_peer_reports_no_height() {
+    let reads = peak_reads_over(vec![Some(tip(9_000_000))]).await;
+
+    assert_eq!(
+        reads.peak_height().await,
+        None,
+        "one peer decided this node's view of the chain: the round consulted a single voice and \
+         believed it"
+    );
+}
+
+/// Silence narrows a round, and a round narrowed to one voice refuses just as a one-peer draw does.
+///
+/// This is the case a draw-size check alone would miss: four peers were drawn, so any assertion
+/// about the SAMPLE still holds, and only one of them actually claimed anything.
+#[tokio::test]
+async fn three_silent_peers_leave_one_voice_and_that_is_not_agreement() {
+    let reads = peak_reads_over(vec![Some(tip(9_000_000)), None, None, None]).await;
+
+    assert_eq!(
+        reads.peak_height().await,
+        None,
+        "three peers said nothing and the fourth was believed anyway"
+    );
+}
+
+/// A liar among honest peers is outvoted at the read, not merely at the pure function.
+#[tokio::test]
+async fn a_lying_peer_does_not_move_the_peak_the_node_reports() {
+    let honest = vec![
+        Some(tip(9_000_000)),
+        Some(tip(9_000_000)),
+        Some(tip(9_000_000)),
+    ];
+    let mut with_liar = honest.clone();
+    with_liar.push(Some(tip(u32::MAX)));
+
+    let truthful = peak_reads_over(honest).await.peak_height().await;
+    let attacked = peak_reads_over(with_liar).await.peak_height().await;
+
+    assert!(
+        truthful.is_some(),
+        "fixture: the honest set must settle, or the equality below holds because both refused"
+    );
+    assert_eq!(
+        attacked, truthful,
+        "a peer claiming an absurd tip changed the height this node reports"
+    );
 }

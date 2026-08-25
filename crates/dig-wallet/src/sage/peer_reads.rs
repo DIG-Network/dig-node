@@ -118,6 +118,15 @@ pub trait CoinPeer: Send + Sync {
 
     /// This peer's spend of `coin_id`: `Ok(None)` is its claim that the coin is unspent or unknown.
     async fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<FallbackCoinSpend>>;
+
+    /// This peer's CLAIMED tip, or `None` when it has not announced one.
+    ///
+    /// A claim, never a fact: a light client cannot verify either field, which is why the height
+    /// this node reports is settled across several of these by
+    /// [`quorum::settled_peak`](super::quorum::settled_peak) rather than taken from any one of
+    /// them. Silence is `None` and is not a failure — a peer that has not spoken lowers the
+    /// round's confidence instead of ending it.
+    async fn peak_claim(&self) -> Option<super::quorum::PeakClaim>;
 }
 
 /// Draws the independently-chosen peers one round asks.
@@ -360,6 +369,48 @@ impl PeerCorroboratedReads {
                 .map_err(|e| Error::internal(format!("chain-spend cache write failed: {e}")))?;
         }
         Ok(answer.clone())
+    }
+
+    /// The chain height this node may report, settled across the peers it holds
+    /// (dig_ecosystem#2790).
+    ///
+    /// # Why the node's peak comes from HERE and not from the router
+    ///
+    /// `chia-query`'s router answers a peak by asking `api.coinset.org` first and consulting this
+    /// node's own peers only when that fails. So the node's headline chain fact used to be a
+    /// third party's notion of the chain even on a node holding five peers — one HTTPS endpoint
+    /// deciding a number that divides into confirmation counts, which is the single-source
+    /// dependency NC-12 exists to remove.
+    ///
+    /// This asks the peers this node dialled itself, concurrently, and settles their claims with
+    /// [`quorum::settled_peak`]. `Ok(None)` is an honest "the peers did not agree, or too few of
+    /// them spoke" — never a repaired number and never a fallback to the oracle, because falling
+    /// through to one endpoint exactly when the peers failed to agree would let it overrule them.
+    pub async fn peak_height(&self) -> Option<u32> {
+        let peers = self.sample.draw().await;
+        // Concurrently, because the claims are only comparable if they are close to simultaneous:
+        // asking four peers in series spreads the round over several block intervals and turns
+        // ordinary progress into apparent disagreement.
+        let mut round = tokio::task::JoinSet::new();
+        for peer in peers {
+            round.spawn(async move {
+                peer.peak_claim().await.map(|claim| quorum::Candidate {
+                    id: peer.id(),
+                    claim,
+                })
+            });
+        }
+
+        let mut candidates = Vec::new();
+        while let Some(joined) = round.join_next().await {
+            // A panicked probe is a peer that gave no claim, which the settlement already treats
+            // as silence. It is never allowed to abort the round: one bad peer must not be able to
+            // stop this node knowing where the chain is.
+            if let Ok(Some(candidate)) = joined {
+                candidates.push(candidate);
+            }
+        }
+        quorum::settled_peak(&candidates)
     }
 }
 
