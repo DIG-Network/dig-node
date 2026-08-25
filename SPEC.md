@@ -5627,6 +5627,104 @@ exactly one signature, a factor re-verified before it can be replaced — are al
 user key. Not holding one is the stronger guarantee, and it is the one the node now makes.
 
 
+## 18.25. Machine identity key at rest (dig_ecosystem#2168)
+
+The node's §21.9 identity seed is the node **authenticating itself**: it derives the BLS key the
+CA-signed `NodeCert` is bound to, and therefore the stable `peer_id = SHA-256(SPKI DER)` the peer
+network knows the node by (§19). It is **NOT user custody** — §18.20 retired the node-side user
+custody plane and MUST NOT be read as retiring this. A user's spend key never enters the node; this
+key never leaves it.
+
+**At-rest format.** The seed MUST be sealed in a `dig_keystore::opaque` `DIGOP1` container
+(AES-256-GCM, Argon2id) under a 32-byte CSPRNG **device key** — the same container and key model
+§16.4 specifies for the wallet host, so the node has ONE at-rest primitive rather than two. The
+node MUST consume `dig-keystore` with its `custody` feature OFF, so the user-custody API is not
+nameable from the engine (dig-keystore `SPEC.md` §18.2). A raw, unsealed seed file MUST NOT be
+written.
+
+**File layout.**
+
+| Path | Contents |
+|---|---|
+| `<identity_dir>/machine-identity.dks` | the sealed `DIGOP1` seed blob |
+| `<identity_dir>-device/device.key` | 32 raw CSPRNG bytes, no header |
+
+Both are owner-only **on Unix** — mode `0600` set at `open` time, not by a later `chmod`. **On
+Windows both inherit the profile ACL**; neither the keystore's `FileBackend` (whose
+`enforce_owner_only` is `#[cfg(unix)]`) nor this node installs an explicit `D:P(A;;FA;;;<user>)`
+DACL for them. §16.4's wallet files DO install that DACL. A surface MUST NOT claim owner-only
+enforcement for the machine key on Windows — it MUST state the floor the running platform actually
+gives it. Bringing Windows to §16.4's floor is recorded as finding 3 on
+https://github.com/DIG-Network/dig_ecosystem/issues/2168 and is NOT satisfied by this section.
+
+The device key is a raw file rather than a keystore record deliberately: it is written with
+`create_new`, and that atomicity is load-bearing (below). `FileBackend::write` is tmp-plus-rename,
+i.e. REPLACE semantics.
+
+`<identity_dir>` is `$DIG_IDENTITY_DIR`, else `<config_dir>/dig` — byte-identical to the path the
+legacy plaintext seed used, so migration finds the existing identity. The device directory is a
+**SIBLING**, never a child: that separation IS the partial-exfiltration boundary (§16.4), and it is
+the only confidentiality this key has on a host with no hardware provider. A copy of the identity
+directory alone MUST NOT yield the seed.
+
+**Migration.** On first start after upgrade, a legacy plaintext `<identity_dir>/identity_key.bin`
+MUST be adopted as the seed — never replaced by a fresh one, which would change the node's
+`peer_id` — sealed, and only then removed. The plaintext file MUST NOT be removed before the sealed
+copy has been read back from storage and compared. The legacy existence check is bound by the same
+`try_exists` rule above: an unreadable legacy path MUST refuse, not mint.
+
+**`identity_key.bin` is a CROSS-TOOL artifact.** `digstore_remote::identity` owns the same path and
+the co-installed `digs` CLI reads it. Removing it therefore causes `digs` to mint a fresh
+**plaintext** seed into the same directory on its next run, silently changing its §21.9 operator
+identity — the node's identity is preserved, `digs`'s is not. The removal is still correct for the
+node, whose seed must not remain in plaintext; the coherent end state is `digs` reading the sealed
+store through this same module, recorded as finding 2 on
+https://github.com/DIG-Network/dig_ecosystem/issues/2168 and NOT satisfied by this section.
+
+**Existence MUST be answered by `try_exists`, never `Path::exists`.** `exists()` is
+`fs::metadata(..).is_ok()`, so it reports a locked, permission-denied or otherwise unreadable path
+as ABSENT — and the next thing the node does with an absent answer is MINT, which overwrites both
+halves. The node MUST distinguish present / absent / **undeterminable** and MUST refuse on the
+third rather than minting. This matters more after sealing than before it: the artifact this
+replaced was a single plaintext file, so the same misread produced a recoverable duplicate; with
+two coupled sealed halves it destroys the identity permanently.
+
+**The device key MUST be installed with `create_new`, and an existing one ADOPTED.** Two starts can
+overlap — a service restart racing the outgoing process, or a manual run beside the service. With
+replace semantics they can leave one process's device key beside the other's blob: a matched pair
+that no longer matches, which the no-re-mint rule below then prevents from ever self-healing. The
+OS atomic test-and-set makes that state unreachable rather than merely unlikely, because exactly
+one racer creates the key and the other adopts it, so both seal under the same key.
+
+**The three-valued rule binds EVERY read on this path, including the device key.** A device key
+that is present but momentarily unreadable — an on-access scanner holding it with `share_mode(0)`,
+a profile sync, a busy volume — MUST NOT be reported as a mismatch. That is the read whose failure
+message carries a destructive instruction, so misclassifying it tells an operator to delete a
+present, intact identity. An undeterminable read MUST say *retry* and MUST NOT propose removing
+either half.
+
+**A mismatched or missing device key MUST be reported as a NAMED state** that identifies both
+halves by path and states the remedy. It is the one state the no-re-mint rule cannot heal, so a
+bare decrypt failure leaves an operator with a permanently dead node and nothing to act on. The
+message MUST separate what is **known** (the two do not currently match) from what is
+**undetermined** (which half is wrong, and whether the matching half still exists), per
+dig-keystore `SPEC.md` §17.5b's discipline, and MUST offer restoring before the irreversible
+option.
+
+**A stored seed that will not open is an ERROR, never a re-mint.** The node MUST report the failure
+and continue with authenticated §21 sync disabled. Minting over it would hand the node a new
+identity in exactly the situation where the real key is most likely still intact on the machine
+that sealed it.
+
+**Reporting protection honestly.** No platform hardware provider ships today (dig_ecosystem#1693),
+so every host resolves `Software(NotRequested)` and the node MUST say so rather than implying
+hardware backing. A surface reporting what protects the key MUST read the **blob's** tier, not the
+host's — a hardware-capable host does not retroactively protect bytes already at rest. On a blob
+this host cannot open, the node MUST NOT make a recovery promise: per dig-keystore `SPEC.md`
+§17.5b the envelope records a hardware *class* and carries no device identity, so the same error is
+returned for a blob copied off its machine (recoverable) and for the original machine with its
+trusted component wiped (permanent). The node MAY state that condition; it MUST NOT resolve it.
+
 ## 19. Peer network — NAT traversal, discovery, address book, and content location
 
 The standalone `dig-node` binary runs an L7 peer network (the in-process FFI/browser host does not —

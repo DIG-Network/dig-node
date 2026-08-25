@@ -4393,14 +4393,46 @@ impl Node {
         // Load the persistent §21.9 identity (best-effort). Present → authenticated
         // whole-store sync is enabled; absent → the node still serves local modules
         // and proxies per-resource.
-        let identity_seed = match identity::load_or_create_seed() {
-            Ok((seed, pk)) => {
-                println!(
-                    "dig-node identity {} (authenticated §21 whole-store sync enabled)",
-                    pk.to_hex()
-                );
-                Some(seed)
-            }
+        //
+        // The seed is SEALED at rest (dig_ecosystem#2168): the ad-hoc plaintext
+        // `identity_key.bin` is migrated into a `dig-keystore` `opaque` container on first start
+        // and then removed. This is the node's MACHINE key only — never user custody (#908) —
+        // which is why dig-keystore is consumed with its `custody` feature off.
+        let identity_seed = match crate::seams::key_mgmt::machine_key::identity_store_dir() {
+            Ok(dir) => match crate::seams::key_mgmt::load_or_create_sealed_seed(&dir, Some(&dir)) {
+                Ok(seed) => {
+                    let pk = digstore_crypto::bls::SecretKey::from_seed(&*seed)
+                        .public_key()
+                        .to_bytes();
+                    println!(
+                        "dig-node identity {} (authenticated §21 whole-store sync enabled)",
+                        pk.to_hex()
+                    );
+                    // Say what actually protects it, rather than letting "sealed" imply hardware
+                    // backing no host has yet (dig-keystore SPEC.md §17.5b).
+                    match crate::seams::key_mgmt::MachineKeyStore::open(
+                        &dir,
+                        crate::seams::key_mgmt::machine_key::platform_provider(),
+                    ) {
+                        Ok(store) => println!("dig-node: {}", store.protection_summary()),
+                        Err(e) => eprintln!("dig-node: machine key protection unknown: {e}"),
+                    }
+                    // NOTE: this copies the seed out of its `Zeroizing` wrapper, because
+                    // `Node::identity_seed` is a plain `Option<[u8; 32]>` that seam 7's
+                    // `KeyManager::identity_seed_for_peer` returns by value. Narrowing that type
+                    // is a seam-wide change, tracked separately -- it is not made cheaper by
+                    // doing it here, and doing it here would widen this diff across the peer
+                    // seam. The copy lives as long as the node does either way.
+                    Some(*seed)
+                }
+                Err(e) => {
+                    // Deliberately NOT a re-mint: a stored identity that will not open here may
+                    // still be intact on the machine that sealed it, and minting over it would
+                    // change the peer_id the network knows this node by.
+                    eprintln!("dig-node: no identity key ({e}); authenticated §21 sync disabled");
+                    None
+                }
+            },
             Err(e) => {
                 eprintln!("dig-node: no identity key ({e}); authenticated §21 sync disabled");
                 None

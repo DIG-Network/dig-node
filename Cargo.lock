@@ -2846,13 +2846,13 @@ dependencies = [
 
 [[package]]
 name = "dig-keystore"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf0908087410d782eaaf62cd02448a3a7e340beead1f6af1fbc37702555422f6"
+checksum = "62ec63fabddd73c796b9224dd42906386ffa422383258102cc41fdce37ffd088"
 dependencies = [
  "aes-gcm",
  "argon2",
- "chia-bls 0.26.0",
+ "chia-bls 0.36.1",
  "crc32fast",
  "hex",
  "parking_lot",
@@ -2963,7 +2963,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2981,6 +2981,7 @@ dependencies = [
  "dig-identity 0.4.0",
  "dig-ip",
  "dig-ipc-protocol",
+ "dig-keystore",
  "dig-message",
  "dig-nat",
  "dig-peer",
@@ -2999,6 +3000,7 @@ dependencies = [
  "digstore-remote",
  "digstore-stage",
  "directories",
+ "dirs 5.0.1",
  "filetime",
  "fs4",
  "futures",
@@ -3018,11 +3020,12 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
 name = "dig-node-service"
-version = "0.148.0"
+version = "0.149.0"
 dependencies = [
  "async-trait",
  "axum",

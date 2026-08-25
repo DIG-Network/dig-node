@@ -124,31 +124,14 @@ fn sibling(path: &Path, name: &str) -> PathBuf {
 
 // -- Presence ------------------------------------------------------------------------------------
 
-/// Whether an artifact is on disk. Deliberately not `bool`: the third answer — *we could not tell*
-/// — is the one that matters, and it lives in the `Err` of [`presence`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Presence {
-    Present,
-    Absent,
-}
-
-/// Answer whether `path` exists, treating "the question could not be answered" as an ERROR rather
-/// than as "no".
+/// Whether an artifact is on disk, and the refusal that goes with it.
 ///
-/// This exists because [`Path::exists`] does not. `exists()` collapses every metadata failure —
-/// permission denied, a locked file, a transient I/O error, an unmounted volume, an ACL that
-/// changed under an OS update — into a plain `false`. That was harmless while the answer only
-/// chose which screen to render. It stops being harmless the moment a `false` causes a wallet to
-/// be *minted*, because the seed IS the wallet: overwriting one is unrecoverable, unundoable, and
-/// the funds are gone. An unreadable path is not an absent one, and this function refuses to say
-/// it is.
-pub fn presence(path: &Path) -> io::Result<Presence> {
-    if path.try_exists()? {
-        Ok(Presence::Present)
-    } else {
-        Ok(Presence::Absent)
-    }
-}
+/// **Re-exported, not defined here.** The canonical definitions now live in
+/// [`dig_node_core::shared::at_rest`], so the node and the wallet host share ONE implementation of
+/// the rule rather than two copies that can drift. This module established the shape and its
+/// threat model; the definitions moved down because `dig-wallet` depends on `dig-node-core` and
+/// not the other way round.
+pub use dig_node_core::shared::at_rest::{presence, Presence};
 
 // -- Device key ----------------------------------------------------------------------------------
 
@@ -514,30 +497,10 @@ fn password_str(key: &DeviceKey) -> Zeroizing<String> {
 ///   is removed and the error propagates. A secret is never left at a path whose permissions could
 ///   not be proven.
 fn write_new_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-
-    let mut file = opts.open(path)?;
-
-    if let Err(e) = harden_owner_only(path).and_then(|()| {
-        use io::Write as _;
-        file.write_all(bytes)?;
-        file.sync_all()
-    }) {
-        drop(file);
-        let _ = fs::remove_file(path);
-        return Err(e);
-    }
-    Ok(())
+    // Delegates to the ONE create-new implementation in `dig-node-core`, passing this crate
+    // Windows DACL installer as the hardening step. Keeping a second copy here is what let the
+    // two drift; the DACL stays because only this crate has the Windows FFI for it.
+    dig_node_core::shared::at_rest::write_new_hardened(path, bytes, harden_owner_only)
 }
 
 /// Replace `path`'s inherited ACL with a protected, owner-only one.

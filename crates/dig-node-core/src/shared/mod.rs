@@ -7,6 +7,9 @@
 //! this module existed; it introduces no new types (id newtypes like `StoreId`/`CapsuleId` are
 //! deferred to a later wave, once a seam trait actually needs them).
 //!
+//! - [`at_rest`] — the at-rest decision primitives every seam that mints key material shares:
+//!   [`presence`] (an unreadable path is NOT an absent one) and [`write_new_owner_only`] /
+//!   atomic create-new that makes two concurrent starts safe).
 //! - [`chain_view`] — the injectable on-chain root resolver ([`AnchoredRootResolver`],
 //!   [`AnchoredStoreState`]) the read-path pin and the chain-watch loop both depend on.
 //! - [`content`] — the decoded-module wire type ([`ContentResponse`]) the local-content and
@@ -18,11 +21,13 @@
 //!   long-lived background loop wraps its per-iteration body in, so a single iteration's panic can
 //!   never silently kill a whole subsystem for the process's lifetime (#2067).
 
+pub mod at_rest;
 pub mod chain_view;
 pub mod content;
 pub mod identity;
 pub mod panic_guard;
 
+pub use at_rest::{presence, write_new_owner_only, Presence};
 pub use chain_view::{AnchoredRootResolver, AnchoredStoreState};
 pub use content::ContentResponse;
 pub use identity::{install_crypto_provider, load_or_generate_node_cert};
