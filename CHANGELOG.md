@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.149.0] - 2026-08-25
+
+### Features
+- **custody:** Remove the second node-side USER custody + signing plane (#338)- **key-mgmt:** Seal the node machine key through dig-keystore's opaque container (#342)
+
+### Bug Fixes
+- **ci:** Make releases/latest wait for a complete asset set (#336)- **relay:** Make a cold relayed capsule fetch reachable in one command (#334)
+
+### Build
+- **deps:** Unify dig-node's three Chia diallers onto chia-query's light client (#339)
+
 ## [0.145.0] - 2026-08-24
 
 ### Features
