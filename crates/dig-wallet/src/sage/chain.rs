@@ -660,15 +660,18 @@ mod corroborated_peak_tests {
     #[tokio::test]
     async fn agreeing_peers_give_the_node_a_height_without_asking_a_third_party() {
         let transport = transport_over(vec![9_000_000; 4]).await;
+        let reported = transport.peak_height().await.unwrap();
 
-        assert_eq!(
-            transport.peak_height().await.unwrap(),
-            Some(9_000_000 - SETTLED_LAG)
-        );
+        // The PLACEMENT assertion goes first, deliberately. Asserted after the value it would
+        // never be REACHED on a regression: the value assertion fires, the placement one is never
+        // evaluated, and the property it exists to pin stays unproven while the test still turns
+        // red for a reason that looks convincing. Measured — all three of these tests originally
+        // failed their revert-proof on the value line and proved nothing about the oracle.
         assert!(
             transport.sources.existing_client().await.is_none(),
             "the node's own peers answered, and it consulted the public oracle anyway"
         );
+        assert_eq!(reported, Some(9_000_000 - SETTLED_LAG));
     }
 
     /// A round that collapses to ONE voice reports no height, and does NOT fall through to the
@@ -680,16 +683,16 @@ mod corroborated_peak_tests {
     #[tokio::test]
     async fn a_single_peer_yields_no_height_and_no_fallback_to_the_oracle() {
         let transport = transport_over(vec![9_000_000]).await;
+        let reported = transport.peak_height().await.unwrap();
 
-        assert_eq!(
-            transport.peak_height().await.unwrap(),
-            None,
-            "one peer was allowed to tell this node where the chain is"
-        );
         assert!(
             transport.sources.existing_client().await.is_none(),
             "the peers did not agree and the node asked a third party instead, which is the \
              single source this change removes"
+        );
+        assert_eq!(
+            reported, None,
+            "one peer was allowed to tell this node where the chain is"
         );
     }
 
@@ -697,11 +700,12 @@ mod corroborated_peak_tests {
     #[tokio::test]
     async fn a_split_sample_yields_no_height_and_no_fallback_to_the_oracle() {
         let transport = transport_over(vec![9_000_000, 9_000_000, 8_000_000, 8_000_000]).await;
+        let reported = transport.peak_height().await.unwrap();
 
-        assert_eq!(transport.peak_height().await.unwrap(), None);
         assert!(
             transport.sources.existing_client().await.is_none(),
             "a partition was resolved by asking a third party which side to believe"
         );
+        assert_eq!(reported, None);
     }
 }
