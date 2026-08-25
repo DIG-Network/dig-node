@@ -534,6 +534,15 @@ mod sole_owner_tests {
     /// the constructors inside THAT WINDOW, not everything to EOF — unlike the brace-counting
     /// classifier this replaced, which went blind to EOF in five files at once.
     ///
+    /// Read "bounded" as bounded, NOT as small. The next item can be an entire `impl`: a false
+    /// latch set on string content nested inside one stays set for the whole block, and a 130-line
+    /// fixture of that shape dropped 40 constructors while reporting `flag=false`. The window is
+    /// the item, and items get large.
+    ///
+    /// The genuinely unbounded case is the LOUD one: a latch that never clears at all reaches EOF,
+    /// which is precisely what [`Swept::ended_inside_a_test_item`] reports and the assertion
+    /// refuses on. What is silent is bounded; what is unbounded is not silent.
+    ///
     /// Taking `&str` rather than walking files is deliberate: it is what lets the fixture tests pin
     /// the classification against shapes chosen to break it, instead of against whatever this
     /// crate's own sources happen to look like today.
@@ -700,11 +709,19 @@ mod sole_owner_tests {
              production; and a constructor written ON a one-line test item (line 6) is reported \
              rather than dropped, because that is the loud direction"
         );
-        // This assertion DOCUMENTS rather than catches, and the distinction is worth stating so a
-        // later reader does not trust it as a live guard: `ended_inside_a_test_item` is false both
-        // before and after the one-line-item fix, because the shape's whole point is that the flag
-        // stays quiet while the sweep goes blind. The site assertion above is what fails on a
-        // revert. This one records the half of the defect the flag could not see.
+        // This assertion is LIVE, and which revert it catches depends on which one you mean.
+        // Measured on this fixture, against the compiled `sweep`:
+        //
+        //   revert A — require a BARE `}` again (the fix this test is named for):  sites=[]  flag=true
+        //   revert B — `continue` past the clearing line instead of judging it:    sites=[4] flag=false
+        //
+        // So under A this assertion FIRES: the latch never clears, the sweep runs to EOF still
+        // inside the test item, and the fail-closed flag is exactly what says so. Under the
+        // narrower B it is non-discriminating and the site assertion above is what fails.
+        //
+        // Recorded because an earlier version of this comment claimed the flag was documentation
+        // rather than a guard — true of B, false of A — and a comment that calls a working
+        // assertion "documentation" is how a working assertion gets deleted.
         assert!(
             !swept.ended_inside_a_test_item,
             "the latch must not still be set at EOF here — a stuck latch that also reports itself \
