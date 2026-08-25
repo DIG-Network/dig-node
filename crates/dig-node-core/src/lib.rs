@@ -7397,6 +7397,102 @@ mod tests {
         );
     }
 
+    /// **Proves (NC-1 / §5.4):** the relay hop pulls and serves a function of `(store_id, root)`
+    /// ALONE. Recipient-specific material in a requestor's params — a retrieval key, the one field
+    /// that names WHOM content is for — selects nothing: it does not steer the pull, it does not
+    /// steer the served bytes, and it leaves no artifact of its own. The hop therefore relays
+    /// capsule ciphertext it cannot read, exactly as `module_relay`'s module docs claim.
+    ///
+    /// **Catches:** the widening those docs forbid. Until now that exclusion was PROSE — the epic's
+    /// own measurement recorded that no test fails if a directed message becomes routable through
+    /// `module_relay`. The nearest wrong implementation is not a dramatic one: it is a future edit
+    /// that threads `params["retrieval_key"]` into the relay so the hop can serve a resource rather
+    /// than a capsule. That single change is what turns a courier of opaque bytes into a courier of
+    /// recipient-addressed ones, and NC-1 requires those to stay sealed to the recipient key.
+    ///
+    /// **Why the fixture carries TWO DIFFERENT keys and not one.** A single key is satisfied
+    /// identically by a hop that ignores it and by a hop that threads it, because with one value
+    /// there is nothing for a threaded key to select differently — the fixture could not exhibit the
+    /// property under test. Two different keys across the describe and the window make the two
+    /// implementations disagree: the correct hop answers both from the same capsule, a threading hop
+    /// cannot. The inequality is asserted rather than assumed, so a later edit that collapses the two
+    /// constants silently blinds nothing.
+    ///
+    /// **Why it runs on the SAME wiring as the gate test above:** a params-insensitivity claim
+    /// asserted on a hop that refuses everything is vacuous. Here the relay is fully open and
+    /// genuinely answers, so "the key changed nothing" is a statement about a relay that ran.
+    #[tokio::test]
+    async fn a_relay_ignores_recipient_specific_params_entirely() {
+        let (b, _bd) = test_node(None);
+        let staging = tempfile::tempdir().unwrap();
+        let store_raw = [0x8au8; 32];
+        let (module, root) = chain_anchored_module(store_raw, [0x8bu8; 32]);
+        let (store, root) = (hex::encode(store_raw), root.to_hex());
+        let pc = wire_relay_hop(&b, &store, &root, module.clone(), &staging);
+        pc.set_onion_relay(true);
+
+        // The two recipient-specific values the requests carry. Different by construction — that
+        // difference is the entire discriminating power of this fixture.
+        let (key_on_describe, key_on_window) = (id_hex(0xc1), id_hex(0xc2));
+        assert_ne!(
+            key_on_describe, key_on_window,
+            "the two keys MUST differ, or this test cannot tell an ignored key from a threaded one"
+        );
+
+        // The DESCRIBE carries one key. It must be answered from the capsule the store/root names.
+        let described = handle_rpc(
+            &b,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getModuleInfo","params":{
+                "store_id": store, "root": root, "proxy": true,
+                "retrieval_key": key_on_describe,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(
+            described["result"]["total_size"],
+            json!(module.len() as u64),
+            "a key-bearing describe is answered by the whole capsule, not by some resource the key \
+             selected: {described}"
+        );
+
+        // The WINDOW carries a DIFFERENT key. A hop that threaded the key could not answer this from
+        // the capsule the first request landed; one that ignores it answers byte-identically.
+        let framed = handle_rpc(
+            &b,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.fetchModuleRange","params":{
+                "store_id": store, "root": root, "offset": 16, "length": 32, "proxy": true,
+                "retrieval_key": key_on_window,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let decoded: dig_nat::RangeFrame = serde_json::from_value(framed["result"].clone())
+            .expect("a key-bearing relayed window still decodes as a RangeFrame");
+        assert_eq!(
+            decoded.bytes,
+            module[16..48],
+            "a second, DIFFERENT key must select nothing — the served bytes are the capsule's"
+        );
+
+        // And the pull left exactly ONE artifact, at the path the capsule identity names. A hop that
+        // keyed its staging or its cache by the requestor's key would leave a second one here, which
+        // is what a relayed DIRECTED payload would look like on disk.
+        assert!(
+            module_path(&b.cache_dir, &store, &root).exists(),
+            "the relayed capsule is cached under (store, root)"
+        );
+        for key in [&key_on_describe, &key_on_window] {
+            assert!(
+                !module_path(&b.cache_dir, &store, key).exists()
+                    && !module_path(&b.cache_dir, key, &root).exists(),
+                "no artifact may be keyed by a retrieval key: the hop is never handed one"
+            );
+        }
+    }
+
     /// **Proves:** a non-canonical id on either module method is a -32602 that never reaches the
     /// filesystem — a store id concatenated into a path would be a traversal primitive.
     #[tokio::test]
