@@ -3496,23 +3496,37 @@ impl WalletDb {
     /// an in-flight spend that does not exist, which is a claim about money the node cannot
     /// support.
     ///
-    /// # All-or-none
+    /// # All-or-none, and what actually guarantees it
     ///
     /// Every named coin is taken or none is. Reading the held set, selecting, then reserving is
-    /// check-then-act: two callers both see a coin free and both take it. Atomicity is what closes
-    /// that, and it rests on the `coin_id` PRIMARY KEY rather than on isolation level — a losing
-    /// racer fails its INSERT and the whole transaction rolls back, so a partial hold cannot exist
-    /// even if the pre-check saw a clear table.
+    /// check-then-act: two callers both see a coin free and both take it.
     ///
-    /// The pre-check is still worth its cost: it names WHICH coins clashed, and it is the only
-    /// thing that can see a clash against [`Self::reserve_spend`]'s table, whose rows share no
-    /// key with this one.
+    /// **The guarantee is the WRITE-BEFORE-READ ordering below, not the `coin_id` PRIMARY KEY.**
+    /// That is measured rather than assumed, because the obvious reading is the wrong one. With 8
+    /// barrier-synchronised callers contending for one coin on a file-backed WAL pool:
+    ///
+    /// | build | result |
+    /// |---|---|
+    /// | PRIMARY KEY defeated (`INSERT OR REPLACE`), ordering kept | still exactly ONE winner |
+    /// | ordering defeated (lapsed-row DELETE moved outside the transaction), PRIMARY KEY kept | **FAILS** |
+    ///
+    /// So the key is a backstop that is never reached in practice, and removing the ordering is
+    /// not merely a lost optimisation. Without it the transaction is read-then-write and DEFERRED:
+    /// a losing racer collides while UPGRADING to a write lock, which surfaces as `SQLITE_BUSY`
+    /// rather than a uniqueness violation, and therefore maps to
+    /// [`ReserveClientCoinsError::Unavailable`] — telling the caller "I cannot read the set, do
+    /// not spend" when the truth is "wait, somebody holds it". That is the money-honesty failure
+    /// this type exists to prevent, produced by contention alone.
+    ///
+    /// The pre-check earns its cost twice over: it names WHICH coins clashed, and it is the ONLY
+    /// thing that can see a clash against [`Self::reserve_spend`]'s table, whose rows share no key
+    /// with this one.
     ///
     /// # Ordering inside the transaction
     ///
     /// Retiring lapsed rows is a WRITE, and it is done FIRST on purpose: it takes SQLite's write
-    /// lock before anything is read, which is what `BEGIN IMMEDIATE` would buy. A read-then-write
-    /// transaction can be built on a snapshot that another writer has already invalidated.
+    /// lock before anything is read, which is what `BEGIN IMMEDIATE` would buy. Every read below
+    /// it therefore happens under an exclusive lock, which is what makes the pre-check sound.
     ///
     /// # §908
     ///
@@ -5668,39 +5682,86 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn two_racing_reservations_of_one_coin_produce_exactly_one_winner() {
-        // Read-then-write is check-then-act, and both callers see the coin free. Only an atomic
-        // acquisition makes exactly one of them win. Run many rounds on a fresh coin each time: a
-        // single round can pass by luck against a broken implementation.
-        let mut rounds_with_two_winners = 0;
-        for round in 0..40 {
-            let db = std::sync::Arc::new(WalletDb::open_in_memory().await.unwrap());
-            db.migrate().await.unwrap();
+    /// How many callers contend for one coin per round.
+    ///
+    /// More than two on purpose. A non-atomic implementation does not fail every time; widening
+    /// the field raises the chance that at least two callers are genuinely inside the critical
+    /// section together, which is the only condition under which the defect is observable.
+    const RACERS: usize = 8;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_reservations_of_one_coin_produce_exactly_one_winner() {
+        // Read-then-write is check-then-act, and every caller sees the coin free. Only atomic
+        // acquisition makes exactly one of them win.
+        //
+        // Three things make this fixture able to SEE a non-atomic implementation, and it was blind
+        // without all three:
+        //
+        // 1. **A file-backed DB.** `open_in_memory` is `max_connections(1)`, so tasks against it
+        //    are serialized by the connection pool and no race can occur at all. A file DB opens
+        //    the ordinary multi-connection WAL pool that production uses.
+        // 2. **A barrier.** Spawning tasks that each do a few fast statements lets the first finish
+        //    before the last begins; they never overlap and the test passes against anything. The
+        //    barrier releases every caller into the critical section at once.
+        // 3. **A multi-threaded runtime.** On the single-threaded runtime the barrier only
+        //    interleaves at await points on one core.
+        //
+        // Measured against a deliberately broken build (`INSERT OR REPLACE`, plus the lapsed-row
+        // DELETE moved outside the transaction so the pre-check no longer runs under the write
+        // lock): this shape reports multiple winners, while the earlier two-task in-memory version
+        // reported exactly one and looked healthy.
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..12 {
+            let path = dir.path().join(format!("race{round}.sqlite"));
+            let db = std::sync::Arc::new(WalletDb::open(path.to_str().unwrap()).await.unwrap());
             let id = format!("race{round}");
             db.upsert_coins(&[coin(&id, 1_000, Some(10), None)])
                 .await
                 .unwrap();
 
-            let (a, b) = (db.clone(), db.clone());
-            let (ida, idb) = (id.clone(), id.clone());
-            let ta = tokio::spawn(async move { a.reserve_client_coins(&[ida], None, NOW).await });
-            let tb = tokio::spawn(async move { b.reserve_client_coins(&[idb], None, NOW).await });
-            let winners = [ta.await.unwrap().is_ok(), tb.await.unwrap().is_ok()]
-                .iter()
-                .filter(|w| **w)
-                .count();
-
-            if winners == 2 {
-                rounds_with_two_winners += 1;
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+            let mut tasks = Vec::with_capacity(RACERS);
+            for _ in 0..RACERS {
+                let (db, gate, id) = (db.clone(), gate.clone(), id.clone());
+                tasks.push(tokio::spawn(async move {
+                    gate.wait().await;
+                    db.reserve_client_coins(&[id], None, NOW).await
+                }));
             }
-            assert!(winners >= 1, "round {round}: both callers lost the coin");
+            let mut outcomes = Vec::with_capacity(RACERS);
+            for t in tasks {
+                outcomes.push(t.await.unwrap());
+            }
+
+            let winners = outcomes.iter().filter(|o| o.is_ok()).count();
+            assert_eq!(
+                winners, 1,
+                "round {round}: {winners} of {RACERS} callers were handed the same coin — 0 is a \
+                 coin nobody can spend, and more than 1 is the double-select this table exists to \
+                 prevent"
+            );
+
+            // Every loser must REFUSE, and the refusal must stay readable as a WAIT rather than as
+            // an unreadable set: a caller told the set is unavailable stops spending altogether,
+            // where a clash only asks it to wait. Contention is exactly when that distinction is
+            // load-bearing, so it is asserted here and not only on the uncontended path.
+            for outcome in outcomes.iter().filter(|o| o.is_err()) {
+                match outcome {
+                    Err(ReserveClientCoinsError::Reserved { coin_ids }) => {
+                        assert_eq!(coin_ids, &vec![id.clone()], "round {round}");
+                    }
+                    other => {
+                        panic!("round {round}: a contended clash must be Reserved, got {other:?}")
+                    }
+                }
+            }
+
+            // And the winner's hold is real rather than merely reported.
+            assert!(
+                db.reserved_coin_ids().await.unwrap().contains(&id),
+                "round {round}: a reservation was granted but nothing is held"
+            );
         }
-        assert_eq!(
-            rounds_with_two_winners, 0,
-            "the same coin was handed to two callers at once, which is the double-select this \
-             table exists to prevent reached through the table itself"
-        );
     }
 
     #[tokio::test]
