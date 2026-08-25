@@ -1508,8 +1508,54 @@ processes contend for one port the loser is exactly the party who needs to be to
 published on `control.status`, so `dign info` says `wallet mTLS UNAVAILABLE (port 9776 held by
 another process ...)`. Any other best-effort bind in this repo should be read the same way.
 
-## NC-12: anchored-root corroboration + the sole-owner sweep's scope (dig-node#365/#366)
+## A "quorum" is only as independent as what its members can REACH (dig-node#365)
 
-WIP marker for the lane taking dig-node#365 (the anchored root is resolved from ONE hardcoded HTTP
-third party) and dig-node#366 (the sole-owner sweep walks `dig-wallet/src` only). Replaced by the
-real entries as the work lands.
+Corroboration rules fail in one characteristic way here: the sources are counted, not weighed. On
+PR#354 a 2-of-2 "independent-group" rule in `dig-wallet` was satisfied by ONE HTTPS endpoint,
+because the second group's peer tier was configured with `max_peers: 0` and could reach nothing at
+all. The rule was correct about its own definition of a group and wrong about the world.
+
+So `seams/chia_peer/endpoints.rs` derives independence from RESOLVED ADDRESSES: two endpoints are
+one voice when their address sets intersect, transitively. Not their type, and not their host name
+— a CNAME costs an attacker nothing, and two names for one machine is exactly the shape a name-based
+rule waves through.
+
+Two consequences worth knowing before touching it:
+
+* **Set INTERSECTION, not equality.** A dual-stack host answers with several addresses (§5.2 makes
+  IPv6 the ordinary case), and a resolver returning different subsets on two lookups would make one
+  machine read as two voices under an equality rule.
+* **The merge must be transitive.** An endpoint bridging two previously-disjoint groups makes all
+  three one voice; stopping at the first matching group leaves the second counted separately, and a
+  third endpoint then turns one host into a passing quorum.
+
+## Refusing on a default install is not a safe default (dig-node#365)
+
+The anchored root decides which bytes a user is served, so a single-source resolution of it is a
+real gap. Refusing to resolve it without corroboration would close the gap and stop every
+unconfigured node serving any content at all — including the surfaces on which an operator would
+then configure a second endpoint. The shipped rule therefore degrades to the single source, states
+that in `SPEC.md` §14.4b as an accepted limitation with its blast radius, and refuses only where two
+independent voices exist and DISAGREE. "State it honestly" is a legitimate outcome; implying
+corroboration the code does not perform is not.
+
+## Widening a source-scanning guard widens its blind spots (dig-node#366)
+
+The NC-12 sole-owner sweep is a line classifier over Rust source, and it took five gate rounds to
+make honest within one crate. Adding `dig-node-core` to its haystack surfaced two failure modes that
+a wider scope creates rather than inherits:
+
+* **File names repeat across a workspace.** Sites were reported as bare basenames and the owner was
+  `"sources.rs"`, so a second fabric built in a `sources.rs` in ANY newly-swept crate would have
+  been accepted as the owner. Sites are now crate-qualified (`dig-wallet/sources.rs:NNN`).
+* **A crate with none of the needle cannot tell you it was read.** `dig-node-core` contains no
+  `ChiaQuery::new(` at all, so a total taken across both roots stays positive from `dig-wallet`
+  alone — a typo in the second path leaves the new scope reading zero files while the guard still
+  reports a real haystack. The haystack test now asserts a FILE count per root, which separates
+  "this crate is clean" from "this crate was never opened".
+
+Both known-silent shapes were re-measured against the new haystack. The column-0 `#[cfg(test)]` as
+string content is absent from both crates. The trailing-comment terminator occurs ONCE, at
+`dig-node-core/src/lib.rs:195` (`const DEFAULT_CACHE_CAP: … ; // 1 GiB`) — harmless only because no
+column-0 `#[cfg(test)]` precedes it in that file, so the latch is never set when it is reached. That
+is a property of where the line sits, not of the line, and nothing would report it if it moved.

@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **dn-3127** (11540 symbols, 31404 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **dn-365-366** (11798 symbols, 32150 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -17,7 +17,7 @@ This project is indexed by GitNexus as **dn-3127** (11540 symbols, 31404 relatio
 
 1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
 2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
-3. `READ gitnexus://repo/dn-3127/process/{processName}` — trace the full execution flow step by step
+3. `READ gitnexus://repo/dn-365-366/process/{processName}` — trace the full execution flow step by step
 4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
 
 ## When Refactoring
@@ -56,10 +56,10 @@ This project is indexed by GitNexus as **dn-3127** (11540 symbols, 31404 relatio
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/dn-3127/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/dn-3127/clusters` | All functional areas |
-| `gitnexus://repo/dn-3127/processes` | All execution flows |
-| `gitnexus://repo/dn-3127/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/dn-365-366/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/dn-365-366/clusters` | All functional areas |
+| `gitnexus://repo/dn-365-366/processes` | All execution flows |
+| `gitnexus://repo/dn-365-366/process/{name}` | Step-by-step execution trace |
 
 ## Self-Check Before Finishing
 

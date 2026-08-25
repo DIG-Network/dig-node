@@ -3850,6 +3850,60 @@ against the on-chain current root or fails closed — it NEVER trusts an upstrea
   a NODE-side gate; clients still verify the returned proof against their own trust root regardless, so
   the opt-out only relaxes the node's serve gate for local dev.
 
+#### 14.4b. Chain corroboration — how many voices decide the anchored root (NC-12)
+
+The anchored root is the chain fact that decides WHICH BYTES A USER IS SERVED, so NC-12's
+"agreement across several concurrently-queried untrusted sources" applies to it directly. This
+section states exactly how much corroboration the node performs, and — as precisely — how much it
+does not. A SPEC that implied more than the code performs would be worse than one that admits the
+gap.
+
+**The endpoints.** The node resolves the anchored root from the coinset-protocol endpoints named by
+`DIG_NODE_CHAIN_ENDPOINTS` (a comma-separated list). When that is unset, `DIG_NODE_COINSET` names a
+single endpoint; when neither is set the node uses `https://api.coinset.org`. An unparseable entry
+is DROPPED, never defaulted — a typo MUST NOT be able to masquerade as an additional source.
+
+**Independence is derived from REACH.** Two endpoints are ONE voice whenever their resolved address
+sets intersect, and the relation is transitive. Independence is NOT derived from an endpoint's type,
+its URL, or its host name: a CNAME costs an attacker nothing, and a "quorum" satisfied by two names
+for one machine is the defect this rule exists to prevent. An endpoint that resolves to no address
+contributes NO voice.
+
+**The agreement rule, with two or more independent voices.** Every voice that answered MUST give the
+SAME answer, and at least two MUST have answered; otherwise the resolution FAILS CLOSED and the pin
+rejects the serve (§14.4, `-32005 ROOT_NOT_ANCHORED`). Specifically:
+
+- One dissenting voice is a REFUSAL, never a repaired value. There is NO majority vote and no
+  tie-break — a majority rule would hand the answer to whoever can field the most endpoints.
+- Presence and absence are different answers: one source reporting a root while another reports no
+  confirmed generation is a DISAGREEMENT, so a single source cannot conjure a store into being.
+- A source that could not be REACHED is dropped rather than counted as dissent, because an outage
+  and an attack demand opposite remedies. Dropping is still fail-closed: fewer answers means the
+  agreement rule has less evidence, and fewer than two answers is a refusal.
+- The rule covers all three resolution calls — the tip state, the bounded pinned-root verification,
+  and lineage membership — because all three are consulted by the serve decision.
+
+**ACCEPTED LIMITATION — the DEFAULT INSTALL resolves the anchored root from ONE third party.** With
+fewer than two independent voices configured, the node answers from its single source, exactly as it
+did before this rule existed. It does not claim corroboration in that state, and it does not refuse:
+refusing would stop every unconfigured node serving any content at all, removing the surface on
+which an operator could configure a second endpoint.
+
+*Blast radius of that limitation:* a default install trusts `api.coinset.org` for the root every
+content read is pinned to. A source that lied about it would redirect reads on every such install,
+and the pin would fail closed against the WRONG root rather than the right one — indistinguishable,
+from outside, from the store having moved on. It does NOT let that source forge content: bytes are
+still accepted only because they verify against the merkle root (§21.2, §22.3). The remedy available
+to an operator today is to name two independently-hosted endpoints.
+
+**ALSO SINGLE-SOURCED, and NOT corroborated (stated, not fixed).** These paths go to one endpoint
+regardless of configuration: `coin_records_by_puzzle_hashes`, `coin_records_by_hints` and
+`coin_records_by_parent` (the wallet's chain-fallback tier), mempool submission, the melt
+confirmation, and the direct singleton walks the RPC surface performs. They are enumerated here so a
+reader does not infer from the rule above that every chain fact is corroborated. By contrast
+`peak_height`, `coin_record_by_id`, `coin_spend` and their cached variants ARE corroborated across
+the node's own dialled Chia peers (§18).
+
 ### 14.4a. Per-path generation resolution (#2088) — serve TIP-AUTHORITATIVE, redirect only on a genuine tip miss (#2211)
 
 A resource UNCHANGED since an earlier commit lives in an OLDER capsule whose own root ≠ the tip;

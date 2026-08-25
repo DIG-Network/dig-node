@@ -9,6 +9,8 @@ use digstore_chain::coinset::Coinset;
 use digstore_chain::singleton::{sync_datastore, sync_datastore_with_history, verify_pinned_root};
 use digstore_core::Bytes32;
 
+use super::corroborated_resolver::CorroboratedResolver;
+use super::endpoints::{ChainEndpoint, DnsReach};
 use crate::shared::chain_view::{AnchoredRootResolver, AnchoredStoreState};
 
 /// Coinset client used to resolve chain-anchored roots. `DIG_NODE_COINSET`
@@ -26,10 +28,66 @@ pub(crate) fn resolution_coinset() -> Coinset {
 /// and returns its metadata root — exactly the source `dig.getAnchoredRoot` and
 /// `dig-resolver` already use, and the same authority the CLI clone/pull pin
 /// resolves against (`current_root`). NEVER consults the serving node.
+///
+/// This speaks to the ONE endpoint [`resolution_coinset`] names. It is the voice, not the
+/// verdict: [`CorroboratedResolver`] holds several of these and serves an answer only when
+/// independent ones agree (dig-node#365).
 pub struct CoinsetResolver;
 
 #[async_trait::async_trait]
 impl AnchoredRootResolver for CoinsetResolver {
+    async fn anchored_root(&self, store_id: &[u8; 32]) -> Result<Option<Bytes32>, String> {
+        EndpointResolver::new(resolution_coinset())
+            .anchored_root(store_id)
+            .await
+    }
+
+    async fn anchored_state(
+        &self,
+        store_id: &[u8; 32],
+    ) -> Result<Option<AnchoredStoreState>, String> {
+        EndpointResolver::new(resolution_coinset())
+            .anchored_state(store_id)
+            .await
+    }
+
+    async fn verify_pinned_root(
+        &self,
+        store_id: &[u8; 32],
+        pinned_root: Bytes32,
+    ) -> Result<(), String> {
+        EndpointResolver::new(resolution_coinset())
+            .verify_pinned_root(store_id, pinned_root)
+            .await
+    }
+
+    async fn verify_lineage_root(&self, store_id: &[u8; 32], root: Bytes32) -> Result<(), String> {
+        EndpointResolver::new(resolution_coinset())
+            .verify_lineage_root(store_id, root)
+            .await
+    }
+}
+
+/// The same walk, against ONE named endpoint rather than the process-wide default.
+///
+/// Split out from [`CoinsetResolver`] so corroboration has something to hold: a rule that needs
+/// several voices needs a resolver that can be pointed at a specific one, and reading the endpoint
+/// from a process-global environment variable inside the walk makes every instance the same voice
+/// no matter how many are constructed.
+pub(crate) struct EndpointResolver {
+    /// The coinset-protocol client for this endpoint.
+    chain: Coinset,
+}
+
+impl EndpointResolver {
+    /// A resolver that walks `chain` and nothing else.
+    pub fn new(chain: Coinset) -> Self {
+        Self { chain }
+    }
+}
+
+#[async_trait::async_trait]
+impl AnchoredRootResolver for EndpointResolver {
     async fn anchored_root(&self, store_id: &[u8; 32]) -> Result<Option<Bytes32>, String> {
         Ok(self.anchored_state(store_id).await?.map(|s| s.root))
     }
@@ -39,7 +97,7 @@ impl AnchoredRootResolver for CoinsetResolver {
         store_id: &[u8; 32],
     ) -> Result<Option<AnchoredStoreState>, String> {
         let launcher = chia_protocol::Bytes32::new(*store_id);
-        match sync_datastore(&resolution_coinset(), launcher).await {
+        match sync_datastore(&self.chain, launcher).await {
             Ok(store) => {
                 // Convert chia_protocol::Bytes32 → digstore_core::Bytes32 (the
                 // node's content-root type), mirroring the CLI clone/pull pin.
@@ -79,7 +137,7 @@ impl AnchoredRootResolver for CoinsetResolver {
     ) -> Result<(), String> {
         let launcher = chia_protocol::Bytes32::new(*store_id);
         let pinned = chia_protocol::Bytes32::new(pinned_root.0);
-        verify_pinned_root(&resolution_coinset(), launcher, pinned)
+        verify_pinned_root(&self.chain, launcher, pinned)
             .await
             .map_err(|e| e.to_string())
     }
@@ -94,7 +152,7 @@ impl AnchoredRootResolver for CoinsetResolver {
     /// redirect the serve to `root`".
     async fn verify_lineage_root(&self, store_id: &[u8; 32], root: Bytes32) -> Result<(), String> {
         let launcher = chia_protocol::Bytes32::new(*store_id);
-        match sync_datastore_with_history(&resolution_coinset(), launcher).await {
+        match sync_datastore_with_history(&self.chain, launcher).await {
             Ok((_store, history)) => {
                 if history
                     .history
@@ -116,9 +174,54 @@ impl AnchoredRootResolver for CoinsetResolver {
     }
 }
 
-/// The default anchored-root resolver (production coinset walk).
+/// The coinset-protocol endpoint the mainnet default speaks to.
+///
+/// Named here rather than left implicit inside `Coinset::mainnet()` because the independence rule
+/// needs an authority to resolve, and a default endpoint with no URL cannot be compared against an
+/// operator's second one.
+const MAINNET_ENDPOINT: &str = "https://api.coinset.org";
+
+/// Every chain endpoint the node may ask, in configuration order.
+///
+/// `DIG_NODE_CHAIN_ENDPOINTS` is a comma-separated list and is what turns single-source resolution
+/// into corroborated resolution — an operator who names two independently-hosted coinset-protocol
+/// endpoints gets the agreement rule; one who names none gets today's behaviour.
+///
+/// `DIG_NODE_COINSET` keeps its existing meaning (a single override, used by tests and by
+/// operators pointing at one alternate endpoint) and is honoured when the list is unset, so no
+/// existing configuration changes meaning. Unparseable entries are DROPPED rather than defaulted:
+/// silently substituting the mainnet endpoint for a typo would let a misconfiguration masquerade
+/// as a second voice.
+pub(crate) fn resolution_endpoints() -> Vec<ChainEndpoint> {
+    let configured = match std::env::var("DIG_NODE_CHAIN_ENDPOINTS") {
+        Ok(list) if !list.trim().is_empty() => list,
+        _ => std::env::var("DIG_NODE_COINSET")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| MAINNET_ENDPOINT.to_string()),
+    };
+    configured
+        .split(',')
+        .filter_map(ChainEndpoint::parse)
+        .collect()
+}
+
+/// The default anchored-root resolver: the configured endpoints, believed only on agreement.
+///
+/// With one endpoint configured — the default install — this resolves exactly as
+/// [`CoinsetResolver`] always did, from a single third party. That limitation is REAL and is
+/// recorded in `SPEC.md` rather than dressed up: see [`CorroboratedResolver`] for why
+/// refusing instead was rejected, and dig-node#365 for the blast radius it leaves.
 pub(crate) fn default_anchored_resolver() -> Arc<dyn AnchoredRootResolver> {
-    Arc::new(CoinsetResolver)
+    Arc::new(CorroboratedResolver::new(
+        resolution_endpoints(),
+        Arc::new(DnsReach),
+        Arc::new(|endpoint: &ChainEndpoint| {
+            Arc::new(EndpointResolver::new(Coinset::with_url(
+                endpoint.url.clone(),
+            ))) as Arc<dyn AnchoredRootResolver>
+        }),
+    ))
 }
 
 #[cfg(test)]

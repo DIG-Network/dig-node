@@ -24,6 +24,8 @@
 //! existing pool rather than dialling a set of full nodes of its own.
 
 mod coinset_resolver;
+mod corroborated_resolver;
+mod endpoints;
 
 pub use coinset_resolver::CoinsetResolver;
 pub(crate) use coinset_resolver::{default_anchored_resolver, resolution_coinset};
