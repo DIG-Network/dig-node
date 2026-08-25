@@ -4872,7 +4872,10 @@ with one frame. Anchoring on a maximum is exactly what §18.6d's peer selection 
 peer claiming `u32::MAX` would otherwise become the reference point and put every honest peer outside
 the credibility band — and this figure is deliberately NOT the anchor for the §18.6a peak ceiling, which
 is anchored on a corroborated settled height precisely because that one cannot be inflated by the peer
-it bounds.
+it bounds. The settled height's own bound is narrower than "cannot be inflated", and MUST be read as
+what it is: it is the MINIMUM of the credible claims, so it cannot lead the true tip while any credible
+claim is honest, and a coordinated MAJORITY of the peers that claimed a peak owns the credibility band
+and can place it arbitrarily high. A single peer cannot, which is what this anchor asserts.
 
 It is used only where an inflated value costs a NEEDLESS RECONNECT and never a money claim. An
 over-stated peers' peak can make a healthy replica report `syncing` instead of `synced`, and can end an

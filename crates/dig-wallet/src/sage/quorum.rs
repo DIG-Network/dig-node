@@ -552,20 +552,6 @@ pub const fn band_kept_a_majority(claimants: usize, credible: usize) -> bool {
     credible * 2 > claimants
 }
 
-/// The settled height every question in this round is asked at: the sample's LOWEST claimed peak,
-/// less [`SETTLED_LAG`].
-///
-/// This is the SECOND half of telling behind from lying, and it is the load-bearing one. Asking
-/// "what is the tip?" guarantees honest disagreement, because the tip moves every ~18.75s and
-/// peers learn of it at different moments. Asking "what was true at height H?", where H is a
-/// height every sampled peer passed at least [`SETTLED_LAG`] blocks ago, guarantees honest
-/// AGREEMENT — the answer stopped changing before any of them was asked.
-///
-/// Once the question is normalised this way, a disagreement can no longer be explained by lag,
-/// which is what makes [`Verdict::Split`] meaningful rather than routine.
-///
-/// Returns `None` for an empty sample, or when the chain is younger than the margin (early
-/// testnet heights), because there is no settled height to ask about.
 /// The chain height this node may report as its own, settled from several peers' claims
 /// (dig_ecosystem#2790).
 ///
@@ -574,9 +560,38 @@ pub const fn band_kept_a_majority(claimants: usize, credible: usize) -> bool {
 /// It is **a height every credible peer in the sample has passed**, not the tip. The tip cannot be
 /// corroborated: it moves every ~18.75s and peers learn of it at different moments, so asking for
 /// it guarantees honest disagreement. Backing off by [`SETTLED_LAG`] asks a question whose answer
-/// stopped changing before anybody was asked, which is what makes agreement meaningful. The number
-/// is therefore conservative — it can lag the true tip by a few blocks, and it never leads it,
-/// which is the safe direction for every "is this coin buried yet" comparison built on top of it.
+/// stopped changing before anybody was asked, which is what makes agreement meaningful.
+///
+/// # The bound it actually carries
+///
+/// The number is exactly `min(credible claims) - SETTLED_LAG`. So: **while at least ONE claim
+/// inside the credibility band came from an honest peer, the result cannot lead the true tip** —
+/// the honest claim is at or below the tip, and a minimum cannot exceed its smallest member. That
+/// is the property, and it is weaker than "it never leads it", which was stated here
+/// unconditionally and is false.
+///
+/// It is false because the band is set by the claimants themselves. [`eligible`] keeps the claims
+/// within [`PEAK_LAG_TOLERANCE`] of their own MEDIAN, so claimants who form a majority of those
+/// who answered own the median, evict every honest claim as an outlier, and place the result where
+/// they like. Measured: two colluding claimants with the rest of the sample silent return
+/// `tip + 998`; two colluders against one honest claimant return `tip + 498`.
+///
+/// A peak that LEADS the tip inflates every confirmation count derived from it, so a caller treats
+/// an unburied coin as buried. That is the money-lie direction, and it is bounded by the honesty of
+/// the claimants, not by this function.
+///
+/// # The sample this runs on is NOT the 10-wide dial
+///
+/// [`band_kept_a_majority`] publishes a `P(X >= 6), X ~ Binom(10, f)` analysis with a crossover
+/// near `f ~ 0.42`. That analysis describes [`hold_best`] narrowing a [`QUORUM_DIAL_WIDE`]-wide
+/// dial to [`QUORUM_HOLD`]. **This function never calls `hold_best` and never sees a 10-wide
+/// dial.** It runs on whatever `DialedPeerSample::redraw` assembled, which is
+/// [`QUORUM_SAMPLE`]-wide, and applies [`eligible`] and [`band_kept_a_majority`] to that directly.
+///
+/// So the bar here is a strict majority of the peers that answered *within a 4-peer sample* — 3
+/// of 4, or 2 of 3, or 2 of 2 once silence thins the set, floored at [`CORROBORATION_FLOOR`].
+/// Silence lowers the denominator for free. Read the 6-of-10 table as describing `hold_best`, not
+/// this path.
 ///
 /// # Why it refuses instead of repairing
 ///
@@ -607,6 +622,24 @@ pub fn settled_peak(candidates: &[Candidate]) -> Option<u32> {
     common_height(&credible, SETTLED_LAG)
 }
 
+/// The settled height every question in this round is asked at: the sample's LOWEST claimed peak,
+/// less `lag`.
+///
+/// This is the SECOND half of telling behind from lying, and it is the load-bearing one. Asking
+/// "what is the tip?" guarantees honest disagreement, because the tip moves every ~18.75s and
+/// peers learn of it at different moments. Asking "what was true at height H?", where H is a
+/// height every sampled peer passed at least `lag` blocks ago, guarantees honest AGREEMENT — the
+/// answer stopped changing before any of them was asked.
+///
+/// Once the question is normalised this way, a disagreement can no longer be explained by lag,
+/// which is what makes [`Verdict::Split`] meaningful rather than routine.
+///
+/// Returns `None` for an empty sample, or when the chain is younger than the margin (early testnet
+/// heights), because there is no settled height to ask about.
+///
+/// It takes the MINIMUM, so its result is at or below every claim in `sample`. Everything the
+/// caller may conclude about leading the true tip rests on that, and therefore on whether any claim
+/// in `sample` is honest — see [`settled_peak`].
 pub fn common_height(sample: &[Candidate], lag: u32) -> Option<u32> {
     sample
         .iter()
@@ -948,6 +981,50 @@ mod settled_peak_tests {
             settled_peak(&sample),
             Some(9_000_000 - SETTLED_LAG),
             "four peers a block apart are ordinary lag, not disagreement, and must settle"
+        );
+    }
+
+    /// The bound `settled_peak`'s doc now claims, from the safe side: while an honest claim
+    /// survives the credibility band, the result cannot LEAD the true tip.
+    ///
+    /// One liar 1,000 blocks ahead is out-voted by two honest claimants, so it is evicted and the
+    /// minimum is honest. The liar's height is deliberately far outside `PEAK_LAG_TOLERANCE` — a
+    /// nearby lie is indistinguishable from ordinary lag and would pin nothing.
+    #[test]
+    fn an_outvoted_liar_cannot_push_the_settled_height_past_the_tip() {
+        let true_tip = 9_000_000;
+        let sample = [
+            claimant("honest-a", true_tip),
+            claimant("honest-b", true_tip),
+            claimant("liar", true_tip + 1_000),
+        ];
+        let settled = settled_peak(&sample).expect("two agreeing honest claims settle a height");
+        assert!(
+            settled <= true_tip,
+            "the settled height {settled} LEADS the true tip {true_tip}; every confirmation count              derived from it would treat an unburied coin as buried"
+        );
+    }
+
+    /// The same bound from the side that FAILS it, so the doc's qualification is pinned rather than
+    /// merely worded.
+    ///
+    /// Two colluding claimants who are a strict majority of those who answered own the median, so
+    /// `eligible` keeps them and evicts the honest claim as the outlier. The result then leads the
+    /// tip by whatever they chose. This is the measured `+498` case, and it is why the doc says
+    /// "while an honest claim survives the band" rather than "never".
+    #[test]
+    fn a_colluding_majority_of_claimants_can_make_the_settled_height_lead_the_tip() {
+        let true_tip = 9_000_000;
+        let lead = 500;
+        let sample = [
+            claimant("colluder-a", true_tip + lead),
+            claimant("colluder-b", true_tip + lead),
+            claimant("honest", true_tip),
+        ];
+        assert_eq!(
+            settled_peak(&sample),
+            Some(true_tip + lead - SETTLED_LAG),
+            "a colluding majority of the CLAIMANTS sets the median and places the settled height              where it likes; if this ever refuses instead, the bound got stronger and              `settled_peak`'s doc must be re-read rather than this test relaxed"
         );
     }
 
