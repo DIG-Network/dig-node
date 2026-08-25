@@ -77,6 +77,7 @@ pub mod routing;
 pub mod rpc;
 pub mod service;
 pub mod singleton;
+pub mod sources;
 pub mod spend;
 pub mod sync;
 pub mod sync_supervisor;

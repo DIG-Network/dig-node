@@ -34,7 +34,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chia_protocol::SpendBundle;
-use tokio::sync::Mutex;
 
 use super::fallback::{
     ChainFallback, ChainPeerTier, CoinsetFallback, FallbackCoin, FallbackCoinSpend,
@@ -76,9 +75,11 @@ pub trait SignedBundlePusher: Send + Sync {
 /// Also the wallet's [`ChainFallback`] tier, so a balance, a coin read and a push all speak to ONE
 /// client rather than three — and so the tier a read reports (`"fallback"`) stays truthful.
 pub struct ChainTransport {
-    /// `None` until the first use builds it. Behind a `Mutex` rather than a `OnceCell` because a
-    /// FAILED build must not be remembered as the answer forever (see the module docs).
-    client: Mutex<Option<Arc<chia_query::ChiaQuery>>>,
+    /// The node's chain sources — the sole owner of the peer fabric and the registry that names
+    /// it ([`super::sources`]). The transport reads THROUGH it rather than building its own, which
+    /// is what makes NC-12's "no path constructs its own peer fabric outside the registry" a
+    /// property of the code instead of a statement about a registry that did not exist.
+    sources: Arc<super::sources::NodeChainSources>,
     /// ARBITRARY coin reads, served by this node's own peers and believed only on agreement
     /// (dig_ecosystem#3032).
     ///
@@ -100,7 +101,16 @@ impl ChainTransport {
     /// A transport that has not yet dialed anything.
     pub fn new() -> Self {
         Self {
-            client: Mutex::new(None),
+            sources: Arc::new(super::sources::NodeChainSources::new()),
+            peer_reads: None,
+        }
+    }
+
+    /// A transport reading through `sources` — the node's one registry-owned fabric.
+    #[must_use]
+    pub fn with_sources(sources: Arc<super::sources::NodeChainSources>) -> Self {
+        Self {
+            sources,
             peer_reads: None,
         }
     }
@@ -124,16 +134,7 @@ impl ChainTransport {
     /// A failure to build is an `Err` and is NOT cached — the next call tries again, so a node that
     /// starts offline becomes useful the moment its network does.
     async fn client(&self) -> Result<Arc<chia_query::ChiaQuery>> {
-        let mut slot = self.client.lock().await;
-        if let Some(existing) = slot.as_ref() {
-            return Ok(existing.clone());
-        }
-        let built = chia_query::ChiaQuery::new(chia_query::ChiaQueryConfig::default())
-            .await
-            .map_err(|e| Error::internal(format!("no chain source could be reached: {e}")))?;
-        let built = Arc::new(built);
-        *slot = Some(built.clone());
-        Ok(built)
+        self.sources.client().await
     }
 
     /// The one shared client, for a consumer that needs the client ITSELF rather than a read.
@@ -156,7 +157,7 @@ impl ChainTransport {
     #[cfg(test)]
     pub(crate) fn with_client(client: Arc<chia_query::ChiaQuery>) -> Self {
         Self {
-            client: Mutex::new(Some(client)),
+            sources: Arc::new(super::sources::NodeChainSources::with_client(client)),
             peer_reads: None,
         }
     }
@@ -198,8 +199,7 @@ impl ChainTransport {
     /// Unbuildable is [`ChainPeerTier::UNOBSERVABLE`], never a zero count: a node that could not
     /// look has not looked and found none.
     pub async fn peer_tier(&self) -> ChainPeerTier {
-        let existing = self.client.lock().await.clone();
-        let Some(client) = existing else {
+        let Some(client) = self.sources.existing_client().await else {
             return ChainPeerTier::UNOBSERVABLE;
         };
         ChainPeerTier {
@@ -244,10 +244,7 @@ impl ChainTransport {
         if client.peer_count().await > 0 {
             return true;
         }
-        let mut slot = self.client.lock().await;
-        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &client)) {
-            *slot = None;
-        }
+        self.sources.discard_if_current(&client).await;
         false
     }
 
@@ -469,7 +466,7 @@ mod tests {
 
         assert_eq!(transport.peer_tier().await, ChainPeerTier::UNOBSERVABLE);
         assert!(
-            transport.client.lock().await.is_none(),
+            transport.sources.existing_client().await.is_none(),
             "asking for the peer tier must not be what makes the node hold peers"
         );
     }
@@ -527,7 +524,7 @@ mod tests {
         assert_eq!(answer.amount, 1234);
         assert_eq!(answer.spent_height, Some(9_000_050));
         assert!(
-            transport.client.lock().await.is_none(),
+            transport.sources.existing_client().await.is_none(),
             "an arbitrary coin read must no longer route through the third-party oracle"
         );
     }
@@ -539,6 +536,6 @@ mod tests {
     #[tokio::test]
     async fn a_new_transport_holds_no_client_until_it_is_used() {
         let transport = ChainTransport::new();
-        assert!(transport.client.lock().await.is_none());
+        assert!(transport.sources.existing_client().await.is_none());
     }
 }
