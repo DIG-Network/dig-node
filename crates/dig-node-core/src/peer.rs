@@ -3881,10 +3881,11 @@ pub(crate) mod tests {
         let wildcard_row = row(&hex::encode([0xAB; 32]));
         assert!(
             wildcard_row.get("address").is_none(),
-            "a wildcard pool address is not a destination and must be omitted, not rendered:              {wildcard_row}"
+            "a wildcard pool address is not a destination and must be omitted, not rendered: {wildcard_row}"
         );
         assert_eq!(
-            wildcard_row["peer_id"], hex::encode([0xAB; 32]),
+            wildcard_row["peer_id"],
+            hex::encode([0xAB; 32]),
             "the peer itself is still enumerated — omitting the address must not drop the peer"
         );
 
