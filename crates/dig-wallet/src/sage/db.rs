@@ -3392,9 +3392,19 @@ pub const CLIENT_RESERVATION_DEFAULT_TTL_MS: i64 = 300_000;
 pub struct ClientReservation {
     /// The OPAQUE handle. 256 bits of OS randomness, hex-encoded.
     ///
-    /// Opaque and unguessable on purpose: `release` identifies a hold by this value alone, so a
-    /// derivable handle would let any local caller free a reservation it does not own — the
-    /// double-select this table prevents, reached through the front door instead.
+    /// Unpredictable so it cannot be DERIVED — but it is **not a capability, and it is not the
+    /// access control** on release. `control.wallet.reservations.held` publishes every live handle
+    /// to any caller holding the control token, so anyone who can call `release` can already read
+    /// the handle to pass it.
+    ///
+    /// The access control is the CONTROL TOKEN, and that is the whole of it. What randomness buys
+    /// is narrower and worth stating exactly: a handle nobody can GUESS means a caller cannot free
+    /// a hold it never observed, and two holds can never collide.
+    ///
+    /// Publishing them is deliberate rather than an oversight — `held` is the operator's recovery
+    /// lever, the thing that turns a stuck lease into `dign wallet release <id>` instead of a wait.
+    /// Withholding the field to make this doc true would trade a documentation error for a real
+    /// lockout.
     pub reservation_id: String,
     /// The coins held, lower-cased. Exactly what was asked for, because acquisition is all-or-none.
     pub coin_ids: Vec<String>,
@@ -3720,9 +3730,16 @@ impl WalletDb {
 
 /// 256 bits of OS randomness, hex-encoded — a reservation handle a caller cannot derive.
 ///
-/// The OS CSPRNG directly rather than a seeded userspace generator: unguessability IS the access
-/// control on [`WalletDb::release_client_reservation`], so the source must be one a local attacker
-/// cannot predict or steer.
+/// The OS CSPRNG directly rather than a seeded userspace generator, for two properties that are
+/// NOT access control: collision resistance across concurrent holds, and unpredictability, so a
+/// caller cannot free a hold it never observed.
+///
+/// **Guarding [`WalletDb::release_client_reservation`] is the control token's job, not this
+/// value's.** Every live handle is published by `control.wallet.reservations.held`, so any caller
+/// authorized to release can already read the handle it would pass. An earlier version of this
+/// comment claimed unguessability WAS the access control; it was false the moment `held` shipped,
+/// and it is recorded here because a doc that oversells a control is worse than no doc — it retires
+/// the suspicion of the next person to read it.
 fn new_reservation_id() -> sqlx::Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|e| {
@@ -5972,7 +5989,7 @@ mod tests {
     // ---- the handle -------------------------------------------------------
 
     #[tokio::test]
-    async fn reservation_handles_are_unguessable_and_distinct() {
+    async fn reservation_handles_are_distinct_and_unpredictable() {
         // A handle a caller can derive lets it release a reservation it does not own, which is the
         // double-select reached through the front door.
         let db = two_coin_wallet().await;

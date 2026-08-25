@@ -61,6 +61,7 @@ use std::sync::Arc;
 
 use dig_node_control_interface::params::{
     WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
+    WalletReservationsReserveParams,
 };
 use dig_node_control_interface::ControlMethod;
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
@@ -2500,7 +2501,7 @@ fn wallet_watched(ctx: &ControlCtx, id: Value) -> Value {
 // interface — narrow against the same set, so two processes sharing one wallet cannot select the
 // same coin.
 //
-// Authority is settled and normative (SPEC §18.25.1): where a node is reachable, THIS node's set
+// Authority is settled and normative (SPEC §18.26.1): where a node is reachable, THIS node's set
 // is authoritative and a client defers to it. A client-local set is the no-node fallback only.
 //
 // §908 binds all three: reservation is BOOKKEEPING. A coin id is a public chain fact; nothing here
@@ -2540,6 +2541,39 @@ async fn wallet_reservations_held(ctx: &ControlCtx, id: Value) -> Value {
     }
 }
 
+/// The most coins `control.wallet.reservations.reserve` will hold in ONE call.
+///
+/// The array is bounded BEFORE anything else touches it, and this is a resource bound rather
+/// than a shape rule (dig_ecosystem#3127 security gate, finding 1).
+///
+/// `reserve` does O(N) SQLite work while holding the write lock, and the ingress limiter at
+/// `server.rs:1106` covers `is_open_control_read` methods ONLY — these are token-gated, so it
+/// does not cover them. Unbounded, one large call stalls concurrent legitimate reserves past
+/// `busy_timeout`, and a stalled reserve surfaces as WALLET_RESERVATIONS_UNAVAILABLE: "do not
+/// spend" when the truth is "wait". That is the disposition inversion the write-before-read
+/// ordering removes elsewhere, reached here by resource pressure instead of a wrong match arm.
+///
+/// The number is taken from the protocol's own ceilings rather than picked. A control frame is
+/// capped at 1 MiB (dig-ipc-protocol `MAX_FRAME_BYTES`), and a coin id costs ~67 bytes as JSON,
+/// so a frame can carry ~15,600 ids — bounded, but 15x more work under the lock than anything
+/// legitimate. Chia's block cost limit bounds a REAL bundle to a few hundred inputs, so 1,000
+/// sits above every honest request and an order of magnitude below the abusive ceiling. It
+/// matches the contract's own `COINS_BY_PARENT_MAX_LIMIT` in both value and spirit.
+const MAX_RESERVE_COIN_IDS: usize = 1_000;
+
+/// Why a reservation batch of `len` ids is refused, or `None` when it is within bounds.
+///
+/// Split out from the handler so the boundary can be pinned from BOTH sides -- at the bound and
+/// one over -- without standing up a whole `ControlCtx`. A bound tested only from above can only
+/// confirm itself; it cannot notice an off-by-one that refuses a legitimate request.
+fn reserve_batch_refusal(len: usize) -> Option<String> {
+    (len > MAX_RESERVE_COIN_IDS).then(|| {
+        format!(
+            "params.coin_ids holds {len} ids, above the {MAX_RESERVE_COIN_IDS} this node will              reserve in one call. Split the request; a bundle that legitimately needs more inputs              than this could not fit in a block anyway"
+        )
+    })
+}
+
 /// `control.wallet.reservations.reserve` — atomically hold coins, all of them or none.
 ///
 /// A clash is `WALLET_COINS_RESERVED`, deliberately distinct from any shortfall: the user HAS the
@@ -2568,33 +2602,36 @@ async fn wallet_reservations_reserve(ctx: &ControlCtx, id: Value, params: &Value
             format!("{METHOD}: params.coin_ids must be an array of coin-id strings"),
         );
     };
-    let mut coin_ids = Vec::with_capacity(items.len());
-    for item in items {
-        let Some(s) = item.as_str() else {
-            return control_error(
-                id,
-                ErrorCode::InvalidParams,
-                format!("{METHOD}: every params.coin_ids entry must be a string"),
-            );
-        };
-        coin_ids.push(s.to_string());
+    // Length is checked on the raw array, before per-id validation, so a huge malformed batch is
+    // refused without paying to validate it.
+    if let Some(why) = reserve_batch_refusal(items.len()) {
+        return control_error(id, ErrorCode::InvalidParams, format!("{METHOD}: {why}"));
     }
 
-    let ttl_secs = match params.get("ttl_secs") {
-        None | Some(Value::Null) => None,
-        Some(v) => match v.as_u64() {
-            Some(n) => Some(n),
-            None => {
-                return control_error(
-                    id,
-                    ErrorCode::InvalidParams,
-                    format!("{METHOD}: params.ttl_secs must be a non-negative integer"),
-                );
+    // Shape comes from the CONTRACT's own validator, never a local re-derivation: it normalizes a
+    // `0x` prefix away, holds every id to lowercase 64-hex, and refuses the WHOLE request when any
+    // one is malformed rather than the well-formed subset. Re-deriving that rule here would be a
+    // rival implementation of a published contract, and the two would drift.
+    //
+    // Validating is not merely tidiness. An unvalidated id is a string this node stores as a
+    // PRIMARY KEY and then compares against real coin ids; a malformed one can never match a coin,
+    // so it would occupy the table until its TTL while protecting nothing.
+    let reserve_params =
+        match serde_json::from_value::<WalletReservationsReserveParams>(params.clone())
+            .map_err(|e| e.to_string())
+            .and_then(|p| p.validated().map_err(|e| e.message))
+        {
+            Ok(p) => p,
+            Err(message) => {
+                return control_error(id, ErrorCode::InvalidParams, format!("{METHOD}: {message}"));
             }
-        },
-    };
+        };
 
-    match ctx.wallet.reserve_coins(&coin_ids, ttl_secs).await {
+    match ctx
+        .wallet
+        .reserve_coins(&reserve_params.coin_ids, reserve_params.ttl_secs)
+        .await
+    {
         Ok(r) => control_ok(
             id,
             json!({
@@ -3170,6 +3207,65 @@ mod tests {
             !is_open_control_read("control.wallet.arrivals"),
             "the arrival cursor names this node's own watched puzzle hashes to a caller that              supplied nothing, so it must stay behind the control token"
         );
+    }
+
+    /// **The reservation batch bound, pinned from BOTH sides (dig_ecosystem#3127, finding 1).**
+    ///
+    /// At the bound MUST pass and one over MUST fail. A bound asserted only from above can only
+    /// confirm itself: it would pass identically for a cap of 1, which refuses every real spend.
+    ///
+    /// Scope, stated because it limits what this proves: it exercises the predicate, not the call
+    /// site. The handler's use of it is three lines from its definition and is the only caller.
+    #[test]
+    fn the_reservation_batch_bound_admits_the_limit_and_refuses_one_over() {
+        assert!(
+            reserve_batch_refusal(MAX_RESERVE_COIN_IDS).is_none(),
+            "a batch exactly at the bound is legitimate and must be admitted"
+        );
+        assert!(
+            reserve_batch_refusal(MAX_RESERVE_COIN_IDS - 1).is_none(),
+            "an ordinary batch under the bound must be admitted"
+        );
+        assert!(
+            reserve_batch_refusal(0).is_none(),
+            "an empty batch is a legitimate no-op, not an oversized one"
+        );
+
+        // The VALUE is pinned literally, not merely used symbolically. Every other assertion here
+        // is written relative to the constant, so all of them pass for ANY value it holds --
+        // including one so large the bound never fires. Measured: raising it to 1_000_000_000 was
+        // caught by nothing until this line existed.
+        assert_eq!(
+            MAX_RESERVE_COIN_IDS, 1_000,
+            "changing the bound is a deliberate act; justify it against the ceilings below"
+        );
+        // And it stays meaningfully BELOW what a single control frame could carry, which is the
+        // ceiling the bound exists to sit under. 1 MiB frame / ~67 bytes per id ~= 15,600.
+        assert!(
+            MAX_RESERVE_COIN_IDS * 15 < (1024 * 1024) / 67,
+            "the bound has drifted up toward the frame ceiling it was chosen to sit well under"
+        );
+
+        let over = reserve_batch_refusal(MAX_RESERVE_COIN_IDS + 1)
+            .expect("one id over the bound must be refused");
+        assert!(
+            over.contains(&(MAX_RESERVE_COIN_IDS + 1).to_string()),
+            "the refusal must say how many were asked for, or a caller cannot size its retry: {over}"
+        );
+        assert!(
+            over.contains(&MAX_RESERVE_COIN_IDS.to_string()),
+            "the refusal must name the bound itself: {over}"
+        );
+    }
+
+    /// The bound is a REFUSAL, never a silent truncation.
+    ///
+    /// Worth its own test because truncating is the tempting fix and it is the dangerous one: a
+    /// caller handed a success for a batch the node only partly reserved believes it holds inputs
+    /// it does not, which is the exact state all-or-none acquisition exists to make unreachable.
+    #[test]
+    fn an_oversized_batch_is_refused_rather_than_trimmed() {
+        assert!(reserve_batch_refusal(MAX_RESERVE_COIN_IDS * 16).is_some());
     }
 
     /// **The watch methods stay GATED (§18.6f, #2823).**
