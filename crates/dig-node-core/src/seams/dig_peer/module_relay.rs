@@ -31,6 +31,12 @@
 //!   the recipient key (NC-1 / §5.4). Widening this path's payload is an NC-1 review, not an
 //!   extension.
 //!
+//!   That exclusion is FALSIFIABLE rather than merely stated: `a_relay_ignores_recipient_specific_params_entirely`
+//!   (`crate::tests`) rides two DIFFERENT retrieval keys through a fully-open hop and requires both to
+//!   select nothing — same capsule described, byte-identical window served, one artifact keyed by
+//!   `(store, root)`. Verified load-bearing: threading `params["retrieval_key"]` into this function
+//!   leaves all 988 other tests in the crate green and fails only that one.
+//!
 //! # The three gates, each independently sufficient to refuse
 //!
 //! 1. **The requestor asked.** `params.proxy == true`. Automatic relaying is off; a requestor that
