@@ -30,7 +30,7 @@ name = "dig-node-core"
 # dig-node#276/#296). Changing a public return type is BREAKING for an out-of-workspace implementor;
 # this crate is consumed in-workspace only and is pre-1.0, so it is a MINOR bump under SemVer's 0.x
 # rule -- recorded here rather than letting the number imply the locator surface held still.
-version = "0.57.1"
+version = "0.57.2"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -82,6 +82,33 @@ lru = "0.12"
 # store_id`) via a bounded backward `parent_coin_info` walk, making the read-root anti-rollback
 # check (#747/#841/#852-node) SOUND. The public signature is unchanged (a pure rev bump). Bump
 # all seven together.
+# NC-7 exception: dig_ecosystem#901 (the crates.io repoint) leaves the seven `digstore-*` deps below
+# git-pinned ON PURPOSE. Three independent facts each block the repoint on their own, and all three are
+# upstream of this workspace:
+#
+#  1. THE SET IS ATOMIC, so `digstore-core` cannot move alone even though it IS published (0.28.0).
+#     Inside the digstore workspace every sibling declares `digstore-core = { path = "../digstore-core" }`,
+#     so a git-sourced `digstore-host` always carries the git `digstore-core`. Repointing only the
+#     published members would put TWO `digstore-core` in the graph — a crates.io one for this crate's
+#     direct imports and a git one inside its siblings — and `ContentResponse`/`Bytes32` would stop
+#     unifying across the serve seam. They move together or not at all.
+#
+#  2. MOST OF THE SET IS UNPUBLISHED, and the closure is wider than it looks. Absent from crates.io:
+#     `digstore-host`, `digstore-remote`, `digstore-stage`, `digstore-crypto`, `digstore-compiler` —
+#     plus `digstore-prover`, `digstore-store`, `digstore-chunker` and `digstore-cli`, which the five
+#     pull in transitively and which no checklist had named. Each declares its siblings as a BARE
+#     `path = "../x"` with no `version` key, which `cargo publish` refuses outright, so publishing them
+#     is real work in DIG-Network/digs rather than a release button.
+#
+#  3. THE PUBLISHED MEMBERS ARE ON THE OTHER CHIA LINE. `digstore-chain 0.28.0` declares chia-protocol
+#     / chia-bls / chia-consensus / chia-puzzle-types / chia-secp / chia-sha2 at 0.36.1 and
+#     chia-wallet-sdk 0.34, while this workspace is held at 0.26 / 0.30 by dig-gossip -> dig-peer-protocol
+#     0.6 (see the dig-gossip note below). Adopting them today would split the store-melt authorization
+#     path across two chia-protocol versions — the exact byte-drift the migration exists to remove.
+#
+# So this row is downstream of the chia-0.36 cascade (dig_ecosystem#2761) AND of publishing the digstore
+# workspace. Do NOT repoint these piecemeal, and never let the pin regress to a floating git BRANCH: the
+# single `rev` is what makes the whole store-format surface reproducible.
 digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
@@ -102,8 +129,31 @@ dig-ip = "0.1.2"
 # domain builders + frame bounds). SSOT shared with dig-app so the two halves can never drift (#1080).
 dig-ipc-protocol = "0.2"
 # On-chain DID resolution (WU3, #778): the honest chain-authenticated read path the production
-# DidSigningKeyResolver delegates to. Not on crates.io — consumed via git tag (same pattern as dig-app).
-dig-identity = { git = "https://github.com/DIG-Network/dig-identity", tag = "v0.4.0" }
+# DidSigningKeyResolver delegates to.
+#
+# NOW A CRATES.IO DEP (dig_ecosystem#901). It was git-pinned at `tag = "v0.4.0"` because the crate was
+# unpublished; it is published now, so the git source is retired and NC-7 is satisfied for this dep.
+#
+# 0.4.2 IS THE CORRECT TARGET, AND IT IS NOT THE LATEST (0.7.1). Two separate constraints pick it, and
+# both are "one line per family" (CLAUDE.md §2.4b), not staleness:
+#
+#  1. CHIA LINE. This crate re-exports `Bytes32` and `Coin` FROM dig_identity (`seams/dig_peer/
+#     session.rs`), so dig-identity's chia-protocol MUST be this workspace's line. Published lines:
+#       0.4.1 / 0.4.2 / 0.5.0  ->  chia-protocol 0.26, chia-sdk-utils 0.30   <- this workspace
+#       0.6.0 / 0.7.0 / 0.7.1  ->  chia-protocol 0.36.1, chia-sdk-utils 0.34+
+#     Taking 0.7.1 links a SECOND chia-protocol and stops every `Bytes32` crossing the resolver seam
+#     from unifying — the same split the dig-gossip and dig-constants notes below describe. The 0.6+
+#     uplift is downstream of the chia-0.36 cascade (dig_ecosystem#2761), not an edit here.
+#
+#  2. DEDUPLICATION. `dig-message 0.5.1` and `dig-nat 0.18.0` already resolve dig-identity 0.4.2 from
+#     crates.io, and a 0.x minor is a semver-INCOMPATIBLE boundary. So `"0.5.0"` would leave TWO
+#     dig-identity copies in the graph, while `"0.4.2"` collapses to ONE. The tree carries two copies
+#     today (git 0.4.0 beside registry 0.4.2); this bump removes that duplicate rather than renaming it,
+#     which for an identity/key crate is the whole point.
+#
+# v0.4.0 -> 0.4.2 is patch-level and purely additive; 0.5.0's only new export, `derive_identity_sk_at`,
+# has zero call sites in this workspace, so nothing is given up by preferring the deduplicating pin.
+dig-identity = "0.4.2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
 # Object-safe async trait for the injectable anchored-root resolver (the
 # mandatory read-path chain pin, #127): production walks coinset, tests inject a
@@ -238,6 +288,13 @@ dig-nat = "0.18"
 # `Bytes32` arriving from dig_gossip on 0.26 while `digstore-chain`/`chia-protocol` hand this crate
 # 0.36.1, splitting the store-melt authorization path in `seams/dig_peer/store_melted.rs` across two
 # chia-protocol versions: the exact byte-drift the migration exists to remove.
+# NC-7 exception: dig-gossip is git-pinned PERMANENTLY, not pending a publish — dig_ecosystem#2647.
+# It cannot be published while its `native-tls` [patch.crates-io] fork stands, because `cargo publish`
+# STRIPS [patch.crates-io] from the published metadata. A published dig-gossip would therefore build
+# against UPSTREAM native-tls, compile cleanly, and silently accept inbound peers presenting no client
+# certificate at all — a mutual-TLS bypass that no consumer could see from its own manifest. Its
+# publish.yml guard is unconditional and deliberate: do not weaken it, do not `--allow-dirty` past it.
+# dig_ecosystem#900 ("publish dig-gossip") was closed as superseded by #2647.
 dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "51054a4132ee51b7cee2cba1768b75ade5360f9c", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope.
 #
@@ -445,6 +502,7 @@ dig-keystore = { version = "0.10", features = ["testing"] }
 # TLS — the only way to assert what a broadcast ACTUALLY put on the wire from a test. Declared here
 # rather than on the normal dependency so the shipped binary never carries the test hook: cargo
 # unifies the feature into test builds only, since dev-dependencies are not built for `cargo build`.
+# NC-7 exception: same permanent git pin as the runtime dep above (dig_ecosystem#2647).
 dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "51054a4132ee51b7cee2cba1768b75ade5360f9c", default-features = false, features = ["rustls", "relay", "test-util"] }
 # Generates the P-256 leaf key pairs the opcode-222 holdings tests sign with: `public_key_der()` IS the
 # leaf `SubjectPublicKeyInfo` DER the wire carries as `provider_spki`, and whose SHA-256 is the

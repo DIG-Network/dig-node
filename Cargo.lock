@@ -2590,8 +2590,9 @@ dependencies = [
 
 [[package]]
 name = "dig-cert"
-version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-cert?tag=v0.1.0#408d604ad2fd398c635b9e5759eadeaf9ad4eb11"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f59d114a13fd504e960f5281eb6a75485e3f2ffb1279c819cb90e14db2c82419"
 dependencies = [
  "arc-swap",
  "rcgen",
@@ -2791,20 +2792,6 @@ dependencies = [
 
 [[package]]
 name = "dig-identity"
-version = "0.4.0"
-source = "git+https://github.com/DIG-Network/dig-identity?tag=v0.4.0#d2eb1f54a14459d380efcb0400920631ccb8acf6"
-dependencies = [
- "blst",
- "chia-bls 0.26.0",
- "chia-protocol 0.26.0",
- "chia-sdk-utils 0.30.0",
- "sha2 0.10.9",
- "sparse-merkle-tree",
- "thiserror 2.0.19",
-]
-
-[[package]]
-name = "dig-identity"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b61a73d7c4ecedfb3364e0f265946ef696dcec84ab58472873b097426691b19"
@@ -2911,7 +2898,7 @@ dependencies = [
  "chia-sha2 0.26.0",
  "chia-traits 0.26.0",
  "chia_streamable_macro 0.26.0",
- "dig-identity 0.4.2",
+ "dig-identity",
  "getrandom 0.2.17",
  "hkdf",
  "sha2 0.10.9",
@@ -2929,7 +2916,7 @@ dependencies = [
  "async-trait",
  "base64",
  "dig-constants 0.5.1",
- "dig-identity 0.4.2",
+ "dig-identity",
  "dig-ip",
  "dig-tls",
  "futures",
@@ -2963,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.57.1"
+version = "0.57.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2978,7 +2965,7 @@ dependencies = [
  "dig-dht",
  "dig-download",
  "dig-gossip",
- "dig-identity 0.4.0",
+ "dig-identity",
  "dig-ip",
  "dig-ipc-protocol",
  "dig-keystore",
@@ -3025,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.151.1"
+version = "0.151.3"
 dependencies = [
  "async-trait",
  "axum",
