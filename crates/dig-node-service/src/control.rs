@@ -2561,6 +2561,18 @@ async fn wallet_reservations_held(ctx: &ControlCtx, id: Value) -> Value {
 /// matches the contract's own `COINS_BY_PARENT_MAX_LIMIT` in both value and spirit.
 const MAX_RESERVE_COIN_IDS: usize = 1_000;
 
+/// The bound must stay well BELOW what one control frame could carry, which is the ceiling it was
+/// chosen to sit under: a 1 MiB frame (dig-ipc-protocol `MAX_FRAME_BYTES`) at ~67 JSON bytes per
+/// coin id is ~15,600 ids.
+///
+/// A compile-time assertion rather than a test: it is a relationship between two constants, so
+/// there is no run to observe it in, and a raised bound should fail the BUILD rather than a suite
+/// somebody might not run.
+const _: () = assert!(
+    MAX_RESERVE_COIN_IDS * 15 < (1024 * 1024) / 67,
+    "MAX_RESERVE_COIN_IDS has drifted up toward the control-frame ceiling it sits under"
+);
+
 /// Why a reservation batch of `len` ids is refused, or `None` when it is within bounds.
 ///
 /// Split out from the handler so the boundary can be pinned from BOTH sides -- at the bound and
@@ -3238,12 +3250,6 @@ mod tests {
         assert_eq!(
             MAX_RESERVE_COIN_IDS, 1_000,
             "changing the bound is a deliberate act; justify it against the ceilings below"
-        );
-        // And it stays meaningfully BELOW what a single control frame could carry, which is the
-        // ceiling the bound exists to sit under. 1 MiB frame / ~67 bytes per id ~= 15,600.
-        assert!(
-            MAX_RESERVE_COIN_IDS * 15 < (1024 * 1024) / 67,
-            "the bound has drifted up toward the frame ceiling it was chosen to sit well under"
         );
 
         let over = reserve_batch_refusal(MAX_RESERVE_COIN_IDS + 1)
