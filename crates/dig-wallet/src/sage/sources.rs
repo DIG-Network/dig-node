@@ -23,8 +23,10 @@
 //! * **The enforcement is `sole_owner_tests`.** It fails when a second `ChiaQuery::new` appears in
 //!   production code anywhere in this crate that its classifier can SEE — a CI gate over the
 //!   source, and what makes the clause a property rather than an absence. It is a heuristic, not a
-//!   parse: `sweep` names every shape it mis-reads and the direction each one fails in, and it
-//!   refuses outright on a file it could not finish classifying.
+//!   parse: `sweep` names the mis-read shapes KNOWN TODAY, with the direction each one fails in,
+//!   and it refuses outright on a file it could not finish classifying. That list is open, not
+//!   exhaustive — four rounds of review found four shapes, each invisible to the fixture written
+//!   for the one before it, so assume a fifth exists rather than reading the list as a proof.
 //! * **The registry gives the sweep its target**, by being the thing the one permitted construction
 //!   registers into. Registering does not make the registry a control.
 //! * **Nothing in production reads the registry.** [`NodeChainSources::registry`] has no production
@@ -489,31 +491,48 @@ mod sole_owner_tests {
     ///
     /// # What it is, and how it fails
     ///
-    /// This is a HEURISTIC, not a parse, and it is written so that every imprecision fails LOUDLY:
+    /// This is a HEURISTIC, not a parse. It is written so its imprecisions fail LOUDLY wherever
+    /// that is achievable without parsing; the two where it is not are named below, and the list of
+    /// both kinds is open. These are the ones known today:
     ///
     /// * An indented `#[cfg(test)]` does not latch, so a constructor inside a small gated helper is
     ///   reported as production and fails here. Noisy; answered by moving the helper into a
     ///   column-0 test module.
     /// * A `}` or a `;` at column 0 INSIDE a multi-line string literal clears the latch early, so
     ///   the rest of a test module is read as production. Also noisy, also loud.
-    /// * A `#[cfg(test)]` item written entirely on one line is classified correctly, but a
-    ///   `CONSTRUCTOR` on that same line is reported as PRODUCTION, because the clearing line is
-    ///   judged like any other. So `#[cfg(test)] fn f() { ChiaQuery::new(c); }` fails here. Loud,
-    ///   and answered by moving it into a column-0 test module — the same trade as the indented
-    ///   attribute above.
+    /// * When the attribute is on its OWN line and the item follows on one line, that item line is
+    ///   the clearing line and is judged like any other — so a `CONSTRUCTOR` on it is reported as
+    ///   PRODUCTION and fails here. Measured on this fixture:
+    ///   `["#[cfg(test)]", "fn f() { ChiaQuery::new(c); }", "fn later() { ChiaQuery::new(c); }"]`
+    ///   yields `sites=[2, 3]`. Loud, and answered by moving it into a column-0 test module — the
+    ///   same trade as the indented attribute above. Note the ATTRIBUTE-INLINE form behaves
+    ///   differently and correctly: `#[cfg(test)] fn f() { ChiaQuery::new(c); }` latches on its own
+    ///   line, and a latching line is never passed to [`ends_a_column_0_item`], so that
+    ///   construction is dropped as the test code it is (`sites=[2]` for the same fixture, the
+    ///   remaining site being the production line below).
     /// * A column-0 `#[cfg(test)]` item that never appears to close is not silent either:
     ///   [`Swept::ended_inside_a_test_item`] reports it and the assertion REFUSES. When this
     ///   classifier cannot tell, it says so instead of returning nothing.
     ///
-    /// # The one shape that IS silent
+    /// # The shapes that are SILENT — two known today, and the list is open
     ///
-    /// A `#[cfg(test)]` appearing at column 0 as STRING CONTENT — inside a multi-line or raw
-    /// literal — latches the sweep on text that is not code. Production lines after it are then
-    /// read as test code and dropped, and since the next column-0 line usually does end an item,
-    /// the fail-closed flag does not fire either. It is silent, which is the direction that
-    /// matters, and it is left unhandled deliberately: detecting it needs literal tracking, which
-    /// is the brace-counting mistake in another costume. No occurrence exists in this crate; one
-    /// would need a source file that quotes Rust attributes at column 0.
+    /// Both drop a production `CONSTRUCTOR` and leave [`Swept::ended_inside_a_test_item`] `false`,
+    /// so nothing reports them. Both are left unhandled DELIBERATELY: each would need literal or
+    /// comment tracking, which is the brace-counting mistake in another costume, and a fifth round
+    /// of heuristic would buy less than an honest bound does. Neither occurs in this crate today.
+    ///
+    /// * **A `#[cfg(test)]` at column 0 as STRING CONTENT** — inside a raw or multi-line literal —
+    ///   latches the sweep on text that is not code. It needs a source file that quotes Rust
+    ///   attributes at column 0.
+    /// * **A terminator carrying trailing content** — `}  // done`. [`ends_a_column_0_item`] judges
+    ///   the raw line, so the comment stops it ending anything. Measured: the same fixture with a
+    ///   bare `}` gives `sites=[5]`, and with `}  // done` gives `sites=[]`. `rustfmt` preserves
+    ///   the trailing comment byte-for-byte, so formatting does not suppress it.
+    ///
+    /// **What bounds the damage**, in both cases: the mis-latch lasts only until the next column-0
+    /// line ending in `}` or `;`, which in ordinary Rust is the end of the next item. So each drops
+    /// the constructors inside THAT WINDOW, not everything to EOF — unlike the brace-counting
+    /// classifier this replaced, which went blind to EOF in five files at once.
     ///
     /// Taking `&str` rather than walking files is deliberate: it is what lets the fixture tests pin
     /// the classification against shapes chosen to break it, instead of against whatever this
@@ -681,6 +700,11 @@ mod sole_owner_tests {
              production; and a constructor written ON a one-line test item (line 6) is reported \
              rather than dropped, because that is the loud direction"
         );
+        // This assertion DOCUMENTS rather than catches, and the distinction is worth stating so a
+        // later reader does not trust it as a live guard: `ended_inside_a_test_item` is false both
+        // before and after the one-line-item fix, because the shape's whole point is that the flag
+        // stays quiet while the sweep goes blind. The site assertion above is what fails on a
+        // revert. This one records the half of the defect the flag could not see.
         assert!(
             !swept.ended_inside_a_test_item,
             "the latch must not still be set at EOF here — a stuck latch that also reports itself \
