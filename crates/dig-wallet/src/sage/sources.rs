@@ -11,22 +11,44 @@
 //!
 //! [`NodeChainSources`] makes it a real property. It owns the lazily-built
 //! [`chia_query::ChiaQuery`] fabric, it is the only production caller of `ChiaQuery::new`, and it
-//! registers what it built. A path that wants chain data asks it; a path that builds its own is a
-//! second, unnamed trust domain, and `sole_owner_tests` below fails on one.
+//! registers what it built. Every production path that wants chain data asks [`NodeChainSources`]
+//! for the fabric ([`NodeChainSources::client`]); a path that builds its own is a second, unnamed
+//! trust domain, and `sole_owner_tests` below fails on one.
+//!
+//! # WHAT ENFORCES THE CLAUSE TODAY: the sweep, not the registry
+//!
+//! State this plainly, because NC-12's "Satisfied by" record is written from here and an
+//! overstatement here becomes the ecosystem's record of a discharged obligation:
+//!
+//! * **The enforcement is `sole_owner_tests`.** It fails when a second `ChiaQuery::new` appears in
+//!   production code anywhere in this crate. That is a CI gate over the source, and it is what
+//!   makes the clause a property rather than an absence.
+//! * **The registry gives the sweep its target**, by being the thing the one permitted construction
+//!   registers into. Registering does not make the registry a control.
+//! * **Nothing in production reads the registry.** [`NodeChainSources::registry`] has no production
+//!   caller at this revision: `ChainTransport` asks only for [`NodeChainSources::client`], and no
+//!   production path calls [`ProviderRegistry::trusted`] or [`ProviderRegistry::any`]. The
+//!   enumeration and the trust classification are a declared INVENTORY.
+//! * **The read that genuinely removed the third party is elsewhere** — the corroborated peak in
+//!   [`super::peer_reads`], reached from the only production `ChainTransport`. That one is consumed
+//!   on every peak read, and it is this module's neighbour rather than its content.
 //!
 //! # What the registry OWNS, and what it deliberately does not
 //!
 //! It owns the ENUMERATION and the TRUST CLASSIFICATION of the node's chain sources — which
-//! sources exist, which independence group each belongs to, and what each is allowed to decide.
-//! Both registered sources are untrusted (their kinds default that way) and
+//! sources exist, which independence group each belongs to, and what each would be allowed to
+//! decide. Both registered sources are untrusted (their kinds default that way) and
 //! `allow_public_quorum_custody` is left OFF, so the custody view
-//! ([`ProviderRegistry::trusted`]) **fails closed** on a default install: no public oracle and no
-//! randomly dialled peer may decide where money goes merely by answering first.
+//! ([`ProviderRegistry::trusted`]) **fails closed** — no public oracle and no randomly dialled peer
+//! could decide where money goes merely by answering first. Read that as a PRE-CONDITION the first
+//! consumer will inherit, not as a gate standing in a live read path: with no production reader,
+//! nothing today is refused by it.
 //!
-//! The classification is derived from what the sources can actually REACH, not from what they are
-//! called — see [`independence_group_for`]. A quorum counts distinct independence groups, so a
-//! group id that overstates independence converts a 2-of-2 quorum into one endpoint answering
-//! twice.
+//! Being correct before it is consumed is the point. The classification is derived from what the
+//! sources can actually REACH, not from what they are called — see [`independence_group_for`] — and
+//! a quorum counts distinct independence groups, so a group id that overstates independence would
+//! convert a 2-of-2 quorum into one endpoint answering twice. That defect was real here, and a
+//! future consumer would have inherited it silently.
 //!
 //! It does NOT own the peer sessions that carry a corroborated read. Those are drawn
 //! independently by [`super::peer_reads::DialedPeerSample`] and by
@@ -200,6 +222,10 @@ impl NodeChainSources {
     }
 
     /// The registry describing the sources this node holds.
+    ///
+    /// **It has no production caller at this revision** — every caller is test code, and the
+    /// module docs say why that is worth stating rather than glossing. Treat what it returns as a
+    /// correct inventory awaiting its first reader, not as a gate a live read passes through.
     ///
     /// # Why this is BUILT per call rather than held
     ///
@@ -681,13 +707,17 @@ mod sole_owner_tests {
 
 #[cfg(test)]
 mod custody_fails_closed_tests {
-    //! The registry is LOAD-BEARING, not ornamental.
+    //! The registry's custody view REFUSES on a default install.
     //!
-    //! A registry that exists but decides nothing would satisfy NC-12's wording exactly as
-    //! vacuously as having no registry at all — the failure this module was written to end. What
-    //! makes it real is that its custody view REFUSES on a default install: no operator has
-    //! declared a source their own, so no public oracle and no randomly dialled peer may decide
-    //! where money goes merely by answering first.
+    //! What this pins, precisely: the refusal is the TRUST RULE, not emptiness and not a transport
+    //! failure. No operator has declared a source their own, so no public oracle and no randomly
+    //! dialled peer would be allowed to decide where money goes merely by answering first.
+    //!
+    //! What it does NOT pin, and must not be read as: that anything in production consults this.
+    //! Nothing does at this revision (see the module docs). These tests establish that the object
+    //! is correct BEFORE it acquires a consumer — a registry whose custody view accepted a public
+    //! oracle would hand its first reader a money-routing answer from one endpoint, and that reader
+    //! would have no reason to re-check.
 
     use super::*;
     use chia_query::provider_registry::interface::{
