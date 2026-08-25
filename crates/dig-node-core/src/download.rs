@@ -878,11 +878,28 @@ impl LocatedHolders {
         self.records.is_empty()
     }
 
-    /// Whether an empty answer may be reported as an ABSENCE. False means the search was cut short —
-    /// a timeout, a refusal, an unreachable peer — and the caller must not conclude the content does
+    /// Whether this answer licenses the claim that NOBODY holds the content.
+    ///
+    /// Two conditions, and BOTH are checked here rather than at the call site: no holder was named,
+    /// AND every leg consulted actually answered. A false `conclusive` means the search was cut short
+    /// — a timeout, a refusal, an unreachable peer — and the caller must not conclude the content does
     /// not exist.
+    ///
+    /// # Why the emptiness lives in this method
+    ///
+    /// It used to be `self.conclusive` alone, with the emptiness supplied by the one caller that
+    /// happened to ask inside an `if located.is_empty()` guard ([`NodeContent::miss_outcome`]). The
+    /// second caller — `dig.getAvailability`'s enrichment in [`crate::Node::availability_answer`] —
+    /// asks OUTSIDE any such guard, so a conclusive walk that FOUND holders answered
+    /// `absence_established: true` in the same object that named them (dig_ecosystem#3159, measured on
+    /// a real fleet). A surface asserting it established an absence while naming who holds the content
+    /// is the money/custody-lie class: a hop reads this field to decide whether to stop looking.
+    ///
+    /// The precondition is a property of the ANSWER, not of one caller's control flow, so it belongs
+    /// here where no future caller can forget it. `miss_outcome` is unaffected — it only ever asks on
+    /// the empty branch, where the added conjunct is already true.
     pub(crate) fn establishes_absence(&self) -> bool {
-        self.conclusive
+        self.records.is_empty() && self.conclusive
     }
 }
 
@@ -1032,24 +1049,32 @@ impl StateStore for CapturingStateStore {
     }
 }
 
-/// A [`RangeTransport`] wrapper that BYPASSES the `getAvailability` confirm probe for a holder the node
-/// is already CONNECTED to in the gossip pool (#836 read-leg confirm-gate fix).
+/// A [`RangeTransport`] wrapper that keeps a CONNECTED-POOL holder in the download when its
+/// `getAvailability` confirm probe could not be obtained (#836 read-leg confirm-gate fix).
 ///
 /// dig-download's `locate_and_confirm` keeps only providers whose `query_availability` answer is
-/// `available`, dropping the rest before any `fetchRange`. For a DHT-discovered provider that probe is a
-/// useful pre-filter. But for a CONNECTED-POOL holder it is actively harmful: the peer is a live,
-/// connection-verified holder offered specifically because we hold a connection to it, and its
-/// self-reported availability flag can be a false negative on a relayed/isolated net (a cache-inventory
-/// lag, a resource-vs-capsule granularity quirk) or its probe can transiently fail — either of which
-/// drops the holder and dead-ends the read at a 404 with ZERO `fetchRange` issued, even though the holder
-/// holds and would serve the bytes. The whole-resource merkle verify (not the availability flag) is the
-/// real integrity gate, so skipping the probe for a connected peer is safe: a genuine non-holder simply
-/// fails its ranges and is dropped there.
+/// `available`, dropping the rest before any `fetchRange`. On a relayed/isolated net that probe can
+/// transiently FAIL against a peer we hold a live connection to, which drops a holder that holds and
+/// would serve the bytes, and dead-ends the read at a 404 with ZERO `fetchRange` issued. The live
+/// connection is itself a confirmation, and the whole-resource merkle bind against the chain-anchored
+/// root — not the availability flag — is the real integrity gate. So on a probe ERROR this wrapper
+/// admits the connected holder anyway: a genuine non-holder simply fails its ranges.
 ///
-/// So `query_availability` short-circuits to `available = true` (no network round-trip) for any provider
-/// whose `peer_id` is currently in the connected pool, and delegates to the inner transport for every
-/// other (DHT-only) provider. `fetch_range` always delegates unchanged, with DEBUG tracing of the dial
-/// target so a live e2e run shows exactly which holder each range reached (#836 observability).
+/// # The bypass covers a MISSING answer, never a NEGATIVE one
+///
+/// It used to short-circuit to `available = true` for every connected peer with no round-trip at all,
+/// so a peer that would have answered "I do not hold this" was fabricated into a holder. Measured on a
+/// real fleet (dig_ecosystem#3159): a STALE provider record for a node whose own log said it was not a
+/// holder was admitted this way and drew **21 range attempts**, while the true holder — DHT-only, and
+/// therefore still subject to the real probe — drew **zero**. The fabricated positive did not merely
+/// add a bad candidate; it OUTRANKED the honest one, because only the honest one had to qualify.
+///
+/// Honouring a connected peer's NOT-held answer is NC-12-sound: it is a self-NEGATIVE claim, so it can
+/// never admit a byte. Trusting a self-POSITIVE claim is what NC-12 forbids, and that is exactly what
+/// this wrapper no longer manufactures.
+///
+/// `fetch_range` always delegates unchanged, with DEBUG tracing of the dial target so a live e2e run
+/// shows exactly which holder each range reached (#836 observability).
 struct PoolConfirmTransport {
     inner: Arc<dyn RangeTransport>,
     connected_pool: ConnectedPool,
@@ -1079,23 +1104,42 @@ impl RangeTransport for PoolConfirmTransport {
         provider: &ProviderRecord,
         items: Vec<dig_nat::AvailabilityItem>,
     ) -> Result<dig_nat::AvailabilityResponse, DownloadError> {
-        // A connected-pool holder is confirmed by the live connection itself — skip the probe (which can
-        // false-negative on a relayed net) and let the fetch + merkle verify be the gate.
-        if self.is_connected(&provider.provider_peer_id) {
-            tracing::debug!(
-                peer = %provider.provider_peer_id,
-                "pool confirm bypass: connected holder skips the getAvailability probe (#836)"
-            );
-            // Built through the constructors, not struct literals: these types are
-            // `#[non_exhaustive]`, which is what makes every future additive wire field a PATCH for
-            // this crate rather than a break (dig-nat SPEC §5.1.1).
-            let answers = items
-                .iter()
-                .map(|_| dig_nat::AvailabilityAnswer::available())
-                .collect();
-            return Ok(dig_nat::AvailabilityResponse::new(answers));
+        if !self.is_connected(&provider.provider_peer_id) {
+            return self.inner.query_availability(provider, items).await;
         }
-        self.inner.query_availability(provider, items).await
+
+        // A connected-pool holder still gets ASKED. The bypass covers only the answer we could not
+        // obtain — see the type doc: fabricating a `yes` for a peer that would have said `no` is what
+        // let a stale record beat the true holder (dig_ecosystem#3159).
+        let count = items.len();
+        match self.inner.query_availability(provider, items).await {
+            // The peer answered. Honour it — including a NOT-held answer. This is a self-NEGATIVE
+            // claim, so honouring it cannot admit a byte: the worst case is skipping a peer that lied
+            // about not holding, which costs one candidate and is the peer's own prerogative (NC-12
+            // forbids trusting a self-POSITIVE claim, which is precisely what this arm no longer
+            // fabricates).
+            Ok(answer) => Ok(answer),
+            // The probe could not be obtained — a transient dial failure, a relayed-net round-trip
+            // that never completed. THIS is #836's measured cause, and dropping the holder here is
+            // what dead-ended the read at a 404 with zero `fetchRange` issued. The live connection is
+            // the confirmation, and the whole-resource merkle bind against the chain-anchored root is
+            // the real integrity gate, so admitting the holder is safe: a genuine non-holder simply
+            // fails its ranges.
+            Err(error) => {
+                tracing::debug!(
+                    peer = %provider.provider_peer_id,
+                    %error,
+                    "pool confirm bypass: connected holder's probe failed; the live connection confirms it (#836)"
+                );
+                // Built through the constructors, not struct literals: these types are
+                // `#[non_exhaustive]`, which is what makes every future additive wire field a PATCH
+                // for this crate rather than a break (dig-nat SPEC §5.1.1).
+                let answers = (0..count)
+                    .map(|_| dig_nat::AvailabilityAnswer::available())
+                    .collect();
+                Ok(dig_nat::AvailabilityResponse::new(answers))
+            }
+        }
     }
 
     async fn fetch_range(
@@ -4000,30 +4044,84 @@ pub(crate) mod tests {
         );
     }
 
-    /// A [`RangeTransport`] modelling a connected holder that ANSWERS `getAvailability` = NOT-available
-    /// for the resource, yet WOULD serve the bytes if a `fetchRange` reached it. This is the read-leg
-    /// sub-cause the address fix (#97) did NOT cover: the holder is connected AND reachable, `find_providers`
-    /// offers it, but dig-download's `locate_and_confirm` drops every provider whose `query_availability`
-    /// answer is not `available` — so NO `fetchRange` is ever issued and the read 404s, even though the
-    /// holder holds (and would serve) the resource. Records the peer_id of every `fetch_range` served, so a
-    /// test can assert whether a `fetchRange` was actually issued (the exact e2e symptom: a dial for the
-    /// availability probe, then zero `fetchRange`).
-    struct AvailabilityFalseButServesTransport {
+    /// dig_ecosystem#3159 defect (a): a located holder and an established absence are mutually
+    /// exclusive, and the answer itself must enforce that — not one caller's `if is_empty()` guard.
+    ///
+    /// The fleet measured `dig.getAvailability` returning `absence_established: true` in the SAME
+    /// object that named a provider. `miss_outcome` only ever asked on the empty branch, so its
+    /// call-site guard supplied the emptiness for free and the method's own definition
+    /// (`self.conclusive`) was never wrong THERE. `availability_answer` asks unconditionally, and
+    /// inherited a claim it had no right to.
+    ///
+    /// # Why this asserts the non-empty case, which is the one that was broken
+    ///
+    /// A test that only checked "empty + conclusive → true" and "empty + inconclusive → false" passes
+    /// identically against `self.conclusive` alone — the nearest wrong implementation. The row that
+    /// discriminates is NON-EMPTY + conclusive, because that is the only input where the two
+    /// definitions disagree, and it is precisely the input the fleet hit.
+    #[test]
+    fn a_located_holder_can_never_establish_an_absence() {
+        let held = |records: Vec<ProviderRecord>, conclusive: bool| LocatedHolders {
+            records: records
+                .into_iter()
+                .map(|r| (r, dig_sex::discovery::Provenance::FirstHand))
+                .collect(),
+            conclusive,
+        };
+
+        // THE discriminating row: a walk that completed AND found a holder. Absence is unclaimable.
+        let cid = mock_content_id();
+        let found = held(vec![mock_provider(1, &cid)], true);
+        assert!(!found.is_empty(), "the fixture must actually name a holder");
+        assert!(
+            !found.establishes_absence(),
+            "naming a provider and asserting its absence in the same answer is the lie #3159 measured"
+        );
+
+        // The rows that already held, kept so a fix cannot trade one wrong answer for another: a
+        // completed walk that found nobody IS an absence, and an unfinished one never is.
+        assert!(
+            held(Vec::new(), true).establishes_absence(),
+            "a completed walk that found nobody is a genuine absence"
+        );
+        assert!(
+            !held(Vec::new(), false).establishes_absence(),
+            "a walk that was cut short proves nothing"
+        );
+    }
+
+    /// A [`RangeTransport`] whose `getAvailability` behaviour is chosen PER PEER, and which serves any
+    /// `fetchRange` that reaches it.
+    ///
+    /// A double that can only express one availability behaviour cannot model the fleet's situation at
+    /// all, because that situation is two peers DISAGREEING: a stale record answering "not me" and a
+    /// true holder answering "me". Widening the double is what makes the ranking question observable —
+    /// with a single behaviour, "the stale peer was preferred" and "the stale peer was skipped" produce
+    /// the same transcript.
+    struct PerPeerAvailabilityTransport {
         inner: MockRangeTransport,
+        /// `peer_id_hex` → the answer that peer gives. Absent → the probe ERRORS for that peer.
+        answers: std::collections::HashMap<String, bool>,
         avail_calls: tokio::sync::Mutex<Vec<String>>,
         fetch_calls: tokio::sync::Mutex<Vec<String>>,
     }
 
-    impl AvailabilityFalseButServesTransport {
-        fn new(content: MockContent) -> Self {
-            AvailabilityFalseButServesTransport {
+    impl PerPeerAvailabilityTransport {
+        fn new(content: MockContent, answers: Vec<(String, bool)>) -> Self {
+            PerPeerAvailabilityTransport {
                 inner: MockRangeTransport::new(content),
+                answers: answers.into_iter().collect(),
                 avail_calls: tokio::sync::Mutex::new(Vec::new()),
                 fetch_calls: tokio::sync::Mutex::new(Vec::new()),
             }
         }
-        async fn fetched_from(&self, peer: &str) -> bool {
-            self.fetch_calls.lock().await.iter().any(|p| p == peer)
+        async fn fetch_count_for(&self, peer: &str) -> usize {
+            self.fetch_calls
+                .lock()
+                .await
+                .iter()
+                .filter(|p| *p == peer)
+                .count()
         }
         async fn availability_probed(&self, peer: &str) -> bool {
             self.avail_calls.lock().await.iter().any(|p| p == peer)
@@ -4031,7 +4129,7 @@ pub(crate) mod tests {
     }
 
     #[async_trait::async_trait]
-    impl RangeTransport for AvailabilityFalseButServesTransport {
+    impl RangeTransport for PerPeerAvailabilityTransport {
         async fn query_availability(
             &self,
             provider: &ProviderRecord,
@@ -4041,12 +4139,24 @@ pub(crate) mod tests {
                 .lock()
                 .await
                 .push(provider.provider_peer_id.clone());
-            // The holder answers NOT-available for every queried item (the confirm-says-no sub-cause).
-            let answers = items
-                .iter()
-                .map(|_| dig_nat::AvailabilityAnswer::unavailable())
-                .collect();
-            Ok(dig_nat::AvailabilityResponse::new(answers))
+            match self.answers.get(&provider.provider_peer_id) {
+                Some(true) => Ok(dig_nat::AvailabilityResponse::new(
+                    items
+                        .iter()
+                        .map(|_| dig_nat::AvailabilityAnswer::available())
+                        .collect(),
+                )),
+                Some(false) => Ok(dig_nat::AvailabilityResponse::new(
+                    items
+                        .iter()
+                        .map(|_| dig_nat::AvailabilityAnswer::unavailable())
+                        .collect(),
+                )),
+                None => Err(DownloadError::Transport {
+                    provider: provider.provider_peer_id.clone(),
+                    reason: "availability probe failed".to_string(),
+                }),
+            }
         }
         async fn fetch_range(
             &self,
@@ -4061,22 +4171,24 @@ pub(crate) mod tests {
         }
     }
 
-    /// #836 read-leg GROUND TRUTH (the confirm-gate sub-cause, arbiter e2e d1d1f728): the reader is
-    /// CONNECTED to the capsule holder in the gossip pool at its REACHABLE address and `find_providers`
-    /// offers it — but the holder's `getAvailability` answer for the resource is NOT-available, so
-    /// dig-download's `locate_and_confirm` drops it and issues ZERO `fetchRange` (the exact e2e symptom:
-    /// the availability probe dials :9444, then no `fetchRange`, then §21 upstream 400 → DATA 404). A
-    /// connected-pool holder must NOT be gated behind a separate availability probe: it was specifically
-    /// offered as a holder over a live connection, and the whole-resource merkle verify — not the
-    /// self-reported availability flag — is the real integrity gate. This test drives the REAL
-    /// fetch_resource→Downloader handoff and asserts a `fetchRange` reaches the connected holder. It is
-    /// RED before the pool-confirm bypass (no `fetchRange` issued) and GREEN after.
+    /// #836 read-leg GROUND TRUTH, narrowed to its SURVIVING cause: the reader is CONNECTED to the
+    /// capsule holder and the holder's availability probe FAILS (a transient dial failure on a relayed
+    /// net). Before the pool-confirm wrapper, `locate_and_confirm` dropped the holder on that failure
+    /// and issued ZERO `fetchRange` — the exact e2e symptom (probe dials :9444, no `fetchRange`, §21
+    /// upstream 400 → DATA 404).
+    ///
+    /// The live connection is the confirmation and the whole-resource merkle verify is the real
+    /// integrity gate, so an UNOBTAINABLE probe must not drop a peer we are already connected to. Note
+    /// what this asserts and what it deliberately no longer does: the probe IS attempted (it must be —
+    /// that is what distinguishes a missing answer from a negative one), and the holder is admitted
+    /// only because the attempt errored.
     #[tokio::test]
-    async fn connected_pool_holder_is_fetched_even_when_it_answers_availability_false() {
+    async fn connected_pool_holder_is_fetched_when_its_availability_probe_fails() {
         let td = tempfile::tempdir().unwrap();
         let content = anchored_mock_content(30, 3);
         let cid = anchored_cid_for(&content);
-        let transport = Arc::new(AvailabilityFalseButServesTransport::new(content.clone()));
+        // No entry for peer 1 → its probe ERRORS.
+        let transport = Arc::new(PerPeerAvailabilityTransport::new(content.clone(), vec![]));
 
         // The DHT discovers nobody reachable (the exact relayed-net condition) — the ONLY source of the
         // holder is the live connected pool.
@@ -4095,21 +4207,85 @@ pub(crate) mod tests {
             addr: "10.0.0.1:9444".parse().unwrap(),
         });
 
-        // DATA: the fetch must reach the connected holder despite its availability=false answer.
+        // DATA: the fetch must reach the connected holder despite its probe failing.
         let f = pc
             .fetch_resource(&cid, ReadOrigin::Local)
             .await
-            .expect("a connected-pool holder is fetched even when it answers availability=false");
+            .expect("a connected-pool holder is fetched when its availability probe fails");
         assert_eq!(f.bytes, content.bytes, "served bytes match the source");
         assert!(
-            transport.fetched_from(&mock_peer_hex(1)).await,
+            transport.fetch_count_for(&mock_peer_hex(1)).await > 0,
             "a fetchRange MUST reach the connected holder (the exact e2e miss: zero fetchRange issued)"
         );
-        // Sanity: the connected-pool holder's availability probe is bypassed (we go straight to fetch),
-        // so a not-available answer can never drop a peer we are already connected to.
+        // The probe is ATTEMPTED. Asserting only the fetch would pass equally for the old blanket
+        // short-circuit, which is the implementation this change exists to remove.
         assert!(
-            !transport.availability_probed(&mock_peer_hex(1)).await,
-            "a connected-pool holder must not be gated behind a separate availability probe"
+            transport.availability_probed(&mock_peer_hex(1)).await,
+            "the connected holder must still be ASKED — only an unobtainable answer is covered"
+        );
+    }
+
+    /// dig_ecosystem#3159 defect (b): a STALE connected record must not outrank the true holder.
+    ///
+    /// The fleet measured a node making **21 pull attempts at a stale `peer_id`** whose own log said it
+    /// was not a holder, and **0 at the real holder**. The cause was not ranking heuristics — it was
+    /// that the connected peer's `getAvailability` answer was never requested, so a fabricated
+    /// `available = true` qualified it while the DHT-only true holder had to earn its place.
+    ///
+    /// # The fixture varies ONE actor and keeps an honest control
+    ///
+    /// Peer 1 is CONNECTED and answers NOT-held (the stale record, telling the truth about itself).
+    /// Peer 2 is DHT-only and answers held, and serves. Making BOTH hostile would be the "strongest"
+    /// fixture and exactly the blind one: with no honest holder left there is no successful read to
+    /// starve, so a preference for the stale peer would be invisible.
+    ///
+    /// # And it asserts the fetch, not merely the outcome
+    ///
+    /// `fetch_resource` succeeding is an outcome the OLD implementation also reaches — the stale peer
+    /// fails its ranges and the downloader eventually falls to peer 2. So the load-bearing assertion is
+    /// that peer 1 received **zero** `fetchRange` calls. That is the difference between "the read
+    /// recovered" and "the read never went to the wrong peer", and only the second is the fix.
+    #[tokio::test]
+    async fn a_connected_peer_that_answers_not_held_is_dropped_before_any_range() {
+        let td = tempfile::tempdir().unwrap();
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content);
+        let stale = mock_peer_hex(1);
+        let holder = mock_peer_hex(2);
+        let transport = Arc::new(PerPeerAvailabilityTransport::new(
+            content.clone(),
+            vec![(stale.clone(), false), (holder.clone(), true)],
+        ));
+
+        // The DHT names the TRUE holder (peer 2). Peer 1 reaches the candidate set via the pool.
+        let locator = Arc::new(MockProviderLocator::fixed(vec![mock_provider(2, &cid)]));
+        let pc = NodeContent::new(
+            locator,
+            transport.clone(),
+            MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addr: "10.0.0.1:9444".parse().unwrap(),
+        });
+
+        let f = pc
+            .fetch_resource(&cid, ReadOrigin::Local)
+            .await
+            .expect("the true holder serves the resource");
+        assert_eq!(f.bytes, content.bytes, "served bytes match the source");
+
+        // THE assertion: the stale peer said "not me" and was believed, so it drew no ranges at all.
+        assert_eq!(
+            transport.fetch_count_for(&stale).await,
+            0,
+            "a connected peer that answers NOT-held must draw zero fetchRange (the fleet measured 21)"
+        );
+        assert!(
+            transport.fetch_count_for(&holder).await > 0,
+            "the true holder must serve the ranges (the fleet measured 0)"
         );
     }
 

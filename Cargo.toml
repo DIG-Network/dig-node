@@ -32,7 +32,7 @@ edition = "2021"
 # the ROOT manifest (`[workspace.package].version`), so it MUST be set here for a
 # release to fire (§3.6). The library crates (dig-node-core/dig-runtime/dig-wallet)
 # keep their own independent versions — only the released binary tracks the workspace version.
-version = "0.152.0"
+version = "0.153.0"
 
 # Release hardening, matching digstore: keep integer-overflow checks ON in release.
 # The node parses untrusted serialized input and does offset/length arithmetic over
@@ -52,7 +52,35 @@ overflow-checks = true
 # which dig-gossip depends on directly. There is nothing left at that rev to patch to, so the patch
 # section — and the #1529 three-rev lockstep it forced — is retired rather than re-pointed.
 
-# The dig-nat unification patch is RETIRED (#1280 crates.io cascade): dig-nat 0.7 is on crates.io and
-# the ENTIRE peer stack (dig-gossip 0.7.1, dig-dht 0.2.2, dig-download 0.2.1, dig-peer-selector 0.2.1,
-# dig-node-core) now depends on dig-nat "0.7" from crates.io, so cargo already resolves ONE dig-nat 0.7
-# instance without any git redirect. dig-constants is likewise a plain crates.io dep everywhere now.
+# The dig-nat unification patch is RETIRED (#1280 crates.io cascade): the ENTIRE peer stack takes
+# dig-nat from crates.io, so cargo resolves ONE dig-nat instance without any git redirect.
+# dig-constants is likewise a plain crates.io dep everywhere now.
+#
+# The RESOLVED line today is dig-nat **0.18.0** (see `crates/dig-node-core/Cargo.toml`, which owns the
+# declaration and the reasoning). Do not read a version out of this comment: an earlier revision of it
+# asserted "dig-nat 0.7 ... resolves ONE dig-nat 0.7 instance", which was true of the #1280 cascade and
+# was eleven minors stale by the time anyone read it. `tests/dependency_tree.rs` asserts the
+# single-instance invariant against the resolved LOCK, which is the only claim that cannot go stale.
+#
+# THE WHOLE PUBLISHED PEER STACK IS BEHIND ONE UNBLOCK, AND IT IS NOT A dig-nat VERSION QUESTION.
+# This workspace declares dig-nat 0.18, dig-dht 0.11.1, dig-download 0.19 and dig-peer 0.11 while
+# newer versions of all four are published. Those four are NOT un-done §2.4b dependency work: they
+# are BLOCKED, and a lane that re-attempts them without reading this will hit the identical wall.
+#
+# The wall is chia-bls. `dig-nat 0.20.0` already requires `dig-tls ^0.4`, and dig-tls 0.4.0 is the
+# chia-bls 0.36.1 uplift (0.3.x is chia-bls ^0.26). Every published stack member -- dig-dht 0.12.1,
+# dig-download 0.20.4, dig-peer 0.12.0, dig-peer-selector 0.9.2 -- declares `dig-nat ^0.20`, so all of
+# them require the 0.36.1 line. This graph cannot have it: dig-gossip is git-pinned and reaches
+# chia-protocol 0.26 through `dig-peer-protocol 0.6.0`, a path no manifest here can edit. Adopting any
+# of them splits chia-bls across two lines inside one crate (dig_ecosystem#3161, blocked on #3152).
+#
+# THE DISTINCTION A FUTURE LANE WILL GET WRONG, stated plainly because it has already been got wrong:
+# the step from dig-nat 0.20 to 0.21 is FREE. Both carry `dig-tls ^0.4`, so there is ZERO chia delta
+# between them, and 0.21.0 (the dig_ecosystem#1871 fix -- the relay duplicate guard now requires a
+# LIVE circuit with a 30 s idle window) costs nothing extra to a consumer already on 0.20. What is
+# expensive is being on 0.20 AT ALL, which this workspace is not and cannot yet be. So "0.21 is
+# chia-blocked" is FALSE and "dig-node cannot reach 0.21" is TRUE, for a reason that lives one version
+# lower. Measured here: forcing dig-nat 0.21 resolves TWO dig-nat lines while cargo prints success.
+#
+# The unblock is a release-first cascade upstream (dig-peer-protocol, then dig-gossip), never an edit
+# in this file. Do not bridge the two chia lines with a shim -- that is the §4.1 byte-drift class.
