@@ -11,6 +11,10 @@ Type=simple
 # The .deb installs the binary here (see build-deb.sh). `run` is the unix-service
 # entrypoint (SPEC §8.1) — it serves in the foreground until SIGTERM.
 ExecStart=/usr/bin/dig-node run
+# The operator's configuration surface (#317). The leading `-` makes a missing file a no-op, so a
+# stock install is unaffected; an operator standing up an isolated network sets DIG_BOOTSTRAP_PEERS
+# and DIG_RELAY_URL here BEFORE first start (see the comments in the shipped file).
+EnvironmentFile=-/etc/dig-node/dig-node.env
 # Self-identify as a SERVICE run (#501): the daemon may bootstrap the machine-wide
 # state dir (/var/lib/dig-node) with a restrictive owner-only ACL. A bare CLI never does.
 Environment=DIG_NODE_RUN_CONTEXT=service

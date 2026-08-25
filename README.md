@@ -14,7 +14,9 @@ shipped as a **self-contained, cross-platform Rust binary** that installs as an 
 > **`dign` alias.** A shorter first-class alias binary, `dign`, ships alongside `dig-node` (mirroring
 > `digs`↔`digstore`): `dign <args>` behaves identically to `dig-node <args>` — same subcommands,
 > flags, `--json`, and exit codes — and each binary reports its own name in `--help`/`--version`. The
-> release publishes it as `dign-<ver>-<os>-<arch>[.exe]` beside the `dig-node-*` asset.
+> release publishes it as `dign-<ver>-<os>-<arch>[.exe]` beside the `dig-node-*` asset, and the
+> Ubuntu `.deb` installs it at `/usr/bin/dign` as a symlink to `/usr/bin/dig-node`. (Note the `n`:
+> `/usr/bin/dig` is BIND's DNS lookup tool and is never touched.)
 
 The extension resolves `chia://` (DIG) URLs by fetching encrypted, Merkle-proven content over a DIG
 RPC and then **verifying + decrypting it in the extension**. By default it talks to `rpc.dig.net`;
