@@ -18,6 +18,8 @@ path = "src/main.rs"
 # node — bump together). digstore-chain: BIP-39 seed + HD wallet scan + DIG-CAT +
 # encrypted seed storage + XCH send. digstore-core: the canonical Capsule
 # (storeId:rootHash) identity rendered by /api/stores.
+# NC-7 exception: the digstore set is git-pinned as one atomic rev — rationale in
+# crates/dig-node-core/Cargo.toml (dig_ecosystem#901, blocked on the digstore publishes + #2761).
 digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 # The node engine (crate `dig_node_core`) — same workspace (the DIG Browser's in-process

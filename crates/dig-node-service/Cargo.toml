@@ -129,7 +129,18 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 # The single source of truth for DIG local-TLS material (#620/#622): the reloadable rustls
 # loader + automatic leaf renewal for `https://dig.local`. PINNED to the released tag v0.1.0
 # (never `main`) — release-first (§4.1): the crate ships + releases before this consumer.
-dig-cert = { git = "https://github.com/DIG-Network/dig-cert", tag = "v0.1.0" }
+# NOW A CRATES.IO DEP (dig_ecosystem#901). It was git-tag pinned only because the crate had never
+# been published — not for any safety reason. The root cause was that dig-cert's release.yml cut a
+# `vX.Y.Z` tag and no job published it, so tags v0.1.0/v0.1.1 existed against an absent crate. Fixed
+# in dig-cert#3, which added publish.yml; 0.1.2 is live on crates.io. NC-7 satisfied for this dep.
+#
+# 0.1.2 IS BYTE-IDENTICAL IN BEHAVIOUR to the v0.1.0 tag this replaced: `git diff v0.1.0 v0.1.2 --
+# src/` is EMPTY. The two intervening commits are a test addition and the publish workflow itself.
+#
+# dig-cert is a leaf crate — no DIG dependencies and no `[patch.crates-io]` section — so the published
+# artifact cannot differ from the git-sourced one. That is the property dig-gossip lacks, which is why
+# this dep could be repointed and that one is a permanent carve-out (see dig-node-core, #2647).
+dig-cert = "0.1.2"
 # The serving TLS stack — pinned byte-identical to dig-cert / dig-node-core / dig-dns (0.23,
 # default-features off, ring + std + tls12 + logging) so a build installs exactly ONE
 # `CryptoProvider` (ring) and never hits the "multiple CryptoProviders" install panic (#622 §7).
@@ -254,6 +265,8 @@ futures-util = "0.3"
 # Builds the LEGACY `EncryptedSeed` fixture `seed_export_rescue.rs` needs. That layout has no
 # writer left in production (nothing here seals a user seed any more), so the only way to
 # produce the exact on-disk shape a pre-existing install carries is the crate that wrote it.
+# NC-7 exception: the digstore set is git-pinned as one atomic rev — rationale in
+# crates/dig-node-core/Cargo.toml (dig_ecosystem#901, blocked on the digstore publishes + #2761).
 digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
