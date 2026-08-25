@@ -3403,6 +3403,13 @@ pub struct ClientReservation {
     /// The lifetime ACTUALLY applied, which may be shorter than the one requested. A caller told
     /// its own requested figure would wait on a schedule this node does not keep.
     pub expires_at_ms: i64,
+    /// That same applied lifetime as a DURATION, ms.
+    ///
+    /// Carried beside the deadline rather than left for a caller to subtract, because the only
+    /// clock a caller could subtract with is its OWN. Under clock skew that yields a lifetime this
+    /// node never granted, and a client scheduling its release against it would either release
+    /// early or hold past the lapse.
+    pub ttl_ms: i64,
 }
 
 /// One held coin, as reported by [`WalletDb::held_reservations`].
@@ -3610,6 +3617,7 @@ impl WalletDb {
             reservation_id,
             coin_ids: wanted,
             expires_at_ms,
+            ttl_ms: ttl,
         })
     }
 
@@ -5935,6 +5943,11 @@ mod tests {
             NOW + CLIENT_RESERVATION_MAX_TTL_MS,
             "a caller was told nothing would wait on a schedule the node does not keep"
         );
+        assert_eq!(
+            r.ttl_ms, CLIENT_RESERVATION_MAX_TTL_MS,
+            "the reported duration must be the applied one, not the requested one"
+        );
+        assert_ne!(r.ttl_ms, day_ms, "the request was echoed back unclamped");
     }
 
     #[tokio::test]

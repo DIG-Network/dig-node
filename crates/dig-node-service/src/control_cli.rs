@@ -89,6 +89,25 @@ pub enum ControlAction {
     WalletUnwatch { public_keys: Vec<String> },
     /// `control.wallet.watched` — the public keys this node is currently following.
     WalletWatched,
+    /// `control.wallet.reservations.held` — the coins committed to in-flight spends.
+    ///
+    /// No arguments by design: a caller-supplied instant would be a lapse oracle, so the node
+    /// reads its own clock (dig_ecosystem#3127).
+    WalletReservationsHeld,
+    /// `control.wallet.reservations.reserve` — hold coins against selection, all of them or none.
+    ///
+    /// Bookkeeping only: coin ids are public chain facts, and this carries no key (§908).
+    WalletReservationsReserve {
+        /// The coin ids to hold.
+        coin_ids: Vec<String>,
+        /// The requested lifetime. The node clamps it and reports what it APPLIED.
+        ttl_secs: Option<u64>,
+    },
+    /// `control.wallet.reservations.release` — free a hold ahead of its TTL.
+    WalletReservationsRelease {
+        /// The opaque handle returned by a reserve.
+        reservation_id: String,
+    },
     /// `control.profile.putBody` — hand this node a profile body to persist and serve.
     ///
     /// The node checks the root on chain and refuses a body it cannot confirm (SPEC §22.3); this
@@ -167,6 +186,13 @@ impl ControlAction {
             ControlAction::WalletWatch { .. } => "control.wallet.watch",
             ControlAction::WalletUnwatch { .. } => "control.wallet.unwatch",
             ControlAction::WalletWatched => "control.wallet.watched",
+            ControlAction::WalletReservationsHeld => "control.wallet.reservations.held",
+            ControlAction::WalletReservationsReserve { .. } => {
+                "control.wallet.reservations.reserve"
+            }
+            ControlAction::WalletReservationsRelease { .. } => {
+                "control.wallet.reservations.release"
+            }
             ControlAction::ProfilePutBody { .. } => "control.profile.putBody",
             ControlAction::ProfileGetBody { .. } => "control.profile.getBody",
             ControlAction::UpdaterStatus => "control.updater.status",
@@ -258,6 +284,15 @@ impl ControlAction {
             ControlAction::WalletWatch { public_keys }
             | ControlAction::WalletUnwatch { public_keys } => {
                 json!({ "public_keys": public_keys })
+            }
+            // `ttl_secs` is omitted rather than sent as null when unset, so the node applies its
+            // own default instead of being handed a value to reject.
+            ControlAction::WalletReservationsReserve { coin_ids, ttl_secs } => match ttl_secs {
+                Some(t) => json!({ "coin_ids": coin_ids, "ttl_secs": t }),
+                None => json!({ "coin_ids": coin_ids }),
+            },
+            ControlAction::WalletReservationsRelease { reservation_id } => {
+                json!({ "reservation_id": reservation_id })
             }
             ControlAction::ProfilePutBody {
                 store_id,
@@ -368,6 +403,16 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         }
         .method(),
         ControlAction::WalletWatched.method(),
+        ControlAction::WalletReservationsHeld.method(),
+        ControlAction::WalletReservationsReserve {
+            coin_ids: Vec::new(),
+            ttl_secs: None,
+        }
+        .method(),
+        ControlAction::WalletReservationsRelease {
+            reservation_id: String::new(),
+        }
+        .method(),
         ControlAction::ProfilePutBody {
             store_id: String::new(),
             root: String::new(),

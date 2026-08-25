@@ -709,6 +709,20 @@ pub enum ErrorCode {
     /// the node and hand the bundle straight back. Retrying cannot help. Node error.
     /// (Wallet range `-3204x`.)
     WalletNodeSpendDisabled,
+    /// One or more named coins are already committed to a live in-flight spend, so NOTHING was
+    /// reserved (dig_ecosystem#3127).
+    ///
+    /// Deliberately distinct from any shortfall: the user HAS the money, it is briefly committed,
+    /// and it returns when that spend settles or its hold lapses. Reporting a shortfall would send
+    /// a person to an exchange to solve a five-minute wait. Node error.
+    WalletCoinsReserved,
+    /// The node's coin-reservation set could not be read, so what is in flight is UNKNOWN
+    /// (dig_ecosystem#3127).
+    ///
+    /// Never collapsed into an empty answer. "Nothing is reserved" and "I cannot tell you what is
+    /// reserved" demand opposite actions: the first permits a spend, the second must refuse one.
+    /// Node error.
+    WalletReservationsUnavailable,
     /// `-32060` — a `control.peers.ping` (dig_ecosystem#1985) was refused BEFORE any dial: either a
     /// ladder is already running (single-flight) or the start-rate bound for the window is spent.
     /// Distinct from a ladder that ran and reached nothing, which is a RESULT (`verdict:
@@ -757,6 +771,14 @@ impl ErrorCode {
             ErrorCode::WalletReadFailed => -32042,
             ErrorCode::WalletRateLimited => -32043,
             ErrorCode::WalletNodeSpendDisabled => -32044,
+            // Taken from the shared catalogue rather than restated, so this crate cannot drift
+            // from the contract it speaks. See `the_wallet_codes_agree_with_the_shared_catalogue`.
+            ErrorCode::WalletCoinsReserved => {
+                dig_node_control_interface::ControlErrorCode::WalletCoinsReserved.code()
+            }
+            ErrorCode::WalletReservationsUnavailable => {
+                dig_node_control_interface::ControlErrorCode::WalletReservationsUnavailable.code()
+            }
             ErrorCode::PeerPingRefused => -32060,
             ErrorCode::PushPendingLimited => -32016,
             ErrorCode::ControlIngressLimited => -32033,
@@ -781,6 +803,8 @@ impl ErrorCode {
             ErrorCode::WalletNotSynced => "WALLET_NOT_SYNCED",
             ErrorCode::WalletReadFailed => "WALLET_READ_FAILED",
             ErrorCode::WalletRateLimited => "WALLET_RATE_LIMITED",
+            ErrorCode::WalletCoinsReserved => "WALLET_COINS_RESERVED",
+            ErrorCode::WalletReservationsUnavailable => "WALLET_RESERVATIONS_UNAVAILABLE",
             ErrorCode::WalletNodeSpendDisabled => "WALLET_NODE_SPEND_DISABLED",
             ErrorCode::PeerPingRefused => "PEER_PING_REFUSED",
             ErrorCode::PushPendingLimited => "PUSH_PENDING_LIMITED",
@@ -810,6 +834,8 @@ impl ErrorCode {
             | ErrorCode::WalletReadFailed
             | ErrorCode::WalletRateLimited
             | ErrorCode::WalletNodeSpendDisabled
+            | ErrorCode::WalletCoinsReserved
+            | ErrorCode::WalletReservationsUnavailable
             // The peer ping is run BY the node's own peer network, so the refusal is the node's.
             | ErrorCode::PeerPingRefused
             // The push-reassembly bound is enforced by the node's own capsule seam.
@@ -860,6 +886,12 @@ impl ErrorCode {
                 "A push was refused: the bundle spends the node's own custodied coins and this \
                  node may not send its own money."
             }
+            ErrorCode::WalletCoinsReserved => {
+                "Coins named by this call are committed to a live in-flight spend; nothing was reserved. This is a wait, NOT a shortfall."
+            }
+            ErrorCode::WalletReservationsUnavailable => {
+                "The node's coin-reservation set could not be read, so coin selection cannot be trusted."
+            }
             ErrorCode::PeerPingRefused => {
                 "A peer ping was refused before dialing: a ladder is already running on this node, \
                  or the start-rate bound is exhausted."
@@ -893,6 +925,8 @@ impl ErrorCode {
             ErrorCode::WalletReadFailed,
             ErrorCode::WalletRateLimited,
             ErrorCode::WalletNodeSpendDisabled,
+            ErrorCode::WalletCoinsReserved,
+            ErrorCode::WalletReservationsUnavailable,
             ErrorCode::PeerPingRefused,
             ErrorCode::PushPendingLimited,
             ErrorCode::ControlIngressLimited,

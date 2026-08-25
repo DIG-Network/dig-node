@@ -89,7 +89,7 @@ dig-node-core = { path = "../dig-node-core" }
 # "0.6.0" the suite went green over a `control.wallet.coinById` the contract had never heard of --
 # it checked nothing about the very method the change added. A caret range keeps the pin moving
 # with the published catalog instead of silently narrowing what CI can see.
-dig-node-control-interface = "0.19"
+dig-node-control-interface = "0.20"
 
 # The OS CSPRNG for all authorization material — the control token, pairing ids/tokens
 # (§7), and the relay loop-probe id (`control::fill_random`). Wraps `getrandom(2)` /
