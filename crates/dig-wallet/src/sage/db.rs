@@ -471,6 +471,22 @@ CREATE TABLE IF NOT EXISTS coin_reservations (
 );
 CREATE INDEX IF NOT EXISTS idx_coin_reservations_tx ON coin_reservations (transaction_id);
 
+-- Coins held for a client that has SELECTED them but has not yet pushed a bundle
+-- (dig_ecosystem#3127). Deliberately NOT a row in `coin_reservations`: that table's rows are
+-- children of a `pending_transactions` row, and a client reservation has no bundle yet. Faking a
+-- pending transaction to reuse it would make `pending_transactions()` report an in-flight spend
+-- that does not exist.
+--
+-- `coin_id` is the PRIMARY KEY, and that is the atomicity guarantee rather than a tidiness one:
+-- two callers racing for the same coin cannot both insert it, whatever either of them read first.
+CREATE TABLE IF NOT EXISTS client_coin_reservations (
+    coin_id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL,
+    expires_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_client_coin_reservations_id
+    ON client_coin_reservations (reservation_id);
+
 CREATE TABLE IF NOT EXISTS peers (
     ip_addr TEXT PRIMARY KEY,
     port INTEGER NOT NULL,
@@ -2176,6 +2192,24 @@ impl WalletDb {
         .execute(&self.pool)
         .await?
         .rows_affected();
+
+        // The same two retirement conditions, applied to the CLIENT holds (dig_ecosystem#3127).
+        // They live in a separate table with no foreign key, so the cascade above cannot reach
+        // them and they would otherwise outlive both their lifetime and their coin.
+        //
+        // Not added to `n`: the returned count means "bundles retired", and a client hold is not a
+        // bundle. Folding them together would inflate a figure callers read as in-flight spends.
+        sqlx::query(
+            "DELETE FROM client_coin_reservations WHERE expires_at_ms <= ?
+             OR coin_id IN (
+                SELECT c.coin_id FROM coins c
+                WHERE c.spent_height IS NOT NULL
+             )",
+        )
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await?;
+
         Ok(n)
     }
 
@@ -2227,9 +2261,24 @@ impl WalletDb {
             .collect())
     }
 
-    /// Every coin id currently committed to a live in-flight bundle, lower-cased.
+    /// Every coin id currently held out of selection, lower-cased.
+    ///
+    /// The UNION of both reservation kinds: coins committed to a pushed bundle
+    /// ([`Self::reserve_spend`]) and coins a client is building against
+    /// ([`Self::reserve_client_coins`]). A selector must narrow against both or the cross-process
+    /// window this union exists to close reopens.
+    ///
+    /// Reads the client table RAW, without filtering on an expiry, because this method has no
+    /// clock. A lapsed hold therefore keeps blocking its coin until [`Self::prune_reservations`]
+    /// runs. That is the SAFE direction and is chosen deliberately: over-reserving costs a delayed
+    /// spend, under-reserving costs an invalid bundle built after the money moved. Every caller of
+    /// this method prunes first, so the delay is not observable in practice.
     pub async fn reserved_coin_ids(&self) -> sqlx::Result<std::collections::HashSet<String>> {
-        let rows = sqlx::query("SELECT coin_id FROM coin_reservations")
+        let rows = sqlx::query(
+            "SELECT coin_id FROM coin_reservations
+             UNION
+             SELECT coin_id FROM client_coin_reservations",
+        )
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
@@ -3316,6 +3365,356 @@ pub struct NetworkSettingsRow {
     pub delta_sync_override: Option<bool>,
     /// An explicit change-address override (`None` = the wallet's own change address).
     pub change_address: Option<String>,
+}
+
+/// The longest lifetime this node will grant a client coin reservation, in milliseconds.
+///
+/// A ceiling rather than a suggestion. The lifetime is the ONLY thing standing between a client
+/// that crashes between reserving and building, and a coin held out of selection forever — so a
+/// caller does not get to ask for a hold this node would not itself clean up.
+pub const CLIENT_RESERVATION_MAX_TTL_MS: i64 = 600_000;
+
+/// The lifetime applied when a caller names none, in milliseconds.
+///
+/// Five minutes: long enough to build, sign and push a bundle across a process boundary, short
+/// enough that an abandoned hold is a nuisance rather than a lockout.
+///
+/// This is deliberately dig-account's `DEFAULT_RESERVATION_TTL_SECS` (300 s), while the ceiling
+/// above is dig-node's own post-broadcast `RESERVATION_TTL_MS` (600 s). The two crates had
+/// disagreed harmlessly because they covered disjoint phases of one lifecycle; they meet here, so
+/// the disagreement is resolved rather than inherited — the shorter figure becomes the DEFAULT and
+/// the longer one the CEILING, which is the only reading under which neither crate is overruled.
+/// Whatever a caller asks for, [`ClientReservation::expires_at_ms`] reports what was APPLIED.
+pub const CLIENT_RESERVATION_DEFAULT_TTL_MS: i64 = 300_000;
+
+/// A hold this node granted to a client, and the handle that releases it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientReservation {
+    /// The OPAQUE handle. 256 bits of OS randomness, hex-encoded.
+    ///
+    /// Opaque and unguessable on purpose: `release` identifies a hold by this value alone, so a
+    /// derivable handle would let any local caller free a reservation it does not own — the
+    /// double-select this table prevents, reached through the front door instead.
+    pub reservation_id: String,
+    /// The coins held, lower-cased. Exactly what was asked for, because acquisition is all-or-none.
+    pub coin_ids: Vec<String>,
+    /// When the hold lapses, ms since the Unix epoch.
+    ///
+    /// The lifetime ACTUALLY applied, which may be shorter than the one requested. A caller told
+    /// its own requested figure would wait on a schedule this node does not keep.
+    pub expires_at_ms: i64,
+}
+
+/// One held coin, as reported by [`WalletDb::held_reservations`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedCoinRow {
+    /// The held coin id, lower-cased.
+    pub coin_id: String,
+    /// The handle holding it.
+    pub reservation_id: String,
+    /// When the hold lapses, ms since the Unix epoch.
+    pub expires_at_ms: i64,
+    /// Which phase of the lifecycle is holding the coin.
+    pub phase: ReservationPhase,
+}
+
+/// Which phase of one spend lifecycle is holding a coin.
+///
+/// Not two competing reservation systems — two stages of the same one. A coin is leased while its
+/// spend is being built, and committed once that spend has been pushed. Naming the phase keeps a
+/// reader from concluding the second table is a rival implementation of the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationPhase {
+    /// Held before broadcast, by a client that has selected coins and is building a spend.
+    ///
+    /// Releasable on demand: nothing has been pushed, so the holder still owns the decision.
+    Lease,
+    /// Held after broadcast, by a bundle this node pushed.
+    ///
+    /// NOT releasable on demand, and deliberately so: the bundle may still be included, and
+    /// freeing its inputs would invite a second spend of a coin that is already committed. The
+    /// chain ends this hold, via [`WalletDb::prune_reservations`], not a caller.
+    Broadcast,
+}
+
+/// Why a client reservation was refused.
+///
+/// The two variants demand OPPOSITE actions from a caller and are deliberately never collapsed.
+/// [`Self::Reserved`] means "wait"; [`Self::Unavailable`] means "do not spend". A caller that
+/// cannot tell them apart either double-selects or blocks a legitimate send.
+#[derive(Debug)]
+pub enum ReserveClientCoinsError {
+    /// One or more named coins are already committed to a live spend, and NOTHING was reserved.
+    ///
+    /// Deliberately distinct from any shortfall: the user has the money, it is briefly committed,
+    /// and it returns when that spend settles or its hold lapses. Reporting a shortfall here sends
+    /// someone to an exchange to solve a five-minute wait.
+    Reserved {
+        /// The coins that clashed. Named so a caller can say WHICH coins to wait for.
+        coin_ids: Vec<String>,
+    },
+    /// The reservation set could not be read or written, so what is in flight is UNKNOWN.
+    ///
+    /// Never reported as "nothing is reserved". A guard that fails open is not a guard.
+    Unavailable(sqlx::Error),
+}
+
+impl std::fmt::Display for ReserveClientCoinsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reserved { coin_ids } => write!(
+                f,
+                "{} coin(s) are committed to a live spend; nothing was reserved",
+                coin_ids.len()
+            ),
+            Self::Unavailable(e) => write!(f, "the coin-reservation set could not be read: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReserveClientCoinsError {}
+
+impl From<sqlx::Error> for ReserveClientCoinsError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Unavailable(e)
+    }
+}
+
+impl WalletDb {
+    /// Hold a named set of coins for a client that has not built its bundle yet
+    /// (dig_ecosystem#3127).
+    ///
+    /// # Why this exists beside [`Self::reserve_spend`]
+    ///
+    /// [`Self::reserve_spend`] reserves at PUSH time, as a child of a `pending_transactions` row.
+    /// That is too late to close the cross-process window: a client selects coins, then builds and
+    /// signs, and only then pushes. The whole build interval is unprotected, and a second process
+    /// sharing the wallet selects the same coins inside it.
+    ///
+    /// So this is a SEPARATE table rather than a synthetic pending transaction. Inventing a
+    /// `pending_transactions` row with no bundle would make [`Self::pending_transactions`] report
+    /// an in-flight spend that does not exist, which is a claim about money the node cannot
+    /// support.
+    ///
+    /// # All-or-none
+    ///
+    /// Every named coin is taken or none is. Reading the held set, selecting, then reserving is
+    /// check-then-act: two callers both see a coin free and both take it. Atomicity is what closes
+    /// that, and it rests on the `coin_id` PRIMARY KEY rather than on isolation level — a losing
+    /// racer fails its INSERT and the whole transaction rolls back, so a partial hold cannot exist
+    /// even if the pre-check saw a clear table.
+    ///
+    /// The pre-check is still worth its cost: it names WHICH coins clashed, and it is the only
+    /// thing that can see a clash against [`Self::reserve_spend`]'s table, whose rows share no
+    /// key with this one.
+    ///
+    /// # Ordering inside the transaction
+    ///
+    /// Retiring lapsed rows is a WRITE, and it is done FIRST on purpose: it takes SQLite's write
+    /// lock before anything is read, which is what `BEGIN IMMEDIATE` would buy. A read-then-write
+    /// transaction can be built on a snapshot that another writer has already invalidated.
+    ///
+    /// # §908
+    ///
+    /// Bookkeeping only. A coin id is a public chain fact; nothing here is or implies key
+    /// material, and this method authorizes nothing.
+    ///
+    /// `now_ms` is passed in rather than read from the clock so a test can drive the expiry edge
+    /// exactly instead of sleeping through it.
+    pub async fn reserve_client_coins(
+        &self,
+        coin_ids: &[String],
+        ttl_ms: Option<i64>,
+        now_ms: i64,
+    ) -> std::result::Result<ClientReservation, ReserveClientCoinsError> {
+        let wanted: Vec<String> = coin_ids.iter().map(|c| c.to_ascii_lowercase()).collect();
+        // Clamped, never trusted. `max(0)` because a negative or zero request must still produce a
+        // hold that lapses rather than one already expired at birth, which would read to a caller
+        // as a hold that was granted and instantly vanished.
+        let ttl = ttl_ms
+            .unwrap_or(CLIENT_RESERVATION_DEFAULT_TTL_MS)
+            .clamp(1, CLIENT_RESERVATION_MAX_TTL_MS);
+        let expires_at_ms = now_ms.saturating_add(ttl);
+        let reservation_id = new_reservation_id().map_err(ReserveClientCoinsError::Unavailable)?;
+
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM client_coin_reservations WHERE expires_at_ms <= ?")
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+
+        let mut clashes = Vec::new();
+        for id in &wanted {
+            let held: Option<(String,)> = sqlx::query_as(
+                "SELECT coin_id FROM client_coin_reservations WHERE coin_id = ?
+                 UNION ALL
+                 SELECT coin_id FROM coin_reservations WHERE coin_id = ?
+                 LIMIT 1",
+            )
+            .bind(id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if held.is_some() {
+                clashes.push(id.clone());
+            }
+        }
+        if !clashes.is_empty() {
+            // Dropping the transaction rolls it back, including the lapsed-row cleanup above.
+            // That is deliberate: a refused call must leave the table exactly as it found it, so a
+            // caller can never observe a side effect of an acquisition that did not happen.
+            return Err(ReserveClientCoinsError::Reserved { coin_ids: clashes });
+        }
+
+        for id in &wanted {
+            let inserted = sqlx::query(
+                "INSERT INTO client_coin_reservations (coin_id, reservation_id, expires_at_ms)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(id)
+            .bind(&reservation_id)
+            .bind(expires_at_ms)
+            .execute(&mut *tx)
+            .await;
+            if let Err(e) = inserted {
+                // The PRIMARY KEY refused it, so a concurrent caller took this coin between our
+                // pre-check and now. That is a clash, not an unreadable set, and the rollback on
+                // drop means nothing partial survives.
+                return Err(if is_unique_violation(&e) {
+                    ReserveClientCoinsError::Reserved {
+                        coin_ids: vec![id.clone()],
+                    }
+                } else {
+                    ReserveClientCoinsError::Unavailable(e)
+                });
+            }
+        }
+
+        tx.commit().await?;
+        Ok(ClientReservation {
+            reservation_id,
+            coin_ids: wanted,
+            expires_at_ms,
+        })
+    }
+
+    /// Free a client hold ahead of its lifetime, returning the coins it released.
+    ///
+    /// The explicit half of the release path. The TTL alone is not enough: once a spend is known
+    /// settled or known dead, holding its inputs for the rest of the window keeps a person out of
+    /// their own money over a question the chain has already answered.
+    ///
+    /// Releasing a handle that names no live hold is a SUCCESS reporting an empty list, NOT an
+    /// error. A client releasing on confirmation cannot know whether the TTL got there first, and
+    /// making the ordinary outcome an error teaches callers to discard the result.
+    ///
+    /// Frees every coin of the hold or none: one statement, one predicate.
+    ///
+    /// Only [`ReservationPhase::Lease`] holds are releasable. A post-broadcast handle reports
+    /// `false` because the chain, not the caller, ends that hold — see [`ReservationPhase`]. In
+    /// practice a caller never possesses such a handle: handles are only ever HANDED OUT by
+    /// [`Self::reserve_client_coins`].
+    pub async fn release_client_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> sqlx::Result<Vec<String>> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query("SELECT coin_id FROM client_coin_reservations WHERE reservation_id = ? ORDER BY coin_id")
+            .bind(reservation_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM client_coin_reservations WHERE reservation_id = ?")
+            .bind(reservation_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.into_iter().map(|r| r.get("coin_id")).collect())
+    }
+
+    /// Every hold that is still LIVE at `now_ms`, of BOTH phases, in coin order.
+    ///
+    /// # One answer, one handle namespace
+    ///
+    /// A coin can be held in either of two phases of the same lifecycle: a PRE-broadcast lease
+    /// taken by [`Self::reserve_client_coins`], or a POST-broadcast commitment taken by
+    /// [`Self::reserve_spend`] when a bundle was pushed. They live in different tables because the
+    /// second is a child of a `pending_transactions` row and the first has no bundle yet.
+    ///
+    /// A caller must not have to know which phase a hold is in — it asked "may I spend this coin",
+    /// and both answers are "no". So both are reported here under one `reservation_id` namespace,
+    /// with the phase carried alongside for the callers that do care.
+    ///
+    /// Filters on the instant rather than trusting either table to have been pruned: a lapsed hold
+    /// reported as live would have a caller waiting for a coin that is already free.
+    ///
+    /// The caller does not supply this time on the wire — the node reads its own clock. A
+    /// caller-supplied `now` would be a lapse oracle, since a far-future value makes every live
+    /// hold read as expired. It is a parameter HERE so a test can drive the edge exactly.
+    pub async fn held_reservations(&self, now_ms: i64) -> sqlx::Result<Vec<ReservedCoinRow>> {
+        let mut out = Vec::new();
+
+        let leases = sqlx::query(
+            "SELECT coin_id, reservation_id, expires_at_ms FROM client_coin_reservations
+             WHERE expires_at_ms > ?",
+        )
+        .bind(now_ms)
+        .fetch_all(&self.pool)
+        .await?;
+        for r in leases {
+            out.push(ReservedCoinRow {
+                coin_id: r.get("coin_id"),
+                reservation_id: r.get("reservation_id"),
+                expires_at_ms: r.get("expires_at_ms"),
+                phase: ReservationPhase::Lease,
+            });
+        }
+
+        // The post-broadcast half. Its lifetime lives on the parent transaction, so the join is
+        // what makes an expiry visible at all; a reservation row alone carries no clock.
+        let broadcast = sqlx::query(
+            "SELECT r.coin_id AS coin_id, r.transaction_id AS reservation_id,
+                    p.expires_at AS expires_at_ms
+             FROM coin_reservations r
+             JOIN pending_transactions p ON p.transaction_id = r.transaction_id
+             WHERE p.expires_at > ?",
+        )
+        .bind(now_ms)
+        .fetch_all(&self.pool)
+        .await?;
+        for r in broadcast {
+            out.push(ReservedCoinRow {
+                coin_id: r.get("coin_id"),
+                reservation_id: r.get("reservation_id"),
+                expires_at_ms: r.get("expires_at_ms"),
+                phase: ReservationPhase::Broadcast,
+            });
+        }
+
+        out.sort_by(|a, b| a.coin_id.cmp(&b.coin_id));
+        Ok(out)
+    }
+}
+
+/// 256 bits of OS randomness, hex-encoded — a reservation handle a caller cannot derive.
+///
+/// The OS CSPRNG directly rather than a seeded userspace generator: unguessability IS the access
+/// control on [`WalletDb::release_client_reservation`], so the source must be one a local attacker
+/// cannot predict or steer.
+fn new_reservation_id() -> sqlx::Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| sqlx::Error::Protocol(format!("reservation id randomness unavailable: {e}")))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether a SQLite error is the PRIMARY KEY refusing a second claim on one coin.
+///
+/// Matched on the driver's own constraint classification rather than on message text, so a phrasing
+/// change in SQLite cannot silently turn a clash into an unreadable set — which would flip the
+/// failure direction from "wait" to "do not spend" for every racing caller.
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
 }
 
 #[cfg(test)]
@@ -5140,6 +5539,480 @@ mod tests {
         assert_eq!(pending[0].submitted_at, 1_000);
         assert_eq!(pending[0].bundle_hex, "bundle-of-earlier");
     }
+    // ---- cross-process client coin reservations (dig_ecosystem#3127) ------
+    //
+    // Fixture discipline for this group. Every expiry here is driven from a PINNED `NOW` rather
+    // than the wall clock. A small literal such as `100` passed through an epoch-milliseconds API
+    // is ~1.8 trillion ms in the PAST, so a group written that way would assert acquisition while
+    // exercising only the already-lapsed path: the reservations would be dead on arrival and every
+    // "it is held" assertion would be testing nothing.
+    const NOW: i64 = 1_800_000_000_000;
+
+    /// Reserve helper: the common case, one caller, the node's default lifetime.
+    async fn hold(db: &WalletDb, ids: &[&str], now_ms: i64) -> ClientReservation {
+        db.reserve_client_coins(
+            &ids.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            None,
+            now_ms,
+        )
+        .await
+        .expect("reservation should have been granted")
+    }
+
+    async fn selectable(db: &WalletDb) -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .unreserved_unspent_coins(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.coin_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Two unspent coins, so every test below has a TRUTHFUL CONTROL: a coin that is NOT reserved
+    /// and must stay selectable. Asserting only that a held coin disappears cannot distinguish a
+    /// working filter from one that hides everything, which is the nearest wrong implementation.
+    async fn two_coin_wallet() -> WalletDb {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.migrate().await.unwrap();
+        db.upsert_coins(&[
+            coin("aa", 1_000, Some(10), None),
+            coin("bb", 2_000, Some(10), None),
+        ])
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn a_client_reservation_narrows_selection_and_leaves_its_neighbour_alone() {
+        let db = two_coin_wallet().await;
+        hold(&db, &["aa"], NOW).await;
+
+        assert_eq!(
+            selectable(&db).await,
+            vec!["bb".to_string()],
+            "the held coin must leave the selectable set and the unheld one must remain in it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reservation_narrows_selection_but_never_the_balance() {
+        let db = two_coin_wallet().await;
+        let before = db.balance(None).await.unwrap();
+        hold(&db, &["aa"], NOW).await;
+
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            before,
+            "a reserved coin is still the user money; netting it out would report money as gone \
+             before the chain has said so"
+        );
+    }
+
+    // ---- all-or-none acquisition ----------------------------------------
+
+    #[tokio::test]
+    async fn a_clash_reserves_nothing_at_all() {
+        let db = two_coin_wallet().await;
+        hold(&db, &["aa"], NOW).await;
+
+        // Ask for the held coin AND a free one. The free one is the load-bearing half: an
+        // implementation that returns the error but has already inserted `bb` satisfies an
+        // assertion about the error alone, and would silently strand `bb`.
+        let err = db
+            .reserve_client_coins(&["aa".into(), "bb".into()], None, NOW)
+            .await
+            .expect_err("a clash must refuse");
+
+        match err {
+            ReserveClientCoinsError::Reserved { coin_ids } => {
+                assert_eq!(coin_ids, vec!["aa".to_string()], "the clashing coin is named");
+            }
+            other => panic!("a clash must be Reserved, not {other:?}"),
+        }
+        assert_eq!(
+            selectable(&db).await,
+            vec!["bb".to_string()],
+            "the coin that did NOT clash must not have been taken by the failed call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clash_against_a_bundle_backed_reservation_also_refuses() {
+        // The two reservation kinds live in DIFFERENT tables, so the coin-id PRIMARY KEY cannot
+        // detect this collision for us. Without an explicit cross-table check a client would be
+        // handed a coin that a pushed bundle is already spending.
+        let db = two_coin_wallet().await;
+        db.reserve_spend(&PendingTransactionRow {
+            transaction_id: "tx1".into(),
+            bundle_hex: "ff".into(),
+            fee: None,
+            submitted_at: NOW,
+            expires_at: NOW + 600_000,
+            attempts: 1,
+            reserved_coin_ids: vec!["aa".into()],
+        })
+        .await
+        .unwrap();
+
+        let err = db
+            .reserve_client_coins(&["aa".into()], None, NOW)
+            .await
+            .expect_err("a coin committed to a pushed bundle must not be re-reservable");
+        assert!(
+            matches!(err, ReserveClientCoinsError::Reserved { .. }),
+            "a bundle-backed clash is still a WAIT, not an unavailable set: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_racing_reservations_of_one_coin_produce_exactly_one_winner() {
+        // Read-then-write is check-then-act, and both callers see the coin free. Only an atomic
+        // acquisition makes exactly one of them win. Run many rounds on a fresh coin each time: a
+        // single round can pass by luck against a broken implementation.
+        let mut rounds_with_two_winners = 0;
+        for round in 0..40 {
+            let db = std::sync::Arc::new(WalletDb::open_in_memory().await.unwrap());
+            db.migrate().await.unwrap();
+            let id = format!("race{round}");
+            db.upsert_coins(&[coin(&id, 1_000, Some(10), None)])
+                .await
+                .unwrap();
+
+            let (a, b) = (db.clone(), db.clone());
+            let (ida, idb) = (id.clone(), id.clone());
+            let ta = tokio::spawn(async move { a.reserve_client_coins(&[ida], None, NOW).await });
+            let tb = tokio::spawn(async move { b.reserve_client_coins(&[idb], None, NOW).await });
+            let winners = [ta.await.unwrap().is_ok(), tb.await.unwrap().is_ok()]
+                .iter()
+                .filter(|w| **w)
+                .count();
+
+            if winners == 2 {
+                rounds_with_two_winners += 1;
+            }
+            assert!(winners >= 1, "round {round}: both callers lost the coin");
+        }
+        assert_eq!(
+            rounds_with_two_winners, 0,
+            "the same coin was handed to two callers at once, which is the double-select this \
+             table exists to prevent reached through the table itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_reservation_succeeds_and_holds_nothing() {
+        let db = two_coin_wallet().await;
+        let r = db.reserve_client_coins(&[], None, NOW).await.unwrap();
+
+        assert!(r.coin_ids.is_empty());
+        assert_eq!(
+            selectable(&db).await,
+            vec!["aa".to_string(), "bb".to_string()],
+            "an empty selection is legitimate and must not look malformed"
+        );
+    }
+
+    // ---- the release path, all four ways a hold can end ------------------
+    //
+    // An acquire-only battery is vacuous: a reservation with no release path is a wallet that
+    // locks itself out of its own funds, which is WORSE than the double-select it prevents. Each
+    // of the four endings gets its own test.
+
+    #[tokio::test]
+    async fn release_1_of_4_explicit_release_frees_the_coin_immediately() {
+        let db = two_coin_wallet().await;
+        let r = hold(&db, &["aa"], NOW).await;
+
+        let freed = db
+            .release_client_reservation(&r.reservation_id)
+            .await
+            .unwrap();
+
+        assert_eq!(freed, vec!["aa".to_string()], "release names what it freed");
+        assert_eq!(
+            selectable(&db).await,
+            vec!["aa".to_string(), "bb".to_string()],
+            "an explicitly released coin is selectable again without waiting out the TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_2_of_4_a_confirmed_spend_retires_the_hold_with_no_release_call() {
+        // The confirm path must not depend on anyone remembering to call release: the client that
+        // would have called it may be gone by the time the chain answers.
+        let db = two_coin_wallet().await;
+        hold(&db, &["aa"], NOW).await;
+
+        db.upsert_coins(&[coin("aa", 1_000, Some(10), Some(11))])
+            .await
+            .unwrap();
+        db.prune_reservations(NOW).await.unwrap();
+
+        assert!(
+            !db.reserved_coin_ids().await.unwrap().contains("aa"),
+            "a coin the chain reports SPENT is not being held for anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_3_of_4_a_lapsed_hold_is_retired_by_the_ttl_alone() {
+        let db = two_coin_wallet().await;
+        let r = hold(&db, &["aa"], NOW).await;
+
+        // One millisecond BEFORE the expiry the hold is still live. Without this half the test
+        // would pass against an implementation that expires everything instantly.
+        db.prune_reservations(r.expires_at_ms - 1).await.unwrap();
+        assert_eq!(
+            selectable(&db).await,
+            vec!["bb".to_string()],
+            "the hold lapsed early, so the TTL is not being honoured"
+        );
+
+        db.prune_reservations(r.expires_at_ms).await.unwrap();
+        assert_eq!(
+            selectable(&db).await,
+            vec!["aa".to_string(), "bb".to_string()],
+            "the hold outlived its TTL, which is a funds lockout"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_4_of_4_an_abandoned_hold_cannot_strand_a_coin_forever() {
+        // Process death: the reserving client never calls release and never comes back. Nothing in
+        // the system knows its handle. Only the unconditional expiry recovers the coin.
+        let db = two_coin_wallet().await;
+        let r = hold(&db, &["aa"], NOW).await;
+        drop(r); // the handle is gone; no one can ever release it explicitly
+
+        db.prune_reservations(NOW + CLIENT_RESERVATION_MAX_TTL_MS + 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            selectable(&db).await,
+            vec!["aa".to_string(), "bb".to_string()],
+            "an abandoned reservation stranded the user coin permanently"
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_an_unknown_handle_is_a_success_that_freed_nothing() {
+        // A client releasing on confirmation cannot know whether the TTL got there first. Making
+        // that an error teaches callers to ignore the result of release, which is worse.
+        let db = two_coin_wallet().await;
+        let freed = db
+            .release_client_reservation(&"0".repeat(64))
+            .await
+            .unwrap();
+        assert!(
+            freed.is_empty(),
+            "an unknown handle freed nothing, and that is not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_frees_every_coin_of_a_multi_coin_hold() {
+        let db = two_coin_wallet().await;
+        let r = hold(&db, &["aa", "bb"], NOW).await;
+
+        let mut freed = db
+            .release_client_reservation(&r.reservation_id)
+            .await
+            .unwrap();
+        freed.sort();
+        assert_eq!(freed, vec!["aa".to_string(), "bb".to_string()]);
+        assert_eq!(
+            selectable(&db).await,
+            vec!["aa".to_string(), "bb".to_string()]
+        );
+    }
+
+    // ---- expiry must not defeat the spent check (the epic own invariant) ----
+
+    #[tokio::test]
+    async fn a_lapsed_reservation_does_not_resurrect_a_spent_coin() {
+        // The registry is a filter LAYERED ON the chain read, never a replacement for it. If a
+        // lapsed hold could make a spent coin selectable again, expiry would have become a way to
+        // build a bundle over money that is already gone.
+        let db = two_coin_wallet().await;
+        let r = hold(&db, &["aa"], NOW).await;
+        db.upsert_coins(&[coin("aa", 1_000, Some(10), Some(11))])
+            .await
+            .unwrap();
+
+        db.prune_reservations(r.expires_at_ms + 1).await.unwrap();
+
+        assert_eq!(
+            selectable(&db).await,
+            vec!["bb".to_string()],
+            "a SPENT coin became selectable once its reservation lapsed"
+        );
+    }
+
+    // ---- the lifetime the node actually applied --------------------------
+
+    #[tokio::test]
+    async fn an_over_long_ttl_is_clamped_to_the_node_maximum() {
+        let db = two_coin_wallet().await;
+        let day_ms = 86_400_000;
+        let r = db
+            .reserve_client_coins(&["aa".into()], Some(day_ms), NOW)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r.expires_at_ms,
+            NOW + CLIENT_RESERVATION_MAX_TTL_MS,
+            "a caller was told nothing would wait on a schedule the node does not keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shorter_ttl_than_the_maximum_is_honoured_as_asked() {
+        // The clamp must be a ceiling, not a flat override; otherwise the test above passes
+        // against an implementation that ignores `ttl_ms` entirely.
+        let db = two_coin_wallet().await;
+        let r = db
+            .reserve_client_coins(&["aa".into()], Some(30_000), NOW)
+            .await
+            .unwrap();
+        assert_eq!(r.expires_at_ms, NOW + 30_000);
+    }
+
+    #[tokio::test]
+    async fn the_default_lifetime_is_applied_when_none_is_asked_for() {
+        let db = two_coin_wallet().await;
+        let r = hold(&db, &["aa"], NOW).await;
+        assert_eq!(r.expires_at_ms, NOW + CLIENT_RESERVATION_DEFAULT_TTL_MS);
+    }
+
+    // ---- the handle -------------------------------------------------------
+
+    #[tokio::test]
+    async fn reservation_handles_are_unguessable_and_distinct() {
+        // A handle a caller can derive lets it release a reservation it does not own, which is the
+        // double-select reached through the front door.
+        let db = two_coin_wallet().await;
+        let a = hold(&db, &["aa"], NOW).await;
+        let b = hold(&db, &["bb"], NOW).await;
+
+        assert_ne!(a.reservation_id, b.reservation_id);
+        assert_eq!(a.reservation_id.len(), 64, "256 bits of handle, hex-encoded");
+        assert!(a.reservation_id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            a.reservation_id.chars().any(|c| c != '0'),
+            "an all-zero handle would mean the generator never ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_one_hold_leaves_another_holder_coin_alone() {
+        let db = two_coin_wallet().await;
+        let a = hold(&db, &["aa"], NOW).await;
+        let _b = hold(&db, &["bb"], NOW).await;
+
+        db.release_client_reservation(&a.reservation_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            selectable(&db).await,
+            vec!["aa".to_string()],
+            "releasing one handle must not free a coin held under a different one"
+        );
+    }
+
+    // ---- the held set ------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_held_set_reports_live_holds_and_omits_lapsed_ones() {
+        let db = two_coin_wallet().await;
+        let r = hold(&db, &["aa"], NOW).await;
+
+        let live = db.held_reservations(NOW).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].coin_id, "aa");
+        assert_eq!(live[0].reservation_id, r.reservation_id);
+        assert_eq!(live[0].expires_at_ms, r.expires_at_ms);
+        assert_eq!(live[0].phase, ReservationPhase::Lease);
+
+        assert!(
+            db.held_reservations(r.expires_at_ms)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a lapsed hold must not be reported as live, or a caller waits for nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_held_set_reports_both_phases_under_one_namespace() {
+        // A caller asked "may I spend this coin". Both phases answer no, so both must appear in
+        // ONE answer. Reporting only the lease table would tell a client that a coin committed to
+        // an already-pushed bundle is free — the exact double-select this serves to prevent, and
+        // the failure a lease-only reader would produce while passing every test above.
+        let db = two_coin_wallet().await;
+        hold(&db, &["aa"], NOW).await;
+        db.reserve_spend(&PendingTransactionRow {
+            transaction_id: "tx-broadcast".into(),
+            bundle_hex: "ff".into(),
+            fee: None,
+            submitted_at: NOW,
+            expires_at: NOW + 600_000,
+            attempts: 1,
+            reserved_coin_ids: vec!["bb".into()],
+        })
+        .await
+        .unwrap();
+
+        let live = db.held_reservations(NOW).await.unwrap();
+        let seen: Vec<(String, ReservationPhase)> = live
+            .iter()
+            .map(|r| (r.coin_id.clone(), r.phase))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("aa".to_string(), ReservationPhase::Lease),
+                ("bb".to_string(), ReservationPhase::Broadcast),
+            ],
+            "both phases of one lifecycle belong in one held answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_broadcast_hold_is_not_releasable_by_a_caller() {
+        // The bundle may still be included. Freeing its inputs on request would invite a second
+        // spend of a coin that is already committed, which is worse than the wait it saves.
+        let db = two_coin_wallet().await;
+        db.reserve_spend(&PendingTransactionRow {
+            transaction_id: "tx-broadcast".into(),
+            bundle_hex: "ff".into(),
+            fee: None,
+            submitted_at: NOW,
+            expires_at: NOW + 600_000,
+            attempts: 1,
+            reserved_coin_ids: vec!["aa".into()],
+        })
+        .await
+        .unwrap();
+
+        let freed = db
+            .release_client_reservation("tx-broadcast")
+            .await
+            .unwrap();
+
+        assert!(freed.is_empty(), "release must not reach a post-broadcast hold");
+        assert_eq!(
+            selectable(&db).await,
+            vec!["bb".to_string()],
+            "the pushed bundle's input stayed held"
+        );
+    }
 }
 
 /// **Hex CASE is not part of a stored value's identity** (dig-node#298).
@@ -5766,5 +6639,3 @@ mod stored_hex_is_case_insensitive {
         );
     }
 }
-
-// dig_ecosystem#3127 (WIP): standalone client coin reservations served over the control interface.
