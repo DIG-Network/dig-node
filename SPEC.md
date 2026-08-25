@@ -3245,6 +3245,16 @@ can point at it. No new verb, address struct or result type is introduced — th
   A NON-empty result is not an absence claim, so a failure beside it is immaterial and MUST NOT cost
   the caller a holder.
 
+  **A located holder and an established absence are MUTUALLY EXCLUSIVE.** `absence_established` MUST be
+  `false` whenever the answer names ANY provider, on every surface that carries it — the emptiness is
+  part of the claim itself and MUST NOT be left to a caller's control flow. dig-node enforces this in
+  `LocatedHolders::establishes_absence()`, which requires an empty record set AND both legs finished.
+  Deriving it from conclusiveness alone was correct only at the one call site that happened to ask
+  inside an emptiness guard; `dig.getAvailability` asks unconditionally and so returned
+  `absence_established: true` in the same object that named a holder (dig_ecosystem#3159). A surface
+  that names who holds the content while asserting it established the content's absence is lying about
+  where content is, which is the manufactured not-found this clause exists to prevent.
+
   `dig.getAvailability` additionally carries `absence_established` on its miss answer, defined by
   `dig-rpc-protocol` (`AvailabilityAnswer::absence_established`). It has **THREE** states and dig-node
   MUST NOT collapse them:
@@ -5949,17 +5959,23 @@ same `peer_id` (newest-wins re-adoption), and that is typically a MOVE — a dea
 a direct dial. The superseded addresses are RETAINED as trailing fallbacks (a still-working older path is
 not discarded) but MUST NOT be dialed first. Re-adoption MUST NOT grow the candidate set: the pool is
 keyed by `peer_id`, so a republished `PeerAdded` upserts one entry — a re-adopted peer is one candidate,
-never two. A connected-pool holder is NOT gated behind a separate `dig.getAvailability`
-confirm probe: the download transport short-circuits the confirm to *available* for any provider whose
-`peer_id` is currently in the connected pool (`PoolConfirmTransport`, #836), so the fetch proceeds
-straight to `dig.fetchRange`. This is required because dig-download's `locate_and_confirm` DROPS any
-provider whose availability answer is not *available*, and a connected holder can answer
-not-available as a FALSE NEGATIVE on a relayed / isolated net (a cache-inventory lag, a
-resource-vs-capsule granularity quirk) or have its probe transiently fail — either of which would drop
-the connected holder, issue ZERO `dig.fetchRange`, and dead-end the read at the §21 upstream backfill
-(404) despite a connected, serving holder. Safety is preserved by the whole-resource merkle check, which
-binds every served byte to the chain-anchored root: a connected NON-holder simply fails its ranges and
-is dropped there, a safe pool-bounded probe. A DHT-only (non-pool) provider still goes through the real
+never two. A connected-pool holder whose `dig.getAvailability` confirm probe CANNOT BE OBTAINED is admitted to
+the download anyway (`PoolConfirmTransport`, #836): dig-download's `locate_and_confirm` DROPS any
+provider whose availability answer is not *available*, and a connected holder's probe can transiently
+FAIL on a relayed / isolated net — which would drop the connected holder, issue ZERO `dig.fetchRange`,
+and dead-end the read at the §21 upstream backfill (404) despite a connected, serving holder. On a probe
+ERROR the live connection stands as the confirmation and the fetch proceeds straight to
+`dig.fetchRange`. Safety is preserved by the whole-resource merkle check, which binds every served byte
+to the chain-anchored root: a connected NON-holder simply fails its ranges and is dropped there.
+
+**The bypass covers a MISSING answer and MUST NOT cover a NEGATIVE one.** A connected peer MUST still be
+ASKED, and an answer of *not-available* MUST be honoured exactly as a DHT-only provider's is. Fabricating
+*available* for every connected peer — the pre-0.153.0 behaviour — did not merely add a bad candidate: it
+qualified a peer for free while the DHT-only true holder still had to earn its place, so a STALE record
+OUTRANKED the real holder (dig_ecosystem#3159 measured 21 range attempts at a stale `peer_id` and 0 at
+the holder). Honouring a not-available answer is sound under NC-12 because it is a self-NEGATIVE claim
+and can never admit a byte; the worst case is skipping a peer that lied about not holding, which costs
+one candidate. Trusting a self-POSITIVE claim is what NC-12 forbids. A DHT-only (non-pool) provider still goes through the real
 `dig.getAvailability` confirm. This source is DOWNLOAD-only — it never feeds the redirect/availability
 hint above.
 
