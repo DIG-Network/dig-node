@@ -1507,3 +1507,9 @@ processes contend for one port the loser is exactly the party who needs to be to
 "does not stop the node", never "is not reported": the outcome is now logged at WARN and
 published on `control.status`, so `dign info` says `wallet mTLS UNAVAILABLE (port 9776 held by
 another process ...)`. Any other best-effort bind in this repo should be read the same way.
+
+## NC-12: anchored-root corroboration + the sole-owner sweep's scope (dig-node#365/#366)
+
+WIP marker for the lane taking dig-node#365 (the anchored root is resolved from ONE hardcoded HTTP
+third party) and dig-node#366 (the sole-owner sweep walks `dig-wallet/src` only). Replaced by the
+real entries as the work lands.
