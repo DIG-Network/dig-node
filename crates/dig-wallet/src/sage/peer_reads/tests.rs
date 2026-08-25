@@ -966,7 +966,9 @@ fn tip(height: u32) -> super::super::quorum::PeakClaim {
 ///
 /// The coin voice is deliberately `Silent` throughout: it isolates the peak round, so a passing
 /// assertion cannot be explained by a coin answer.
-async fn peak_reads_over(peaks: Vec<Option<super::super::quorum::PeakClaim>>) -> PeerCorroboratedReads {
+async fn peak_reads_over(
+    peaks: Vec<Option<super::super::quorum::PeakClaim>>,
+) -> PeerCorroboratedReads {
     let db = WalletDb::open_in_memory().await.unwrap();
     let sample = Arc::new(ScriptedSample {
         voices: vec![Voice::Silent; peaks.len()],

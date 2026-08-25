@@ -211,7 +211,10 @@ mod sole_owner_tests {
     /// which would be the silent direction.
     fn production_call_sites() -> Vec<String> {
         let mut files = Vec::new();
-        rust_files(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(), &mut files);
+        rust_files(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(),
+            &mut files,
+        );
         files.sort();
 
         let mut sites = Vec::new();
@@ -242,7 +245,10 @@ mod sole_owner_tests {
     #[test]
     fn the_sweep_can_find_a_construction_site_at_all() {
         let mut files = Vec::new();
-        rust_files(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(), &mut files);
+        rust_files(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(),
+            &mut files,
+        );
         let total: usize = files
             .iter()
             .map(|f| {
@@ -294,7 +300,9 @@ mod custody_fails_closed_tests {
     //! where money goes merely by answering first.
 
     use super::*;
-    use chia_query::provider_registry::interface::{ChainSource, ChainSourceError, ChainSourceProvider};
+    use chia_query::provider_registry::interface::{
+        ChainSource, ChainSourceError, ChainSourceProvider,
+    };
 
     /// A `ChiaQuery` that dials nothing: `max_peers: 0` leaves the peer tier with nothing to draw,
     /// so it performs no DNS and no TLS handshake. The coinset tier stays enabled only because
@@ -329,7 +337,10 @@ mod custody_fails_closed_tests {
         let rt = multi_thread();
         let registry = rt.block_on(async {
             let sources = NodeChainSources::with_client(offline_client().await);
-            sources.registry().await.expect("the registry needs no network")
+            sources
+                .registry()
+                .await
+                .expect("the registry needs no network")
         });
 
         let refusal = registry
@@ -353,7 +364,10 @@ mod custody_fails_closed_tests {
         let rt = multi_thread();
         let registry = rt.block_on(async {
             let sources = NodeChainSources::with_client(offline_client().await);
-            sources.registry().await.expect("the registry needs no network")
+            sources
+                .registry()
+                .await
+                .expect("the registry needs no network")
         });
 
         // chia-query gives the oracle a higher (later) priority number than this node's peers, so

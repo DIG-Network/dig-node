@@ -1955,10 +1955,16 @@ impl WalletBackend {
                 synced: self.replica_answer_is_current(Some(peak_height)).await,
             });
         }
-        // The replica has no height, so answering means an OUTBOUND call to the third-party tier.
-        // That call is subject to the SAME global bound as the other open reads (#1957): this is an
-        // unauthenticated loopback endpoint, so without the bound a local process (or a
-        // CORS-reflected origin) could loop it into egress amplification against that third party.
+        // The replica has no height, so answering means an OUTBOUND round to the chain tier —
+        // since dig_ecosystem#2790 a concurrent ask of the node's OWN dialled peers, settled on
+        // their agreement, rather than a read of a third-party oracle. `Ok(None)` from it is the
+        // peers failing to agree, which this endpoint reports as an unknown height; it is never
+        // repaired from a single source.
+        //
+        // The bound still applies, and for the same reason (#1957): this is an unauthenticated
+        // loopback endpoint, so without it a local process (or a CORS-reflected origin) could loop
+        // it into egress amplification — now against the peer set rather than against coinset,
+        // which is if anything the more valuable resource to protect.
         //
         // Guarded HERE rather than inherited from the coin read, because a bound that lives inside
         // one method's fallback arm covers exactly that method -- and a caller bounding a claimed
