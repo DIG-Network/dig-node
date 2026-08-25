@@ -23,6 +23,11 @@
 //! ([`ProviderRegistry::trusted`]) **fails closed** on a default install: no public oracle and no
 //! randomly dialled peer may decide where money goes merely by answering first.
 //!
+//! The classification is derived from what the sources can actually REACH, not from what they are
+//! called — see [`independence_group_for`]. A quorum counts distinct independence groups, so a
+//! group id that overstates independence converts a 2-of-2 quorum into one endpoint answering
+//! twice.
+//!
 //! It does NOT own the peer sessions that carry a corroborated read. Those are drawn
 //! independently by [`super::peer_reads::DialedPeerSample`] and by
 //! [`super::sync_supervisor::ChiaQuorumCorroborator`], on purpose: NC-12 asks for AGREEMENT across
@@ -30,13 +35,19 @@
 //! would unify the owner by destroying the plurality. **One dialler is the goal; one voice is a
 //! regression.**
 //!
-//! # Try-order: this node's peers before the oracle
+//! # Try-order, and what it does NOT buy
 //!
-//! The peer provider registers at [`PEER_PROVIDER_PRIORITY`], ahead of coinset's. `chia-query`'s
-//! own router asks `api.coinset.org` FIRST and consults this node's peers only when that fails, so
-//! a read taken straight off the router is a third party's view of the chain even on a node
-//! holding five peers. The registry's discovery view inverts that: the node's own peers answer,
-//! and the oracle is what is left when they cannot.
+//! The peer provider registers at [`PEER_PROVIDER_PRIORITY`], ahead of coinset's, so the discovery
+//! view asks it first. That orders the two REGISTRATIONS; it cannot reorder what happens inside
+//! the first one. `chia-query`'s router asks `api.coinset.org` FIRST and consults this node's
+//! peers only when that fails, so a read served by the peer provider is still a third party's view
+//! of the chain even on a node holding five peers.
+//!
+//! The read that genuinely removed the third party is the corroborated peak in
+//! [`super::peer_reads`], which reads held peer streams and never falls through to an oracle. The
+//! registry's contribution is honest ENUMERATION and honest CLASSIFICATION of what remains — which
+//! is why the peer provider is grouped with the oracle while it is backed by a coinset-first
+//! router.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -62,8 +73,48 @@ pub const PEER_PROVIDER_PRIORITY: i32 = 5;
 /// peers it holds — counting it as several would let a quorum be satisfied by a single dialler.
 pub const PEER_INDEPENDENCE_GROUP: &str = "chia-peers";
 
+/// This node's peer provider's ID — its NAME in the registry, which is not its trust grouping.
+///
+/// Kept distinct from the independence group because the two answer different questions: the id
+/// says which provider answered, the group says who else it could be lying with.
+pub const PEER_PROVIDER_ID: &str = "chia-peers";
+
 /// The independence group of the public coinset oracle.
 pub const ORACLE_INDEPENDENCE_GROUP: &str = "coinset.org";
+
+/// The config every production fabric is built from — the one place its shape is decided.
+///
+/// Named rather than inlined because [`independence_group_for`] classifies the fabric from it: a
+/// future change to what the fabric may reach must move its trust classification with it, and it
+/// can only do that if both read the same value.
+fn client_config() -> ChiaQueryConfig {
+    ChiaQueryConfig::default()
+}
+
+/// The independence group a peer provider backed by `cfg` belongs to.
+///
+/// # Why this is derived rather than declared
+///
+/// chia-query's quorum counts DISTINCT independence groups, and its own definition of a group is
+/// *"sources that could fail or lie together — e.g. two views of the same coinset.org"*. A
+/// `ChiaQuery` built with `coinset_fallback_enabled` asks `api.coinset.org` first and consults its
+/// peers only when that fails, so such a fabric IS a view of coinset.org — however many peers it
+/// holds. Registering it as its own group made a 2-of-2 independent-group custody quorum
+/// satisfiable by one HTTPS endpoint: measured on a `max_peers: 0` client, which holds no peers at
+/// all, the custody view returned a peak. Naming the group after the provider TYPE rather than
+/// after what it can reach is what made that possible.
+///
+/// So: a fabric that can fall through to the oracle shares the oracle's group, and only a fabric
+/// that cannot is counted as an independent peer source. The property this establishes is that two
+/// providers counted as independent cannot both be satisfied by the same endpoint.
+#[must_use]
+pub fn independence_group_for(cfg: &ChiaQueryConfig) -> &'static str {
+    if cfg.coinset_fallback_enabled {
+        ORACLE_INDEPENDENCE_GROUP
+    } else {
+        PEER_INDEPENDENCE_GROUP
+    }
+}
 
 /// The node's chain sources: one peer fabric, and the registry that names it.
 ///
@@ -74,6 +125,8 @@ pub const ORACLE_INDEPENDENCE_GROUP: &str = "coinset.org";
 pub struct NodeChainSources {
     /// `None` until the first use builds it.
     client: Mutex<Option<Arc<ChiaQuery>>>,
+    /// The independence group the fabric is registered in, decided by what it can REACH.
+    peer_group: &'static str,
 }
 
 impl Default for NodeChainSources {
@@ -88,6 +141,7 @@ impl NodeChainSources {
     pub fn new() -> Self {
         Self {
             client: Mutex::new(None),
+            peer_group: independence_group_for(&client_config()),
         }
     }
 
@@ -96,10 +150,16 @@ impl NodeChainSources {
     /// Seeding is what makes pointer identity assertable: a consumer that quietly built its own
     /// fabric returns a different `Arc`, which no agreement-based assertion could tell apart from
     /// sharing — two pools that happened to pick the same peers agree too.
+    ///
+    /// A fabric handed in from outside carries no description of what it can reach, so it is
+    /// classified CONSERVATIVELY: it shares the oracle's independence group. Guessing the other
+    /// way would let a caller manufacture independence by construction, which is the failure this
+    /// classification exists to remove.
     #[must_use]
     pub fn with_client(client: Arc<ChiaQuery>) -> Self {
         Self {
             client: Mutex::new(Some(client)),
+            peer_group: ORACLE_INDEPENDENCE_GROUP,
         }
     }
 
@@ -113,7 +173,7 @@ impl NodeChainSources {
             return Ok(existing.clone());
         }
         let built = Arc::new(
-            ChiaQuery::new(ChiaQueryConfig::default())
+            ChiaQuery::new(client_config())
                 .await
                 .map_err(|e| Error::internal(format!("no chain source could be reached: {e}")))?,
         );
@@ -159,13 +219,27 @@ impl NodeChainSources {
     /// reads fail closed with a clear error rather than deadlocking. Registration itself is
     /// runtime-agnostic, so building the registry is always safe.
     pub async fn registry(&self) -> Result<ProviderRegistry> {
+        self.registry_with_public_quorum_custody(false).await
+    }
+
+    /// The registry, with chia-query's pure-public-quorum custody rule set explicitly.
+    ///
+    /// Production always passes `false`: custody must be decided by an operator-trusted source, not
+    /// by two public sources agreeing. The parameter exists because the `true` case is the one that
+    /// can be WRONG — it is where an overstated independence group turns into a custody answer —
+    /// and a property that is only reachable through a flag nobody can set is a property nobody can
+    /// test. See `independence_tests` below.
+    async fn registry_with_public_quorum_custody(
+        &self,
+        allow_public_quorum_custody: bool,
+    ) -> Result<ProviderRegistry> {
         let client = self.client().await?;
 
         let peers = ChiaQueryProvider::new(
             client,
             tokio::runtime::Handle::current(),
             ProviderInfo {
-                id: ProviderId(Cow::Borrowed(PEER_INDEPENDENCE_GROUP)),
+                id: ProviderId(Cow::Borrowed(PEER_PROVIDER_ID)),
                 kind: ProviderKind::DigPeers,
                 priority: PEER_PROVIDER_PRIORITY,
                 // What makes a coin read sound here is the corroborated round in
@@ -177,8 +251,130 @@ impl NodeChainSources {
             .map_err(|e| Error::internal(format!("coinset provider unavailable: {e}")))?;
 
         Ok(ProviderRegistry::new()
-            .register(Box::new(peers), None, PEER_INDEPENDENCE_GROUP)
+            .allow_public_quorum_custody(allow_public_quorum_custody)
+            .register(Box::new(peers), None, self.peer_group)
             .register(Box::new(oracle), None, ORACLE_INDEPENDENCE_GROUP))
+    }
+}
+
+#[cfg(test)]
+mod independence_tests {
+    //! Two providers counted as INDEPENDENT must not be satisfiable by the same endpoint.
+    //!
+    //! chia-query's quorum counts distinct independence groups, so a group id that overstates
+    //! independence does not merely mislabel a source — it lets one endpoint answer twice and
+    //! satisfy a 2-of-2 custody quorum by itself. That is what this module pins.
+
+    use super::*;
+    use chia_query::provider_registry::interface::{ChainSource, ChainSourceError};
+
+    fn multi_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a multi-thread runtime")
+    }
+
+    /// A client that holds NO peers, so nothing but the oracle could possibly answer through it.
+    async fn peerless_client() -> Arc<ChiaQuery> {
+        Arc::new(
+            ChiaQuery::new(ChiaQueryConfig {
+                max_peers: 0,
+                ..client_config()
+            })
+            .await
+            .expect("a zero-peer client with the coinset tier enabled always constructs"),
+        )
+    }
+
+    /// The classification tracks what the fabric can REACH, in both directions.
+    ///
+    /// Both directions are asserted because a classifier that answered "coinset.org" for everything
+    /// would satisfy the safety half while destroying the point: a genuinely peers-only fabric must
+    /// still count as an independent source.
+    #[test]
+    fn a_fabric_that_can_reach_the_oracle_is_grouped_with_the_oracle() {
+        let coinset_first = ChiaQueryConfig {
+            coinset_fallback_enabled: true,
+            ..ChiaQueryConfig::default()
+        };
+        let peers_only = ChiaQueryConfig {
+            coinset_fallback_enabled: false,
+            ..ChiaQueryConfig::default()
+        };
+
+        assert_eq!(
+            independence_group_for(&coinset_first),
+            ORACLE_INDEPENDENCE_GROUP,
+            "a fabric whose router asks api.coinset.org first is a VIEW of coinset.org, so \
+             counting it as its own independence group lets one endpoint satisfy a 2-of-2 quorum"
+        );
+        assert_eq!(
+            independence_group_for(&peers_only),
+            PEER_INDEPENDENCE_GROUP,
+            "a fabric that cannot fall through to the oracle is a genuinely independent source and \
+             must still be counted as one"
+        );
+    }
+
+    /// The production fabric is the coinset-first one, so the registry inherits the oracle's group.
+    ///
+    /// This is the link that makes the classifier load-bearing rather than decorative: it reads the
+    /// same [`client_config`] that [`NodeChainSources::client`] builds from, so flipping the
+    /// production config moves the trust classification with it instead of leaving a stale label.
+    #[test]
+    fn the_production_fabric_is_classified_from_the_config_it_is_built_with() {
+        assert!(
+            client_config().coinset_fallback_enabled,
+            "this test describes the coinset-first fabric; if the production config becomes \
+             peers-only, the grouping below changes with it and this file should say so"
+        );
+        assert_eq!(
+            NodeChainSources::new().peer_group,
+            ORACLE_INDEPENDENCE_GROUP,
+            "the registered peer provider must share the oracle's group while the fabric behind it \
+             asks the oracle first"
+        );
+        let external = multi_thread().block_on(async { peerless_client().await });
+        assert_eq!(
+            NodeChainSources::with_client(external).peer_group,
+            ORACLE_INDEPENDENCE_GROUP,
+            "a fabric handed in from outside describes nothing about what it can reach, so it must \
+             be grouped conservatively"
+        );
+    }
+
+    /// One endpoint must not be able to satisfy a 2-of-2 independent-group custody quorum.
+    ///
+    /// The client holds ZERO peers, so the only thing that can answer either registration is
+    /// api.coinset.org. Before the grouping fix this returned `Ok(Some(peak))` from a node with no
+    /// peers at all — a "quorum" of one HTTPS endpoint counted twice.
+    ///
+    /// # What this test can and cannot see
+    ///
+    /// On a machine that cannot reach api.coinset.org, the pre-fix code also refuses, and this
+    /// assertion passes for the wrong reason. That is why it is PAIRED with the two classification
+    /// tests above, which need no network and pin the mechanism rather than the outcome.
+    #[test]
+    fn public_quorum_custody_cannot_be_satisfied_by_a_single_endpoint() {
+        let rt = multi_thread();
+        let registry = rt.block_on(async {
+            let sources = NodeChainSources::with_client(peerless_client().await);
+            sources
+                .registry_with_public_quorum_custody(true)
+                .await
+                .expect("the registry needs no network")
+        });
+
+        let refusal = registry.trusted().peak_height().expect_err(
+            "a node holding ZERO peers has only one source that can answer — api.coinset.org — so \
+             a quorum requiring two INDEPENDENT groups must not be satisfiable",
+        );
+        assert!(
+            matches!(refusal, ChainSourceError::NoProvider),
+            "the refusal must come from the quorum rule (too few independent groups), not from a \
+             provider-level failure; got {refusal:?}"
+        );
     }
 }
 
