@@ -21,8 +21,10 @@
 //! overstatement here becomes the ecosystem's record of a discharged obligation:
 //!
 //! * **The enforcement is `sole_owner_tests`.** It fails when a second `ChiaQuery::new` appears in
-//!   production code anywhere in this crate. That is a CI gate over the source, and it is what
-//!   makes the clause a property rather than an absence.
+//!   production code anywhere in this crate that its classifier can SEE — a CI gate over the
+//!   source, and what makes the clause a property rather than an absence. It is a heuristic, not a
+//!   parse: `sweep` names every shape it mis-reads and the direction each one fails in, and it
+//!   refuses outright on a file it could not finish classifying.
 //! * **The registry gives the sweep its target**, by being the thing the one permitted construction
 //!   registers into. Registering does not make the registry a control.
 //! * **Nothing in production reads the registry.** [`NodeChainSources::registry`] has no production
@@ -443,9 +445,17 @@ mod sole_owner_tests {
 
     /// Whether `line` ends a top-level item, judged only at column 0.
     ///
-    /// Rust items introduced by a column-0 attribute close at column 0: a block ends on a bare `}`
-    /// there, and a one-line item (`#[cfg(test)] use …;`) ends on a `;` there. Anything indented is
-    /// still inside the item.
+    /// Rust items introduced by a column-0 attribute close at column 0, and a column-0 line ending
+    /// in `}` or `;` is the end of one — a block's own closing brace, a one-line item
+    /// (`#[cfg(test)] use …;`), or a whole item written on ONE line (`#[cfg(test)] fn helper() {}`).
+    /// Anything indented is still inside the item.
+    ///
+    /// The one-line block is why this tests "ends with `}`" rather than "IS `}`". Requiring the
+    /// bare brace missed `fn helper() {}`, `mod probe {}` and `impl X {}` — each of which left the
+    /// latch set for the rest of the file AND left [`Swept::ended_inside_a_test_item`] `false`, so
+    /// the sweep went blind and the fail-closed flag did not fire. `rustfmt` preserves those
+    /// one-liners, so formatting does not suppress the shape. No file in this crate has it today;
+    /// the guard is written for the file somebody adds tomorrow.
     ///
     /// Column 0 is the entire mechanism, and it is what makes this immune to the defect it
     /// replaces. Counting braces meant counting them inside STRING LITERALS, and the crate's
@@ -455,11 +465,8 @@ mod sole_owner_tests {
     /// look at it is both simpler and stricter than trying to parse it out.
     fn ends_a_column_0_item(line: &str) -> bool {
         let trimmed = line.trim_end();
-        if trimmed == "}" {
-            return true;
-        }
         let at_column_0 = !trimmed.starts_with(char::is_whitespace) && !trimmed.is_empty();
-        at_column_0 && trimmed.ends_with(';')
+        at_column_0 && (trimmed.ends_with('}') || trimmed.ends_with(';'))
     }
 
     /// Sweep `text` for PRODUCTION calls to `CONSTRUCTOR`.
@@ -489,9 +496,24 @@ mod sole_owner_tests {
     ///   column-0 test module.
     /// * A `}` or a `;` at column 0 INSIDE a multi-line string literal clears the latch early, so
     ///   the rest of a test module is read as production. Also noisy, also loud.
-    /// * The one silent shape left — a column-0 `#[cfg(test)]` item that never appears to close —
-    ///   is not silent, because [`Swept::ended_inside_a_test_item`] reports it and the assertion
-    ///   REFUSES. When this classifier cannot tell, it says so instead of returning nothing.
+    /// * A `#[cfg(test)]` item written entirely on one line is classified correctly, but a
+    ///   `CONSTRUCTOR` on that same line is reported as PRODUCTION, because the clearing line is
+    ///   judged like any other. So `#[cfg(test)] fn f() { ChiaQuery::new(c); }` fails here. Loud,
+    ///   and answered by moving it into a column-0 test module — the same trade as the indented
+    ///   attribute above.
+    /// * A column-0 `#[cfg(test)]` item that never appears to close is not silent either:
+    ///   [`Swept::ended_inside_a_test_item`] reports it and the assertion REFUSES. When this
+    ///   classifier cannot tell, it says so instead of returning nothing.
+    ///
+    /// # The one shape that IS silent
+    ///
+    /// A `#[cfg(test)]` appearing at column 0 as STRING CONTENT — inside a multi-line or raw
+    /// literal — latches the sweep on text that is not code. Production lines after it are then
+    /// read as test code and dropped, and since the next column-0 line usually does end an item,
+    /// the fail-closed flag does not fire either. It is silent, which is the direction that
+    /// matters, and it is left unhandled deliberately: detecting it needs literal tracking, which
+    /// is the brace-counting mistake in another costume. No occurrence exists in this crate; one
+    /// would need a source file that quotes Rust attributes at column 0.
     ///
     /// Taking `&str` rather than walking files is deliberate: it is what lets the fixture tests pin
     /// the classification against shapes chosen to break it, instead of against whatever this
@@ -501,10 +523,19 @@ mod sole_owner_tests {
         let mut in_test_item = false;
         for (ix, line) in text.lines().enumerate() {
             if in_test_item {
-                in_test_item = !ends_a_column_0_item(line);
+                if !ends_a_column_0_item(line) {
+                    continue;
+                }
+                // The clearing line is the item's LAST line, and a whole item can be written on
+                // it. Falling through to the check below, rather than skipping the line, is what
+                // makes a constructor on a one-line test item fail loudly instead of vanishing
+                // along with the line that cleared the latch.
+                in_test_item = false;
             } else if line.starts_with("#[cfg(test)]") {
                 in_test_item = true;
-            } else if line.contains(CONSTRUCTOR) {
+                continue;
+            }
+            if line.contains(CONSTRUCTOR) {
                 sites.push(ix + 1);
             }
         }
@@ -619,6 +650,44 @@ mod sole_owner_tests {
         );
     }
 
+    /// A `#[cfg(test)]` item written on ONE line ends there, and does not swallow the file.
+    ///
+    /// `fn helper() {}` is at column 0 and ends with `}`, but it is not the bare `}` an earlier
+    /// version of [`ends_a_column_0_item`] required — so the latch stayed set for the rest of the
+    /// file. That shape defeated BOTH of the previous round's remedies at once: the sweep went
+    /// blind (the production site at line 4 was dropped) and `ended_inside_a_test_item` stayed
+    /// `false`, so the fail-closed refusal never fired either. `rustfmt` preserves such one-liners,
+    /// so `cargo fmt` does not suppress it. `mod probe {}` and `impl X {}` are the same shape.
+    ///
+    /// The one-line item's OWN construction is asserted too, on line 6: it is reported as
+    /// production, deliberately and loudly, because the clearing line is judged like any other.
+    #[test]
+    fn a_one_line_test_item_does_not_swallow_the_rest_of_the_file() {
+        let fixture = [
+            "#[cfg(test)]".to_string(),
+            "fn helper() {}".to_string(),
+            String::new(),
+            format!("fn later() {{ {CONSTRUCTOR}cfg); }}"),
+            "#[cfg(test)]".to_string(),
+            format!("fn gated() {{ {CONSTRUCTOR}cfg); }}"),
+        ]
+        .join("\n");
+
+        let swept = sweep(&fixture);
+        assert_eq!(
+            swept.sites,
+            vec![4, 6],
+            "a one-line `#[cfg(test)]` item must end on its own line, leaving line 4 visible as \
+             production; and a constructor written ON a one-line test item (line 6) is reported \
+             rather than dropped, because that is the loud direction"
+        );
+        assert!(
+            !swept.ended_inside_a_test_item,
+            "the latch must not still be set at EOF here — a stuck latch that also reports itself \
+             as clean is how this shape defeated both of the previous remedies at once"
+        );
+    }
+
     /// A file the sweep could not finish reading is REFUSED, never reported clean.
     ///
     /// An unterminated `#[cfg(test)]` item means every line after it was assumed to be test code
@@ -681,6 +750,13 @@ mod sole_owner_tests {
     /// This is the clause that was vacuously satisfied — it held because there was no registry.
     /// It is a real property only while exactly one production site can build a fabric, and that
     /// site is the one that registers what it built.
+    ///
+    /// What this asserts is bounded by what [`sweep`] can see, and that bound is written down
+    /// there rather than assumed away here: it classifies text by column-0 attributes, it names
+    /// the shapes it mis-reads together with the direction each fails in, and a file it could not
+    /// finish classifying is REFUSED above rather than counted as clean. So read a green here as
+    /// "no visible second owner, and nothing was invisible", which is a narrower claim than "no
+    /// second owner exists" and is the strongest one a source sweep can make.
     #[test]
     fn only_the_registry_owner_constructs_a_peer_fabric() {
         let (sites, unread) = production_call_sites();
