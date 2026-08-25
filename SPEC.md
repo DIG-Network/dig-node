@@ -2456,10 +2456,15 @@ which fail unless the parser really accepts the verb and carries its operands th
 
 - `peers [list]` → `control.peerStatus` — the live peer status: running flag, connected count,
   relay reservation, and a **per-peer array** `peers[]`, each element
-  `{ peer_id, address, via, direction }` where `via ∈ {"direct","relay"}` is the REAL per-peer
+  `{ peer_id, via, direction }` — plus `address` — where `via ∈ {"direct","relay"}` is the REAL per-peer
   transport (a peer whose gossip rides the relay's RLY-002 forwarder reports `"relay"`, every other
   peer `"direct"`, sourced from dig-gossip's `connected_pool_peers_with_via`) and
   `direction ∈ {"outbound","inbound"}`.
+  `address` is OPTIONAL and MUST be present only when the pool reported a dialable destination: an
+  element whose only reported remote is not a destination — an unspecified IP (`::` / `0.0.0.0`) or
+  port `0`, which is what dig-nat records for a relay-accepted circuit with no configured relay
+  endpoint — MUST OMIT the key rather than emit the wildcard. A consumer MUST therefore treat a
+  missing `address` as "this peer has no known dialable address", never as a malformed element.
   The array is present whenever a peer network is running and
   omitted (count only) on the in-process FFI path / before bring-up. The per-peer `peer_id` is the
   machine-checkable proof of a mutual A↔B connection (each side lists the other's `peer_id`). Peer

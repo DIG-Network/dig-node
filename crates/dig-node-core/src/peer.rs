@@ -300,7 +300,9 @@ impl PeerStatus {
 // -- Per-peer enumeration for control.peerStatus (#929) ----------------------------------------------
 
 /// The connected pool as a per-peer JSON array — one object per connected peer:
-/// `{ peer_id, address, via, direction }`. This is the machine-checkable proof surface for a mutual
+/// `{ peer_id, via, direction }`, plus `address` when the pool reported a dialable destination
+/// ([`is_usable_contact`](crate::net::is_usable_contact)). The key is OMITTED — never emitted as a
+/// placeholder — for a peer whose only reported remote is the wildcard `[::]:0` (dig-node#253). This is the machine-checkable proof surface for a mutual
 /// A↔B connection (each side lists the OTHER's `peer_id`), beyond the bare `connected_peers` count.
 ///
 /// Sourced from [`connected_pool_peers`](dig_gossip::GossipHandle::connected_pool_peers) (dialable
@@ -323,12 +325,21 @@ pub(crate) fn connected_peers_json(handle: &dig_gossip::GossipHandle) -> Vec<Val
                 Some(Via::Relay) => "relay",
                 _ => "direct",
             };
-            json!({
+            let mut row = json!({
                 "peer_id": hex::encode(peer_id),
-                "address": addr.to_string(),
                 "via": via,
                 "direction": if outbound { "outbound" } else { "inbound" },
-            })
+            });
+            // `address` is present ONLY when the pool reported a real destination. dig-nat records
+            // the unspecified wildcard `[::]:0` as the remote of an accepted relayed circuit with no
+            // configured relay endpoint (#1784), and that is the ABSENCE of an endpoint, not one.
+            // Emitting it would be a falsehood no consumer can detect — the field is present and
+            // non-null, so a reader's own "I have no address" fallback never fires. Omitting the key
+            // lets every consumer say what is true (dig-node#253).
+            if crate::net::is_usable_contact(&addr) {
+                row["address"] = json!(addr.to_string());
+            }
+            row
         })
         .collect()
 }
@@ -3814,6 +3825,74 @@ pub(crate) mod tests {
         }));
         let found = locator.find_providers(&content).await.expect("locate ok");
         assert_eq!(found.len(), 2, "two identities are two candidates");
+    }
+
+    /// **dig-node#253 — a relay-reached peer whose pool address is the wildcard reports NO address,
+    /// so `dign peers` renders its honest `(no address)` fallback instead of `[::]:0`.**
+    ///
+    /// `[::]:0` is the IPv6 *unspecified* address on port 0 — the ABSENCE of an endpoint, which
+    /// `dig-nat` records as the remote of an accepted relayed circuit with no configured relay
+    /// endpoint (#1784). Emitting it as the `address` field is a falsehood the renderer cannot
+    /// catch: `unwrap_or("(no address)")` only fires on a MISSING field, never on a present string
+    /// that happens to be meaningless. So the producer must omit the key.
+    ///
+    /// Fixture design — ONE actor varies. Both peers are RELAY-reached; only their pool address
+    /// differs. That distinguishes this property from the two nearest wrong implementations: a
+    /// producer that emits every address unconditionally fails the first assertion, and one that
+    /// drops the address for anything relayed fails the CONTROL. Asserting through
+    /// [`connected_peers_json`] rather than a pure helper is what pins the WIRING — a fix placed in
+    /// the CLI renderer, or a helper written and never called, leaves this red.
+    #[tokio::test]
+    async fn a_relay_peer_with_a_wildcard_pool_address_reports_no_address() {
+        let handle = fresh_pool_handle("wildcard-address", [23u8; 32]).await;
+
+        // The peer seen in the wild: relayed, with dig-nat's unspecified remote.
+        let (wildcard, _wildcard_server) = loopback_nat_conn(
+            [0xAB; 32],
+            "[::]:0".parse().unwrap(),
+            dig_nat::TraversalKind::Relayed,
+        );
+        handle
+            .adopt_nat_connection(wildcard)
+            .await
+            .expect("a relayed peer is adopted whatever its reported remote");
+
+        // The truthful control: ALSO relayed, but at a real destination, so the guard cannot be
+        // satisfied by blanking every relay peer's address.
+        let (honest, _honest_server) = loopback_nat_conn(
+            [0xCD; 32],
+            "198.51.100.8:9444".parse().unwrap(),
+            dig_nat::TraversalKind::Relayed,
+        );
+        handle
+            .adopt_nat_connection(honest)
+            .await
+            .expect("the control peer is adopted");
+
+        let peers = connected_peers_json(&handle);
+        let row = |id: &str| {
+            peers
+                .iter()
+                .find(|p| p["peer_id"] == id)
+                .unwrap_or_else(|| panic!("{id} is a pool member"))
+                .clone()
+        };
+
+        let wildcard_row = row(&hex::encode([0xAB; 32]));
+        assert!(
+            wildcard_row.get("address").is_none(),
+            "a wildcard pool address is not a destination and must be omitted, not rendered:              {wildcard_row}"
+        );
+        assert_eq!(
+            wildcard_row["peer_id"], hex::encode([0xAB; 32]),
+            "the peer itself is still enumerated — omitting the address must not drop the peer"
+        );
+
+        let honest_row = row(&hex::encode([0xCD; 32]));
+        assert_eq!(
+            honest_row["address"], "198.51.100.8:9444",
+            "a relay peer WITH a real address still reports it"
+        );
     }
 
     /// #1784, DHT-routing half: the routing feed does NOT pass through the connected pool, so it
