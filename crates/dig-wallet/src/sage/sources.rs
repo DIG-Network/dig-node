@@ -203,12 +203,76 @@ mod sole_owner_tests {
         }
     }
 
-    /// Every PRODUCTION call site of `CONSTRUCTOR`, as `path:line`.
+    /// The net brace balance a line contributes: `{` opens, `}` closes.
     ///
-    /// A call is production unless a `#[cfg(test)]` attribute appears EARLIER in the same file —
-    /// an approximation, and a deliberately conservative one: it can only ever over-report a test
-    /// site as production, which fails loudly, never under-report a production site as a test one,
-    /// which would be the silent direction.
+    /// Braces inside string literals and comments are counted too. That is the one imprecision in
+    /// [`production_lines`]' scope tracking, and it is recorded rather than hidden: a stray unpaired
+    /// `{` inside a test module keeps the latch set past that module's end (silent under-report),
+    /// and a stray unpaired `}` clears it early (loud over-report). Neither shape exists in this
+    /// crate today.
+    fn brace_balance(line: &str) -> i32 {
+        let opens = i32::try_from(line.matches('{').count()).unwrap_or(i32::MAX);
+        let closes = i32::try_from(line.matches('}').count()).unwrap_or(i32::MAX);
+        opens - closes
+    }
+
+    /// The 1-based line numbers at which `text` calls `CONSTRUCTOR` from PRODUCTION code.
+    ///
+    /// # How test code is recognised, and why this shape
+    ///
+    /// A `#[cfg(test)]` attribute **at column 0** latches the sweep into test code, and the latch
+    /// CLEARS when the item it introduced ends — tracked by brace balance for a block, or by a
+    /// trailing `;` for a one-line item. Both halves are load-bearing, and both were defects:
+    ///
+    /// * Latching on ANY `#[cfg(test)]` blinded the sweep to a whole file from the first INDENTED
+    ///   one. `chain.rs` gates a test helper inside `impl ChainTransport` at line 157, so lines
+    ///   158-711 — `peak_height()`, `push()`, the `ChainFallback` impl, the natural home of the
+    ///   very regression this guard names — were invisible, and a live second fabric compiled into
+    ///   `ChainTransport::peak_height` left this test green.
+    /// * A latch that never cleared blinded it to every line below a file's first test module, so
+    ///   production code beneath one could never be reported.
+    ///
+    /// This is a HEURISTIC, not a parse, and it is written to fail in the LOUD direction. An
+    /// indented `#[cfg(test)]` no longer latches at all, so a constructor inside a small gated
+    /// helper is reported as production and fails here — noisy, and answered by moving the helper
+    /// into a column-0 test module. The silent direction (a production site read as a test one)
+    /// now requires a column-0 `#[cfg(test)]` whose item never appears to close, which is the
+    /// imprecision [`brace_balance`] describes.
+    ///
+    /// Taking `&str` rather than walking files is deliberate: it is what lets
+    /// [`an_indented_cfg_test_does_not_blind_the_sweep`] pin the classification against a fixture
+    /// instead of against whatever this crate's own sources happen to look like today.
+    fn production_lines(text: &str) -> Vec<usize> {
+        let mut sites = Vec::new();
+        // `Some(depth)` while inside a column-0 `#[cfg(test)]` item; `depth` is the brace balance
+        // accumulated since the attribute, so back-to-zero-on-a-close means the item ended.
+        let mut in_test_item: Option<i32> = None;
+        for (ix, line) in text.lines().enumerate() {
+            match in_test_item.as_mut() {
+                Some(depth) => {
+                    *depth += brace_balance(line);
+                    let block_closed = *depth <= 0 && line.contains('}');
+                    let one_liner_ended = *depth == 0 && line.trim_end().ends_with(';');
+                    if block_closed || one_liner_ended {
+                        in_test_item = None;
+                    }
+                }
+                None if line.starts_with("#[cfg(test)]") => in_test_item = Some(0),
+                None if line.contains(CONSTRUCTOR) => sites.push(ix + 1),
+                None => {}
+            }
+        }
+        sites
+    }
+
+    /// Every PRODUCTION call site of `CONSTRUCTOR` in this crate, as `file:line`.
+    ///
+    /// # Scope, stated so it is not overstated
+    ///
+    /// It walks `dig-wallet/src` ONLY. A fabric constructed in another crate — `dig-node-core`, a
+    /// bin target — is invisible to it. No such site exists today, and this guard is not what
+    /// proves that; what it proves is that within the crate owning the wallet's chain access, one
+    /// file builds the fabric.
     fn production_call_sites() -> Vec<String> {
         let mut files = Vec::new();
         rust_files(
@@ -220,21 +284,73 @@ mod sole_owner_tests {
         let mut sites = Vec::new();
         for file in files {
             let text = std::fs::read_to_string(&file).expect("read a source file");
-            let mut in_tests = false;
-            for (ix, line) in text.lines().enumerate() {
-                if line.contains("#[cfg(test)]") {
-                    in_tests = true;
-                }
-                if !in_tests && line.contains(CONSTRUCTOR) {
-                    sites.push(format!(
-                        "{}:{}",
-                        file.file_name().expect("a file name").to_string_lossy(),
-                        ix + 1
-                    ));
-                }
+            for line_no in production_lines(&text) {
+                sites.push(format!(
+                    "{}:{}",
+                    file.file_name().expect("a file name").to_string_lossy(),
+                    line_no
+                ));
             }
         }
         sites
+    }
+
+    /// An indented `#[cfg(test)]` must not blind the sweep to the rest of its file.
+    ///
+    /// The fixture is `chain.rs`'s real shape in miniature: a gated helper inside an `impl`, then
+    /// ordinary production code that builds a fabric, then a column-0 test module that legitimately
+    /// builds one. Against the latch-on-any-`#[cfg(test)]` classifier the production site at line 6
+    /// is silently dropped and this returns empty — which is exactly how a live second fabric in
+    /// `ChainTransport::peak_height` passed the sole-owner assertion.
+    #[test]
+    fn an_indented_cfg_test_does_not_blind_the_sweep() {
+        // The construction lines are BUILT from `CONSTRUCTOR` rather than written out, so this
+        // file never contains the needle it sweeps for. A source-scanning test that spells its own
+        // needle finds itself, and its verdict then describes the test rather than the crate.
+        let fixture = [
+            "impl ChainTransport {".to_string(),
+            "    #[cfg(test)]".to_string(),
+            "    fn with_client(c: Arc<Q>) -> Self { Self { c } }".to_string(),
+            String::new(),
+            "    async fn peak_height(&self) -> u32 {".to_string(),
+            format!("        let rogue = {CONSTRUCTOR}cfg).await;"),
+            "        rogue.peak()".to_string(),
+            "    }".to_string(),
+            "}".to_string(),
+            "#[cfg(test)]".to_string(),
+            "mod tests {".to_string(),
+            format!("    fn client() {{ {CONSTRUCTOR}cfg); }}"),
+            "}".to_string(),
+        ]
+        .join("\n");
+
+        assert_eq!(
+            production_lines(&fixture),
+            vec![6],
+            "the sweep must SEE the production construction at line 6 — inside an `impl` that also \
+             holds an INDENTED `#[cfg(test)]` helper — and must NOT see the one at line 12, inside \
+             a column-0 test module. Reporting neither is the vacuity that let a live second peer \
+             fabric pass this guard."
+        );
+    }
+
+    /// The latch CLEARS at the end of a test module, so production code below one is still swept.
+    #[test]
+    fn production_code_below_a_test_module_is_still_swept() {
+        let fixture = [
+            "#[cfg(test)]".to_string(),
+            "mod tests {".to_string(),
+            format!("    fn c() {{ {CONSTRUCTOR}cfg); }}"),
+            "}".to_string(),
+            format!("fn later() {{ {CONSTRUCTOR}cfg); }}"),
+        ]
+        .join("\n");
+
+        assert_eq!(
+            production_lines(&fixture),
+            vec![5],
+            "a file's first test module must not hide every line beneath it"
+        );
     }
 
     /// The haystack is real: the sweep can still SEE a call site.
