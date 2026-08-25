@@ -399,66 +399,93 @@ mod sole_owner_tests {
         }
     }
 
-    /// The net brace balance a line contributes: `{` opens, `}` closes.
+    /// What sweeping one file's text found, and whether the sweep could still TELL at the end.
     ///
-    /// Braces inside string literals and comments are counted too. That is the one imprecision in
-    /// [`production_lines`]' scope tracking, and it is recorded rather than hidden: a stray unpaired
-    /// `{` inside a test module keeps the latch set past that module's end (silent under-report),
-    /// and a stray unpaired `}` clears it early (loud over-report). Neither shape exists in this
-    /// crate today.
-    fn brace_balance(line: &str) -> i32 {
-        let opens = i32::try_from(line.matches('{').count()).unwrap_or(i32::MAX);
-        let closes = i32::try_from(line.matches('}').count()).unwrap_or(i32::MAX);
-        opens - closes
+    /// `ended_inside_a_test_item` is the fail-CLOSED signal: it means the classifier latched into
+    /// test code and never saw the item end, so everything after that point was assumed to be test
+    /// code without evidence. A file in that state is not "clean", it is UNREAD, and
+    /// [`only_the_registry_owner_constructs_a_peer_fabric`] refuses on it rather than reporting a
+    /// green it did not earn. That distinction is the whole reason this is a struct and not a
+    /// `Vec<usize>`: the previous version could only say "no strays", which reads identically
+    /// whether the file was clean or invisible.
+    struct Swept {
+        /// 1-based line numbers of PRODUCTION calls to `CONSTRUCTOR`.
+        sites: Vec<usize>,
+        /// The text ran out while still inside a `#[cfg(test)]` item.
+        ended_inside_a_test_item: bool,
     }
 
-    /// The 1-based line numbers at which `text` calls `CONSTRUCTOR` from PRODUCTION code.
+    /// Whether `line` ends a top-level item, judged only at column 0.
+    ///
+    /// Rust items introduced by a column-0 attribute close at column 0: a block ends on a bare `}`
+    /// there, and a one-line item (`#[cfg(test)] use …;`) ends on a `;` there. Anything indented is
+    /// still inside the item.
+    ///
+    /// Column 0 is the entire mechanism, and it is what makes this immune to the defect it
+    /// replaces. Counting braces meant counting them inside STRING LITERALS, and the crate's
+    /// ordinary malformed-JSON fixture (`"{ not json"`) leaves the balance permanently positive —
+    /// five of this crate's files never cleared the latch again, so each was blind from its first
+    /// column-0 `#[cfg(test)]` to EOF. Literal CONTENT is almost always indented, so refusing to
+    /// look at it is both simpler and stricter than trying to parse it out.
+    fn ends_a_column_0_item(line: &str) -> bool {
+        let trimmed = line.trim_end();
+        if trimmed == "}" {
+            return true;
+        }
+        let at_column_0 = !trimmed.starts_with(char::is_whitespace) && !trimmed.is_empty();
+        at_column_0 && trimmed.ends_with(';')
+    }
+
+    /// Sweep `text` for PRODUCTION calls to `CONSTRUCTOR`.
     ///
     /// # How test code is recognised, and why this shape
     ///
     /// A `#[cfg(test)]` attribute **at column 0** latches the sweep into test code, and the latch
-    /// CLEARS when the item it introduced ends — tracked by brace balance for a block, or by a
-    /// trailing `;` for a one-line item. Both halves are load-bearing, and both were defects:
+    /// clears at the next column-0 item end ([`ends_a_column_0_item`]). Both halves are
+    /// load-bearing, and each was a measured defect rather than a hypothetical:
     ///
     /// * Latching on ANY `#[cfg(test)]` blinded the sweep to a whole file from the first INDENTED
     ///   one. `chain.rs` gates a test helper inside `impl ChainTransport` at line 157, so lines
     ///   158-711 — `peak_height()`, `push()`, the `ChainFallback` impl, the natural home of the
     ///   very regression this guard names — were invisible, and a live second fabric compiled into
     ///   `ChainTransport::peak_height` left this test green.
-    /// * A latch that never cleared blinded it to every line below a file's first test module, so
-    ///   production code beneath one could never be reported.
+    /// * A latch that cleared on BRACE BALANCE counted braces inside string literals, so the
+    ///   crate's routine malformed-JSON fixtures held it set to EOF in five files, `rpc.rs` — the
+    ///   crate's largest production file — among them. A column-0 production `fn` appended to any
+    ///   of them was read as test code and passed the sweep.
     ///
-    /// This is a HEURISTIC, not a parse, and it is written to fail in the LOUD direction. An
-    /// indented `#[cfg(test)]` no longer latches at all, so a constructor inside a small gated
-    /// helper is reported as production and fails here — noisy, and answered by moving the helper
-    /// into a column-0 test module. The silent direction (a production site read as a test one)
-    /// now requires a column-0 `#[cfg(test)]` whose item never appears to close, which is the
-    /// imprecision [`brace_balance`] describes.
+    /// # What it is, and how it fails
     ///
-    /// Taking `&str` rather than walking files is deliberate: it is what lets
-    /// [`an_indented_cfg_test_does_not_blind_the_sweep`] pin the classification against a fixture
-    /// instead of against whatever this crate's own sources happen to look like today.
-    fn production_lines(text: &str) -> Vec<usize> {
+    /// This is a HEURISTIC, not a parse, and it is written so that every imprecision fails LOUDLY:
+    ///
+    /// * An indented `#[cfg(test)]` does not latch, so a constructor inside a small gated helper is
+    ///   reported as production and fails here. Noisy; answered by moving the helper into a
+    ///   column-0 test module.
+    /// * A `}` or a `;` at column 0 INSIDE a multi-line string literal clears the latch early, so
+    ///   the rest of a test module is read as production. Also noisy, also loud.
+    /// * The one silent shape left — a column-0 `#[cfg(test)]` item that never appears to close —
+    ///   is not silent, because [`Swept::ended_inside_a_test_item`] reports it and the assertion
+    ///   REFUSES. When this classifier cannot tell, it says so instead of returning nothing.
+    ///
+    /// Taking `&str` rather than walking files is deliberate: it is what lets the fixture tests pin
+    /// the classification against shapes chosen to break it, instead of against whatever this
+    /// crate's own sources happen to look like today.
+    fn sweep(text: &str) -> Swept {
         let mut sites = Vec::new();
-        // `Some(depth)` while inside a column-0 `#[cfg(test)]` item; `depth` is the brace balance
-        // accumulated since the attribute, so back-to-zero-on-a-close means the item ended.
-        let mut in_test_item: Option<i32> = None;
+        let mut in_test_item = false;
         for (ix, line) in text.lines().enumerate() {
-            match in_test_item.as_mut() {
-                Some(depth) => {
-                    *depth += brace_balance(line);
-                    let block_closed = *depth <= 0 && line.contains('}');
-                    let one_liner_ended = *depth == 0 && line.trim_end().ends_with(';');
-                    if block_closed || one_liner_ended {
-                        in_test_item = None;
-                    }
-                }
-                None if line.starts_with("#[cfg(test)]") => in_test_item = Some(0),
-                None if line.contains(CONSTRUCTOR) => sites.push(ix + 1),
-                None => {}
+            if in_test_item {
+                in_test_item = !ends_a_column_0_item(line);
+            } else if line.starts_with("#[cfg(test)]") {
+                in_test_item = true;
+            } else if line.contains(CONSTRUCTOR) {
+                sites.push(ix + 1);
             }
         }
-        sites
+        Swept {
+            sites,
+            ended_inside_a_test_item: in_test_item,
+        }
     }
 
     /// Every PRODUCTION call site of `CONSTRUCTOR` in this crate, as `file:line`.
@@ -469,7 +496,7 @@ mod sole_owner_tests {
     /// bin target — is invisible to it. No such site exists today, and this guard is not what
     /// proves that; what it proves is that within the crate owning the wallet's chain access, one
     /// file builds the fabric.
-    fn production_call_sites() -> Vec<String> {
+    fn production_call_sites() -> (Vec<String>, Vec<String>) {
         let mut files = Vec::new();
         rust_files(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(),
@@ -478,17 +505,23 @@ mod sole_owner_tests {
         files.sort();
 
         let mut sites = Vec::new();
+        let mut unread = Vec::new();
         for file in files {
+            let name = file
+                .file_name()
+                .expect("a file name")
+                .to_string_lossy()
+                .into_owned();
             let text = std::fs::read_to_string(&file).expect("read a source file");
-            for line_no in production_lines(&text) {
-                sites.push(format!(
-                    "{}:{}",
-                    file.file_name().expect("a file name").to_string_lossy(),
-                    line_no
-                ));
+            let swept = sweep(&text);
+            if swept.ended_inside_a_test_item {
+                unread.push(name.clone());
+            }
+            for line_no in swept.sites {
+                sites.push(format!("{name}:{line_no}"));
             }
         }
-        sites
+        (sites, unread)
     }
 
     /// An indented `#[cfg(test)]` must not blind the sweep to the rest of its file.
@@ -521,7 +554,7 @@ mod sole_owner_tests {
         .join("\n");
 
         assert_eq!(
-            production_lines(&fixture),
+            sweep(&fixture).sites,
             vec![6],
             "the sweep must SEE the production construction at line 6 — inside an `impl` that also \
              holds an INDENTED `#[cfg(test)]` helper — and must NOT see the one at line 12, inside \
@@ -530,22 +563,61 @@ mod sole_owner_tests {
         );
     }
 
-    /// The latch CLEARS at the end of a test module, so production code below one is still swept.
+    /// The latch CLEARS at the end of a test module, so production code below one is still swept
+    /// — and it must still clear when that module holds a string literal containing a stray brace.
+    ///
+    /// The unbalanced `"{ not json"` is the point of this fixture, not decoration. It is the
+    /// crate's ordinary malformed-input idiom, present today in `rpc.rs`, `tipping.rs`, `types.rs`,
+    /// `watchlist.rs` and `autoseed.rs`, and against a brace-COUNTING classifier it holds the latch
+    /// set past the module's end: the production site at line 5 goes unreported, this returns
+    /// empty, and a second peer fabric anywhere below `rpc.rs:4783` passes the sweep. An earlier
+    /// version of this test used a brace-BALANCED fixture and so could not express the shape at
+    /// all — it proved the latch CAN clear, never that it does on any file this crate contains.
     #[test]
-    fn production_code_below_a_test_module_is_still_swept() {
+    fn a_stray_brace_in_a_test_fixture_does_not_hide_the_production_code_below_it() {
         let fixture = [
             "#[cfg(test)]".to_string(),
             "mod tests {".to_string(),
-            format!("    fn c() {{ {CONSTRUCTOR}cfg); }}"),
+            r#"    fn rejects_garbage() { parse("{ not json"); }"#.to_string(),
             "}".to_string(),
             format!("fn later() {{ {CONSTRUCTOR}cfg); }}"),
         ]
         .join("\n");
 
         assert_eq!(
-            production_lines(&fixture),
+            sweep(&fixture).sites,
             vec![5],
-            "a file's first test module must not hide every line beneath it"
+            "a test module holding an unbalanced brace inside a STRING must not hide every line \
+             beneath it; this is the shape that made five of this crate's files invisible from \
+             their first column-0 `#[cfg(test)]` to their end"
+        );
+    }
+
+    /// A file the sweep could not finish reading is REFUSED, never reported clean.
+    ///
+    /// An unterminated `#[cfg(test)]` item means every line after it was assumed to be test code
+    /// with no evidence. "No strays" from such a file is indistinguishable from "no strays" from a
+    /// file that was genuinely read — which is precisely how the previous classifier reported green
+    /// over five blind files.
+    #[test]
+    fn a_file_the_sweep_could_not_finish_reading_is_reported_as_unread() {
+        let unterminated = ["#[cfg(test)]".to_string(), "mod tests {".to_string()].join("\n");
+        assert!(
+            sweep(&unterminated).ended_inside_a_test_item,
+            "a `#[cfg(test)]` item that never closes leaves the rest of the file unclassified, and \
+             the sweep must SAY so rather than return an empty stray list"
+        );
+
+        let terminated = [
+            "#[cfg(test)]".to_string(),
+            "mod tests {".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            !sweep(&terminated).ended_inside_a_test_item,
+            "an ordinary closed test module must not be reported as unread, or every file in the \
+             crate refuses and this guard means nothing"
         );
     }
 
@@ -585,7 +657,13 @@ mod sole_owner_tests {
     /// site is the one that registers what it built.
     #[test]
     fn only_the_registry_owner_constructs_a_peer_fabric() {
-        let sites = production_call_sites();
+        let (sites, unread) = production_call_sites();
+        assert!(
+            unread.is_empty(),
+            "the sweep never saw a `#[cfg(test)]` item END in these files, so everything below \
+             that point was assumed to be test code and a second peer fabric there would be \
+             invisible. This guard refuses rather than report a green it did not earn: {unread:?}"
+        );
         let strays: Vec<&String> = sites.iter().filter(|s| !s.starts_with(OWNER)).collect();
         assert!(
             strays.is_empty(),
