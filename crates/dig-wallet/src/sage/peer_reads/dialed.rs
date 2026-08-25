@@ -33,7 +33,7 @@ use chia::protocol::Bytes32;
 
 use super::super::fallback::{FallbackCoin, FallbackCoinSpend};
 use super::super::quorum;
-use super::super::sync_supervisor::{assemble_distinct_sample, Draw};
+use super::super::sync_supervisor::{assemble_distinct_sample, await_peak_from, peak_from, Draw};
 use super::super::{Error, Result};
 use super::{CoinPeer, PeerSample};
 
@@ -57,6 +57,15 @@ pub struct ChiaCoinPeer {
     /// four opinions four opinions.
     addr: String,
     genesis_challenge: Bytes32,
+    /// This session's inbound stream, HELD rather than dropped.
+    ///
+    /// A full node announces `new_peak_wallet` unsolicited as blocks arrive, so the stream is what
+    /// keeps this peer's claimed tip CURRENT. Dropping it — which this module used to do — left
+    /// the only peak available the one captured at handshake, and a sample is held for
+    /// `SAMPLE_LIFETIME`, so by the end of a sample every claim would be minutes stale.
+    inbound: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<chia::protocol::Message>>,
+    /// The freshest tip this peer has announced. `None` until it announces one.
+    claimed_peak: tokio::sync::Mutex<Option<quorum::PeakClaim>>,
     /// Set the moment a request to this peer fails, so the next redraw drops it. A peer is never
     /// banned or accused — it is simply not re-used by a sample that could not reach it.
     failed: AtomicBool,
@@ -96,6 +105,28 @@ impl ChiaCoinPeer {
 impl CoinPeer for ChiaCoinPeer {
     fn id(&self) -> String {
         self.addr.clone()
+    }
+
+    async fn peak_claim(&self) -> Option<quorum::PeakClaim> {
+        let mut inbound = self.inbound.lock().await;
+        let mut held = self.claimed_peak.lock().await;
+
+        // Drain everything already queued and keep the LAST peak in it. The stream carries every
+        // message type, so this is also what stops an unread queue growing until the channel fills
+        // and the session stalls.
+        while let Ok(message) = inbound.try_recv() {
+            if let Some(claim) = peak_from(&message) {
+                *held = Some(claim);
+            }
+        }
+
+        // Nothing queued and nothing heard yet: this is a session drawn moments ago whose first
+        // announcement is still in flight. Wait BOUNDED for it rather than reporting silence,
+        // because a peer treated as silent is a voice the round loses for no reason.
+        if held.is_none() {
+            *held = await_peak_from(&mut inbound, PEER_TIMEOUT).await;
+        }
+        *held
     }
 
     async fn coin_record(&self, coin_id: Bytes32) -> Result<Option<FallbackCoin>> {
@@ -224,7 +255,7 @@ impl DialedPeerSample {
             quorum::QUORUM_SAMPLE,
             MAX_DIAL_ATTEMPTS,
             |exclude: Vec<std::net::SocketAddr>| async move {
-                let (peer, addr, _receiver, origin) =
+                let (peer, addr, receiver, origin) =
                     chia_query::peer::connect::connect_random_peer_excluding(
                         self.network,
                         tls,
@@ -236,7 +267,7 @@ impl DialedPeerSample {
                 Some(Draw {
                     addr,
                     origin,
-                    member: peer,
+                    member: (peer, receiver),
                 })
             },
         )
@@ -244,11 +275,13 @@ impl DialedPeerSample {
 
         drawn
             .into_iter()
-            .map(|(addr, peer)| {
+            .map(|(addr, (peer, receiver))| {
                 Arc::new(ChiaCoinPeer {
                     peer,
                     addr: addr.to_string(),
                     genesis_challenge: self.genesis_challenge,
+                    inbound: tokio::sync::Mutex::new(receiver),
+                    claimed_peak: tokio::sync::Mutex::new(None),
                     failed: AtomicBool::new(false),
                 })
             })

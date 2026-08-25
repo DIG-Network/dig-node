@@ -2068,8 +2068,21 @@ where
 /// A CLAIM, never a fact: a light client cannot verify either field. It is used only to COMPARE
 /// HEIGHTS — to exclude the badly-lagged, and to settle the height everyone is then asked about —
 /// and never reaches the replica.
-async fn await_peak(
+pub(crate) async fn await_peak(
     mut receiver: tokio::sync::mpsc::Receiver<chia::protocol::Message>,
+    timeout: Duration,
+) -> Option<quorum::PeakClaim> {
+    await_peak_from(&mut receiver, timeout).await
+}
+
+/// [`await_peak`] against a BORROWED stream, for a caller that keeps the session afterwards.
+///
+/// The corroborator drops its probe once it has a claim; a held sample keeps its session and
+/// re-reads the same stream as blocks arrive, so it cannot hand ownership over. One
+/// implementation serves both — a second parser of the same message would be free to disagree
+/// with this one about what a peer claimed.
+pub(crate) async fn await_peak_from(
+    receiver: &mut tokio::sync::mpsc::Receiver<chia::protocol::Message>,
     timeout: Duration,
 ) -> Option<quorum::PeakClaim> {
     let deadline = tokio::time::sleep(timeout);
@@ -2079,20 +2092,30 @@ async fn await_peak(
             () = &mut deadline => return None,
             message = receiver.recv() => {
                 let message = message?;
-                if message.msg_type == chia::protocol::ProtocolMessageTypes::NewPeakWallet {
-                    let peak =
-                        <chia::protocol::NewPeakWallet as chia::traits::Streamable>::from_bytes(
-                            &message.data,
-                        )
-                        .ok()?;
-                    return Some(quorum::PeakClaim {
-                        height: peak.height,
-                        header_hash: peak.header_hash,
-                    });
+                if let Some(claim) = peak_from(&message) {
+                    return Some(claim);
                 }
             }
         }
     }
+}
+
+/// The peak claim carried by `message`, or `None` when it carries none.
+///
+/// `None` covers both "not a peak announcement" and "a peak announcement this node could not
+/// decode". Neither is a claim, and treating an undecodable one as anything else would let a
+/// malformed frame stand in for a height.
+pub(crate) fn peak_from(message: &chia::protocol::Message) -> Option<quorum::PeakClaim> {
+    if message.msg_type != chia::protocol::ProtocolMessageTypes::NewPeakWallet {
+        return None;
+    }
+    let peak =
+        <chia::protocol::NewPeakWallet as chia::traits::Streamable>::from_bytes(&message.data)
+            .ok()?;
+    Some(quorum::PeakClaim {
+        height: peak.height,
+        header_hash: peak.header_hash,
+    })
 }
 
 #[async_trait::async_trait]

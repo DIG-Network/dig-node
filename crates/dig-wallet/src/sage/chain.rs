@@ -162,11 +162,41 @@ impl ChainTransport {
         }
     }
 
-    /// The chain's current peak height, or `Ok(None)` when the source tracks none.
+    /// Serve the corroborated reads from `reads`, so a test can script the peers a round hears.
+    #[cfg(test)]
+    pub(crate) fn with_peer_reads_arc(
+        mut self,
+        reads: Arc<super::peer_reads::PeerCorroboratedReads>,
+    ) -> Self {
+        self.peer_reads = Some(reads);
+        self
+    }
+
+    /// The chain height this node reports, or `Ok(None)` when it does not know one.
     ///
     /// `Ok(None)` is an honest "no height known" — never height zero, which every block is
     /// trivially above and which would silently satisfy any "is it buried yet" comparison.
+    ///
+    /// # It is the node's OWN peers that answer this (dig_ecosystem#2790)
+    ///
+    /// When the corroborated peer reads are attached — which is every production transport — the
+    /// height is settled across the peers this node dialled itself
+    /// ([`super::quorum::settled_peak`]), and their failure to agree is reported as not knowing.
+    ///
+    /// The alternative it replaces was worse than it looked: `chia-query`'s router answers a peak
+    /// by asking `api.coinset.org` FIRST and consulting this node's peers only when that fails, so
+    /// the node's headline chain fact was one HTTPS endpoint's opinion even on a node holding five
+    /// peers — and that number divides into the confirmation counts served over RPC. NC-12 asks
+    /// for agreement across several concurrently-queried untrusted peers; a single third party is
+    /// the shape it exists to prevent.
+    ///
+    /// A transport with no peer reads — a bare one built by a test — still falls through to the
+    /// router. That path is the oracle-first one, and it is documented as such rather than
+    /// silently retained: nothing in production takes it.
     pub async fn peak_height(&self) -> Result<Option<u32>> {
+        if let Some(peers) = &self.peer_reads {
+            return Ok(peers.peak_height().await);
+        }
         self.client()
             .await?
             .peak_height_opt()
@@ -537,5 +567,141 @@ mod tests {
     async fn a_new_transport_holds_no_client_until_it_is_used() {
         let transport = ChainTransport::new();
         assert!(transport.sources.existing_client().await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod corroborated_peak_tests {
+    //! The height the node reports is its OWN peers' settled view, not a third party's
+    //! (dig_ecosystem#2790).
+    //!
+    //! # What these catch that the previous code did not
+    //!
+    //! `peak_height` used to call `chia-query`'s router, which asks `api.coinset.org` FIRST and
+    //! consults this node's peers only when that fails. Under the old code every assertion here
+    //! would have been decided by one HTTPS endpoint: the collapsed-round cases would have
+    //! returned a number rather than refusing, and all of them would have built a chain client.
+    //!
+    //! So the load-bearing assertion in each test is the SECOND one — that no client was ever
+    //! built. "The value came back `None`" is satisfied identically by a transport that consulted
+    //! the oracle, failed to reach it, and reported nothing; asserting that the oracle was never
+    //! reached for is what makes the placement observable rather than inferred from an equal
+    //! value.
+
+    use super::*;
+    use crate::sage::peer_reads::{CoinPeer, PeerCorroboratedReads, PeerSample};
+    use crate::sage::quorum::{PeakClaim, SETTLED_LAG};
+    use async_trait::async_trait;
+    use chia::protocol::Bytes32;
+
+    /// A peer that announces one tip and answers no coin question.
+    ///
+    /// Coin silence isolates the peak round: nothing here can pass because of a coin answer.
+    struct PeakOnlyPeer {
+        id: String,
+        claim: Option<PeakClaim>,
+    }
+
+    #[async_trait]
+    impl CoinPeer for PeakOnlyPeer {
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+
+        async fn peak_claim(&self) -> Option<PeakClaim> {
+            self.claim
+        }
+
+        async fn coin_record(&self, _coin_id: Bytes32) -> Result<Option<FallbackCoin>> {
+            Err(Error::internal("this peer answers no coin questions"))
+        }
+
+        async fn coin_spend(&self, _coin_id: Bytes32) -> Result<Option<FallbackCoinSpend>> {
+            Err(Error::internal("this peer answers no coin questions"))
+        }
+    }
+
+    /// A draw of peers claiming the given heights, each with a distinct id.
+    struct ScriptedTips(Vec<u32>);
+
+    #[async_trait]
+    impl PeerSample for ScriptedTips {
+        async fn draw(&self) -> Vec<Arc<dyn CoinPeer>> {
+            self.0
+                .iter()
+                .enumerate()
+                .map(|(i, height)| {
+                    let mut hash = [0u8; 32];
+                    hash[..4].copy_from_slice(&height.to_be_bytes());
+                    Arc::new(PeakOnlyPeer {
+                        id: format!("10.0.0.{i}:8444"),
+                        claim: Some(PeakClaim {
+                            height: *height,
+                            header_hash: Bytes32::from(hash),
+                        }),
+                    }) as Arc<dyn CoinPeer>
+                })
+                .collect()
+        }
+    }
+
+    async fn transport_over(tips: Vec<u32>) -> ChainTransport {
+        let db = crate::sage::db::WalletDb::open_in_memory().await.unwrap();
+        ChainTransport::new().with_peer_reads_arc(Arc::new(PeerCorroboratedReads::new(
+            Arc::new(ScriptedTips(tips)),
+            db,
+        )))
+    }
+
+    /// The control: agreeing peers produce a height, and still nothing dials an oracle.
+    ///
+    /// Without this every test below is satisfied by a `peak_height` that returns `None`
+    /// unconditionally, which would pass the refusals and break the node.
+    #[tokio::test]
+    async fn agreeing_peers_give_the_node_a_height_without_asking_a_third_party() {
+        let transport = transport_over(vec![9_000_000; 4]).await;
+
+        assert_eq!(
+            transport.peak_height().await.unwrap(),
+            Some(9_000_000 - SETTLED_LAG)
+        );
+        assert!(
+            transport.sources.existing_client().await.is_none(),
+            "the node's own peers answered, and it consulted the public oracle anyway"
+        );
+    }
+
+    /// A round that collapses to ONE voice reports no height, and does NOT fall through to the
+    /// oracle to find one.
+    ///
+    /// Falling through is the tempting repair and it is the defect: it would let a single HTTPS
+    /// endpoint decide the height precisely when the peers failed to agree — which is the
+    /// single-source dependency NC-12 exists to remove, arriving at exactly the moment it matters.
+    #[tokio::test]
+    async fn a_single_peer_yields_no_height_and_no_fallback_to_the_oracle() {
+        let transport = transport_over(vec![9_000_000]).await;
+
+        assert_eq!(
+            transport.peak_height().await.unwrap(),
+            None,
+            "one peer was allowed to tell this node where the chain is"
+        );
+        assert!(
+            transport.sources.existing_client().await.is_none(),
+            "the peers did not agree and the node asked a third party instead, which is the \
+             single source this change removes"
+        );
+    }
+
+    /// A split sample is an unknown height, reported as unknown — again without an oracle read.
+    #[tokio::test]
+    async fn a_split_sample_yields_no_height_and_no_fallback_to_the_oracle() {
+        let transport = transport_over(vec![9_000_000, 9_000_000, 8_000_000, 8_000_000]).await;
+
+        assert_eq!(transport.peak_height().await.unwrap(), None);
+        assert!(
+            transport.sources.existing_client().await.is_none(),
+            "a partition was resolved by asking a third party which side to believe"
+        );
     }
 }
