@@ -7317,9 +7317,15 @@ mod tests {
         let ctx = &mut SpendContext::new();
         let p2 = StandardLayer::new(owner.pk);
         let memos = ctx.hint(owner.puzzle_hash).unwrap();
-        let (issue, cats) = SdkCat::issue_with_coin(
+        let (issue, cats) = SdkCat::single_issuance(
             ctx,
             owner.coin.coin_id(),
+            // `hidden_puzzle_hash`: the slot chia-sdk-driver 0.36 exposes where 0.30's
+            // `issue_with_coin` hard-coded `None`. `None` is the only value that keeps this
+            // fixture's CAT identical — it feeds `CatInfo`, so `Some(..)` would change the eve
+            // coin's puzzle hash and issue a DIFFERENT coin. The TAIL (and so the asset id) is
+            // `GenesisByCoinIdTailArgs` either way.
+            None,
             1_000,
             Conditions::new().create_coin(owner.puzzle_hash, 1_000, memos),
         )
@@ -9185,9 +9191,12 @@ mod tests {
         let alice = sim.bls(1_000);
         let alice_p2 = StandardLayer::new(alice.pk);
         let memos = ctx.hint(alice.puzzle_hash).unwrap();
-        let (issue_cat, cats) = SdkCat::issue_with_coin(
+        let (issue_cat, cats) = SdkCat::single_issuance(
             ctx,
             alice.coin.coin_id(),
+            // See the `single_issuance` note above: `None` keeps the eve coin's puzzle hash, and
+            // so this fixture's CAT, byte-identical to the 0.30 `issue_with_coin` it replaces.
+            None,
             1_000,
             Conditions::new().create_coin(alice.puzzle_hash, 1_000, memos),
         )
@@ -9360,9 +9369,12 @@ mod tests {
         let alice = sim.bls(1_000);
         let alice_p2 = StandardLayer::new(alice.pk);
         let memos = ctx.hint(alice.puzzle_hash).unwrap();
-        let (issue_cat, cats) = SdkCat::issue_with_coin(
+        let (issue_cat, cats) = SdkCat::single_issuance(
             ctx,
             alice.coin.coin_id(),
+            // See the `single_issuance` note above: `None` keeps the eve coin's puzzle hash, and
+            // so this fixture's CAT, byte-identical to the 0.30 `issue_with_coin` it replaces.
+            None,
             1_000,
             Conditions::new().create_coin(alice.puzzle_hash, 1_000, memos),
         )

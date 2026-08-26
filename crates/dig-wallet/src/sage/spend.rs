@@ -1163,9 +1163,13 @@ mod tests {
 
         // Issue + settle a CAT so we hold a spendable child CAT (parent is a CAT coin).
         let memos = ctx.hint(alice.puzzle_hash).unwrap();
-        let (issue, cats) = SdkCat::issue_with_coin(
+        let (issue, cats) = SdkCat::single_issuance(
             ctx,
             alice.coin.coin_id(),
+            // `hidden_puzzle_hash`: the slot chia-sdk-driver 0.36 exposes where 0.30's
+            // `issue_with_coin` hard-coded `None`. `None` keeps the eve coin's puzzle hash — and so
+            // this fixture's CAT — byte-identical; `Some(..)` would issue a different coin.
+            None,
             1_000,
             Conditions::new().create_coin(alice.puzzle_hash, 1_000, memos),
         )
@@ -1205,9 +1209,13 @@ mod tests {
         let ctx = &mut SpendContext::new();
 
         let memos = ctx.hint(alice.puzzle_hash).unwrap();
-        let (issue, cats) = SdkCat::issue_with_coin(
+        let (issue, cats) = SdkCat::single_issuance(
             ctx,
             alice.coin.coin_id(),
+            // `hidden_puzzle_hash`: the slot chia-sdk-driver 0.36 exposes where 0.30's
+            // `issue_with_coin` hard-coded `None`. `None` keeps the eve coin's puzzle hash — and so
+            // this fixture's CAT — byte-identical; `Some(..)` would issue a different coin.
+            None,
             1_000,
             Conditions::new().create_coin(alice.puzzle_hash, 1_000, memos),
         )

@@ -601,9 +601,13 @@ mod tests {
         // Issue a CAT to alice, then spend it to produce a child CAT (its parent is now a
         // CAT coin, which is what parse_children reconstructs from).
         let memos = ctx.hint(alice.puzzle_hash).unwrap();
-        let (issue_cat, cats) = SdkCat::issue_with_coin(
+        let (issue_cat, cats) = SdkCat::single_issuance(
             ctx,
             alice.coin.coin_id(),
+            // `hidden_puzzle_hash`: the slot chia-sdk-driver 0.36 exposes where 0.30's
+            // `issue_with_coin` hard-coded `None`. `None` keeps the eve coin's puzzle hash — and so
+            // this fixture's CAT — byte-identical; `Some(..)` would issue a different coin.
+            None,
             1000,
             Conditions::new().create_coin(alice.puzzle_hash, 1000, memos),
         )
