@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.154.0] - 2026-08-26
+
+### Features
+- **wallet:** Serve cross-process coin reservations over the control interface (#344)
+
+### Bug Fixes
+- **peers:** Omit the wildcard address for a relay-reached peer (#347)- **packaging:** Ship dign in the .deb and support configure-before-joining (#359)- **download:** A located holder can never establish an absence (#362)- **wallet:** Make the provider registry real, and stop reporting a third party's peak (#354)
+
+### Testing
+- **relay:** Make the module relay's NC-1 payload exclusion falsifiable (#353)
+
+### Chores
+- **deps:** Repoint dig-node workspace git deps to crates.io (dig_ecosystem#901) (#358)
+
 ## [0.149.0] - 2026-08-25
 
 ### Features
