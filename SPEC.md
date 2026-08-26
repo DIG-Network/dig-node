@@ -3867,8 +3867,16 @@ is DROPPED, never defaulted — a typo MUST NOT be able to masquerade as an addi
 **Independence is derived from REACH.** Two endpoints are ONE voice whenever their resolved address
 sets intersect, and the relation is transitive. Independence is NOT derived from an endpoint's type,
 its URL, or its host name: a CNAME costs an attacker nothing, and a "quorum" satisfied by two names
-for one machine is the defect this rule exists to prevent. An endpoint that resolves to no address
-contributes NO voice.
+for one machine is the defect this rule exists to prevent. With two or more endpoints configured, an
+endpoint that resolves to no address contributes NO voice — the lookup is the evidence that it is a
+separate machine, and a source that cannot be shown independent MUST NOT be counted as one.
+
+A SINGLE configured endpoint is a voice whether or not its name resolves. Independence is a relation
+BETWEEN endpoints, so with one endpoint there is nothing for a lookup to decide, and requiring one
+would make name resolution a gate on READING: a resolver failure would deny a read the HTTP client
+would have served, on the default install, over a path that performed no name resolution at all
+before this rule existed. Failing closed is required when the CHAIN ANSWER is in doubt; a name
+lookup is not that.
 
 **The agreement rule, with two or more independent voices.** Every voice that answered MUST give the
 SAME answer, and at least two MUST have answered; otherwise the resolution FAILS CLOSED and the pin
@@ -3891,15 +3899,36 @@ distinguished from one that could not be asked, and its rejection MUST refuse th
 regardless of how many other sources confirmed. A flat *k*-of-*N* threshold does NOT satisfy this
 clause: under one, 2-of-3 and 2-of-10 are the same bar, so adding endpoints would not raise an
 attacker's cost — and, with no attacker at all, three endpoints of which one is a generation behind
-would serve stale content. **The bar rises with `N` because every added source can veto, not because
-more must agree.**
+would serve stale content. **The bar rises with the number of REACHED sources, because every source
+that answers can veto — not because more must agree.**
+
+State that precisely, because the difference is the whole security property. A source can only veto
+a resolution it was reached for; an UNREACHABLE source neither confirms nor vetoes, and adding an
+endpoint therefore raises the bar only while that endpoint is answering. So an attacker who can
+SILENCE a source — degrade its reachability rather than change its answer — removes that source's
+veto, and a root two lagging endpoints still confirm is then served. Two consequences follow and
+both are normative:
+
+- A source that has ANSWERED a read MUST NOT be reclassified as unreachable on the strength of a
+  later failed probe. Reachability is established BEFORE a verification, never re-tested after one:
+  an endpoint that answered HAS been reached, and a subsequent failure describes its future rather
+  than its past. The residual misclassification MUST run the other way — a chain that drops between
+  the probe and the verification is recorded as a REJECTION, which refuses.
+- The remedy available to an operator is the same one §14.4b already recommends and is stated here
+  for a different reason: prefer **three or more** endpoints, so that silencing ONE still leaves a
+  reached source able to veto.
 
 **Latency and disclosure, both consequences of asking more than one source.** Endpoint independence
-is recomputed per resolution, so name resolution happens on the content-serve request path: lookups
-are performed CONCURRENTLY and each is bounded (3 seconds), and an endpoint that exceeds it counts
-as unreachable — the fail-closed direction. And resolving now discloses the STORE ID to every
-configured endpoint rather than to one. An operator adding endpoints buys corroboration and widens
-that disclosure; both halves are real.
+is recomputed per resolution, so the endpoint set is consulted on the content-serve request path.
+Recomputing is NOT re-resolving: resolved address sets are CACHED for 60 seconds, so an ordinary read
+costs a map lookup rather than a name lookup, and an independence verdict can be at most that stale.
+A lookup that fails while a previously-resolved answer is still held (within 10 minutes) reuses that
+answer rather than dropping the voice — a resolver blip is not evidence that an endpoint moved, and
+silently changing the VOICE COUNT on that evidence would report a DNS hiccup as a corroboration
+failure. Lookups that are performed are CONCURRENT and each is bounded (3 seconds); an endpoint that
+exceeds it and has no cached answer counts as unreachable — the fail-closed direction. And resolving
+discloses the STORE ID to every configured endpoint rather than to one. An operator adding endpoints
+buys corroboration and widens that disclosure; both halves are real.
 
 **ACCEPTED LIMITATION — the DEFAULT INSTALL resolves the anchored root from ONE third party.** With
 fewer than two independent voices configured, the node answers from its single source, exactly as it

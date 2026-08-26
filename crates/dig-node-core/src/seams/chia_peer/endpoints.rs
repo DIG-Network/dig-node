@@ -14,9 +14,12 @@
 //! resolved addresses — and two endpoints whose address sets INTERSECT are treated as a single
 //! voice, however different they look on paper.
 //!
-//! An endpoint that cannot be resolved contributes NO voice. That is the fail-closed direction:
-//! an unreachable source has not agreed with anything, and counting it would let a typo inflate a
-//! quorum.
+//! Among SEVERAL endpoints, one that cannot be resolved contributes NO voice. That is the
+//! fail-closed direction: a source whose independence cannot be measured has not been shown to be
+//! a second machine, and counting it would let a typo inflate a quorum. With a SINGLE endpoint
+//! there is no independence to measure and the lookup is skipped entirely — see
+//! [`super::corroborated_resolver::CorroboratedResolver`], where that carve-out lives, for why a
+//! name lookup must not become a gate on reading.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -154,6 +157,91 @@ impl EndpointReach for DnsReach {
             return Err(format!("host {host} port {port} resolves to no address"));
         }
         Ok(addrs)
+    }
+}
+
+/// How long a resolved address set is reused before the name is looked up again.
+///
+/// Independence must not be decided from a verdict fixed at start-up — an endpoint's addresses
+/// change, and a permanently-cached grouping would keep claiming corroboration long after two
+/// endpoints had converged on one host. A short TTL keeps that from happening while removing the
+/// per-READ lookup: the verdict can be at most this stale, which is the same order as the DNS TTLs
+/// the resolver is honouring anyway.
+const REACH_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a previously-resolved address set is still served AFTER the name stops resolving.
+///
+/// A resolver blip is not evidence that an endpoint moved, and treating it as one silently changes
+/// the VOICE COUNT — the number the refusal rule trusts — on the basis of a failure that has
+/// nothing to do with the chain. Serving the last known answer for a bounded window keeps a DNS
+/// hiccup from being reported as a corroboration failure. Beyond the window the entry is abandoned:
+/// a name that has not resolved for ten minutes has genuinely stopped resolving.
+const REACH_STALE_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What one authority last resolved to, and when.
+struct CachedAddrs {
+    /// The addresses that lookup returned.
+    addrs: BTreeSet<IpAddr>,
+    /// When they were learned.
+    learned: std::time::Instant,
+}
+
+/// An [`EndpointReach`] that remembers, so name resolution is not paid on every read.
+///
+/// Wrapping rather than folding the cache into [`DnsReach`] keeps the lookup and the caching
+/// policy separately testable: a cache tested through a live resolver can only be tested against
+/// whatever that resolver happens to do.
+pub(crate) struct CachedReach<R> {
+    /// The reach this one is a cache over.
+    inner: R,
+    /// One entry per authority. A `std::sync::Mutex` is deliberate — the critical section is a map
+    /// lookup with no `await` in it, so an async mutex would buy nothing and cost a task wake.
+    entries: std::sync::Mutex<std::collections::HashMap<Authority, CachedAddrs>>,
+}
+
+impl<R> CachedReach<R> {
+    /// A cache over `inner`.
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The cached answer for `authority`, if one is fresh enough to be used under `limit`.
+    fn cached(
+        &self,
+        authority: &Authority,
+        limit: std::time::Duration,
+    ) -> Option<BTreeSet<IpAddr>> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(authority)?;
+        (entry.learned.elapsed() <= limit).then(|| entry.addrs.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl<R: EndpointReach> EndpointReach for CachedReach<R> {
+    async fn addrs(&self, authority: &Authority) -> Result<BTreeSet<IpAddr>, String> {
+        if let Some(fresh) = self.cached(authority, REACH_TTL) {
+            return Ok(fresh);
+        }
+        match self.inner.addrs(authority).await {
+            Ok(addrs) => {
+                if let Ok(mut entries) = self.entries.lock() {
+                    entries.insert(
+                        authority.clone(),
+                        CachedAddrs {
+                            addrs: addrs.clone(),
+                            learned: std::time::Instant::now(),
+                        },
+                    );
+                }
+                Ok(addrs)
+            }
+            // A failed lookup falls back to the last known answer rather than dropping the voice.
+            Err(why) => self.cached(authority, REACH_STALE_GRACE).ok_or(why),
+        }
     }
 }
 
@@ -423,6 +511,95 @@ mod tests {
             vec![vec![0], vec![1]],
             "with the second endpoint reachable the same input yields TWO voices — the control \
              that kills an implementation which drops every endpoint"
+        );
+    }
+
+    /// A reach that counts its calls and can be switched to failing, so a cache is observable.
+    ///
+    /// Cloned rather than shared behind a pointer so a test can hold a handle AND hand one to the
+    /// cache: the counters live behind their own `Arc`s, so every clone observes the same calls.
+    #[derive(Clone)]
+    struct CountingReach {
+        /// How many lookups actually reached this reach.
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// Whether lookups currently succeed.
+        answering: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CountingReach {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                answering: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn stop_answering(&self) {
+            self.answering
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EndpointReach for CountingReach {
+        async fn addrs(&self, _authority: &Authority) -> Result<BTreeSet<IpAddr>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.answering.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(BTreeSet::from(["203.0.113.7".parse().expect("an ip")]))
+            } else {
+                Err("does not resolve".into())
+            }
+        }
+    }
+
+    /// The lookup is paid once per TTL, not once per read, and a blip does not drop the voice.
+    ///
+    /// Independence is recomputed on every content read, so an uncached reach makes name
+    /// resolution a per-READ `getaddrinfo` on a caller-drivable path — and a resolver failure then
+    /// denies a read the HTTP client would have served. The two halves below pin both.
+    #[tokio::test]
+    async fn a_cached_reach_looks_up_once_per_ttl_and_survives_a_resolver_blip() {
+        let inner = CountingReach::new();
+        let cached = CachedReach::new(inner.clone());
+        let authority = ChainEndpoint::parse("https://a.example.org")
+            .expect("parses")
+            .authority;
+
+        let first = cached.addrs(&authority).await.expect("resolves");
+        let second = cached.addrs(&authority).await.expect("resolves");
+        assert_eq!(
+            first, second,
+            "the cached answer must be the answer that was learned, not an empty stand-in"
+        );
+        assert_eq!(
+            inner.calls(),
+            1,
+            "the second resolution must be served from the cache. A per-read lookup is a DNS gate \
+             on the content-serve path, paid twice on a read that falls back from the tip to the \
+             bounded pinned-root check"
+        );
+
+        // The resolver now fails. The endpoint has not moved, and the voice count must not change
+        // on that evidence.
+        inner.stop_answering();
+        assert_eq!(
+            cached.addrs(&authority).await,
+            Ok(first),
+            "a lookup failure with a known-good answer in hand must serve that answer: failing \
+             closed is right when the CHAIN ANSWER is in doubt, and wrong when only the NAME \
+             lookup is"
+        );
+
+        // The control, and it is what stops the above passing against a reach that never fails:
+        // with nothing ever learned, a failing resolver is still a failure.
+        let cold = CachedReach::new(CountingReach::new());
+        cold.inner.stop_answering();
+        assert!(
+            cold.addrs(&authority).await.is_err(),
+            "an authority that has NEVER resolved has no last-known answer to fall back on, and \
+             inventing one would let a typo contribute a voice"
         );
     }
 }

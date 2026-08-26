@@ -137,10 +137,26 @@ impl CorroboratedResolver {
 
     /// The independent voices available right now — ONE speaker per voice.
     ///
-    /// Recomputed per resolution rather than cached: an endpoint's addresses change, and a voice
-    /// count fixed at start-up would keep claiming corroboration long after two endpoints had
+    /// Recomputed per resolution rather than fixed at start-up: an endpoint's addresses change, and
+    /// a voice count decided once would keep claiming corroboration long after two endpoints had
     /// converged on one host — a stale independence verdict is worse than none, because it is the
-    /// verdict the refusal rule trusts.
+    /// verdict the refusal rule trusts. Recomputing is not the same as re-RESOLVING, and the
+    /// production reach caches its lookups on a short TTL
+    /// ([`super::endpoints::CachedReach`]) so this costs a map read rather than a DNS round trip
+    /// on every content read.
+    ///
+    /// # A SINGLE configured endpoint is a voice whether or not its name resolves
+    ///
+    /// Independence is a relation BETWEEN endpoints, so with one endpoint there is nothing for a
+    /// lookup to decide. Asking anyway turns name resolution into a gate on reading: a resolver
+    /// failure would deny a read the HTTP client — with its own resolver, its own cache, and
+    /// possibly a proxy — would have served, and it would do so on the DEFAULT INSTALL, which had
+    /// no name resolution on this path at all before corroboration existed. Failing closed is
+    /// right when the CHAIN ANSWER is in doubt; a name lookup is not that.
+    ///
+    /// This does not soften the quorum rule. With two or more endpoints an unresolvable one still
+    /// contributes NO voice, because there it is exactly the evidence that the endpoint is a
+    /// separate machine — and a voice that cannot be shown independent must not be counted.
     ///
     /// # Why the first member speaks, and no failover between members
     ///
@@ -156,6 +172,9 @@ impl CorroboratedResolver {
     /// comment promised per-group failover that the code did not perform, which is a worse state
     /// than either choice.
     async fn voices(&self) -> Vec<Arc<dyn ChainVoice>> {
+        if let [only] = self.endpoints.as_slice() {
+            return vec![(self.source)(only)];
+        }
         independent_voices(&self.endpoints, self.reach.as_ref())
             .await
             .iter()
@@ -765,6 +784,78 @@ mod tests {
             Ok(()),
             "an UNREACHABLE tenth voice is silence, not dissent — it must not refuse, or a single \
              endpoint outage takes the node down and the two conditions become indistinguishable"
+        );
+    }
+
+    /// A reach that resolves NOTHING — a DNS outage, or a resolver this process cannot use.
+    struct NeverResolves;
+
+    #[async_trait::async_trait]
+    impl EndpointReach for NeverResolves {
+        async fn addrs(&self, _authority: &Authority) -> Result<BTreeSet<IpAddr>, String> {
+            Err("does not resolve".into())
+        }
+    }
+
+    /// Build a resolver over `rows` whose reach answers nothing at all.
+    fn unresolvable(rows: &[(&str, Voice)]) -> CorroboratedResolver {
+        let endpoints: Vec<ChainEndpoint> = rows
+            .iter()
+            .map(|(url, _)| ChainEndpoint::parse(url).expect("a parseable fixture url"))
+            .collect();
+        let script: BTreeMap<String, Voice> = rows
+            .iter()
+            .map(|(url, voice)| ((*url).to_string(), voice.clone()))
+            .collect();
+        CorroboratedResolver::new(
+            endpoints,
+            Arc::new(NeverResolves),
+            Arc::new(move |endpoint: &ChainEndpoint| {
+                Arc::new(Scripted(
+                    script.get(&endpoint.url).cloned().expect("a scripted url"),
+                )) as Arc<dyn ChainVoice>
+            }),
+        )
+    }
+
+    /// A name lookup must not become a gate on READING when there is only one endpoint.
+    ///
+    /// Independence is a relation BETWEEN endpoints, so a single configured endpoint has nothing
+    /// for a lookup to decide — and the DEFAULT INSTALL is exactly that case. Asking anyway turns
+    /// a resolver failure into a refusal to serve content the HTTP client (its own resolver, its
+    /// own cache, possibly a proxy) would have fetched, on a path that performed no name
+    /// resolution at all before corroboration existed.
+    ///
+    /// # The second half is the load-bearing one
+    ///
+    /// With TWO endpoints an unresolvable one must STILL contribute no voice, because there the
+    /// lookup is the evidence that they are separate machines. Without that control this test
+    /// would be satisfied by simply deleting the reach check, which would let two names for one
+    /// host corroborate each other whenever DNS was unavailable — the PR#354 defect, restored by
+    /// an outage.
+    #[tokio::test]
+    async fn one_endpoint_answers_without_a_name_lookup_but_two_still_need_one() {
+        let alone = unresolvable(&[("https://a.example.org", Voice::Root(0xAA))]);
+        assert_eq!(
+            alone.anchored_root(&STORE).await,
+            Ok(Some(Bytes32([0xAA; 32]))),
+            "one configured endpoint is one voice whether or not its NAME resolves; refusing here \
+             denies a read on the strength of a DNS failure that says nothing about the chain"
+        );
+
+        let pair = unresolvable(&[
+            ("https://a.example.org", Voice::Root(0xAA)),
+            ("https://b.example.org", Voice::Root(0xAA)),
+        ]);
+        let refusal = pair
+            .anchored_root(&STORE)
+            .await
+            .expect_err("two endpoints that cannot be told apart corroborate nothing");
+        assert!(
+            refusal.contains("no configured chain endpoint could be reached"),
+            "two endpoints whose independence cannot be measured must NOT be counted as two \
+             voices — an unmeasured pair may be one machine, which is the quorum this rule exists \
+             to refuse: {refusal}"
         );
     }
 }
