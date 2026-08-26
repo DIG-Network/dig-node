@@ -30,11 +30,6 @@ name = "dig-node-core"
 # dig-node#276/#296). Changing a public return type is BREAKING for an out-of-workspace implementor;
 # this crate is consumed in-workspace only and is pre-1.0, so it is a MINOR bump under SemVer's 0.x
 # rule -- recorded here rather than letting the number imply the locator surface held still.
-# 0.59.0 makes the anchored-root resolver a CORROBORATING one: `default_anchored_resolver` now
-# returns a resolver over the endpoints named by `DIG_NODE_CHAIN_ENDPOINTS`, believing the root only
-# when independent voices agree and REFUSING on dissent (dig-node#365, NC-12). No public type
-# changes -- `CoinsetResolver` keeps its shape and its single-endpoint behaviour -- but the BEHAVIOUR
-# of the node's default resolver does, which is a new capability rather than a fix, hence MINOR.
 version = "0.60.0"
 edition = "2021"
 license = "GPL-2.0-only"
@@ -204,7 +199,25 @@ getrandom = "0.2"
 # here today), and the `opaque` surface this crate uses is bytes + Password with no BLS type on
 # it at all, so nothing crosses between lines -- and adopting 0.10 now avoids routing the node's
 # identity onto a type identity that was about to change under it.
-dig-keystore = "0.10"
+#
+# 0.13 is the FLOOR for taking hardware binding live, and the reason is not the providers.
+# dig-keystore#18 made `create_with_rng` an atomic check-then-write in 0.13.0; 0.12 will happily
+# overwrite an existing record. On a SOFTWARE tier an overwritten machine key is recoverable from
+# a backup of two plaintext-sealed halves. Hardware wrapping binds the wrapping key to a
+# non-exportable component, so the same overwrite becomes PERMANENT -- there is nothing to restore
+# from. Sealing therefore upgrades that bug from recoverable to unrecoverable, and 0.12 is not a
+# version this seam may be enabled on.
+dig-keystore = "0.13"
+# The platform trusted-component providers (Windows TPM 2.0 via CNG, Apple Secure Enclave, Linux
+# TPM 2.0). A SEPARATE crate because `dig-keystore` forbids `unsafe` and every one of these is FFI;
+# it is the workspace member dig_ecosystem#1693 asked for, and it landed in dig-keystore v0.12.0.
+# Without it the node's hardware seam -- already fully composed at `machine_key.rs` -- passes a
+# hardcoded `None` and can never report anything but `Software(NotRequested)`.
+# 0.2 pairs with dig-keystore 0.13: it adds the macOS Secure Enclave and Linux TPM 2.0 providers,
+# and reclassifies a TPM AUTHORIZATION refusal (owner password set, dictionary-attack lockout) as
+# `Absent` rather than `Indeterminate`, so an ordinary locked-down Windows box degrades instead of
+# refusing. Only a genuinely uninspectable host is indeterminate now.
+dig-keystore-hardware = "0.2"
 # The machine key lives in the SAME user-global identity dir digstore_remote used for the
 # plaintext seed (`<config_dir>/dig`), so the #2168 migration finds it in place and the node
 # keeps its peer_id. digstore keeps its own `identity_dir` private, so the path is reproduced.
@@ -501,10 +514,12 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 
 [dev-dependencies]
 tempfile = "3"
-# `dig_keystore::hardware::double::FakeDevice` -- the only way to exercise the hardware-bound
-# tier, since no platform provider ships (dig_ecosystem#1693). Test-only: `testing` is never
-# enabled for the library build.
-dig-keystore = { version = "0.10", features = ["testing"] }
+# `dig_keystore::hardware::double::FakeDevice` -- the only way to exercise a SPECIFIC hardware
+# outcome from a test. The real providers ship now (dig-keystore-hardware above), but which one a
+# host answers with is a property of that host: no CI runner can be made to produce an
+# indeterminate TPM probe on demand, and that is the outcome the refusal path turns on.
+# Test-only: `testing` is never enabled for the library build.
+dig-keystore = { version = "0.13", features = ["testing"] }
 # Same git rev as the normal dependency above, with dig-gossip's `test-util` feature added. That
 # feature gates `__connect_stub_peer_with_direction`, which registers a connected peer without real
 # TLS — the only way to assert what a broadcast ACTUALLY put on the wire from a test. Declared here
