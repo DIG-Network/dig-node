@@ -123,7 +123,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 async-trait = "0.1"
 # -- #216 send/spend + singleton reconstruction (§18.9 → §18.8) -------------------------
 # Pre-broadcast spend-bundle validation (C.6 fail-closed): validate_spend_bundle runs the
-# bundle through chia-consensus before any peer broadcast. Same chia-* 0.26 / SDK 0.30 line
+# bundle through chia-consensus before any peer broadcast. Same chia-* 0.36.1 / SDK 0.36.0 line
 # as dig-wallet, so Coin/CoinSpend/SpendBundle unify across the crate boundary.
 #
 # crates.io, NOT the old git rev (#2072). That rev resolved to dig-clvm 0.1.1, which re-exported

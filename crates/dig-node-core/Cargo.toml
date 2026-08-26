@@ -100,15 +100,20 @@ lru = "0.12"
 #     `path = "../x"` with no `version` key, which `cargo publish` refuses outright, so publishing them
 #     is real work in DIG-Network/digs rather than a release button.
 #
-#  3. THE PUBLISHED MEMBERS ARE ON THE OTHER CHIA LINE. `digstore-chain 0.28.0` declares chia-protocol
-#     / chia-bls / chia-consensus / chia-puzzle-types / chia-secp / chia-sha2 at 0.36.1 and
-#     chia-wallet-sdk 0.34, while this workspace is held at 0.26 / 0.30 by dig-gossip -> dig-peer-protocol
-#     0.6 (see the dig-gossip note below). Adopting them today would split the store-melt authorization
-#     path across two chia-protocol versions — the exact byte-drift the migration exists to remove.
+#  3. (CLEARED 2026-08-26, dig_ecosystem#3161.) This used to read "the published members are on the
+#     OTHER chia line", because digstore declared the primitives at 0.36.1 while this workspace was
+#     held at 0.26 by dig-gossip -> dig-peer-protocol 0.6. Both halves moved: the dig-gossip rev now
+#     carries 0.36.1, and the digstore rev below is digstore's own ceiling fix. The primitives are
+#     one line across the boundary, so nothing is split.
 #
-# So this row is downstream of the chia-0.36 cascade (dig_ecosystem#2761) AND of publishing the digstore
-# workspace. Do NOT repoint these piecemeal, and never let the pin regress to a floating git BRANCH: the
-# single `rev` is what makes the whole store-format surface reproducible.
+#     What did NOT fully collapse is the SDK family: digstore's rev takes `chia-wallet-sdk 0.34`
+#     while dig-wallet takes 0.36.0. Both pin the PRIMITIVES at 0.36.1, so `Bytes32`/`Coin` unify and
+#     no chia type is split; only the SDK's own driver types differ, and none crosses this boundary.
+#     Collapsing that last pair needs digstore to release against 0.36.0 — upstream, not here.
+#
+# So this row is still downstream of publishing the digstore workspace. Do NOT repoint these
+# piecemeal, and never let the pin regress to a floating git BRANCH: the single `rev` is what makes
+# the whole store-format surface reproducible.
 digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
 digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
@@ -148,14 +153,15 @@ dig-ipc-protocol = "=0.3.0"
 #     from unifying — the same split the dig-gossip and dig-constants notes below describe. The 0.6+
 #     uplift is downstream of the chia-0.36 cascade (dig_ecosystem#2761), not an edit here.
 #
-#  2. DEDUPLICATION. `dig-message 0.5.1` and `dig-nat 0.18.0` already resolve dig-identity 0.4.2 from
-#     crates.io, and a 0.x minor is a semver-INCOMPATIBLE boundary. So `"0.5.0"` would leave TWO
-#     dig-identity copies in the graph, while `"0.4.2"` collapses to ONE. The tree carries two copies
-#     today (git 0.4.0 beside registry 0.4.2); this bump removes that duplicate rather than renaming it,
-#     which for an identity/key crate is the whole point.
+#  2. DEDUPLICATION. A 0.x minor is a semver-INCOMPATIBLE boundary, so this pin must match whatever
+#     the rest of the graph already resolves or the tree carries TWO dig-identity copies — which for
+#     an identity/key crate is the whole point of pinning it at all.
 #
-# v0.4.0 -> 0.4.2 is patch-level and purely additive; 0.5.0's only new export, `derive_identity_sk_at`,
-# has zero call sites in this workspace, so nothing is given up by preferring the deduplicating pin.
+# 0.7.1 is that value on the chia-0.36.1 ceiling (dig_ecosystem#3161): `dig-nat 0.20` and
+# `dig-message 0.7` both declare `dig-identity ^0.7`, and 0.7.1 is the only line whose `chia-bls` is
+# 0.36.1. The previous pin here was 0.4.2, chosen by the same rule against the then-current
+# `dig-message 0.5` / `dig-nat 0.18`; it is the RULE that is stable, not the number. Re-derive it
+# from `Cargo.lock` rather than trusting this comment.
 dig-identity = "0.7.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
 # Object-safe async trait for the injectable anchored-root resolver (the
@@ -299,16 +305,28 @@ dig-nat = "0.20"
 # still described those patches as live; it was wrong, and a false manifest comment is how the next
 # lane reasons wrongly about the version line.
 #
-# THIS DEP IS THE CHIA-0.36 MIGRATION BLOCKER (dig_ecosystem#2761 WU4), measured 2026-08-22.
-# dig-gossip depends on `dig-peer-protocol = "0.6"`, whose ONLY published 0.6.x is 0.6.0, and that
-# declares `chia-protocol 0.26` + `chia-sdk-client 0.28` (which itself resolves chia-protocol 0.26).
-# So `chia-protocol 0.26.0` enters this graph through a path no dig-node manifest can edit, and NO
-# assignment of versions here removes it. dig-peer-protocol `main` and dig-gossip `main` are both
-# still on the 0.26 line, so the uplift is a release-first cascade (dig-peer-protocol, then
-# dig-gossip, then this workspace), not a dig-node-local edit. Uplifting dig-node alone would leave
-# `Bytes32` arriving from dig_gossip on 0.26 while `digstore-chain`/`chia-protocol` hand this crate
-# 0.36.1, splitting the store-melt authorization path in `seams/dig_peer/store_melted.rs` across two
-# chia-protocol versions: the exact byte-drift the migration exists to remove.
+# THIS DEP WAS THE CHIA-0.36 MIGRATION BLOCKER, AND IS NO LONGER (dig_ecosystem#3161, 2026-08-26).
+#
+# The old block, recorded because a future lane will otherwise re-derive it: the pinned rev was
+# v0.25.0, which took `dig-peer-protocol = "0.6"`, whose only published 0.6.x declares
+# `chia-protocol 0.26`. That put 0.26 into the graph through a path no dig-node manifest could edit,
+# so no assignment of versions HERE could remove it.
+#
+# What cleared it was upstream moving, exactly as that comment predicted: dig-gossip `main` (v0.30.0,
+# the rev pinned below) is on `dig-peer-protocol 0.7` and declares chia-protocol/traits/sha2/bls at
+# 0.36.1. Repointing the rev is what let this workspace take the ceiling; it was never a local edit.
+#
+# The consequence that mattered is now discharged rather than merely avoided: `Bytes32` reaches the
+# store-melt authorization path in `seams/dig_peer/store_melted.rs` from dig_gossip and from
+# `digstore-chain` as the SAME type, so that path is no longer split across two chia-protocol
+# versions. No conversion shim was added, and none may be — bridging two lines is the byte-drift
+# class this migration exists to remove.
+#
+# STILL PINNED HERE, and deliberately: this rev takes `dig-nat ^0.20`, while the published
+# dig-dht/dig-peer/dig-download/dig-peer-selector tips have moved to `^0.21`. So the peer stack below
+# is held at its ^0.20 tier to keep ONE dig-nat in the graph. Taking the newer tier resolves TWO
+# dig-nat lines while cargo prints success. The fix is a dig-gossip release against `dig-nat ^0.21`,
+# upstream, never a version edit here.
 # NC-7 exception: dig-gossip is git-pinned PERMANENTLY, not pending a publish — dig_ecosystem#2647.
 # It cannot be published while its `native-tls` [patch.crates-io] fork stands, because `cargo publish`
 # STRIPS [patch.crates-io] from the published metadata. A published dig-gossip would therefore build
@@ -434,22 +452,25 @@ dig-peer = "0.12.0"
 # dig-nat/dig-dht types). The selector mirrors `dig_gossip::PoolEvent` LOCALLY (it does not depend on
 # dig-gossip, which lags as a git dep), so the node maps `dig_gossip::PoolEvent` → the selector's local
 # `PoolEvent` 1:1 (see `download.rs::pool_event_to_selector`).
-# NOT bumped to 0.9.1: that release moves onto `dig-tls` 0.4, and this crate still resolves 0.3
-# through `dig-nat`/`dig-gossip`, so the graph would carry TWO `dig_tls::PeerId` types that do not
-# unify (dig_ecosystem#3129 WU2 measured the split at `download.rs:4435`). It moves with the chia-0.36
-# cascade, not before it. Re-measured 2026-08-23 from the crates.io index: 0.9.1 declares dig-dht
-# "^0.12" + dig-nat "^0.20", i.e. it is gated on dig_ecosystem#3152 exactly as the dig-tls split above
-# describes. Held at 0.9 (resolving 0.9.0, the newest 0.9-line release).
+# 0.9.2 IS the chia-0.36 cascade landing (dig_ecosystem#3161). The old note here said "NOT bumped to
+# 0.9.1: that release moves onto dig-tls 0.4, and this crate still resolves 0.3 through
+# dig-nat/dig-gossip, so the graph would carry TWO `dig_tls::PeerId` types that do not unify". Both
+# halves of that split are gone — dig-nat 0.20 and the dig-gossip rev both take `dig-tls ^0.4`, and
+# the lock now resolves dig-tls ONCE at 0.4.0.
+#
+# NOT bumped to 0.10: that release requires `dig-nat ^0.21`, which dig-gossip v0.30.0 does not take
+# (it declares `^0.20`). Taking it splits dig-nat in two while cargo prints success. See the peer-stack
+# note in the ROOT manifest for why the ^0.20 tier is the correct choice rather than the newest.
 dig-peer-selector = "0.9.2"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
 # the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the
 # legacy self-signed `rcgen` cert as the node dials/serves over the dig-nat CA-signed mTLS model
 # (#1280). `peer_id = SHA256(SPKI DER)` is stable across restarts. dig-tls re-exports chia-bls's
-# `SecretKey`, unifying with this crate's chia-bls 0.26. Resolves 0.3.1 (a test-only release: the
-# consumer conformance suite for the canonical peer certificate). 0.4 is held behind
-# dig_ecosystem#3152 — taking it here would split `dig_tls::PeerId` against the 0.3 that
-# dig-nat/dig-gossip still resolve.
+# `SecretKey`, unifying with this crate's chia-bls 0.36.1. 0.4 is the chia-bls 0.36.1 uplift and is
+# now TAKEN (dig_ecosystem#3161): the old hold — "taking it here would split `dig_tls::PeerId`
+# against the 0.3 that dig-nat/dig-gossip still resolve" — expired when dig-nat 0.20 and the
+# dig-gossip rev both moved onto `dig-tls ^0.4`. The lock resolves dig-tls ONCE, at 0.4.0.
 dig-tls = "0.4"
 # -- The store-exchange DECISION layer (dig_ecosystem#3130) -------------------------------------------
 # `dig-sex` owns every cache/tier/relevance/selection DECISION this node used to make in-tree: what to
