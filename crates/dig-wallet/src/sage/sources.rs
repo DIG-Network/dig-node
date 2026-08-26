@@ -502,14 +502,37 @@ mod sole_owner_tests {
     ///   the rest of a test module is read as production. Also noisy, also loud.
     /// * When the attribute is on its OWN line and the item follows on one line, that item line is
     ///   the clearing line and is judged like any other — so a `CONSTRUCTOR` on it is reported as
-    ///   PRODUCTION and fails here. Measured on this fixture:
-    ///   `["#[cfg(test)]", "fn f() { ChiaQuery::new(c); }", "fn later() { ChiaQuery::new(c); }"]`
-    ///   yields `sites=[2, 3]`. Loud, and answered by moving it into a column-0 test module — the
-    ///   same trade as the indented attribute above. Note the ATTRIBUTE-INLINE form behaves
-    ///   differently and correctly: `#[cfg(test)] fn f() { ChiaQuery::new(c); }` latches on its own
-    ///   line, and a latching line is never passed to [`ends_a_column_0_item`], so that
-    ///   construction is dropped as the test code it is (`sites=[2]` for the same fixture, the
-    ///   remaining site being the production line below).
+    ///   PRODUCTION and fails here. Loud, and answered by moving it into a column-0 test module —
+    ///   the same trade as the indented attribute above.
+    ///
+    ///   ```json
+    ///   {
+    ///     "name": "attribute on its own line: the gated item is reported as production",
+    ///     "lines": [
+    ///       "#[cfg(test)]",
+    ///       "fn f() { ChiaQuery::new(c); }",
+    ///       "fn later() { ChiaQuery::new(c); }"
+    ///     ],
+    ///     "sites": [2, 3],
+    ///     "ended_inside_a_test_item": false
+    ///   }
+    ///   ```
+    ///
+    ///   The ATTRIBUTE-INLINE form behaves differently and correctly: it latches on its own line,
+    ///   and a latching line is never passed to [`ends_a_column_0_item`], so that construction is
+    ///   dropped as the test code it is. Only the production line below it remains.
+    ///
+    ///   ```json
+    ///   {
+    ///     "name": "attribute inline: the gated construction is correctly dropped",
+    ///     "lines": [
+    ///       "#[cfg(test)] fn f() { ChiaQuery::new(c); }",
+    ///       "fn later() { ChiaQuery::new(c); }"
+    ///     ],
+    ///     "sites": [2],
+    ///     "ended_inside_a_test_item": false
+    ///   }
+    ///   ```
     /// * A column-0 `#[cfg(test)]` item that never appears to close is not silent either:
     ///   [`Swept::ended_inside_a_test_item`] reports it and the assertion REFUSES. When this
     ///   classifier cannot tell, it says so instead of returning nothing.
@@ -525,9 +548,50 @@ mod sole_owner_tests {
     ///   latches the sweep on text that is not code. It needs a source file that quotes Rust
     ///   attributes at column 0.
     /// * **A terminator carrying trailing content** — `}  // done`. [`ends_a_column_0_item`] judges
-    ///   the raw line, so the comment stops it ending anything. Measured: the same fixture with a
-    ///   bare `}` gives `sites=[5]`, and with `}  // done` gives `sites=[]`. `rustfmt` preserves
-    ///   the trailing comment byte-for-byte, so formatting does not suppress it.
+    ///   the raw line, so the comment stops it ending anything and the latch runs on over the
+    ///   production item below. `rustfmt` preserves the trailing comment byte-for-byte, so
+    ///   formatting does not suppress it.
+    ///
+    ///   The two fixtures below differ in ONE character-run — line 4's trailing comment — and that
+    ///   is the whole demonstration: the constructor on line 6 is seen with a bare terminator and
+    ///   silently dropped with a commented one, `ended_inside_a_test_item` reporting `false` in
+    ///   both cases. The production item is written over three lines deliberately; a one-line
+    ///   `fn later() { … }` would itself end at column 0 and clear the latch, so the drop would not
+    ///   occur and the example would demonstrate nothing.
+    ///
+    ///   ```json
+    ///   {
+    ///     "name": "bare terminator: the production construction below is seen",
+    ///     "lines": [
+    ///       "#[cfg(test)]",
+    ///       "mod tests {",
+    ///       "    fn f() { ChiaQuery::new(c); }",
+    ///       "}",
+    ///       "fn later() {",
+    ///       "    ChiaQuery::new(c);",
+    ///       "}"
+    ///     ],
+    ///     "sites": [6],
+    ///     "ended_inside_a_test_item": false
+    ///   }
+    ///   ```
+    ///
+    ///   ```json
+    ///   {
+    ///     "name": "terminator with a trailing comment: the same construction is dropped, silently",
+    ///     "lines": [
+    ///       "#[cfg(test)]",
+    ///       "mod tests {",
+    ///       "    fn f() { ChiaQuery::new(c); }",
+    ///       "}  // done",
+    ///       "fn later() {",
+    ///       "    ChiaQuery::new(c);",
+    ///       "}"
+    ///     ],
+    ///     "sites": [],
+    ///     "ended_inside_a_test_item": false
+    ///   }
+    ///   ```
     ///
     /// **What bounds the damage**, in both cases: the mis-latch lasts only until the next column-0
     /// line ending in `}` or `;`, which in ordinary Rust is the end of the next item. So each drops
@@ -727,6 +791,112 @@ mod sole_owner_tests {
             "the latch must not still be set at EOF here — a stuck latch that also reports itself \
              as clean is how this shape defeated both of the previous remedies at once"
         );
+    }
+
+    /// **Every worked example in this module's documentation is EXECUTED, and a wrong one fails
+    /// CI.**
+    ///
+    /// # Why this exists (dig-node#363)
+    ///
+    /// A doc example in this file was exactly backwards — it claimed the attribute-inline shape
+    /// failed loudly, when it measures `sites=[2]` and drops the construction — and it survived
+    /// **four adversarial gate rounds**. Everything else in the file was measured; only the
+    /// examples were prose, and that is precisely where the false statement lived. Reviewers read
+    /// a doc example as documentation rather than as a claim to test, so the fix is not a sharper
+    /// reviewer: it is making the claim executable.
+    ///
+    /// The same pass found a second, quieter failure of the same kind. The trailing-comment
+    /// example asserted `sites=[5]` and `sites=[]` for "the same fixture" **without ever writing
+    /// that fixture down**, so its numbers were unreproducible by construction. The reconstructed
+    /// fixture measures `[6]` and `[]`. A claim whose input is missing cannot be checked by
+    /// anybody, which is a worse failure than a claim that is merely wrong.
+    ///
+    /// # This is a documentation harness, NOT another classifier heuristic
+    ///
+    /// Five rounds established that the durable artifact here is the fail-closed flag plus an
+    /// honestly OPEN enumeration of mis-read shapes — not a better parser. Nothing below changes
+    /// what [`sweep`] does. It only makes the file's own statements about `sweep` fail when they
+    /// are false.
+    ///
+    /// # Why an extracted JSON block and not a `#[doc]` example
+    ///
+    /// `rustdoc` does not run doctests on `#[cfg(test)]` items, and this whole module is one — so
+    /// a ```` ```rust ```` example here would compile in nobody's build and read exactly like a
+    /// passing test. That is the cfg-gated-and-unfalsifiable trap, and it would leave the file in
+    /// the state the ticket was filed about while looking fixed.
+    #[test]
+    fn every_worked_example_in_the_docs_is_executed_against_the_real_classifier() {
+        /// One worked example, in the shape the doc blocks are written in.
+        #[derive(serde::Deserialize)]
+        struct Example {
+            name: String,
+            lines: Vec<String>,
+            sites: Vec<usize>,
+            ended_inside_a_test_item: bool,
+        }
+
+        // This module's own source. Reading the FILE rather than a copied fixture is what ties the
+        // assertions to the sentences a reader actually sees.
+        let source = include_str!("sources.rs");
+
+        let mut examples = Vec::new();
+        let mut collecting: Option<String> = None;
+        for raw in source.lines() {
+            // Strip the doc-comment prefix so what remains is the JSON as rendered.
+            let Some(doc) = raw.trim_start().strip_prefix("///") else {
+                continue;
+            };
+            let doc = doc.trim();
+            match (&mut collecting, doc) {
+                (None, "```json") => collecting = Some(String::new()),
+                (Some(_), "```") => {
+                    let body = collecting.take().expect("collecting");
+                    examples.push(serde_json::from_str::<Example>(&body).unwrap_or_else(|e| {
+                        panic!("a worked example is not valid JSON: {e}\n{body}")
+                    }));
+                }
+                (Some(buf), line) => {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+                (None, _) => {}
+            }
+        }
+
+        assert!(
+            collecting.is_none(),
+            "an unterminated ```json block -- the extractor stopped mid-example, so the examples \
+             after it were never checked"
+        );
+
+        // Fail-closed on the COUNT, not merely on emptiness. Deleting an inconvenient example is
+        // the cheapest way to make this test green, and it is the one edit this must not permit
+        // silently; adding one deliberately means updating this number, which is the review moment.
+        const WORKED_EXAMPLES: usize = 4;
+        assert_eq!(
+            examples.len(),
+            WORKED_EXAMPLES,
+            "the docs carry a different number of worked examples than this harness expects -- if \
+             that is deliberate, say so here; if it is not, an example has been lost and its claim \
+             is unchecked again"
+        );
+
+        for example in examples {
+            let swept = sweep(&example.lines.join("\n"));
+            assert_eq!(
+                swept.sites, example.sites,
+                "the documented `sites` for \"{}\" is not what the classifier measures -- the \
+                 documentation is wrong, not the classifier (this ticket does not change `sweep`)",
+                example.name
+            );
+            assert_eq!(
+                swept.ended_inside_a_test_item, example.ended_inside_a_test_item,
+                "the documented fail-closed flag for \"{}\" is not what the classifier measures; \
+                 a shape documented as SILENT that in fact reports itself -- or the reverse -- \
+                 misstates the one bound this guard offers",
+                example.name
+            );
+        }
     }
 
     /// A file the sweep could not finish reading is REFUSED, never reported clean.
