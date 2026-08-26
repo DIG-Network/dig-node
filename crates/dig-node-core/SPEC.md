@@ -394,10 +394,17 @@ the current root.
   `async fn anchored_root(store_id) -> Result<Option<Bytes32>, _>` — `Ok(Some(root))` = the confirmed
   unspent-singleton tip's `metadata.root_hash`; `Ok(None)` = the store has no confirmed generation;
   `Err` = the chain is unreachable.
-- Production uses `CoinsetResolver`, which walks the singleton via
-  `digstore_chain::singleton::sync_datastore` over a coinset endpoint (`Coinset::mainnet()` /
-  `api.coinset.org`, overridable by `DIG_NODE_COINSET`). Tests inject a deterministic resolver so the
-  fail-closed gate is unit-testable without a chain.
+- Production uses `CorroboratedResolver`, which holds one `EndpointResolver` per configured chain
+  endpoint — each walking the singleton via `digstore_chain::singleton::sync_datastore` over its own
+  coinset endpoint — and serves an answer only when independent endpoints AGREE. Endpoints come from
+  `DIG_NODE_CHAIN_ENDPOINTS` (comma-separated); `DIG_NODE_COINSET` names a single endpoint when that
+  is unset, and the default is `api.coinset.org`. Independence is derived from RESOLVED ADDRESSES,
+  never from a name: two endpoints whose address sets intersect are ONE voice. A reached endpoint
+  that rejects a root vetoes the resolution; fewer than two independent answers refuses. With one
+  configured endpoint — the default install — resolution is single-sourced and does not claim
+  corroboration; the full rule and its accepted limitations are the repo `SPEC.md` §14.4b.
+  `CoinsetResolver` remains as the single-endpoint resolver against the process-wide default. Tests
+  inject a deterministic resolver so the fail-closed gate is unit-testable without a chain.
 
 ### 4.2 The read-path pin (fail-closed, `-32005`)
 
@@ -1196,6 +1203,7 @@ cache cap is `config.json` > env > default).
 | `DIG_PEER_PORT` | mTLS peer-RPC listen port (dual-stack `[::]`) | `9444` |
 | `DIG_NODE_UPSTREAM` | §21 host base for sync + read proxy fallback (OPTIONAL) | *(unset — no upstream)* |
 | `DIG_NODE_COINSET` | coinset API base for chain reads | `Coinset::mainnet()` (api.coinset.org) |
+| `DIG_NODE_CHAIN_ENDPOINTS` | comma-separated endpoints the anchored root is corroborated across | unset (single-source; see repo `SPEC.md` §14.4b) |
 | `DIG_NODE_CACHE` | override the shared cache dir | per-OS `DigNode/cache` (§3.4) |
 | `DIG_NODE_CACHE_CAP` | on-disk cache cap (bytes) | `DEFAULT_CACHE_CAP` = 1 GiB (floor 64 MiB) |
 | `DIG_NODE_PIN` | anchored-root pin enforcement (`off`/`0`/`false` disables) | enforced (fail-closed) |

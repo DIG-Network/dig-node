@@ -216,6 +216,7 @@ does not own them (except `DIG_NODE_UPSTREAM`, which the shell SETS — see belo
 |---|---|---|---|
 | `DIG_NODE_CACHE_CAP` | LRU cache size cap, in bytes | `1073741824` (1 GiB) | Parsed as `u64`. Consulted ONLY when the persisted `cache_cap_bytes` key in `config.json` is absent or `0` (the persisted value wins). Unparsable/unset ⇒ default. |
 | `DIG_NODE_COINSET` | override the coinset API base used for chain-anchored-root resolution | `https://api.coinset.org` (mainnet) | Blank/unset ⇒ mainnet default. Used for tests / alternate endpoints. |
+| `DIG_NODE_CHAIN_ENDPOINTS` | comma-separated coinset-protocol endpoints the anchored root is CORROBORATED across (§14.4b) | unset (single-source) | Two or more INDEPENDENTLY-HOSTED endpoints enable the agreement rule; independence is derived from resolved addresses, so two names for one machine stay ONE voice. Unparseable entries are DROPPED, never defaulted. Prefer three or more. Takes precedence over `DIG_NODE_COINSET`. |
 | `DIG_NODE_PIN` | read-path anchored-root pin enforcement (§14.4) | `on` (ENFORCED, fail-closed) | ONLY `off`/`0`/`false` disable the node-side pin (a named offline/local-dev escape hatch); any other value or unset ENFORCES. Clients still verify proofs against their own trust root regardless. |
 | `DIG_NODE_WATCH_INTERVAL` | chain-watch poll interval, in seconds (§14.2) | `30` | Parsed as `u64`; `0`/unparsable/unset ⇒ default `30`; floored at `1` s so a mis-set value cannot flood coinset. |
 | `DIG_NODE_UPSTREAM` | **INTERNAL** — the effective upstream the node library reads | *(unset — NO default upstream)* | NOT a user knob. The shell resolves the upstream (§3.4) and writes this via `Config::apply_to_env()` (§3.5); the shell's public knob is `DIG_RPC_UPSTREAM`. Empty ⇒ the library makes no upstream request at all. |
@@ -3883,6 +3884,23 @@ rejects the serve (§14.4, `-32005 ROOT_NOT_ANCHORED`). Specifically:
 - The rule covers all three resolution calls — the tip state, the bounded pinned-root verification,
   and lineage membership — because all three are consulted by the serve decision.
 
+**A reached source that REJECTS a root vetoes the resolution; it is never outvoted.** This is stated
+separately because the two verification calls answer a yes/no question and so have no value channel
+in which to disagree. A source that is reached and says *"that root is not current"* MUST be
+distinguished from one that could not be asked, and its rejection MUST refuse the whole resolution
+regardless of how many other sources confirmed. A flat *k*-of-*N* threshold does NOT satisfy this
+clause: under one, 2-of-3 and 2-of-10 are the same bar, so adding endpoints would not raise an
+attacker's cost — and, with no attacker at all, three endpoints of which one is a generation behind
+would serve stale content. **The bar rises with `N` because every added source can veto, not because
+more must agree.**
+
+**Latency and disclosure, both consequences of asking more than one source.** Endpoint independence
+is recomputed per resolution, so name resolution happens on the content-serve request path: lookups
+are performed CONCURRENTLY and each is bounded (3 seconds), and an endpoint that exceeds it counts
+as unreachable — the fail-closed direction. And resolving now discloses the STORE ID to every
+configured endpoint rather than to one. An operator adding endpoints buys corroboration and widens
+that disclosure; both halves are real.
+
 **ACCEPTED LIMITATION — the DEFAULT INSTALL resolves the anchored root from ONE third party.** With
 fewer than two independent voices configured, the node answers from its single source, exactly as it
 did before this rule existed. It does not claim corroboration in that state, and it does not refuse:
@@ -3894,7 +3912,14 @@ content read is pinned to. A source that lied about it would redirect reads on e
 and the pin would fail closed against the WRONG root rather than the right one — indistinguishable,
 from outside, from the store having moved on. It does NOT let that source forge content: bytes are
 still accepted only because they verify against the merkle root (§21.2, §22.3). The remedy available
-to an operator today is to name two independently-hosted endpoints.
+to an operator today is to name several independently-hosted endpoints.
+
+*How many:* prefer **three or more**, not two. Two is the minimum the rule accepts and the most
+fragile count it accepts, because with two ANY single source being unreachable drops the node to one
+answer — below the corroboration floor — so every read refuses until it returns. A third endpoint is
+what makes the guarantee survive one outage rather than converting one outage into a serve failure.
+Note the veto is unconditional at every count: a third source raises availability, and it also gains
+a third party able to refuse the read.
 
 **ALSO SINGLE-SOURCED, and NOT corroborated (stated, not fixed).** These paths go to one endpoint
 regardless of configuration: `coin_records_by_puzzle_hashes`, `coin_records_by_hints` and

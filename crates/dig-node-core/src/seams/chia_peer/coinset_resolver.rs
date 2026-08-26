@@ -37,14 +37,16 @@ pub struct CoinsetResolver;
 #[async_trait::async_trait]
 impl AnchoredRootResolver for CoinsetResolver {
     async fn anchored_root(&self, store_id: &[u8; 32]) -> Result<Option<Bytes32>, String> {
-        AnchoredRootResolver::anchored_root(&EndpointResolver::new(resolution_coinset()), store_id).await
+        AnchoredRootResolver::anchored_root(&EndpointResolver::new(resolution_coinset()), store_id)
+            .await
     }
 
     async fn anchored_state(
         &self,
         store_id: &[u8; 32],
     ) -> Result<Option<AnchoredStoreState>, String> {
-        AnchoredRootResolver::anchored_state(&EndpointResolver::new(resolution_coinset()), store_id).await
+        AnchoredRootResolver::anchored_state(&EndpointResolver::new(resolution_coinset()), store_id)
+            .await
     }
 
     async fn verify_pinned_root(
@@ -52,11 +54,21 @@ impl AnchoredRootResolver for CoinsetResolver {
         store_id: &[u8; 32],
         pinned_root: Bytes32,
     ) -> Result<(), String> {
-        AnchoredRootResolver::verify_pinned_root(&EndpointResolver::new(resolution_coinset()), store_id, pinned_root).await
+        AnchoredRootResolver::verify_pinned_root(
+            &EndpointResolver::new(resolution_coinset()),
+            store_id,
+            pinned_root,
+        )
+        .await
     }
 
     async fn verify_lineage_root(&self, store_id: &[u8; 32], root: Bytes32) -> Result<(), String> {
-        AnchoredRootResolver::verify_lineage_root(&EndpointResolver::new(resolution_coinset()), store_id, root).await
+        AnchoredRootResolver::verify_lineage_root(
+            &EndpointResolver::new(resolution_coinset()),
+            store_id,
+            root,
+        )
+        .await
     }
 }
 

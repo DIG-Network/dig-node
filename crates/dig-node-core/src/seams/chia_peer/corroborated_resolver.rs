@@ -21,12 +21,28 @@
 //!   wrong root is not.
 //! * **Fewer than two independent voices** — the node has ONE source and says so. The answer is
 //!   that source's, exactly as before this resolver existed. This is the DEFAULT INSTALL, and it
-//!   is a named limitation rather than a corroboration claim: see `SPEC.md` §"Chain corroboration"
-//!   and dig-node#365.
+//!   is a named limitation rather than a corroboration claim: see `SPEC.md` §14.4b and
+//!   dig-node#365.
 //!
 //! Refusing on a default install was considered and rejected: it would stop every unconfigured
 //! node serving any content at all, which trades a corroboration gap for a total outage and
 //! removes the only surface on which an operator could then configure a second endpoint.
+//!
+//! # All THREE calls take that rule, and one of them had to be rebuilt to
+//!
+//! `anchored_state` carries a value, so disagreement is expressible in its return type.
+//! `verify_pinned_root` and `verify_lineage_root` answer a yes/no question and originally returned
+//! `Result<(), String>` per voice — in which a rejection and an unreachable chain are the same
+//! `Err`. A rule reading that cannot tell dissent from silence, and the version that shipped in
+//! this file counted the `Ok`s and passed at two, so **the bar did not rise with `N`** and three
+//! endpoints with two a generation behind served stale content. [`Verdict`] is what fixed it.
+//!
+//! # What this resolver discloses, which is new
+//!
+//! Resolving now sends the STORE ID to every configured endpoint rather than one. Corroboration is
+//! not free: the price of not trusting a single third party is telling several of them what this
+//! node is looking for. An operator adding endpoints is widening that disclosure, and `SPEC.md`
+//! §14.4b says so rather than leaving it to be discovered.
 
 use std::sync::Arc;
 
@@ -73,8 +89,10 @@ pub(crate) enum Verdict {
 pub(crate) trait ChainVoice: Send + Sync {
     /// The store's tip state as THIS voice sees it. Already has a value channel, so it needs no
     /// tri-state: a differing root is expressible directly.
-    async fn anchored_state(&self, store_id: &[u8; 32])
-        -> Result<Option<AnchoredStoreState>, String>;
+    async fn anchored_state(
+        &self,
+        store_id: &[u8; 32],
+    ) -> Result<Option<AnchoredStoreState>, String>;
 
     /// Is `pinned_root` the store's CURRENT on-chain generation, as this voice sees it?
     async fn verify_pinned_root(&self, store_id: &[u8; 32], pinned_root: Bytes32) -> Verdict;
@@ -88,8 +106,7 @@ pub(crate) trait ChainVoice: Send + Sync {
 /// Injected rather than hardcoded so the corroboration rule can be exercised against sources that
 /// answer from a fixture. Without this seam the only fixture available is a live network, and the
 /// dissent case — the entire point of this module — cannot be expressed at all.
-pub(crate) type SourceFactory =
-    Arc<dyn Fn(&ChainEndpoint) -> Arc<dyn ChainVoice> + Send + Sync>;
+pub(crate) type SourceFactory = Arc<dyn Fn(&ChainEndpoint) -> Arc<dyn ChainVoice> + Send + Sync>;
 
 /// An [`AnchoredRootResolver`] that believes a chain fact only when independent voices agree.
 pub(crate) struct CorroboratedResolver {
@@ -118,12 +135,26 @@ impl CorroboratedResolver {
         }
     }
 
-    /// The independent voices available right now, as resolvers.
+    /// The independent voices available right now — ONE speaker per voice.
     ///
     /// Recomputed per resolution rather than cached: an endpoint's addresses change, and a voice
     /// count fixed at start-up would keep claiming corroboration long after two endpoints had
     /// converged on one host — a stale independence verdict is worse than none, because it is the
     /// verdict the refusal rule trusts.
+    ///
+    /// # Why the first member speaks, and no failover between members
+    ///
+    /// A group's members are, by construction, endpoints that land on the SAME machine. Trying a
+    /// second one after the first fails is a retry against the host that just failed, not a
+    /// fallback to another source — so it would buy availability only in the narrow case of one
+    /// name of a multi-homed host going bad, and it would cost a second round trip on the request
+    /// path in every other case.
+    ///
+    /// It would also blur the very distinction this module rests on: a voice is a machine, and a
+    /// voice that is really "whichever of these names answered" is harder to reason about when a
+    /// rejection has to be attributed to a source. Recorded because an earlier version of this
+    /// comment promised per-group failover that the code did not perform, which is a worse state
+    /// than either choice.
     async fn voices(&self) -> Vec<Arc<dyn ChainVoice>> {
         independent_voices(&self.endpoints, self.reach.as_ref())
             .await

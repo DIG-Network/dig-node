@@ -106,6 +106,13 @@ pub(crate) trait EndpointReach: Send + Sync {
     async fn addrs(&self, authority: &Authority) -> Result<BTreeSet<IpAddr>, String>;
 }
 
+/// How long one endpoint's name resolution may take before it counts as unreachable.
+///
+/// Chosen to bound the request path rather than to be generous: independence is recomputed per
+/// resolution, so this is paid on reads, and an endpoint slower than this is not one the node can
+/// usefully corroborate against anyway.
+const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Production reach: ordinary DNS, through the same resolver the HTTP client will use.
 pub(crate) struct DnsReach;
 
@@ -122,11 +129,27 @@ impl EndpointReach for DnsReach {
     /// and it caught this function.
     async fn addrs(&self, authority: &Authority) -> Result<BTreeSet<IpAddr>, String> {
         let Authority { host, port } = authority;
-        let addrs: BTreeSet<IpAddr> = tokio::net::lookup_host((host.as_str(), *port))
-            .await
-            .map_err(|e| format!("host {host} port {port} does not resolve: {e}"))?
-            .map(|socket| socket.ip())
-            .collect();
+        // BOUNDED, because this runs on the content-serve request path. A resolver that never
+        // answers would otherwise hold a read open indefinitely, and it would do so while the node
+        // looks healthy — the endpoint set is consulted per resolution, so one black-holed DNS
+        // server would stall every read rather than costing one voice.
+        //
+        // A timeout is an UNREACHABLE verdict, which is the fail-closed direction: the endpoint
+        // contributes no voice, and too few voices refuses.
+        let addrs: BTreeSet<IpAddr> = tokio::time::timeout(
+            LOOKUP_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), *port)),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "host {host} port {port} did not resolve within {}s",
+                LOOKUP_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("host {host} port {port} does not resolve: {e}"))?
+        .map(|socket| socket.ip())
+        .collect();
         if addrs.is_empty() {
             return Err(format!("host {host} port {port} resolves to no address"));
         }
@@ -148,12 +171,23 @@ pub(crate) async fn independent_voices(
     endpoints: &[ChainEndpoint],
     reach: &dyn EndpointReach,
 ) -> Vec<Vec<usize>> {
-    let mut reachable: Vec<(usize, BTreeSet<IpAddr>)> = Vec::new();
-    for (ix, endpoint) in endpoints.iter().enumerate() {
-        if let Ok(addrs) = reach.addrs(&endpoint.authority).await {
-            reachable.push((ix, addrs));
-        }
-    }
+    // CONCURRENTLY, because this is on the content-serve request path and the lookups are
+    // independent of one another: resolving N endpoints one after another makes the cost of
+    // configuring another source a latency penalty on every read, which is a reason not to
+    // configure one. `join_all` keeps the results in endpoint order, so the grouping below stays
+    // deterministic — the merge is order-sensitive, and a set of voices that varied run to run
+    // would make the refusal rule itself nondeterministic.
+    let looked_up = futures::future::join_all(
+        endpoints
+            .iter()
+            .map(|endpoint| reach.addrs(&endpoint.authority)),
+    )
+    .await;
+    let reachable: Vec<(usize, BTreeSet<IpAddr>)> = looked_up
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ix, addrs)| addrs.ok().map(|addrs| (ix, addrs)))
+        .collect();
 
     let mut groups: Vec<(Vec<usize>, BTreeSet<IpAddr>)> = Vec::new();
     for (ix, addrs) in reachable {
