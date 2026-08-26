@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
-use digstore_chain::coinset::Coinset;
+use digstore_chain::coinset::{ChainReads, Coinset};
 use digstore_chain::singleton::{sync_datastore, sync_datastore_with_history, verify_pinned_root};
 use digstore_core::Bytes32;
 
-use super::corroborated_resolver::CorroboratedResolver;
+use super::corroborated_resolver::{ChainVoice, CorroboratedResolver, Verdict};
 use super::endpoints::{ChainEndpoint, DnsReach};
 use crate::shared::chain_view::{AnchoredRootResolver, AnchoredStoreState};
 
@@ -37,18 +37,14 @@ pub struct CoinsetResolver;
 #[async_trait::async_trait]
 impl AnchoredRootResolver for CoinsetResolver {
     async fn anchored_root(&self, store_id: &[u8; 32]) -> Result<Option<Bytes32>, String> {
-        EndpointResolver::new(resolution_coinset())
-            .anchored_root(store_id)
-            .await
+        AnchoredRootResolver::anchored_root(&EndpointResolver::new(resolution_coinset()), store_id).await
     }
 
     async fn anchored_state(
         &self,
         store_id: &[u8; 32],
     ) -> Result<Option<AnchoredStoreState>, String> {
-        EndpointResolver::new(resolution_coinset())
-            .anchored_state(store_id)
-            .await
+        AnchoredRootResolver::anchored_state(&EndpointResolver::new(resolution_coinset()), store_id).await
     }
 
     async fn verify_pinned_root(
@@ -56,15 +52,11 @@ impl AnchoredRootResolver for CoinsetResolver {
         store_id: &[u8; 32],
         pinned_root: Bytes32,
     ) -> Result<(), String> {
-        EndpointResolver::new(resolution_coinset())
-            .verify_pinned_root(store_id, pinned_root)
-            .await
+        AnchoredRootResolver::verify_pinned_root(&EndpointResolver::new(resolution_coinset()), store_id, pinned_root).await
     }
 
     async fn verify_lineage_root(&self, store_id: &[u8; 32], root: Bytes32) -> Result<(), String> {
-        EndpointResolver::new(resolution_coinset())
-            .verify_lineage_root(store_id, root)
-            .await
+        AnchoredRootResolver::verify_lineage_root(&EndpointResolver::new(resolution_coinset()), store_id, root).await
     }
 }
 
@@ -84,12 +76,79 @@ impl EndpointResolver {
     pub fn new(chain: Coinset) -> Self {
         Self { chain }
     }
+
+    /// Could this endpoint be reached AT ALL, right now?
+    ///
+    /// Used only to classify a failed verification: an endpoint that answers this and then rejects
+    /// a root has DISSENTED, while one that cannot answer it has said nothing. `unspent_coins_by_hint`
+    /// is the read `digstore_chain::singleton::verify_pinned_root` itself starts with, so a
+    /// success here means the very call that just failed had a reachable chain under it.
+    async fn is_reachable(&self, store_id: &[u8; 32]) -> bool {
+        self.chain
+            .unspent_coins_by_hint(chia_protocol::Bytes32::new(*store_id))
+            .await
+            .is_ok()
+    }
+}
+
+/// One endpoint speaking for itself, able to say NO as distinct from saying nothing.
+///
+/// # Where the classification comes from, and which way it errs
+///
+/// * `verify_lineage_root` needs no extra call: the walk ALREADY separates the two cases
+///   structurally — a completed walk whose history lacks the root is a rejection, and a failed
+///   walk is an unreachable chain.
+/// * `verify_pinned_root` delegates to a digstore function that performs its own read and collapses
+///   both outcomes into one error, so reachability is probed separately on the FAILURE path only.
+///   A success costs nothing extra.
+///
+/// The probe races the call it classifies, and that race is deliberately biased. If the chain drops
+/// between the probe and the verification, a genuine unreachability is recorded as a REJECTION —
+/// which refuses. The opposite misclassification, a rejection read as unreachability, is the defect
+/// this type exists to remove, and it fails OPEN. So the classification is arranged to be wrong
+/// only in the direction that refuses.
+#[async_trait::async_trait]
+impl ChainVoice for EndpointResolver {
+    async fn anchored_state(
+        &self,
+        store_id: &[u8; 32],
+    ) -> Result<Option<AnchoredStoreState>, String> {
+        AnchoredRootResolver::anchored_state(self, store_id).await
+    }
+
+    async fn verify_pinned_root(&self, store_id: &[u8; 32], pinned_root: Bytes32) -> Verdict {
+        match AnchoredRootResolver::verify_pinned_root(self, store_id, pinned_root).await {
+            Ok(()) => Verdict::Confirmed,
+            Err(why) if self.is_reachable(store_id).await => Verdict::Rejected(why),
+            Err(why) => Verdict::Unreachable(why),
+        }
+    }
+
+    async fn verify_lineage_root(&self, store_id: &[u8; 32], root: Bytes32) -> Verdict {
+        let launcher = chia_protocol::Bytes32::new(*store_id);
+        match sync_datastore_with_history(&self.chain, launcher).await {
+            // The walk COMPLETED, so this endpoint has a real opinion about the lineage.
+            Ok((_store, history)) => {
+                if history.history.iter().any(|c| c.root_hash == root) {
+                    Verdict::Confirmed
+                } else {
+                    Verdict::Rejected(format!(
+                        "root {} is not in the store's on-chain lineage (chain is the authority)",
+                        root.to_hex()
+                    ))
+                }
+            }
+            Err(e) => Verdict::Unreachable(e.to_string()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl AnchoredRootResolver for EndpointResolver {
     async fn anchored_root(&self, store_id: &[u8; 32]) -> Result<Option<Bytes32>, String> {
-        Ok(self.anchored_state(store_id).await?.map(|s| s.root))
+        Ok(AnchoredRootResolver::anchored_state(self, store_id)
+            .await?
+            .map(|s| s.root))
     }
 
     async fn anchored_state(
@@ -219,7 +278,7 @@ pub(crate) fn default_anchored_resolver() -> Arc<dyn AnchoredRootResolver> {
         Arc::new(|endpoint: &ChainEndpoint| {
             Arc::new(EndpointResolver::new(Coinset::with_url(
                 endpoint.url.clone(),
-            ))) as Arc<dyn AnchoredRootResolver>
+            ))) as Arc<dyn ChainVoice>
         }),
     ))
 }
