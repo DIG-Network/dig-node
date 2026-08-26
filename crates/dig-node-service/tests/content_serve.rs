@@ -29,11 +29,117 @@ fn env_guard() -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// RAII release of the env-serialization lock (held for the whole test).
 #[must_use]
 struct EnvHold(#[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>);
+
+/// A node's temp tree, **owned** — removed when the test's binding drops, including on panic.
+///
+/// # Why this is a type and not a `PathBuf` plus a cleanup line (dig-node#361)
+///
+/// This harness used to build its path by hand, `env::temp_dir().join(format!("dig-node-serve-\
+/// test-{pid}-{n}"))`, and nothing ever removed it. Each node seeds a real compiled `.dig` module
+/// and warms a cache, so a run costs ~57 MB. **1,123 of them reached 62.5 GB and took the dev
+/// machine to 81 MB free on a 1.9 TB disk**, producing a machine-wide `ENOSPC` that stopped an
+/// unrelated lane mid-build. It is self-concealing: it grows fastest exactly when the suite runs
+/// most, so it surfaces during heavy development and reads like a build-cache problem.
+///
+/// **Ownership is the point, not the deletion.** A `remove_dir_all` at the end of each test would
+/// be skipped by every failing assertion — the runs most worth diagnosing leak, and a panic
+/// unwinding past a deferred cleanup placed after an `.await` leaks whenever anything catches it.
+/// `TempDir` removes the tree in `Drop`, which unwinding runs.
+struct NodeCache {
+    /// The whole per-node tree (`<temp>/<prefix><random>/`): cache, state dir, everything.
+    dir: tempfile::TempDir,
+    /// `<dir>/cache`, the path handed to `DIG_NODE_CACHE` and to [`seed_module`].
+    cache: PathBuf,
+}
+
+/// Every temp tree this harness has ever created carries this prefix — the guard's own name for
+/// itself, and what [`sweep_stale_trees`] matches on.
+const TREE_PREFIX: &str = "dig-node-serve-test-";
+
+/// A tree untouched for this long cannot belong to a live run.
+///
+/// Only the `content_serve` binary creates these, and it finishes in ~2.5 minutes, so a tree idle
+/// for fifteen has no owner. Chosen as a safety margin rather than a tuning knob: being too eager
+/// deletes a concurrent lane's working directory and manufactures a flaky failure somewhere else,
+/// while being too patient costs only one more run's worth of small files.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Remove trees left by EARLIER runs, once per test process.
+///
+/// # Why a sweep is needed at all when the guard is RAII
+///
+/// The per-node [`NodeCache`] drop removes the ~57 MB cache tree, which is the whole of the disk
+/// cost. What it cannot always remove is the node's `wallet.sqlite` (~428 KB with its `-wal` and
+/// `-shm`): the axum task serving the node is detached and still holds the handle when the test
+/// body returns, and **Windows refuses to unlink an open file**. `TempDir::drop` swallows that
+/// error, so the tree survives with its database in it.
+///
+/// Fixing that inside `Drop` is not possible honestly — cancelling the server task needs the
+/// runtime to poll it, and `Drop` cannot `.await`. So the residue is **bounded** instead of
+/// pretended away, which dig-node#361 names as the acceptable second option: one run's worth of
+/// small files at any time, rather than unbounded growth. The 62.5 GB / `ENOSPC` failure the
+/// ticket was filed for is removed by the guard; this keeps the entry COUNT flat.
+fn sweep_stale_trees() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| sweep_trees_in(&std::env::temp_dir(), STALE_AFTER));
+}
+
+/// The sweep itself, over an explicit directory and threshold.
+///
+/// Split out from [`sweep_stale_trees`] so it is reachable from a test: the `Once` fires before
+/// the first [`NodeCache`], and a `Once` cannot be made to fire twice, so a test that could only
+/// call the wrapper could never observe what it did.
+fn sweep_trees_in(root: &Path, stale_after: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(TREE_PREFIX) {
+            continue;
+        }
+        // Unreadable metadata is treated as RECENT, so an entry this code cannot judge is left
+        // alone. The fail-safe direction is keeping a stranger's directory, never removing it.
+        let recently_touched = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+            .map_or(true, |age| age < stale_after);
+        if recently_touched {
+            continue;
+        }
+        // Best effort by design: a tree whose database is still open elsewhere simply stays, and
+        // the next run tries again.
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+impl NodeCache {
+    /// A fresh, uniquely-named tree with its `cache` subdirectory created.
+    fn new() -> Self {
+        sweep_stale_trees();
+        let dir = tempfile::Builder::new()
+            .prefix(TREE_PREFIX)
+            .tempdir()
+            .expect("temp dir for a serve-test node");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        Self { dir, cache }
+    }
+
+    /// The tree root — the node's `DIG_NODE_STATE_DIR`.
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl AsRef<Path> for NodeCache {
+    fn as_ref(&self) -> &Path {
+        &self.cache
+    }
+}
 
 /// Compile a REAL public `.dig` module (the SAME `digstore_stage::stage_and_compile` engine the node
 /// depends on) with a `PublicManifest` section. Returns `(root, module_bytes)`.
@@ -70,8 +176,8 @@ fn compile_public_module(store_id: Bytes32, files: &[(String, Vec<u8>)]) -> (Byt
 
 /// Seed a compiled module into the node's on-disk cache at its canonical `(store, root)` path
 /// (`<cache>/modules/<store>/<root>.module`) so the local-first serve finds it.
-fn seed_module(cache: &Path, store_hex: &str, root_hex: &str, bytes: &[u8]) {
-    let dir = cache.join("modules").join(store_hex);
+fn seed_module(cache: impl AsRef<Path>, store_hex: &str, root_hex: &str, bytes: &[u8]) {
+    let dir = cache.as_ref().join("modules").join(store_hex);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{root_hex}.module")), bytes).unwrap();
 }
@@ -98,7 +204,7 @@ async fn mock_upstream_all_miss() -> String {
 /// Start the service app on an ephemeral loopback port with a unique temp cache, the pin OFF (so the
 /// serve is hermetic — no coinset), and the given upstream. Returns the bound addr, the cache dir (to
 /// seed a module into), and the env-serialization hold.
-async fn start_server(upstream: &str) -> (SocketAddr, PathBuf, EnvHold) {
+async fn start_server(upstream: &str) -> (SocketAddr, NodeCache, EnvHold) {
     let hold = env_guard().lock_owned().await;
     let (addr, cache) = spawn_node(upstream).await;
     (addr, cache, EnvHold(hold))
@@ -108,19 +214,12 @@ async fn start_server(upstream: &str) -> (SocketAddr, PathBuf, EnvHold) {
 /// lock, so a single test can stand up two nodes (a reader and the gateway it falls back to) inside
 /// one hold. Each node captures its own cache dir at construction, so the process-global
 /// `DIG_NODE_CACHE` may be repointed between calls.
-async fn spawn_node(upstream: &str) -> (SocketAddr, PathBuf) {
-    let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!(
-        "dig-node-serve-test-{}-{}",
-        std::process::id(),
-        unique
-    ));
-    let cache = base.join("cache");
-    std::fs::create_dir_all(&cache).unwrap();
-    std::env::set_var("DIG_NODE_CACHE", &cache);
+async fn spawn_node(upstream: &str) -> (SocketAddr, NodeCache) {
+    let cache = NodeCache::new();
+    std::env::set_var("DIG_NODE_CACHE", &cache.cache);
     // Isolate the #501 control-token/paired-token state dir per test (identity-independent), so a
     // host with a real machine state dir can't defeat the temp isolation.
-    std::env::set_var("DIG_NODE_STATE_DIR", &base);
+    std::env::set_var("DIG_NODE_STATE_DIR", cache.root());
     // Hermetic: disable the chain-anchored pin so the serve resolves against the requested root with
     // NO coinset call (the node-side gate only; a real deploy leaves the pin ON).
     std::env::set_var("DIG_NODE_PIN", "off");
@@ -653,15 +752,11 @@ async fn drive_s_get(
     use tower::ServiceExt;
 
     let hold = env_guard().lock_owned().await;
-    let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!(
-        "dig-node-origin-test-{}-{}",
-        std::process::id(),
-        unique
-    ));
-    std::fs::create_dir_all(base.join("cache")).unwrap();
-    std::env::set_var("DIG_NODE_CACHE", base.join("cache"));
-    std::env::set_var("DIG_NODE_STATE_DIR", &base);
+    // Owned for the body of this helper, so the tree goes when it returns OR panics. The same
+    // hand-rolled leak as `spawn_node` had (`dig-node-origin-test-*`), fixed the same way.
+    let base = NodeCache::new();
+    std::env::set_var("DIG_NODE_CACHE", &base.cache);
+    std::env::set_var("DIG_NODE_STATE_DIR", base.root());
     std::env::set_var("DIG_NODE_PIN", "off");
     let config = dig_node_service::Config {
         upstream: "http://127.0.0.1:1/unreachable".to_string(),
@@ -926,5 +1021,113 @@ async fn health_reports_the_peer_tier_as_unattached_before_the_peer_network_star
         body["peer_tier"]["attached"],
         json!(false),
         "a live node with no peer network must say so rather than leaving it unstated"
+    );
+}
+
+/// **The temp tree is removed when the guard drops — including when the drop is a PANIC unwinding
+/// out of a failing test.**
+///
+/// This is dig-node#361's regression, and the panic half is the half that matters. The leak was
+/// not "someone forgot the cleanup line"; it was that a cleanup line cannot run on the failing
+/// runs, which are exactly the runs a developer repeats. 1,123 leaked trees reached 62.5 GB and
+/// took the machine to 81 MB free.
+///
+/// **Asserted on the path, after the guard is gone.** Asserting that `Drop` was *reached* would
+/// pass for a `Drop` that reached a `remove_dir_all` and ignored its error, which is precisely the
+/// silent failure mode of the type being tested.
+///
+/// No node is started here on purpose: this pins the GUARD, and a live node's open `wallet.sqlite`
+/// handle is a separate, bounded residue that [`sweep_stale_trees`] owns.
+#[test]
+fn the_temp_tree_is_removed_on_drop_and_on_panic() {
+    let cache = NodeCache::new();
+    let normal = cache.root().to_path_buf();
+    std::fs::write(
+        normal.join("cache").join("seeded.bin"),
+        b"57 MB stands in here",
+    )
+    .unwrap();
+    assert!(
+        normal.is_dir(),
+        "the fixture never existed, so nothing is proven"
+    );
+    drop(cache);
+    assert!(
+        !normal.exists(),
+        "a guard dropped normally left its tree at {}",
+        normal.display()
+    );
+
+    // The panic path. `catch_unwind` is what makes it observable from inside a passing test; the
+    // unwind is real, and the guard is dropped by it and not by us.
+    let leaked = std::sync::Arc::new(std::sync::Mutex::new(PathBuf::new()));
+    let seen = std::sync::Arc::clone(&leaked);
+    let outcome = std::panic::catch_unwind(move || {
+        let cache = NodeCache::new();
+        *seen.lock().unwrap() = cache.root().to_path_buf();
+        std::fs::write(cache.as_ref().join("seeded.bin"), b"and here").unwrap();
+        panic!("a failing assertion, which is when the old harness leaked");
+    });
+
+    assert!(
+        outcome.is_err(),
+        "the fixture did not panic, so it proves nothing"
+    );
+    let path = leaked.lock().unwrap().clone();
+    assert!(
+        !path.as_os_str().is_empty(),
+        "the closure never built a tree, so the assertion below is vacuous"
+    );
+    assert!(
+        !path.exists(),
+        "a panic unwound past the guard and left its tree at {} -- this is the ENOSPC defect",
+        path.display()
+    );
+}
+
+/// **The sweep removes an abandoned tree and leaves a live one alone.**
+///
+/// Both halves are the test. A sweep that removes everything would pass a
+/// "the stale one is gone" assertion while deleting a concurrent lane's working directory
+/// mid-run — turning a disk-hygiene fix into a flaky-failure generator in an unrelated repo. So
+/// the fresh tree is not decoration: it is the actor that distinguishes this sweep from the
+/// nearest wrong one.
+///
+/// Run over a scratch directory rather than the real `Temp`, so it cannot delete anything real,
+/// and with an explicit threshold rather than [`STALE_AFTER`], so it does not take fifteen
+/// minutes to be true.
+#[test]
+fn the_sweep_removes_an_abandoned_tree_and_spares_a_live_one() {
+    let scratch = tempfile::tempdir().unwrap();
+    let threshold = std::time::Duration::from_millis(300);
+
+    let abandoned = scratch.path().join(format!("{TREE_PREFIX}abandoned"));
+    std::fs::create_dir_all(abandoned.join("cache")).unwrap();
+    std::fs::write(abandoned.join("wallet.sqlite"), b"residue").unwrap();
+
+    // An unrelated directory that merely shares the temp dir. The sweep must be selective by
+    // PREFIX as well as by age -- it is pointed at a directory full of other people's files.
+    let stranger = scratch.path().join("someone-elses-work");
+    std::fs::create_dir_all(&stranger).unwrap();
+
+    std::thread::sleep(threshold * 4);
+
+    let live = scratch.path().join(format!("{TREE_PREFIX}live"));
+    std::fs::create_dir_all(live.join("cache")).unwrap();
+
+    sweep_trees_in(scratch.path(), threshold);
+
+    assert!(
+        !abandoned.exists(),
+        "the abandoned tree survived, so the count grows without bound"
+    );
+    assert!(
+        live.is_dir(),
+        "the sweep deleted a tree young enough to belong to a running test -- this would break \
+         a concurrent lane rather than tidy up after this one"
+    );
+    assert!(
+        stranger.is_dir(),
+        "the sweep removed a directory that is not one of ours at all"
     );
 }
