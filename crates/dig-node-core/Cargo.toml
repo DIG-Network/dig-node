@@ -550,10 +550,10 @@ dig-download = { version = "0.19", features = ["testkit"] }
 # and that no payload byte or proof ever reaches it.
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # Builds canonical `did:chia:` strings for the on-chain DID-resolver tests (matches dig-identity's codec).
-chia-sdk-utils = "0.30"
+chia-sdk-utils = "0.36.0"
 # The session attach tests sign challenges with the BLS12-381 G2 AugScheme (the app's slot-0x0010
 # identity key), matching dig-ipc-protocol's signing contract and dig-identity's published G1 key.
-chia-bls = "0.26"
+chia-bls = "0.36.1"
 # axum is a TEST-ONLY dependency of the engine library: the node no longer serves its
 # own HTTP (the `dig-node-service` shell owns the axum transport, `dig-runtime` owns the
 # in-process FFI path — dispatch is `handle_rpc`, which is transport-agnostic). The

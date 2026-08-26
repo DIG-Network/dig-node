@@ -26,7 +26,7 @@ digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c
 # node + wallet are one host cluster). dig-wallet reads the node's cache surface for the
 # wallet UI's "My Node" cache view (cache_cap_bytes / cache_used_bytes / clear_cache / list).
 dig-node-core = { path = "../dig-node-core" }
-chia-protocol = "0.26"
+chia-protocol = "0.36.1"
 # BIP-39 mnemonic → seed for deriving each custodied wallet's stable id (the Chia BLS
 # master public-key FINGERPRINT, #427). Already resolved transitively via digstore-chain;
 # declared directly here so `custody` can compute the fingerprint without re-exposing it
@@ -34,13 +34,13 @@ chia-protocol = "0.26"
 bip39 = "2"
 # `chia::puzzles::nft::NftMetadata` — the on-chain NFT metadata struct we serialize
 # into a MintSpec's metadata Program for chia_mintNft / chia_bulkMintNfts.
-chia = "0.26"
+chia = "0.36.1"
 # Needed to NAME the SDK spendable `Cat` type when assembling a make-offer's
 # MakerFunds, and `SpendContext` to serialize NFT metadata into a Program.
-chia-wallet-sdk = { version = "0.30", features = ["offer-compression"] }
+chia-wallet-sdk = { version = "0.36.0", features = ["offer-compression"] }
 # CLVM runtime types (NodePtr/Allocator) used by the #216 singleton reconstruction + spend
-# builders. Pinned to the same 0.14 the SDK resolves so the NodePtr types unify.
-clvmr = "0.14"
+# builders. Pinned to the same 0.16 the SDK resolves so the NodePtr types unify.
+clvmr = "0.16.2"
 # Offer building (design A.5): the chia-wallet-sdk action system's `Spends::finish_with_keys`
 # takes an ordered `IndexMap<Bytes32, PublicKey>` (owner ph -> signing key), as digstore-chain's
 # offer builder does. Same crate the SDK resolves.
@@ -152,7 +152,7 @@ totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
 # an attacker cannot predict, observe or steer (dig_ecosystem#2549). Deliberately not `rand` --
 # `thread_rng` would work but adds a seeded layer whose provenance a reader has to go and check.
 getrandom = "0.2"
-chia-traits = "0.26"
+chia-traits = "0.36.1"
 
 # -- #277 unattended wallet bootstrap (`autoseed`) --------------------------------------
 # The `created_at` stamp on the wallet's origin sidecar, as RFC 3339. Already in the
@@ -177,8 +177,8 @@ windows-sys = { version = "0.61", features = [
 tempfile = "3"
 # Recompute the canonical offer id with THIS crate's chia stack, so the parity test can pin
 # dig-offers' (newer) stack and ours to the same value rather than trusting they agree (#283).
-# Pinned to the 0.26 line the local chia-protocol resolves.
-chia-sha2 = "0.26"
+# Pinned to the 0.36.1 line the local chia-protocol resolves.
+chia-sha2 = "0.36.1"
 # `start_paused` — a virtual clock, so the peer-request deadline (#2851) is asserted to EXIST
 # without a test that actually waits sixty seconds for it.
 tokio = { version = "1", features = ["test-util"] }
@@ -187,7 +187,7 @@ tokio = { version = "1", features = ["test-util"] }
 # The SAME 0.3 line dig-logging builds on, so one tracing-subscriber resolves.
 tracing-subscriber = "0.3"
 # K1Pair — real secp256k1 test key pairs for the vault config / K1 pubkey parse tests.
-chia-sdk-test = { version = "0.30", features = ["peer-simulator"] }
+chia-sdk-test = { version = "0.36.0", features = ["peer-simulator"] }
 # Drive the axum Router transport-independently (oneshot) and read response bodies in
 # the conformance + transport-parity tests.
 tower = { version = "0.5", features = ["util"] }
