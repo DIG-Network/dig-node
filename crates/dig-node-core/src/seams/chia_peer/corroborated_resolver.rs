@@ -698,6 +698,27 @@ mod tests {
             "and the same for lineage membership: {lineage}"
         );
 
+        // THE COMPOSITION, and it is the half of this defect that made it dangerous rather than
+        // merely wrong. `content_serve.rs`, `dig_rpc/dispatch.rs` and `module_reshare.rs` all
+        // treat a failed tip resolution as the #747 broken-walk case and FALL BACK to
+        // `verify_pinned_root`. Widening what `anchored_state`'s `Err` means — it now also means
+        // "sources DISAGREE" — routes the strongest signal this feature produces onto that
+        // fallback. So the fallback must refuse on the same fixture, or a disagreement is
+        // laundered into a serve by the ladder that exists for a different failure entirely.
+        assert!(
+            two_against_one.anchored_state(&STORE).await.is_err(),
+            "the tip resolution must refuse on dissent — this is the input to the fallback below"
+        );
+        assert!(
+            two_against_one
+                .verify_pinned_root(&STORE, root)
+                .await
+                .is_err(),
+            "and the BOUNDED fallback the serve path drops to must refuse on the SAME fixture. If \
+             it does not, a disagreement about the tip is answered by the #747 escape hatch and \
+             the read is served"
+        );
+
         // Nine confirmations against one rejection. A threshold rule passes this trivially; the
         // dissent rule refuses it, which is what "the bar rises with N" means.
         let mut many: Vec<(&str, &str, Voice)> = Vec::new();
