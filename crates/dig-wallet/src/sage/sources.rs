@@ -993,6 +993,17 @@ mod sole_owner_tests {
     /// a real haystack. Counting FILES per root separates "this crate is clean" from "this crate
     /// was never opened", which is the same distinction [`Swept::ended_inside_a_test_item`] draws
     /// within a file.
+    ///
+    /// Both misconfigurations were measured against the compiled walk, because they fail through
+    /// different mechanisms and only one of them is this assertion:
+    ///
+    /// * A root that does NOT EXIST panics inside `rust_files` (`read_dir(…).expect(…)`) before
+    ///   this assertion is reached. Loud, and fine — but it is the panic doing the work, not the
+    ///   count.
+    /// * A root that EXISTS and holds no Rust — a `src` renamed, a crate reorganised, a path that
+    ///   silently stopped being the source tree — reaches this assertion, and it is what fires.
+    ///   Verified by pointing both roots at an empty sibling directory: this test fails naming the
+    ///   root it read zero files from.
     #[test]
     fn the_sweep_reaches_every_root_and_can_find_a_construction_site_at_all() {
         let roots = swept_roots();
@@ -1035,7 +1046,10 @@ mod sole_owner_tests {
     /// The stray test is the half that would rot silently. `dig-node-core` could perfectly well
     /// gain a `sources.rs` of its own, and against the unqualified `OWNER` this fixture's site
     /// would then be accepted as the owner's — a second fabric passing the guard because it was
-    /// filed under a familiar name.
+    /// filed under a familiar name. Measured: reverting `OWNER` and the site format to their
+    /// unqualified single-crate forms fails THIS test and leaves every other test in the module
+    /// green, including [`only_the_registry_owner_constructs_a_peer_fabric`] — which is precisely
+    /// why the demonstration is needed rather than the real assertion alone.
     #[test]
     fn a_second_fabric_in_the_new_root_is_seen_and_judged_a_stray() {
         let root = std::env::temp_dir().join(format!(

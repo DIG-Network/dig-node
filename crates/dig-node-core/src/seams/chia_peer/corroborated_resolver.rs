@@ -277,6 +277,12 @@ mod tests {
     /// here: with no honest majority left it cannot distinguish "refused because they disagreed"
     /// from "refused because nothing answered", and a majority-vote implementation — the nearest
     /// wrong one — passes it.
+    ///
+    /// Measured against the compiled resolver: replacing the unanimity check with a MAJORITY vote
+    /// (two of three say `0xAA`, so serve `0xAA`) fails this test, and fails
+    /// [`one_source_reporting_not_minted_against_a_named_root_is_a_disagreement`] and
+    /// [`two_endpoints_on_one_machine_do_not_corroborate_each_other`] with it. That is the revert
+    /// this test is named for.
     #[tokio::test]
     async fn a_single_dissenting_source_refuses_rather_than_repairing_the_root() {
         let agreeing = resolver(&[
@@ -348,6 +354,15 @@ mod tests {
     /// an implementation counting CONFIGURED sources — or counting sources by type — sees a 2-of-2
     /// agreement and serves the root. The control below moves ONE endpoint to a second machine
     /// and nothing else, so the fixture cannot pass by refusing everything.
+    ///
+    /// Which revert this catches, measured rather than assumed: it fires on the MAJORITY-vote
+    /// revert (a and b are one voice, so the second half is 1-against-1 and a majority rule serves
+    /// `0xAA`). It does NOT fire on a name-based independence revert — under that rule a, b and c
+    /// are three voices, two agree and one dissents, and unanimity refuses anyway. The name-based
+    /// revert is caught in [`super::super::endpoints`] by
+    /// `two_names_for_one_machine_are_one_voice_and_two_machines_are_two`, which is where the
+    /// grouping rule lives. Recorded because a test whose comment claims a revert it does not
+    /// catch is how the revert that IS uncaught goes unnoticed.
     #[tokio::test]
     async fn two_endpoints_on_one_machine_do_not_corroborate_each_other() {
         let one_machine = resolver(&[

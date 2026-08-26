@@ -201,7 +201,10 @@ mod tests {
         async fn addrs(&self, authority: &Authority) -> Result<BTreeSet<IpAddr>, String> {
             match self.0.get(authority) {
                 Some(addrs) => Ok(addrs.iter().copied().collect()),
-                None => Err(format!("{}:{} does not resolve", authority.host, authority.port)),
+                None => Err(format!(
+                    "{}:{} does not resolve",
+                    authority.host, authority.port
+                )),
             }
         }
     }
@@ -294,31 +297,59 @@ mod tests {
 
     /// A partial overlap is still one voice, and the merge is transitive.
     ///
-    /// A dual-stack host answers with several addresses, so requiring set EQUALITY would call one
-    /// machine two voices whenever a resolver returned its addresses in different combinations.
-    /// The third endpoint is the transitivity probe: it shares nothing with the first directly,
-    /// and is bridged to it by the second.
+    /// A dual-stack host answers with several addresses (§5.2 makes IPv6 the ordinary case here),
+    /// so requiring set EQUALITY would call one machine two voices whenever a resolver returned
+    /// its addresses in different combinations.
+    ///
+    /// # The bridging endpoint is deliberately LAST, and that ordering is the whole test
+    ///
+    /// The property is that an endpoint joining two ALREADY-DISJOINT groups merges both. An
+    /// earlier version of this fixture listed the bridge in the middle, so at every step there was
+    /// only ever ONE existing group to consider and merge-into-all and merge-into-the-first agreed
+    /// on every input — measured: reverting the merge to stop at the first match left this test
+    /// GREEN. The fixture asserted a property the code has, on an input that could not exhibit it.
+    ///
+    /// With the bridge last, `a` and `c` are two separate voices by the time it arrives, and only
+    /// a rule that keeps merging collapses all three.
     #[tokio::test]
-    async fn overlapping_address_sets_merge_transitively_into_one_voice() {
+    async fn an_endpoint_bridging_two_disjoint_groups_merges_all_of_them() {
         let endpoints = endpoints(
             [
                 "https://a.example.org",
-                "https://b.example.org",
                 "https://c.example.org",
+                "https://bridge.example.org",
             ]
             .as_slice(),
         );
         let bridged = TableReach::new(&[
             ("https://a.example.org", &["203.0.113.7"]),
-            ("https://b.example.org", &["203.0.113.7", "2001:db8::1"]),
             ("https://c.example.org", &["2001:db8::1"]),
+            (
+                "https://bridge.example.org",
+                &["203.0.113.7", "2001:db8::1"],
+            ),
         ]);
 
         assert_eq!(
             independent_voices(&endpoints, bridged.as_ref()).await,
             vec![vec![0, 1, 2]],
-            "a and c share no address, so a rule that merged only on the FIRST match reports two \
-             voices here and the third endpoint turns one host into a passing quorum"
+            "a and c share no address directly and are two groups when the bridge arrives; a rule \
+             that merged only into the FIRST match leaves c standing alone, so ONE machine \
+             reachable under three names reports two independent voices and satisfies the quorum"
+        );
+
+        // The control: the same three endpoints with the bridge reaching a THIRD machine are
+        // three voices. Without it an implementation that collapsed everything into one group
+        // would satisfy the assertion above while destroying the property it is named for.
+        let unbridged = TableReach::new(&[
+            ("https://a.example.org", &["203.0.113.7"]),
+            ("https://c.example.org", &["2001:db8::1"]),
+            ("https://bridge.example.org", &["192.0.2.5"]),
+        ]);
+        assert_eq!(
+            independent_voices(&endpoints, unbridged.as_ref()).await,
+            vec![vec![0], vec![1], vec![2]],
+            "three genuinely separate machines must stay three voices"
         );
     }
 
