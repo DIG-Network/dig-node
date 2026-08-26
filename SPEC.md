@@ -4497,7 +4497,7 @@ and small (one wallet). Indexes on `puzzle_hash`, `asset_id`, a PARTIAL index on
 `u64`/`u128` range, no `i64` overflow). This DB is the source of truth for a SYNCED wallet's data.
 
 18.6. **Direct-peer sync (primary path).** Wallet chain data is obtained by connecting directly to Chia
-full-node peers over the light-wallet protocol on `chia-wallet-sdk 0.30` `Peer` (`NodeType::Wallet`,
+full-node peers over the light-wallet protocol on `chia-wallet-sdk 0.36` `Peer` (`NodeType::Wallet`,
 protocol `0.0.37`, the four DNS introducers, multi-peer, IPv6-first per §5.2), exactly as Sage does — NOT
 via coinset for the wallet-data path. The node subscribes the wallet's puzzle hashes (BOTH hardened and
 unhardened + CAT hints) with `request_puzzle_state(subscribe = true)`, applies the returned coin states,
@@ -6096,7 +6096,19 @@ same `peer_id` (newest-wins re-adoption), and that is typically a MOVE — a dea
 a direct dial. The superseded addresses are RETAINED as trailing fallbacks (a still-working older path is
 not discarded) but MUST NOT be dialed first. Re-adoption MUST NOT grow the candidate set: the pool is
 keyed by `peer_id`, so a republished `PeerAdded` upserts one entry — a re-adopted peer is one candidate,
-never two. A connected-pool holder whose `dig.getAvailability` confirm probe CANNOT BE OBTAINED is admitted to
+never two.
+
+A `PoolEvent::PeerRemoved` carries WHY the peer left, and the node MUST preserve the distinction between a
+peer that FAILED and one that merely departed. `Banned` is the only reason that is behavioural — it makes
+the peer ineligible until re-added (§9.4). `Displaced` names a peer that was HEALTHY and was cycled out to
+make room for a holder content discovery found outside the persistent set; it is the one reason that is not
+a failure, and the node MUST NOT record it as evidence against the peer. Specifically it MUST NOT be mapped
+to `Banned` (which would make the node's own capacity decision bias selection toward unremembered peers — a
+sybil) nor to `Dead` (which asserts a keepalive found the peer unresponsive, a claim a displacement is no
+evidence for). A reason the selector has no variant for MUST fold to `Disconnected`, the reason that carries
+no such claim.
+
+A connected-pool holder whose `dig.getAvailability` confirm probe CANNOT BE OBTAINED is admitted to
 the download anyway (`PoolConfirmTransport`, #836): dig-download's `locate_and_confirm` DROPS any
 provider whose availability answer is not *available*, and a connected holder's probe can transiently
 FAIL on a relayed / isolated net — which would drop the connected holder, issue ZERO `dig.fetchRange`,
