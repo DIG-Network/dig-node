@@ -5888,10 +5888,17 @@ and continue with authenticated §21 sync disabled. Minting over it would hand t
 identity in exactly the situation where the real key is most likely still intact on the machine
 that sealed it.
 
-**Reporting protection honestly.** No platform hardware provider ships today (dig_ecosystem#1693),
-so every host resolves `Software(NotRequested)` and the node MUST say so rather than implying
-hardware backing. A surface reporting what protects the key MUST read the **blob's** tier, not the
-host's — a hardware-capable host does not retroactively protect bytes already at rest. On a blob
+**Binding to the host's trusted component.** The node MUST walk the platform ladder when opening
+its machine keystore — Windows TPM 2.0, Apple Secure Enclave, Linux TPM 2.0 — and MUST NOT report
+`Software(NotRequested)`, which asserts that no binding was ASKED FOR. It MUST request a policy
+that refuses to report an uninspectable host as an absent one, and it MUST NOT let that refusal
+prevent the keystore opening: the machine key is on the boot path, and a node that cannot construct
+it cannot serve the peer network. A host whose trusted component cannot be inspected therefore
+degrades to the software floor, and the node MUST report the probe's own reason for that degrade
+rather than a confident `NoHardwarePresent`.
+
+**Reporting protection honestly.** A surface reporting what protects the key MUST read the
+**blob's** tier, not the host's — a hardware-capable host does not retroactively protect bytes already at rest. On a blob
 this host cannot open, the node MUST NOT make a recovery promise: per dig-keystore `SPEC.md`
 §17.5b the envelope records a hardware *class* and carries no device identity, so the same error is
 returned for a blob copied off its machine (recoverable) and for the original machine with its

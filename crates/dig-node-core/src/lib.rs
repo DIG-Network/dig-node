@@ -4410,10 +4410,7 @@ impl Node {
                     );
                     // Say what actually protects it, rather than letting "sealed" imply hardware
                     // backing no host has yet (dig-keystore SPEC.md §17.5b).
-                    match crate::seams::key_mgmt::MachineKeyStore::open(
-                        &dir,
-                        crate::seams::key_mgmt::machine_key::platform_provider(),
-                    ) {
+                    match crate::seams::key_mgmt::MachineKeyStore::open_platform_bound(&dir) {
                         Ok(store) => println!("dig-node: {}", store.protection_summary()),
                         Err(e) => eprintln!("dig-node: machine key protection unknown: {e}"),
                     }
