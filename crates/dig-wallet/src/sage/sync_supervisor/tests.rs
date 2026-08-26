@@ -77,6 +77,12 @@ struct Script {
     connects: AtomicUsize,
     /// Addresses `connect` dialed, in order.
     dialled: Mutex<Vec<String>>,
+    /// The exclusion list handed to each `connect`, one entry per call.
+    ///
+    /// Recorded rather than discarded because a double that drops the argument cannot express the
+    /// property under test at all: "the replacement dial avoided the contradicting peer" is
+    /// invisible to a factory that never saw which peer it was asked to avoid (#307).
+    excluded: Mutex<Vec<Vec<SocketAddr>>>,
     /// The sender feeding each live session's update loop; the test drives and closes it.
     senders: Mutex<Vec<tokio::sync::mpsc::Sender<Message>>>,
     /// Delays passed to [`TimeSource::sleep`], in order.
@@ -196,7 +202,12 @@ struct ScriptedFactory {
 
 #[async_trait::async_trait]
 impl SyncSessionFactory for ScriptedFactory {
-    async fn connect(&self) -> Result<Box<dyn SyncSession>, SyncError> {
+    async fn connect(&self, exclude: &[SocketAddr]) -> Result<Box<dyn SyncSession>, SyncError> {
+        self.script
+            .excluded
+            .lock()
+            .unwrap()
+            .push(exclude.to_vec());
         let ok = self
             .script
             .outcomes
@@ -2108,6 +2119,73 @@ async fn run_discovered_session(
     harness.settle().await;
     harness.stop().await;
     (db, script)
+}
+
+
+/// **Proves (#307):** the dial that REPLACES a writer caught contradicting a decisive quorum is
+/// told to avoid that writer.
+///
+/// Discovery is random and `connect_random_peer` took no exclusion argument, so the replacement for
+/// a peer this node has just caught lying could be that same peer — making the replacement a coin
+/// flip rather than a replacement.
+///
+/// FIXTURE DESIGN — exactly ONE actor varies, and the CONTROL is the sibling test below. Asserting
+/// only "the second dial excluded something" would be satisfied by a supervisor that excludes the
+/// current peer unconditionally, which would spend the pool down on every ordinary rotation and
+/// shrink the plurality NC-12 rests on. So this asserts the exclusion is PRESENT after a
+/// contradiction and the sibling asserts it is ABSENT after an honest session — the pair is what
+/// distinguishes "excludes the accused" from "always excludes".
+///
+/// The first dial is asserted empty too: a supervisor seeded with a non-empty avoid-list would
+/// satisfy the second assertion for a reason that has nothing to do with the contradiction.
+#[tokio::test]
+async fn a_writer_caught_contradicting_the_quorum_is_excluded_from_the_replacement_dial() {
+    let (_db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
+
+    let excluded = script.excluded.lock().unwrap().clone();
+    let accused: SocketAddr = "203.0.113.1:8444".parse().expect("the fixture address parses");
+
+    assert!(
+        excluded.len() >= 2,
+        "a contradicting writer is replaced at once, so a replacement dial must have happened; \
+         saw {} dial(s)",
+        excluded.len()
+    );
+    assert!(
+        excluded[0].is_empty(),
+        "the first dial has nobody to avoid: {:?}",
+        excluded[0]
+    );
+    assert!(
+        excluded[1].contains(&accused),
+        "the replacement dial must avoid the peer the quorum just caught contradicting it; \
+         it was told to avoid {:?}",
+        excluded[1]
+    );
+}
+
+/// **Proves the CONTROL for #307:** an honest session excludes NOBODY.
+///
+/// Without this, the exclusion could be unconditional — every reconnect refusing the peer it just
+/// held — and the test above would still pass. That version would be a real regression rather than
+/// a harmless one: a node that avoids its own last peer on every ordinary rotation steadily narrows
+/// the set a random dial can reach, which is the plurality NC-12 depends on.
+///
+/// Only a writer that CONTRADICTS a decisive quorum names a culprit; a split, a silent writer, a
+/// stall and a rotation all accuse nobody.
+#[tokio::test]
+async fn an_honest_session_never_asks_the_next_dial_to_avoid_anyone() {
+    let (_db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+
+    let excluded = script.excluded.lock().unwrap().clone();
+    assert!(
+        !excluded.is_empty(),
+        "the fixture must have dialled at least once"
+    );
+    assert!(
+        excluded.iter().all(Vec::is_empty),
+        "no peer was accused of anything, so no dial should have been asked to avoid one: {excluded:?}"
+    );
 }
 
 /// **Proves:** a single lying peer cannot move the replica.
