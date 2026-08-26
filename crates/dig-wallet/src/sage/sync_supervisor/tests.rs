@@ -203,11 +203,7 @@ struct ScriptedFactory {
 #[async_trait::async_trait]
 impl SyncSessionFactory for ScriptedFactory {
     async fn connect(&self, exclude: &[SocketAddr]) -> Result<Box<dyn SyncSession>, SyncError> {
-        self.script
-            .excluded
-            .lock()
-            .unwrap()
-            .push(exclude.to_vec());
+        self.script.excluded.lock().unwrap().push(exclude.to_vec());
         let ok = self
             .script
             .outcomes
@@ -2121,7 +2117,6 @@ async fn run_discovered_session(
     (db, script)
 }
 
-
 /// **Proves (#307):** the dial that REPLACES a writer caught contradicting a decisive quorum is
 /// told to avoid that writer.
 ///
@@ -2143,7 +2138,9 @@ async fn a_writer_caught_contradicting_the_quorum_is_excluded_from_the_replaceme
     let (_db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
 
     let excluded = script.excluded.lock().unwrap().clone();
-    let accused: SocketAddr = "203.0.113.1:8444".parse().expect("the fixture address parses");
+    let accused: SocketAddr = "203.0.113.1:8444"
+        .parse()
+        .expect("the fixture address parses");
 
     assert!(
         excluded.len() >= 2,

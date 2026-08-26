@@ -4855,6 +4855,22 @@ observed and `null` when unobservable, and a consumer MUST NOT add them. A node 
 subscription session as `chia_peer_count`: doing so made a node holding five peers and serving every read
 from them announce `chia_peer_count: 1`, a figure that was neither the peers serving reads nor the total.
 
+**`chia_peer_count` MUST be a MEASUREMENT, and `null` when it cannot be one.** The pool it counts
+evicts an entry only when a request to that peer FAILS, and the node reads the chain through a tier that
+consults the coinset HTTP API first — so a node whose reads are all answered by coinset never routes a
+request to a peer, never ejects one, and never has its held-peer belief contradicted. That belief then has
+unbounded age. A node MUST therefore report the count only while its held peers have shown a sign of life
+within a bounded window, and MUST report `null` otherwise. The two admissible signs of life are the peers
+announced peak ADVANCING and the held count itself CHANGING; both are facts about this node sockets, and a
+peer claim about itself is NOT one (NC-12). Unknown MUST NOT be reported as `0`.
+
+**A node MUST NOT offer a peer a decisive quorum has just caught contradicting it as that peer own
+replacement.** When a corroboration round refuses a writer with `WriterContradicted`, the dial that
+replaces it MUST exclude that address. Refusals that name no culprit — a split, a silent writer — MUST NOT
+exclude anyone: an exclusion applied on every refusal narrows the set a random dial can reach, which is the
+plurality corroboration depends on. The exclusion is a hint and MUST fail OPEN: an implementation that
+cannot honour it MUST still connect.
+
 **A node with chain sync enabled MUST hold its Chia peers because it is running**, not because a read
 happened to build them. The chain transport is connected in the background at start-up and RETRIED, so a
 node that booted before its network came up does not stay peerless for the life of the process. Asking for

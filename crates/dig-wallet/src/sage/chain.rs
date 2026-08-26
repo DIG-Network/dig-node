@@ -338,7 +338,11 @@ impl ChainTransport {
     /// gave, and it is written as a two-line composition so that a miswiring would be visible in
     /// the one place it could occur. The instant is a parameter because the window is three
     /// minutes long and a test that waits three minutes is a test nobody runs.
-    pub(crate) fn observe_peer_liveness_at(&self, now: Instant, raw: ChainPeerTier) -> ChainPeerTier {
+    pub(crate) fn observe_peer_liveness_at(
+        &self,
+        now: Instant,
+        raw: ChainPeerTier,
+    ) -> ChainPeerTier {
         self.peer_liveness
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -942,8 +946,10 @@ mod corroborated_peak_tests {
         let now = Instant::now();
 
         transport.observe_peer_liveness_at(now, tier(Some(5), Some(100)));
-        let stale = transport
-            .observe_peer_liveness_at(now + PEER_LIVENESS_WINDOW + Duration::from_secs(1), tier(Some(5), Some(100)));
+        let stale = transport.observe_peer_liveness_at(
+            now + PEER_LIVENESS_WINDOW + Duration::from_secs(1),
+            tier(Some(5), Some(100)),
+        );
 
         assert_eq!(stale.peer_count, None);
         assert_ne!(stale.peer_count, Some(0), "unknown is not a measured none");
@@ -1028,7 +1034,10 @@ mod corroborated_peak_tests {
 
         assert_eq!(
             transport
-                .observe_peer_liveness_at(lapsed + Duration::from_secs(19), tier(Some(5), Some(101)))
+                .observe_peer_liveness_at(
+                    lapsed + Duration::from_secs(19),
+                    tier(Some(5), Some(101))
+                )
                 .peer_count,
             Some(5),
             "the peers spoke again, so the count is a measurement again"
@@ -1099,5 +1108,4 @@ mod corroborated_peak_tests {
             "a rebuilt pool is measured from its own first sighting"
         );
     }
-
 }

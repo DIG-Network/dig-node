@@ -1458,9 +1458,7 @@ impl Supervisor {
             // silent writer, a stall, a rotation — accuses nobody, and excluding a peer on those
             // would spend the pool down for no evidence.
             avoid = match refusal {
-                Some(RefusalReason::WriterContradicted) => {
-                    peer_addr_to_avoid.into_iter().collect()
-                }
+                Some(RefusalReason::WriterContradicted) => peer_addr_to_avoid.into_iter().collect(),
                 _ => Vec::new(),
             };
             handle.set_connected(0);
@@ -1906,14 +1904,15 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
         // quorum just caught contradicting it, and the plain helper would happily hand that same
         // peer back (#307). The exclusion covers the priority addresses too, which is what makes
         // it a real avoidance rather than a filter on the discovered set alone.
-        let (peer, addr, receiver, _origin) = chia_query::peer::connect::connect_random_peer_excluding(
-            self.network,
-            &tls,
-            DIAL_TIMEOUT,
-            exclude,
-        )
-        .await
-        .map_err(|e| SyncError::Peer(e.to_string()))?;
+        let (peer, addr, receiver, _origin) =
+            chia_query::peer::connect::connect_random_peer_excluding(
+                self.network,
+                &tls,
+                DIAL_TIMEOUT,
+                exclude,
+            )
+            .await
+            .map_err(|e| SyncError::Peer(e.to_string()))?;
         Ok(Box::new(ChiaPeerSession {
             peer,
             ip: addr.to_string(),
