@@ -268,7 +268,7 @@ zeroize = "1"
 # above -- `SafeText` crosses dig-dht's AND dig-peer's public error surfaces, so two dig-nat versions is
 # an outright compile error on those seams rather than merely two mTLS stacks. See
 # `seams/dig_peer/dht.rs::stage_failed` for this crate's side of the adoption.
-dig-nat = "0.21"
+dig-nat = "0.20"
 # dig-gossip is the ONE peer-stack exception: not yet published to crates.io (its publish is guarded
 # pending dig-peer-protocol, #681), so it stays a git dependency PINNED to a release commit — here
 # v0.17.12 (rev 3e352d91).
@@ -336,26 +336,6 @@ dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "48a14ed
 # the release-first cascade on #2072. Do NOT pin this BACK to widen a window: the fix is upstream
 # moving forward, never dig-node drifting backward.
 dig-constants = "0.11.2"
-# The canonical bootstrap peer anchors (`DIG_BOOTSTRAP_PEERS`, dig_ecosystem#923), read from the
-# CURRENT dig-constants line under an alias while `dig-constants = "0.9"` above stays on dig-node's
-# chia line.
-#
-# Why an alias rather than bumping the dep above: the 0.9 pin exists because `DIG_MAINNET` is a
-# `Bytes32`, and on 0.10+ that type arrives from chia-protocol 0.36 while the rest of this workspace
-# reads `Bytes32` from 0.26 via dig-gossip — the unification split the pin comment describes. That
-# argument is specific to the chia-typed constants. `DIG_BOOTSTRAP_PEERS` is a `&[&str]` and carries
-# no chia type across the boundary at all, so it can be read from the current line with no
-# unification surface.
-#
-# This adds NO new version to the graph: chia-protocol 0.36.1 is already resolved here through
-# digstore-chain (see the dig-gossip entry above), which is exactly why the 0.36 migration is a
-# cascade rather than a version-string edit.
-#
-# This is NOT pinning back to widen a window -- the anti-pattern that comment warns about. It pins
-# FORWARD for one chia-free constant so the value is read from the SSOT instead of being hardcoded
-# here, which is the drift class dig-constants exists to prevent. Collapse this alias into the dep
-# above the moment the chia-0.36 cascade (#2761) lands; nothing else may use it.
-dig-constants-net = { package = "dig-constants", version = "0.11" }
 # -- Portable profile body format (DPB) — epic #3008 W6 -----------------------------------------------
 #
 # `default-features = false` deliberately: the default `chia` feature pulls dig-did/dig-store/
@@ -379,7 +359,7 @@ dig-social-profile = { version = "0.7", default-features = false }
 # so cargo unifies to ONE dig-dht instance — dig-dht's `PeerId` / `Contact` / `DhtTransport` share the
 # exact types `dig_nat::connect` returns. dig-dht 0.5 deps dig-nat "^0.10" (crates.io), the SAME
 # dig-nat "0.10" this crate pins, so the whole graph shares ONE dig-nat 0.10 instance.
-dig-dht = "0.13"
+dig-dht = "0.12.1"
 # -- L7 Peer Exchange (PEX, #166) --------------------------------------------------------------------
 # The node<->node peer-sharing protocol: over each established mTLS peer connection, a dedicated PEX
 # logical stream exchanges delta-based first-hand known-peer sets (handshake -> snapshot -> deltas),
@@ -425,7 +405,7 @@ dig-pex = "0.1.1"
 # checkpoint store (`download.rs::capturing_state_store_checkpoints_a_real_module_download_key`),
 # because dig-download's own suite missed it: every `module.rs` test used `InMemoryStateStore` (no
 # filename at all) and the one `FileStateStore` test used a 3-character key.
-dig-download = "0.21"
+dig-download = "0.20.4"
 # -- The shared peer client (#1283/#1576) -------------------------------------------------------------
 # `DigPeer` — the ONE DIG Network peer client: peer_id-pinned mTLS over the full NAT ladder plus typed
 # RPC. Depended on DIRECTLY (not only transitively through dig-download) because dig-node supplies the
@@ -437,7 +417,7 @@ dig-download = "0.21"
 # module pull's trust boundary — on the fields that drive the whole pull plan. dig-download 0.8.1 is on
 # dig-peer 0.5 too, so exactly ONE dig-rpc-protocol + ONE dig-peer resolve here (asserted by
 # `crates/dig-node-core/tests/dependency_tree.rs`).
-dig-peer = "0.13"
+dig-peer = "0.12.0"
 # -- Self-optimizing peer selection (#178) ------------------------------------------------------------
 # The decision + learning layer between dig-dht discovery and dig-download execution: it ranks the
 # providers `find_providers` returns (learning throughput/rtt/reliability + a per-class saturation
@@ -460,7 +440,7 @@ dig-peer = "0.13"
 # cascade, not before it. Re-measured 2026-08-23 from the crates.io index: 0.9.1 declares dig-dht
 # "^0.12" + dig-nat "^0.20", i.e. it is gated on dig_ecosystem#3152 exactly as the dig-tls split above
 # describes. Held at 0.9 (resolving 0.9.0, the newest 0.9-line release).
-dig-peer-selector = "0.10"
+dig-peer-selector = "0.9.2"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
 # the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the
@@ -544,7 +524,7 @@ rcgen = "0.13"
 #
 # Pinned by the `the_fail_open_anchor_verifier_is_not_reachable_from_a_production_build` test, which
 # fails if `testkit` ever appears on the production entry.
-dig-download = { version = "0.21", features = ["testkit"] }
+dig-download = { version = "0.20.4", features = ["testkit"] }
 # Captures the peer-facing serve's real emitted tracing records into an in-memory buffer, so the
 # serve-observability tests (#1595) assert what an operator would actually see in the node log —
 # and that no payload byte or proof ever reaches it.

@@ -94,7 +94,7 @@ pub fn resolve_bootstrap_targets(env: Option<&str>) -> Vec<BootstrapTarget> {
 /// there is only one interpretation. An entry the parser rejects is dropped here exactly as it would
 /// be from the override — a malformed canonical entry yields no anchor rather than a mis-dialled one.
 fn compiled_in_targets() -> Vec<BootstrapTarget> {
-    dig_constants_net::DIG_BOOTSTRAP_PEERS
+    dig_constants::DIG_BOOTSTRAP_PEERS
         .iter()
         .copied()
         .filter_map(parse_bootstrap_target)

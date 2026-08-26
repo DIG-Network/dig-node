@@ -2764,7 +2764,7 @@ dependencies = [
  "chia-sha2 0.36.1",
  "chia-traits 0.36.1",
  "chia_streamable_macro 0.36.1",
- "dig-message",
+ "dig-message 0.7.0",
  "sha2 0.10.9",
 ]
 
@@ -2814,13 +2814,13 @@ dependencies = [
 
 [[package]]
 name = "dig-dht"
-version = "0.13.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74e4c62744a1051edd768adcae93c20e3723acde53f7ffe20a4cefcfbec466b3"
+checksum = "2c688e8e15124843953e52d75e8f9b114e18cb1c7351fb87e84fd9c2e4acea7a"
 dependencies = [
  "async-trait",
  "dig-ip",
- "dig-nat 0.21.0",
+ "dig-nat",
  "rand 0.8.7",
  "serde",
  "serde_json",
@@ -2832,14 +2832,14 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.21.0"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c187e30254a3a94448c76f6b58b384239e28bd002f3970cdb459cedde79c026"
+checksum = "be658f713ebd801a0fa7fe3e9756e34ffae8dd1239cd7adee029b59a86076876"
 dependencies = [
  "async-trait",
- "dig-constants 0.11.2",
+ "dig-constants 0.10.1",
  "dig-dht",
- "dig-nat 0.21.0",
+ "dig-nat",
  "dig-peer",
  "dig-rpc-protocol",
  "futures",
@@ -2874,7 +2874,7 @@ dependencies = [
  "chia-traits 0.36.1",
  "chia_streamable_macro 0.36.1",
  "dig-ip",
- "dig-nat 0.20.0",
+ "dig-nat",
  "dig-peer-protocol",
  "dig-tls",
  "futures-util",
@@ -3025,6 +3025,26 @@ dependencies = [
 
 [[package]]
 name = "dig-message"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b6907ad0a2fab0f3c3af42825a72732a10dd5e541e127b4d6c440e53dd9a072"
+dependencies = [
+ "chacha20poly1305",
+ "chia-bls 0.36.1",
+ "chia-protocol 0.36.1",
+ "chia-sha2 0.36.1",
+ "chia-traits 0.36.1",
+ "chia_streamable_macro 0.36.1",
+ "dig-identity 0.6.0",
+ "getrandom 0.2.17",
+ "hkdf",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "zstd",
+]
+
+[[package]]
+name = "dig-message"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4861f7d7682081a8aff1dbaa9a6f11b49d3ebed4eea3071e7739e6c9c8f623ea"
@@ -3054,36 +3074,6 @@ dependencies = [
  "base64",
  "dig-constants 0.10.1",
  "dig-identity 0.6.0",
- "dig-ip",
- "dig-tls",
- "futures",
- "futures-util",
- "igd-next",
- "ring",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.19",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "yamux",
-]
-
-[[package]]
-name = "dig-nat"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f32d4a8ddbb282a8326dfa4a23d1af37f3d6fdd9d66bd67cba6b7e46658cb915"
-dependencies = [
- "arc-swap",
- "async-trait",
- "base64",
- "dig-constants 0.11.2",
- "dig-identity 0.7.1",
  "dig-ip",
  "dig-tls",
  "futures",
@@ -3136,8 +3126,8 @@ dependencies = [
  "dig-ipc-protocol",
  "dig-keystore",
  "dig-keystore-hardware",
- "dig-message",
- "dig-nat 0.21.0",
+ "dig-message 0.7.0",
+ "dig-nat",
  "dig-peer",
  "dig-peer-selector",
  "dig-pex",
@@ -3270,14 +3260,14 @@ dependencies = [
 
 [[package]]
 name = "dig-peer"
-version = "0.13.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80e4e58ca84bd44119c829273f6badc92f42ce1e8a3191a756cfdbef4523d9e4"
+checksum = "788bbfa5f64c30f793799daaef4695f7f1ade876968e64e0e67add19981da1b6"
 dependencies = [
  "chia-protocol 0.36.1",
  "chia-traits 0.36.1",
- "dig-message",
- "dig-nat 0.21.0",
+ "dig-message 0.6.1",
+ "dig-nat",
  "dig-rpc-protocol",
  "dig-tls",
  "serde",
@@ -3310,12 +3300,12 @@ dependencies = [
 
 [[package]]
 name = "dig-peer-selector"
-version = "0.10.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c21c975473af910434801a34f8437037f44cd5204ebaae1389e519524414eb3b"
+checksum = "6a1207adf6950888ed3e3fb1ac6e2c75bb56f9f29442363ca296a0740c6d5662"
 dependencies = [
  "dig-dht",
- "dig-nat 0.21.0",
+ "dig-nat",
  "dig-peer",
  "rand 0.8.7",
  "rand_pcg 0.3.1",
