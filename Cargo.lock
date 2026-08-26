@@ -2850,6 +2850,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-keystore"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a239e32ed5a36f36623eda490613598328ee336ff21c2ddca1a0492ca6632fbc"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "chia-bls 0.36.1",
+ "crc32fast",
+ "hex",
+ "parking_lot",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "dig-logging"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2950,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.59.1"
+version = "0.60.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2968,7 +2986,7 @@ dependencies = [
  "dig-identity",
  "dig-ip",
  "dig-ipc-protocol",
- "dig-keystore",
+ "dig-keystore 0.10.0",
  "dig-message",
  "dig-nat",
  "dig-peer",
@@ -3012,7 +3030,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.156.1"
+version = "0.157.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3274,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.37.2"
+version = "0.37.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -3289,7 +3307,7 @@ dependencies = [
  "chia-wallet-sdk 0.30.0",
  "clvmr 0.14.0",
  "dig-clvm",
- "dig-keystore",
+ "dig-keystore 0.13.0",
  "dig-node-control-interface",
  "dig-node-core",
  "dig-offers",
