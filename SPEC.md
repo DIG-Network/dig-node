@@ -4860,11 +4860,11 @@ evicts an entry only when a request to that peer FAILS, and the node reads the c
 consults the coinset HTTP API first — so a node whose reads are all answered by coinset never routes a
 request to a peer, never ejects one, and never has its held-peer belief contradicted. That belief then has
 unbounded age. A node MUST therefore report the count only while its held peers have shown a sign of life
-within a bounded window, and MUST report `null` otherwise. The two admissible signs of life are the peers
-announced peak ADVANCING and the held count itself CHANGING; both are facts about this node sockets, and a
-peer claim about itself is NOT one (NC-12). Unknown MUST NOT be reported as `0`.
+within a bounded window, and MUST report `null` otherwise. The two admissible signs of life are the peers'
+announced peak ADVANCING and the held count itself CHANGING; both are facts about this node's sockets, and a
+peer claim about itself is NOT one (NC-12). Unknown MUST NOT be reported as `0`. The count is reported when at least one held peer has shown a sign of life, not when all held peers have done so.
 
-**A node MUST NOT offer a peer a decisive quorum has just caught contradicting it as that peer own
+**A node MUST NOT offer a peer a decisive quorum has just caught contradicting it as that peer's own
 replacement.** When a corroboration round refuses a writer with `WriterContradicted`, the dial that
 replaces it MUST exclude that address. Refusals that name no culprit — a split, a silent writer — MUST NOT
 exclude anyone: an exclusion applied on every refusal narrows the set a random dial can reach, which is the

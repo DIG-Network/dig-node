@@ -334,7 +334,7 @@ impl ChainTransport {
     /// Fold a raw tier reading through this transport's liveness record, at a caller-supplied
     /// instant.
     ///
-    /// [`peer_tier`](Self::peer_tier) is this with  and the reading the client
+    /// [`peer_tier`](Self::peer_tier) is this with `now` and the reading the client
     /// gave, and it is written as a two-line composition so that a miswiring would be visible in
     /// the one place it could occur. The instant is a parameter because the window is three
     /// minutes long and a test that waits three minutes is a test nobody runs.
