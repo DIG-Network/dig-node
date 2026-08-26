@@ -19,9 +19,9 @@
 //! wallet). Because Chia enforces conservation over the whole bundle, the launcher value
 //! flows from the funding coin through the aggregate.
 
+use chia_protocol::{Bytes32, Coin, CoinSpend};
 use chia_puzzle_types::nft::NftMetadata;
 use chia_puzzle_types::Memos;
-use chia_protocol::{Bytes32, Coin, CoinSpend};
 use chia_wallet_sdk::driver::{
     Did, IntermediateLauncher, Launcher, Nft, NftMint as SdkNftMint, SingletonInfo, SpendContext,
     StandardLayer,

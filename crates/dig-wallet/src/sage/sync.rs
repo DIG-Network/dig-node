@@ -16,11 +16,11 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use chia_protocol::Bytes32;
 use chia_protocol::{
     Coin, CoinState, CoinStateFilters, CoinStateUpdate, Message, NewPeakWallet,
     ProtocolMessageTypes, RespondPuzzleState,
 };
-use chia_protocol::Bytes32;
 use chia_wallet_sdk::client::Peer;
 
 use super::db::{CatchUpReplay, CoinRow, WalletDb};

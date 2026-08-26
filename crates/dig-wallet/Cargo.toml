@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.37.3"
+version = "0.38.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -70,10 +70,14 @@ dig-node-control-interface = "0.21"
 # crate once derived the id itself from the offered coin set alone, which collided across offers
 # over the same coins and silently overwrote rows in the `offers` table.
 #
-# dig-offers resolves its own (newer) chia stack, so its `Bytes32` is a DIFFERENT type from this
-# crate's. That is deliberately not a problem: `offer_id` is a pure `&str -> hash` function and we
-# consume only its bytes, so nothing crosses the version boundary. `sage::offers::offer_id_matches_
-# a_locally_computed_bundle_hash` pins the two stacks to the same value.
+# dig-offers USED to resolve a newer chia stack than this crate, making its `Bytes32` a different
+# type; on the 0.36.1 ceiling the two now unify. The isolation argument that made the split
+# harmless still holds and is worth keeping: `offer_id` is a pure `&str -> hash` function and we
+# consume only its bytes, so nothing depends on the two stacks agreeing.
+#
+# `sage::offers::offer_id_matches_a_locally_computed_bundle_hash` therefore keeps its value: it
+# pins the two implementations to the same HASH rather than trusting they agree, which is a claim
+# about the algorithm and not about the version they happen to share today.
 dig-offers = "0.3"
 
 serde = { version = "1", features = ["derive"] }
@@ -100,11 +104,11 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 # ever constructed; removing the dead module removed the pin, and the lock now resolves chia-query
 # once. Verify from `Cargo.lock`, not from this comment.
 #
-# The next move is 0.15, which is on chia 0.36.1 + chia-wallet-sdk 0.34. It is BLOCKED, and not by
-# anything in this file: `digstore-chain` (a git dep of dig-node-core) is still built against
-# chia 0.26, and chia types cross the dig-wallet -> dig-node-core boundary. Bumping this alone
-# would need a conversion shim between two chia lines, which is exactly the byte-drift this
-# ecosystem forbids. Track it on dig_ecosystem#3152 / #3149.
+# THAT BLOCK IS CLEARED (dig_ecosystem#3161). This used to read "the next move is 0.15 ... BLOCKED
+# because digstore-chain is still built against chia 0.26". digstore's own ceiling fix landed, this
+# workspace repointed the digstore git rev onto it, and chia types now cross the
+# dig-wallet -> dig-node-core boundary on ONE line (0.36.1). So 0.19 needs no shim and none was
+# added. Verify from `Cargo.lock`, never from this comment.
 chia-query = "0.19.0"
 # Diagnostics MUST go through `tracing`, never stderr. dig-node installs the `dig-logging`
 # subscriber process-globally (dig-node-service::logging), and a Windows service has no stderr

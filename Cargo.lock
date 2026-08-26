@@ -2758,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "dig-chat-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chia-protocol 0.36.1",
  "chia-sha2 0.36.1",
@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.60.0"
+version = "0.61.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3169,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.157.0"
+version = "0.158.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3478,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.37.3"
+version = "0.38.0"
 dependencies = [
  "async-trait",
  "axum",

@@ -29,8 +29,8 @@
 //! follow-on lands in. `get_options`/`get_option`/`mint_option`/`transfer_options` are fully
 //! served in the meantime.
 
-use chia_puzzle_types::Memos;
 use chia_protocol::{Bytes32, Coin, CoinSpend, Program};
+use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{
     OptionContract, OptionInfo, OptionLauncher, OptionLauncherInfo, OptionType, Puzzle,
     SpendContext, StandardLayer,

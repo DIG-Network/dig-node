@@ -9161,8 +9161,8 @@ mod tests {
     #[tokio::test]
     async fn get_cats_returns_cat_tail_after_synced_cat_coin() {
         use super::super::singleton::{reconstruct_coins, LineageSource, ParentSpend};
-        use chia_traits::Streamable;
         use chia_sdk_test::Simulator;
+        use chia_traits::Streamable;
         use chia_wallet_sdk::driver::{
             Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer,
         };
@@ -9303,8 +9303,8 @@ mod tests {
         use super::super::fallback::ChainFallback;
         use super::super::singleton::{LineageSource, ParentSpend};
         use super::super::spend::{self, MockBroadcaster, WalletSigner};
-        use chia_traits::Streamable;
         use chia_sdk_test::Simulator;
+        use chia_traits::Streamable;
         use chia_wallet_sdk::driver::{
             Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer,
         };

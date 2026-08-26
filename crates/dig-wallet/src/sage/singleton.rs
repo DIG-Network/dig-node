@@ -16,8 +16,8 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use chia_puzzle_types::nft::NftMetadata;
 use chia_protocol::{Bytes32, Coin, Program};
+use chia_puzzle_types::nft::NftMetadata;
 use chia_wallet_sdk::driver::{Cat, Did, Nft, Puzzle, SpendContext};
 use chia_wallet_sdk::utils::Address;
 use clvmr::NodePtr;
@@ -431,8 +431,8 @@ pub async fn reconstruct_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia_traits::Streamable;
     use chia_sdk_test::Simulator;
+    use chia_traits::Streamable;
     use chia_wallet_sdk::driver::{
         Cat as SdkCat, CatSpend, IntermediateLauncher, Launcher, NftMint, SingletonInfo,
         SpendWithConditions, StandardLayer,

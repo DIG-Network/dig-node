@@ -50,8 +50,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use chia_bls::PublicKey;
-use chia_puzzle_types::standard::StandardArgs;
 use chia_protocol::Bytes32;
+use chia_puzzle_types::standard::StandardArgs;
 
 use super::custody::WalletCustody;
 use super::db::WalletDb;
@@ -2155,9 +2155,8 @@ pub(crate) fn peak_from(message: &chia_protocol::Message) -> Option<quorum::Peak
     if message.msg_type != chia_protocol::ProtocolMessageTypes::NewPeakWallet {
         return None;
     }
-    let peak =
-        <chia_protocol::NewPeakWallet as chia_traits::Streamable>::from_bytes(&message.data)
-            .ok()?;
+    let peak = <chia_protocol::NewPeakWallet as chia_traits::Streamable>::from_bytes(&message.data)
+        .ok()?;
     Some(quorum::PeakClaim {
         height: peak.height,
         header_hash: peak.header_hash,
