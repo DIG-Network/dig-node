@@ -4408,12 +4408,11 @@ impl Node {
                         "dig-node identity {} (authenticated §21 whole-store sync enabled)",
                         pk.to_hex()
                     );
-                    // Say what actually protects it, rather than letting "sealed" imply hardware
-                    // backing no host has yet (dig-keystore SPEC.md §17.5b).
-                    match crate::seams::key_mgmt::MachineKeyStore::open(
-                        &dir,
-                        crate::seams::key_mgmt::machine_key::platform_provider(),
-                    ) {
+                    // Say what actually protects it, rather than letting "sealed" imply a hardware
+                    // tier this host may not have reached (dig-keystore SPEC.md §17.5b). Hardware
+                    // backing now genuinely ships, so the summary reports the tier the blob was
+                    // bound at — hardware, software, or an inconclusive probe — never a guess.
+                    match crate::seams::key_mgmt::MachineKeyStore::open_platform_bound(&dir) {
                         Ok(store) => println!("dig-node: {}", store.protection_summary()),
                         Err(e) => eprintln!("dig-node: machine key protection unknown: {e}"),
                     }

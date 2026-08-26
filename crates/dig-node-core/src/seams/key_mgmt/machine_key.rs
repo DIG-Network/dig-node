@@ -28,19 +28,25 @@
 //! a container image layer — carries both halves and the container protects nothing. Split, the
 //! common single-directory grab yields ciphertext.
 //!
-//! **No platform hardware provider ships yet**, so on every real host the tier resolves to
-//! `Software(NotRequested)`: what protects the two halves is their SEPARATION, plus whatever file
-//! permissions the platform gives them -- which is NOT the same on both. On Unix each is mode
-//! `0600`, set at `open` time. **On Windows both inherit the profile ACL**: dig-keystore
-//! `FileBackend`s `enforce_owner_only` is `#[cfg(unix)]`, and this module installs no explicit
-//! DACL either, unlike `SPEC.md` §16.4s wallet files. [`at_rest_floor`] is the ONE place that
-//! sentence is written, so [`MachineKeyStore::protection_summary`] cannot drift from it.
+//! **Platform hardware binding is LIVE** (dig-node#367): [`MachineKeyStore::open_platform_bound`]
+//! walks the `dig-keystore-hardware` ladder -- Windows TPM 2.0 via CNG, Apple Secure Enclave,
+//! Linux TPM 2.0 -- and a host that can prove one seals both halves under a wrapping key that
+//! cannot leave that component, so copying the directory to another machine yields bytes nobody
+//! can open. A host that cannot lands on the software floor and SAYS WHY.
 //!
-//! What it does buy is the shape: once a provider exists, [`HardwareBoundBackend::bind`] wraps
-//! both records in place, and the pair stops opening on any other machine — with no format change
-//! and no re-minted `peer_id`. [`MachineKeyStore::protection`] reports the *blob's* tier, never
-//! the host's, because a capable host does not retroactively protect bytes already at rest
-//! (dig-keystore `SPEC.md` §17.5b).
+//! On that floor -- which is still where most hosts and every CI runner land -- what protects the
+//! two halves is their SEPARATION, plus whatever file permissions the platform gives them, which
+//! is NOT the same on both. On Unix each is mode `0600`, set at `open` time. **On Windows both
+//! inherit the profile ACL**: dig-keystore `FileBackend`s `enforce_owner_only` is `#[cfg(unix)]`,
+//! and this module installs no explicit DACL either, unlike `SPEC.md` §16.4s wallet files.
+//! [`at_rest_floor`] is the ONE place that sentence is written, so
+//! [`MachineKeyStore::protection_summary`] cannot drift from it.
+//!
+//! Hardware wrapping is an OUTER envelope: the format does not change and the `peer_id` is not
+//! re-minted when a host gains or loses it. [`MachineKeyStore::protection`] reports the *blob's*
+//! tier, never the host's, because a capable host does not retroactively protect bytes already at
+//! rest (dig-keystore `SPEC.md` §17.5b) -- an existing keystore stays software-tier until it is
+//! rewritten on the capable host.
 //!
 //! # Two failure behaviours, both carried over from `SPEC.md` §16.4
 //!
@@ -253,11 +259,13 @@ pub struct MachineKeyStore {
 impl MachineKeyStore {
     /// Open the store rooted at `dir`, resolving the protection tier once.
     ///
-    /// `provider` is the host's hardware key-wrapping provider. **Production passes
-    /// [`platform_provider`], which is `None` on every host today**; tests inject a double to
-    /// exercise the bound tier. The policy is [`HardwarePolicy::Optional`] so a node on a host
-    /// with no trusted component still starts and simply reports what protects its key — refusing
-    /// to boot the peer network over absent hardware would strand every node in existence.
+    /// `provider` is a hardware key-wrapping provider chosen by the CALLER — the seam a test
+    /// injects a double through. **Production does not use this constructor**; it uses
+    /// [`Self::open_platform_bound`], which walks the real platform ladder.
+    ///
+    /// The policy is [`HardwarePolicy::Optional`] so a node on a host with no trusted component
+    /// still starts and simply reports what protects its key — refusing to boot the peer network
+    /// over absent hardware would strand every node in existence.
     ///
     /// # Errors
     /// [`MachineKeyError::Keystore`] if the tier cannot be resolved.
@@ -272,6 +280,73 @@ impl MachineKeyStore {
                 provider,
                 HardwarePolicy::Optional,
             )?,
+            device_key_path: device_dir(dir)?.join(DEVICE_KEY_FILE),
+            blob_dir: dir.to_path_buf(),
+            kdf: KdfParams::DEFAULT,
+            #[cfg(test)]
+            after_blob_write: None,
+        })
+    }
+
+    /// Open the store rooted at `dir`, bound to the strongest trusted component THIS host can
+    /// actually prove — the production constructor.
+    ///
+    /// # Why the ladder chooses, rather than this function
+    ///
+    /// [`dig_keystore_hardware::bind_strongest`] walks every platform candidate in preference
+    /// order, and a candidate is only accepted once it has passed a live wrap/unwrap self-test.
+    /// Taking `platform_candidates().next()` instead would hand over the FIRST candidate whether
+    /// or not it works, and a TPM that fails its round-trip would degrade the whole node to
+    /// software rather than falling to the next rung.
+    ///
+    /// It also distinguishes the two negatives that matter to an operator: a platform this build
+    /// ships no provider for reports *that*, where a bare `None` provider would report
+    /// `NotRequested` — "nobody asked" — when the truth is "nobody could answer".
+    ///
+    /// # It asks strictly, and it handles the no
+    ///
+    /// The policy asked for is [`HardwarePolicy::Preferred`], which is the only one that refuses
+    /// to turn *"this host could not be inspected"* into *"this host has no hardware"*. That
+    /// distinction is the whole point of the tier being reported at all, so the strict ask is
+    /// right — but a refusal cannot be allowed to reach the caller, because
+    /// [`Self::open_platform_bound`] is on the node's BOOT path and a node that cannot construct
+    /// its machine key is a node that cannot start.
+    ///
+    /// [`HardwarePolicy::Required`] is not a candidate at all: it would lock out every host whose
+    /// provider cannot bind — an Intel Mac, a Linux box with no TPM, a CI runner — which is a
+    /// lockout rather than a posture.
+    ///
+    /// So the shape is ask-strictly-then-degrade-explicitly, in
+    /// [`bind_preferring_hardware`]: on the one refusal `Preferred` can produce, re-bind under
+    /// [`HardwarePolicy::Optional`] and **say so, with the probe's own detail**. The downgrade
+    /// becomes a stated decision in the log and in [`Self::protection_summary`], instead of
+    /// either a silent one or a dead node.
+    ///
+    /// # This is the node's machine key, not user custody
+    ///
+    /// The seed sealed here is `DIGOP1`/`DIGVK1` — the identity the node dials peers under. It is
+    /// NOT a user's wallet key, and §908's boundary is untouched by this: the node still holds no
+    /// key it can spend a user's funds with, before this change or after it.
+    ///
+    /// # Errors
+    /// [`MachineKeyError::Keystore`] if the ladder cannot settle a tier even under `Optional`.
+    pub fn open_platform_bound(dir: impl AsRef<Path>) -> Result<Self, MachineKeyError> {
+        let dir = dir.as_ref();
+        let backend = bind_preferring_hardware(
+            |policy| dig_keystore_hardware::bind_strongest(FileBackend::new(dir), policy),
+            |detail, tier| {
+                tracing::warn!(
+                    probe_detail = %detail,
+                    tier = %tier,
+                    "machine key: hardware binding WAS attempted and could not be established — \
+                     this host's trusted component answered inconclusively, which is not the same \
+                     as its absence. Continuing on the software tier; the component may still be \
+                     present and worth investigating"
+                );
+            },
+        )?;
+        Ok(Self {
+            backend,
             device_key_path: device_dir(dir)?.join(DEVICE_KEY_FILE),
             blob_dir: dir.to_path_buf(),
             kdf: KdfParams::DEFAULT,
@@ -600,14 +675,55 @@ fn at_rest_floor() -> &'static str {
     }
 }
 
-/// This host's hardware key-wrapping provider.
+/// Bind the strongest trusted component `bind` can prove, asking strictly and degrading loudly.
 ///
-/// **`None` on every host today.** `dig-keystore` ships no platform binding — its `hardware`
-/// module forbids `unsafe`, so the TPM / Secure-Enclave FFI lives in a future workspace member
-/// (dig_ecosystem#1693) — so every host resolves `Software(NotRequested)`. This function is the
-/// single seam that changes when that lands; nothing else in the node moves.
-pub fn platform_provider() -> Option<Arc<dyn HardwareProvider>> {
-    None
+/// `bind` is the ladder walk, parameterised by policy so that the caller decides which candidate
+/// list is walked: production hands it [`dig_keystore_hardware::bind_strongest`] over the real
+/// platform, and a test hands it `bind_strongest_from` over a chosen provider — because no CI
+/// runner can be made to produce an indeterminate TPM probe on demand, and that outcome is the
+/// only one this function exists to handle.
+///
+/// # The one refusal `Preferred` can produce, and why it is caught here
+///
+/// Under [`HardwarePolicy::Preferred`] the ladder degrades on every negative EXCEPT
+/// [`DegradeReason::ProbeIndeterminate`] — a host that could not be inspected at all. That
+/// refusal is deliberate in `dig-keystore`: an unknown must never be laundered into a confident
+/// "no hardware here". It is also fatal in this position, because the refusal gates opening an
+/// EXISTING keystore, not merely minting a new one, so an inconclusive probe would take a node
+/// that has been serving the peer network for months offline.
+///
+/// A degrade that is announced is the honest resolution of that tension. The node keeps running;
+/// the reason it is running on software is in the log with the probe's own detail, and in
+/// [`MachineKeyStore::protection_summary`] as `ProbeIndeterminate` rather than as the confident
+/// `NoHardwarePresent` this codebase must never fabricate.
+///
+/// `announce_degrade` is that report, taken as a parameter rather than emitted inline for one
+/// reason: it is the part of this function a test can OBSERVE. Asking `Preferred` and then
+/// degrading has, by construction, the same end state as asking `Optional` outright — the tier is
+/// identical either way — so the announcement is the only thing that distinguishes a considered
+/// downgrade from an unconsidered one, and a silent `tracing::warn!` would leave the whole
+/// difference untestable.
+///
+/// Note what this does NOT swallow: an indeterminate candidate does not mask a working one. The
+/// ladder only applies the policy when NO candidate was selected, so a host with a healthy TPM
+/// behind a flaky first candidate still settles on hardware and never reaches this path.
+///
+/// # Errors
+/// [`MachineKeyError::Keystore`] for any failure other than the indeterminate refusal, and for
+/// the refusal itself if the `Optional` re-bind also fails.
+fn bind_preferring_hardware(
+    bind: impl Fn(HardwarePolicy) -> Result<HardwareBoundBackend, KeystoreError>,
+    announce_degrade: impl FnOnce(&str, &ProtectionTier),
+) -> Result<HardwareBoundBackend, MachineKeyError> {
+    match bind(HardwarePolicy::Preferred) {
+        Ok(backend) => Ok(backend),
+        Err(KeystoreError::HardwareProbeIndeterminate { detail }) => {
+            let backend = bind(HardwarePolicy::Optional)?;
+            announce_degrade(&detail, backend.tier());
+            Ok(backend)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Load or mint the node's machine identity seed under `dir`, migrating a legacy plaintext
@@ -619,7 +735,7 @@ pub fn load_or_create_sealed_seed(
     dir: impl AsRef<Path>,
     legacy_dir: Option<&Path>,
 ) -> Result<Zeroizing<[u8; 32]>, MachineKeyError> {
-    MachineKeyStore::open(dir, platform_provider())?.load_or_create(legacy_dir)
+    MachineKeyStore::open_platform_bound(dir)?.load_or_create(legacy_dir)
 }
 
 #[cfg(test)]
@@ -1294,6 +1410,172 @@ mod tests {
         assert!(
             summary.contains("only if"),
             "summary must state the condition it cannot verify, rather than omitting it: {summary}"
+        );
+    }
+
+    /// **The production constructor consults the platform, and `NotRequested` is the one tier it
+    /// can never report.**
+    ///
+    /// This is the whole of dig-node#367 as an assertion. `platform_provider()` used to be
+    /// `pub fn platform_provider() -> Option<_> { None }`, sitting under a doc comment stating
+    /// that `dig-keystore` shipped no platform binding — untrue since `ed9601a3` / v0.12.0. The
+    /// seam at `open` was already fully composed; one hardcoded `None` kept it dark, and the
+    /// comment explaining the `None` is what stopped anyone looking.
+    ///
+    /// # Why `NotRequested` is the right needle, and an outcome assertion is not
+    ///
+    /// The tier this host reports is a property of the HOST, so it is not assertable: this suite
+    /// runs on Windows TPM boxes, on macOS, and on Linux CI runners with no TPM at all, and the
+    /// honest answer differs on each. Pinning `Hardware(WindowsTpm20)` would fail on CI; pinning
+    /// `Software(..)` would pass on a host that never asked, which is the defect.
+    ///
+    /// `DegradeReason::NotRequested` means precisely *"the caller supplied no provider or
+    /// explicitly opted out"* — it is the fingerprint of the old hardcoded `None`, and it is
+    /// UNREACHABLE through [`MachineKeyStore::open_platform_bound`] on every host, because
+    /// `bind_strongest` either settles on hardware, or reports a confident absence, or reports
+    /// `PlatformUnsupported`. So the assertion is host-independent while still being exactly the
+    /// regression.
+    ///
+    /// Reverting the seam to `MachineKeyStore::open(dir, None)` turns this red on every platform.
+    #[test]
+    fn the_production_store_asks_the_platform_and_never_reports_notrequested() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+
+        let store = MachineKeyStore::open_platform_bound(&dir)
+            .expect("Optional policy opens on every host, including one with no provider");
+
+        assert_ne!(
+            store.backend.tier(),
+            &ProtectionTier::Software(DegradeReason::NotRequested),
+            "the production constructor reported that nobody asked for hardware binding, which \
+             is the hardcoded `None` this ticket removed -- not a fact about this host"
+        );
+
+        // The control. Without it the assertion above is satisfied by a constructor that returns
+        // any other tier for any reason at all, including one that stopped consulting the host.
+        // `open(dir, None)` is the shape being regressed AWAY from, and it must still be able to
+        // express `NotRequested` -- if it cannot, the needle has stopped naming the defect and
+        // this test has gone vacuous.
+        let opted_out = MachineKeyStore::open(&dir, None).expect("Optional policy always opens");
+        assert_eq!(
+            opted_out.backend.tier(),
+            &ProtectionTier::Software(DegradeReason::NotRequested),
+            "an explicit opt-out is what NotRequested means; if this no longer holds, the \
+             assertion above proves nothing"
+        );
+    }
+
+    /// **An uninspectable host degrades, announces why, and does NOT refuse to open.**
+    ///
+    /// `Preferred` is the policy production asks for, and in dig-keystore 0.13 it treats an
+    /// indeterminate probe as an ERROR rather than an absence — correctly, since laundering an
+    /// unknown into a confident `NoHardwarePresent` is the defect the three-valued probe exists
+    /// to prevent. In this position that refusal gates opening an EXISTING keystore, so an
+    /// inconclusive probe would take a running node off the peer network.
+    ///
+    /// # Why the fixture is one indeterminate provider and not "no provider"
+    ///
+    /// A host with no provider degrades under `Preferred` already, so a no-provider fixture
+    /// passes whether or not the refusal is handled — it cannot distinguish this fix from its
+    /// absence. `FakeDevice::indeterminate` is the only fixture that makes `Preferred` actually
+    /// refuse, and the first assertion below PROVES it refuses rather than assuming it: without
+    /// that control, `bind_preferring_hardware` returning `Ok` would be evidence of nothing.
+    ///
+    /// The announcement is asserted too, and it carries the weight the tier cannot: degrading
+    /// after a strict ask reaches the same tier as never asking strictly, so the report is the
+    /// only observable difference between a considered downgrade and an unconsidered one.
+    #[test]
+    fn an_uninspectable_host_degrades_with_its_reason_instead_of_refusing_to_open() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let device: Arc<dyn HardwareProvider> = Arc::new(FakeDevice::indeterminate(
+            HardwareKind::WindowsTpm20,
+            "TPM handle busy",
+        ));
+        let candidates = [Arc::clone(&device)];
+        let bind = |policy| {
+            dig_keystore_hardware::bind_strongest_from(FileBackend::new(&dir), &candidates, policy)
+        };
+
+        // The control: this fixture genuinely makes the strict ask fail. If dig-keystore ever
+        // stops refusing here, the assertion below stops being about the refusal path at all.
+        assert!(
+            matches!(
+                bind(HardwarePolicy::Preferred),
+                Err(KeystoreError::HardwareProbeIndeterminate { .. })
+            ),
+            "the fixture must produce the refusal this test handles, or it proves nothing"
+        );
+
+        let mut announced: Option<String> = None;
+        let backend = bind_preferring_hardware(bind, |detail, _tier| {
+            announced = Some(detail.to_owned());
+        })
+        .expect("an uninspectable host must still open — this is the node's boot path");
+
+        // The reason is carried through, not flattened. Reporting `NoHardwarePresent` here would
+        // be a confident claim about a machine nothing successfully inspected.
+        assert!(
+            matches!(
+                backend.tier(),
+                ProtectionTier::Software(DegradeReason::ProbeIndeterminate { .. })
+            ),
+            "the degrade must carry the probe's own reason, got {:?}",
+            backend.tier()
+        );
+        let announced = announced.expect("the downgrade must be announced, not taken silently");
+        assert!(
+            announced.contains("TPM handle busy"),
+            "the announcement must carry the probe's own detail, so an operator can act on the \
+             actual cause: {announced}"
+        );
+    }
+
+    /// **A flaky candidate does not cost the host its hardware tier, and nothing is announced.**
+    ///
+    /// The second actor, and the reason the test above is not satisfied by a
+    /// `bind_preferring_hardware` that announced a downgrade on every call. Here a WORKING device
+    /// sits behind the indeterminate one: the ladder settles on hardware, so there is no
+    /// downgrade to report and the reporter must stay silent. An implementation that reported
+    /// unconditionally — the cheapest way to make the first test pass — fails this one.
+    ///
+    /// It also pins the narrowness of the refusal handling: the policy is applied by the ladder
+    /// only when NO candidate was selected, so an inconclusive probe on one component never
+    /// downgrades a host that has another that works.
+    #[test]
+    fn an_indeterminate_candidate_does_not_mask_a_working_one() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        let candidates: [Arc<dyn HardwareProvider>; 2] = [
+            Arc::new(FakeDevice::indeterminate(
+                HardwareKind::WindowsTpm20,
+                "TPM handle busy",
+            )),
+            Arc::new(FakeDevice::working(HardwareKind::MacSecureEnclave, 7)),
+        ];
+
+        let mut announced: Option<String> = None;
+        let backend = bind_preferring_hardware(
+            |policy| {
+                dig_keystore_hardware::bind_strongest_from(
+                    FileBackend::new(&dir),
+                    &candidates,
+                    policy,
+                )
+            },
+            |detail, _tier| announced = Some(detail.to_owned()),
+        )
+        .expect("a host with one working component must bind to it");
+
+        assert_eq!(
+            backend.tier(),
+            &ProtectionTier::Hardware(HardwareKind::MacSecureEnclave),
+            "a working component behind a flaky one must still be selected"
+        );
+        assert!(
+            announced.is_none(),
+            "nothing was downgraded, so nothing may be reported as downgraded: {announced:?}"
         );
     }
 }

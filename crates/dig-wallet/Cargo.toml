@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.37.2"
+version = "0.37.3"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -129,7 +129,7 @@ dig-clvm = "0.2"
 # AES-256-GCM, versioned/magic-tagged/CRC-guarded) replaces the bespoke `digstore_chain::seed`
 # on-disk layout for NEW writes; `seed_store::decrypt_seed` still reads old-format files.
 # Published on crates.io (not a git dep) — the crate ships its library surface there.
-dig-keystore = "0.10"
+dig-keystore = "0.13"
 # The `SyncEvent` stream (design A.9): wraps the `tokio::sync::broadcast` receiver as a
 # `Stream` for the SSE `GET /events` handler (`sage::transport`). `tokio-stream` supplies the
 # `BroadcastStream` wrapper + `StreamExt` combinators; `futures-core` supplies the `Stream`
