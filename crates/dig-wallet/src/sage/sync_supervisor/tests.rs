@@ -2164,27 +2164,39 @@ async fn a_writer_caught_contradicting_the_quorum_is_excluded_from_the_replaceme
     );
 }
 
-/// **Proves the CONTROL for #307:** an honest session excludes NOBODY.
+/// **Proves the CONTROL for #307:** a session refused for a reason that names NO culprit leaves the
+/// replacement dial excluding nobody.
 ///
-/// Without this, the exclusion could be unconditional — every reconnect refusing the peer it just
-/// held — and the test above would still pass. That version would be a real regression rather than
-/// a harmless one: a node that avoids its own last peer on every ordinary rotation steadily narrows
-/// the set a random dial can reach, which is the plurality NC-12 depends on.
+/// The fixture is a SPLIT quorum with an honest writer — refused, session ended, replacement dial
+/// made, exactly as in the test above — so the ONLY difference between the two is whether the
+/// refusal accused anyone. That is what makes this discriminating.
 ///
-/// Only a writer that CONTRADICTS a decisive quorum names a culprit; a split, a silent writer, a
-/// stall and a rotation all accuse nobody.
+/// The first draft of this control used a plain honest session and was VACUOUS: an elevated writer
+/// keeps its session, so the fixture never reached a second dial and could not observe the
+/// avoid-list at all. It passed unchanged when the exclusion was mutated to fire unconditionally —
+/// the very regression it exists to catch. Hence the explicit two-dial assertion below: without it
+/// this test cannot tell "excluded nobody" from "never asked".
+///
+/// The unconditional version is a real regression rather than a harmless one. A node that avoids
+/// its own last peer after every ordinary refusal steadily narrows the set a random dial can reach,
+/// which is the plurality NC-12 depends on.
 #[tokio::test]
-async fn an_honest_session_never_asks_the_next_dial_to_avoid_anyone() {
-    let (_db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+async fn a_refusal_that_names_no_culprit_leaves_the_replacement_dial_excluding_nobody() {
+    let split = Verdict::Split {
+        tallies: vec![2, 2],
+    };
+    let (_db, script) = run_discovered_session(split, Some(HONEST_HASH)).await;
 
     let excluded = script.excluded.lock().unwrap().clone();
     assert!(
-        !excluded.is_empty(),
-        "the fixture must have dialled at least once"
+        excluded.len() >= 2,
+        "the control must REACH a replacement dial, or it cannot observe the avoid-list at all; \
+         saw {} dials",
+        excluded.len()
     );
     assert!(
         excluded.iter().all(Vec::is_empty),
-        "no peer was accused of anything, so no dial should have been asked to avoid one: {excluded:?}"
+        "a split accuses nobody, so no dial should have been asked to avoid a peer: {excluded:?}"
     );
 }
 
