@@ -338,7 +338,10 @@ impl MachineKeyStore {
                 tracing::warn!(
                     probe_detail = %detail,
                     tier = %tier,
-                    "machine key: this host's trusted component could not be inspected, so                      hardware binding was not attempted; continuing on the software tier"
+                    "machine key: hardware binding WAS attempted and could not be established — \
+                     this host's trusted component answered inconclusively, which is not the same \
+                     as its absence. Continuing on the software tier; the component may still be \
+                     present and worth investigating"
                 );
             },
         )?;
@@ -1524,7 +1527,8 @@ mod tests {
         let announced = announced.expect("the downgrade must be announced, not taken silently");
         assert!(
             announced.contains("TPM handle busy"),
-            "the announcement must carry the probe's own detail, so an operator can act on the              actual cause: {announced}"
+            "the announcement must carry the probe's own detail, so an operator can act on the \
+             actual cause: {announced}"
         );
     }
 
