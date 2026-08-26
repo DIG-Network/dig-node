@@ -4862,7 +4862,10 @@ request to a peer, never ejects one, and never has its held-peer belief contradi
 unbounded age. A node MUST therefore report the count only while its held peers have shown a sign of life
 within a bounded window, and MUST report `null` otherwise. The two admissible signs of life are the peers'
 announced peak ADVANCING and the held count itself CHANGING; both are facts about this node's sockets, and a
-peer claim about itself is NOT one (NC-12). Unknown MUST NOT be reported as `0`. The count is reported when at least one held peer has shown a sign of life, not when all held peers have done so.
+peer claim about itself is NOT one (NC-12). Unknown MUST NOT be reported as `0`. The window is satisfied
+by AT LEAST ONE held peer showing a sign of life, not by all of them: the pool's peak is a `fetch_max`
+across per-peer tasks, so a single live socket refreshes the stamp for the whole count. A reported count
+therefore asserts that the set is not wholly dead — never that every counted peer is individually live.
 
 **A node MUST NOT offer a peer a decisive quorum has just caught contradicting it as that peer's own
 replacement.** When a corroboration round refuses a writer with `WriterContradicted`, the dial that
