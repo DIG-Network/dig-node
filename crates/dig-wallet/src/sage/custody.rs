@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chia::bls::PublicKey;
+use chia_bls::PublicKey;
 
 use super::{Error, Result};
 

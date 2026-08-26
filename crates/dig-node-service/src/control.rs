@@ -3305,7 +3305,7 @@ mod tests {
     #[test]
     fn a_malformed_key_refuses_the_whole_registration() {
         let valid = hex::encode(
-            chia::bls::SecretKey::from_seed(&[7u8; 64])
+            chia_bls::SecretKey::from_seed(&[7u8; 64])
                 .public_key()
                 .to_bytes(),
         );
@@ -3345,7 +3345,7 @@ mod tests {
                 let mut seed = [0u8; 64];
                 seed[0] = *t;
                 hex::encode(
-                    chia::bls::SecretKey::from_seed(&seed)
+                    chia_bls::SecretKey::from_seed(&seed)
                         .public_key()
                         .to_bytes(),
                 )

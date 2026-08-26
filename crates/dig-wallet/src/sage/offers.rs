@@ -11,8 +11,8 @@
 //! broadcasts — the assembled bundle is validated by `dig-clvm` and pushed under the
 //! [`super::spend::Broadcaster`] gate in the RPC layer (mock/simulator only in CI).
 
-use chia::puzzles::offer::{NotarizedPayment, Payment};
-use chia::puzzles::Memos;
+use chia_puzzle_types::offer::{NotarizedPayment, Payment};
+use chia_puzzle_types::Memos;
 use chia_protocol::{Bytes32, Coin, SpendBundle};
 use chia_wallet_sdk::driver::{
     decode_offer, encode_offer, Action, AssetInfo, Cat, CatAssetInfo, Id, Offer, Relation,
@@ -269,7 +269,7 @@ pub fn combine_offers(offers: &[String]) -> Result<String> {
         return Err(Error::api("combine_offers requires at least two offers"));
     }
     let mut coin_spends = Vec::new();
-    let mut signature = chia::bls::Signature::default();
+    let mut signature = chia_bls::Signature::default();
     for s in offers {
         let trimmed = s.trim();
         if !trimmed.starts_with("offer1") {
@@ -465,7 +465,7 @@ mod tests {
     use chia_sdk_test::Simulator;
     use chia_wallet_sdk::types::TESTNET11_CONSTANTS;
 
-    fn signer_for(sk: chia::bls::SecretKey) -> WalletSigner {
+    fn signer_for(sk: chia_bls::SecretKey) -> WalletSigner {
         WalletSigner::new(vec![sk], TESTNET11_CONSTANTS.agg_sig_me_additional_data)
     }
 

@@ -74,11 +74,11 @@ lru = "0.12"
 # commit (08f5d39) so `PublicManifest`/`read_public_manifest`/`extract_data_section_blob`
 # exist.
 #
-# Bumped again to 4c34f0be (digstore v0.19.2, fix #1473) to adopt the HARDENED,
+# Bumped again to 5872240f369a03e0828b6a26389480ba7726114f (digstore v0.19.2, fix #1473) to adopt the HARDENED,
 # unforgeable `digstore_chain::singleton::verify_pinned_root`. The prior rev (d5e52fb)
 # anchored store identity on the attacker-controllable curried `SingletonStruct.launcher_id`,
 # so a forged singleton currying `launcher_id == store_id` (hinted to store_id) could pass as
-# chain-verified. 4c34f0be anchors identity on the UNFORGEABLE launcher coin (`coin_id ==
+# chain-verified. 5872240f369a03e0828b6a26389480ba7726114f anchors identity on the UNFORGEABLE launcher coin (`coin_id ==
 # store_id`) via a bounded backward `parent_coin_info` walk, making the read-root anti-rollback
 # check (#747/#841/#852-node) SOUND. The public signature is unchanged (a pure rev bump). Bump
 # all seven together.
@@ -109,13 +109,13 @@ lru = "0.12"
 # So this row is downstream of the chia-0.36 cascade (dig_ecosystem#2761) AND of publishing the digstore
 # workspace. Do NOT repoint these piecemeal, and never let the pin regress to a floating git BRANCH: the
 # single `rev` is what makes the whole store-format surface reproducible.
-digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
+digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
 chia-protocol = "0.36.1"
 # The `Streamable` to_bytes/from_bytes trait, used to serialize the chat `ChatMessage` payload before
 # the dig-message seal. Same 0.36.1 as chia-protocol so the byte layout agrees across the workspace.
@@ -156,7 +156,7 @@ dig-ipc-protocol = "=0.3.0"
 #
 # v0.4.0 -> 0.4.2 is patch-level and purely additive; 0.5.0's only new export, `derive_identity_sk_at`,
 # has zero call sites in this workspace, so nothing is given up by preferring the deduplicating pin.
-dig-identity = "0.4.2"
+dig-identity = "0.7.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
 # Object-safe async trait for the injectable anchored-root resolver (the
 # mandatory read-path chain pin, #127): production walks coinset, tests inject a
@@ -172,7 +172,7 @@ dig-rpc-protocol = "0.10.2"
 # The directed-message base protocol (epic #793/#796): the e2e seal/open pipeline + the typed envelope
 # the chat subsystem seals into. dig-node is the TRANSPORT — it seals an app-supplied opaque DIGCHAT1
 # envelope to the recipient's 0x0010 BLS identity key and dig-gossip directed-sends the sealed bytes.
-dig-message = "0.5"
+dig-message = "0.7"
 # The chat message-TYPE layer: the five chat payloads on dig-message's dig-chat band + the registry
 # wiring. A crypto-free, content-blind type layer — the DIGCHAT1 seal is carried as opaque bytes.
 dig-chat-protocol = { path = "../dig-chat-protocol", version = "0.1" }
@@ -268,7 +268,7 @@ zeroize = "1"
 # above -- `SafeText` crosses dig-dht's AND dig-peer's public error surfaces, so two dig-nat versions is
 # an outright compile error on those seams rather than merely two mTLS stacks. See
 # `seams/dig_peer/dht.rs::stage_failed` for this crate's side of the adoption.
-dig-nat = "0.18"
+dig-nat = "0.21"
 # dig-gossip is the ONE peer-stack exception: not yet published to crates.io (its publish is guarded
 # pending dig-peer-protocol, #681), so it stays a git dependency PINNED to a release commit — here
 # v0.17.12 (rev 3e352d91).
@@ -316,7 +316,7 @@ dig-nat = "0.18"
 # certificate at all — a mutual-TLS bypass that no consumer could see from its own manifest. Its
 # publish.yml guard is unconditional and deliberate: do not weaken it, do not `--allow-dirty` past it.
 # dig_ecosystem#900 ("publish dig-gossip") was closed as superseded by #2647.
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "51054a4132ee51b7cee2cba1768b75ade5360f9c", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "48a14ed2ed395a41c913d5c8f944e6ea0b747075", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope.
 #
 # 0.9 is the TIP OF DIG-NODE'S CHIA LINE, and that — not 0.10 — is the correct target here (#2072).
@@ -335,7 +335,7 @@ dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "51054a4
 # consumer cannot edit. Collapsing to a single copy needs each of those to release against 0.9 —
 # the release-first cascade on #2072. Do NOT pin this BACK to widen a window: the fix is upstream
 # moving forward, never dig-node drifting backward.
-dig-constants = "0.9"
+dig-constants = "0.11.2"
 # The canonical bootstrap peer anchors (`DIG_BOOTSTRAP_PEERS`, dig_ecosystem#923), read from the
 # CURRENT dig-constants line under an alias while `dig-constants = "0.9"` above stays on dig-node's
 # chia line.
@@ -367,7 +367,7 @@ dig-constants-net = { package = "dig-constants", version = "0.11" }
 # Consequence to keep in mind: `dig_social_profile::resolve` is NOT available here. The node resolves
 # a store's on-chain root through its OWN `AnchoredRootResolver` (the coinset lineage walk), which is
 # the same authority, reached by the node's existing seam.
-dig-social-profile = { version = "0.6", default-features = false }
+dig-social-profile = { version = "0.7", default-features = false }
 # -- L7 content-location DHT (PHASE-B, #163) ---------------------------------------------------------
 # The Kademlia DHT that maps DIG content (store / capsule / root / resource) to the peer_ids holding
 # it. The node LOCATES content it lacks via `find_providers`, and keeps its OWN held-inventory provider
@@ -379,7 +379,7 @@ dig-social-profile = { version = "0.6", default-features = false }
 # so cargo unifies to ONE dig-dht instance — dig-dht's `PeerId` / `Contact` / `DhtTransport` share the
 # exact types `dig_nat::connect` returns. dig-dht 0.5 deps dig-nat "^0.10" (crates.io), the SAME
 # dig-nat "0.10" this crate pins, so the whole graph shares ONE dig-nat 0.10 instance.
-dig-dht = "0.11.1"
+dig-dht = "0.13"
 # -- L7 Peer Exchange (PEX, #166) --------------------------------------------------------------------
 # The node<->node peer-sharing protocol: over each established mTLS peer connection, a dedicated PEX
 # logical stream exchanges delta-based first-hand known-peer sets (handshake -> snapshot -> deltas),
@@ -425,7 +425,7 @@ dig-pex = "0.1.1"
 # checkpoint store (`download.rs::capturing_state_store_checkpoints_a_real_module_download_key`),
 # because dig-download's own suite missed it: every `module.rs` test used `InMemoryStateStore` (no
 # filename at all) and the one `FileStateStore` test used a 3-character key.
-dig-download = "0.19"
+dig-download = "0.21"
 # -- The shared peer client (#1283/#1576) -------------------------------------------------------------
 # `DigPeer` — the ONE DIG Network peer client: peer_id-pinned mTLS over the full NAT ladder plus typed
 # RPC. Depended on DIRECTLY (not only transitively through dig-download) because dig-node supplies the
@@ -437,7 +437,7 @@ dig-download = "0.19"
 # module pull's trust boundary — on the fields that drive the whole pull plan. dig-download 0.8.1 is on
 # dig-peer 0.5 too, so exactly ONE dig-rpc-protocol + ONE dig-peer resolve here (asserted by
 # `crates/dig-node-core/tests/dependency_tree.rs`).
-dig-peer = "0.11"
+dig-peer = "0.13"
 # -- Self-optimizing peer selection (#178) ------------------------------------------------------------
 # The decision + learning layer between dig-dht discovery and dig-download execution: it ranks the
 # providers `find_providers` returns (learning throughput/rtt/reliability + a per-class saturation
@@ -460,7 +460,7 @@ dig-peer = "0.11"
 # cascade, not before it. Re-measured 2026-08-23 from the crates.io index: 0.9.1 declares dig-dht
 # "^0.12" + dig-nat "^0.20", i.e. it is gated on dig_ecosystem#3152 exactly as the dig-tls split above
 # describes. Held at 0.9 (resolving 0.9.0, the newest 0.9-line release).
-dig-peer-selector = "0.9"
+dig-peer-selector = "0.10"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
 # the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the
@@ -470,7 +470,7 @@ dig-peer-selector = "0.9"
 # consumer conformance suite for the canonical peer certificate). 0.4 is held behind
 # dig_ecosystem#3152 — taking it here would split `dig_tls::PeerId` against the 0.3 that
 # dig-nat/dig-gossip still resolve.
-dig-tls = "0.3"
+dig-tls = "0.4"
 # -- The store-exchange DECISION layer (dig_ecosystem#3130) -------------------------------------------
 # `dig-sex` owns every cache/tier/relevance/selection DECISION this node used to make in-tree: what to
 # keep, what to sacrifice first, and whether a fresh candidate is worth displacing an incumbent. It is
@@ -526,7 +526,7 @@ dig-keystore = { version = "0.13", features = ["testing"] }
 # rather than on the normal dependency so the shipped binary never carries the test hook: cargo
 # unifies the feature into test builds only, since dev-dependencies are not built for `cargo build`.
 # NC-7 exception: same permanent git pin as the runtime dep above (dig_ecosystem#2647).
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "51054a4132ee51b7cee2cba1768b75ade5360f9c", default-features = false, features = ["rustls", "relay", "test-util"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "48a14ed2ed395a41c913d5c8f944e6ea0b747075", default-features = false, features = ["rustls", "relay", "test-util"] }
 # Generates the P-256 leaf key pairs the opcode-222 holdings tests sign with: `public_key_der()` IS the
 # leaf `SubjectPublicKeyInfo` DER the wire carries as `provider_spki`, and whose SHA-256 is the
 # announcing peer_id — so a test signer is a real §5.2 identity rather than a stand-in that could hide
@@ -544,7 +544,7 @@ rcgen = "0.13"
 #
 # Pinned by the `the_fail_open_anchor_verifier_is_not_reachable_from_a_production_build` test, which
 # fails if `testkit` ever appears on the production entry.
-dig-download = { version = "0.19", features = ["testkit"] }
+dig-download = { version = "0.21", features = ["testkit"] }
 # Captures the peer-facing serve's real emitted tracing records into an in-memory buffer, so the
 # serve-observability tests (#1595) assert what an operator would actually see in the node log —
 # and that no payload byte or proof ever reaches it.

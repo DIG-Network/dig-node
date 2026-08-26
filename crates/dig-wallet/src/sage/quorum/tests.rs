@@ -5,7 +5,7 @@
 //! however strongly it asserts.
 
 use super::*;
-use chia::protocol::Coin;
+use chia_protocol::Coin;
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
