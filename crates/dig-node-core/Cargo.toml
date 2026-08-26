@@ -116,10 +116,10 @@ digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "4
 digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-chia-protocol = "0.26"
+chia-protocol = "0.36.1"
 # The `Streamable` to_bytes/from_bytes trait, used to serialize the chat `ChatMessage` payload before
-# the dig-message seal. Same 0.26 as chia-protocol so the byte layout agrees across the workspace.
-chia-traits = "0.26"
+# the dig-message seal. Same 0.36.1 as chia-protocol so the byte layout agrees across the workspace.
+chia-traits = "0.36.1"
 # The ecosystem's canonical address-family / IPv6-first primitive (CLAUDE.md §5.2). The advertise
 # path keys + orders candidate addresses via `dig_ip::Family` and aggregates them source-tagged +
 # de-duplicated via `dig_ip::PeerCandidates` — never a hand-rolled family sort (epic #1020, #1032).
