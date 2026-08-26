@@ -1227,10 +1227,34 @@ mod tests {
         }
     }
 
+    /// A fresh directory for one test.
+    ///
+    /// # Why the clock is in the name
+    ///
+    /// `(process id, unique_suffix())` is unique WITHIN a run and repeats ACROSS runs: the counter
+    /// restarts at zero every process, and the OS recycles process ids. These tests never remove
+    /// what they create, so a later run that draws a recycled pid inherits an earlier run's
+    /// directory — already populated — and a test asserting on the FULL contents of its own
+    /// temp tree fails on somebody else's leftovers.
+    ///
+    /// That is not hypothetical: `held_pairs_skips_names_this_module_did_not_write` failed once in
+    /// a full-suite run against 223 leaked `dig-profile-sync-test-<pid>-<n>` directories, passed
+    /// alone, and passed on a re-run — the signature of a name collision rather than a defect in
+    /// the code under test. A monotonic component makes the name unrepeatable across runs, which
+    /// is what the tests actually need from it.
+    ///
+    /// The LEAK itself is untouched here and is still real (dig-node#365 lane finding): the fix
+    /// for it is a drop guard per test, which is a larger change than this file's share of the
+    /// work.
     fn tempdir() -> PathBuf {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "dig-profile-sync-test-{}-{}",
+            "dig-profile-sync-test-{}-{}-{}",
             std::process::id(),
+            since_epoch,
             unique_suffix()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");

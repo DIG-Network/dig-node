@@ -1507,3 +1507,93 @@ processes contend for one port the loser is exactly the party who needs to be to
 "does not stop the node", never "is not reported": the outcome is now logged at WARN and
 published on `control.status`, so `dign info` says `wallet mTLS UNAVAILABLE (port 9776 held by
 another process ...)`. Any other best-effort bind in this repo should be read the same way.
+
+## A "quorum" is only as independent as what its members can REACH (dig-node#365)
+
+Corroboration rules fail in one characteristic way here: the sources are counted, not weighed. On
+PR#354 a 2-of-2 "independent-group" rule in `dig-wallet` was satisfied by ONE HTTPS endpoint,
+because the second group's peer tier was configured with `max_peers: 0` and could reach nothing at
+all. The rule was correct about its own definition of a group and wrong about the world.
+
+So `seams/chia_peer/endpoints.rs` derives independence from RESOLVED ADDRESSES: two endpoints are
+one voice when their address sets intersect, transitively. Not their type, and not their host name
+— a CNAME costs an attacker nothing, and two names for one machine is exactly the shape a name-based
+rule waves through.
+
+Two consequences worth knowing before touching it:
+
+* **Set INTERSECTION, not equality.** A dual-stack host answers with several addresses (§5.2 makes
+  IPv6 the ordinary case), and a resolver returning different subsets on two lookups would make one
+  machine read as two voices under an equality rule.
+* **The merge must be transitive.** An endpoint bridging two previously-disjoint groups makes all
+  three one voice; stopping at the first matching group leaves the second counted separately, and a
+  third endpoint then turns one host into a passing quorum.
+
+## Refusing on a default install is not a safe default (dig-node#365)
+
+The anchored root decides which bytes a user is served, so a single-source resolution of it is a
+real gap. Refusing to resolve it without corroboration would close the gap and stop every
+unconfigured node serving any content at all — including the surfaces on which an operator would
+then configure a second endpoint. The shipped rule therefore degrades to the single source, states
+that in `SPEC.md` §14.4b as an accepted limitation with its blast radius, and refuses only where two
+independent voices exist and DISAGREE. "State it honestly" is a legitimate outcome; implying
+corroboration the code does not perform is not.
+
+## Widening a source-scanning guard widens its blind spots (dig-node#366)
+
+The NC-12 sole-owner sweep is a line classifier over Rust source, and it took five gate rounds to
+make honest within one crate. Adding `dig-node-core` to its haystack surfaced two failure modes that
+a wider scope creates rather than inherits:
+
+* **File names repeat across a workspace.** Sites were reported as bare basenames and the owner was
+  `"sources.rs"`, so a second fabric built in a `sources.rs` in ANY newly-swept crate would have
+  been accepted as the owner. Sites are now crate-qualified (`dig-wallet/sources.rs:NNN`).
+* **A crate with none of the needle cannot tell you it was read.** `dig-node-core` contains no
+  `ChiaQuery::new(` at all, so a total taken across both roots stays positive from `dig-wallet`
+  alone — a typo in the second path leaves the new scope reading zero files while the guard still
+  reports a real haystack. The haystack test now asserts a FILE count per root, which separates
+  "this crate is clean" from "this crate was never opened".
+
+Both known-silent shapes were re-measured against the new haystack. The column-0 `#[cfg(test)]` as
+string content is absent from both crates. The trailing-comment terminator occurs ONCE, at
+`dig-node-core/src/lib.rs:195` (`const DEFAULT_CACHE_CAP: … ; // 1 GiB`) — harmless only because no
+column-0 `#[cfg(test)]` precedes it in that file, so the latch is never set when it is reached. That
+is a property of where the line sits, not of the line, and nothing would report it if it moved.
+
+## A yes/no answer cannot carry a dissent, and a threshold hides that (dig-node#365)
+
+`Result<(), String>` has no value channel, so a source saying *"that root is not current"* and one
+saying *"I could not reach the chain"* arrive as the SAME `Err`. An agreement rule reading that
+cannot tell dissent from silence, and the natural implementation — drop the errors, count the `Ok`s,
+require two — is a flat *k*-of-*N* threshold whose **bar does not rise with `N`**. 2-of-3 and 2-of-10
+are the same bar.
+
+This shipped. `verify_pinned_root` and `verify_lineage_root` had it while `anchored_state`, which
+carries a value, was correct on byte-identical input — so the two calls the read-path pin actually
+makes were the two without the property, and three endpoints with one a generation behind served
+stale content with no attacker involved.
+
+Three things worth carrying forward:
+
+* **A tri-state at the source beats classifying an error string.** `Verdict::{Confirmed, Rejected,
+  Unreachable}` is decided where the evidence exists: the lineage walk already separated the cases
+  structurally (a completed walk missing the root is a rejection; a failed walk is unreachable), and
+  the bounded pin needed one extra reachability probe on the failure path only.
+* **Arrange the remaining ambiguity to fail in the refusing direction.** That probe races the call it
+  classifies. If the chain drops in between, a genuine unreachability is recorded as a rejection —
+  which refuses. The opposite error fails OPEN, and is the defect being removed.
+* **The dangerous half was the COMPOSITION.** `content_serve.rs`, `dig_rpc/dispatch.rs` and
+  `module_reshare.rs` all treat a failed tip resolution as the #747 broken-walk case and fall back to
+  `verify_pinned_root`. Widening what the tip's `Err` MEANS routed the strongest signal the feature
+  produces onto the one check that could not hear it. Whenever an existing error value gains a new
+  meaning, re-read every arm that already matches on it — the arm was written against the old set.
+
+## Test the configuration that separates the semantics, not the one that is easiest to script
+
+Every verification test here scripted only an unreachable source. That fixture cannot distinguish a
+dissent rule from a threshold rule, because under both an unreachable voice is dropped — so the
+defect above was untested rather than tested-and-wrong. The missing fixture was one sentence long: a
+voice that is REACHED and says no.
+
+Ask what the nearest wrong implementation is, then ask which input it would answer differently on. If
+no fixture in the suite is that input, the property is undefended however many tests surround it.

@@ -2818,9 +2818,9 @@ dependencies = [
 
 [[package]]
 name = "dig-ipc-protocol"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5558929d2823b73a9ead6d617cc96ea4fe2284949fdb2cbe2309a160e01b60cc"
+checksum = "5e020b45104158b247370416b35b4386efdc201854b969254cfe6cc693bdb011"
 dependencies = [
  "base64",
  "chia-bls 0.26.0",
@@ -2950,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.58.0"
+version = "0.59.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3012,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.156.0"
+version = "0.156.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3138,9 +3138,9 @@ dependencies = [
 
 [[package]]
 name = "dig-rpc-protocol"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d40447a4cb8f3c7bd6aa40e734e56646a637e720061d6bfb71c22a2b7510ef5d"
+checksum = "94ebacf438d821c3b22027a2ea6a532a92ef7c4a1a5797d836540432bdfab45b"
 dependencies = [
  "serde",
  "serde_json",
@@ -3274,7 +3274,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.37.1"
+version = "0.37.2"
 dependencies = [
  "async-trait",
  "axum",

@@ -412,8 +412,14 @@ mod independence_tests {
 mod sole_owner_tests {
     use std::path::{Path, PathBuf};
 
-    /// The file that is allowed to construct the fabric.
-    const OWNER: &str = "sources.rs";
+    /// The file that is allowed to construct the fabric, CRATE-QUALIFIED.
+    ///
+    /// The crate prefix is load-bearing now that the sweep walks more than one crate: file names
+    /// repeat across a workspace (both swept crates already contain a `chain.rs`), so an
+    /// unqualified `"sources.rs"` would accept a second fabric built in a file of that name in
+    /// ANY swept crate — the guard widening its haystack and losing its property in the same
+    /// change.
+    const OWNER: &str = "dig-wallet/sources.rs";
 
     /// The call that constructs a chia peer fabric.
     const CONSTRUCTOR: &str = "ChiaQuery::new(";
@@ -542,7 +548,24 @@ mod sole_owner_tests {
     /// Both drop a production `CONSTRUCTOR` and leave [`Swept::ended_inside_a_test_item`] `false`,
     /// so nothing reports them. Both are left unhandled DELIBERATELY: each would need literal or
     /// comment tracking, which is the brace-counting mistake in another costume, and a fifth round
-    /// of heuristic would buy less than an honest bound does. Neither occurs in this crate today.
+    /// of heuristic would buy less than an honest bound does.
+    ///
+    /// Re-measured across the WIDENED haystack when `dig-node-core` was added (dig-node#366),
+    /// because widening a heuristic's input widens its blind spots and a bound measured on the
+    /// old scope says nothing about the new one:
+    ///
+    /// * A column-0 `#[cfg(test)]` as string content: **absent from both crates.** Every
+    ///   occurrence of that text inside a literal here is INDENTED, and indentation is what the
+    ///   latch requires.
+    /// * A terminator carrying trailing content: **present once**, at `dig-node-core`'s
+    ///   `lib.rs:195` (`const DEFAULT_CACHE_CAP: … ; // 1 GiB`). It is HARMLESS today for a
+    ///   reason worth writing down rather than trusting: the shape only bites when the latch is
+    ///   already set, and no column-0 `#[cfg(test)]` precedes it in that file. The same line
+    ///   moved below one would go silent, and nothing would say so.
+    ///
+    /// No file in either crate ends inside a test item, so the fail-closed refusal is not
+    /// currently firing anywhere — which is the state that makes the two shapes above the whole
+    /// of the residual risk.
     ///
     /// * **A `#[cfg(test)]` at column 0 as STRING CONTENT** — inside a raw or multi-line literal —
     ///   latches the sweep on text that is not code. It needs a source file that quotes Rust
@@ -637,37 +660,67 @@ mod sole_owner_tests {
         }
     }
 
-    /// Every PRODUCTION call site of `CONSTRUCTOR` in this crate, as `file:line`.
+    /// The crate source trees this sweep walks, as `(label, path)`.
+    ///
+    /// `dig-node-core` is here because NC-12's clause is about the NODE, not about one crate
+    /// (dig-node#366). It holds no `CONSTRUCTOR` today — its `chia-peer` light client was removed
+    /// (`seams/chia_peer/mod.rs`) — and that is exactly why it needs sweeping: an unguarded crate
+    /// with a chain seam in it is where the next fabric gets built.
+    ///
+    /// Paths are relative to THIS crate's manifest, which is what makes them stable under a
+    /// worktree, a checkout at any location, and a `cargo test` run from any directory.
+    fn swept_roots() -> Vec<(String, PathBuf)> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crates directory")
+            .to_path_buf();
+        ["dig-wallet", "dig-node-core"]
+            .into_iter()
+            .map(|crate_name| {
+                (
+                    crate_name.to_string(),
+                    workspace.join(crate_name).join("src"),
+                )
+            })
+            .collect()
+    }
+
+    /// Every PRODUCTION call site of `CONSTRUCTOR` under `roots`, as `crate/file:line`, plus the
+    /// files the sweep could not finish classifying.
     ///
     /// # Scope, stated so it is not overstated
     ///
-    /// It walks `dig-wallet/src` ONLY. A fabric constructed in another crate — `dig-node-core`, a
-    /// bin target — is invisible to it. No such site exists today, and this guard is not what
-    /// proves that; what it proves is that within the crate owning the wallet's chain access, one
-    /// file builds the fabric.
-    fn production_call_sites() -> (Vec<String>, Vec<String>) {
-        let mut files = Vec::new();
-        rust_files(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(),
-            &mut files,
-        );
-        files.sort();
-
+    /// It walks the `src` tree of `dig-wallet` and `dig-node-core`, and nothing else. A fabric
+    /// constructed in any OTHER crate of this workspace — `dig-node-service`, `dig-runtime`,
+    /// `dig-chat-protocol` — or in a `tests/`, `benches/` or `examples/` target of any crate,
+    /// INCLUDING the two it does walk, is invisible to it. So is one built by a dependency.
+    ///
+    /// What a green here means is therefore narrower than "the node holds one fabric": it is
+    /// "within the two crates that own the node's chain access, one file builds the fabric, and
+    /// no file in either was unreadable". That is the strongest claim a source sweep over a named
+    /// list of directories can make, and naming the list is what keeps it from reading as the
+    /// wider one.
+    fn production_call_sites_in(roots: &[(String, PathBuf)]) -> (Vec<String>, Vec<String>) {
         let mut sites = Vec::new();
         let mut unread = Vec::new();
-        for file in files {
-            let name = file
-                .file_name()
-                .expect("a file name")
-                .to_string_lossy()
-                .into_owned();
-            let text = std::fs::read_to_string(&file).expect("read a source file");
-            let swept = sweep(&text);
-            if swept.ended_inside_a_test_item {
-                unread.push(name.clone());
-            }
-            for line_no in swept.sites {
-                sites.push(format!("{name}:{line_no}"));
+        for (label, root) in roots {
+            let mut files = Vec::new();
+            rust_files(root, &mut files);
+            files.sort();
+            for file in files {
+                let name = file
+                    .file_name()
+                    .expect("a file name")
+                    .to_string_lossy()
+                    .into_owned();
+                let text = std::fs::read_to_string(&file).expect("read a source file");
+                let swept = sweep(&text);
+                if swept.ended_inside_a_test_item {
+                    unread.push(format!("{label}/{name}"));
+                }
+                for line_no in swept.sites {
+                    sites.push(format!("{label}/{name}:{line_no}"));
+                }
             }
         }
         (sites, unread)
@@ -927,32 +980,114 @@ mod sole_owner_tests {
         );
     }
 
-    /// The haystack is real: the sweep can still SEE a call site.
+    /// The haystack is real: the sweep can still SEE a call site, and it reaches EVERY root.
     ///
-    /// Without this the sweep below passes just as well against a broken file walk, a renamed
-    /// constructor, or a source tree it never read — the failure mode where a guard reports clean
-    /// because it looked at nothing.
+    /// Without the first assertion the sweep passes just as well against a broken file walk, a
+    /// renamed constructor, or a source tree it never read — the failure mode where a guard
+    /// reports clean because it looked at nothing.
+    ///
+    /// The PER-ROOT assertion is what the widening to `dig-node-core` needs, and it is a
+    /// different property. `dig-node-core` contains NO `CONSTRUCTOR` today, so a total taken
+    /// across both roots stays positive from `dig-wallet` alone: a typo in the second path, or a
+    /// crate rename, would leave the new scope reading zero files while the guard still reported
+    /// a real haystack. Counting FILES per root separates "this crate is clean" from "this crate
+    /// was never opened", which is the same distinction [`Swept::ended_inside_a_test_item`] draws
+    /// within a file.
+    ///
+    /// Both misconfigurations were measured against the compiled walk, because they fail through
+    /// different mechanisms and only one of them is this assertion:
+    ///
+    /// * A root that does NOT EXIST panics inside `rust_files` (`read_dir(…).expect(…)`) before
+    ///   this assertion is reached. Loud, and fine — but it is the panic doing the work, not the
+    ///   count.
+    /// * A root that EXISTS and holds no Rust — a `src` renamed, a crate reorganised, a path that
+    ///   silently stopped being the source tree — reaches this assertion, and it is what fires.
+    ///   Verified by pointing both roots at an empty sibling directory: this test fails naming the
+    ///   root it read zero files from.
     #[test]
-    fn the_sweep_can_find_a_construction_site_at_all() {
-        let mut files = Vec::new();
-        rust_files(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(),
-            &mut files,
-        );
-        let total: usize = files
-            .iter()
-            .map(|f| {
-                std::fs::read_to_string(f)
-                    .expect("read a source file")
-                    .matches(CONSTRUCTOR)
-                    .count()
-            })
-            .sum();
+    fn the_sweep_reaches_every_root_and_can_find_a_construction_site_at_all() {
+        let roots = swept_roots();
+        let mut total = 0usize;
+        for (label, root) in &roots {
+            let mut files = Vec::new();
+            rust_files(root, &mut files);
+            assert!(
+                !files.is_empty(),
+                "the sweep read ZERO files under {label} ({}), so that crate contributes nothing \
+                 and its half of the guard is vacuous however green it looks",
+                root.display()
+            );
+            total += files
+                .iter()
+                .map(|f| {
+                    std::fs::read_to_string(f)
+                        .expect("read a source file")
+                        .matches(CONSTRUCTOR)
+                        .count()
+                })
+                .sum::<usize>();
+        }
         assert!(
             total > 0,
-            "the sweep found NO `{CONSTRUCTOR}` anywhere in {} files — it is measuring nothing, \
-             so the sole-owner assertion below would pass no matter what the code did",
-            files.len()
+            "the sweep found NO `{CONSTRUCTOR}` anywhere under {} roots — it is measuring \
+             nothing, so the sole-owner assertion below would pass no matter what the code did",
+            roots.len()
+        );
+    }
+
+    /// A second fabric introduced in `dig-node-core` FAILS the sweep — demonstrated, not asserted.
+    ///
+    /// `dig-node-core` holds no `CONSTRUCTOR` today, so extending the scope to it proves nothing
+    /// on its own: the new root would report clean whether it was swept or skipped. This drives
+    /// the SAME classifier over a stand-in root whose only content is the violation, and checks
+    /// both halves of the verdict the real assertion acts on — that the site is SEEN, and that it
+    /// is judged a STRAY rather than accepted as the owner.
+    ///
+    /// The stray test is the half that would rot silently. `dig-node-core` could perfectly well
+    /// gain a `sources.rs` of its own, and against the unqualified `OWNER` this fixture's site
+    /// would then be accepted as the owner's — a second fabric passing the guard because it was
+    /// filed under a familiar name. Measured: reverting `OWNER` and the site format to their
+    /// unqualified single-crate forms fails THIS test and leaves every other test in the module
+    /// green, including [`only_the_registry_owner_constructs_a_peer_fabric`] — which is precisely
+    /// why the demonstration is needed rather than the real assertion alone.
+    #[test]
+    fn a_second_fabric_in_the_new_root_is_seen_and_judged_a_stray() {
+        let root = std::env::temp_dir().join(format!(
+            "dig-wallet-sole-owner-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let nested = root.join("seams");
+        std::fs::create_dir_all(&nested).expect("a temporary root");
+        // Built from `CONSTRUCTOR` rather than written out, so this file never contains the
+        // needle it sweeps for; and named `sources.rs` because that is the name the unqualified
+        // owner check would wave through.
+        std::fs::write(
+            nested.join("sources.rs"),
+            format!("pub fn rogue() {{ let _ = {CONSTRUCTOR}cfg); }}\n"),
+        )
+        .expect("write the fixture");
+
+        let roots = vec![("dig-node-core".to_string(), root.clone())];
+        let (sites, unread) = production_call_sites_in(&roots);
+        std::fs::remove_dir_all(&root).expect("clean up the temporary root");
+
+        assert!(
+            unread.is_empty(),
+            "the fixture is ordinary production code and must classify cleanly: {unread:?}"
+        );
+        assert_eq!(
+            sites,
+            vec!["dig-node-core/sources.rs:1".to_string()],
+            "the sweep must SEE a fabric built in the new root, CRATE-QUALIFIED — an unqualified \
+             site string is what lets a second crate's `sources.rs` impersonate the owner"
+        );
+        let strays: Vec<&String> = sites.iter().filter(|s| !s.starts_with(OWNER)).collect();
+        assert_eq!(
+            strays.len(),
+            1,
+            "and must judge it a STRAY: this is the assertion the real sweep makes, run against \
+             a root that actually contains the violation"
         );
     }
 
@@ -970,7 +1105,7 @@ mod sole_owner_tests {
     /// second owner exists" and is the strongest one a source sweep can make.
     #[test]
     fn only_the_registry_owner_constructs_a_peer_fabric() {
-        let (sites, unread) = production_call_sites();
+        let (sites, unread) = production_call_sites_in(&swept_roots());
         assert!(
             unread.is_empty(),
             "the sweep never saw a `#[cfg(test)]` item END in these files, so everything below \

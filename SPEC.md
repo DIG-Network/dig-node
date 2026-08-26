@@ -216,6 +216,7 @@ does not own them (except `DIG_NODE_UPSTREAM`, which the shell SETS — see belo
 |---|---|---|---|
 | `DIG_NODE_CACHE_CAP` | LRU cache size cap, in bytes | `1073741824` (1 GiB) | Parsed as `u64`. Consulted ONLY when the persisted `cache_cap_bytes` key in `config.json` is absent or `0` (the persisted value wins). Unparsable/unset ⇒ default. |
 | `DIG_NODE_COINSET` | override the coinset API base used for chain-anchored-root resolution | `https://api.coinset.org` (mainnet) | Blank/unset ⇒ mainnet default. Used for tests / alternate endpoints. |
+| `DIG_NODE_CHAIN_ENDPOINTS` | comma-separated coinset-protocol endpoints the anchored root is CORROBORATED across (§14.4b) | unset (single-source) | Two or more INDEPENDENTLY-HOSTED endpoints enable the agreement rule; independence is derived from resolved addresses, so two names for one machine stay ONE voice. Unparseable entries are DROPPED, never defaulted. Prefer three or more. Takes precedence over `DIG_NODE_COINSET`. |
 | `DIG_NODE_PIN` | read-path anchored-root pin enforcement (§14.4) | `on` (ENFORCED, fail-closed) | ONLY `off`/`0`/`false` disable the node-side pin (a named offline/local-dev escape hatch); any other value or unset ENFORCES. Clients still verify proofs against their own trust root regardless. |
 | `DIG_NODE_WATCH_INTERVAL` | chain-watch poll interval, in seconds (§14.2) | `30` | Parsed as `u64`; `0`/unparsable/unset ⇒ default `30`; floored at `1` s so a mis-set value cannot flood coinset. |
 | `DIG_NODE_UPSTREAM` | **INTERNAL** — the effective upstream the node library reads | *(unset — NO default upstream)* | NOT a user knob. The shell resolves the upstream (§3.4) and writes this via `Config::apply_to_env()` (§3.5); the shell's public knob is `DIG_RPC_UPSTREAM`. Empty ⇒ the library makes no upstream request at all. |
@@ -3849,6 +3850,113 @@ against the on-chain current root or fails closed — it NEVER trusts an upstrea
   environment variable, a named offline/local-development escape hatch — never the default. The pin is
   a NODE-side gate; clients still verify the returned proof against their own trust root regardless, so
   the opt-out only relaxes the node's serve gate for local dev.
+
+#### 14.4b. Chain corroboration — how many voices decide the anchored root (NC-12)
+
+The anchored root is the chain fact that decides WHICH BYTES A USER IS SERVED, so NC-12's
+"agreement across several concurrently-queried untrusted sources" applies to it directly. This
+section states exactly how much corroboration the node performs, and — as precisely — how much it
+does not. A SPEC that implied more than the code performs would be worse than one that admits the
+gap.
+
+**The endpoints.** The node resolves the anchored root from the coinset-protocol endpoints named by
+`DIG_NODE_CHAIN_ENDPOINTS` (a comma-separated list). When that is unset, `DIG_NODE_COINSET` names a
+single endpoint; when neither is set the node uses `https://api.coinset.org`. An unparseable entry
+is DROPPED, never defaulted — a typo MUST NOT be able to masquerade as an additional source.
+
+**Independence is derived from REACH.** Two endpoints are ONE voice whenever their resolved address
+sets intersect, and the relation is transitive. Independence is NOT derived from an endpoint's type,
+its URL, or its host name: a CNAME costs an attacker nothing, and a "quorum" satisfied by two names
+for one machine is the defect this rule exists to prevent. With two or more endpoints configured, an
+endpoint that resolves to no address contributes NO voice — the lookup is the evidence that it is a
+separate machine, and a source that cannot be shown independent MUST NOT be counted as one.
+
+A SINGLE configured endpoint is a voice whether or not its name resolves. Independence is a relation
+BETWEEN endpoints, so with one endpoint there is nothing for a lookup to decide, and requiring one
+would make name resolution a gate on READING: a resolver failure would deny a read the HTTP client
+would have served, on the default install, over a path that performed no name resolution at all
+before this rule existed. Failing closed is required when the CHAIN ANSWER is in doubt; a name
+lookup is not that.
+
+**The agreement rule, with two or more independent voices.** Every voice that answered MUST give the
+SAME answer, and at least two MUST have answered; otherwise the resolution FAILS CLOSED and the pin
+rejects the serve (§14.4, `-32005 ROOT_NOT_ANCHORED`). Specifically:
+
+- One dissenting voice is a REFUSAL, never a repaired value. There is NO majority vote and no
+  tie-break — a majority rule would hand the answer to whoever can field the most endpoints.
+- Presence and absence are different answers: one source reporting a root while another reports no
+  confirmed generation is a DISAGREEMENT, so a single source cannot conjure a store into being.
+- A source that could not be REACHED is dropped rather than counted as dissent, because an outage
+  and an attack demand opposite remedies. Dropping is still fail-closed: fewer answers means the
+  agreement rule has less evidence, and fewer than two answers is a refusal.
+- The rule covers all three resolution calls — the tip state, the bounded pinned-root verification,
+  and lineage membership — because all three are consulted by the serve decision.
+
+**A reached source that REJECTS a root vetoes the resolution; it is never outvoted.** This is stated
+separately because the two verification calls answer a yes/no question and so have no value channel
+in which to disagree. A source that is reached and says *"that root is not current"* MUST be
+distinguished from one that could not be asked, and its rejection MUST refuse the whole resolution
+regardless of how many other sources confirmed. A flat *k*-of-*N* threshold does NOT satisfy this
+clause: under one, 2-of-3 and 2-of-10 are the same bar, so adding endpoints would not raise an
+attacker's cost — and, with no attacker at all, three endpoints of which one is a generation behind
+would serve stale content. **The bar rises with the number of REACHED sources, because every source
+that answers can veto — not because more must agree.**
+
+State that precisely, because the difference is the whole security property. A source can only veto
+a resolution it was reached for; an UNREACHABLE source neither confirms nor vetoes, and adding an
+endpoint therefore raises the bar only while that endpoint is answering. So an attacker who can
+SILENCE a source — degrade its reachability rather than change its answer — removes that source's
+veto, and a root two lagging endpoints still confirm is then served. Two consequences follow and
+both are normative:
+
+- A source that has ANSWERED a read MUST NOT be reclassified as unreachable on the strength of a
+  later failed probe. Reachability is established BEFORE a verification, never re-tested after one:
+  an endpoint that answered HAS been reached, and a subsequent failure describes its future rather
+  than its past. The residual misclassification MUST run the other way — a chain that drops between
+  the probe and the verification is recorded as a REJECTION, which refuses.
+- The remedy available to an operator is the same one §14.4b already recommends and is stated here
+  for a different reason: prefer **three or more** endpoints, so that silencing ONE still leaves a
+  reached source able to veto.
+
+**Latency and disclosure, both consequences of asking more than one source.** Endpoint independence
+is recomputed per resolution, so the endpoint set is consulted on the content-serve request path.
+Recomputing is NOT re-resolving: resolved address sets are CACHED for 60 seconds, so an ordinary read
+costs a map lookup rather than a name lookup, and an independence verdict can be at most that stale.
+A lookup that fails while a previously-resolved answer is still held (within 10 minutes) reuses that
+answer rather than dropping the voice — a resolver blip is not evidence that an endpoint moved, and
+silently changing the VOICE COUNT on that evidence would report a DNS hiccup as a corroboration
+failure. Lookups that are performed are CONCURRENT and each is bounded (3 seconds); an endpoint that
+exceeds it and has no cached answer counts as unreachable — the fail-closed direction. And resolving
+discloses the STORE ID to every configured endpoint rather than to one. An operator adding endpoints
+buys corroboration and widens that disclosure; both halves are real.
+
+**ACCEPTED LIMITATION — the DEFAULT INSTALL resolves the anchored root from ONE third party.** With
+fewer than two independent voices configured, the node answers from its single source, exactly as it
+did before this rule existed. It does not claim corroboration in that state, and it does not refuse:
+refusing would stop every unconfigured node serving any content at all, removing the surface on
+which an operator could configure a second endpoint.
+
+*Blast radius of that limitation:* a default install trusts `api.coinset.org` for the root every
+content read is pinned to. A source that lied about it would redirect reads on every such install,
+and the pin would fail closed against the WRONG root rather than the right one — indistinguishable,
+from outside, from the store having moved on. It does NOT let that source forge content: bytes are
+still accepted only because they verify against the merkle root (§21.2, §22.3). The remedy available
+to an operator today is to name several independently-hosted endpoints.
+
+*How many:* prefer **three or more**, not two. Two is the minimum the rule accepts and the most
+fragile count it accepts, because with two ANY single source being unreachable drops the node to one
+answer — below the corroboration floor — so every read refuses until it returns. A third endpoint is
+what makes the guarantee survive one outage rather than converting one outage into a serve failure.
+Note the veto is unconditional at every count: a third source raises availability, and it also gains
+a third party able to refuse the read.
+
+**ALSO SINGLE-SOURCED, and NOT corroborated (stated, not fixed).** These paths go to one endpoint
+regardless of configuration: `coin_records_by_puzzle_hashes`, `coin_records_by_hints` and
+`coin_records_by_parent` (the wallet's chain-fallback tier), mempool submission, the melt
+confirmation, and the direct singleton walks the RPC surface performs. They are enumerated here so a
+reader does not infer from the rule above that every chain fact is corroborated. By contrast
+`peak_height`, `coin_record_by_id`, `coin_spend` and their cached variants ARE corroborated across
+the node's own dialled Chia peers (§18).
 
 ### 14.4a. Per-path generation resolution (#2088) — serve TIP-AUTHORITATIVE, redirect only on a genuine tip miss (#2211)
 
