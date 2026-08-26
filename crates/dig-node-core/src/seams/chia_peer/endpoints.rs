@@ -111,15 +111,24 @@ pub(crate) struct DnsReach;
 
 #[async_trait::async_trait]
 impl EndpointReach for DnsReach {
+    /// Resolve `authority` by handing the host and the port to the resolver SEPARATELY.
+    ///
+    /// The `(host, port)` tuple form is not stylistic. Rendering an address as
+    /// `format!("{host}:{port}")` is invalid for every IPv6 literal — the grammar requires brackets
+    /// — and this module strips those brackets when it parses, so re-joining the two would produce
+    /// `::1:8555` and fail to resolve every v6 endpoint. §5.2 makes IPv6 the first-class case here,
+    /// so that would not be an edge; it would be the common path. `crates/dig-node-core/tests/
+    /// banned_address_patterns.rs` bans the concatenation at the source for exactly this reason,
+    /// and it caught this function.
     async fn addrs(&self, authority: &Authority) -> Result<BTreeSet<IpAddr>, String> {
-        let target = format!("{}:{}", authority.host, authority.port);
-        let addrs: BTreeSet<IpAddr> = tokio::net::lookup_host(&target)
+        let Authority { host, port } = authority;
+        let addrs: BTreeSet<IpAddr> = tokio::net::lookup_host((host.as_str(), *port))
             .await
-            .map_err(|e| format!("{target} does not resolve: {e}"))?
+            .map_err(|e| format!("host {host} port {port} does not resolve: {e}"))?
             .map(|socket| socket.ip())
             .collect();
         if addrs.is_empty() {
-            return Err(format!("{target} resolves to no address"));
+            return Err(format!("host {host} port {port} resolves to no address"));
         }
         Ok(addrs)
     }
@@ -201,8 +210,10 @@ mod tests {
         async fn addrs(&self, authority: &Authority) -> Result<BTreeSet<IpAddr>, String> {
             match self.0.get(authority) {
                 Some(addrs) => Ok(addrs.iter().copied().collect()),
+                // Rendered with the host and port kept APART, matching the production reach and
+                // the source-level ban -- an IPv6 literal has no valid bare  form.
                 None => Err(format!(
-                    "{}:{} does not resolve",
+                    "host {} port {} does not resolve",
                     authority.host, authority.port
                 )),
             }
