@@ -5,6 +5,13 @@
 #   - BOTH present                -> both must increase AND equal each other on this branch
 #   - neither present             -> nothing to enforce (passes)
 # Version files added new on this branch (absent on base) pass. Modeled on Chia-Network/cadt.
+#
+# The comparison is written to the job summary on EVERY run, pass or fail (dig-node#364). A stale
+# bump is invisible everywhere else: `git status`, the diff, fmt, clippy and the test suite are all
+# green when `main` has taken your version number, and a rebase can drop the bump commit entirely as
+# "already upstream". This gate is the only thing that holds both numbers, so it is the only place
+# the comparison can be surfaced -- and being able to read it WHILE the gate is green is what turns
+# a merge-time surprise into something a long-lived review round can notice.
 name: Check Version Increment
 
 on:
@@ -56,6 +63,22 @@ jobs:
           # strictly-greater semver-ish compare using sort -V; true when $2 > $1
           greater() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]; }
 
+          # One row of the comparison table, to the job summary AND the log.
+          # `${GITHUB_STEP_SUMMARY:-/dev/null}` so the script stays runnable outside Actions.
+          SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          row() { printf '| %s | `%s` | `%s` | %s |\n' "$1" "${2:-(absent)}" "${3:-(absent)}" "$4" >> "$SUMMARY"; }
+
+          base_sha=$(git -C base-repo rev-parse --short HEAD)
+          head_sha=$(git -C branch-repo rev-parse --short HEAD)
+          {
+            echo "### Version increment"
+            echo
+            echo "Comparing this branch against \`main\` at \`$base_sha\` (head \`$head_sha\`)."
+            echo
+            echo "| manifest | base | head | verdict |"
+            echo "| --- | --- | --- | --- |"
+          } >> "$SUMMARY"
+
           B=base-repo
           H=branch-repo
           has_pkg=false; has_cargo=false
@@ -73,12 +96,16 @@ jobs:
             bp=$(pkg_version "$B"); hp=$(pkg_version "$H")
             echo "package.json: base='$bp' head='$hp'"
             if [ -n "$bp" ]; then
-              if ! greater "$bp" "$hp"; then
+              if greater "$bp" "$hp"; then
+                row "package.json" "$bp" "$hp" "increments"
+              else
                 echo "::error::package.json version must be incremented ($bp -> $hp) before merging."
+                row "package.json" "$bp" "$hp" "**does not increment**"
                 fail=1
               fi
             else
               echo "package.json is new on this branch (no base version) — OK."
+              row "package.json" "" "$hp" "new on this branch"
             fi
           fi
 
@@ -86,12 +113,16 @@ jobs:
             bc=$(cargo_version "$B"); hc=$(cargo_version "$H")
             echo "Cargo.toml: base='$bc' head='$hc'"
             if [ -n "$bc" ]; then
-              if ! greater "$bc" "$hc"; then
+              if greater "$bc" "$hc"; then
+                row "Cargo.toml" "$bc" "$hc" "increments"
+              else
                 echo "::error::Cargo.toml version must be incremented ($bc -> $hc) before merging."
+                row "Cargo.toml" "$bc" "$hc" "**does not increment**"
                 fail=1
               fi
             else
               echo "Cargo.toml is new on this branch (no base version) — OK."
+              row "Cargo.toml" "" "$hc" "new on this branch"
             fi
           fi
 
@@ -99,8 +130,24 @@ jobs:
             hp=$(pkg_version "$H"); hc=$(cargo_version "$H")
             if [ -n "$hp" ] && [ -n "$hc" ] && [ "$hp" != "$hc" ]; then
               echo "::error::package.json ($hp) and Cargo.toml ($hc) versions must match each other."
+              row "both manifests" "$hp" "$hc" "**disagree with each other**"
               fail=1
+            elif [ -n "$hp" ] && [ -n "$hc" ]; then
+              row "both manifests" "$hp" "$hc" "agree"
             fi
           fi
+
+          # The verdict, spelled out. A summary showing only rows would leave a reader inferring
+          # the outcome from the rows -- which is the inference this whole change exists to remove.
+          {
+            echo
+            if [ "$fail" -eq 0 ]; then
+              echo "**PASS** — the version increments over \`main\`."
+            else
+              echo "**FAIL** — see the rows above. If this branch has been open a while, \`main\`"
+              echo "has probably taken your version number, or a rebase dropped the bump commit as"
+              echo "\"already upstream\". Re-bump against \`$base_sha\`."
+            fi
+          } >> "$SUMMARY"
 
           exit $fail
