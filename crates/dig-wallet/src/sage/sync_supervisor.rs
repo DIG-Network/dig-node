@@ -45,6 +45,7 @@
 //! seed is touched and nothing here can sign.
 
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -738,8 +739,17 @@ pub(crate) fn puzzle_hash_for(pk: &PublicKey) -> Bytes32 {
 /// Opens one peer subscription session.
 #[async_trait::async_trait]
 pub trait SyncSessionFactory: Send + Sync {
-    /// Dial a peer and hand back a session bound to it.
-    async fn connect(&self) -> Result<Box<dyn SyncSession>, SyncError>;
+    /// Dial a peer that is NOT at one of `exclude`, and hand back a session bound to it.
+    ///
+    /// `exclude` exists because the supervisor replaces a writer the moment a decisive quorum
+    /// catches it contradicting them, and a replacement dial that could return THAT PEER AGAIN
+    /// makes the replacement a coin flip (#307). Discovery is random, so nothing else prevents it.
+    ///
+    /// It is a HINT about which peer to avoid, never a ban: an implementation that cannot honour
+    /// it must still connect. Excluding a peer is hardening on top of a backoff ladder that
+    /// already bounds the damage, and refusing to connect at all would trade a repeat dial for a
+    /// node that stops syncing.
+    async fn connect(&self, exclude: &[SocketAddr]) -> Result<Box<dyn SyncSession>, SyncError>;
 }
 
 /// One live peer subscription.
@@ -753,6 +763,16 @@ pub trait SyncSessionFactory: Send + Sync {
 pub trait SyncSession: Send + Sync {
     /// The address dialed, for the [`crate::sage::events::SyncEvent::Start`] event.
     fn peer_ip(&self) -> String;
+
+    /// The address dialed, parsed, so the supervisor can ask NOT to be given this peer again.
+    ///
+    /// Defaulted from [`peer_ip`](Self::peer_ip) because every implementation builds that string
+    /// from a `SocketAddr` in the first place. `None` when it does not parse, and the caller then
+    /// simply excludes nothing — an exclusion that fails OPEN costs a possible repeat dial, while
+    /// one that failed closed would cost the session entirely.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_ip().parse().ok()
+    }
 
     /// The trust this peer carries INTO the session, decided by HOW it was reached and by
     /// nothing it says ([`trust_for`]).
@@ -1255,9 +1275,15 @@ impl Supervisor {
         // The replica's freeze, tracked across sessions rather than within one — see
         // [`StallWatch`] for why that is required rather than merely tidy.
         let stall_watch = Mutex::new(StallWatch::default());
+        // The peer to avoid on the NEXT dial: set only when a decisive quorum caught this session
+        // contradicting it, and cleared by every other ending. It holds at most one address on
+        // purpose — a growing avoid-list would shrink the pool a random dial can reach, which is
+        // the plurality NC-12 depends on, and the peer this excludes is the one this node has
+        // actual evidence against (#307).
+        let mut avoid: Vec<SocketAddr> = Vec::new();
 
         while !*shutdown.borrow() {
-            let session = match self.factory.connect().await {
+            let session = match self.factory.connect(&avoid).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::debug!(error = %e, "wallet sync: no peer; backing off");
@@ -1382,6 +1408,9 @@ impl Supervisor {
             // Taken before the session is moved into `run` below, so the stall and recovery lines
             // can both name the peer the episode was about.
             let peer_ip = session.peer_ip();
+            // Captured HERE, while the session is still owned: the address is needed after the
+            // select, by which point the session may already have been dropped.
+            let peer_addr_to_avoid = session.peer_addr();
             let mut state = sync::SessionState::with_authority(&subscribed, authority);
             let outcome = tokio::select! {
                 result = session.run(&self.db, &self.events, &mut state) => {
@@ -1423,6 +1452,14 @@ impl Supervisor {
                 // Dropping the `run` future drops the receiver, which closes the peer. No
                 // abort, so any DB write already in flight completes first.
                 _ = shutdown.changed() => SessionOutcome::Stop,
+            };
+            // A writer caught contradicting a decisive quorum is the ONE ending that names a
+            // culprit, so it is the one that earns an exclusion. Every other ending — a split, a
+            // silent writer, a stall, a rotation — accuses nobody, and excluding a peer on those
+            // would spend the pool down for no evidence.
+            avoid = match refusal {
+                Some(RefusalReason::WriterContradicted) => peer_addr_to_avoid.into_iter().collect(),
+                _ => Vec::new(),
             };
             handle.set_connected(0);
             match outcome {
@@ -1808,7 +1845,7 @@ pub const fn trust_for(source: DialSource) -> PeerTrust {
 
 #[async_trait::async_trait]
 impl SyncSessionFactory for ChiaPeerSessionFactory {
-    async fn connect(&self) -> Result<Box<dyn SyncSession>, SyncError> {
+    async fn connect(&self, exclude: &[SocketAddr]) -> Result<Box<dyn SyncSession>, SyncError> {
         // Generated in memory, never file-backed: a node running as a Windows service has no
         // readable `~/.chia`, and a full node accepts any well-formed client certificate, so
         // a file would be pure liability (dig_ecosystem#2210).
@@ -1863,10 +1900,19 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
             ));
         }
 
-        let (peer, addr, receiver) =
-            chia_query::peer::connect::connect_random_peer(self.network, &tls, DIAL_TIMEOUT)
-                .await
-                .map_err(|e| SyncError::Peer(e.to_string()))?;
+        // `_excluding` rather than `connect_random_peer`: the caller passes the peer a decisive
+        // quorum just caught contradicting it, and the plain helper would happily hand that same
+        // peer back (#307). The exclusion covers the priority addresses too, which is what makes
+        // it a real avoidance rather than a filter on the discovered set alone.
+        let (peer, addr, receiver, _origin) =
+            chia_query::peer::connect::connect_random_peer_excluding(
+                self.network,
+                &tls,
+                DIAL_TIMEOUT,
+                exclude,
+            )
+            .await
+            .map_err(|e| SyncError::Peer(e.to_string()))?;
         Ok(Box::new(ChiaPeerSession {
             peer,
             ip: addr.to_string(),

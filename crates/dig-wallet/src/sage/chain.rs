@@ -30,7 +30,8 @@
 //! chain into an empty list or a zero: an empty answer would tell somebody who holds funds that
 //! they hold nothing, and a spend built on that refuses with a shortfall that is not true.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chia_protocol::SpendBundle;
@@ -40,6 +41,101 @@ use super::fallback::{
 };
 use super::spend::to_query_bundle;
 use super::{Error, Result};
+
+/// How long the pool's held-peer count stays believable without a fresh sign of life.
+///
+/// Three minutes, which is about 9.6 mainnet block intervals at the ~18.75 s target. A live Chia
+/// peer announces `NewPeakWallet` roughly once a block, so the chance of every held peer being
+/// honestly silent for this long is on the order of 0.007%. Past it, silence is far better
+/// explained by sessions that are not delivering than by a chain that has stopped.
+///
+/// It is DERIVED from the protocol's own interval rather than chosen, and it is deliberately
+/// generous: the cost of being too long is a stale number for a few minutes, while the cost of
+/// being too short is a healthy node reporting its peers as unknown during ordinary block jitter.
+pub(crate) const PEER_LIVENESS_WINDOW: Duration = Duration::from_secs(180);
+
+/// What the transport has last SEEN of its own peer tier, so a held-peer count can be reported as
+/// a measurement rather than as a belief nothing has challenged (#351).
+///
+/// # Why a held-peer count needs corroborating at all
+///
+/// `chia_query`'s count is the pool's held-entry registry, and an entry leaves it in exactly one
+/// way: a request routed to that peer FAILS. But `Router::get_blockchain_state` consults the
+/// coinset HTTP tier FIRST and falls back to the peers, so a node whose reads are all answered by
+/// coinset never routes a request to a peer, never ejects one, and never has its belief
+/// contradicted. On the #3159 fleet — every Chia peer and all outbound `tcp/8444` blocked, HTTPS
+/// untouched — the count sat at 5 for 180 s while the node could reach zero.
+///
+/// The belief is not fabricated and it is not useless; it simply has **unbounded age** precisely
+/// when the node is not using its peers, which is when an operator most wants to know.
+///
+/// # What counts as a sign of life
+///
+/// Two observations, both passive, neither of which dials anything:
+///
+/// * **the peers' peak advancing** — `NewPeakWallet` is a per-peer heartbeat, and the pool's peak
+///   is fed only by held sessions, so a rise means at least one session delivered something; and
+/// * **the held count changing** — which happens only on a real admission or a real ejection.
+///
+/// Neither is a peer's claim about ITSELF (NC-12): a peer asserting it is alive proves nothing,
+/// whereas a peak this node's own pool recorded is a fact about the node's sockets.
+///
+/// # Which way it is allowed to be wrong
+///
+/// A frozen peak is ambiguous between "the sessions are dead" and "the chain is quiet", and this
+/// cannot tell them apart. So it answers **unknown**, never zero and never the stale number — an
+/// operator who cannot be told how many peers are held is much better served by being told that
+/// than by a confident five.
+#[derive(Debug, Default)]
+pub(crate) struct PeerLiveness {
+    /// When the tier was last observed to be alive, or `None` before the first observation and
+    /// after the client goes away.
+    confirmed_at: Option<Instant>,
+    /// The peak carried by the previous observation, so a rise can be recognised.
+    last_peak: Option<u32>,
+    /// The held count carried by the previous observation, so a change can be recognised.
+    last_count: Option<u32>,
+}
+
+impl PeerLiveness {
+    /// Fold one raw tier reading into the liveness record and return the tier to REPORT.
+    ///
+    /// `now` is passed rather than read so a test can pin fixture time; a liveness window driven by
+    /// the wall clock is untestable without sleeping for three minutes.
+    ///
+    /// An unobservable reading — no client exists — RESETS the record rather than ageing it. The
+    /// next client is a different set of sockets, and carrying a previous client's confirmation
+    /// across the gap would let a freshly built pool inherit an expiry it never earned.
+    pub(crate) fn observe(&mut self, now: Instant, raw: ChainPeerTier) -> ChainPeerTier {
+        let Some(count) = raw.peer_count else {
+            *self = Self::default();
+            return raw;
+        };
+
+        // A first sighting is itself an observation: the client exists and reports what it holds,
+        // which is a fact established at this instant rather than one inherited from earlier.
+        let alive = self.confirmed_at.is_none()
+            || raw.peak_height != self.last_peak
+            || Some(count) != self.last_count;
+        if alive {
+            self.confirmed_at = Some(now);
+        }
+        self.last_peak = raw.peak_height;
+        self.last_count = Some(count);
+
+        let fresh = self
+            .confirmed_at
+            .is_some_and(|seen| now.duration_since(seen) <= PEER_LIVENESS_WINDOW);
+
+        ChainPeerTier {
+            peer_count: fresh.then_some(count),
+            // The peak is reported exactly as the peers gave it. It was already honest on the
+            // fleet — it froze when they died — and it is documented as "what the peers announced"
+            // rather than as a claim about now.
+            peak_height: raw.peak_height,
+        }
+    }
+}
 
 /// The outcome of pushing an already-signed bundle to the network.
 ///
@@ -89,6 +185,9 @@ pub struct ChainTransport {
     /// refused quorum would let one endpoint overrule the peers whenever they failed to agree,
     /// which is the trusted-peer dependency this exists to remove.
     peer_reads: Option<Arc<super::peer_reads::PeerCorroboratedReads>>,
+    /// What this transport has last seen of its own peer tier, so the held-peer count is reported
+    /// as a measurement rather than as a belief nothing has challenged (#351). See [`PeerLiveness`].
+    peer_liveness: StdMutex<PeerLiveness>,
 }
 
 impl Default for ChainTransport {
@@ -103,6 +202,7 @@ impl ChainTransport {
         Self {
             sources: Arc::new(super::sources::NodeChainSources::new()),
             peer_reads: None,
+            peer_liveness: StdMutex::default(),
         }
     }
 
@@ -150,6 +250,7 @@ impl ChainTransport {
         Self {
             sources: Arc::new(super::sources::NodeChainSources::with_client(client)),
             peer_reads: None,
+            peer_liveness: StdMutex::default(),
         }
     }
 
@@ -220,13 +321,32 @@ impl ChainTransport {
     /// Unbuildable is [`ChainPeerTier::UNOBSERVABLE`], never a zero count: a node that could not
     /// look has not looked and found none.
     pub async fn peer_tier(&self) -> ChainPeerTier {
-        let Some(client) = self.sources.existing_client().await else {
-            return ChainPeerTier::UNOBSERVABLE;
+        let raw = match self.sources.existing_client().await {
+            Some(client) => ChainPeerTier {
+                peer_count: u32::try_from(client.peer_count().await).ok(),
+                peak_height: client.peer_peak_height().await,
+            },
+            None => ChainPeerTier::UNOBSERVABLE,
         };
-        ChainPeerTier {
-            peer_count: u32::try_from(client.peer_count().await).ok(),
-            peak_height: client.peer_peak_height().await,
-        }
+        self.observe_peer_liveness_at(Instant::now(), raw)
+    }
+
+    /// Fold a raw tier reading through this transport's liveness record, at a caller-supplied
+    /// instant.
+    ///
+    /// [`peer_tier`](Self::peer_tier) is this with `Instant::now()` and the reading the client
+    /// gave, and it is written as a two-line composition so that a miswiring would be visible in
+    /// the one place it could occur. The instant is a parameter because the window is three
+    /// minutes long and a test that waits three minutes is a test nobody runs.
+    pub(crate) fn observe_peer_liveness_at(
+        &self,
+        now: Instant,
+        raw: ChainPeerTier,
+    ) -> ChainPeerTier {
+        self.peer_liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe(now, raw)
     }
 
     /// Connect the peer tier, so the node HOLDS Chia peers because it is running
@@ -757,6 +877,235 @@ mod corroborated_peak_tests {
              list {ALLOWED:?}: {unlisted:?} — a transport whose peak_height is one HTTPS \
              endpoint's opinion (NC-12, dig-node#360). Attach peer reads, or add the name here \
              deliberately."
+        );
+    }
+    // -----------------------------------------------------------------------
+    // The held-peer count is a measurement, not a belief nothing challenged (#351)
+    // -----------------------------------------------------------------------
+
+    /// A raw tier reading as the pool would give it.
+    fn tier(peer_count: Option<u32>, peak_height: Option<u32>) -> ChainPeerTier {
+        ChainPeerTier {
+            peer_count,
+            peak_height,
+        }
+    }
+
+    /// **Proves (#351):** the exact fleet observation. With the held count frozen at 5 and the
+    /// peers' peak frozen beside it, the reported count becomes UNKNOWN once the liveness window
+    /// passes — and the CONTROL in the same test, a pool whose peak keeps advancing, still reports
+    /// 5 at the very same instant.
+    ///
+    /// **The control is what makes this discriminating.** "The count goes unknown after three
+    /// minutes" is satisfied identically by an implementation that always reports unknown, or that
+    /// expires on a timer regardless of evidence. Only the pair distinguishes *stale* from *old*,
+    /// and staleness is the defect: on the #3159 fleet the node reported `chia_peer_count: 5` for
+    /// 180 s while every Chia peer was blocked and it could reach zero.
+    ///
+    /// Both transports see the SAME held count and the SAME elapsed time. The one difference is
+    /// whether anything alive was heard from.
+    #[test]
+    fn a_frozen_peer_tier_goes_unknown_while_a_live_one_keeps_reporting_its_count() {
+        let now = Instant::now();
+        let dead = ChainTransport::new();
+        let live = ChainTransport::new();
+
+        assert_eq!(
+            dead.observe_peer_liveness_at(now, tier(Some(5), Some(9_196_851))),
+            tier(Some(5), Some(9_196_851)),
+            "a first sighting is itself an observation"
+        );
+        assert_eq!(
+            live.observe_peer_liveness_at(now, tier(Some(5), Some(9_196_851))),
+            tier(Some(5), Some(9_196_851))
+        );
+
+        let later = now + PEER_LIVENESS_WINDOW + Duration::from_secs(1);
+
+        assert_eq!(
+            dead.observe_peer_liveness_at(later, tier(Some(5), Some(9_196_851))),
+            tier(None, Some(9_196_851)),
+            "nothing has been heard from the held peers, so how many are held is unknown"
+        );
+        assert_eq!(
+            live.observe_peer_liveness_at(later, tier(Some(5), Some(9_196_860))),
+            tier(Some(5), Some(9_196_860)),
+            "a peak that advanced is a held session delivering, so the count still stands"
+        );
+    }
+
+    /// **Proves:** an unknown count is `None`, never `Some(0)`.
+    ///
+    /// Stated separately because the two are the same shape to a careless reader and opposite
+    /// claims to an operator: `0` says "your machine is connected to no Chia peers", which is a
+    /// measurement nobody took, and it is the exact failure the surrounding `ChainPeerTier` doc
+    /// forbids field by field.
+    #[test]
+    fn an_unknown_held_count_is_never_reported_as_a_measured_zero() {
+        let transport = ChainTransport::new();
+        let now = Instant::now();
+
+        transport.observe_peer_liveness_at(now, tier(Some(5), Some(100)));
+        let stale = transport.observe_peer_liveness_at(
+            now + PEER_LIVENESS_WINDOW + Duration::from_secs(1),
+            tier(Some(5), Some(100)),
+        );
+
+        assert_eq!(stale.peer_count, None);
+        assert_ne!(stale.peer_count, Some(0), "unknown is not a measured none");
+    }
+
+    /// **Proves:** the window is `PEER_LIVENESS_WINDOW`, pinned from BOTH sides.
+    ///
+    /// Exactly at the window the count still stands; one millisecond past it, it does not. A bound
+    /// tested only from one side can only confirm itself — an implementation expiring instantly, or
+    /// one expiring an hour late, passes a test that checks a single point.
+    #[test]
+    fn the_liveness_window_holds_at_its_bound_and_lapses_one_tick_past_it() {
+        let now = Instant::now();
+        let at_bound = ChainTransport::new();
+        let past_bound = ChainTransport::new();
+
+        at_bound.observe_peer_liveness_at(now, tier(Some(5), Some(100)));
+        past_bound.observe_peer_liveness_at(now, tier(Some(5), Some(100)));
+
+        assert_eq!(
+            at_bound
+                .observe_peer_liveness_at(now + PEER_LIVENESS_WINDOW, tier(Some(5), Some(100)))
+                .peer_count,
+            Some(5),
+            "at the bound the count is still believable"
+        );
+        assert_eq!(
+            past_bound
+                .observe_peer_liveness_at(
+                    now + PEER_LIVENESS_WINDOW + Duration::from_millis(1),
+                    tier(Some(5), Some(100)),
+                )
+                .peer_count,
+            None,
+            "one tick past it, it is not"
+        );
+    }
+
+    /// **Proves:** the held count CHANGING is itself a sign of life, independently of the peak.
+    ///
+    /// A count moves only when the pool admits or ejects, which are real events on real sockets. So
+    /// a pool losing peers — `5 -> 4` — is observably alive even while the chain is quiet, and must
+    /// not be reported as unknown merely because no new peak arrived.
+    ///
+    /// This is the assertion that fails if the freshness test is narrowed to the peak alone.
+    #[test]
+    fn a_change_in_the_held_count_is_itself_a_sign_of_life() {
+        let now = Instant::now();
+        let transport = ChainTransport::new();
+
+        transport.observe_peer_liveness_at(now, tier(Some(5), Some(100)));
+
+        // Well past the window, but the pool visibly ejected a peer at this instant.
+        let later = now + PEER_LIVENESS_WINDOW + Duration::from_secs(60);
+        assert_eq!(
+            transport
+                .observe_peer_liveness_at(later, tier(Some(4), Some(100)))
+                .peer_count,
+            Some(4),
+            "an ejection is an observation of the pool acting on real sockets"
+        );
+    }
+
+    /// **Proves:** unknown is RECOVERABLE. A node whose peers come back reports a count again
+    /// rather than staying dark, so the field is a live reading in both directions.
+    ///
+    /// Without this a single quiet stretch would latch the surface into permanent uncertainty,
+    /// which is a different lie in the other direction.
+    #[test]
+    fn a_count_that_lapsed_into_unknown_is_reported_again_once_the_peers_speak() {
+        let now = Instant::now();
+        let transport = ChainTransport::new();
+
+        transport.observe_peer_liveness_at(now, tier(Some(5), Some(100)));
+        let lapsed = now + PEER_LIVENESS_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            transport
+                .observe_peer_liveness_at(lapsed, tier(Some(5), Some(100)))
+                .peer_count,
+            None
+        );
+
+        assert_eq!(
+            transport
+                .observe_peer_liveness_at(
+                    lapsed + Duration::from_secs(19),
+                    tier(Some(5), Some(101))
+                )
+                .peer_count,
+            Some(5),
+            "the peers spoke again, so the count is a measurement again"
+        );
+    }
+
+    /// **Proves the WIRING:** `peer_tier` routes through the liveness record rather than reading
+    /// the pool and reporting it.
+    ///
+    /// A unit test of `observe` alone cannot see whether anything calls it, and a policy nothing
+    /// calls is indistinguishable from no policy. The proof uses the one observable side effect
+    /// available without a network: an unobservable reading RESETS the record, so calling
+    /// `peer_tier()` on an unbuilt transport must make a subsequent reading count as a FIRST
+    /// sighting even though the window has long since passed.
+    ///
+    /// If `peer_tier` did not touch the record, the aged confirmation from before would survive and
+    /// the final count would come back `None`.
+    #[tokio::test]
+    async fn peer_tier_folds_its_reading_through_the_liveness_record() {
+        let transport = ChainTransport::new();
+        let now = Instant::now();
+
+        transport.observe_peer_liveness_at(now, tier(Some(5), Some(100)));
+
+        assert_eq!(
+            transport.peer_tier().await,
+            ChainPeerTier::UNOBSERVABLE,
+            "no client exists, so there is nothing to measure"
+        );
+
+        assert_eq!(
+            transport
+                .observe_peer_liveness_at(
+                    now + PEER_LIVENESS_WINDOW + Duration::from_secs(600),
+                    tier(Some(5), Some(100)),
+                )
+                .peer_count,
+            Some(5),
+            "peer_tier reset the record, so this is a first sighting rather than a stale one"
+        );
+    }
+
+    /// **Proves:** a client going away resets the record rather than ageing it, and reports
+    /// unknown while it is gone.
+    ///
+    /// The next client is a different set of sockets. Carrying the previous one's confirmation
+    /// across the gap would let a freshly built pool inherit an expiry it never earned — and,
+    /// worse, would let a pool that has just connected be reported as unknown.
+    #[test]
+    fn a_client_going_away_resets_the_record_rather_than_ageing_it() {
+        let now = Instant::now();
+        let transport = ChainTransport::new();
+
+        transport.observe_peer_liveness_at(now, tier(Some(5), Some(100)));
+        assert_eq!(
+            transport.observe_peer_liveness_at(now, ChainPeerTier::UNOBSERVABLE),
+            ChainPeerTier::UNOBSERVABLE
+        );
+
+        assert_eq!(
+            transport
+                .observe_peer_liveness_at(
+                    now + PEER_LIVENESS_WINDOW + Duration::from_secs(1),
+                    tier(Some(3), Some(100)),
+                )
+                .peer_count,
+            Some(3),
+            "a rebuilt pool is measured from its own first sighting"
         );
     }
 }
