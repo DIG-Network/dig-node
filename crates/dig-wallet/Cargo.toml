@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.38.0"
+version = "0.39.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -20,8 +20,8 @@ path = "src/main.rs"
 # (storeId:rootHash) identity rendered by /api/stores.
 # NC-7 exception: the digstore set is git-pinned as one atomic rev — rationale in
 # crates/dig-node-core/Cargo.toml (dig_ecosystem#901, blocked on the digstore publishes + #2761).
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
 # The node engine (crate `dig_node_core`) — same workspace (the DIG Browser's in-process
 # node + wallet are one host cluster). dig-wallet reads the node's cache surface for the
 # wallet UI's "My Node" cache view (cache_cap_bytes / cache_used_bytes / clear_cache / list).
