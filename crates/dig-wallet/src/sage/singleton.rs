@@ -1,7 +1,7 @@
 //! NFT / DID / CAT singleton reconstruction from synced coin state (design **B.6**, #216).
 //!
 //! The direct-peer sync ([`crate::sage::sync`]) records every coin at the wallet's puzzle
-//! hashes, but a raw [`chia::protocol::CoinState`] does not say whether a coin is an NFT, a
+//! hashes, but a raw [`chia_protocol::CoinState`] does not say whether a coin is an NFT, a
 //! DID, or a CAT — that lives in the coin's *puzzle*, which is only revealed when its parent
 //! is spent. This module reconstructs those assets by **uncurrying the parent coin's spend**
 //! via the canonical `chia-wallet-sdk` driver parsers ([`Nft::parse_child`],
@@ -16,8 +16,8 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use chia::puzzles::nft::NftMetadata;
 use chia_protocol::{Bytes32, Coin, Program};
+use chia_puzzle_types::nft::NftMetadata;
 use chia_wallet_sdk::driver::{Cat, Did, Nft, Puzzle, SpendContext};
 use chia_wallet_sdk::utils::Address;
 use clvmr::NodePtr;
@@ -431,8 +431,8 @@ pub async fn reconstruct_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia::traits::Streamable;
     use chia_sdk_test::Simulator;
+    use chia_traits::Streamable;
     use chia_wallet_sdk::driver::{
         Cat as SdkCat, CatSpend, IntermediateLauncher, Launcher, NftMint, SingletonInfo,
         SpendWithConditions, StandardLayer,
@@ -601,9 +601,13 @@ mod tests {
         // Issue a CAT to alice, then spend it to produce a child CAT (its parent is now a
         // CAT coin, which is what parse_children reconstructs from).
         let memos = ctx.hint(alice.puzzle_hash).unwrap();
-        let (issue_cat, cats) = SdkCat::issue_with_coin(
+        let (issue_cat, cats) = SdkCat::single_issuance(
             ctx,
             alice.coin.coin_id(),
+            // `hidden_puzzle_hash`: the slot chia-sdk-driver 0.36 exposes where 0.30's
+            // `issue_with_coin` hard-coded `None`. `None` keeps the eve coin's puzzle hash — and so
+            // this fixture's CAT — byte-identical; `Some(..)` would issue a different coin.
+            None,
             1000,
             Conditions::new().create_coin(alice.puzzle_hash, 1000, memos),
         )

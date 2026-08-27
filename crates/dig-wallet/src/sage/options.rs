@@ -29,8 +29,8 @@
 //! follow-on lands in. `get_options`/`get_option`/`mint_option`/`transfer_options` are fully
 //! served in the meantime.
 
-use chia::puzzles::Memos;
 use chia_protocol::{Bytes32, Coin, CoinSpend, Program};
+use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{
     OptionContract, OptionInfo, OptionLauncher, OptionLauncherInfo, OptionType, Puzzle,
     SpendContext, StandardLayer,
@@ -347,7 +347,7 @@ mod tests {
     use chia_sdk_test::{BlsPair, Simulator};
     use chia_wallet_sdk::types::TESTNET11_CONSTANTS;
 
-    fn signer_for(sk: chia::bls::SecretKey) -> WalletSigner {
+    fn signer_for(sk: chia_bls::SecretKey) -> WalletSigner {
         WalletSigner::new(vec![sk], TESTNET11_CONSTANTS.agg_sig_me_additional_data)
     }
 
@@ -408,7 +408,7 @@ mod tests {
     /// transfer via [`build_option_transfer`].
     #[test]
     fn transfer_option_builds_validates_and_broadcasts_on_simulator() {
-        use chia::traits::Streamable;
+        use chia_traits::Streamable;
         use chia_wallet_sdk::driver::SpendContext as Ctx;
 
         let mut sim = Simulator::new();

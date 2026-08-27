@@ -49,9 +49,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use chia::bls::PublicKey;
-use chia::puzzles::standard::StandardArgs;
+use chia_bls::PublicKey;
 use chia_protocol::Bytes32;
+use chia_puzzle_types::standard::StandardArgs;
 
 use super::custody::WalletCustody;
 use super::db::WalletDb;
@@ -2115,7 +2115,7 @@ where
 /// HEIGHTS — to exclude the badly-lagged, and to settle the height everyone is then asked about —
 /// and never reaches the replica.
 pub(crate) async fn await_peak(
-    mut receiver: tokio::sync::mpsc::Receiver<chia::protocol::Message>,
+    mut receiver: tokio::sync::mpsc::Receiver<chia_protocol::Message>,
     timeout: Duration,
 ) -> Option<quorum::PeakClaim> {
     await_peak_from(&mut receiver, timeout).await
@@ -2128,7 +2128,7 @@ pub(crate) async fn await_peak(
 /// implementation serves both — a second parser of the same message would be free to disagree
 /// with this one about what a peer claimed.
 pub(crate) async fn await_peak_from(
-    receiver: &mut tokio::sync::mpsc::Receiver<chia::protocol::Message>,
+    receiver: &mut tokio::sync::mpsc::Receiver<chia_protocol::Message>,
     timeout: Duration,
 ) -> Option<quorum::PeakClaim> {
     let deadline = tokio::time::sleep(timeout);
@@ -2151,13 +2151,12 @@ pub(crate) async fn await_peak_from(
 /// `None` covers both "not a peak announcement" and "a peak announcement this node could not
 /// decode". Neither is a claim, and treating an undecodable one as anything else would let a
 /// malformed frame stand in for a height.
-pub(crate) fn peak_from(message: &chia::protocol::Message) -> Option<quorum::PeakClaim> {
-    if message.msg_type != chia::protocol::ProtocolMessageTypes::NewPeakWallet {
+pub(crate) fn peak_from(message: &chia_protocol::Message) -> Option<quorum::PeakClaim> {
+    if message.msg_type != chia_protocol::ProtocolMessageTypes::NewPeakWallet {
         return None;
     }
-    let peak =
-        <chia::protocol::NewPeakWallet as chia::traits::Streamable>::from_bytes(&message.data)
-            .ok()?;
+    let peak = <chia_protocol::NewPeakWallet as chia_traits::Streamable>::from_bytes(&message.data)
+        .ok()?;
     Some(quorum::PeakClaim {
         height: peak.height,
         header_hash: peak.header_hash,
@@ -2243,7 +2242,7 @@ async fn header_hash_from(
     peer: &chia_wallet_sdk::client::Peer,
     height: u32,
 ) -> Result<Option<Bytes32>, SyncError> {
-    use chia::protocol::{RejectHeaderRequest, RequestBlockHeader, RespondBlockHeader};
+    use chia_protocol::{RejectHeaderRequest, RequestBlockHeader, RespondBlockHeader};
 
     let response = peer
         .request_fallible::<RespondBlockHeader, RejectHeaderRequest, _>(RequestBlockHeader::new(
@@ -2267,7 +2266,7 @@ struct ChiaPeerSession {
     trust: PeerTrust,
     /// Taken by [`SyncSession::run`]. Behind a mutex only because the trait's `catch_up` takes
     /// `&self`; exactly one `run` ever consumes it.
-    receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<chia::protocol::Message>>>,
+    receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<chia_protocol::Message>>>,
 }
 
 #[async_trait::async_trait]

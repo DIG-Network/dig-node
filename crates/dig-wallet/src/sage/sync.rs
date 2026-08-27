@@ -16,11 +16,11 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use chia::protocol::{
+use chia_protocol::Bytes32;
+use chia_protocol::{
     Coin, CoinState, CoinStateFilters, CoinStateUpdate, Message, NewPeakWallet,
     ProtocolMessageTypes, RespondPuzzleState,
 };
-use chia_protocol::Bytes32;
 use chia_wallet_sdk::client::Peer;
 
 use super::db::{CatchUpReplay, CoinRow, WalletDb};
@@ -1095,7 +1095,7 @@ pub async fn run_update_loop(
     Ok(())
 }
 
-fn decode<T: chia::traits::Streamable>(message: &Message) -> Result<T, SyncError> {
+fn decode<T: chia_traits::Streamable>(message: &Message) -> Result<T, SyncError> {
     T::from_bytes(&message.data).map_err(|e| SyncError::Peer(format!("decode: {e}")))
 }
 
@@ -1139,7 +1139,7 @@ mod tests {
         Message {
             msg_type: ProtocolMessageTypes::NewPeakWallet,
             id: None,
-            data: chia::traits::Streamable::to_bytes(&peak).unwrap().into(),
+            data: chia_traits::Streamable::to_bytes(&peak).unwrap().into(),
         }
     }
 
@@ -1622,7 +1622,7 @@ mod tests {
             tx.send(Message {
                 msg_type: ProtocolMessageTypes::NewPeakWallet,
                 id: None,
-                data: chia::traits::Streamable::to_bytes(&peak).unwrap().into(),
+                data: chia_traits::Streamable::to_bytes(&peak).unwrap().into(),
             })
             .await
             .unwrap();
@@ -1883,7 +1883,7 @@ mod tests {
         let msg = Message {
             msg_type: ProtocolMessageTypes::CoinStateUpdate,
             id: None,
-            data: chia::traits::Streamable::to_bytes(&update).unwrap().into(),
+            data: chia_traits::Streamable::to_bytes(&update).unwrap().into(),
         };
         tx.send(msg).await.unwrap();
         drop(tx);
@@ -2366,7 +2366,7 @@ mod tests {
         let msg = Message {
             msg_type: ProtocolMessageTypes::CoinStateUpdate,
             id: None,
-            data: chia::traits::Streamable::to_bytes(&update).unwrap().into(),
+            data: chia_traits::Streamable::to_bytes(&update).unwrap().into(),
         };
         tx.send(msg).await.unwrap();
         drop(tx);

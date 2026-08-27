@@ -575,7 +575,8 @@ pub(crate) fn pool_event_to_selector(peer_id: [u8; 32], event: PoolEventKind) ->
 /// Maps `dig_gossip::PoolRemovalReason` → the selector's local [`PoolRemovalReason`]
 /// (`Banned` makes the peer ineligible until re-added, SPEC §9.4).
 ///
-/// `Reaped` has no selector counterpart, so it must fold into one of the three the selector knows.
+/// `Reaped` and `Displaced` have no selector counterpart, so each must fold into one of the three
+/// the selector knows.
 /// It folds to `Disconnected` rather than `Dead` because a reaped peer's transport was *provably
 /// closed* — a departure, which is what `Disconnected` names — whereas `Dead` names a keepalive
 /// finding a peer unresponsive. What makes the choice safe rather than merely tidy: the selector
@@ -583,11 +584,24 @@ pub(crate) fn pool_event_to_selector(peer_id: [u8; 32], event: PoolEventKind) ->
 /// ineligible) and treats `Disconnected`/`Dead` identically, so this fold is observability-only and
 /// cannot change eligibility. Folding it to `Banned` would be the real error — it would make an
 /// honestly-departed peer ineligible and bias the node toward unremembered peers, which is a sybil.
+///
+/// `Displaced` folds to `Disconnected` for a STRONGER version of the same reason. dig-gossip
+/// documents it as the one removal reason that is not a failure: the peer was healthy and was cycled
+/// out to make room for a discovered holder, so a consumer must not read it as evidence against the
+/// peer. `Disconnected` is the only one of the three that carries no such evidence — `Dead` asserts a
+/// keepalive found it unresponsive, and `Banned` asserts misbehaviour. Folding a displaced peer into
+/// either would let the node's own capacity decision degrade the reputation of a peer that did
+/// nothing wrong, and `Banned` would additionally make it ineligible until re-added (SPEC §9.4).
+///
+/// This match is deliberately EXHAUSTIVE rather than wildcarded: a `_` arm would silently fold the
+/// NEXT variant dig-gossip adds into `Disconnected` without anyone deciding that it belongs there.
+/// The compile error this exhaustiveness produced on the dig-gossip 0.25 -> 0.30 uplift is exactly
+/// the review the wildcard would have skipped.
 pub(crate) fn pool_removal_reason(reason: GossipRemovalReason) -> PoolRemovalReason {
     match reason {
-        GossipRemovalReason::Disconnected | GossipRemovalReason::Reaped => {
-            PoolRemovalReason::Disconnected
-        }
+        GossipRemovalReason::Disconnected
+        | GossipRemovalReason::Reaped
+        | GossipRemovalReason::Displaced => PoolRemovalReason::Disconnected,
         GossipRemovalReason::Dead => PoolRemovalReason::Dead,
         GossipRemovalReason::Banned => PoolRemovalReason::Banned,
     }
@@ -663,6 +677,13 @@ pub(crate) enum GossipRemovalReason {
     /// Swept up by dig-gossip's departed-peer reaper: the transport was provably closed, but the
     /// slot is keepalive-less so nothing else observed the departure.
     Reaped,
+    /// Cycled out WHILE HEALTHY to make room for a holder that content discovery found outside the
+    /// persistent set (dig_ecosystem#3128 requirement 8).
+    ///
+    /// The only variant here that is not a failure. Every other one reports a peer that broke,
+    /// misbehaved or left; this one reports a peer that was fine, so it must never be read as
+    /// evidence AGAINST the peer.
+    Displaced,
 }
 
 // -- Selector-driven DIAL ordering (#384) ------------------------------------------------------------
@@ -4636,6 +4657,44 @@ pub(crate) mod tests {
 
     // -- the peer selector (#178): the discovery → select → download → record_outcome loop ----------
 
+    /// A peer cycled out WHILE HEALTHY is never reported to the selector as having failed
+    /// (dig_ecosystem#3128 requirement 8, adopted with dig-gossip 0.30).
+    ///
+    /// dig-gossip documents `Displaced` as the one removal reason that is not a failure — the peer
+    /// was fine and was evicted to make room for a discovered holder — so the node must not turn its
+    /// OWN capacity decision into evidence against that peer.
+    ///
+    /// WHY THIS ASSERTS THE EXACT VARIANT rather than "the peer stays eligible": the selector
+    /// currently distinguishes only `Banned` behaviourally and treats `Dead` and `Disconnected`
+    /// identically, so an eligibility-only assertion would pass just as happily on the wrong
+    /// mapping `Displaced -> Dead`. That mapping is wrong for a reason eligibility cannot see —
+    /// `Dead` ASSERTS a keepalive found the peer unresponsive, which is a claim about the peer, not
+    /// about our capacity — and it would become behaviourally wrong the moment the selector learns
+    /// to score `Dead` separately. Pinning the variant catches both nearest-wrong mappings; pinning
+    /// eligibility catches only the loudest one.
+    #[test]
+    fn a_displaced_peer_is_never_reported_as_having_failed() {
+        let mapped = pool_removal_reason(GossipRemovalReason::Displaced);
+
+        assert_eq!(
+            mapped,
+            PoolRemovalReason::Disconnected,
+            "a healthy peer we cycled out must be reported as a departure, not as a failure"
+        );
+        assert_ne!(
+            mapped,
+            PoolRemovalReason::Dead,
+            "`Dead` asserts a keepalive found the peer unresponsive — a claim about the PEER that a \
+             displacement makes no evidence for"
+        );
+        assert_ne!(
+            mapped,
+            PoolRemovalReason::Banned,
+            "`Banned` makes the peer ineligible until re-added (SPEC §9.4); banning a peer for our \
+             own capacity decision biases the node toward unremembered peers, which is a sybil"
+        );
+    }
+
     /// The gossip → selector `PoolEvent` map preserves identity and removal semantics (SPEC §5.4):
     /// the peer id is the same 32 bytes, the three reasons the selector shares map
     /// variant-for-variant, and `Reaped` — which the selector has no variant for — folds to the
@@ -4662,6 +4721,13 @@ pub(crate) mod tests {
             // fold is a decision the suite states, not an accident a later edit can quietly change
             // into `Banned` — which would make an honestly-departed peer ineligible.
             (GossipRemovalReason::Reaped, PoolRemovalReason::Disconnected),
+            // `Displaced` likewise has no selector counterpart. See
+            // `a_displaced_peer_is_never_reported_as_having_failed` for why this row is
+            // `Disconnected` and not merely "something non-punitive".
+            (
+                GossipRemovalReason::Displaced,
+                PoolRemovalReason::Disconnected,
+            ),
         ] {
             assert_eq!(pool_removal_reason(g), s);
             assert_eq!(

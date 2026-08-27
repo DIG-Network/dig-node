@@ -189,14 +189,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # in the SERVICE shell's open-command path ONLY — NEVER in dig-node-core (the server
 # engine), where it would be the real dependency cycle. Depends on the PUBLISHED crates.io
 # version (no git dep, #681); native feature (reqwest transport + blocking convenience).
-dig-urn-resolver = "0.4.0"
+dig-urn-resolver = "0.5.3"
 
 # `dig_constants::DIG_NODE_PORT` (§5.3) — the single-sourced canonical default localhost port
 # for client→node connections; `config.rs`'s DEFAULT_PORT reads it rather than re-declaring the
-# literal. Held in lockstep with dig-node-core's pin (#2072) — 0.9, the tip of dig-node's chia 0.26
-# line (see that manifest for why 0.10 is a chia-migration question) — so the two node crates can
-# never disagree about a canonical value.
-dig-constants = "0.9"
+# literal. Held in lockstep with dig-node-core's pin (#2072) — 0.11.2, on dig-node's chia 0.36.1
+# line (dig_ecosystem#3161) — so the two node crates can never disagree about a canonical value.
+dig-constants = "0.11.2"
 
 # Windows Service Control Protocol. service-manager only REGISTERS the service in the
 # SCM; the binary the SCM launches must itself speak the service protocol
@@ -242,7 +241,11 @@ dig-wallet = { path = "../dig-wallet" }
 # The watch-list control tests (SPEC §18.6f, dig_ecosystem#2823) build real BLS G1 keys and spell
 # them the way a client would. Pinned to the same lines `dig-wallet` builds on so exactly one of
 # each resolves.
-chia = "0.26"
+#
+# Named directly rather than through the `chia` umbrella: the umbrella publishes no 0.36.x
+# (its series skips 0.32 -> 0.42) and pins the primitives to its own version, so it cannot
+# sit on the chia-wallet-sdk ceiling without re-splitting the family (dig_ecosystem#3161).
+chia-bls = "0.36.1"
 hex = "0.4"
 # The crate's own integration tests need its test-construction seams (the `testkit` feature above).
 # Depending on self with the feature on is what keeps those seams available to `tests/` while staying
@@ -267,10 +270,10 @@ futures-util = "0.3"
 # produce the exact on-disk shape a pre-existing install carries is the crate that wrote it.
 # NC-7 exception: the digstore set is git-pinned as one atomic rev — rationale in
 # crates/dig-node-core/Cargo.toml (dig_ecosystem#901, blocked on the digstore publishes + #2761).
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
 tempfile = "3"
 # The `/s/` origin-derivation test (#1576) drives the REAL router with a FORGED non-loopback
 # `ConnectInfo` — the one remote address a loopback-bound test server can never produce — via

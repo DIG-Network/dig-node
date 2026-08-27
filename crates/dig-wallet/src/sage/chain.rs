@@ -625,12 +625,12 @@ mod tests {
         // The id is DERIVED from the three fields below rather than picked, because the cached
         // read path re-checks that a row's fields hash to the key it is stored under
         // (dig_ecosystem#3035). A picked id would make this a row that could not exist on chain.
-        let hex32 = |h: &str| -> chia::protocol::Bytes32 {
+        let hex32 = |h: &str| -> chia_protocol::Bytes32 {
             let bytes: [u8; 32] = hex::decode(h).unwrap().try_into().unwrap();
-            chia::protocol::Bytes32::from(bytes)
+            chia_protocol::Bytes32::from(bytes)
         };
         let coin_id = hex::encode(
-            chia::protocol::Coin {
+            chia_protocol::Coin {
                 parent_coin_info: hex32(&"cd".repeat(32)),
                 puzzle_hash: hex32(&"ef".repeat(32)),
                 amount: 1234,
@@ -703,7 +703,7 @@ mod corroborated_peak_tests {
     use crate::sage::peer_reads::{CoinPeer, PeerCorroboratedReads, PeerSample};
     use crate::sage::quorum::{PeakClaim, SETTLED_LAG};
     use async_trait::async_trait;
-    use chia::protocol::Bytes32;
+    use chia_protocol::Bytes32;
 
     /// A peer that announces one tip and answers no coin question.
     ///

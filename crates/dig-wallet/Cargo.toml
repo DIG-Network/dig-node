@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.37.3"
+version = "0.38.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -20,27 +20,41 @@ path = "src/main.rs"
 # (storeId:rootHash) identity rendered by /api/stores.
 # NC-7 exception: the digstore set is git-pinned as one atomic rev — rationale in
 # crates/dig-node-core/Cargo.toml (dig_ecosystem#901, blocked on the digstore publishes + #2761).
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
 # The node engine (crate `dig_node_core`) — same workspace (the DIG Browser's in-process
 # node + wallet are one host cluster). dig-wallet reads the node's cache surface for the
 # wallet UI's "My Node" cache view (cache_cap_bytes / cache_used_bytes / clear_cache / list).
 dig-node-core = { path = "../dig-node-core" }
-chia-protocol = "0.26"
+chia-protocol = "0.36.1"
 # BIP-39 mnemonic → seed for deriving each custodied wallet's stable id (the Chia BLS
 # master public-key FINGERPRINT, #427). Already resolved transitively via digstore-chain;
 # declared directly here so `custody` can compute the fingerprint without re-exposing it
 # through digstore-chain's `WalletKeys` (a separate, release-first repo).
 bip39 = "2"
-# `chia::puzzles::nft::NftMetadata` — the on-chain NFT metadata struct we serialize
-# into a MintSpec's metadata Program for chia_mintNft / chia_bulkMintNfts.
-chia = "0.26"
+# The primitive crates this crate used to reach through the `chia` UMBRELLA facade.
+#
+# The umbrella is GONE, and not by preference: its version series SKIPS the 0.36 line
+# entirely (0.32.0 -> 0.42.0, with no 0.36.x published), and every `chia` release pins the
+# primitives to its OWN version number. So no `chia` version can hold `chia-protocol`
+# 0.36.1, and depending on the umbrella at all would re-split the family this crate just
+# unified on the `chia-wallet-sdk` ceiling (dig_ecosystem#3161). Naming the primitives
+# directly is the only shape that can sit on the ceiling.
+#
+# `chia_puzzle_types::nft::NftMetadata` — the on-chain NFT metadata struct we serialize
+# into a MintSpec's metadata Program for chia_mintNft / chia_bulkMintNfts; `Memos` and the
+# `offer::{NotarizedPayment, Payment}` pair for the offer builder.
+chia-puzzle-types = "0.36.1"
+# BLS G1/G2 keys + signatures for the wallet signer and the offer aggregate signature.
+chia-bls = "0.36.1"
+# `tree_hash_from_bytes` for the fallback puzzle-hash path.
+clvm-utils = "0.36.1"
 # Needed to NAME the SDK spendable `Cat` type when assembling a make-offer's
 # MakerFunds, and `SpendContext` to serialize NFT metadata into a Program.
-chia-wallet-sdk = { version = "0.30", features = ["offer-compression"] }
+chia-wallet-sdk = { version = "0.36.0", features = ["offer-compression"] }
 # CLVM runtime types (NodePtr/Allocator) used by the #216 singleton reconstruction + spend
-# builders. Pinned to the same 0.14 the SDK resolves so the NodePtr types unify.
-clvmr = "0.14"
+# builders. Pinned to the same 0.16 the SDK resolves so the NodePtr types unify.
+clvmr = "0.16.2"
 # Offer building (design A.5): the chia-wallet-sdk action system's `Spends::finish_with_keys`
 # takes an ordered `IndexMap<Bytes32, PublicKey>` (owner ph -> signing key), as digstore-chain's
 # offer builder does. Same crate the SDK resolves.
@@ -56,11 +70,15 @@ dig-node-control-interface = "0.21"
 # crate once derived the id itself from the offered coin set alone, which collided across offers
 # over the same coins and silently overwrote rows in the `offers` table.
 #
-# dig-offers resolves its own (newer) chia stack, so its `Bytes32` is a DIFFERENT type from this
-# crate's. That is deliberately not a problem: `offer_id` is a pure `&str -> hash` function and we
-# consume only its bytes, so nothing crosses the version boundary. `sage::offers::offer_id_matches_
-# a_locally_computed_bundle_hash` pins the two stacks to the same value.
-dig-offers = "0.2"
+# dig-offers USED to resolve a newer chia stack than this crate, making its `Bytes32` a different
+# type; on the 0.36.1 ceiling the two now unify. The isolation argument that made the split
+# harmless still holds and is worth keeping: `offer_id` is a pure `&str -> hash` function and we
+# consume only its bytes, so nothing depends on the two stacks agreeing.
+#
+# `sage::offers::offer_id_matches_a_locally_computed_bundle_hash` therefore keeps its value: it
+# pins the two implementations to the same HASH rather than trusting they agree, which is a claim
+# about the algorithm and not about the version they happen to share today.
+dig-offers = "0.3"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -86,12 +104,12 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 # ever constructed; removing the dead module removed the pin, and the lock now resolves chia-query
 # once. Verify from `Cargo.lock`, not from this comment.
 #
-# The next move is 0.15, which is on chia 0.36.1 + chia-wallet-sdk 0.34. It is BLOCKED, and not by
-# anything in this file: `digstore-chain` (a git dep of dig-node-core) is still built against
-# chia 0.26, and chia types cross the dig-wallet -> dig-node-core boundary. Bumping this alone
-# would need a conversion shim between two chia lines, which is exactly the byte-drift this
-# ecosystem forbids. Track it on dig_ecosystem#3152 / #3149.
-chia-query = "0.6.2"
+# THAT BLOCK IS CLEARED (dig_ecosystem#3161). This used to read "the next move is 0.15 ... BLOCKED
+# because digstore-chain is still built against chia 0.26". digstore's own ceiling fix landed, this
+# workspace repointed the digstore git rev onto it, and chia types now cross the
+# dig-wallet -> dig-node-core boundary on ONE line (0.36.1). So 0.19 needs no shim and none was
+# added. Verify from `Cargo.lock`, never from this comment.
+chia-query = "0.19.0"
 # Diagnostics MUST go through `tracing`, never stderr. dig-node installs the `dig-logging`
 # subscriber process-globally (dig-node-service::logging), and a Windows service has no stderr
 # to discard to — an `eprintln!` here reaches nobody, which is why a chain-source failure stayed
@@ -105,7 +123,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 async-trait = "0.1"
 # -- #216 send/spend + singleton reconstruction (§18.9 → §18.8) -------------------------
 # Pre-broadcast spend-bundle validation (C.6 fail-closed): validate_spend_bundle runs the
-# bundle through chia-consensus before any peer broadcast. Same chia-* 0.26 / SDK 0.30 line
+# bundle through chia-consensus before any peer broadcast. Same chia-* 0.36.1 / SDK 0.36.0 line
 # as dig-wallet, so Coin/CoinSpend/SpendBundle unify across the crate boundary.
 #
 # crates.io, NOT the old git rev (#2072). That rev resolved to dig-clvm 0.1.1, which re-exported
@@ -114,7 +132,7 @@ async-trait = "0.1"
 # values were finalized in 0.4.0, so the git rev pinned a spend-validation context describing a
 # different chain identity than the rest of the node. Signature checking is disabled at that call
 # site, so nothing was mis-signed, but the divergence must not be allowed to persist.
-dig-clvm = "0.2"
+dig-clvm = "0.4"
 # Spend building (XCH/CAT), coin selection, signing, and NFT/DID/CAT singleton
 # reconstruction all reuse the canonical `chia-wallet-sdk` driver constructors
 # (SpendContext + StandardLayer + Cat::spend_all + the Nft/Did parsers) already depended on
@@ -152,7 +170,7 @@ totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
 # an attacker cannot predict, observe or steer (dig_ecosystem#2549). Deliberately not `rand` --
 # `thread_rng` would work but adds a seeded layer whose provenance a reader has to go and check.
 getrandom = "0.2"
-chia-traits = "0.26"
+chia-traits = "0.36.1"
 
 # -- #277 unattended wallet bootstrap (`autoseed`) --------------------------------------
 # The `created_at` stamp on the wallet's origin sidecar, as RFC 3339. Already in the
@@ -177,8 +195,8 @@ windows-sys = { version = "0.61", features = [
 tempfile = "3"
 # Recompute the canonical offer id with THIS crate's chia stack, so the parity test can pin
 # dig-offers' (newer) stack and ours to the same value rather than trusting they agree (#283).
-# Pinned to the 0.26 line the local chia-protocol resolves.
-chia-sha2 = "0.26"
+# Pinned to the 0.36.1 line the local chia-protocol resolves.
+chia-sha2 = "0.36.1"
 # `start_paused` — a virtual clock, so the peer-request deadline (#2851) is asserted to EXIST
 # without a test that actually waits sixty seconds for it.
 tokio = { version = "1", features = ["test-util"] }
@@ -187,7 +205,7 @@ tokio = { version = "1", features = ["test-util"] }
 # The SAME 0.3 line dig-logging builds on, so one tracing-subscriber resolves.
 tracing-subscriber = "0.3"
 # K1Pair — real secp256k1 test key pairs for the vault config / K1 pubkey parse tests.
-chia-sdk-test = { version = "0.30", features = ["peer-simulator"] }
+chia-sdk-test = { version = "0.36.0", features = ["peer-simulator"] }
 # Drive the axum Router transport-independently (oneshot) and read response bodies in
 # the conformance + transport-parity tests.
 tower = { version = "0.5", features = ["util"] }

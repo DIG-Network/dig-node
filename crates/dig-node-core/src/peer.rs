@@ -2183,6 +2183,9 @@ pub(crate) fn map_gossip_pool_event(ev: &dig_gossip::PoolEvent) -> dig_peer_sele
                 dig_gossip::PoolRemovalReason::Reaped => {
                     crate::download::GossipRemovalReason::Reaped
                 }
+                dig_gossip::PoolRemovalReason::Displaced => {
+                    crate::download::GossipRemovalReason::Displaced
+                }
             };
             crate::download::pool_event_to_selector(
                 bytes,

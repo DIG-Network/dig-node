@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use chia::protocol::Bytes32;
+use chia_protocol::Bytes32;
 
 use super::super::fallback::{FallbackCoin, FallbackCoinSpend};
 use super::super::quorum;
@@ -63,7 +63,7 @@ pub struct ChiaCoinPeer {
     /// keeps this peer's claimed tip CURRENT. Dropping it — which this module used to do — left
     /// the only peak available the one captured at handshake, and a sample is held for
     /// `SAMPLE_LIFETIME`, so by the end of a sample every claim would be minutes stale.
-    inbound: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<chia::protocol::Message>>,
+    inbound: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<chia_protocol::Message>>,
     /// The freshest tip this peer has announced. `None` until it announces one.
     claimed_peak: tokio::sync::Mutex<Option<quorum::PeakClaim>>,
     /// Set the moment a request to this peer fails, so the next redraw drops it. A peer is never
@@ -77,7 +77,7 @@ impl ChiaCoinPeer {
     /// The `false` is `include_spent_coins`-as-subscription: this asks for the coin's state
     /// without subscribing to it, which is what an arbitrary read wants — a subscription would
     /// make every coin a profile walk touches a permanent obligation of the peer.
-    async fn coin_state(&self, coin_id: Bytes32) -> Result<Option<chia::protocol::CoinState>> {
+    async fn coin_state(&self, coin_id: Bytes32) -> Result<Option<chia_protocol::CoinState>> {
         let response = tokio::time::timeout(
             PEER_TIMEOUT,
             self.peer

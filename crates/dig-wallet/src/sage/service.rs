@@ -512,7 +512,7 @@ mod tests {
         let key = {
             let mut seed = [0u8; 64];
             seed[0] = 7;
-            chia::bls::SecretKey::from_seed(&seed).public_key()
+            chia_bls::SecretKey::from_seed(&seed).public_key()
         };
         {
             let svc = build_offline(&dir).await;

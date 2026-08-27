@@ -3711,7 +3711,7 @@ async fn a_client_can_register_and_deregister_the_addresses_the_node_follows() {
         let mut seed = [0u8; 64];
         seed[0] = tag;
         hex::encode(
-            chia::bls::SecretKey::from_seed(&seed)
+            chia_bls::SecretKey::from_seed(&seed)
                 .public_key()
                 .to_bytes(),
         )

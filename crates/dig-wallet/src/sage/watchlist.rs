@@ -37,7 +37,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use chia::bls::PublicKey;
+use chia_bls::PublicKey;
 
 /// A key this node can be asked to follow: a BLS G1 public key.
 ///
@@ -254,7 +254,7 @@ fn restrict_permissions(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia::bls::SecretKey;
+    use chia_bls::SecretKey;
 
     /// A distinct, valid G1 key per `tag`.
     fn key(tag: u8) -> PublicKey {
