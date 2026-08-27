@@ -972,7 +972,6 @@ dependencies = [
  "chia-ssl 0.42.1",
  "chia-traits 0.36.1",
  "futures-util",
- "native-tls",
  "rustls",
  "rustls-pemfile",
  "thiserror 2.0.19",
@@ -1017,20 +1016,6 @@ dependencies = [
 
 [[package]]
 name = "chia-sdk-coinset"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02175bf3670878f6c43fcd4497c9b7b9d8e3cf43d90dff625997db50a3d71778"
-dependencies = [
- "chia-protocol 0.36.1",
- "hex",
- "hex-literal",
- "reqwest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "chia-sdk-coinset"
 version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f506b96f9fda1038315a3aa6a27ee57fc652aa118e21977ac35b24f6fe8d0a3"
@@ -1041,24 +1026,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "chia-sdk-daemon"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b44f9008f55d605ab688e239d8303e6240beca329d27838e0ad6340422bef13a"
-dependencies = [
- "chia-sdk-client 0.34.0",
- "chia-sdk-coinset 0.34.0",
- "futures-util",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tungstenite",
 ]
 
 [[package]]
@@ -1146,40 +1113,6 @@ dependencies = [
 
 [[package]]
 name = "chia-sdk-driver"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb2677cf560410db034c8bb5de1e07dec2021b12fd986981390654e260a2b856"
-dependencies = [
- "bigdecimal",
- "bip39",
- "chia-bls 0.36.1",
- "chia-consensus 0.36.1",
- "chia-protocol 0.36.1",
- "chia-puzzle-types 0.36.1",
- "chia-puzzles",
- "chia-sdk-signer 0.34.0",
- "chia-sdk-types 0.34.0",
- "chia-sdk-utils 0.34.0",
- "chia-secp 0.36.1",
- "chia-sha2 0.36.1",
- "chia-traits 0.36.1",
- "chia_streamable_macro 0.36.1",
- "clvm-traits 0.36.1",
- "clvm-utils 0.36.1",
- "clvmr 0.16.4",
- "flate2",
- "getrandom 0.3.4",
- "hex",
- "hex-literal",
- "indexmap",
- "num-bigint",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
- "thiserror 2.0.19",
-]
-
-[[package]]
-name = "chia-sdk-driver"
 version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33d22cc417877a290eff196fe851cfc1175a5432166f8d9bedeb9f55e010bc76"
@@ -1233,26 +1166,6 @@ dependencies = [
 
 [[package]]
 name = "chia-sdk-signer"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83f8553345d14f9eb89f07df0d3854162d818d21acf27140997ae77256dc7883"
-dependencies = [
- "chia-bls 0.36.1",
- "chia-consensus 0.36.1",
- "chia-protocol 0.36.1",
- "chia-sdk-types 0.34.0",
- "chia-secp 0.36.1",
- "chia-sha2 0.36.1",
- "clvm-traits 0.36.1",
- "clvmr 0.16.4",
- "colored",
- "k256",
- "rue-lir 0.6.0",
- "thiserror 2.0.19",
-]
-
-[[package]]
-name = "chia-sdk-signer"
 version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "512d32dc79e27a7bd1cbd7f9fc899dcd9cbac0fbabe5ad956842097ab440ef33"
@@ -1299,44 +1212,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
-]
-
-[[package]]
-name = "chia-sdk-test"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de32a1cc7124f151401d553413d45b88b607dbfa69cf1721c7daab75b717d1a2"
-dependencies = [
- "anyhow",
- "bincode 2.0.1",
- "bip39",
- "chia-bls 0.36.1",
- "chia-consensus 0.36.1",
- "chia-protocol 0.36.1",
- "chia-puzzle-types 0.36.1",
- "chia-sdk-client 0.34.0",
- "chia-sdk-signer 0.34.0",
- "chia-sdk-types 0.34.0",
- "chia-secp 0.36.1",
- "chia-sha2 0.36.1",
- "chia-traits 0.36.1",
- "clvm-traits 0.36.1",
- "clvm-utils 0.36.1",
- "clvmr 0.16.4",
- "futures-channel",
- "futures-util",
- "hex",
- "indexmap",
- "itertools 0.13.0",
- "prettytable-rs",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
- "serde",
- "signature 2.2.0",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tracing",
 ]
 
 [[package]]
@@ -1698,35 +1573,6 @@ dependencies = [
 
 [[package]]
 name = "chia-wallet-sdk"
-version = "0.34.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d57cc9efa1f6f4cca48b38ec4ee461e2d06ccdc71abc9f422b6b0f4c4940732"
-dependencies = [
- "chia-bls 0.36.1",
- "chia-consensus 0.36.1",
- "chia-protocol 0.36.1",
- "chia-puzzle-types 0.36.1",
- "chia-puzzles",
- "chia-sdk-client 0.34.0",
- "chia-sdk-coinset 0.34.0",
- "chia-sdk-daemon 0.34.0",
- "chia-sdk-driver 0.34.0",
- "chia-sdk-signer 0.34.0",
- "chia-sdk-test 0.34.0",
- "chia-sdk-types 0.34.0",
- "chia-sdk-utils 0.34.0",
- "chia-secp 0.36.1",
- "chia-serde 0.36.1",
- "chia-sha2 0.36.1",
- "chia-ssl 0.42.1",
- "chia-traits 0.36.1",
- "clvm-traits 0.36.1",
- "clvm-utils 0.36.1",
- "clvmr 0.16.4",
-]
-
-[[package]]
-name = "chia-wallet-sdk"
 version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fea288e24663821de8679cc27458f2ebb9e61f54b5cf2f92249657b904b300d9"
@@ -1738,7 +1584,7 @@ dependencies = [
  "chia-puzzles",
  "chia-sdk-client 0.36.0",
  "chia-sdk-coinset 0.36.0",
- "chia-sdk-daemon 0.36.0",
+ "chia-sdk-daemon",
  "chia-sdk-driver 0.36.0",
  "chia-sdk-signer 0.36.0",
  "chia-sdk-test 0.36.0",
@@ -2586,9 +2432,9 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "datalayer-driver"
-version = "4.0.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64a514849bc9c1081f448e050c72d1a8c02712e3e252a864c9bdfe8e00c3f074"
+checksum = "05d40304df187e0513810287e43800e748cea259a43dc102b21e5d516c19142f"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-consensus 0.36.1",
@@ -2596,7 +2442,7 @@ dependencies = [
  "chia-puzzle-types 0.36.1",
  "chia-puzzles",
  "chia-traits 0.36.1",
- "chia-wallet-sdk 0.34.0",
+ "chia-wallet-sdk 0.36.0",
  "clvm-traits 0.36.1",
  "clvm-utils 0.36.1",
  "clvmr 0.16.4",
@@ -2706,13 +2552,13 @@ dependencies = [
 
 [[package]]
 name = "dig-cat"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3882dc416993efd5d3e16041fa62fdbabaa951dcfb10203f8a6cce222f24744b"
+checksum = "4c92aac16ca2391e299a4d4f046c128e9a6ea38dba13aafe60509a3a90595c4a"
 dependencies = [
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
- "chia-wallet-sdk 0.34.0",
+ "chia-wallet-sdk 0.36.0",
  "clvm-traits 0.36.1",
  "clvmr 0.16.4",
  "thiserror 2.0.19",
@@ -2828,6 +2674,23 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "dig-did"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f231158bf14fe370d7d3975ca8ee3de950ae964858f9772389bc25f4a15c108b"
+dependencies = [
+ "chia-protocol 0.36.1",
+ "chia-puzzle-types 0.36.1",
+ "chia-puzzles",
+ "chia-sdk-utils 0.36.0",
+ "chia-wallet-sdk 0.36.0",
+ "clvm-traits 0.36.1",
+ "clvm-utils 0.36.1",
+ "dig-chainsource-interface 0.3.2",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -3094,6 +2957,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-nft"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ac1147a4af63c6b076ba721c533c1b72b8691fe3e3bf49c30fc7bb2004856bd"
+dependencies = [
+ "chia-protocol 0.36.1",
+ "chia-puzzle-types 0.36.1",
+ "chia-wallet-sdk 0.36.0",
+ "clvm-traits 0.36.1",
+ "clvmr 0.16.4",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "dig-node-control-interface"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3138,7 +3015,7 @@ dependencies = [
  "dig-tls",
  "digstore-chain",
  "digstore-compiler",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "digstore-crypto",
  "digstore-host",
  "digstore-remote",
@@ -3187,7 +3064,7 @@ dependencies = [
  "dig-urn-resolver",
  "dig-wallet",
  "digstore-chain",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "digstore-crypto",
  "digstore-stage",
  "futures-util",
@@ -3214,22 +3091,6 @@ dependencies = [
 
 [[package]]
 name = "dig-offers"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1d00092dd46a0da238b08a07804bff9d33c56728abc97f25c880ca867221d15"
-dependencies = [
- "chia-protocol 0.36.1",
- "chia-puzzle-types 0.36.1",
- "chia-sha2 0.36.1",
- "chia-traits 0.36.1",
- "chia-wallet-sdk 0.34.0",
- "clvmr 0.16.4",
- "indexmap",
- "thiserror 2.0.19",
-]
-
-[[package]]
-name = "dig-offers"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cd492131e55517e035972caf64c72079045f75b175c5909041f335f911213c0"
@@ -3246,14 +3107,14 @@ dependencies = [
 
 [[package]]
 name = "dig-options"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b7f54511292e7c3ab237def051682aab72a5c92998cd4c32e682e905236fd5"
+checksum = "2b4962ca3ee718e01e0c61c3554416316e423f3751f6ae6e371ab83da4fc10ef"
 dependencies = [
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
  "chia-puzzles",
- "chia-wallet-sdk 0.34.0",
+ "chia-wallet-sdk 0.36.0",
  "clvmr 0.16.4",
  "thiserror 2.0.19",
 ]
@@ -3342,7 +3203,7 @@ dependencies = [
  "base64",
  "dig-node-core",
  "dig-wallet",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "hex",
  "serde_json",
  "tokio",
@@ -3410,17 +3271,17 @@ dependencies = [
 
 [[package]]
 name = "dig-tips"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4cb6db4d44cbea00de7620861fb76cc4610d36dfaf05cab5df2eaae83a426d0"
+checksum = "1bcdc5e37682fce4ab8f7961f2cb997e845a0c1438c728059dc530a09178450d"
 dependencies = [
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
- "chia-wallet-sdk 0.34.0",
+ "chia-wallet-sdk 0.36.0",
  "clvm-traits 0.36.1",
  "clvmr 0.16.4",
  "dig-cat",
- "dig-constants 0.10.1",
+ "dig-constants 0.11.2",
  "thiserror 2.0.19",
 ]
 
@@ -3498,9 +3359,9 @@ dependencies = [
  "dig-keystore",
  "dig-node-control-interface",
  "dig-node-core",
- "dig-offers 0.3.0",
+ "dig-offers",
  "digstore-chain",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "futures-core",
  "getrandom 0.2.17",
  "hex",
@@ -3526,22 +3387,24 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet-backend"
-version = "0.29.1"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5433cb56de4dd8a6f4c8a6a14cc9066fccff83b330d456b8bfffea7c44ea4be8"
+checksum = "28f560620fc4a805b8204226cf4f01c1bbefe90e7c05e6f46447b500627a1f97"
 dependencies = [
  "async-trait",
  "chia-bls 0.36.1",
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
- "chia-wallet-sdk 0.34.0",
+ "chia-wallet-sdk 0.36.0",
  "clvm-traits 0.36.1",
  "clvm-utils 0.36.1",
  "clvmr 0.16.4",
  "dig-cat",
  "dig-constants 0.11.2",
+ "dig-did",
  "dig-events-protocol",
- "dig-offers 0.2.0",
+ "dig-nft",
+ "dig-offers",
  "dig-options",
  "dig-tips",
  "enumset",
@@ -3590,8 +3453,8 @@ dependencies = [
 
 [[package]]
 name = "digstore-chain"
-version = "0.28.1"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+version = "0.29.0"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3601,15 +3464,15 @@ dependencies = [
  "chia-consensus 0.36.1",
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
- "chia-sdk-coinset 0.34.0",
+ "chia-sdk-coinset 0.36.0",
  "chia-secp 0.36.1",
  "chia-sha2 0.36.1",
- "chia-wallet-sdk 0.34.0",
+ "chia-wallet-sdk 0.36.0",
  "clvm-utils 0.36.1",
  "datalayer-driver",
- "dig-constants 0.10.1",
+ "dig-constants 0.11.2",
  "dig-wallet-backend",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "dirs 5.0.1",
  "getrandom 0.2.17",
  "hex",
@@ -3626,20 +3489,20 @@ dependencies = [
 
 [[package]]
 name = "digstore-chunker"
-version = "0.28.1"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+version = "0.29.0"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "digstore-compiler"
 version = "1.0.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
  "chacha20 0.9.1",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "digstore-store",
  "hex",
  "sha2 0.10.9",
@@ -3664,8 +3527,8 @@ dependencies = [
 
 [[package]]
 name = "digstore-core"
-version = "0.28.1"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+version = "0.29.0"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
  "aes-gcm-siv",
  "hex",
@@ -3678,10 +3541,10 @@ dependencies = [
 [[package]]
 name = "digstore-crypto"
 version = "0.1.1"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
  "chia-bls 0.36.1",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "hex",
  "serde",
  "serde_json",
@@ -3692,11 +3555,11 @@ dependencies = [
 [[package]]
 name = "digstore-host"
 version = "0.3.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
  "anyhow",
  "clap",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "digstore-crypto",
  "digstore-prover",
  "futures",
@@ -3714,9 +3577,9 @@ dependencies = [
 [[package]]
 name = "digstore-prover"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "digstore-crypto",
  "reqwest",
  "serde",
@@ -3726,14 +3589,14 @@ dependencies = [
 
 [[package]]
 name = "digstore-remote"
-version = "0.28.1"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+version = "0.29.0"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
  "async-trait",
  "axum",
  "base64",
  "bytes",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "digstore-crypto",
  "digstore-host",
  "digstore-store",
@@ -3756,11 +3619,11 @@ dependencies = [
 [[package]]
 name = "digstore-stage"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
  "digstore-chunker",
  "digstore-compiler",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "digstore-crypto",
  "digstore-store",
  "hex",
@@ -3772,10 +3635,10 @@ dependencies = [
 [[package]]
 name = "digstore-store"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=5872240f369a03e0828b6a26389480ba7726114f#5872240f369a03e0828b6a26389480ba7726114f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a3108cb4bb6c8791e96a26588ec99afb029"
 dependencies = [
  "digstore-chunker",
- "digstore-core 0.28.1",
+ "digstore-core 0.29.0",
  "digstore-crypto",
  "hex",
  "serde",
@@ -4628,7 +4491,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -5803,7 +5666,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -5841,7 +5704,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
