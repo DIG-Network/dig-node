@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.160.0] - 2026-08-27
+
+### Features
+- **key-mgmt:** Take the machine-key hardware seam live on dig-keystore 0.13 (#372)- **spend-audit:** Node-side audit record for automated spends (#378)
+
+### Bug Fixes
+- **node:** Dead transport ctor, temp-dir leak, version-gate reporting, executed sweep examples (#368)- **wallet:** Report chia_peer_count only when something has confirmed the held peers (#371)- **nc12:** Corroborate the anchored root, and widen the sole-owner sweep to dig-node-core (#369)- **deps:** Repoint digstore off the datalayer memo panic (#375)
+
+### Chores
+- **deps:** Bring dig-node onto the chia 0.36 ceiling (#373)
+
 ## [0.154.0] - 2026-08-26
 
 ### Features
