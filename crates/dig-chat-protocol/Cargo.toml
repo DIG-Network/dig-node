@@ -21,7 +21,15 @@ categories = ["network-programming", "encoding"]
 # The base message protocol this crate rides: the envelope, the type registry (`MessageKind` /
 # `MessageRegistry` / `MessageBand`), the reserved dig-chat band, and the error taxonomy. All seal /
 # sign / replay / streaming crypto lives HERE, never in this crate. Pinned to the SAME dig-message the
-# dig-node engine seals with (0.7), so the type ids + envelope agree byte-for-byte across the workspace.
+# dig-node engine seals with (0.7), so the type ids + envelope agree byte-for-byte ON THE SEALED PATH.
+#
+# NOT "across the workspace", which this comment used to claim and which is no longer true: the
+# resolved lock carries TWO dig-message lines, 0.7.0 here and in dig-node-core, and 0.6.1 pulled in
+# by `dig-peer 0.12.0`. That is inert today — dig-peer exposes `seal_request`/`open_response` as a
+# BYTE api with no `pub use dig_message`, and dig-node-core references neither `SealingIdentity` nor
+# `RPC_MESSAGE_TYPE` — so no dig-message type crosses between the two lines. It collapses when
+# dig-peer releases against 0.7. Stated rather than left overstated, because a manifest comment that
+# asserts more than the lock holds is how a real split later reads as already-handled.
 dig-message = "0.7"
 # The byte-deterministic Chia Streamable wire types + the `Streamable` derive + the to_bytes/from_bytes
 # trait — the SAME source + versions dig-message uses, so the payload bytes agree byte-for-byte.
