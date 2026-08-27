@@ -97,6 +97,10 @@ pub mod service;
 /// tokio's blocking pool, plus a bounded graceful-shutdown deadline, so a wedged internal can
 /// never leave a service the OS is unable to stop. See [`service_control`].
 pub mod service_control;
+/// The automated-spend audit record (#376): the node's source of truth for every spend it made
+/// without per-transaction user approval, and the reconciliation seam that checks that local
+/// bookkeeping against the chain. See [`spend_audit`].
+pub mod spend_audit;
 /// The machine-wide, identity-independent daemon STATE dir (#501): where the control token +
 /// paired-token store live so the daemon (which may run as a service under a different OS
 /// account) and the operator CLI resolve the SAME files. See [`state`].
