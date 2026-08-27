@@ -162,7 +162,7 @@ enum Command {
         #[command(subcommand)]
         action: WalletCommand,
     },
-    /// Audit the spends this node made WITHOUT asking you first (#376).
+    /// Audit the spends this node made WITHOUT asking you first.
     ///
     /// The node signs some spends automatically, because a recurring per-store cycle cannot wait on
     /// a person pressing approve. This is where every one of them is visible — successes AND

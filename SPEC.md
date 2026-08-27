@@ -7134,3 +7134,96 @@ seed, private key, signature or unsigned-spend field on any profile method, and 
 
 
 <!-- dig_ecosystem#2870: trusted Chia peer add/list/remove (WIP) -->
+
+---
+
+## 23. Automated-spend audit record — accountability for money moved without approval (#376)
+
+The node is permitted to sign certain spends **automatically**, without per-transaction user approval,
+because a recurring per-store cycle cannot be gated on a person pressing approve. This section is the
+contract for the record that **replaces authorization with accountability**. On a headless install it is
+the only surface on which that automation is visible.
+
+The record MUST be owned by the node, not by a client: a record owned by dig-app would leave a headless
+node spending a person's money with no trail. `dign` and the app's Activity tab are two VIEWS of the one
+record; there MUST NOT be a second record that has to agree with it.
+
+### 23.1. The record models a SPEND, generically
+
+An entry is NOT specific to any producer. It states: `kind` (what for) · `initiated_ms`/`updated_ms`
+(when) · `amount_mojos` (how much) · `asset` (which asset) · `authority` (on whose authority) ·
+`purpose` (what for, in prose) · `status` (confirmed or failed) · and a chain reference.
+
+`authority` has two fields: `principal` (whose funds moved and whose standing consent is relied on) and
+`grant` (the standing permission relied on, named so an operator can revoke it).
+
+`amount_mojos` is denominated in the entry's own `asset`; an amount MUST NOT be read without it.
+
+### 23.2. Status, and what MUST NOT be claimed
+
+`status.state ∈ { pending, submitted, confirmed, failed, unresolved }`.
+
+* `confirmed` carries `height` and the `coin_id` the spend **created**, INSIDE the status. A record MUST
+  NOT be able to hold a confirmation height without a confirmation.
+* A spend is confirmed by observing **the coin it created**, never by observing that a funding coin was
+  spent. A competing spend of the same funding coin satisfies the latter identically while the intended
+  coin never exists. The implementation MUST make the two coins distinct types.
+* `unresolved` means the node signed and does not know the outcome. It MUST NOT be reported as `failed`
+  (money may have moved) nor as `confirmed`.
+* Before confirmation a known coin id is an **intention**. Any surface that shows it MUST mark it as
+  unobserved; `chain_reference` carries `{ coin_id, confirmed }` for exactly this.
+
+### 23.3. Entries are unconditional
+
+* The `pending` entry MUST be durable **before** the producer is able to sign. A spend that fails, is
+  refused, or never leaves the machine is an ENTRY; a record listing only successes makes a blocked node
+  read as an idle one.
+* A producer that ends without recording an outcome MUST leave `unresolved`, never silence and never a
+  `pending` entry that reads as work in flight.
+* **The structural guard:** the signing entry point takes a value obtainable ONLY from the journal call
+  that has already written the pending entry. Recording is therefore the shape of the call rather than a
+  rule each future producer must remember. A spend reaching chain with no entry is invisible money
+  movement.
+
+### 23.4. Storage
+
+An append-only JSONL file, `spend-audit.jsonl`, in the machine-wide state dir (§ the control-token dir,
+#501) so the daemon and the operator's CLI resolve the same file across accounts.
+
+Each line is a full snapshot of one record at one `revision`; the ledger is the fold keeping the highest
+revision per `id`. A terminal outcome MUST NOT rewrite the line that recorded the attempt. A line that
+cannot be parsed MUST be counted and reported, never silently dropped: a corrupt trail that reads as a
+tidy shorter one is the same lie as a missing entry.
+
+There is deliberately **no verb that edits or deletes an entry**.
+
+### 23.5. Reconciliation — local state is never trusted alone
+
+The record MUST be checkable against the chain. `reconcile` takes a chain-side inventory of the coins an
+owner holds and reports:
+
+* `unrecorded_on_chain` — coins the chain shows that no entry accounts for. **The alarm**: money moved
+  with no trail.
+* `missing_on_chain` — confirmed entries whose coin the chain does not show.
+* `unresolved` — entries the node never resolved.
+
+`pending` and `failed` entries claim no coin and MUST NOT produce a discrepancy. `submitted` and
+`unresolved` entries ACCOUNT for their intended coin, so chasing one does not raise a false alarm about
+its own coin.
+
+When no chain inventory is available the operation MUST refuse. Reporting "clean" for "I could not look"
+is prohibited.
+
+### 23.6. CLI surface
+
+`dign spends [list|show|reconcile]`, read-only and LOCAL — it contacts no node, so it still answers when
+the node is stopped or wedged.
+
+* `list` — newest first; `--since-ms`, `--until-ms`, `--store`, `--kind`, `--status`, `--limit`. A limit
+  keeps the newest rows.
+* `show <id>` — one entry in full. An unknown id is a usage error, not an empty success.
+* `reconcile <owner-puzzle-hash>` — § 23.5.
+
+Every verb offers `--json` beside the human output, with stable field names (§6.2). The JSON listing is
+`{ path, count, unreadable_lines, spends[] }`, and each spend carries its raw fields plus `status_token`
+and `chain_reference`.

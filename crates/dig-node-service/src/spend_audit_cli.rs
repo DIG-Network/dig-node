@@ -60,35 +60,48 @@ pub fn run_against(
 ) -> Result<Outcome, (ExitCode, String)> {
     match action {
         SpendsAction::List(query) => {
-            let ledger = log
-                .query(&query)
-                .map_err(|e| (ExitCode::IoError, format!("cannot read the audit record: {e}")))?;
+            let ledger = log.query(&query).map_err(|e| {
+                (
+                    ExitCode::IoError,
+                    format!("cannot read the audit record: {e}"),
+                )
+            })?;
             Ok(list_outcome(log, &ledger))
         }
         SpendsAction::Show { id } => {
-            let ledger = log
-                .ledger()
-                .map_err(|e| (ExitCode::IoError, format!("cannot read the audit record: {e}")))?;
+            let ledger = log.ledger().map_err(|e| {
+                (
+                    ExitCode::IoError,
+                    format!("cannot read the audit record: {e}"),
+                )
+            })?;
             match ledger.records.iter().find(|r| r.id == id) {
                 Some(rec) => Ok(show_outcome(rec)),
                 None => Err((
                     ExitCode::Usage,
-                    format!("no automated spend with id {id} in {}", log.path().display()),
+                    format!(
+                        "no automated spend with id {id} in {}",
+                        log.path().display()
+                    ),
                 )),
             }
         }
         SpendsAction::Reconcile { owner_puzzle_hash } => {
-            let ledger = log
-                .ledger()
-                .map_err(|e| (ExitCode::IoError, format!("cannot read the audit record: {e}")))?;
+            let ledger = log.ledger().map_err(|e| {
+                (
+                    ExitCode::IoError,
+                    format!("cannot read the audit record: {e}"),
+                )
+            })?;
             let Some(inventory) = inventory else {
                 // Stated as a refusal, not as a clean result. "Nothing to report" and "I could not
                 // look" are different answers, and printing the first for the second is the class of
                 // lie this whole record exists to prevent.
                 return Err((
                     ExitCode::NotServing,
-                    "cannot reconcile: this node has no chain inventory wired yet (dig-node#377). \
-                     The local record is unchanged and readable with `dign spends list`."
+                    "cannot reconcile: this node cannot read the chain's coin inventory yet, so \
+                     there is nothing to compare the local record against. The record itself is \
+                     unchanged and readable with `dign spends list`."
                         .to_string(),
                 ));
             };
@@ -276,11 +289,8 @@ mod tests {
     fn tmp_log() -> SpendLog {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-spends-cli-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dig-node-spends-cli-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).expect("temp dir");
         SpendLog::at(dir.join("spend-audit.jsonl"))
     }
@@ -329,8 +339,7 @@ mod tests {
     #[test]
     fn the_default_listing_shows_failures_beside_successes() {
         let log = seeded_log();
-        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None)
-            .expect("list");
+        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         assert_eq!(out.result["count"], 2);
         let tokens: Vec<&str> = out.result["spends"]
             .as_array()
@@ -400,8 +409,7 @@ mod tests {
         journal.confirmed(&done, TargetCoinId("coin-real".to_string()), 12);
         drop(done);
 
-        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None)
-            .expect("list");
+        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         assert!(
             out.summary.contains("~coin-expected (expected)"),
             "an unobserved coin must be marked as expected: {}",
@@ -433,8 +441,7 @@ mod tests {
             .expect("open");
         f.write_all(b"garbage\n").expect("write");
 
-        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None)
-            .expect("list");
+        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         assert_eq!(out.result["unreadable_lines"], 1);
         assert!(out.summary.contains("INCOMPLETE"), "{}", out.summary);
     }
@@ -442,10 +449,14 @@ mod tests {
     /// An empty record says so plainly rather than printing nothing at all.
     #[test]
     fn an_empty_record_says_no_money_moved_unattended() {
-        let out = run_against(&tmp_log(), SpendsAction::List(SpendQuery::default()), None)
-            .expect("list");
+        let out =
+            run_against(&tmp_log(), SpendsAction::List(SpendQuery::default()), None).expect("list");
         assert_eq!(out.result["count"], 0);
-        assert!(out.summary.contains("no money unattended"), "{}", out.summary);
+        assert!(
+            out.summary.contains("no money unattended"),
+            "{}",
+            out.summary
+        );
     }
 
     /// `show` renders one entry, and an unknown id is a usage error rather than an empty success.
@@ -492,7 +503,7 @@ mod tests {
         )
         .expect_err("no inventory");
         assert_eq!(err.0, ExitCode::NotServing);
-        assert!(err.1.contains("no chain inventory"), "{}", err.1);
+        assert!(err.1.contains("cannot read the chain"), "{}", err.1);
     }
 
     /// With a chain source, a coin the chain shows and the record does not is reported as the alarm.
@@ -528,20 +539,29 @@ mod tests {
         )
         .expect("reconcile");
         assert_eq!(out.result["clean"], true);
-        assert!(out.summary.contains("agrees with the chain"), "{}", out.summary);
+        assert!(
+            out.summary.contains("agrees with the chain"),
+            "{}",
+            out.summary
+        );
     }
 
     /// The `--json` envelope keys are a contract the app and scripts read. Pinned.
     #[test]
     fn the_json_listing_keys_are_stable() {
         let log = seeded_log();
-        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None)
-            .expect("list");
+        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         for key in ["path", "count", "unreadable_lines", "spends"] {
             assert!(out.result.get(key).is_some(), "missing {key}");
         }
         let first = &out.result["spends"][0];
-        for key in ["id", "status", "status_token", "chain_reference", "authority"] {
+        for key in [
+            "id",
+            "status",
+            "status_token",
+            "chain_reference",
+            "authority",
+        ] {
             assert!(first.get(key).is_some(), "missing spend.{key}");
         }
     }
@@ -552,10 +572,13 @@ mod tests {
     #[test]
     fn the_human_output_states_on_whose_authority_the_node_spent() {
         let log = seeded_log();
-        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None)
-            .expect("list");
+        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         assert!(out.summary.contains("by node"), "{}", out.summary);
-        assert!(out.summary.contains("settings.autoMirror"), "{}", out.summary);
+        assert!(
+            out.summary.contains("settings.autoMirror"),
+            "{}",
+            out.summary
+        );
     }
 
     /// A status token that matches nothing yields an empty list, not an error — and does not
@@ -583,10 +606,8 @@ mod tests {
         let journal = SpendJournal::with_clock(log.clone(), clock);
         // Distinct initiated_ms so "newest" is well defined rather than a tiebreak.
         for (i, store) in ["old", "new"].iter().enumerate() {
-            let j = SpendJournal::with_clock(
-                log.clone(),
-                if i == 0 { || NOW } else { || NOW + 1_000 },
-            );
+            let j =
+                SpendJournal::with_clock(log.clone(), if i == 0 { || NOW } else { || NOW + 1_000 });
             let s = j.begin(intent(kinds::MIRROR_COIN, Some(store)));
             j.failed(&s, FailureStage::Signing, "x");
             drop(s);

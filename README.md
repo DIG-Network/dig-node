@@ -152,6 +152,24 @@ dig-node             # bare invocation == run
 dign run             # identical to `dig-node run`
 ```
 
+## Audit what the node spent without asking
+
+The node signs a few spends automatically, because a recurring per-store cycle cannot wait on someone
+pressing approve. Every one of them — the ones that worked and the ones that did not — is recorded, and
+`dign spends` is where you read it:
+
+```bash
+dign spends list                          # newest first: what, how much, on whose authority, outcome
+dign spends list --status failed          # also: --store, --kind, --since-ms, --until-ms, --limit
+dign spends show <id>                     # one spend in full
+dign spends reconcile <owner-puzzle-hash> # check the local record against the chain
+dign spends list --json                   # the same answer, machine-readable
+```
+
+These verbs read a file on this machine and contact no node, so they still answer when the node is
+stopped. A coin id printed with `#` was seen on chain; one printed with `~` is only what the spend was
+expected to produce.
+
 ## Configuration
 
 All knobs are environment variables (read at startup; `install` records the current values into the

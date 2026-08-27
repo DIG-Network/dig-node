@@ -813,7 +813,11 @@ fn new_spend_id(now_ms: u64) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("sp_{now_ms:013}_{:06}_{}", n % 1_000_000, std::process::id())
+    format!(
+        "sp_{now_ms:013}_{:06}_{}",
+        n % 1_000_000,
+        std::process::id()
+    )
 }
 
 #[cfg(test)]
@@ -917,7 +921,10 @@ mod tests {
 
         // The chain says: funding coin gone (a competitor took it), target coin absent. The producer
         // can therefore observe no target, and the only thing it can honestly write is unresolved.
-        journal.unresolved(&recorded, "the target coin did not appear within the window");
+        journal.unresolved(
+            &recorded,
+            "the target coin did not appear within the window",
+        );
         drop(recorded);
 
         let ledger = journal.log().ledger().expect("ledger");
@@ -946,7 +953,11 @@ mod tests {
                 funding_coin_ids: vec![FundingCoinId("funding-coin".to_string())],
             },
         );
-        journal.confirmed(&recorded, TargetCoinId("target-coin".to_string()), 9_000_001);
+        journal.confirmed(
+            &recorded,
+            TargetCoinId("target-coin".to_string()),
+            9_000_001,
+        );
         drop(recorded);
 
         let ledger = journal.log().ledger().expect("ledger");
@@ -1208,8 +1219,8 @@ mod tests {
             unreadable_lines: 0,
         };
 
-        let report = reconcile(&ledger, &FakeChain(vec!["coin-u".to_string()]), "ph")
-            .expect("reconcile");
+        let report =
+            reconcile(&ledger, &FakeChain(vec!["coin-u".to_string()]), "ph").expect("reconcile");
         assert!(
             report.unrecorded_on_chain.is_empty(),
             "an unresolved entry's own coin is accounted for, not an alarm"
