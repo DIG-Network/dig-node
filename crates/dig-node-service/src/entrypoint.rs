@@ -162,6 +162,18 @@ enum Command {
         #[command(subcommand)]
         action: WalletCommand,
     },
+    /// Audit the spends this node made WITHOUT asking you first (#376).
+    ///
+    /// The node signs some spends automatically, because a recurring per-store cycle cannot wait on
+    /// a person pressing approve. This is where every one of them is visible — successes AND
+    /// failures — with the authority relied on and a coin id you can check in an explorer.
+    ///
+    /// LOCAL: it reads this machine's audit file and contacts no node, so it still answers when the
+    /// node is stopped or wedged.
+    Spends {
+        #[command(subcommand)]
+        action: Option<SpendsCommand>,
+    },
     /// Drive the DIG auto-update beacon (the `control.updater.*` surface).
     Updater {
         #[command(subcommand)]
@@ -403,6 +415,48 @@ enum WalletCommand {
     },
 }
 
+/// `dig-node spends` sub-actions — the read surface over the automated-spend audit record (#376).
+///
+/// Every verb here is READ-ONLY and local. There is deliberately no verb that edits or deletes an
+/// entry: a record of unapproved spending that its own subject can rewrite is not an audit record.
+#[derive(Subcommand)]
+enum SpendsCommand {
+    /// List automated spends, newest first (the default when no sub-action is given).
+    List {
+        /// Only spends initiated at or after this unix-ms instant.
+        #[arg(long)]
+        since_ms: Option<u64>,
+        /// Only spends initiated strictly before this unix-ms instant.
+        #[arg(long)]
+        until_ms: Option<u64>,
+        /// Only spends serving this store id.
+        #[arg(long)]
+        store: Option<String>,
+        /// Only this kind of spend (e.g. `mirror-coin`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only this outcome: `pending`, `submitted`, `confirmed`, `failed` or `unresolved`.
+        #[arg(long)]
+        status: Option<String>,
+        /// Keep at most this many rows, newest first.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Show one automated spend in full, by its audit id.
+    Show {
+        /// The audit id, as printed by `list` (`sp_…`).
+        id: String,
+    },
+    /// Compare the local record against the coins the chain actually shows.
+    ///
+    /// Local bookkeeping is never trusted alone: the check that matters is a coin on chain that no
+    /// entry accounts for, which is money moved with no trail.
+    Reconcile {
+        /// The owner puzzle hash to ask the chain about (lowercase 64-hex).
+        owner_puzzle_hash: String,
+    },
+}
+
 /// `dig-node profile` sub-actions — the two halves of profile-body custody on this node.
 #[derive(Subcommand)]
 enum ProfileCommand {
@@ -581,6 +635,7 @@ impl Command {
             Command::Sync { .. } => "sync",
             Command::Profile { .. } => "profile",
             Command::Wallet { .. } => "wallet",
+            Command::Spends { .. } => "spends",
             Command::Updater { .. } => "updater",
             Command::Subscriptions { .. } => "subscriptions",
             Command::Peers { .. } => "peers",
@@ -708,6 +763,22 @@ pub fn run() -> std::process::ExitCode {
                 ExitCode::Usage
             }
         },
+        // `spends` reaches no node: the audit record is a file on this machine, and a person
+        // asking what it spent is often asking BECAUSE the node stopped.
+        Command::Spends { action: cmd } => match crate::spend_audit_cli::run(spends_action(cmd)) {
+            Ok(outcome) => render(Ok(outcome), action, json),
+            Err((exit, message)) => {
+                if json {
+                    println!(
+                        "{}",
+                        crate::cli::error_envelope(action, exit, &message, None)
+                    );
+                } else {
+                    eprintln!("error: {message}");
+                }
+                exit
+            }
+        },
         Command::Profile { action: cmd } => {
             render(control_cli::run(&config, profile_action(cmd)), action, json)
         }
@@ -731,6 +802,34 @@ pub fn run() -> std::process::ExitCode {
         Command::EnsureHosts => render(crate::hosts::run(), action, json),
     };
     std::process::ExitCode::from(exit.code())
+}
+
+/// Map the `spends` subcommand to its audit action (no sub-action → list everything).
+fn spends_action(cmd: Option<SpendsCommand>) -> crate::spend_audit_cli::SpendsAction {
+    use crate::spend_audit::SpendQuery;
+    use crate::spend_audit_cli::SpendsAction;
+    match cmd {
+        None => SpendsAction::List(SpendQuery::default()),
+        Some(SpendsCommand::List {
+            since_ms,
+            until_ms,
+            store,
+            kind,
+            status,
+            limit,
+        }) => SpendsAction::List(SpendQuery {
+            since_ms,
+            until_ms,
+            store_id: store,
+            kind,
+            status,
+            limit,
+        }),
+        Some(SpendsCommand::Show { id }) => SpendsAction::Show { id },
+        Some(SpendsCommand::Reconcile { owner_puzzle_hash }) => {
+            SpendsAction::Reconcile { owner_puzzle_hash }
+        }
+    }
 }
 
 /// Map the `config` subcommand to its [`ControlAction`] (no sub-action → print the config).
