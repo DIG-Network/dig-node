@@ -9,7 +9,13 @@
 //! headless install it is the ONLY surface on which that automation is visible at all. That is also
 //! why it lives in the node rather than in dig-app: a record owned by the app would leave a headless
 //! node spending a person's money with no trail. One record, two views — `dign` and the app's
-//! Activity tab both READ this — never two records that must agree.
+//! Activity tab — never two records that must agree.
+//!
+//! **This crate is the only reader of the file.** The app's view goes through `dign spends --json`
+//! (SPEC §23), so the file's name, location and encoding stay implementation detail and the CLI's
+//! JSON envelope is the published contract. A second process parsing this file directly would be a
+//! second implementation of one format, which is how two views of "what did the node spend" start
+//! disagreeing — on the one subject where disagreeing is least affordable.
 //!
 //! # It models a SPEND, generically
 //!
@@ -69,6 +75,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// The audit file's name inside the state dir.
+///
+/// **Node-private, and deliberately not a canonical cross-repo constant.** Only this crate resolves
+/// the path; every other view of the record — dig-app's Activity tab included — reads it through
+/// `dign spends --json` (SPEC §23). The published contract is the CLI's JSON envelope and the status
+/// tokens, not this file name, so a second implementation has nothing here to drift from.
 pub const SPEND_AUDIT_FILE: &str = "spend-audit.jsonl";
 
 /// Well-known [`SpendKind`] values. A kind is an open string so a new producer needs no change to
@@ -175,15 +186,40 @@ impl fmt::Display for FundingCoinId {
 /// Where an attempt died. Kept coarse and stable: the point is which STEP failed, because that is
 /// what tells a person whether their money is at risk (a broadcast failure may still land) versus
 /// definitely untouched (a signing failure cannot have moved anything).
+///
+/// That difference is not commentary — it is load-bearing, and [`Self::money_may_have_moved`] is the
+/// ONE place it is decided. Every consumer asks the stage rather than re-listing the variants, so
+/// the "it didn't happen" claim cannot be re-attached to a stage that never earned it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureStage {
     /// The spend could not be built or signed — nothing reached the network, no coin moved.
     Signing,
-    /// The signed bundle was rejected by the mempool.
+    /// The signed bundle was rejected by the mempool — as far as THIS node saw. A bundle it holds
+    /// may still have reached the network by another route, or been accepted after the rejection it
+    /// observed.
     Broadcast,
     /// The bundle went out and the chain then reported it could not succeed.
     Confirmation,
+}
+
+impl FailureStage {
+    /// Could the money have moved anyway, despite the attempt failing at this stage?
+    ///
+    /// `Signing` is the only stage that answers NO, and it answers it structurally: no signed bundle
+    /// ever existed, so there was nothing that could reach a mempool. `Broadcast` and `Confirmation`
+    /// both happen AFTER a valid signed bundle exists, and neither observation is a proof of
+    /// absence — a rejection this node saw does not bind a network it does not fully observe.
+    ///
+    /// Written as an exhaustive `match` rather than a negated `matches!` so that adding a stage is a
+    /// compile error here, forcing whoever adds it to decide which side it falls on. Guessing that
+    /// side wrong is what makes an audit record lie about money.
+    pub fn money_may_have_moved(&self) -> bool {
+        match self {
+            FailureStage::Signing => false,
+            FailureStage::Broadcast | FailureStage::Confirmation => true,
+        }
+    }
 }
 
 impl fmt::Display for FailureStage {
@@ -198,10 +234,14 @@ impl fmt::Display for FailureStage {
 
 /// The lifecycle of one automated spend.
 ///
-/// `Confirmed` is reachable ONLY through [`SpendJournal::confirmed`], and carries the height and the
-/// created coin INSIDE the variant, so a record cannot hold a confirmation height without a
-/// confirmation. That is the shape rule behind honesty rule 2 in the module docs: there is no field
-/// to optimistically fill in.
+/// `Confirmed` carries the height and the created coin INSIDE the variant, so a record cannot hold a
+/// confirmation height without a confirmation. That is the shape rule behind honesty rule 2 in the
+/// module docs: there is no field to optimistically fill in.
+///
+/// [`SpendJournal::confirmed`] is the only producer of the variant in this crate, and the write path
+/// it uses ([`SpendLog::append`]) is private to this module — so no code outside `spend_audit` can
+/// put a `Confirmed` line in the file by any route. Within the module the invariant is held by
+/// reading these few hundred lines, not by a claim in a doc comment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SpendStatus {
@@ -216,9 +256,16 @@ pub enum SpendStatus {
         /// The coin the spend created — the chain reference a person can paste into an explorer.
         coin_id: TargetCoinId,
     },
-    /// The attempt ended without moving the money it intended to.
+    /// The attempt ended in a failure this node observed.
+    ///
+    /// **This is NOT uniformly a claim that the money stayed put.** Only a `Signing` failure carries
+    /// that claim; at [`FailureStage::Broadcast`] and [`FailureStage::Confirmation`] a signed bundle
+    /// already existed and the outcome is genuinely UNKNOWN. Ask
+    /// [`FailureStage::money_may_have_moved`] before treating any `Failed` entry as settled — such an
+    /// entry is neither [terminal](Self::is_terminal) nor ignored by [`reconcile`].
     Failed {
-        /// Which step failed.
+        /// Which step failed — and, through [`FailureStage::money_may_have_moved`], whether this
+        /// entry claims the money is untouched or merely records where the attempt died.
         stage: FailureStage,
         /// One line a person can act on.
         reason: String,
@@ -247,12 +294,16 @@ impl SpendStatus {
 
     /// Is this a terminal outcome — one no further observation is expected to change?
     ///
-    /// `Unresolved` is NOT terminal: it is the state whose whole purpose is to be chased.
+    /// `Unresolved` is NOT terminal: it is the state whose whole purpose is to be chased. Neither is
+    /// a `Failed` entry whose stage [may have moved money](FailureStage::money_may_have_moved) — it
+    /// is an unknown wearing a failure's name, and calling it settled is how a spend that actually
+    /// landed stops being chased.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            SpendStatus::Confirmed { .. } | SpendStatus::Failed { .. }
-        )
+        match self {
+            SpendStatus::Confirmed { .. } => true,
+            SpendStatus::Failed { stage, .. } => !stage.money_may_have_moved(),
+            SpendStatus::Pending | SpendStatus::Submitted | SpendStatus::Unresolved { .. } => false,
+        }
     }
 }
 
@@ -422,7 +473,12 @@ impl SpendLog {
     }
 
     /// Append one revision. Never rewrites an earlier line.
-    pub fn append(&self, record: &SpendRecord) -> std::io::Result<()> {
+    ///
+    /// Deliberately PRIVATE to this module. It takes an arbitrary [`SpendRecord`], so a public
+    /// version would be a second way to produce any status — including `Confirmed` — bypassing
+    /// [`SpendJournal`] entirely and making every honesty rule in the module docs advisory. The
+    /// journal is the only writer; this is how that is enforced rather than merely documented.
+    fn append(&self, record: &SpendRecord) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             crate::state::ensure_dir_restricted(dir)?;
         }
@@ -733,7 +789,10 @@ pub struct ReconcileReport {
     /// Coins the chain shows that NO entry accounts for. **The direction that matters most:** money
     /// this node's automation moved with no audit entry is invisible money movement.
     pub unrecorded_on_chain: Vec<String>,
-    /// Entries the node never resolved, still awaiting an answer.
+    /// Entries whose outcome this node does not know, still awaiting an answer — every
+    /// [`SpendStatus::Unresolved`] entry, AND every [`SpendStatus::Failed`] one whose stage
+    /// [may have moved money](FailureStage::money_may_have_moved). The two are one bucket because
+    /// they are one situation: a signed bundle exists and the chain has not told us how it ended.
     pub unresolved: Vec<String>,
 }
 
@@ -748,9 +807,15 @@ impl ReconcileReport {
 
 /// Compare the local record against the chain for one owner.
 ///
-/// Only entries with a CONFIRMED coin are matched against the chain: a pending or failed entry makes
-/// no claim about a coin existing, so counting it as missing would manufacture a discrepancy out of
-/// an honest record.
+/// Only entries with a CONFIRMED coin are matched against the chain: a pending entry, or one that
+/// failed before anything was signed, makes no claim about a coin existing, so counting it as
+/// missing would manufacture a discrepancy out of an honest record.
+///
+/// The other direction is the one that matters. An entry whose outcome is UNKNOWN — `Unresolved`,
+/// or `Failed` at a stage that [may have moved money](FailureStage::money_may_have_moved) — accounts
+/// for its intended coin, so finding that coin on chain does not fire the
+/// [`ReconcileReport::unrecorded_on_chain`] alarm. That alarm means "money moved with no audit
+/// entry"; an entry exists here, and it says the outcome is unknown, which is the truth.
 pub fn reconcile(
     ledger: &SpendLedger,
     inventory: &dyn ChainInventory,
@@ -789,6 +854,20 @@ pub fn reconcile(
                     accounted.insert(c.0.clone());
                 }
             }
+            // A failure at a stage that may still have moved money is an UNKNOWN, not a settled
+            // "it didn't happen". It therefore behaves exactly like `Unresolved` here: its intended
+            // coin ACCOUNTS for a chain coin, and the entry is reported as awaiting an answer.
+            // Without this, a broadcast-failed spend that actually landed puts its own coin in
+            // `unrecorded_on_chain` — the field that means "money moved with no audit entry" —
+            // while an entry for it sits in the file saying the opposite.
+            SpendStatus::Failed { stage, .. } if stage.money_may_have_moved() => {
+                if let Some(c) = &rec.intended_coin_id {
+                    accounted.insert(c.0.clone());
+                }
+                report.unresolved.push(rec.id.clone());
+            }
+            // Everything left claims no coin: `Pending` never signed, and the only `Failed` stage
+            // still reaching here is one that could not have moved anything.
             SpendStatus::Pending | SpendStatus::Failed { .. } => {}
         }
     }
@@ -995,6 +1074,60 @@ mod tests {
         }
         let ledger = journal.log().ledger().expect("ledger");
         assert_eq!(ledger.records[0].status.token(), "unresolved");
+    }
+
+    /// **A producer that PANICS mid-spend still leaves an honest unknown, not silence.**
+    ///
+    /// The forgetful-producer test above returns normally, which a guard implemented as an explicit
+    /// call at the end of the happy path would also satisfy. Only an unwind distinguishes "the guard
+    /// is `Drop`" from "the guard is the last statement" — and a panic between signing and settling
+    /// is exactly when the record matters most, because that is when the node has handed a bundle to
+    /// the network and then lost track of it.
+    ///
+    /// The assertions also pin what the guard carries FORWARD: exactly one entry, and the
+    /// `intended_coin_id` learned at `submitted` still present. A guard that rebuilt the record from
+    /// the opening `Pending` entry would write an unresolved row with no coin to chase, which is
+    /// silence wearing an entry's clothes.
+    #[test]
+    fn a_producer_that_panics_still_leaves_an_unresolved_entry_with_its_coin() {
+        let journal = SpendJournal::with_clock(tmp_log(), clock);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let recorded = journal.begin(intent());
+            journal.submitted(
+                &recorded,
+                Submission {
+                    intended_coin_id: TargetCoinId("target-coin".to_string()),
+                    funding_coin_ids: vec![FundingCoinId("funding-coin".to_string())],
+                },
+            );
+            panic!("the producer blew up after handing the bundle to the network");
+        }));
+        assert!(panicked.is_err(), "the fixture must actually unwind");
+
+        let ledger = journal.log().ledger().expect("ledger");
+        assert_eq!(
+            ledger.records.len(),
+            1,
+            "one spend, one current row — the guard must not double-write"
+        );
+        let rec = &ledger.records[0];
+        assert_eq!(
+            rec.status.token(),
+            "unresolved",
+            "a panic between signing and settling is an unknown outcome, never silence and never a \
+             pending row that reads as work in flight"
+        );
+        assert_eq!(
+            rec.intended_coin_id,
+            Some(TargetCoinId("target-coin".to_string())),
+            "the coin learned at submitted must survive into the unresolved row, or there is \
+             nothing for reconciliation to chase"
+        );
+        assert_eq!(
+            rec.funding_coin_ids,
+            vec![FundingCoinId("funding-coin".to_string())]
+        );
     }
 
     /// A settled entry is not overwritten by the drop guard.
@@ -1244,6 +1377,106 @@ mod tests {
         };
         let report = reconcile(&ledger, &FakeChain(vec![]), "ph").expect("reconcile");
         assert!(report.is_clean());
+    }
+
+    /// **A BROADCAST failure is an unknown, not a settled "it didn't happen" — and reconciliation
+    /// must account for it.**
+    ///
+    /// The property: a spend that failed at a stage where money may still have moved must (a) not be
+    /// terminal, (b) account for its intended coin so that coin is not reported as untracked money
+    /// movement, and (c) be surfaced as still awaiting an answer.
+    ///
+    /// The nearest wrong implementation is the collapse this test exists to exclude: treat every
+    /// `Failed` alike — terminal, and accounted for by nothing. Under it, `coin-broadcast` (which IS
+    /// on chain) lands in `unrecorded_on_chain`, the field documented as money moved with NO audit
+    /// entry, while an entry for it sits in the file saying the opposite.
+    ///
+    /// The fixture varies one actor and keeps two truthful controls, because the assertions that
+    /// matter here are all about a set being empty or not, and an implementation that simply
+    /// suppressed the alarm would satisfy a one-actor version identically:
+    ///
+    /// * `coin-nobody-recorded` is on chain with no entry at all and MUST still raise the alarm — so
+    ///   a fix that empties `unrecorded_on_chain` wholesale fails.
+    /// * a SIGNING failure MUST stay terminal and silent — so a fix that reclassifies every failure
+    ///   as an unknown fails too.
+    #[test]
+    fn a_broadcast_failure_is_unresolved_and_accounts_for_its_intended_coin() {
+        let broadcast_failed = {
+            let mut r = record_at("b", 100, kinds::MIRROR_COIN, None);
+            r.status = SpendStatus::Failed {
+                stage: FailureStage::Broadcast,
+                reason: "mempool rejected".to_string(),
+            };
+            r.intended_coin_id = Some(TargetCoinId("coin-broadcast".to_string()));
+            r
+        };
+        // Control: nothing was ever signed, so this one genuinely did not happen.
+        let signing_failed = {
+            let mut r = record_at("s", 100, kinds::MIRROR_COIN, None);
+            r.status = SpendStatus::Failed {
+                stage: FailureStage::Signing,
+                reason: "insufficient funds".to_string(),
+            };
+            r.intended_coin_id = Some(TargetCoinId("coin-never-signed".to_string()));
+            r
+        };
+
+        assert!(
+            !broadcast_failed.status.is_terminal(),
+            "a broadcast failure may have landed, so it is an unknown to be chased, not a settled \
+             outcome"
+        );
+        assert!(
+            signing_failed.status.is_terminal(),
+            "a signing failure genuinely did not happen — reclassifying it would make every \
+             failure an unknown and the distinction useless"
+        );
+
+        let ledger = SpendLedger {
+            records: vec![broadcast_failed, signing_failed],
+            unreadable_lines: 0,
+        };
+        // The broadcast-failed spend DID land; a coin nobody recorded is also present.
+        let chain = FakeChain(vec![
+            "coin-broadcast".to_string(),
+            "coin-nobody-recorded".to_string(),
+        ]);
+
+        let report = reconcile(&ledger, &chain, "owner-ph").expect("reconcile");
+
+        assert_eq!(
+            report.unrecorded_on_chain,
+            vec!["coin-nobody-recorded".to_string()],
+            "a broadcast-failed spend that landed has an ENTRY, so its coin is not untracked money \
+             movement; the coin with no entry at all still is"
+        );
+        assert_eq!(
+            report.unresolved,
+            vec!["b".to_string()],
+            "the broadcast failure is still awaiting an answer; the signing failure is not"
+        );
+        assert!(
+            !report.is_clean(),
+            "an outcome the node does not know needs a person's attention"
+        );
+    }
+
+    /// Every stage's answer to "could the money have moved?" is pinned, from BOTH sides. A predicate
+    /// tested only where it says `false` can only confirm itself.
+    #[test]
+    fn only_a_signing_failure_claims_the_money_stayed_put() {
+        assert!(
+            !FailureStage::Signing.money_may_have_moved(),
+            "no signed bundle ever existed"
+        );
+        assert!(
+            FailureStage::Broadcast.money_may_have_moved(),
+            "a rejection this node saw is not a proof of absence on the network"
+        );
+        assert!(
+            FailureStage::Confirmation.money_may_have_moved(),
+            "the bundle went out before the chain reported it could not succeed"
+        );
     }
 
     /// The status tokens are the CLI's `--status` values and the app's filter values. Pinned so a

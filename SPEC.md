@@ -7148,6 +7148,14 @@ The record MUST be owned by the node, not by a client: a record owned by dig-app
 node spending a person's money with no trail. `dign` and the app's Activity tab are two VIEWS of the one
 record; there MUST NOT be a second record that has to agree with it.
 
+**The file is node-private; the CLI is the contract.** Exactly ONE implementation reads the audit file:
+the node's own. Every other view — dig-app's Activity tab included — MUST obtain the record through
+`dign spends --json` (§23.6), never by opening the file itself. The file's name, its location and its
+on-disk encoding are therefore implementation detail the node may change; the `--json` envelope and the
+status tokens are the published contract, and they are what a second view is written against. A reader
+that parses the file directly re-creates the two-implementations-of-one-format drift this section exists
+to prevent, and does so where the subject is money.
+
 ### 23.1. The record models a SPEND, generically
 
 An entry is NOT specific to any producer. It states: `kind` (what for) · `initiated_ms`/`updated_ms`
@@ -7170,6 +7178,11 @@ An entry is NOT specific to any producer. It states: `kind` (what for) · `initi
   coin never exists. The implementation MUST make the two coins distinct types.
 * `unresolved` means the node signed and does not know the outcome. It MUST NOT be reported as `failed`
   (money may have moved) nor as `confirmed`.
+* `failed` is NOT uniformly a claim that the money stayed put, and MUST NOT be treated as one. Only a
+  failure at the SIGNING stage carries that claim, because no signed bundle ever existed. A failure at
+  the `broadcast` or `confirmation` stage happened after a valid bundle existed, so the outcome is
+  unknown: such an entry MUST NOT be treated as terminal, and MUST be reconciled (§23.5) rather than
+  ignored. A rejection this node observed is not a proof of absence on a network it does not fully see.
 * Before confirmation a known coin id is an **intention**. Any surface that shows it MUST mark it as
   unobserved; `chain_reference` carries `{ coin_id, confirmed }` for exactly this.
 
@@ -7188,7 +7201,8 @@ An entry is NOT specific to any producer. It states: `kind` (what for) · `initi
 ### 23.4. Storage
 
 An append-only JSONL file, `spend-audit.jsonl`, in the machine-wide state dir (§ the control-token dir,
-#501) so the daemon and the operator's CLI resolve the same file across accounts.
+#501) so the daemon and the operator's CLI resolve the same file across accounts. Both of those are the
+node's own code; no other component resolves this path (see the CLI-is-the-contract rule above).
 
 Each line is a full snapshot of one record at one `revision`; the ledger is the fold keeping the highest
 revision per `id`. A terminal outcome MUST NOT rewrite the line that recorded the attempt. A line that
@@ -7205,11 +7219,14 @@ owner holds and reports:
 * `unrecorded_on_chain` — coins the chain shows that no entry accounts for. **The alarm**: money moved
   with no trail.
 * `missing_on_chain` — confirmed entries whose coin the chain does not show.
-* `unresolved` — entries the node never resolved.
+* `unresolved` — entries whose outcome the node does not know, still awaiting an answer.
 
-`pending` and `failed` entries claim no coin and MUST NOT produce a discrepancy. `submitted` and
-`unresolved` entries ACCOUNT for their intended coin, so chasing one does not raise a false alarm about
-its own coin.
+`pending` entries, and `failed` entries at the `signing` stage, claim no coin and MUST NOT produce a
+discrepancy. `submitted` entries, `unresolved` entries, and `failed` entries at the `broadcast` or
+`confirmation` stage ACCOUNT for their intended coin and are reported under `unresolved`, so chasing one
+does not raise a false alarm about its own coin. A spend that failed to broadcast but nonetheless landed
+MUST NOT appear in `unrecorded_on_chain`: an entry for it exists, so reporting it as untracked money
+movement would be false in the one direction this record exists to be trusted about.
 
 When no chain inventory is available the operation MUST refuse. Reporting "clean" for "I could not look"
 is prohibited.

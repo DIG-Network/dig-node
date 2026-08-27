@@ -156,6 +156,17 @@ fn human_line(rec: &SpendRecord) -> String {
     // the difference between a node that is broken and a wallet that needs topping up — so it is
     // rendered inline rather than reserved for `show`.
     let why = match &rec.status {
+        // A failure the money can have survived MUST NOT read like a settled "it didn't happen".
+        // "broadcast failed: mempool rejected" is true and, on its own, invites a person to assume
+        // their funds are untouched — which the node does not know.
+        crate::spend_audit::SpendStatus::Failed { stage, reason }
+            if stage.money_may_have_moved() =>
+        {
+            format!(
+                "\n    {stage} failed: {reason}\n    \
+                 outcome UNKNOWN — the spend was signed, so the money may still have moved"
+            )
+        }
         crate::spend_audit::SpendStatus::Failed { stage, reason } => {
             format!("\n    {stage} failed: {reason}")
         }
@@ -243,7 +254,7 @@ fn reconcile_outcome(report: &ReconcileReport) -> Outcome {
             "DISAGREEMENT between the local record and the chain:\n  \
              {} coin(s) on chain with NO audit entry: {}\n  \
              {} confirmed entry/entries whose coin the chain does not show: {}\n  \
-             {} entry/entries the node never resolved: {}",
+             {} entry/entries whose outcome the node does not know: {}",
             report.unrecorded_on_chain.len(),
             join_or_dash(&report.unrecorded_on_chain),
             report.missing_on_chain.len(),
