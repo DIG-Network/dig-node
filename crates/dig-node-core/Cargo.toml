@@ -106,21 +106,30 @@ lru = "0.12"
 #     carries 0.36.1, and the digstore rev below is digstore's own ceiling fix. The primitives are
 #     one line across the boundary, so nothing is split.
 #
-#     What did NOT fully collapse is the SDK family: digstore's rev takes `chia-wallet-sdk 0.34`
-#     while dig-wallet takes 0.36.0. Both pin the PRIMITIVES at 0.36.1, so `Bytes32`/`Coin` unify and
-#     no chia type is split; only the SDK's own driver types differ, and none crosses this boundary.
-#     Collapsing that last pair needs digstore to release against 0.36.0 — upstream, not here.
+#     The SDK family has now collapsed too (2026-08-26, dig-node#374). This used to read that
+#     digstore's rev took `chia-wallet-sdk 0.34` against dig-wallet's 0.36.0, and that closing the
+#     gap needed a digstore release — upstream, not here. That release happened: DIG-Network/digs#59
+#     moved `digstore-chain` onto `chia-wallet-sdk 0.36` (and `datalayer-driver` 5, which is what
+#     required the SDK bump), and the rev below is that commit.
+#
+#     Repointing was a SECURITY fix, not tidiness. `chia-sdk-driver` 0.30 and 0.34 decode the oracle
+#     fee out of an attacker-authored CREATE_COIN memo as
+#     `BigInt::from_signed_bytes_be(&memo).to_u64_digits().1[0]`, and an empty or explicit-zero memo
+#     makes that index an empty vec — a panic reachable from any spend dig-node walks through
+#     `Datastore::from_spend` (the lineage walk, `verify_pinned_root`, `sync_datastore`). 0.36 guards
+#     the empty case and uses `try_into`, so both become `DriverError::InvalidMemo`; it also stops
+#     silently discarding a negative memo's sign and truncating an over-`u64` fee to its low digit.
 #
 # So this row is still downstream of publishing the digstore workspace. Do NOT repoint these
 # piecemeal, and never let the pin regress to a floating git BRANCH: the single `rev` is what makes
 # the whole store-format surface reproducible.
-digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
 chia-protocol = "0.36.1"
 # The `Streamable` to_bytes/from_bytes trait, used to serialize the chat `ChatMessage` payload before
 # the dig-message seal. Same 0.36.1 as chia-protocol so the byte layout agrees across the workspace.

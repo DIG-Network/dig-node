@@ -270,10 +270,10 @@ futures-util = "0.3"
 # produce the exact on-disk shape a pre-existing install carries is the crate that wrote it.
 # NC-7 exception: the digstore set is git-pinned as one atomic rev — rationale in
 # crates/dig-node-core/Cargo.toml (dig_ecosystem#901, blocked on the digstore publishes + #2761).
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
-digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
+digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
 tempfile = "3"
 # The `/s/` origin-derivation test (#1576) drives the REAL router with a FORGED non-loopback
 # `ConnectInfo` — the one remote address a loopback-bound test server can never produce — via

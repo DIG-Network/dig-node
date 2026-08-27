@@ -21,7 +21,7 @@ serde_json = "1"
 # browser). Pinned to the SAME rev dig-node-core uses so cargo unifies to one version.
 # NC-7 exception: the digstore set is git-pinned as one atomic rev — rationale in
 # crates/dig-node-core/Cargo.toml (dig_ecosystem#901, blocked on the digstore publishes + #2761).
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "5872240f369a03e0828b6a26389480ba7726114f" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "161c2a3108cb4bb6c8791e96a26588ec99afb029" }
 # The `X-Dig-Inclusion-Proof` header wire form is base64; store id / root / salt are hex.
 base64 = "0.22"
 hex = "0.4"
