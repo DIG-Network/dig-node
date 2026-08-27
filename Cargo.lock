@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.61.0"
+version = "0.62.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3046,7 +3046,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.158.0"
+version = "0.159.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "dig-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "dig-node-core",
@@ -3339,7 +3339,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.38.0"
+version = "0.39.0"
 dependencies = [
  "async-trait",
  "axum",
