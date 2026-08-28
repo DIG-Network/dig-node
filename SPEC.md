@@ -7458,56 +7458,79 @@ legal choice and any conversion to whole percent would erase it.
 * The node is the **authoritative home** for the setting: the flywheel is headless, so a machine with no
   GUI MUST be able to set it. dig-app is a remote control for the same value.
 
-### 24.5. The funding advice — how much to hold, and the three states
+### 24.5. The funding advice — how much to hold, and the states
 
 **Collateral is RECLAIMED, not spent.** Each pass creates the coins for `(store, root, epoch n)` and
-reclaims epoch `n−1`; reclaims run FIRST and are never gated on funds, so returned collateral funds the
-creates behind it. **The steady state is roughly ONE epoch's lock, not one per epoch.** A recommendation
-of "requirement × epochs of runway" overstates the answer by the epoch count and tells an operator to
-hold many times what they need.
+reclaims epoch `n-1`; reclaims run FIRST and are never gated on funds, so returned collateral funds
+the creates behind it. **The steady state is roughly ONE epoch's lock, not one per epoch.** A
+recommendation of "requirement x epochs of runway" overstates by the epoch count and tells an
+operator to hold many times what they need.
 
-The recommendation therefore covers the current epoch's lock plus the **transition overlap** — epoch `n`
-existing before `n−1` is reclaimed, or a reclaim delayed or failed — with the next epoch allowed to have
-escalated:
+The total is three named terms that sum without double-counting:
 
 ```
-lock        = pairs × apply_safety_margin(required_per_store, margin_bp)
-recommended = lock + lock × (1 + 1/UP_STEP_DENOM)^HORIZON
+lock        = pairs_served_by_this_node x apply_safety_margin(required_per_store, margin_bp)
+overlap     = the collateral still locked in the epoch being reclaimed
+headroom    = what the next `horizon_epochs` could add at the escalation ceiling
+recommended = lock + overlap + headroom
 ```
 
-Escalation **compounds** (`UP_STEP_DENOM = 8`, so at most `+12.5%` per epoch): 1 epoch `1.12×`, 2
-`1.27×`, 4 `1.60×`, 8 `2.57×`, 13 `4.62×`. The horizon is therefore a CHOICE and MUST be reported with
-the figure. The node uses **4 epochs**; a horizon demanding several times the current lock is advice
-nobody acts on. The ceiling is a **worst case, not a forecast** — inside the controller's dead band the
-multiplier does not move at all, and a surface MUST say so.
+The **overlap** is the real peak and the term nobody budgets for: epoch `n` exists before `n-1` is
+reclaimed, and a reclaim can be delayed or fail.
 
-The three states, of which only two may notify:
+**`pairs_served_by_this_node` is THIS NODE's own `(owner, store, root)` set.** It MUST NOT be taken
+from `control.collateral.requirement`'s `stores` or `owners`, which are network census figures
+(§24.1), and it MUST NOT be approximated from the hosted-store list, which is a different set that
+merely resembles it. A resemblance is not an identity, and both produce a plausible number.
 
-| state | meaning | notifies? |
+**Escalation MUST be obtained by stepping `dig_mirror_collateral::step_multiplier` in its high
+band**, never from a hand-rolled closed form. A `(9/8)^n` loses two behaviours the controller has:
+the step truncates each epoch (0.8x over four epochs reaches 1.281444, not 1.281445), and the result
+is clamped at `MULT_CEILING_MICROS`, so a long horizon cannot manufacture headroom the controller
+could never produce.
+
+`horizon_epochs` and `escalation_ceiling_micros` are BOTH required alongside the figure. A buffer
+without its horizon is a magic number, and a horizon without its ceiling cannot be reproduced. The
+ceiling is a **worst case, not a forecast** — inside the dead band the multiplier does not move.
+
+The states, of which only two leave an epoch uncovered:
+
+| state | meaning | `is_shortfall()` |
 |---|---|---|
-| `short_now` | cannot cover the current epoch; stores are already uncollateralised | **yes** |
+| `short_now` | cannot cover the current epoch; roots are already uncollateralised | **yes** |
 | `dangerously_low` | covers now; could not cover the next epoch at the escalation ceiling | **yes** |
-| `below_recommended_buffer` | fine for several epochs, no cushion | **NO — readout only** |
+| `below_recommended_buffer` | every epoch covered, no cushion | **NO — readout only** |
 | `adequate` | at or above the recommendation | no |
-| `unknown` | a required fact is missing | **NO** |
 
-`below_recommended_buffer` MUST NOT raise a notification. A healthy node sits there much of the time, and
-a recurring alert an operator learns to dismiss teaches them to dismiss the two that matter.
+`below_recommended_buffer` MUST be excluded from `is_shortfall()` and MUST NOT raise a notification.
+Every epoch it covers *is* covered; a healthy node sits there much of the time, and a recurring alert
+an operator learns to dismiss teaches them to dismiss the two above it.
 
-### 24.6. Never answer an unknown with a reassuring number
+### 24.6. UNKNOWN must be UNREPRESENTABLE as a number
 
-If the node cannot determine its requirement, its served-advertisement count, or the operator's balance,
-the state is `unknown`. It MUST NOT be a zero and MUST NOT be an alarm.
+The buffer answer is a **tagged variant**: the unknown case carries `state` and `reason` and **no
+numeric field at all**. This is a shape requirement, not a convention — a struct with optional
+numbers can hold a `0`, and a zero buffer reads as *no buffer needed*.
 
-This is a live hazard rather than a theoretical one, because **an unknown and a genuine zero produce
-identical arithmetic**: an unreadable hosted-store list read as zero advertisements yields a `0.000 DIG`
-recommendation that every balance clears, so a node that could not tell how much it owes would report
-"funded". A surface MUST distinguish "nothing to collateralise" from "your funding is sufficient" for the
-same reason.
+| `reason` | the missing fact |
+|---|---|
+| `served_set_unknown` | the node cannot enumerate the roots it serves |
+| `reclaim_state_unknown` | the node cannot tell which of last epoch's coins are reclaimed |
+| `balance_unknown` | the operator's spendable $DIG is not known to this node |
 
-A malformed operator-supplied balance is REFUSED, never parsed as zero, which would report `short_now`
-over a typo. Amounts are scaled by integer arithmetic: `0.001 DIG` steps are where an `f64` starts
-rounding, and a rounded figure about somebody's money is the lie this section exists to prevent.
+**None of these has a counterpart in §24.2's census taxonomy**, which is the structural reason the
+buffer is its own method rather than a widening of the requirement: collapsing `served_set_unknown`
+into `not_censused` reports a missing LOCAL fact as a missing NETWORK one and sends the operator to
+fix the wrong thing.
+
+This is a live hazard, not a theoretical one, because **an unknown and a genuine zero produce
+identical arithmetic**: a served count read as zero yields a `0.000 DIG` recommendation that every
+balance clears, so a node that could not tell how much it owes would report "funded". A surface MUST
+also distinguish "nothing to collateralise" from "your funding is sufficient" for the same reason.
+
+A malformed operator-supplied balance is REFUSED, never parsed as zero, which would report
+`short_now` over a typo. Amounts are scaled by integer arithmetic: `0.001 DIG` steps are where an
+`f64` starts rounding.
 
 ### 24.7. The `dign` verbs
 
@@ -7516,7 +7539,9 @@ rounding, and a rounded figure about somebody's money is the lie this section ex
   `dig-mirror-collateral`'s own constant, never to a number spelled out in the CLI; a second spelling is
   how two surfaces post different amounts for one choice. An unrecognised word is REFUSED, never treated
   as the default.
-* `collateral buffer [--balance <DIG>]` — §24.5/§24.6. States an AMOUNT to add, not an adjective, and
-  shows the working: advertisements served, per-store requirement, margin, and the horizon used.
+* `collateral buffer [--roots <N>] [--balance <DIG>]` — §24.5/§24.6. States an AMOUNT to add, not an
+  adjective, and shows the working: roots served, per-store requirement, margin, the three terms, and
+  the horizon with its ceiling. `--roots` is an operand until `control.collateral.buffer` publishes,
+  because no published method reports the served set and the nearest-looking one is a different set.
 
 Every verb offers `--json` beside the human output, with stable field names (§6.2).
