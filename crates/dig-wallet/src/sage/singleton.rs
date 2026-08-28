@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use chia_protocol::{Bytes32, Coin, Program};
 use chia_puzzle_types::nft::NftMetadata;
-use chia_wallet_sdk::driver::{Cat, Did, Nft, Puzzle, SpendContext};
+use chia_wallet_sdk::driver::{Cat, Did, Nft, Puzzle, SingletonInfo, SpendContext};
 use chia_wallet_sdk::utils::Address;
 use clvmr::NodePtr;
 
@@ -153,13 +153,32 @@ pub fn reconstruct_parsed(
         }
     }
 
-    // DID: parse_child validates the given child coin.
+    // DID: `parse_child` takes the child coin but does NOT bind it to what it parsed. It reads the
+    // owner out of the parent spend's CREATE_COIN memo *hint* and stores it verbatim
+    // (`DidInfo::p2_puzzle_hash = hint`), which anybody who can spend any DID may write to name any
+    // p2 hash they like. So the parse alone proves nothing about ownership, and the check the SDK's
+    // own construction path makes — `inner_puzzle_hash() == create_coin.puzzle_hash` — has no
+    // counterpart on the read path.
+    //
+    // Recomputing the singleton puzzle hash FROM the parsed info and requiring it to equal the real
+    // child coin's is what turns the hint back into a proof: `puzzle_hash()` is curried over
+    // `p2_puzzle_hash`, so a lie about the owner cannot reproduce the on-chain coin. An honest DID
+    // pays nothing — its child is built from that same hash, so the two are equal by construction.
+    // (The NFT arm above needs no equivalent: `nft.coin` is derived from `nft.info`, and the coin-id
+    // equality at that arm already commits to it.)
     if let Ok(Some(did)) = Did::parse_child(ctx, parent_coin, parent_puzzle, parent_solution, child)
     {
-        return Reconstructed::Did {
-            owner_p2: hexb(did.info.p2_puzzle_hash),
-            row: Box::new(did_row(prefix, created_height, &did)),
-        };
+        let reconstructed_puzzle_hash: Bytes32 = did.info.puzzle_hash().into();
+        if reconstructed_puzzle_hash == child.puzzle_hash {
+            return Reconstructed::Did {
+                owner_p2: hexb(did.info.p2_puzzle_hash),
+                row: Box::new(did_row(prefix, created_height, &did)),
+            };
+        }
+        tracing::warn!(
+            coin_id = %hexb(child_id),
+            "DID reconstruction: the parent spend's owner hint does not reproduce the coin's puzzle hash; refusing"
+        );
     }
 
     // CAT: parse_children returns every child; match ours by coin id.
