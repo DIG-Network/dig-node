@@ -372,10 +372,17 @@ impl ChainFallback for CoinsetFallback {
     /// `Ok(None)` ONLY when a chain source ANSWERED and reported no such coin; every failure to
     /// read is an `Err` (dig_ecosystem#2392).
     ///
-    /// `Ok(None)` is NOT yet proof of absence: `chia-query` 0.6 mints it from ONE peer's empty
-    /// coin-state list without consulting coinset, so a peer that is a block behind, mid-reorg,
-    /// pruning or hostile produces it. Requiring corroboration is dig_ecosystem#2456, one crate
-    /// down. Callers polling a mint read `None` as "not seen yet", never as "never happened".
+    /// `Ok(None)` IS proof of absence, and the mapping at [`ChiaQueryLineage::parent_spend`] now
+    /// depends on that. The graph resolves `chia-query` **0.19.0**, where this read goes through
+    /// `peer_then_coinset_opt` into `read_opt_corroborated`: `Ok(None)` is produced only for a
+    /// `CorroboratedAbsent` — the answering peer plus `CORROBORATION_FLOOR` independent peers at
+    /// different addresses all reporting absent — or a peer-uncorroborated absence that coinset
+    /// agrees with. ONE peer's empty coin-state list yields `UncorroboratedAbsent`, and any
+    /// contradiction is `SourcesDisagree`, which stays an `Err`. dig_ecosystem#2456, which this
+    /// comment used to cite as pending against `chia-query` 0.6, has landed.
+    ///
+    /// Callers polling a MINT should still read `None` as "not seen yet" rather than "never
+    /// happened" — but that is a statement about mempool timing, not about corroboration.
     ///
     /// The absence-aware `_opt` variant carries that distinction (a `success: true` envelope with a
     /// null record is absence; a transport/API failure is not), so this method must not re-decide
@@ -506,33 +513,110 @@ impl super::singleton::LineageSource for ChiaQueryLineage {
     async fn parent_spend(
         &self,
         parent_coin_id: &str,
-        spent_height: u32,
-    ) -> Result<Option<super::singleton::ParentSpend>> {
+        _spent_height: u32,
+    ) -> Result<super::singleton::LineageAnswer> {
+        use super::singleton::LineageAnswer;
         let coin_id = format!("0x{}", CoinsetFallback::norm_hex(parent_coin_id));
-        let cs = match self
-            .query
-            .get_puzzle_and_solution(&coin_id, Some(spent_height))
-            .await
-        {
-            Ok(cs) => cs,
-            // The parent spend is not available (unspent / not found) — a clean "no lineage".
-            Err(_) => return Ok(None),
+        // The ABSENCE-AWARE read, and the choice is load-bearing rather than stylistic.
+        //
+        // The non-`_opt` `get_puzzle_and_solution` returns `Result<CoinSpend, _>`, so a parent
+        // that does not exist arrives as an `Err` indistinguishable from an outage. Mapping that
+        // to `Unavailable` was the only safe direction available — and it made a settled absence
+        // unreachable in production for the exact case it was written for, so a parent that simply
+        // does not exist produced "this node could not read the chain" and the attribution pass
+        // retried it forever instead of concluding anything (dig-node#383).
+        //
+        // `get_coin_spend_opt` carries the distinction the caller needs, and carries it graded:
+        // it routes through `peer_then_coinset_opt`, so `Ok(None)` is a CORROBORATED absence —
+        // the answering peer plus `CORROBORATION_FLOOR` independent peers at different addresses,
+        // or a peer-uncorroborated absence that coinset agrees with — while any contradiction is
+        // `SourcesDisagree` and stays an `Err`. One hostile peer's empty coin-state list cannot
+        // mint an absence here.
+        //
+        // It also needs no height: it resolves the spend height itself from a coin-state read,
+        // which is why `_spent_height` is unused. An unknown OR unspent coin is `Ok(None)` — both
+        // are honestly "there is no such parent spend", which is the question being asked.
+        let cs = match self.query.get_coin_spend_opt(&coin_id).await {
+            Ok(Some(cs)) => cs,
+            // A corroborated absence. SETTLED, not unknown: the coin the peer offered descends
+            // from nothing, so refusing it is a judgement about the peer's claim and leaves the
+            // replica no less complete.
+            Ok(None) => return Ok(LineageAnswer::Absent),
+            // A read that could not be completed — an outage, a rejection, or two sources that
+            // disagree. Nothing was learned, so the weaker claim is the only safe one: a caller
+            // that hears "unknown" retries and refuses to declare itself complete, whereas one
+            // that hears "absent" writes the coin off and answers a confident balance without it.
+            Err(_) => return Ok(LineageAnswer::Unavailable),
         };
         let decode = |field: &str, s: &str| -> Result<Vec<u8>> {
             hex::decode(s.strip_prefix("0x").unwrap_or(s))
                 .map_err(|e| Error::internal(format!("lineage {field} hex: {e}")))
         };
-        let parent = super::singleton::bytes32_from_hex(&cs.coin.parent_coin_info)?;
-        let puzzle_hash = super::singleton::bytes32_from_hex(&cs.coin.puzzle_hash)?;
-        Ok(Some(super::singleton::ParentSpend {
-            coin: chia_protocol::Coin {
-                parent_coin_info: parent,
-                puzzle_hash,
-                amount: cs.coin.amount,
+        let coin = chia_protocol::Coin {
+            parent_coin_info: super::singleton::bytes32_from_hex(&cs.coin.parent_coin_info)?,
+            puzzle_hash: super::singleton::bytes32_from_hex(&cs.coin.puzzle_hash)?,
+            amount: cs.coin.amount,
+        };
+        // The coin a spend answer CARRIES is checked against the coin that was ASKED for, and
+        // repaired from the coin record when it does not bind.
+        //
+        // This is not defence-in-depth. `chia-query`'s PEER tier returns the puzzle and solution
+        // faithfully and leaves the coin a placeholder — measured on mainnet 2026-08-27: for
+        // parent `567d481d…` the coinset tier answered the real coin while the peer tier answered
+        // `puzzle_hash: 0x00…00, amount: 0` beside byte-identical reveal and solution. Every CAT
+        // driver derives its children's coin ids FROM that coin, so a zeroed one makes
+        // `Cat::parse_children` compute children that match nothing and report "not a CAT". That
+        // is the whole of dig-node#382's last mile: eight real $DIG coins, refused one by one, on
+        // a wallet holding 3,856.455 $DIG.
+        //
+        // A coin id is self-certifying — `SHA256(parent ‖ puzzle_hash ‖ amount)` — so the binding
+        // is checkable locally and costs nothing when the answer is already right.
+        let expected = super::singleton::bytes32_from_hex(parent_coin_id)?;
+        let coin = if coin.coin_id() == expected {
+            coin
+        } else {
+            // `Ok(None)` on a failed read, matching the spend read above (`Err(_) => Ok(None)`)
+            // rather than propagating. On the peer tier the answer is a placeholder every time,
+            // so THIS is the common path — and an `Err` here escapes `reconstruct_coins`, then
+            // `attribute()`, then `run_update_loop`, killing the peer session over a transient
+            // coinset blip. The supervisor makes the same call one function away, deliberately:
+            // "a read failure must never turn a completed catch-up into a failed session".
+            // A missing lineage is refused-and-retried; a dead session is not.
+            let record = match CoinsetFallback::new(self.query.clone())
+                .coin_record_by_id(parent_coin_id)
+                .await
+            {
+                Ok(Some(record)) => record,
+                // A source answered and has no such coin: settled, and cheap to remember.
+                Ok(None) => return Ok(LineageAnswer::Absent),
+                // No source answered. Never an `Err`, for the reason above the spend read; and
+                // never `Absent`, because nothing was learned.
+                Err(_) => return Ok(LineageAnswer::Unavailable),
+            };
+            let repaired = chia_protocol::Coin {
+                parent_coin_info: super::singleton::bytes32_from_hex(&record.parent_coin_info)?,
+                puzzle_hash: super::singleton::bytes32_from_hex(&record.puzzle_hash)?,
+                amount: record.amount,
+            };
+            // `coin_record_by_id` already refuses a record for a different coin, so reaching here
+            // with a mismatch would mean two independent reads disagree about a self-certifying
+            // id. There is no honest lineage to return in that case.
+            if repaired.coin_id() != expected {
+                // Both reads answered and they disagree about a self-certifying id. Not an
+                // outage — the sources are reachable and one of them is wrong — so this is
+                // `Absent`: there is no honest lineage here and re-asking would return the same
+                // contradiction.
+                return Ok(LineageAnswer::Absent);
+            }
+            repaired
+        };
+        Ok(LineageAnswer::Found(Box::new(
+            super::singleton::ParentSpend {
+                coin,
+                puzzle_reveal: decode("puzzle_reveal", &cs.puzzle_reveal)?,
+                solution: decode("solution", &cs.solution)?,
             },
-            puzzle_reveal: decode("puzzle_reveal", &cs.puzzle_reveal)?,
-            solution: decode("solution", &cs.solution)?,
-        }))
+        )))
     }
 }
 
@@ -627,6 +711,7 @@ mod chain_failure_tests {
     //! performs no DNS), so every read falls through to the local coinset stand-in below.
 
     use super::*;
+    use crate::sage::singleton::{LineageAnswer, LineageSource};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -672,6 +757,221 @@ mod chain_failure_tests {
             }
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// Serve a body chosen by the request PATH, so one fixture can answer two different coinset
+    /// endpoints differently. [`serve_json`] answers every path identically, which cannot express
+    /// a tier that is right about one read and wrong about another.
+    async fn serve_routed(routes: &'static [(&'static str, &'static str)]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = routes
+                    .iter()
+                    .find(|(path, _)| request.contains(path))
+                    .map(|(_, body)| *body)
+                    .unwrap_or(r#"{"success":false}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A `get_puzzle_and_solution` answer carrying a PLACEHOLDER coin — a zeroed puzzle hash and a
+    /// zero amount beside a faithful reveal and solution. This is the shape `chia-query`'s PEER
+    /// tier really returns (measured on mainnet, dig-node#382).
+    const SPEND_WITH_PLACEHOLDER_COIN: &str = r#"{"success":true,"coin_solution":{
+                "coin":{"parent_coin_info":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "puzzle_hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+                        "amount":0},
+                "puzzle_reveal":"0x01","solution":"0x80"}}"#;
+
+    /// The coin record for [`KNOWN_COIN_ID`], which is what the repair read must recover.
+    const REPAIR_RECORD: &str = KNOWN_COIN_RECORD;
+
+    async fn lineage_against(base_url: String) -> ChiaQueryLineage {
+        let query = chia_query::ChiaQuery::new(chia_query::ChiaQueryConfig {
+            coinset_base_url: base_url,
+            max_peers: 0,
+            coinset_fallback_enabled: true,
+            coinset_request_timeout: std::time::Duration::from_secs(5),
+            ..Default::default()
+        })
+        .await
+        .expect("a zero-peer client with the coinset fallback enabled always constructs");
+        ChiaQueryLineage::new(Arc::new(query))
+    }
+
+    /// **Proves (dig-node#382, the last mile):** a parent spend whose CARRIED coin does not bind to
+    /// the coin that was asked for is repaired from the coin record, never returned as-is.
+    ///
+    /// # Why this is a correctness bug and not hardening
+    ///
+    /// Every CAT/singleton driver derives its children's coin ids FROM `ParentSpend::coin`. A
+    /// placeholder coin therefore makes `Cat::parse_children` compute children that match nothing,
+    /// and the caller concludes the coin is not a CAT. Measured on mainnet: all eight of a real
+    /// wallet's unspent $DIG coins were refused this way, on a wallet holding 3,856.455 $DIG, while
+    /// the coinset tier answered the same question correctly.
+    ///
+    /// The fixture serves a placeholder coin on the SPEND read and the truth on the RECORD read,
+    /// because that is exactly the split observed — a tier right about one read and wrong about
+    /// another. A fixture that got both wrong could not tell repair from luck.
+    #[tokio::test]
+    async fn a_parent_spend_that_does_not_bind_is_repaired_from_the_coin_record() {
+        let base = serve_routed(&[
+            ("get_puzzle_and_solution", SPEND_WITH_PLACEHOLDER_COIN),
+            ("get_coin_record_by_name", REPAIR_RECORD),
+        ])
+        .await;
+        let lineage = lineage_against(base).await;
+
+        let spend = lineage
+            .parent_spend(KNOWN_COIN_ID, 140)
+            .await
+            .expect("the read succeeds")
+            .found()
+            .expect("a spend the chain reported must not be dropped");
+
+        assert_eq!(
+            hex::encode(spend.coin.coin_id()),
+            KNOWN_COIN_ID,
+            "the returned parent coin must bind to the coin that was asked for"
+        );
+        assert_eq!(spend.puzzle_reveal, vec![0x01]);
+        assert_eq!(spend.solution, vec![0x80]);
+    }
+
+    /// **The control:** when the repair read cannot recover a binding coin either, the answer is
+    /// a reported ABSENCE — never the placeholder.
+    ///
+    /// Without this half, the test above is satisfied by an implementation that returns whatever
+    /// the record read produced without checking it, which is the same unchecked trust one hop
+    /// further along.
+    #[tokio::test]
+    async fn an_unrepairable_parent_spend_is_no_lineage_rather_than_a_placeholder() {
+        let base = serve_routed(&[
+            ("get_puzzle_and_solution", SPEND_WITH_PLACEHOLDER_COIN),
+            (
+                "get_coin_record_by_name",
+                r#"{"success":true,"coin_record":null}"#,
+            ),
+        ])
+        .await;
+        let lineage = lineage_against(base).await;
+
+        let spend = lineage
+            .parent_spend(KNOWN_COIN_ID, 140)
+            .await
+            .expect("a reported absence is not a read failure");
+
+        assert!(
+            matches!(spend, LineageAnswer::Absent),
+            "a chain that ANSWERED 'no such coin' is an absence, not an outage: an absence may be              remembered and written off, an outage may not. Got {spend:?}"
+        );
+    }
+
+    /// A `get_puzzle_and_solution` answer reporting that the chain HAS no such spend: a
+    /// `success: true` envelope carrying a null `coin_solution`. This is the shape coinset returns
+    /// for a coin that is unknown or simply unspent.
+    const NO_SUCH_SPEND: &str = r#"{"success":true,"coin_solution":null}"#;
+
+    /// **Proves (dig-node#383, F1):** the PRODUCTION source reports a parent the chain does not
+    /// have as [`LineageAnswer::Absent`], not as an outage.
+    ///
+    /// # Why this test is about a call, not a branch
+    ///
+    /// The attribution pass distinguishes "the chain says there is no such parent" from "this node
+    /// could not read the chain", and only the first is a settled judgement it can act on. That
+    /// distinction was unreachable in production: the spend read went through the non-`_opt`
+    /// `get_puzzle_and_solution`, which returns `Result<CoinSpend, _>`, so a nonexistent parent
+    /// arrived as an `Err` indistinguishable from a dead network and was mapped, correctly for what
+    /// it knew, to [`LineageAnswer::Unavailable`]. A row whose parent genuinely does not exist was
+    /// therefore re-read on every pass, forever, and never concluded.
+    ///
+    /// So the defect was not a branch that decided wrongly; it was a CALL that could not carry the
+    /// answer. This asserts on the answer the production impl gives for the honest wire shape,
+    /// which is the only thing that can distinguish the two reads.
+    ///
+    /// The sibling below is the control that stops this being satisfied by a source that simply
+    /// calls everything absent: an outage on the SAME read must still be `Unavailable`.
+    #[tokio::test]
+    async fn a_parent_the_chain_reports_no_spend_for_is_absent_not_unavailable() {
+        let base = serve_routed(&[("get_puzzle_and_solution", NO_SUCH_SPEND)]).await;
+        let lineage = lineage_against(base).await;
+
+        let answer = lineage
+            .parent_spend(KNOWN_COIN_ID, 140)
+            .await
+            .expect("a reported absence is not a read failure");
+
+        assert!(
+            matches!(answer, LineageAnswer::Absent),
+            "a corroborated 'there is no such spend' is a settled judgement about the PEER'S \
+             CLAIM, so the coin is refused and the batch stays complete. Reported as an outage it \
+             becomes a statement about this node, the batch is incomplete, the session is torn \
+             down, and the peer re-sends the same 32 random bytes on every redial. Got {answer:?}"
+        );
+    }
+
+    /// **The control for the test above.** A read that genuinely FAILS on the very same endpoint
+    /// must still be [`LineageAnswer::Unavailable`].
+    ///
+    /// Without it, "absence maps to `Absent`" would be satisfied by a source that had simply
+    /// stopped distinguishing the two in the other direction — which is the money-lie this family
+    /// exists to close, since a wallet that reads "we could not reach anyone" as "it does not
+    /// exist" writes off coins it owns and answers a confident balance without them.
+    #[tokio::test]
+    async fn a_spend_read_that_fails_is_still_unavailable_not_absent() {
+        // No route matches, so the fixture answers `{"success":false}` — a rejection, not an
+        // absence.
+        let base = serve_routed(&[("some_other_endpoint", NO_SUCH_SPEND)]).await;
+        let lineage = lineage_against(base).await;
+
+        let answer = lineage
+            .parent_spend(KNOWN_COIN_ID, 140)
+            .await
+            .expect("a failed read refuses the coin, never the session");
+
+        assert!(
+            matches!(answer, LineageAnswer::Unavailable),
+            "nothing was learned about the chain, so the weaker claim is the only honest one. \
+             Got {answer:?}"
+        );
+    }
+
+    /// **A failed REPAIR read is no lineage, not a dead peer session (#383).**
+    ///
+    /// The spend read beside it maps a failed read to `Ok(None)` deliberately; the repair read
+    /// added with the binding check did not, and on the peer tier the repair branch is the
+    /// COMMON path — every answer there is a placeholder. So a transient coinset failure
+    /// propagated out of `parent_spend`, through `reconstruct_coins`, through `attribute()`, and
+    /// ended the peer session, over a read the wallet is entitled to simply retry.
+    ///
+    /// The fixture routes ONLY the spend read, so the record read hits the fallback route and
+    /// FAILS. That is the distinction that matters and the one the sibling test above cannot
+    /// make: it serves `coin_record: null`, a chain that answered "no such coin", which reaches
+    /// `Ok(None)` by a different branch and would stay green with the propagation intact.
+    #[tokio::test]
+    async fn a_failed_repair_read_is_no_lineage_rather_than_a_failed_session() {
+        let base = serve_routed(&[("get_puzzle_and_solution", SPEND_WITH_PLACEHOLDER_COIN)]).await;
+        let lineage = lineage_against(base).await;
+
+        let spend = lineage.parent_spend(KNOWN_COIN_ID, 140).await;
+
+        assert!(
+            matches!(spend, Ok(LineageAnswer::Unavailable)),
+            "a failed repair read must refuse the coin, not the session — and must say UNAVAILABLE              rather than ABSENT, because nothing was learned about the chain. Reporting it as an              absence would let one failed read write a real coin off for the cache's whole TTL.              Got {spend:?}"
+        );
     }
 
     /// A coin id the fixtures ask for. Its value is irrelevant — what varies is the SOURCE.

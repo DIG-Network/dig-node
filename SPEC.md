@@ -5402,8 +5402,86 @@ attribute CAT coins to their asset id (TAIL hash) in the `coins` table (so `get_
 complete). Parent spends are fetched through a `LineageSource` (out-of-DB lineage reads, B.5). Reads only.
 The sync loop runs this attribution as a post-apply step (`sync::CatAttributor`, threaded into
 `run_update_loop`): every `coin_state_update` is followed by an attribution pass that uncurries the
-newly-synced candidate coins, so a synced CAT coin — stored initially with `asset_id: None` — gains its
-TAIL and surfaces in `get_cats` (this is how `$DIG` resolves from the node).
+newly-synced candidate coins. A CAT of a KNOWN asset is already attributed on arrival by §18.11a's
+derived-hash subscription and needs no such read; this pass covers the rest — NFT and DID singletons, and
+any CAT row already in the replica. The attributor is owned by
+the SUPERVISOR, which builds it from the subscription set it resolved for the current attempt and threads
+it into BOTH the catch-up and the update loop; a supervisor with no lineage source attaches none, and
+that absence MUST be honest rather than silent. The pass also runs ONCE after a completed catch-up, so a
+replica that syncs from genesis and then receives no further pushes still attributes what it found.
+
+18.11a. **A CAT coin is recognised by a puzzle hash the wallet DERIVED, not by a claim a peer makes.**
+A CAT coin does not sit at its owner's p2 puzzle hash; it sits at the OUTER hash that curries the asset's
+TAIL around that p2 hash. Because that curry commits to the asset AND the owner together, the wallet MUST
+derive `cat_puzzle_hash(owner_p2, asset_id)` for each of its p2 hashes crossed with each asset id it
+knows, and MUST add those hashes to the set it SUBSCRIBES. A coin arriving at one of them is that asset,
+and is this wallet's, by construction.
+
+Admission is therefore a set-membership test against hashes this node computed from its own key material,
+and it MUST issue no chain read. A coin so admitted MUST be written with its `asset_id` AND its owner
+`hint` already populated: the CAT balance query scopes by `hint`, so a row stored without one is present,
+correctly typed, and still reads as zero.
+
+No coin admitted from a peer frame may be written with a NULL `asset_id` unless the wallet means it as
+XCH. `asset_id IS NULL` denotes XCH in this schema and is selected UNSCOPED by the spend-input selector,
+so a row admitted "unattributed, to be attributed later" is offered to the coin selector as spendable XCH
+that the wallet cannot solve. Deriving the hash before subscribing is what makes that state unreachable
+rather than merely guarded against.
+
+The derived hashes MUST widen the SUBSCRIPTION set only. They are not addresses and they are not hashes
+the wallet can sign for: they MUST NOT enter the plain p2 set that marks a coin as an ordinary signable
+XCH coin, MUST NOT be counted as watched addresses, MUST NOT be recorded as the addresses a catch-up
+covered, and MUST NOT reach the signer's own puzzle-hash set. Each of those sets answers a different
+question, and a derived CAT hash is a wrong answer to every one of them.
+
+The failure direction is INCOMPLETENESS, never a wrong figure. An asset whose id the wallet does not know
+in advance cannot have its outer hash derived, so its coins are not subscribed and not admitted, and that
+asset reads as ABSENT. Discovering CATs whose asset ids are unknown in advance is OUT OF SCOPE of this
+section; it cannot be done by local derivation and MUST NOT be attempted on the frame path, where a
+remote peer sets the pace.
+
+18.11b. **A parent spend binds to the coin it was asked for.** A coin id is self-certifying —
+`SHA256(parent ‖ puzzle_hash ‖ amount)` — so a `LineageSource` MUST check that the coin a spend answer
+carries hashes to the coin that was requested, and MUST NOT return one that does not. Where it does not,
+the coin is repaired from the coin record; where it still does not bind, the answer is NO LINEAGE rather
+than a placeholder. This is a correctness requirement and not defence-in-depth: every CAT/singleton
+driver derives its children's coin ids FROM that coin, so a placeholder makes `Cat::parse_children`
+compute children matching nothing and the caller conclude the coin is not a CAT — the failure that
+refused eight real `$DIG` coins on a funded wallet.
+
+18.11c. **The out-of-band attribution pass remembers its OUTCOMES, and distinguishes an absence from an
+outage.** Coins the wallet did not recognise on arrival — NFT and DID singletons, and any CAT row already
+in the replica — are attributed by a pass over rows the replica already holds. That pass runs on this
+node's own schedule over its own data; it is not on the frame path and a remote peer does not set its
+pace.
+
+**The pass remembers the attribution OUTCOME per coin row, not the lineage lookup.** A coin's parent
+spend is settled chain history, so a row a pass RESOLVED and could not attribute answers identically for
+ever. Those rows are ordinary: an NFT or DID coin row keeps `asset_id` NULL because the reconstruction is
+written to its own table, and an odd-amount plain coin at the wallet's own p2 hash reconstructs to
+nothing. A memory of failed LOOKUPS cannot cover them, because their lookups succeed — so without an
+outcome mark each costs one outbound chain read per push frame for the life of the replica. A row whose
+parent could NOT be read MUST NOT be marked: nothing was learned about it. The pass MUST therefore cost
+work proportional to newly-arrived rows, and MUST NOT run after a frame that was refused before any
+database write.
+
+**A lineage answer distinguishes ABSENT from UNAVAILABLE, and the SOURCE must be able to tell them
+apart.** "A source answered and there is no such spend" and "no source could be reached" MUST NOT be the
+same value. Only an absence may be remembered or treated as a settled judgement; an unavailability is a
+statement about this node's reachability and MUST be treated as *unknown*, so that a later pass asks
+again.
+
+The distinction MUST be carried by the chain READ, not merely by the enum. A source that reads spends
+through an API which collapses "no such spend" into the same error as "the read failed" cannot produce an
+absence at all, whatever its mapping says — so the ABSENT arm becomes unreachable in production for the
+exact case it was written for. The production source MUST therefore use an absence-aware, corroborated
+read (`chia-query`'s `get_coin_spend_opt`), whose `Ok(None)` requires agreement across independent
+sources and whose every transport failure, rejection and disagreement remains an error. Collapsing the
+pair lets a transient outage be cached as a fact.
+
+**A failed lineage read is NO LINEAGE, never an error.** An error propagates out of the attribution pass
+and ends the peer session, which hands a denial of service to whoever made the read fail. The same
+reasoning binds §18.11b's repair read, which fails to NO LINEAGE rather than propagating.
 
 18.12. **Live broadcaster bring-up — real mainnet $DIG spends behind a config gate (#428).** The
 node-custodied wallet BUILDS + SIGNS + VALIDATES spends (§18.9/§18.21) and the tip engine (§18.23)

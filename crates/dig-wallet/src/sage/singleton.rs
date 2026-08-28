@@ -68,6 +68,76 @@ pub struct ReconstructStats {
     pub dids: u32,
     /// CAT coins attributed.
     pub cats: u32,
+    /// Rows this pass RESOLVED and will never read again, whatever they turned out to be.
+    pub settled: u32,
+    /// Rows whose parent could not be read at all, so nothing was learned and nothing marked.
+    pub unresolved: u32,
+}
+
+/// What a lineage source has to say about a parent coin's spend.
+///
+/// The two negative answers are deliberately NOT one variant. They differ in the only way that
+/// matters to a caller deciding what to do next:
+///
+/// * [`LineageAnswer::Absent`] is a FACT about the chain — it was asked and the spend is not
+///   there. Remembering it is sound, because asking again immediately gets the same answer.
+/// * [`LineageAnswer::Unavailable`] is a fact about THIS NODE — no source could be reached.
+///   Nothing was learned about the chain at all.
+/// * [`LineageAnswer::Deferred`] is also a fact about this node, and a *different* one: the read
+///   was never issued, because a local budget declined to issue it.
+///
+/// Collapsing the first two is how an outage becomes a money-lie: a wallet that caches "we could
+/// not reach anyone" as "it does not exist" spends the cache's lifetime confidently refusing to
+/// name coins it owns. Every consumer here therefore treats `Unavailable` as *unknown* — never as
+/// a negative result, and never as grounds to declare a replica complete.
+///
+/// Collapsing the last two is how a bound becomes a denial of service, which is the reason
+/// `Deferred` exists at all (dig-node#383). `Unavailable` is TRANSIENT — the chain source is
+/// unreachable now and a retry is the remedy — so a caller that sees it re-opens the session and
+/// asks again. A budget refusal is a STANDING property of this node under its current load, so a
+/// caller that reads it as transient reconnects forever without ever making progress. This is the
+/// distinction the attribution pass needs in order to decide whether asking again can help.
+#[derive(Debug, Clone)]
+pub enum LineageAnswer {
+    /// The parent spend, as read.
+    Found(Box<ParentSpend>),
+    /// A source answered, and there is no such spend at that height.
+    Absent,
+    /// No source could answer. Nothing is known either way.
+    Unavailable,
+    /// The read was declined locally, by a budget, before any source was asked. Nothing is known
+    /// either way — and unlike [`Self::Unavailable`], nothing was even attempted.
+    Deferred,
+}
+
+impl LineageAnswer {
+    /// The spend if one was found. Discards the [`Absent`](LineageAnswer::Absent) /
+    /// [`Unavailable`](LineageAnswer::Unavailable) distinction, so it belongs only in callers
+    /// that genuinely treat the two alike.
+    pub fn found(self) -> Option<ParentSpend> {
+        match self {
+            Self::Found(spend) => Some(*spend),
+            _ => None,
+        }
+    }
+
+    /// The answer for a spend that was found, or `on_miss` when it was not.
+    ///
+    /// # Why the miss answer must be passed in
+    ///
+    /// This replaces a `from_answered(Option<ParentSpend>)` helper that folded every miss to
+    /// [`Self::Absent`]. Nothing in production ever called it — but it was the constructor every
+    /// test double reached for, so **every** double in this crate modelled an unresolvable parent
+    /// as a settled absence while the production source modelled it as unreadable. The suite was
+    /// therefore structurally unable to reach production's unreadable-parent path by the ordinary
+    /// route, which is how dig-node#383 survived a review round hunting exactly that class.
+    ///
+    /// A fixture map cannot know which of the two a miss represents, so it has to say. Making the
+    /// caller name it is the whole point: a double that cannot express production's failure mode
+    /// makes every test over it a partial green.
+    pub fn from_lookup(spend: Option<ParentSpend>, on_miss: Self) -> Self {
+        spend.map_or(on_miss, |s| Self::Found(Box::new(s)))
+    }
 }
 
 /// Fetches the parent coin's spend for a coin being reconstructed. The production path reads
@@ -76,12 +146,13 @@ pub struct ReconstructStats {
 #[async_trait]
 pub trait LineageSource: Send + Sync {
     /// The spend of `parent_coin_id`, which was spent at `spent_height` (= the child's
-    /// created height). `None` if the parent spend is not available.
-    async fn parent_spend(
-        &self,
-        parent_coin_id: &str,
-        spent_height: u32,
-    ) -> Result<Option<ParentSpend>>;
+    /// created height).
+    ///
+    /// `Err` is reserved for a caller-fatal fault. An unreadable parent is
+    /// [`LineageAnswer::Unavailable`], not an error: an error here escapes
+    /// [`reconstruct_coins`] and ends the peer session, handing a denial of service to whoever
+    /// made the read fail.
+    async fn parent_spend(&self, parent_coin_id: &str, spent_height: u32) -> Result<LineageAnswer>;
 }
 
 fn hexb(b: Bytes32) -> String {
@@ -366,8 +437,26 @@ fn is_candidate(c: &CoinRow, plain_puzzle_hashes: &HashSet<String>) -> bool {
 ///
 /// For each **unspent** candidate coin, fetch its parent spend through `lineage`, reconstruct
 /// it, and write the result: NFT/DID rows are upserted; a CAT coin is attributed to its asset
-/// id in the `coins` table (so `get_cats`/`get_token` become complete). Coins whose parent
-/// spend is unavailable, or that are not NFT/DID/CAT, are skipped.
+/// id in the `coins` table (so `get_cats`/`get_token` become complete).
+///
+/// # A row is examined ONCE, and the outcome is what gets remembered
+///
+/// A coin's parent spend is immutable chain history, and so is what that spend says the coin is.
+/// So a row this pass RESOLVED and could not attribute — an NFT, a DID, an odd-amount plain XCH
+/// coin that uncurries to [`Reconstructed::Unknown`] — will answer identically on every future
+/// pass, forever, at the cost of one outbound chain read each time.
+///
+/// That is not hypothetical: `upsert_nft`/`upsert_did` write the `nfts`/`dids` tables and never
+/// touch `coins.asset_id`, so **every NFT and DID the wallet holds** stays a candidate for the
+/// life of the replica. A negative cache over the *lookup* cannot help, because these lookups
+/// SUCCEED. What has to be remembered is the *attribution outcome*.
+///
+/// [`WalletDb::mark_attribution_examined`] records it, so the pass costs one indexed read plus
+/// work proportional to **newly-arrived** rows rather than to every row ever synced.
+///
+/// A row whose parent could not be READ ([`LineageAnswer::Unavailable`]) is deliberately NOT
+/// marked: nothing was learned about it, and marking it would convert a chain-source outage into
+/// a permanent refusal to name the wallet's own money.
 pub async fn reconstruct_coins(
     db: &WalletDb,
     lineage: &dyn LineageSource,
@@ -386,11 +475,25 @@ pub async fn reconstruct_coins(
         if !is_candidate(c, plain_puzzle_hashes) {
             continue;
         }
-        let Some(parent) = lineage
+        let parent = match lineage
             .parent_spend(&c.parent_coin_info, created as u32)
             .await?
-        else {
-            continue;
+        {
+            LineageAnswer::Found(parent) => *parent,
+            // The chain says there is no such spend. That answer is stable, so the row is
+            // settled and never costs another read.
+            LineageAnswer::Absent => {
+                db.mark_attribution_examined(&c.coin_id).await?;
+                stats.settled += 1;
+                continue;
+            }
+            // Nothing was learned, whether because no source answered or because this node's own
+            // budget declined to ask. Either way the row is left UNMARKED so a later pass retries
+            // it — marking it would turn a momentary refusal into a permanently wrong balance.
+            LineageAnswer::Unavailable | LineageAnswer::Deferred => {
+                stats.unresolved += 1;
+                continue;
+            }
         };
         let child = coin_from_row(c)?;
         match reconstruct(prefix, Some(created as u32), &parent, child)? {
@@ -413,18 +516,28 @@ pub async fn reconstruct_coins(
             }
             Reconstructed::Unknown => {}
         }
+        // Marked for EVERY resolved outcome, including the CAT one. `asset_id` alone would do
+        // for a CAT, but making the mark unconditional on "we read the spend and acted on it"
+        // means no future reconstruction kind can be added that silently re-reads forever.
+        db.mark_attribution_examined(&c.coin_id).await?;
+        stats.settled += 1;
     }
     Ok(stats)
 }
 
-/// Convenience: reconstruct every coin currently in the wallet DB.
+/// Reconstruct every coin in the wallet DB that a pass could still learn something from.
+///
+/// The candidate set is narrowed in SQL — unspent, unattributed, confirmed, and not already
+/// examined — rather than by scanning the whole `coins` table in Rust. The scan this replaces
+/// was the standing per-frame cost that made a seeded replica an amplifier: one `SELECT *` plus
+/// one outbound chain read per stable row, on every push frame, for the life of the process.
 pub async fn reconstruct_all(
     db: &WalletDb,
     lineage: &dyn LineageSource,
     prefix: &str,
     plain_puzzle_hashes: &HashSet<String>,
 ) -> Result<ReconstructStats> {
-    let coins = db.all_coins().await?;
+    let coins = db.unexamined_attribution_candidates().await?;
     reconstruct_coins(db, lineage, prefix, plain_puzzle_hashes, &coins).await
 }
 
@@ -454,8 +567,13 @@ mod tests {
             &self,
             parent_coin_id: &str,
             _spent_height: u32,
-        ) -> Result<Option<ParentSpend>> {
-            Ok(self.by_parent.get(parent_coin_id).cloned())
+        ) -> Result<LineageAnswer> {
+            // A parent this map does not hold is one the node could not READ — production's
+            // answer for an unresolvable parent, not a settled absence.
+            Ok(LineageAnswer::from_lookup(
+                self.by_parent.get(parent_coin_id).cloned(),
+                LineageAnswer::Unavailable,
+            ))
         }
     }
 
@@ -690,5 +808,183 @@ mod tests {
         let mut odd = c.clone();
         odd.amount = "1".into();
         assert!(is_candidate(&odd, &phs));
+    }
+
+    /// A [`LineageSource`] that counts its reads and answers however it was told to.
+    struct CountingLineage {
+        answer: LineageAnswerKind,
+        hits: std::sync::atomic::AtomicUsize,
+    }
+
+    /// Which answer [`CountingLineage`] gives. Named rather than boolean because the three cases
+    /// have three different consequences for whether a row may be written off.
+    #[derive(Clone, Copy)]
+    enum LineageAnswerKind {
+        /// A real spend that reconstructs to nothing — the shape of an odd-amount plain XCH coin
+        /// at the wallet's own p2 hash, and of every NFT/DID coin row after its own table is
+        /// written. These RESOLVE, which is precisely why a cache over the lookup cannot help.
+        ResolvesToNothing,
+        /// The chain answered: no such spend.
+        Absent,
+        /// Nothing could be reached.
+        Unavailable,
+    }
+
+    #[async_trait]
+    impl LineageSource for CountingLineage {
+        async fn parent_spend(&self, _parent: &str, _height: u32) -> Result<LineageAnswer> {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(match self.answer {
+                LineageAnswerKind::ResolvesToNothing => {
+                    LineageAnswer::Found(Box::new(ParentSpend {
+                        // A spend of a coin that creates nothing the drivers recognise, so
+                        // `reconstruct_parsed` falls through to `Unknown`.
+                        coin: Coin {
+                            parent_coin_info: Bytes32::from([1u8; 32]),
+                            puzzle_hash: Bytes32::from([2u8; 32]),
+                            amount: 1,
+                        },
+                        puzzle_reveal: vec![0x01],
+                        solution: vec![0x80],
+                    }))
+                }
+                LineageAnswerKind::Absent => LineageAnswer::Absent,
+                LineageAnswerKind::Unavailable => LineageAnswer::Unavailable,
+            })
+        }
+    }
+
+    fn counting(answer: LineageAnswerKind) -> CountingLineage {
+        CountingLineage {
+            answer,
+            hits: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// An unattributed, unspent, confirmed coin at an UNSUBSCRIBED puzzle hash — a candidate on
+    /// every pass until something settles it.
+    fn candidate_row(n: u8) -> CoinRow {
+        CoinRow {
+            coin_id: hex::encode([n; 32]),
+            parent_coin_info: hex::encode([n.wrapping_add(100); 32]),
+            puzzle_hash: hex::encode([n.wrapping_add(200); 32]),
+            amount: "1".into(),
+            created_height: Some(5),
+            spent_height: None,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    /// **Proves (dig-node#383):** a row whose parent RESOLVES but which cannot be attributed is
+    /// read exactly once, however many passes run.
+    ///
+    /// # Why this fixture and not an unresolvable parent
+    ///
+    /// The nearest wrong implementation is the one that shipped: a negative cache over the LOOKUP.
+    /// It makes an *unresolvable* parent free and is structurally unable to help here, because
+    /// this lookup succeeds. Every NFT and DID the wallet holds has this shape — the reconstructed
+    /// row is written to its own table and `coins.asset_id` stays NULL — so choosing a resolving
+    /// parent is what distinguishes remembering the OUTCOME from remembering the lookup.
+    ///
+    /// Ten passes rather than two, so a fix that merely halves the work fails as loudly as one
+    /// that does nothing.
+    #[tokio::test]
+    async fn a_resolving_but_unattributable_row_is_read_once_not_once_per_pass() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&[candidate_row(1)]).await.unwrap();
+        let lineage = counting(LineageAnswerKind::ResolvesToNothing);
+        let plain = HashSet::new();
+
+        for _ in 0..10 {
+            reconstruct_all(&db, &lineage, "xch", &plain).await.unwrap();
+        }
+
+        assert_eq!(
+            lineage.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "ten passes over one settled row must cost one read; anything more is a per-frame \
+             outbound chain read for the life of the replica"
+        );
+    }
+
+    /// **Proves (dig-node#383):** a reported ABSENCE settles the row too — asking again gets the
+    /// same answer, so paying for it again buys nothing.
+    #[tokio::test]
+    async fn a_reported_absence_settles_the_row() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&[candidate_row(2)]).await.unwrap();
+        let lineage = counting(LineageAnswerKind::Absent);
+        let plain = HashSet::new();
+
+        for _ in 0..10 {
+            reconstruct_all(&db, &lineage, "xch", &plain).await.unwrap();
+        }
+
+        assert_eq!(
+            lineage.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a spend the chain says does not exist is settled chain history, not a retry"
+        );
+    }
+
+    /// **Proves (dig-node#383, D3):** an UNREADABLE parent is NOT settled, so a chain-source
+    /// outage cannot write a coin off.
+    ///
+    /// The control that makes this test load-bearing is its sibling above: identical traffic,
+    /// identical row, and the only difference is whether the source answered. If the mark were
+    /// applied on every pass rather than on a resolved one, this would report 1 like the others —
+    /// and the wallet would spend the rest of the replica's life refusing to look at a coin it
+    /// failed to read once.
+    #[tokio::test]
+    async fn an_unreadable_parent_is_retried_rather_than_written_off() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&[candidate_row(3)]).await.unwrap();
+        let lineage = counting(LineageAnswerKind::Unavailable);
+        let plain = HashSet::new();
+
+        for _ in 0..10 {
+            reconstruct_all(&db, &lineage, "xch", &plain).await.unwrap();
+        }
+
+        assert_eq!(
+            lineage.hits.load(std::sync::atomic::Ordering::SeqCst),
+            10,
+            "nothing was learned about this parent, so every pass must ask again; marking it \
+             would turn a transient outage into a permanent wrong balance"
+        );
+    }
+
+    /// **Proves (dig-node#383):** the pass's cost tracks NEWLY-ARRIVED rows, not the size of the
+    /// replica.
+    ///
+    /// This is the property the deferral of the per-frame scan was wrongly assumed to already
+    /// have. Twenty settled rows plus one new one costs one read, not twenty-one — the difference
+    /// between a scan a peer can re-trigger for the price of an empty frame and one it cannot.
+    #[tokio::test]
+    async fn a_later_pass_pays_only_for_what_newly_arrived() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let seeded: Vec<CoinRow> = (10..30).map(candidate_row).collect();
+        db.upsert_coins(&seeded).await.unwrap();
+        let lineage = counting(LineageAnswerKind::ResolvesToNothing);
+        let plain = HashSet::new();
+
+        reconstruct_all(&db, &lineage, "xch", &plain).await.unwrap();
+        assert_eq!(
+            lineage.hits.load(std::sync::atomic::Ordering::SeqCst),
+            20,
+            "the first pass must genuinely examine all twenty, or the second pass proves nothing"
+        );
+
+        db.upsert_coins(&[candidate_row(40)]).await.unwrap();
+        reconstruct_all(&db, &lineage, "xch", &plain).await.unwrap();
+
+        assert_eq!(
+            lineage.hits.load(std::sync::atomic::Ordering::SeqCst),
+            21,
+            "the second pass must pay for the one new row only"
+        );
     }
 }

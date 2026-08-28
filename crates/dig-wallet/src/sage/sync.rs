@@ -13,7 +13,7 @@
 //! mainnet-safely against synthetic `CoinState`s AND the Chia peer simulator — no real
 //! spends (this PR has none).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chia_protocol::Bytes32;
@@ -463,6 +463,85 @@ pub fn coin_state_to_row(state: &CoinState) -> CoinRow {
 /// wallet *does* own. That is what [`handle_coin_state_update`]'s fail-closed latch is for.
 pub type SubscribedHashes = HashSet<Bytes32>;
 
+/// What a coin sitting at a derived CAT outer puzzle hash IS, known before the coin arrives.
+///
+/// Both facts are recovered from the derivation rather than from anything the peer said, which
+/// is the whole reason this shape needs no chain read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatIdentity {
+    /// The CAT's asset id (its TAIL hash).
+    pub asset_id: Bytes32,
+    /// The wallet p2 puzzle hash that owns coins at this outer hash. Stored as the row's
+    /// `hint`, because that — not `puzzle_hash` — is what the CAT balance query scopes by.
+    pub owner_p2: Bytes32,
+}
+
+/// The CAT outer puzzle hashes this wallet can recognise, mapped to what a coin at each one is.
+///
+/// # Why this replaces resolving lineage at admission
+///
+/// A CAT coin does not sit at its owner's p2 hash; it sits at the OUTER hash that curries the
+/// asset's TAIL around that p2 hash. Because the curry commits to both the asset and the owner,
+/// a coin found at `cat_puzzle_hash(owner_p2, asset_id)` IS that asset and IS this wallet's, by
+/// construction. So the wallet can derive those hashes itself, SUBSCRIBE them, and let the
+/// subscription filter do the proving — no parent spend, no uncurrying, no read budget, and no
+/// window in which an unattributed row exists.
+///
+/// The alternative the previous rounds took — admit the coin, then read its parent spend to
+/// decide whether to keep it — put a remote read on the frame path, where a peer sets the pace.
+/// Every high-severity finding across four review rounds lived in that machinery.
+///
+/// # What this cannot do
+///
+/// It recognises only assets whose id the wallet knows in advance. A CAT whose asset id is
+/// unknown cannot have its outer hash derived, so it is not subscribed and not admitted — it
+/// reads as ABSENT rather than as a wrong number. That is the acceptable failure direction, and
+/// unknown-CAT discovery is deliberately out of scope here (see SPEC 18.11).
+#[derive(Debug, Clone, Default)]
+pub struct DerivedCats(HashMap<Bytes32, CatIdentity>);
+
+impl DerivedCats {
+    /// Derive the outer hash for every (owner p2 hash x known asset id) pair.
+    ///
+    /// Uses `digstore_chain::cat::cat_puzzle_hash`, the one construction the wallet's CAT
+    /// balance, coin reconstruction and send paths already share. A second spelling of this
+    /// curry would be a byte-drift bug that decides whether money is counted.
+    pub fn derive(owner_p2_hashes: &[Bytes32], asset_ids: &[Bytes32]) -> Self {
+        let mut map = HashMap::new();
+        for owner_p2 in owner_p2_hashes {
+            for asset_id in asset_ids {
+                let outer = digstore_chain::cat::cat_puzzle_hash(*owner_p2, *asset_id);
+                map.insert(
+                    outer,
+                    CatIdentity {
+                        asset_id: *asset_id,
+                        owner_p2: *owner_p2,
+                    },
+                );
+            }
+        }
+        Self(map)
+    }
+
+    /// The derived outer hashes, sorted so a subscription (and a test asserting one) is
+    /// reproducible regardless of map iteration order.
+    pub fn hashes(&self) -> Vec<Bytes32> {
+        let mut hashes: Vec<Bytes32> = self.0.keys().copied().collect();
+        hashes.sort();
+        hashes
+    }
+
+    /// What a coin at `puzzle_hash` is, if this wallet derived that hash.
+    pub fn identify(&self, puzzle_hash: &Bytes32) -> Option<CatIdentity> {
+        self.0.get(puzzle_hash).copied()
+    }
+
+    /// Whether anything was derived at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Everything one peer session carries across the frames it handles: what it subscribed, how
 /// far its peer is trusted, and how much of its rollback allowance it has spent.
 ///
@@ -472,7 +551,12 @@ pub type SubscribedHashes = HashSet<Bytes32>;
 /// and lends it to every [`handle_coin_state_update`] call.
 pub struct SessionState<'a> {
     /// The puzzle hashes this session subscribed. Empty when the session subscribes nothing.
+    ///
+    /// Includes the derived CAT outer hashes, so a $DIG coin is inside the filter rather than an
+    /// exception to it.
     pub subscribed: &'a SubscribedHashes,
+    /// What a coin at each derived CAT outer hash is, so an admitted coin is typed on arrival.
+    pub derived_cats: &'a DerivedCats,
     /// What this session's peer is entitled to write, and up to what height.
     pub authority: WriteAuthority,
     /// The session's remaining allowance for walking the peak backwards.
@@ -483,9 +567,14 @@ pub struct SessionState<'a> {
 
 impl<'a> SessionState<'a> {
     /// A session over `subscribed` entitled to write exactly what `authority` says.
-    pub fn with_authority(subscribed: &'a SubscribedHashes, authority: WriteAuthority) -> Self {
+    pub fn with_authority(
+        subscribed: &'a SubscribedHashes,
+        derived_cats: &'a DerivedCats,
+        authority: WriteAuthority,
+    ) -> Self {
         Self {
             subscribed,
+            derived_cats,
             authority,
             rollback: RollbackBudget::new(),
             refused_peaks: 0,
@@ -695,15 +784,35 @@ impl CatchUpBudget {
 /// Coins at a puzzle hash outside `subscribed` are dropped — they were never requested, so a
 /// peer offering them is either confused or hostile, and either way the replica must not grow a
 /// row the wallet cannot account for.
+///
+/// # Attribution happens HERE, and costs nothing
+///
+/// A coin whose puzzle hash is one of the wallet's derived CAT outer hashes is stored with its
+/// `asset_id` and its owner `hint` already filled, because matching that hash IS the proof of
+/// both ([`DerivedCats`]). No chain read is issued, and no row is ever written with a NULL
+/// `asset_id` that the wallet did not itself mean as XCH — which matters because
+/// [`crate::sage::db::WalletDb::unspent_coins`]`(None)` reads `asset_id IS NULL` as *XCH* and
+/// feeds it to the spend-input selector.
+///
+/// The `hint` is not decoration: the CAT balance query scopes by `hint`, not by `puzzle_hash`,
+/// so a row admitted without it is stored, typed, and still invisible to the balance.
 pub async fn apply_coin_states(
     db: &WalletDb,
     states: &[CoinState],
     subscribed: &SubscribedHashes,
+    derived_cats: &DerivedCats,
 ) -> Result<(), SyncError> {
     let rows: Vec<CoinRow> = states
         .iter()
         .filter(|s| subscribed.contains(&s.coin.puzzle_hash))
-        .map(coin_state_to_row)
+        .map(|s| {
+            let mut row = coin_state_to_row(s);
+            if let Some(cat) = derived_cats.identify(&s.coin.puzzle_hash) {
+                row.asset_id = Some(hex::encode(cat.asset_id));
+                row.hint = Some(hex::encode(cat.owner_p2));
+            }
+            row
+        })
         .collect();
     if rows.len() != states.len() {
         tracing::warn!(
@@ -724,7 +833,11 @@ pub async fn apply_coin_states(
 /// with an even amount is an ordinary XCH coin and is skipped (never fetches a parent
 /// spend). Attribution reads only; it never signs or broadcasts.
 pub struct CatAttributor<'a> {
-    /// The parent-spend source (coinset/peer point-read) uncurrying reads through.
+    /// The parent-spend source the whole-replica attribution pass reads through.
+    ///
+    /// The ONE lineage source this type holds. An earlier shape split it in two because a second,
+    /// admission-time leg competed with this one for a read allowance; that leg is gone, and with
+    /// it the starvation the split existed to prevent.
     pub lineage: &'a dyn LineageSource,
     /// The address bech32m prefix for any reconstructed NFT/DID addresses.
     pub prefix: &'a str,
@@ -779,13 +892,13 @@ pub async fn handle_coin_state_update(
     update: &CoinStateUpdate,
     events: &EventBus,
     session: &mut SessionState<'_>,
-) -> Result<(), SyncError> {
+) -> Result<FrameApplied, SyncError> {
     if !session.authority.trust().is_authoritative() {
         tracing::debug!(
             claimed_height = update.height,
             "wallet sync: dropping a coin_state_update from a discovered peer"
         );
-        return Ok(());
+        return Ok(FrameApplied::Dropped);
     }
     // Judged BEFORE the frame acts, not at the write. A guard sitting on the `set_peak` call would
     // satisfy "the peak is unchanged" identically while the rollback below had already deleted
@@ -794,7 +907,7 @@ pub async fn handle_coin_state_update(
     // coins included, which is also the conservative reading of coins offered alongside one.
     let admitted = match session.admit_peak(update.height)? {
         PeakClaim::Admitted(peak) => peak,
-        PeakClaim::Refused => return Ok(()),
+        PeakClaim::Refused => return Ok(FrameApplied::Dropped),
     };
     let current_peak = db.sync_state().await?.peak_height;
     let mut moved_backwards = false;
@@ -823,7 +936,9 @@ pub async fn handle_coin_state_update(
         );
         db.set_initial_sync_complete(false).await?;
     }
-    apply_coin_states(db, &update.items, session.subscribed).await?;
+    // The peak is recorded only after the batch has landed: advancing it first would leave the
+    // replica claiming to be current at a height whose coins it had not yet written.
+    apply_coin_states(db, &update.items, session.subscribed, session.derived_cats).await?;
     db.record_peak(admitted, &hex::encode(update.peak_hash))
         .await?;
     // Incoming-funds arrivals (dig_ecosystem#2548), recorded AFTER the batch has committed and
@@ -848,7 +963,21 @@ pub async fn handle_coin_state_update(
         );
     }
     events.publish(SyncEvent::CoinState);
-    Ok(())
+    Ok(FrameApplied::Applied)
+}
+
+/// Whether a `coin_state_update` frame reached the database at all.
+///
+/// Returned so the caller can decide whether the follow-up attribution pass is worth running. A
+/// frame dropped for coming from a discovered peer, or for claiming a peak this session will not
+/// admit, changed nothing — and running the pass after it was how an *empty, refused* frame from
+/// an untrusted peer still drove a whole-replica scan and a chain read per candidate row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameApplied {
+    /// The frame's coins and peak were written.
+    Applied,
+    /// The frame was refused before any database write.
+    Dropped,
 }
 
 /// The one peer call [`initial_sync_with_authority`] makes, behind a trait.
@@ -898,6 +1027,11 @@ impl PuzzleStateSource for Peer {
 /// This is where the terminal height meets the session's [`PeakCeiling`] — see
 /// [`CatchUpReplay::finished_at`], which refuses an over-ceiling terminal rather than arming
 /// `initial_sync_complete` over it.
+// Eight parameters, and each one is a distinct thing the floor check must see for itself. Bundling
+// them into a context struct would move the trust inputs — the authority and the attributor — behind
+// one argument a caller could assemble wrongly, and this function exists precisely so that no
+// caller-side refactor can walk around them.
+#[allow(clippy::too_many_arguments)]
 pub async fn initial_sync_with_authority(
     peer: &dyn PuzzleStateSource,
     db: &WalletDb,
@@ -906,6 +1040,7 @@ pub async fn initial_sync_with_authority(
     peer_ip: &str,
     events: &EventBus,
     authority: WriteAuthority,
+    derived_cats: &DerivedCats,
 ) -> Result<(), SyncError> {
     let trust = authority.trust();
     // THE TRUST BOUNDARY. This is the only place a PEER can set `initial_sync_complete`, and
@@ -932,7 +1067,14 @@ pub async fn initial_sync_with_authority(
         return Err(SyncError::NoPuzzleHashes);
     }
 
-    let subscribed: SubscribedHashes = puzzle_hashes.iter().copied().collect();
+    // The set actually REQUESTED and admitted: the wallet's p2 hashes plus the CAT outer hashes
+    // it derived for its known assets. `puzzle_hashes` itself stays the p2 set, because
+    // `CatchUpReplay::finished_at` below records it as the ADDRESSES this catch-up covered and the
+    // read router compares that against the addresses the node follows. A CAT outer hash is not an
+    // address, and putting one there would answer a different question than the one asked.
+    let mut requested = puzzle_hashes.clone();
+    requested.extend(derived_cats.hashes());
+    let subscribed: SubscribedHashes = requested.iter().copied().collect();
     let mut previous_height: Option<u32> = None;
     let mut header_hash = genesis_challenge;
     events.publish(SyncEvent::Start {
@@ -957,7 +1099,7 @@ pub async fn initial_sync_with_authority(
         // path, which drops the peer and backs off.
         let respond = tokio::time::timeout(
             PEER_REQUEST_TIMEOUT,
-            peer.request_puzzle_state(puzzle_hashes.clone(), previous_height, header_hash),
+            peer.request_puzzle_state(requested.clone(), previous_height, header_hash),
         )
         .await
         .map_err(|_| {
@@ -987,7 +1129,7 @@ pub async fn initial_sync_with_authority(
             }
         }
 
-        apply_coin_states(db, &respond.coin_states, &subscribed).await?;
+        apply_coin_states(db, &respond.coin_states, &subscribed, derived_cats).await?;
         events.publish(SyncEvent::PuzzleBatchSynced);
 
         if respond.is_finished {
@@ -1036,9 +1178,15 @@ pub async fn run_update_loop(
         match message.msg_type {
             ProtocolMessageTypes::CoinStateUpdate => {
                 if let Ok(update) = decode::<CoinStateUpdate>(&message) {
-                    handle_coin_state_update(db, &update, events, session).await?;
-                    if let Some(a) = attributor {
-                        a.attribute(db).await?;
+                    let applied = handle_coin_state_update(db, &update, events, session).await?;
+                    // Only after a frame that actually WROTE something. A dropped frame leaves the
+                    // replica byte-identical, so a pass over it can only re-examine rows an
+                    // earlier pass already settled — work a peer gets to schedule for free by
+                    // sending frames the node has already refused.
+                    if applied == FrameApplied::Applied {
+                        if let Some(a) = attributor {
+                            a.attribute(db).await?;
+                        }
                     }
                 }
             }
@@ -1123,9 +1271,20 @@ mod tests {
         HashSet::from([Bytes32::new([OWNED; 32])])
     }
 
+    /// A wallet that recognises no CAT assets, for the many tests about peak/trust/rollback
+    /// behaviour that have nothing to do with attribution.
+    ///
+    /// `'static` so the session helpers below keep their single-argument shape; an empty
+    /// derivation makes every coin in those fixtures an ordinary subscribed p2 coin, which is
+    /// exactly what they mean to exercise.
+    fn no_cats() -> &'static DerivedCats {
+        static NO_CATS: std::sync::OnceLock<DerivedCats> = std::sync::OnceLock::new();
+        NO_CATS.get_or_init(DerivedCats::default)
+    }
+
     /// A session over `subscribed` whose peer the OPERATOR chose — full authority.
     fn operator(subscribed: &SubscribedHashes) -> SessionState<'_> {
-        SessionState::with_authority(subscribed, WriteAuthority::Operator)
+        SessionState::with_authority(subscribed, no_cats(), WriteAuthority::Operator)
     }
 
     /// A `new_peak_wallet` frame claiming `height`, exactly as it arrives on the wire.
@@ -1145,13 +1304,14 @@ mod tests {
 
     /// A session over a peer this node merely DISCOVERED — writes nothing.
     fn discovered(subscribed: &SubscribedHashes) -> SessionState<'_> {
-        SessionState::with_authority(subscribed, WriteAuthority::Discovered)
+        SessionState::with_authority(subscribed, no_cats(), WriteAuthority::Discovered)
     }
 
     /// A session over a DISCOVERED peer a quorum settled at `anchor` — full authority, bounded.
     fn corroborated(subscribed: &SubscribedHashes, anchor: u32) -> SessionState<'_> {
         SessionState::with_authority(
             subscribed,
+            no_cats(),
             WriteAuthority::Corroborated(PeakCeiling::from_corroborated(
                 anchor,
                 SESSION_MAX_LIFETIME,
@@ -1198,7 +1358,7 @@ mod tests {
             state(coin(1, 9, 1_000), Some(10), None),
             state(coin(2, 9, 2_000), Some(11), None),
         ];
-        apply_coin_states(&db, &states, &subscribed_owned())
+        apply_coin_states(&db, &states, &subscribed_owned(), no_cats())
             .await
             .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 3_000);
@@ -1209,14 +1369,24 @@ mod tests {
     async fn later_spend_state_marks_coin_spent() {
         let db = WalletDb::open_in_memory().await.unwrap();
         let c = coin(1, 9, 500);
-        apply_coin_states(&db, &[state(c, Some(10), None)], &subscribed_owned())
-            .await
-            .unwrap();
+        apply_coin_states(
+            &db,
+            &[state(c, Some(10), None)],
+            &subscribed_owned(),
+            no_cats(),
+        )
+        .await
+        .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 500);
         // The peer later reports the same coin as spent.
-        apply_coin_states(&db, &[state(c, Some(10), Some(20))], &subscribed_owned())
-            .await
-            .unwrap();
+        apply_coin_states(
+            &db,
+            &[state(c, Some(10), Some(20))],
+            &subscribed_owned(),
+            no_cats(),
+        )
+        .await
+        .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 0);
     }
 
@@ -1238,6 +1408,7 @@ mod tests {
                 state(coin(2, OWNED, 7_000), Some(20), None),
             ],
             &subscribed,
+            no_cats(),
         )
         .await
         .unwrap();
@@ -1253,6 +1424,7 @@ mod tests {
                 state(coin(2, OWNED, 7_000), Some(20), None),
             ],
             &subscribed,
+            no_cats(),
         )
         .await
         .unwrap();
@@ -1357,6 +1529,7 @@ mod tests {
             &db,
             &[state(coin(1, 9, 5), Some(10), Some(30))],
             &subscribed_owned(),
+            no_cats(),
         )
         .await
         .unwrap();
@@ -1388,6 +1561,7 @@ mod tests {
             &db,
             &[state(coin(1, 9, 5), Some(10), None)],
             &subscribed_owned(),
+            no_cats(),
         )
         .await
         .unwrap();
@@ -1429,6 +1603,7 @@ mod tests {
                 None,
             )],
             &subscribed_owned(),
+            no_cats(),
         )
         .await
         .unwrap();
@@ -1717,6 +1892,7 @@ mod tests {
                 "127.0.0.1",
                 &events,
                 WriteAuthority::Operator,
+                no_cats(),
             ),
         )
         .await
@@ -1757,6 +1933,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Operator,
+            no_cats(),
         )
         .await
         .expect_err("an empty subscription set must be refused, not performed");
@@ -1827,6 +2004,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Operator,
+            no_cats(),
         )
         .await
         .expect("a non-empty subscription set catches up normally");
@@ -1933,6 +2111,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Discovered,
+            no_cats(),
         )
         .await
         .expect_err("a discovered peer must not be allowed to run a catch-up");
@@ -2003,6 +2182,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Discovered,
+            no_cats(),
         )
         .await
         .expect_err("the reconnect must not buy a fresh catch-up");
@@ -2102,7 +2282,7 @@ mod tests {
                 rx,
                 &events,
                 None,
-                &mut SessionState::with_authority(&subscribed, authority),
+                &mut SessionState::with_authority(&subscribed, no_cats(), authority),
             )
             .await
             .unwrap();
@@ -2308,6 +2488,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Operator,
+            no_cats(),
         )
         .await
         .expect_err("a non-advancing catch-up must be refused");
@@ -2332,7 +2513,7 @@ mod tests {
     /// CAT can be attributed. (The full uncurry→`get_cats` path is proven in `sage::rpc`.)
     #[tokio::test]
     async fn run_update_loop_runs_attribution_when_attributor_present() {
-        use crate::sage::singleton::{LineageSource, ParentSpend};
+        use crate::sage::singleton::LineageSource;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -2345,9 +2526,9 @@ mod tests {
                 &self,
                 _parent_coin_id: &str,
                 _spent_height: u32,
-            ) -> crate::sage::Result<Option<ParentSpend>> {
+            ) -> crate::sage::Result<crate::sage::singleton::LineageAnswer> {
                 self.hits.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
+                Ok(crate::sage::singleton::LineageAnswer::Absent)
             }
         }
 
@@ -2396,6 +2577,311 @@ mod tests {
         );
     }
 
+    /// A lineage source that COUNTS reads and would answer every one of them.
+    ///
+    /// Always-answering on purpose. A source that refused would make "zero reads" true for the
+    /// wrong reason — the nearest wrong implementation is one that reads and is merely rebuffed,
+    /// and that implementation must fail these tests, not pass them.
+    use crate::sage::singleton::LineageAnswer;
+
+    struct CountingLineage(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl LineageSource for CountingLineage {
+        async fn parent_spend(
+            &self,
+            _parent_coin_info: &str,
+            _height: u32,
+        ) -> crate::sage::Result<LineageAnswer> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(LineageAnswer::Absent)
+        }
+    }
+
+    /// The wallet p2 hash and the $DIG asset id used by the derived-hash tests.
+    fn owner_p2() -> Bytes32 {
+        Bytes32::from([7u8; 32])
+    }
+
+    fn dig_asset() -> Bytes32 {
+        digstore_chain::dig::DIG_ASSET_ID
+    }
+
+    /// A confirmed CAT coin sitting at the derived outer hash, with a DISTINCT parent per index.
+    ///
+    /// Distinct parents matter: a fixture reusing one parent could be bounded by any caching
+    /// layer, so it could not tell "issues no reads" from "issues one read and reuses it".
+    fn cat_coin_at(outer: Bytes32, n: u32) -> CoinState {
+        let mut parent = [0u8; 32];
+        parent[..4].copy_from_slice(&n.to_be_bytes());
+        CoinState {
+            coin: Coin {
+                parent_coin_info: Bytes32::from(parent),
+                puzzle_hash: outer,
+                amount: 1_000 + u64::from(n),
+            },
+            spent_height: None,
+            created_height: Some(100 + n),
+        }
+    }
+
+    /// **Proves (dig-node#380, #382):** a CAT coin at a DERIVED outer puzzle hash is admitted, and
+    /// is stored carrying BOTH its asset id and its owner hint.
+    ///
+    /// # Why the hint is asserted separately from the asset id
+    ///
+    /// They are two different failure modes and only one of them is visible in a balance. The CAT
+    /// balance query scopes by `hint`, not by `puzzle_hash`, so a row admitted with the right
+    /// `asset_id` and a NULL `hint` is stored, correctly typed, and still reads as zero — which is
+    /// dig-node#382's exact symptom reached by a new route. Asserting only the asset id would go
+    /// green on precisely that bug.
+    #[tokio::test]
+    async fn a_coin_at_a_derived_cat_hash_arrives_attributed_with_its_owner_hint() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[owner_p2()], &[dig_asset()]);
+        let outer = derived.hashes()[0];
+        // The construction is the wallet's canonical one, not a second spelling of the curry.
+        assert_eq!(
+            outer,
+            digstore_chain::cat::cat_puzzle_hash(owner_p2(), dig_asset()),
+            "the derived hash must be the canonical CAT outer hash"
+        );
+
+        let subscribed: SubscribedHashes = std::iter::once(owner_p2())
+            .chain(derived.hashes())
+            .collect();
+        apply_coin_states(&db, &[cat_coin_at(outer, 1)], &subscribed, &derived)
+            .await
+            .unwrap();
+
+        let rows = db.all_coins().await.unwrap();
+        assert_eq!(rows.len(), 1, "the derived-hash coin must be admitted");
+        assert_eq!(
+            rows[0].asset_id.as_deref(),
+            Some(hex::encode(dig_asset()).as_str()),
+            "admitted with its asset id, from the derivation that matched"
+        );
+        assert_eq!(
+            rows[0].hint.as_deref(),
+            Some(hex::encode(owner_p2()).as_str()),
+            "admitted with its owner hint — the column the CAT balance actually scopes by"
+        );
+    }
+
+    /// **Proves (dig-node#383):** admission issues ZERO outbound chain reads, and a coin at a hash
+    /// the wallet did NOT derive is still refused.
+    ///
+    /// # Why 300 coins over an always-answering source
+    ///
+    /// 300 is the same batch size the previous rounds measured a read budget with, so the numbers
+    /// compare directly: that shape issued roughly one read per admitted coin, and this one must
+    /// issue none. The source ANSWERS every read it is given, so a surviving read path shows up as
+    /// a count rather than as an error — an refusing source would hide a real read behind a
+    /// failure that looks like the intended refusal.
+    ///
+    /// The batch mixes a subscribed p2 coin, derived-CAT coins, and a coin at an UNDERIVED CAT
+    /// hash. The last one is the control: without it "zero reads" would also be satisfied by an
+    /// implementation that simply admitted everything it was offered.
+    #[tokio::test]
+    async fn admitting_a_large_batch_issues_no_chain_reads_and_still_refuses_a_stranger() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[owner_p2()], &[dig_asset()]);
+        let outer = derived.hashes()[0];
+        let subscribed: SubscribedHashes = std::iter::once(owner_p2())
+            .chain(derived.hashes())
+            .collect();
+
+        let mut states: Vec<CoinState> = (0..300).map(|n| cat_coin_at(outer, n)).collect();
+        // A coin at a CAT hash derived for somebody ELSE's p2. Structurally indistinguishable from
+        // ours to anything that does not check the set, and it must not be written.
+        let stranger = digstore_chain::cat::cat_puzzle_hash(Bytes32::from([9u8; 32]), dig_asset());
+        states.push(cat_coin_at(stranger, 9_000));
+
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = CountingLineage(reads.clone());
+        // Held so the source is genuinely reachable from the session: a counter that no wired
+        // source could ever increment proves nothing about the code under test.
+        let _ = &counting as &dyn LineageSource;
+
+        apply_coin_states(&db, &states, &subscribed, &derived)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "admission must issue no outbound chain reads at any batch size"
+        );
+        let rows = db.all_coins().await.unwrap();
+        assert_eq!(
+            rows.len(),
+            300,
+            "every derived-hash coin admitted; the stranger's refused"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.hint.as_deref() == Some(hex::encode(owner_p2()).as_str())),
+            "every admitted row carries the owner hint"
+        );
+    }
+
+    /// **Proves (dig-node#383):** a catch-up whose peer bursts spent and unspent coins together
+    /// completes, with no budget anywhere that a burst could exhaust.
+    ///
+    /// This is the catch-up-with-spent-burst probe the earlier rounds used, kept so the comparison
+    /// is direct. Under the previous shape the burst competed for a read allowance and could
+    /// starve the money path; here the same burst is a pure filter-and-upsert, so the assertion is
+    /// simply that everything offered at a recognised hash lands, spent rows included.
+    #[tokio::test]
+    async fn a_spent_burst_during_catch_up_costs_no_reads_and_loses_no_coins() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[owner_p2()], &[dig_asset()]);
+        let outer = derived.hashes()[0];
+        let subscribed: SubscribedHashes = std::iter::once(owner_p2())
+            .chain(derived.hashes())
+            .collect();
+
+        let states: Vec<CoinState> = (0..300)
+            .map(|n| {
+                let mut state = cat_coin_at(outer, n);
+                // Half the burst is already spent — the shape a long catch-up actually replays.
+                if n % 2 == 0 {
+                    state.spent_height = Some(200 + n);
+                }
+                state
+            })
+            .collect();
+
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = CountingLineage(reads.clone());
+        let _ = &counting as &dyn LineageSource;
+
+        apply_coin_states(&db, &states, &subscribed, &derived)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a spent burst issues no reads either"
+        );
+        let rows = db.all_coins().await.unwrap();
+        assert_eq!(rows.len(), 300, "no coin in the burst is lost");
+        assert_eq!(
+            rows.iter().filter(|r| r.spent_height.is_some()).count(),
+            150,
+            "the spent half is recorded as spent, not dropped"
+        );
+    }
+
+    /// **Proves (dig-node#383):** a frame the node REFUSED schedules no attribution work.
+    ///
+    /// # The fixture varies one actor and keeps an honest control
+    ///
+    /// Two runs over the same replica, the same seeded candidate row and the same frame. Only the
+    /// session's trust differs. An operator session must run the pass — that is the control, and
+    /// without it "zero reads" would be satisfied by an attributor that was simply never wired.
+    /// A discovered session must not, because its frame is dropped before any database write, so
+    /// the pass can only re-examine rows an earlier pass already settled.
+    ///
+    /// The frame is EMPTY on purpose. An empty, refused frame is the cheapest thing on the wire —
+    /// roughly forty bytes — and a peer that gets a whole-replica pass for it has an amplifier
+    /// whatever the read bound says, because the bound meters reads rather than frames.
+    #[tokio::test]
+    async fn a_refused_frame_schedules_no_attribution_pass() {
+        use crate::sage::singleton::LineageSource;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingLineage {
+            hits: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl LineageSource for CountingLineage {
+            async fn parent_spend(
+                &self,
+                _parent_coin_id: &str,
+                _spent_height: u32,
+            ) -> crate::sage::Result<crate::sage::singleton::LineageAnswer> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::sage::singleton::LineageAnswer::Absent)
+            }
+        }
+
+        /// Run one empty `coin_state_update` through the production loop and report how many
+        /// parent-spend reads the seeded candidate row cost.
+        async fn reads_for_one_empty_frame(authoritative: bool) -> usize {
+            let db = WalletDb::open_in_memory().await.unwrap();
+            db.set_peak(10, "aa").await.unwrap();
+            // One unattributed, unspent, confirmed coin at an unsubscribed hash: a candidate the
+            // pass will want to read the moment it runs.
+            db.upsert_coins(&[CoinRow {
+                coin_id: hex::encode([9u8; 32]),
+                parent_coin_info: hex::encode([8u8; 32]),
+                puzzle_hash: hex::encode([7u8; 32]),
+                amount: "1".into(),
+                created_height: Some(5),
+                spent_height: None,
+                asset_id: None,
+                hint: None,
+                created_timestamp: None,
+                spent_timestamp: None,
+            }])
+            .await
+            .unwrap();
+
+            let events = EventBus::with_capacity(8);
+            let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(4);
+            let update = CoinStateUpdate {
+                height: 11,
+                fork_height: 10,
+                peak_hash: Bytes32::new([2; 32]),
+                items: vec![],
+            };
+            tx.send(Message {
+                msg_type: ProtocolMessageTypes::CoinStateUpdate,
+                id: None,
+                data: chia_traits::Streamable::to_bytes(&update).unwrap().into(),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+
+            let hits = Arc::new(AtomicUsize::new(0));
+            let lineage = CountingLineage { hits: hits.clone() };
+            let plain = HashSet::new();
+            let attributor = CatAttributor {
+                lineage: &lineage,
+                prefix: "xch",
+                plain_puzzle_hashes: &plain,
+            };
+            let subscribed = subscribed_owned();
+            let mut session = if authoritative {
+                operator(&subscribed)
+            } else {
+                discovered(&subscribed)
+            };
+            run_update_loop(&db, receiver, &events, Some(&attributor), &mut session)
+                .await
+                .unwrap();
+            hits.load(Ordering::SeqCst)
+        }
+
+        assert_eq!(
+            reads_for_one_empty_frame(true).await,
+            1,
+            "control: an APPLIED frame runs the pass, so the fixture really does present a \
+             candidate row that costs a read"
+        );
+        assert_eq!(
+            reads_for_one_empty_frame(false).await,
+            0,
+            "a frame dropped before any database write must schedule no work at all; running the \
+             pass after it lets a peer buy a whole-replica scan for an empty frame it already \
+             knows will be refused"
+        );
+    }
+
     // ---------------------------------------------------------------------------------------
     // The corroborated peak ceiling (dig_ecosystem#2851).
     // ---------------------------------------------------------------------------------------
@@ -2437,6 +2923,7 @@ mod tests {
             "1.2.3.4",
             &events,
             authority,
+            no_cats(),
         )
         .await
     }
@@ -2749,7 +3236,7 @@ mod tests {
         db: &WalletDb,
         session: &mut SessionState<'_>,
         update: CoinStateUpdate,
-    ) -> Result<(), SyncError> {
+    ) -> Result<FrameApplied, SyncError> {
         handle_coin_state_update(db, &update, &EventBus::default(), session).await
     }
 
@@ -2885,6 +3372,7 @@ mod tests {
             &db,
             &[state(coin(1, OWNED, 5_000), Some(anchor - 5), None)],
             &subscribed_owned(),
+            no_cats(),
         )
         .await
         .unwrap();

@@ -32,8 +32,9 @@ use super::spend::{
     Broadcaster, ChiaQueryBroadcaster, ChiaQueryConfirmer, Confirmer, ConfirmingBroadcaster,
 };
 use super::sync_supervisor::{
-    spawn_supervisor, ChiaPeerSessionFactory, ChiaQuorumCorroborator, FallbackChainTip, Supervisor,
-    SyncHandle, TokioTime, UnionPuzzleHashSource, SESSION_MAX_LIFETIME,
+    spawn_supervisor, Attribution, ChiaPeerSessionFactory, ChiaQuorumCorroborator,
+    FallbackChainTip, Supervisor, SyncHandle, TokioTime, UnionPuzzleHashSource,
+    KNOWN_CAT_ASSET_IDS, SESSION_MAX_LIFETIME,
 };
 use super::tipping::{ChainOwnerResolver, NodeTipSpender, SystemClock, TipEventBus, TippingEngine};
 use super::transport::SharedCert;
@@ -230,8 +231,29 @@ impl WalletService {
         // writes", never a silent downgrade.
         // The task handle is dropped deliberately: the supervisor lives for the process, and
         // its stop signal is `SyncHandle::shutdown`, not a dropped join handle.
+        // Attribution rides the SAME shared client as every other chain read, and is built here
+        // rather than inside `build_live_wallet` on purpose: uncurrying a parent spend to recover
+        // a CAT's asset id is a READ. Gating it on `enable_live_broadcast` — the flag that means
+        // "this node may spend" — would leave every read-only install unable to name the $DIG it
+        // holds, which is exactly the shape of dig-node#382.
+        let attribution: Option<Arc<Attribution>> = if cfg.enable_chain_sync {
+            match chain.shared_client().await {
+                Ok(query) => Some(Arc::new(Attribution::new(
+                    Arc::new(ChiaQueryLineage::new(query)),
+                    WalletConfig::default().address_prefix,
+                ))),
+                Err(e) => {
+                    warn_chain_source_unavailable(&e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let sync = if cfg.enable_chain_sync {
             Some(spawn_supervisor(Supervisor {
+                attribution,
+                cat_asset_ids: KNOWN_CAT_ASSET_IDS.to_vec(),
                 db: db.clone(),
                 puzzle_hashes: Arc::new(UnionPuzzleHashSource::new(
                     custody.clone(),
