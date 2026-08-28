@@ -1041,19 +1041,6 @@ fn subscriptions_action(cmd: Option<SubscriptionsCommand>) -> ControlAction {
     }
 }
 
-/// Map the `chia-peers` subcommand to its [`ControlAction`] (no sub-action → list the peers).
-///
-/// Listing is the default because it is the only harmless one of the three: defaulting to `add`
-/// would make a bare `dign chia-peers` grant trust, and a default must never be the act that
-/// costs something.
-/// Map the `collateral` subcommand to its [`ControlAction`], resolving a margin preset name.
-///
-/// A preset resolves to the SAME basis-point constant `dig-mirror-collateral` publishes, rather
-/// than to a number spelled out here. A second spelling of "generous" is how one surface comes to
-/// post a different amount than another for a setting the operator believes is one choice.
-///
-/// An unrecognised word is REFUSED, never silently treated as a number or as the default: a typo
-/// that fell through to the default would change what this node posts without saying so.
 /// Parse a `--balance` operand in DIG into DIG base units.
 ///
 /// $DIG has THREE decimals and its base unit is 0.001 DIG. Parsed as text and scaled by integer
@@ -1086,6 +1073,14 @@ fn parse_dig_amount(raw: Option<&str>) -> std::io::Result<Option<u64>> {
         .ok_or_else(refuse)
 }
 
+/// Map the `collateral` subcommand to its [`ControlAction`], resolving a margin preset name.
+///
+/// A preset resolves to the SAME basis-point constant `dig-mirror-collateral` publishes, rather
+/// than to a number spelled out here. A second spelling of "generous" is how one surface comes to
+/// post a different amount than another for a setting the operator believes is one choice.
+///
+/// An unrecognised word is REFUSED, never silently treated as a number or as the default: a typo
+/// that fell through to the default would change what this node posts without saying so.
 fn collateral_action(cmd: Option<CollateralCommand>) -> std::io::Result<ControlAction> {
     use dig_mirror_collateral::{
         SAFETY_MARGIN_BP_DEFAULT, SAFETY_MARGIN_BP_GENEROUS, SAFETY_MARGIN_BP_TIGHT,
@@ -1116,6 +1111,11 @@ fn collateral_action(cmd: Option<CollateralCommand>) -> std::io::Result<ControlA
     }
 }
 
+/// Map the `chia-peers` subcommand to its [`ControlAction`] (no sub-action → list the peers).
+///
+/// Listing is the default because it is the only harmless one of the three: defaulting to `add`
+/// would make a bare `dign chia-peers` grant trust, and a default must never be the act that
+/// costs something.
 fn chia_peers_action(cmd: Option<ChiaPeersCommand>) -> ControlAction {
     match cmd {
         None | Some(ChiaPeersCommand::List) => ControlAction::ChiaPeersList,

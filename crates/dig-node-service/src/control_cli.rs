@@ -765,7 +765,13 @@ pub fn collateral_buffer(
         ControlAction::CollateralMarginGet.method(),
         json!({}),
     )?;
-    let margin_bp = margin_json["margin_bp"].as_u64().unwrap_or(0);
+    // Decoded typed and REFUSED if undecodable, never defaulted to zero. A zero margin is a
+    // legitimate setting, so a missing one substituted for it is indistinguishable from a real
+    // answer — and it understates the recommendation by exactly the cushion the operator chose,
+    // which is enough to render `BelowRecommendedBuffer` as `Funded`.
+    let margin: dig_node_control_interface::results::CollateralMarginResult =
+        serde_json::from_value(margin_json).map_err(std::io::Error::other)?;
+    let margin_bp = margin.margin_bp;
 
     let advice = buffer_advice(
         pairs_served,
@@ -902,43 +908,88 @@ fn summarize_collateral_buffer(result: &Value) -> String {
 /// The unknown branch prints the REASON, never a zero. Each reason names a different missing fact
 /// because the remedies differ: a node that has not censused the epoch needs to run the census,
 /// whereas one inside the finality depth only needs to wait.
+///
+/// # Why this decodes typed instead of guarding on the `state` string
+///
+/// An earlier version tested `state == "unknown"` positively and let EVERY other payload fall
+/// through to a formatter whose fields were each `unwrap_or(0)`. That renders an unrecognised state
+/// as a real epoch number beside a fabricated `0.000 DIG per store` — which reads as authoritative
+/// rather than degraded, and is the exact money lie the unknown branch exists to prevent. An
+/// operator acting on it posts nothing and leaves every store root uncollateralised.
+///
+/// The trigger is a PLANNED event, not a failure. [`CollateralRequirementResult`] is
+/// `#[serde(tag = "state")]`, so a new variant is an ADDITIVE contract change, and `dign` and the
+/// node are separately installed binaries — so the next minor would make every already-installed
+/// `dign` print it. Decoding typed means an undecodable payload is reported as undecodable, exactly
+/// as [`summarize_collateral_buffer`] already does.
 fn summarize_collateral_requirement(result: &Value) -> String {
-    if result["state"].as_str() == Some("unknown") {
-        let (reason, remedy) = match result["reason"].as_str().unwrap_or("") {
-            "not_censused" => (
-                "this node has not censused the epoch",
-                "run the census for this epoch",
-            ),
-            "behind_finality_depth" => (
-                "the epoch's census inputs are not final yet",
-                "wait for the chain to settle",
-            ),
-            "record_unreadable" => (
-                "the record for this epoch could not be read",
-                "re-run the census for this epoch",
-            ),
-            "no_chain_source" => ("this node cannot see the chain", "configure a chain source"),
-            other => (other, "unknown"),
-        };
-        // Emphatically NOT "0 DIG". An absent requirement rendered as a zero cost is the money lie
-        // this surface exists to prevent.
-        return format!("collateral requirement UNKNOWN — {reason} · {remedy}");
-    }
+    use dig_node_control_interface::results::{
+        CollateralRequirementResult, CollateralUnknownReason,
+    };
 
-    let dig = |key: &str| crate::collateral::format_dig(result[key].as_u64().unwrap_or(0));
-    let multiplier = result["multiplier_micros"].as_u64().unwrap_or(0);
+    let answer = match serde_json::from_value::<CollateralRequirementResult>(result.clone()) {
+        Ok(answer) => answer,
+        // A payload this build cannot decode is reported as such, never as a figure. Guessing at a
+        // partially-understood money answer is worse than saying the node spoke a shape we do not
+        // know.
+        Err(e) => return format!("collateral requirement: unreadable answer from the node ({e})"),
+    };
+
+    let (epoch, protocol_version, required, stores, owners, multiplier, handicap) = match answer {
+        CollateralRequirementResult::Unknown { reason } => {
+            let (reason, remedy) = match reason {
+                CollateralUnknownReason::NotCensused => (
+                    "this node has not censused the epoch",
+                    "run the census for this epoch",
+                ),
+                CollateralUnknownReason::BehindFinalityDepth => (
+                    "the epoch's census inputs are not final yet",
+                    "wait for the chain to settle",
+                ),
+                CollateralUnknownReason::RecordUnreadable => (
+                    "the record for this epoch could not be read",
+                    "re-run the census for this epoch",
+                ),
+                CollateralUnknownReason::NoChainSource => {
+                    ("this node cannot see the chain", "configure a chain source")
+                }
+            };
+            // Emphatically NOT "0 DIG". An absent requirement rendered as a zero cost is the money
+            // lie this surface exists to prevent.
+            return format!("collateral requirement UNKNOWN — {reason} · {remedy}");
+        }
+        CollateralRequirementResult::Known {
+            epoch,
+            protocol_version,
+            required_per_store_dig_base_units,
+            stores,
+            owners,
+            multiplier_micros,
+            handicap_dig_base_units,
+        } => (
+            epoch,
+            protocol_version,
+            required_per_store_dig_base_units,
+            stores,
+            owners,
+            multiplier_micros,
+            handicap_dig_base_units,
+        ),
+    };
+
+    let dig = crate::collateral::format_dig;
     format!(
         "epoch {} (protocol v{}) — {} DIG per store, before any safety margin\n  \
          from {} advertisement(s) across {} collateralised owner(s) · multiplier {}.{:06}x · \
          handicap {} DIG",
-        result["epoch"].as_u64().unwrap_or(0),
-        result["protocol_version"].as_u64().unwrap_or(0),
-        dig("required_per_store_dig_base_units"),
-        result["stores"].as_u64().unwrap_or(0),
-        result["owners"].as_u64().unwrap_or(0),
+        epoch,
+        protocol_version,
+        dig(required),
+        stores,
+        owners,
         multiplier / 1_000_000,
         multiplier % 1_000_000,
-        dig("handicap_dig_base_units"),
+        dig(handicap),
     )
 }
 
@@ -947,8 +998,19 @@ fn summarize_collateral_requirement(result: &Value) -> String {
 /// A margin shown alone is a number of basis points and nothing more. Shown beside the per-store
 /// amount it adds, it is a decision an operator can make — which is the whole point of exposing the
 /// setting rather than just storing it.
+///
+/// Decoded typed for the same reason as [`summarize_collateral_requirement`]: zero is a legitimate
+/// margin, so an absent one substituted for it reads as a deliberate choice the operator did not
+/// make — and this line is what they check after `margin set`, which makes it the one place a
+/// silently-defaulted zero would be believed.
 fn summarize_margin(result: &Value) -> String {
-    let bp = result["margin_bp"].as_u64().unwrap_or(0);
+    let bp = match serde_json::from_value::<
+        dig_node_control_interface::results::CollateralMarginResult,
+    >(result.clone())
+    {
+        Ok(margin) => margin.margin_bp,
+        Err(e) => return format!("safety margin: unreadable answer from the node ({e})"),
+    };
     let preset = match bp {
         b if b == dig_mirror_collateral::SAFETY_MARGIN_BP_TIGHT => " (tight)",
         b if b == dig_mirror_collateral::SAFETY_MARGIN_BP_DEFAULT => " (default)",
@@ -1201,6 +1263,131 @@ mod tests {
         );
         assert!(line.contains("0.900000x"), "{line}");
         assert!(line.contains("0.720 DIG"), "{line}");
+    }
+
+    /// A payload this build cannot decode must render as UNREADABLE — never as a figure, and never
+    /// as the `unknown` branch either.
+    ///
+    /// # What each fixture distinguishes
+    ///
+    /// The nearest wrong implementation is the one this replaced: guard positively on
+    /// `state == "unknown"`, and let everything else fall through to a formatter of
+    /// `unwrap_or(0)`s. It renders a REAL epoch number beside a fabricated `0.000 DIG per store`,
+    /// which reads as authoritative rather than degraded.
+    ///
+    /// So the fixtures carry `epoch: 104` — the SAME epoch as the truthful control above — and the
+    /// assertions forbid it appearing. A renderer that leaked any real field through would print
+    /// `104` and fail here; asserting only the absence of `0.000` would not catch a formatter that
+    /// happened to be given a non-zero requirement.
+    ///
+    /// The `known`-with-a-missing-field case is the one that separates a typed decode from a
+    /// hybrid that matches the state string and then falls back per field: the state token is
+    /// perfectly valid there, and only a decode of the whole variant refuses it.
+    ///
+    /// This matters because the trigger is a PLANNED event: `CollateralRequirementResult` is
+    /// `#[serde(tag = "state")]`, so a new variant is additive, and `dign` ships separately from
+    /// the node — the next minor would put an unrecognised state in front of every installed CLI.
+    #[test]
+    fn an_undecodable_requirement_renders_unreadable_and_never_a_figure() {
+        let cases = [
+            // A state this build has never heard of — the additive-variant case.
+            (
+                "unrecognised state",
+                json!({ "state": "suspended", "epoch": 104 }),
+            ),
+            // No state tag at all.
+            ("empty object", json!({})),
+            // A VALID state token whose payload is short a required field. A positive guard on the
+            // string cannot tell this from a complete answer.
+            (
+                "known missing owners",
+                json!({
+                    "state": "known",
+                    "epoch": 104,
+                    "protocol_version": 1,
+                    "required_per_store_dig_base_units": 3_780u64,
+                    "stores": 17,
+                    "multiplier_micros": 900_000u64,
+                    "handicap_dig_base_units": 720u64,
+                }),
+            ),
+            // An unknown whose REASON this build does not recognise: the reason taxonomy is
+            // additive too, and a reason rendered as an empty remedy is its own small lie.
+            (
+                "unrecognised reason",
+                json!({ "state": "unknown", "reason": "awaiting_peer_quorum" }),
+            ),
+        ];
+
+        for (label, payload) in cases {
+            let line = summarize_collateral_requirement(&payload);
+            assert!(
+                line.contains("unreadable answer from the node"),
+                "{label} was not reported as unreadable: {line}"
+            );
+            // Not a figure, at any value.
+            assert!(
+                !line.contains("per store"),
+                "{label} rendered a per-store figure: {line}"
+            );
+            assert!(
+                !line.contains("0.000"),
+                "{label} rendered a zero cost: {line}"
+            );
+            // Not a real field leaked from the payload. `104` is the live epoch in the truthful
+            // control above, so its presence here means the formatter ran.
+            assert!(
+                !line.contains("104"),
+                "{label} leaked a real field into a degraded line: {line}"
+            );
+            // And not misreported as the node having NAMED a missing fact, which would send the
+            // operator to run a census that would not help.
+            assert!(
+                !line.contains("UNKNOWN"),
+                "{label} borrowed the unknown branch: {line}"
+            );
+        }
+    }
+
+    /// An undecodable margin must not render as `0 bp`.
+    ///
+    /// Zero is a LEGITIMATE margin, which is what makes the old `unwrap_or(0)` dangerous here:
+    /// unlike an absent requirement, an absent margin substituted for zero is indistinguishable
+    /// from a real answer, and this line is what an operator reads back after `margin set` to
+    /// confirm the setting took. The `250` fixture is the distinguishing one — a renderer that
+    /// leaked the payload through would still find no `margin_bp`, so the fixture instead proves
+    /// the ADJACENT well-formed value renders, keeping a truthful control beside the refusal.
+    #[test]
+    fn an_undecodable_margin_renders_unreadable_and_never_zero_bp() {
+        for (label, payload) in [
+            ("empty object", json!({})),
+            ("wrong type", json!({ "margin_bp": "250" })),
+            ("negative", json!({ "margin_bp": -1 })),
+            ("misspelled field", json!({ "marginBp": 250 })),
+        ] {
+            let line = summarize_margin(&payload);
+            assert!(
+                line.contains("unreadable answer from the node"),
+                "{label} was not reported as unreadable: {line}"
+            );
+            assert!(
+                !line.contains("0 bp"),
+                "{label} rendered a fabricated zero margin: {line}"
+            );
+            assert!(
+                !line.contains('%'),
+                "{label} rendered a percentage from an unknown: {line}"
+            );
+        }
+        // The truthful control: the same shape, well-formed, still renders its real value.
+        assert!(summarize_margin(&json!({ "margin_bp": 250 })).contains("250 bp"));
+        // And a genuine zero margin is still reportable as itself.
+        let zero = summarize_margin(&json!({ "margin_bp": 0 }));
+        assert!(zero.contains("0 bp"), "{zero}");
+        assert!(
+            !zero.contains("unreadable"),
+            "a real zero margin must not be reported as unreadable: {zero}"
+        );
     }
 
     #[test]
