@@ -151,6 +151,23 @@ pub enum ControlAction {
     /// `control.chiaPeers.list` — the tracked Chia full-node peers, with the `user_managed` flag
     /// that says which of them are trusted without corroboration.
     ChiaPeersList,
+    /// `control.collateral.requirement` — this epoch's per-store collateral requirement, with the
+    /// census inputs behind it, or a NAMED reason the node cannot state it.
+    ///
+    /// The answer is consensus-derived and identical on every node. It carries no safety margin:
+    /// the margin is this operator's local preference, and folding it in here would make a private
+    /// choice look like the network's price.
+    CollateralRequirement,
+    /// `control.collateral.margin.get` — the node's local safety margin, in basis points.
+    CollateralMarginGet,
+    /// `control.collateral.margin.set` — persist the local safety margin.
+    ///
+    /// The node is the authoritative home for this setting: the flywheel is headless, so a machine
+    /// with no GUI must be able to set it from the command line.
+    CollateralMarginSet {
+        /// The margin in BASIS POINTS (`100` is +1%), already resolved from any preset name.
+        margin_bp: u64,
+    },
     /// `control.chiaPeers.remove` — stop trusting a Chia full node (`ban` keeps it excluded so
     /// discovery cannot re-add it).
     ChiaPeersRemove { ip: String, ban: bool },
@@ -205,6 +222,9 @@ impl ControlAction {
             ControlAction::SubsRemove { .. } => "control.unsubscribe",
             ControlAction::ChiaPeersAdd { .. } => "control.chiaPeers.add",
             ControlAction::ChiaPeersList => "control.chiaPeers.list",
+            ControlAction::CollateralRequirement => "control.collateral.requirement",
+            ControlAction::CollateralMarginGet => "control.collateral.margin.get",
+            ControlAction::CollateralMarginSet { .. } => "control.collateral.margin.set",
             ControlAction::ChiaPeersRemove { .. } => "control.chiaPeers.remove",
         }
     }
@@ -235,6 +255,9 @@ impl ControlAction {
 
         match self {
             ControlAction::ConfigSetUpstream { url } => json!({ "upstream": url }),
+            // Basis points, never a percentage and never a float. A 1 bp margin (0.01%) is a legal
+            // choice and any conversion to whole percent would erase it.
+            ControlAction::CollateralMarginSet { margin_bp } => json!({ "margin_bp": margin_bp }),
             ControlAction::CacheSetCap { bytes } => json!({ "cap_bytes": bytes }),
             ControlAction::StoresPin { store }
             | ControlAction::StoresUnpin { store }
@@ -445,6 +468,11 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         // (dig_ecosystem#2870).
         ControlAction::ChiaPeersAdd { ip: String::new() }.method(),
         ControlAction::ChiaPeersList.method(),
+        // `dign collateral requirement` and `dign collateral margin [set …]` drive the
+        // deterministic mirror-coin collateral surface (dig_ecosystem#3173).
+        ControlAction::CollateralRequirement.method(),
+        ControlAction::CollateralMarginGet.method(),
+        ControlAction::CollateralMarginSet { margin_bp: 0 }.method(),
         ControlAction::ChiaPeersRemove {
             ip: String::new(),
             ban: false,
@@ -462,6 +490,12 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         "control.peerStatus",
         "control.peers.connect",
         "control.peers.ping",
+        // `dign spends list` drives the automated-spend audit record (dig-node#385). It reads the
+        // same node-private file through the same `SpendLog`, so the CLI and the control method
+        // cannot disagree about what the record says -- which is the property the contract's
+        // "only sanctioned reader" rule is protecting, and the reason this is one verb rather than
+        // a second parser.
+        "control.spends.list",
         // `dig-node pair …` drives the pairing-admin methods (#280).
         "control.pairing.list",
         "control.pairing.approve",
@@ -669,9 +703,93 @@ fn summarize(method: &str, result: &Value) -> String {
             };
             format!("{coins} direct child coin(s) — one hop, not a lineage{more}")
         }
+        "control.collateral.requirement" => summarize_collateral_requirement(result),
+        // Shown with its real cost, not as a bare setting: a margin is a number of basis points
+        // until someone says what it costs to hold.
+        "control.collateral.margin.get" | "control.collateral.margin.set" => {
+            summarize_margin(result)
+        }
         "control.updater.status" => summarize_updater_status(result),
         _ => compact(result),
     }
+}
+
+
+/// A concise human line for `control.collateral.requirement`.
+///
+/// The census inputs travel with the figure on purpose: a surface that can show only the number can
+/// say the price moved, while one holding `stores`, `owners`, the multiplier and the handicap can
+/// say WHY it moved — the difference between a figure an operator can weigh and one they can only
+/// accept.
+///
+/// The unknown branch prints the REASON, never a zero. Each reason names a different missing fact
+/// because the remedies differ: a node that has not censused the epoch needs to run the census,
+/// whereas one inside the finality depth only needs to wait.
+fn summarize_collateral_requirement(result: &Value) -> String {
+    if result["state"].as_str() == Some("unknown") {
+        let (reason, remedy) = match result["reason"].as_str().unwrap_or("") {
+            "not_censused" => (
+                "this node has not censused the epoch",
+                "run the census for this epoch",
+            ),
+            "behind_finality_depth" => (
+                "the epoch's census inputs are not final yet",
+                "wait for the chain to settle",
+            ),
+            "record_unreadable" => (
+                "the record for this epoch could not be read",
+                "re-run the census for this epoch",
+            ),
+            "no_chain_source" => (
+                "this node cannot see the chain",
+                "configure a chain source",
+            ),
+            other => (other, "unknown"),
+        };
+        // Emphatically NOT "0 DIG". An absent requirement rendered as a zero cost is the money lie
+        // this surface exists to prevent.
+        return format!("collateral requirement UNKNOWN — {reason} · {remedy}");
+    }
+
+    let dig = |key: &str| {
+        crate::collateral::format_dig(result[key].as_u64().unwrap_or(0))
+    };
+    let multiplier = result["multiplier_micros"].as_u64().unwrap_or(0);
+    format!(
+        "epoch {} (protocol v{}) — {} DIG per store, before any safety margin\n  \
+         from {} advertisement(s) across {} collateralised owner(s) · multiplier {}.{:06}x · \
+         handicap {} DIG",
+        result["epoch"].as_u64().unwrap_or(0),
+        result["protocol_version"].as_u64().unwrap_or(0),
+        dig("required_per_store_dig_base_units"),
+        result["stores"].as_u64().unwrap_or(0),
+        result["owners"].as_u64().unwrap_or(0),
+        multiplier / 1_000_000,
+        multiplier % 1_000_000,
+        dig("handicap_dig_base_units"),
+    )
+}
+
+/// A concise human line for the local safety margin, WITH what it costs.
+///
+/// A margin shown alone is a number of basis points and nothing more. Shown beside the per-store
+/// amount it adds, it is a decision an operator can make — which is the whole point of exposing the
+/// setting rather than just storing it.
+fn summarize_margin(result: &Value) -> String {
+    let bp = result["margin_bp"].as_u64().unwrap_or(0);
+    let preset = match bp {
+        b if b == dig_mirror_collateral::SAFETY_MARGIN_BP_TIGHT => " (tight)",
+        b if b == dig_mirror_collateral::SAFETY_MARGIN_BP_DEFAULT => " (default)",
+        b if b == dig_mirror_collateral::SAFETY_MARGIN_BP_GENEROUS => " (generous)",
+        _ => "",
+    };
+    // Percent is shown for readability only; the STORED unit is basis points, and a 1 bp margin
+    // must still read as 0.01% rather than rounding away to zero.
+    format!(
+        "safety margin {bp} bp{preset} = +{}.{:02}% over the per-store requirement",
+        bp / 100,
+        bp % 100,
+    )
 }
 
 /// A concise human line for the auto-update beacon status (`control.updater.status`). The rich

@@ -199,6 +199,10 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.reservations.reserve",
     "control.wallet.reservations.release",
     "control.wallet.broadcast",
+    "control.spends.list",
+    "control.collateral.requirement",
+    "control.collateral.margin.get",
+    "control.collateral.margin.set",
     "control.profile.putBody",
     "control.profile.getBody",
     "control.updater.status",
@@ -258,6 +262,10 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.reservations.reserve",
     "control.wallet.reservations.release",
     "control.wallet.broadcast",
+    "control.spends.list",
+    "control.collateral.requirement",
+    "control.collateral.margin.get",
+    "control.collateral.margin.set",
     "control.profile.putBody",
     "control.profile.getBody",
     "control.updater.status",
@@ -901,6 +909,15 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.profile.putBody" => profile_put_body(ctx, id, params).await,
         "control.profile.getBody" => profile_get_body(ctx, id, params).await,
         "control.peerCounts" => peer_counts(ctx, id).await,
+        // The automated-spend audit record (dig-node#385) -- a READ of this node's own spending
+        // history, and the only sanctioned reader of a node-private append-only file.
+        "control.spends.list" => spends_list(ctx, id, params),
+        // The deterministic mirror-coin collateral model (dig_ecosystem#3173). The requirement is
+        // consensus-derived and identical on every node; the margin is a LOCAL preference and the
+        // two are deliberately served by different methods so neither can be mistaken for the other.
+        "control.collateral.requirement" => collateral_requirement(ctx, id),
+        "control.collateral.margin.get" => collateral_margin_get(ctx, id),
+        "control.collateral.margin.set" => collateral_margin_set(ctx, id, params),
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
@@ -3101,6 +3118,194 @@ async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
             format!("{METHOD}: the profile body could not be read from disk: {e}"),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The automated-spend audit record and the deterministic mirror-coin collateral model.
+//
+// `control.spends.list` is the ONLY sanctioned reader of the audit record: it is a node-private
+// file, and a second process parsing a growing append-only format is how two views of "what did
+// the node spend" start disagreeing, on the one subject where disagreeing is least affordable.
+// ---------------------------------------------------------------------------------------------
+
+/// `control.spends.list` — one page of the automated-spend audit record.
+///
+/// Decoding through [`SpendsListParams`] rather than by hand is deliberate: the contract validates
+/// the page bound inside its own `Deserialize`, so a limit of `0` or one above the cap is refused
+/// here without this handler having to remember to check. A `0` page makes no progress and a caller
+/// looping until `complete` would loop forever.
+fn spends_list(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    use dig_node_control_interface::params::SpendsListParams;
+
+    let params: SpendsListParams = match serde_json::from_value(params.clone()) {
+        Ok(p) => p,
+        Err(e) => return control_error(id, ErrorCode::InvalidParams, e.to_string()),
+    };
+    // `effective_limit` resolves an omitted limit on the contract's terms, so the node and the
+    // client cannot resolve the same absent field to two different page sizes.
+    let limit = params.effective_limit() as usize;
+    let query = crate::spend_audit::SpendQuery {
+        since_ms: params.since_ms,
+        until_ms: params.until_ms,
+        store_id: params.store_id.clone(),
+        kind: params.kind.clone(),
+        status: params.status.clone(),
+        after_id: params.after_id.clone(),
+        limit: Some(limit),
+    };
+
+    let log = crate::spend_audit::SpendLog::at(ctx.state_dir.join("spend-audit.jsonl"));
+    let ledger = match log.query(&query) {
+        Ok(l) => l,
+        // A cursor the record does not know is the caller's mistake, not a broken record.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            return control_error(id, ErrorCode::InvalidParams, e.to_string())
+        }
+        // Anything else means the node could not LOOK. That is never an empty page: "nothing to
+        // report" is the answer a person stops investigating on, and it must not be returned for a
+        // record that could not be read.
+        Err(e) => {
+            return control_error(
+                id,
+                ErrorCode::SpendAuditUnreadable,
+                format!("the automated-spend record could not be read: {e}"),
+            )
+        }
+    };
+
+    let cursor = crate::spend_audit::SpendLog::cursor_of(&ledger);
+    control_ok(
+        id,
+        json!({
+            "spends": ledger.records.iter().map(spend_row).collect::<Vec<_>>(),
+            "complete": ledger.complete,
+            // Both keys are always PRESENT. `null` is meaningful here, so an absent key must not
+            // decode into it: a truncated payload would otherwise read as a confident "there is
+            // nothing to look up".
+            "cursor": cursor,
+            "unreadable_lines": ledger.unreadable_lines,
+        }),
+    )
+}
+
+/// One audit row on the wire.
+///
+/// Amounts are decimal STRINGS. They carry the full `u64` range, which does not survive a JSON
+/// number through an f64 parser, and a silently rounded figure about somebody's money is exactly
+/// the lie this record exists to prevent.
+fn spend_row(r: &crate::spend_audit::SpendRecord) -> Value {
+    use crate::spend_audit::SpendStatus;
+
+    // The failure STAGE travels with a failure, never a bare "failed": only `Signing` means the
+    // money definitely did not move, so flattening the stage would make every client structurally
+    // unable to tell a person the truth about their money.
+    let status = match &r.status {
+        SpendStatus::Pending => json!({ "state": "pending" }),
+        SpendStatus::Submitted => json!({ "state": "submitted" }),
+        SpendStatus::Confirmed { height, coin_id } => json!({
+            "state": "confirmed",
+            "height": height,
+            "coin_id": coin_id.to_string(),
+        }),
+        SpendStatus::Failed { stage, reason } => json!({
+            "state": "failed",
+            "stage": stage.to_string(),
+            "reason": reason,
+        }),
+        SpendStatus::Unresolved { reason } => json!({
+            "state": "unresolved",
+            "reason": reason,
+        }),
+    };
+    json!({
+        "id": r.id,
+        "revision": r.revision,
+        "kind": r.kind.as_str(),
+        "purpose": r.purpose,
+        "authority": {
+            "principal": r.authority.principal,
+            "grant": r.authority.grant,
+        },
+        "asset": r.asset.to_string(),
+        "amount_mojos": r.amount_mojos.to_string(),
+        "fee_mojos": r.fee_mojos.to_string(),
+        "store_id": r.store_id,
+        "initiated_ms": r.initiated_ms,
+        "updated_ms": r.updated_ms,
+        "status": status,
+        "funding_coin_ids": r.funding_coin_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        // Carries its own observed/expected flag, so a client never has to re-derive the
+        // distinction between the coin the node INTENDS to create and one it has seen on chain.
+        "chain_reference": r.chain_reference().map(|c| json!({
+            "coin_id": c.coin_id.to_string(),
+            "confirmed": c.confirmed,
+        })),
+    })
+}
+
+/// This node's view of which collateral epoch is in force.
+///
+/// The epoch is NOT derived from the clock here. The collateral epoch schedule is a consensus fact
+/// anchored on chain, and a node that guessed it would post against the wrong epoch — so until the
+/// census names an epoch (dig-node#387), the honest answer is that nothing has been censused. That
+/// is a first-class answer, not an error, and it is why `control.collateral.requirement` returns a
+/// reason rather than a zero.
+fn current_collateral_epoch(_ctx: &ControlCtx) -> crate::collateral::CurrentEpoch {
+    crate::collateral::CurrentEpoch::NotCensused
+}
+
+/// `control.collateral.requirement` — this epoch's per-store requirement, or a named reason.
+///
+/// The local safety margin is deliberately not consulted: this figure is the consensus-derived one
+/// every node derives identically, and returning the margined amount would make this operator's
+/// preference look like the network's price.
+fn collateral_requirement(ctx: &ControlCtx, id: Value) -> Value {
+    let store = crate::collateral::EpochRecordStore::at(
+        ctx.state_dir.join("collateral-epochs.jsonl"),
+    );
+    let answer = crate::collateral::requirement(&store, current_collateral_epoch(ctx));
+    match serde_json::to_value(&answer) {
+        Ok(v) => control_ok(id, v),
+        Err(e) => control_error(id, ErrorCode::ControlError, e.to_string()),
+    }
+}
+
+/// `control.collateral.margin.get` — the node's local safety margin, in basis points.
+fn collateral_margin_get(ctx: &ControlCtx, id: Value) -> Value {
+    let cfg = crate::collateral::CollateralConfig::load_from(&ctx.state_dir);
+    control_ok(id, json!({ "margin_bp": cfg.margin_bp }))
+}
+
+/// `control.collateral.margin.set` — persist the margin and return what is now in force.
+///
+/// A value above the contract's ceiling is REFUSED rather than clamped, and the returned figure is
+/// what was actually stored. Clamping and returning the clamped value would leave the caller's
+/// stored intent and the node's behaviour disagreeing on the money path.
+fn collateral_margin_set(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    use dig_node_control_interface::params::CollateralMarginSetParams;
+
+    let parsed: CollateralMarginSetParams = match serde_json::from_value(params.clone()) {
+        Ok(p) => p,
+        Err(e) => return control_error(id, ErrorCode::InvalidParams, e.to_string()),
+    };
+    let parsed = match parsed.validated() {
+        Ok(p) => p,
+        Err(e) => return control_error(id, ErrorCode::InvalidParams, e.message),
+    };
+
+    let cfg = crate::collateral::CollateralConfig {
+        margin_bp: parsed.margin_bp,
+    };
+    // Persisted before it is reported. A margin that lapsed to the default on reboot would silently
+    // change what the node posts, so a write failure must not be answered with a success.
+    if let Err(e) = cfg.save_to(&ctx.state_dir) {
+        return control_error(
+            id,
+            ErrorCode::ControlError,
+            format!("failed to persist the safety margin: {e}"),
+        );
+    }
+    control_ok(id, json!({ "margin_bp": cfg.margin_bp }))
 }
 
 #[cfg(test)]

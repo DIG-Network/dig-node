@@ -197,6 +197,15 @@ enum Command {
     /// A different network from `peers`, which manages DIG gossip peers. Trusting a Chia peer
     /// grants it authority over this node's wallet replica without corroboration — see
     /// `chia-peers add --help`.
+    /// Inspect the collateral this node must post, and set your local safety margin.
+    ///
+    /// The requirement is decided by the network and is the same on every node. The margin is
+    /// yours: a cushion you hold on top, so an epoch whose price rises does not leave your stores
+    /// uncollateralised.
+    Collateral {
+        #[command(subcommand)]
+        action: Option<CollateralCommand>,
+    },
     ChiaPeers {
         #[command(subcommand)]
         action: Option<ChiaPeersCommand>,
@@ -575,6 +584,36 @@ enum PeersCommand {
 /// The ticket reference above is a Rust doc comment on the enum, NOT on a clap `#[derive]` field,
 /// so it never reaches `--help`. Doc comments on the VARIANTS below are user-facing help text and
 /// must stay free of internal task numbers (contract §4.3).
+/// `dig-node collateral` sub-actions.
+#[derive(Subcommand)]
+enum CollateralCommand {
+    /// Show this epoch's per-store collateral requirement (the default with no sub-action).
+    ///
+    /// This is the amount BEFORE your safety margin, because it is the figure the network derives
+    /// and every node derives it identically. If this node has not censused the epoch yet, it says
+    /// so and why — it never reports a requirement it does not have as zero.
+    Requirement,
+    /// Show your local safety margin, and what it adds.
+    Margin {
+        #[command(subcommand)]
+        action: Option<MarginCommand>,
+    },
+}
+
+/// `dig-node collateral margin` sub-actions.
+#[derive(Subcommand)]
+enum MarginCommand {
+    /// Set the safety margin, by preset name or in basis points.
+    ///
+    /// Presets: `tight` (0.01%), `default` (+1%), `generous` (+5%). Or give a raw number of basis
+    /// points, where 100 is +1%. At most 10000 (+100%): a cushion larger than the requirement
+    /// itself is past any honest cushion, and it is REFUSED rather than quietly reduced.
+    Set {
+        /// A preset name (`tight`, `default`, `generous`) or a number of basis points.
+        value: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum ChiaPeersCommand {
     /// List the tracked Chia full-node peers, marking which are trusted.
@@ -642,6 +681,7 @@ impl Command {
             Command::Updater { .. } => "updater",
             Command::Subscriptions { .. } => "subscriptions",
             Command::Peers { .. } => "peers",
+            Command::Collateral { .. } => "collateral",
             Command::ChiaPeers { .. } => "chia-peers",
             Command::EnsureHosts => "ensure-hosts",
         }
@@ -795,6 +835,10 @@ pub fn run() -> std::process::ExitCode {
         ),
         Command::Peers { action: cmd } => match peers_action(cmd) {
             Ok(a) => render(peers::run(&config, a), action, json),
+            Err(e) => emit_error(&e, action, json),
+        },
+        Command::Collateral { action: cmd } => match collateral_action(cmd) {
+            Ok(a) => render(control_cli::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
         },
         Command::ChiaPeers { action: cmd } => render(
@@ -965,6 +1009,42 @@ fn subscriptions_action(cmd: Option<SubscriptionsCommand>) -> ControlAction {
 /// Listing is the default because it is the only harmless one of the three: defaulting to `add`
 /// would make a bare `dign chia-peers` grant trust, and a default must never be the act that
 /// costs something.
+/// Map the `collateral` subcommand to its [`ControlAction`], resolving a margin preset name.
+///
+/// A preset resolves to the SAME basis-point constant `dig-mirror-collateral` publishes, rather
+/// than to a number spelled out here. A second spelling of "generous" is how one surface comes to
+/// post a different amount than another for a setting the operator believes is one choice.
+///
+/// An unrecognised word is REFUSED, never silently treated as a number or as the default: a typo
+/// that fell through to the default would change what this node posts without saying so.
+fn collateral_action(cmd: Option<CollateralCommand>) -> std::io::Result<ControlAction> {
+    use dig_mirror_collateral::{
+        SAFETY_MARGIN_BP_DEFAULT, SAFETY_MARGIN_BP_GENEROUS, SAFETY_MARGIN_BP_TIGHT,
+    };
+    match cmd {
+        None | Some(CollateralCommand::Requirement) => Ok(ControlAction::CollateralRequirement),
+        Some(CollateralCommand::Margin { action: None }) => Ok(ControlAction::CollateralMarginGet),
+        Some(CollateralCommand::Margin {
+            action: Some(MarginCommand::Set { value }),
+        }) => {
+            let margin_bp = match value.as_str() {
+                "tight" => SAFETY_MARGIN_BP_TIGHT,
+                "default" => SAFETY_MARGIN_BP_DEFAULT,
+                "generous" => SAFETY_MARGIN_BP_GENEROUS,
+                raw => raw.parse::<u64>().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "{raw:?} is not a preset (tight, default, generous) nor a basis-point number"
+                        ),
+                    )
+                })?,
+            };
+            Ok(ControlAction::CollateralMarginSet { margin_bp })
+        }
+    }
+}
+
 fn chia_peers_action(cmd: Option<ChiaPeersCommand>) -> ControlAction {
     match cmd {
         None | Some(ChiaPeersCommand::List) => ControlAction::ChiaPeersList,

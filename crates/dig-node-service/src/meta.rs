@@ -696,6 +696,13 @@ pub enum ErrorCode {
     /// Distinct from `WALLET_NO_CHAIN_SOURCE` (nothing to ask) and `WALLET_NOT_SYNCED`
     /// (not ready). Node error.
     WalletReadFailed,
+    /// `-32048` — the automated-spend audit record exists and could not be READ.
+    ///
+    /// Never an empty page. "Nothing to report" is the answer a person stops investigating on, so
+    /// a record the node could not look at must not be returned as one that says the node has
+    /// spent nothing. A record that was never WRITTEN is a different thing again, and IS an empty
+    /// page: a node that has never spent automatically is the ordinary case. Shell error.
+    SpendAuditUnreadable,
     /// `-32043` — a wallet balance read was refused because the GLOBAL coinset-fallback rate
     /// bound (#1957) is exhausted: too many arbitrary-address reads have hit the expensive
     /// fallback in a short window. Defense-in-depth against an open-read amplification/oracle
@@ -779,6 +786,9 @@ impl ErrorCode {
             ErrorCode::WalletReservationsUnavailable => {
                 dig_node_control_interface::ControlErrorCode::WalletReservationsUnavailable.code()
             }
+            ErrorCode::SpendAuditUnreadable => {
+                dig_node_control_interface::ControlErrorCode::SpendAuditUnreadable.code()
+            }
             ErrorCode::PeerPingRefused => -32060,
             ErrorCode::PushPendingLimited => -32016,
             ErrorCode::ControlIngressLimited => -32033,
@@ -806,6 +816,7 @@ impl ErrorCode {
             ErrorCode::WalletCoinsReserved => "WALLET_COINS_RESERVED",
             ErrorCode::WalletReservationsUnavailable => "WALLET_RESERVATIONS_UNAVAILABLE",
             ErrorCode::WalletNodeSpendDisabled => "WALLET_NODE_SPEND_DISABLED",
+            ErrorCode::SpendAuditUnreadable => "SPEND_AUDIT_UNREADABLE",
             ErrorCode::PeerPingRefused => "PEER_PING_REFUSED",
             ErrorCode::PushPendingLimited => "PUSH_PENDING_LIMITED",
             ErrorCode::ControlIngressLimited => "CONTROL_INGRESS_LIMITED",
@@ -826,6 +837,8 @@ impl ErrorCode {
             | ErrorCode::ControlError
             // Minted by the control SERVER at ingress, before the request reaches the node.
             | ErrorCode::ControlIngressLimited
+            // The audit record is a node-private FILE read by the shell, not by the node.
+            | ErrorCode::SpendAuditUnreadable
             | ErrorCode::ParseError => "shell",
             ErrorCode::MethodNotFound => "boundary",
             // The wallet balance read (#1851) is served by the node-custodied wallet backend.
@@ -879,6 +892,9 @@ impl ErrorCode {
                 "A wallet balance read of the wallet's own address is still syncing with no fallback."
             }
             ErrorCode::WalletReadFailed => "A wallet balance read failed at the DB / chain layer.",
+            ErrorCode::SpendAuditUnreadable => {
+                "The automated-spend audit record exists and could not be read."
+            }
             ErrorCode::WalletRateLimited => {
                 "A wallet balance read was refused: the open coinset-fallback rate bound is exhausted."
             }
@@ -927,6 +943,7 @@ impl ErrorCode {
             ErrorCode::WalletNodeSpendDisabled,
             ErrorCode::WalletCoinsReserved,
             ErrorCode::WalletReservationsUnavailable,
+            ErrorCode::SpendAuditUnreadable,
             ErrorCode::PeerPingRefused,
             ErrorCode::PushPendingLimited,
             ErrorCode::ControlIngressLimited,
