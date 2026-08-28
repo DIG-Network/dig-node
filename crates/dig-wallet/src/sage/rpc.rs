@@ -3130,12 +3130,10 @@ impl WalletBackend {
                     .collect::<Vec<_>>(),
             )
             .await?;
-        let (rows, staged) = super::cat_discovery::route_point_read_rows(
-            &fetched_rows,
-            &owned,
-            &derived,
-            |id| promoted.contains(id),
-        );
+        let (rows, staged) =
+            super::cat_discovery::route_point_read_rows(&fetched_rows, &owned, &derived, |id| {
+                promoted.contains(id)
+            });
         let n = rows.len();
         if n > 0 {
             self.db.upsert_coins(&rows).await?;
@@ -8660,7 +8658,8 @@ mod tests {
         // What the attacker places: a coin at the derived $DIG hash for this victim, hinted to
         // them, for a number they will read as their balance. It costs one mojo per base unit and
         // needs only `ph`, which is public.
-        let derived_hash = digstore_chain::cat::cat_puzzle_hash(ph, digstore_chain::dig::DIG_ASSET_ID);
+        let derived_hash =
+            digstore_chain::cat::cat_puzzle_hash(ph, digstore_chain::dig::DIG_ASSET_ID);
         let fallback = TwoTierFallback {
             at_our_hash: FallbackCoin {
                 coin_id: "aa".repeat(32),

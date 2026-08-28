@@ -242,8 +242,12 @@ where
             // away would make a promoted coin's history poorer than the row it came from.
             created_timestamp: row.created_timestamp,
             spent_timestamp: row.spent_timestamp,
-            derived_asset_id: predicted.map(|o| hex::encode(o.asset_id)).unwrap_or_default(),
-            derived_owner_p2: predicted.map(|o| hex::encode(o.owner_p2)).unwrap_or_default(),
+            derived_asset_id: predicted
+                .map(|o| hex::encode(o.asset_id))
+                .unwrap_or_default(),
+            derived_owner_p2: predicted
+                .map(|o| hex::encode(o.owner_p2))
+                .unwrap_or_default(),
         });
     }
     (believed, staged)
@@ -438,8 +442,8 @@ async fn promote_one(
     // own p2 hashes, that IS "this coin is a unit of asset A and only this wallet can spend it" —
     // which is the entire claim being made. The predicted case additionally checks that the
     // derivation was not lying about which asset it expected.
-    let asset_agrees = row.derived_asset_id.is_empty()
-        || asset_id.eq_ignore_ascii_case(&row.derived_asset_id);
+    let asset_agrees =
+        row.derived_asset_id.is_empty() || asset_id.eq_ignore_ascii_case(&row.derived_asset_id);
     let owner_agrees = if row.derived_owner_p2.is_empty() {
         // Unpredicted: the reconstruction's own hint must name an address this wallet controls.
         // Without this the hint would be attacker-controlled all the way to `coins`, which is the

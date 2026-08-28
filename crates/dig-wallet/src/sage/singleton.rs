@@ -391,7 +391,10 @@ pub async fn reconstruct_coins(
         // the failure honestly, propagating it here would let a single timeout abandon attribution
         // for every remaining coin in the pass. Skip and log, exactly as before — the difference is
         // that the cause is now visible rather than indistinguishable from a chain fact.
-        let parent = match lineage.parent_spend(&c.parent_coin_info, created as u32).await {
+        let parent = match lineage
+            .parent_spend(&c.parent_coin_info, created as u32)
+            .await
+        {
             Ok(Some(parent)) => parent,
             Ok(None) => continue,
             Err(e) => {
