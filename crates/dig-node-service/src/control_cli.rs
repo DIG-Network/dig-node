@@ -160,6 +160,13 @@ pub enum ControlAction {
     CollateralRequirement,
     /// `control.collateral.margin.get` — the node's local safety margin, in basis points.
     CollateralMarginGet,
+    /// `control.collateral.buffer` — the node's OWN answer: what it recommends holding and
+    /// the funding state it is in, from the served set and balance the node itself knows.
+    ///
+    /// Distinct from the operator-supplied form of `dign collateral buffer`, which computes the
+    /// same figures from operands a person types. The node is authoritative; the operands exist
+    /// so a person can get a number before the node can enumerate its own served set.
+    CollateralBuffer,
     /// `control.collateral.margin.set` — persist the local safety margin.
     ///
     /// The node is the authoritative home for this setting: the flywheel is headless, so a machine
@@ -224,6 +231,7 @@ impl ControlAction {
             ControlAction::ChiaPeersList => "control.chiaPeers.list",
             ControlAction::CollateralRequirement => "control.collateral.requirement",
             ControlAction::CollateralMarginGet => "control.collateral.margin.get",
+            ControlAction::CollateralBuffer => "control.collateral.buffer",
             ControlAction::CollateralMarginSet { .. } => "control.collateral.margin.set",
             ControlAction::ChiaPeersRemove { .. } => "control.chiaPeers.remove",
         }
@@ -472,6 +480,7 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         // deterministic mirror-coin collateral surface (dig_ecosystem#3173).
         ControlAction::CollateralRequirement.method(),
         ControlAction::CollateralMarginGet.method(),
+        ControlAction::CollateralBuffer.method(),
         ControlAction::CollateralMarginSet { margin_bp: 0 }.method(),
         ControlAction::ChiaPeersRemove {
             ip: String::new(),
@@ -739,9 +748,9 @@ pub fn collateral_buffer(
     pairs_served: Option<u64>,
     spendable_dig_base_units: Option<u64>,
 ) -> std::io::Result<Outcome> {
-    use crate::collateral::{
-        buffer_advice, format_dig, BufferAdvice, FundingState, DEFAULT_BUFFER_HORIZON_EPOCHS,
-    };
+    use crate::collateral::{buffer_advice, buffer_remedy, format_dig, one_epoch_lock};
+    use dig_node_control_interface::params::DEFAULT_BUFFER_HORIZON_EPOCHS;
+    use dig_node_control_interface::results::{CollateralBufferResult, CollateralFundingState};
 
     let requirement_json = call_control(
         config,
@@ -766,21 +775,44 @@ pub fn collateral_buffer(
     );
     let result = serde_json::to_value(advice).map_err(std::io::Error::other)?;
 
-    let figures = match advice {
-        BufferAdvice::Unknown { reason } => {
+    let known = match advice {
+        CollateralBufferResult::Unknown { reason } => {
             // Names the missing fact and what would resolve it. Emphatically not a zero: a zero
             // buffer reads as "no buffer needed", which is the reassuring rendering of an unknown.
             return Ok(Outcome::new(
                 format!(
                     "collateral buffer UNKNOWN — {}.\n  Run `dign collateral requirement` to see \
                      what this node does know.",
-                    reason.remedy()
+                    buffer_remedy(reason)
                 ),
                 result,
             ));
         }
-        BufferAdvice::Known(f) => f,
+        known @ CollateralBufferResult::Known { .. } => known,
     };
+    let CollateralBufferResult::Known {
+        funding_state,
+        recommended_buffer_dig_base_units,
+        spendable_dig_base_units,
+        pairs_served_by_this_node,
+        required_per_store_dig_base_units,
+        margin_bp,
+        overlap_dig_base_units,
+        escalation_headroom_dig_base_units,
+        horizon_epochs,
+        escalation_ceiling_micros,
+        ..
+    } = known
+    else {
+        unreachable!("the unknown arm returned above")
+    };
+    // Derived rather than carried: the contract publishes the three inputs, so a client and this
+    // node compute the same lock instead of trusting a fourth field that could disagree with them.
+    let lock = one_epoch_lock(
+        pairs_served_by_this_node,
+        required_per_store_dig_base_units,
+        margin_bp,
+    );
 
     // The working is shown, briefly. A figure nobody can sanity-check is a figure nobody acts on,
     // and the horizon is stated because a buffer without its horizon is a magic number.
@@ -789,49 +821,50 @@ pub fn collateral_buffer(
          this epoch locks {} DIG · reclaim overlap {} DIG · escalation headroom {} DIG over {} \
          epochs (x{}.{:06} ceiling — a worst case, not a forecast)\n  \
          recommended holding {} DIG",
-        figures.pairs_served_by_this_node,
-        format_dig(figures.required_per_store_dig_base_units),
-        figures.margin_bp,
-        format_dig(figures.one_epoch_lock_dig_base_units),
-        format_dig(figures.overlap_dig_base_units),
-        format_dig(figures.escalation_headroom_dig_base_units),
-        figures.horizon_epochs,
-        figures.escalation_ceiling_micros / 1_000_000,
-        figures.escalation_ceiling_micros % 1_000_000,
-        format_dig(figures.recommended_buffer_dig_base_units),
+        pairs_served_by_this_node,
+        format_dig(required_per_store_dig_base_units),
+        margin_bp,
+        format_dig(lock),
+        format_dig(overlap_dig_base_units),
+        format_dig(escalation_headroom_dig_base_units),
+        horizon_epochs,
+        escalation_ceiling_micros / 1_000_000,
+        escalation_ceiling_micros % 1_000_000,
+        format_dig(recommended_buffer_dig_base_units),
     );
 
     // The number a person acts on goes LAST, where the eye lands, and it is an amount rather than
     // an adjective: "balance low" is not actionable, "add 3.250 DIG" is.
-    let short = format_dig(figures.shortfall_to_recommended_dig_base_units);
+    // Derived, not carried: the contract publishes the recommendation and the balance, so a
+    // shortfall field would be a fourth number that could disagree with the two it comes from.
+    let short =
+        format_dig(recommended_buffer_dig_base_units.saturating_sub(spendable_dig_base_units));
     summary.push_str("\n  ");
-    summary.push_str(&match figures.funding_state {
-        FundingState::ShortNow => format!(
+    summary.push_str(&match funding_state {
+        CollateralFundingState::ShortNow => format!(
             "SHORT NOW — you cannot cover this epoch; store roots are going uncollateralised. \
              Add at least {} DIG now, {short} DIG to reach the recommendation.",
-            format_dig(
-                figures
-                    .one_epoch_lock_dig_base_units
-                    .saturating_sub(figures.spendable_dig_base_units)
-            ),
+            format_dig(lock.saturating_sub(spendable_dig_base_units)),
         ),
-        FundingState::DangerouslyLow => format!(
+        CollateralFundingState::DangerouslyLow => format!(
             "DANGEROUSLY LOW — this epoch is covered, but a rise at the ceiling would not be. \
              Add {short} DIG to reach the recommendation."
         ),
         // Deliberately unalarming prose: every epoch this state covers IS covered, and it is a
-        // readout rather than a shortfall (`FundingState::is_shortfall`).
-        FundingState::BelowRecommendedBuffer => format!(
+        // readout rather than a shortfall (`CollateralFundingState::is_shortfall`).
+        CollateralFundingState::BelowRecommendedBuffer => format!(
             "below the recommended buffer — every epoch is covered, but there is no cushion. \
              Add {short} DIG to reach it."
         ),
         // Zero served roots is NOT the same sentence as "your funding is sufficient", even though
         // the arithmetic agrees: saying "funded" to an operator serving nothing implies their store
         // roots are covered, and they have none.
-        FundingState::Adequate if figures.pairs_served_by_this_node == 0 => {
+        CollateralFundingState::Funded if pairs_served_by_this_node == 0 => {
             "no store roots to collateralise — nothing to fund.".to_string()
         }
-        FundingState::Adequate => "funded — at or above the recommended buffer.".to_string(),
+        CollateralFundingState::Funded => {
+            "funded — at or above the recommended buffer.".to_string()
+        }
     });
 
     Ok(Outcome::new(summary, result))

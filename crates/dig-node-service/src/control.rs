@@ -203,6 +203,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.collateral.requirement",
     "control.collateral.margin.get",
     "control.collateral.margin.set",
+    "control.collateral.buffer",
     "control.profile.putBody",
     "control.profile.getBody",
     "control.updater.status",
@@ -266,6 +267,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.collateral.requirement",
     "control.collateral.margin.get",
     "control.collateral.margin.set",
+    "control.collateral.buffer",
     "control.profile.putBody",
     "control.profile.getBody",
     "control.updater.status",
@@ -918,6 +920,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.collateral.requirement" => collateral_requirement(id),
         "control.collateral.margin.get" => collateral_margin_get(id),
         "control.collateral.margin.set" => collateral_margin_set(id, params),
+        "control.collateral.buffer" => collateral_buffer(id),
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
@@ -3269,6 +3272,44 @@ fn collateral_requirement(id: Value) -> Value {
     let store = crate::collateral::EpochRecordStore::in_state_dir();
     let answer = crate::collateral::requirement(&store, current_collateral_epoch());
     match serde_json::to_value(&answer) {
+        Ok(v) => control_ok(id, v),
+        Err(e) => control_error(id, ErrorCode::ControlError, e.to_string()),
+    }
+}
+
+/// `control.collateral.buffer` — the $DIG this node recommends HOLDING, and the funding state.
+///
+/// A SEPARATE method from [`collateral_requirement`] because the two figures have different
+/// authorities: the requirement is consensus-derived and identical on every node, while this one
+/// depends on this node's own served set, an operator preference, and a horizon this node chose.
+///
+/// **The funding state is carried, not left to the client to re-derive from thresholds.** Two
+/// clients deriving it will eventually disagree, and the one that disagrees about a funding warning
+/// is the one an operator acts on.
+///
+/// Today this answers `unknown` with a NAMED reason on most nodes, and that is the honest answer
+/// rather than a stub: the served `(owner, store, root)` set is enumerated by the census
+/// (dig-node#387), and the operator's spendable balance is not a fact this node holds — it cannot
+/// know which address holds their $DIG, and a balance read of the wrong address returns a confident
+/// number about the wrong money. A zero would read as "no buffer needed" and have them post nothing.
+fn collateral_buffer(id: Value) -> Value {
+    let store = crate::collateral::EpochRecordStore::in_state_dir();
+    let requirement = crate::collateral::requirement(&store, current_collateral_epoch());
+    let margin_bp = crate::collateral::CollateralConfig::load().margin_bp;
+
+    let answer = crate::collateral::buffer_advice(
+        // The served set and the spendable balance are both genuinely unknown to the node today, so
+        // each is passed as `None` and reported through its own reason. They are NOT approximated
+        // from the hosted-store list or from an arbitrary address: a set that merely resembles the
+        // served pairs, or a balance for the wrong address, yields a plausible wrong number on a
+        // money surface — which is worse than no number.
+        None,
+        &requirement,
+        margin_bp,
+        None,
+        dig_node_control_interface::params::DEFAULT_BUFFER_HORIZON_EPOCHS,
+    );
+    match serde_json::to_value(answer) {
         Ok(v) => control_ok(id, v),
         Err(e) => control_error(id, ErrorCode::ControlError, e.to_string()),
     }
