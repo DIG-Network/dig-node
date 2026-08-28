@@ -40,9 +40,13 @@ const CATCH_UP_HEIGHT: u32 = 6_000_000;
 // Doubles
 // ---------------------------------------------------------------------------
 
-/// A peer that reports "caught up, nothing to send" — what a real full node answers to a
+/// A peer that answers a subscription in ONE finished batch — what a real full node answers to a
 /// subscription it has already satisfied.
-struct CaughtUpAtOnce;
+///
+/// The batch carries whatever coin states the [`Script`] holds, which is normally none. A test
+/// that loads them is exercising the ingest filter for real: the catch-up requests puzzle state
+/// with `include_hinted`, so a truthful peer answers with coins the wallet never subscribed.
+struct CaughtUpAtOnce(Arc<Script>);
 
 #[async_trait::async_trait]
 impl PuzzleStateSource for CaughtUpAtOnce {
@@ -54,7 +58,7 @@ impl PuzzleStateSource for CaughtUpAtOnce {
     ) -> Result<RespondPuzzleState, SyncError> {
         Ok(RespondPuzzleState {
             puzzle_hashes: vec![],
-            coin_states: vec![],
+            coin_states: self.0.catch_up_coin_states.lock().unwrap().clone(),
             height: CATCH_UP_HEIGHT,
             header_hash: Bytes32::new([9; 32]),
             is_finished: true,
@@ -87,6 +91,9 @@ struct Script {
     senders: Mutex<Vec<tokio::sync::mpsc::Sender<Message>>>,
     /// Delays passed to [`TimeSource::sleep`], in order.
     slept: Mutex<Vec<Duration>>,
+    /// The coin states every scripted catch-up answers with. Empty for every test that is not
+    /// about ingest.
+    catch_up_coin_states: Mutex<Vec<chia_protocol::CoinState>>,
     /// How long each session appears to last, on the test clock.
     session_lifetime: Mutex<Duration>,
     /// Connect outcomes, consumed in order; exhaustion means "fail".
@@ -262,6 +269,7 @@ impl SyncSession for ScriptedSession {
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
+        attributor: Option<&sync::CatAttributor<'_>>,
     ) -> Result<(), SyncError> {
         self.script
             .catch_ups
@@ -276,7 +284,7 @@ impl SyncSession for ScriptedSession {
         // The REAL catch-up, so the empty-set guard and the completion-flag write are both
         // exercised exactly as production would exercise them.
         sync::initial_sync_with_authority(
-            &CaughtUpAtOnce,
+            &CaughtUpAtOnce(self.script.clone()),
             db,
             puzzle_hashes,
             genesis_challenge,
@@ -286,6 +294,10 @@ impl SyncSession for ScriptedSession {
             // reading `self.trust` here would make the elevation invisible to the floor check and
             // quietly re-create the bug this suite exists to exclude.
             authority,
+            // Forwarded, exactly as `ChiaPeerSession::catch_up` forwards it: a hinted CAT coin is
+            // admitted only by the attributor, so a double that swallowed it would be blind to
+            // the ingest half of dig-node#382.
+            attributor,
         )
         .await
     }
@@ -295,9 +307,13 @@ impl SyncSession for ScriptedSession {
         db: &WalletDb,
         events: &EventBus,
         session: &mut sync::SessionState<'_>,
+        attributor: Option<&sync::CatAttributor<'_>>,
     ) -> Result<(), SyncError> {
         let receiver = self.receiver.lock().await.take().expect("run called once");
-        let result = sync::run_update_loop(db, receiver, events, None, session).await;
+        // Forwarded exactly as `ChiaPeerSession::run` forwards it. Substituting `None` here would
+        // make this double structurally incapable of observing dig-node#382, which is the defect
+        // the double is used to prove absent.
+        let result = sync::run_update_loop(db, receiver, events, attributor, session).await;
         let lifetime = *self.script.session_lifetime.lock().unwrap();
         self.script.advance(lifetime);
         result
@@ -571,6 +587,34 @@ impl Harness {
         chain_tip: Option<Arc<dyn ChainTipObserver>>,
         session_lifetime: Duration,
     ) -> Self {
+        Self::start_with_attribution(
+            db,
+            hashes,
+            script,
+            addrs,
+            trust,
+            corroborator,
+            chain_tip,
+            session_lifetime,
+            None,
+        )
+        .await
+    }
+
+    /// Start a supervisor with a CAT/singleton attribution source attached — the production
+    /// shape, and the only one that can observe dig-node#382.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_attribution(
+        db: WalletDb,
+        hashes: Arc<dyn PuzzleHashSource>,
+        script: Arc<Script>,
+        addrs: Vec<String>,
+        trust: PeerTrust,
+        corroborator: Option<Arc<dyn Corroborator>>,
+        chain_tip: Option<Arc<dyn ChainTipObserver>>,
+        session_lifetime: Duration,
+        attribution: Option<Arc<Attribution>>,
+    ) -> Self {
         let factory = Arc::new(ScriptedFactory {
             script: script.clone(),
             addrs,
@@ -585,6 +629,7 @@ impl Harness {
             time: script.clone(),
             corroborator: corroborator.clone(),
             chain_tip,
+            attribution,
             session_lifetime,
         });
         Self {
@@ -1885,6 +1930,8 @@ async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
         // The acceptance step watches a REAL peer follow mainnet; a stall deadline would only
         // add a second reason for the session to end and blur what the run proves.
         chain_tip: None,
+        // This fixture holds no wallet, so there is nothing to attribute.
+        attribution: None,
         session_lifetime: SESSION_MAX_LIFETIME,
     });
 
@@ -4222,4 +4269,486 @@ async fn a_refused_writer_is_not_reported_as_synced() {
          reporting synced tells the user a partition or a hostile peer set is fine"
     );
     assert_eq!(status.phase, SyncPhase::Syncing);
+}
+
+// ---------------------------------------------------------------------------
+// dig-node#382 -- the $DIG balance that read zero on a funded wallet
+// ---------------------------------------------------------------------------
+
+use crate::sage::singleton::LineageAnswer;
+
+/// A [`crate::sage::singleton::LineageSource`] backed by an in-memory
+/// `parent_coin_id -> ParentSpend` map, populated from a `Simulator`. The production source reads
+/// the same two fields off the chain.
+///
+/// A miss answers [`LineageAnswer::Unavailable`], which is what the production source reports for
+/// a parent it cannot resolve. It used to answer `Absent`, and because this double drives the
+/// whole supervisor suite that single choice made the suite structurally unable to reach
+/// `SyncError::IncompleteBatch` by the ordinary route — see [`LineageAnswer::from_lookup`].
+struct FixtureLineage {
+    by_parent: std::collections::HashMap<String, crate::sage::singleton::ParentSpend>,
+    /// What an unmapped parent answers. Explicit so a test can choose the settled-absence case
+    /// deliberately rather than inheriting it.
+    on_miss: LineageAnswer,
+}
+
+impl Default for FixtureLineage {
+    fn default() -> Self {
+        Self {
+            by_parent: std::collections::HashMap::new(),
+            on_miss: LineageAnswer::Unavailable,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::sage::singleton::LineageSource for FixtureLineage {
+    async fn parent_spend(
+        &self,
+        parent_coin_id: &str,
+        _spent_height: u32,
+    ) -> crate::sage::Result<crate::sage::singleton::LineageAnswer> {
+        Ok(LineageAnswer::from_lookup(
+            self.by_parent.get(parent_coin_id).cloned(),
+            self.on_miss.clone(),
+        ))
+    }
+}
+
+/// One issued CAT and the child coin a syncing wallet observes.
+struct CatFixture {
+    child: chia_protocol::Coin,
+    parent: crate::sage::singleton::ParentSpend,
+    asset_id: String,
+    owner_p2: Bytes32,
+}
+
+/// Issue `count` independent CATs on ONE simulator, each to its own holder, and return the child
+/// coin plus its parent spend for each.
+///
+/// Independent holders are the point: the ingest guard is about WHOSE coin it is, so a fixture
+/// with one holder cannot tell "admits coins it can prove are ours" from "admits every CAT a peer
+/// offers".
+fn issue_cats(count: usize) -> Vec<CatFixture> {
+    use chia_sdk_test::Simulator;
+    use chia_traits::Streamable;
+    use chia_wallet_sdk::driver::{
+        Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer,
+    };
+    use chia_wallet_sdk::types::Conditions;
+
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+    let mut holders = Vec::new();
+    for _ in 0..count {
+        let holder = sim.bls(1000);
+        let p2 = StandardLayer::new(holder.pk);
+        let memos = ctx.hint(holder.puzzle_hash).unwrap();
+        let (issue, cats) = SdkCat::single_issuance(
+            ctx,
+            holder.coin.coin_id(),
+            None,
+            1000,
+            Conditions::new().create_coin(holder.puzzle_hash, 1000, memos),
+        )
+        .unwrap();
+        p2.spend(ctx, holder.coin, issue).unwrap();
+        holders.push((holder, p2, memos, cats[0]));
+    }
+    let keys: Vec<_> = holders.iter().map(|(h, ..)| h.sk.clone()).collect();
+    sim.spend_coins(ctx.take(), &keys).unwrap();
+
+    // Spend each eve CAT once, so the coin the wallet syncs has a CAT coin as its parent -- the
+    // shape `Cat::parse_children` reconstructs from.
+    for (holder, p2, memos, cat) in &holders {
+        let inner = p2
+            .spend_with_conditions(
+                ctx,
+                Conditions::new().create_coin(holder.puzzle_hash, 1000, *memos),
+            )
+            .unwrap();
+        SdkCat::spend_all(ctx, &[CatSpend::new(*cat, inner)]).unwrap();
+    }
+    sim.spend_coins(ctx.take(), &keys).unwrap();
+
+    holders
+        .iter()
+        .map(|(holder, _, _, cat)| CatFixture {
+            child: cat.child(holder.puzzle_hash, 1000).coin,
+            parent: crate::sage::singleton::ParentSpend {
+                coin: cat.coin,
+                puzzle_reveal: sim
+                    .puzzle_reveal(cat.coin.coin_id())
+                    .expect("parent puzzle reveal")
+                    .to_bytes()
+                    .unwrap(),
+                solution: sim
+                    .solution(cat.coin.coin_id())
+                    .expect("parent solution")
+                    .to_bytes()
+                    .unwrap(),
+            },
+            asset_id: hex::encode(cat.info.asset_id),
+            owner_p2: holder.puzzle_hash,
+        })
+        .collect()
+}
+
+fn unspent_coin_state(coin: chia_protocol::Coin) -> chia_protocol::CoinState {
+    chia_protocol::CoinState {
+        coin,
+        created_height: Some(CATCH_UP_HEIGHT - 1),
+        spent_height: None,
+    }
+}
+
+/// **Proves (dig-node#382):** the supervisor's own catch-up lands a hinted CAT coin in the replica
+/// WITH its `asset_id`, so `unspent_coins(Some(asset))` -- the query every $DIG balance and every
+/// coin selection runs -- finds it on a funded wallet.
+///
+/// # Why this test and not the one that already existed
+///
+/// `sync::run_update_loop_runs_attribution_when_attributor_present` hands `run_update_loop` an
+/// attributor directly and asserts it is used. That proves the CAPABILITY, and it was green for
+/// the entire life of the defect, because the only production call site passed `None`. This test
+/// never names `run_update_loop`, `apply_coin_states` or `CatAttributor`: it starts the real
+/// [`Supervisor`] and asserts on the DATABASE afterwards, so it can only pass if production
+/// genuinely constructs and threads the attributor.
+///
+/// # The three assertions, and what each one alone would miss
+///
+/// - **Our coin is attributed.** Red before the fix: the coin is dropped at ingest, and would keep
+///   `asset_id = NULL` even if it were not.
+/// - **The stranger's coin is absent from the table ENTIRELY**, not merely absent from the $DIG
+///   query. This is the assertion that pins the guard's PLACEMENT: a guard that admitted every CAT
+///   a peer offered and filtered afterwards would satisfy the first assertion identically while
+///   storing a stranger's coin.
+/// - **`unspent_coins(None)` is empty.** That query selects `asset_id IS NULL`, which is exactly
+///   what an unattributed CAT coin looks like, so this is the money-lie in the other direction --
+///   it fails if either coin lands unattributed and is counted as XCH.
+#[tokio::test]
+async fn the_supervisor_attributes_the_hinted_cat_coins_its_catch_up_syncs() {
+    let cats = issue_cats(2);
+    let (ours, stranger) = (&cats[0], &cats[1]);
+    assert_ne!(
+        ours.owner_p2, stranger.owner_p2,
+        "the fixture must give the two coins different owners, or the control proves nothing"
+    );
+
+    let mut lineage = FixtureLineage::default();
+    for cat in &cats {
+        lineage
+            .by_parent
+            .insert(hex::encode(cat.child.parent_coin_info), cat.parent.clone());
+    }
+
+    let script = Script::new();
+    *script.catch_up_coin_states.lock().unwrap() = vec![
+        unspent_coin_state(ours.child),
+        unspent_coin_state(stranger.child),
+    ];
+
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let h = Harness::start_with_attribution(
+        db.clone(),
+        // Only OUR p2 hash is followed. The stranger's coin arrives from the same peer, in the
+        // same batch, and is exactly as well-formed.
+        Arc::new(FixedHashes::unlocked(vec![ours.owner_p2])),
+        script,
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        None,
+        NO_ROTATION,
+        Some(Arc::new(Attribution::new(
+            Arc::new(lineage),
+            "xch".to_string(),
+        ))),
+    )
+    .await;
+
+    // The catch-up applies its batch and latches `initial_sync_complete` in ONE statement, so the
+    // flag is the honest signal that the batch above has been written.
+    h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
+        .await;
+
+    let attributed = db.unspent_coins(Some(&ours.asset_id)).await.unwrap();
+    assert_eq!(
+        attributed.len(),
+        1,
+        "the wallet's own hinted CAT coin must be selectable by its asset id; found {attributed:?}"
+    );
+    assert_eq!(attributed[0].coin_id, hex::encode(ours.child.coin_id()));
+
+    let all = db.all_coins().await.unwrap();
+    assert!(
+        !all.iter()
+            .any(|c| c.coin_id == hex::encode(stranger.child.coin_id())),
+        "a coin the wallet cannot prove it owns must never be written, not merely filtered later"
+    );
+
+    let unattributed = db.unspent_coins(None).await.unwrap();
+    assert!(
+        unattributed.is_empty(),
+        "an unattributed CAT coin is counted as XCH by unspent_coins(None); found {unattributed:?}"
+    );
+
+    h.stop().await;
+}
+
+/// **Proves (dig-node#383, the round-2 gating finding):** a wallet whose lineage read budget is
+/// exhausted NEVER answers `balance 0, synced true`. It declines to call itself synced instead.
+///
+/// # This is the probe that failed before the fix, and it failed silently
+///
+/// The bound added to close the amplification introduced a way to reach dig-node#382's exact
+/// observable without any defect in the ownership proof: with the shared bucket spent, every
+/// hinted CAT coin was refused, `apply_coin_states` dropped each one and returned `Ok(())`
+/// regardless, and the catch-up completed and latched `initial_sync_complete = true` on a batch it
+/// had partly discarded. `unspent_coins(Some(asset))` then returned `[]` over a *confident*
+/// replica — a funded wallet reporting zero, which is the whole reason this PR exists.
+///
+/// So the assertion here is deliberately NOT "the coin is attributed". Under an exhausted budget
+/// the coin genuinely cannot be attributed, and a test demanding otherwise would be demanding the
+/// impossible. What must hold is that the wallet does not LIE about it: the replica is not
+/// declared authoritative, so every balance read falls through to the chain tier and the user is
+/// told the truth by a slower route rather than a wrong number by a fast one.
+///
+/// # Why the fixture uses a zero admission burst rather than draining the scan leg
+///
+/// Draining one leg to starve the other is no longer expressible — the two legs hold separate
+/// buckets ([`Attribution::new`]), which is the structural half of the fix. What remains
+/// reachable is a genuine outage or an exhausted admission budget, and that is what this states
+/// directly. The `starvation` test below pins the separation itself.
+#[tokio::test]
+async fn an_exhausted_read_budget_leaves_the_wallet_unsynced_rather_than_confidently_empty() {
+    let cats = issue_cats(1);
+    let ours = &cats[0];
+
+    let mut lineage = FixtureLineage::default();
+    lineage.by_parent.insert(
+        hex::encode(ours.child.parent_coin_info),
+        ours.parent.clone(),
+    );
+
+    let script = Script::new();
+    *script.catch_up_coin_states.lock().unwrap() = vec![unspent_coin_state(ours.child)];
+
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let h = Harness::start_with_attribution(
+        db.clone(),
+        Arc::new(FixedHashes::unlocked(vec![ours.owner_p2])),
+        script,
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        None,
+        NO_ROTATION,
+        // Admission burst ZERO: every parent-spend read the admission leg wants is refused, which
+        // is exactly the state the round-2 probe reached by spending the shared bucket.
+        Some(Arc::new(Attribution::with_bursts(
+            Arc::new(lineage),
+            "xch".to_string(),
+            0.0,
+            256.0,
+        ))),
+    )
+    .await;
+
+    // RACE the two possible outcomes rather than waiting for one of them, so the assertion below
+    // is reached under BOTH behaviours and reports the real state instead of timing out:
+    //
+    //  * the latch going up is the defect, and it happens immediately;
+    //  * a second catch-up is the fix, and proves the first one ENDED — the supervisor abandoned
+    //    the session and dialled again — rather than merely not having got there yet.
+    //
+    // Whichever lands first ends the wait. A probe that waited only for the retry would go red on
+    // the defect by TIMEOUT, which reads as a wedged supervisor rather than as a wallet lying
+    // about money.
+    let deadline = Deadline::start();
+    loop {
+        let latched = db.sync_state().await.unwrap().initial_sync_complete;
+        let retried = h.script.catch_ups.lock().unwrap().len() >= 2;
+        if latched || retried {
+            break;
+        }
+        deadline
+            .tick("the catch-up to either latch or be retried")
+            .await;
+    }
+
+    let state = db.sync_state().await.unwrap();
+    assert!(
+        !state.initial_sync_complete,
+        "a catch-up that could not read every coin it was offered must not latch the replica as \
+         authoritative; latching is what turns a refused coin into `balance 0, synced true`"
+    );
+    assert!(
+        !db.is_synced().await.unwrap(),
+        "the routing gate must keep wallet reads on the chain tier while the replica is known to \
+         be missing coins"
+    );
+
+    h.stop().await;
+}
+
+/// **Proves (dig-node#383, F2):** a coin whose parent this node could not READ leaves the replica
+/// unauthoritative — reached by the ORDINARY route, with a budget that refuses nothing.
+///
+/// # Why this test did not exist, and why that is the interesting part
+///
+/// Every `LineageSource` double in this crate answered an unresolvable parent with `Absent`, via a
+/// `LineageAnswer::from_answered` helper that folded any `None` to a settled absence. Production
+/// answered `Unavailable`. `FixtureLineage` drives this whole suite, so a coin whose parent was not
+/// in the fixture map took the `ParentAbsent` path in every test here and the `LineageUnavailable`
+/// path on a real node — and the suite was therefore **structurally unable** to reach
+/// `SyncError::IncompleteBatch` by the route production actually takes. The only test that reached
+/// it at all did so by setting the admission burst to `0.0` by hand, which exercises the budget
+/// rather than the read.
+///
+/// That is how a gating denial-of-service survived a review round that was hunting exactly this
+/// class. A double that cannot express production's failure mode makes every test over it a
+/// partial green.
+///
+/// # The fixture varies ONE actor and keeps an honest control
+///
+/// Two runs over the same coin, the same peer, the same generous budget. Only whether the fixture
+/// can answer about the parent differs. The control must latch — without it, "does not latch"
+/// would also be satisfied by a supervisor that never latches at all, which is precisely the
+/// failure this family exists to close in the other direction.
+#[tokio::test]
+async fn a_parent_this_node_could_not_read_leaves_the_replica_unauthoritative() {
+    /// Run one catch-up offering `ours.child`, with the parent map either populated or empty, and
+    /// report whether the replica ended up authoritative.
+    async fn latches_with_parent_known(known: bool) -> bool {
+        let cats = issue_cats(1);
+        let ours = &cats[0];
+
+        let mut lineage = FixtureLineage::default();
+        if known {
+            lineage.by_parent.insert(
+                hex::encode(ours.child.parent_coin_info),
+                ours.parent.clone(),
+            );
+        }
+
+        let script = Script::new();
+        *script.catch_up_coin_states.lock().unwrap() = vec![unspent_coin_state(ours.child)];
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let h = Harness::start_with_attribution(
+            db.clone(),
+            Arc::new(FixedHashes::unlocked(vec![ours.owner_p2])),
+            script,
+            vec!["203.0.113.1:8444".into()],
+            PeerTrust::Operator,
+            None,
+            None,
+            NO_ROTATION,
+            // Both bursts generous: the budget must refuse NOTHING, so the only thing that can go
+            // unjudged is the read itself. A zero burst would prove the sibling test's point
+            // again rather than this one's.
+            Some(Arc::new(Attribution::with_bursts(
+                Arc::new(lineage),
+                "xch".to_string(),
+                256.0,
+                256.0,
+            ))),
+        )
+        .await;
+
+        // Race the latch against a second catch-up, exactly as the sibling test does: waiting only
+        // for the retry would make the defect show up as a timeout, which reads as a wedged
+        // supervisor rather than as a wallet lying about money.
+        let deadline = Deadline::start();
+        loop {
+            let latched = db.sync_state().await.unwrap().initial_sync_complete;
+            let retried = h.script.catch_ups.lock().unwrap().len() >= 2;
+            if latched || retried {
+                break;
+            }
+            deadline
+                .tick("the catch-up to either latch or be retried")
+                .await;
+        }
+        let latched = db.sync_state().await.unwrap().initial_sync_complete;
+        h.stop().await;
+        latched
+    }
+
+    assert!(
+        latches_with_parent_known(true).await,
+        "the control: with the parent readable the coin is judged, so the catch-up completes and \
+         the replica is authoritative. Without this, the assertion below is satisfied by a \
+         supervisor that never latches anything"
+    );
+    assert!(
+        !latches_with_parent_known(false).await,
+        "a coin whose parent could not be read may be the user's money, and a refused coin is \
+         never written — so nothing in the replica remembers it existed. Latching here is what \
+         turns an unreadable parent into `balance 0, synced true` on a funded wallet"
+    );
+}
+
+/// **Proves (dig-node#383):** the background attribution pass cannot spend the read allowance the
+/// admission leg needs.
+///
+/// # The fixture varies ONE actor and keeps an honest control
+///
+/// The replica is pre-seeded with rows the scan leg will happily read forever — the shape the
+/// round-2 audit measured, an unattributable row whose parent RESOLVES — enough of them to spend
+/// the whole scan burst. The wallet's own hinted CAT coin then arrives through the ordinary
+/// catch-up. If one bucket served both, the coin is refused and the wallet reports nothing; with
+/// two, the coin is attributed exactly as it is when the replica is empty.
+///
+/// The scan burst is set to zero rather than merely small, because "the scan spent everything" is
+/// the state under test and a small-but-nonzero burst would leave the result dependent on how many
+/// rows the fixture happened to seed.
+#[tokio::test]
+async fn the_background_pass_cannot_starve_the_admission_leg() {
+    let cats = issue_cats(1);
+    let ours = &cats[0];
+
+    let mut lineage = FixtureLineage::default();
+    lineage.by_parent.insert(
+        hex::encode(ours.child.parent_coin_info),
+        ours.parent.clone(),
+    );
+
+    let script = Script::new();
+    *script.catch_up_coin_states.lock().unwrap() = vec![unspent_coin_state(ours.child)];
+
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let h = Harness::start_with_attribution(
+        db.clone(),
+        Arc::new(FixedHashes::unlocked(vec![ours.owner_p2])),
+        script,
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        None,
+        NO_ROTATION,
+        // The scan leg has NOTHING. The admission leg has its production burst. Under one shared
+        // bucket this pairing is unrepresentable, which is the point.
+        Some(Arc::new(Attribution::with_bursts(
+            Arc::new(lineage),
+            "xch".to_string(),
+            256.0,
+            0.0,
+        ))),
+    )
+    .await;
+
+    h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
+        .await;
+
+    let attributed = db.unspent_coins(Some(&ours.asset_id)).await.unwrap();
+    assert_eq!(
+        attributed.len(),
+        1,
+        "the wallet's own coin must be admitted on the admission budget, whatever the background \
+         pass has spent; found {attributed:?}"
+    );
+
+    h.stop().await;
 }

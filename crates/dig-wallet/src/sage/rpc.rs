@@ -3328,6 +3328,7 @@ impl WalletBackend {
             let parent = lineage
                 .parent_spend(&row.parent_coin_info, created)
                 .await?
+                .found()
                 .ok_or_else(|| Error::internal("CAT parent spend unavailable"))?;
             let child = singleton::coin_from_row(row)?;
             let cat = singleton::resolve_cat(&parent, child)?
@@ -3468,6 +3469,7 @@ impl WalletBackend {
         let parent = lineage
             .parent_spend(&row.parent_coin_info, created)
             .await?
+            .found()
             .ok_or_else(|| Error::internal("parent spend unavailable"))?;
         let child = singleton::coin_from_row(&row)?;
         Ok((parent, child))
@@ -9179,8 +9181,13 @@ mod tests {
                 &self,
                 parent_coin_id: &str,
                 _spent_height: u32,
-            ) -> Result<Option<ParentSpend>> {
-                Ok((parent_coin_id == self.parent_id).then(|| self.spend.clone()))
+            ) -> Result<singleton::LineageAnswer> {
+                // A parent this double does not hold is one the node could not READ, which is
+                // what the production source reports for an unresolvable parent.
+                Ok(singleton::LineageAnswer::from_lookup(
+                    (parent_coin_id == self.parent_id).then(|| self.spend.clone()),
+                    singleton::LineageAnswer::Unavailable,
+                ))
             }
         }
 
@@ -9357,8 +9364,13 @@ mod tests {
                 &self,
                 parent_coin_id: &str,
                 _spent_height: u32,
-            ) -> Result<Option<ParentSpend>> {
-                Ok((parent_coin_id == self.parent_id).then(|| self.spend.clone()))
+            ) -> Result<singleton::LineageAnswer> {
+                // A parent this double does not hold is one the node could not READ, which is
+                // what the production source reports for an unresolvable parent.
+                Ok(singleton::LineageAnswer::from_lookup(
+                    (parent_coin_id == self.parent_id).then(|| self.spend.clone()),
+                    singleton::LineageAnswer::Unavailable,
+                ))
             }
         }
 
