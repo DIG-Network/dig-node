@@ -211,6 +211,20 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
+            // dig-node#387 — the gossip serve half of the per-epoch collateral record. OPEN, and
+            // deliberately so: an epoch record is a recomputable consensus value carrying no
+            // secret, and a peer that cannot fetch history has to re-census it from chain, which
+            // is the expensive path this method exists to spare the network. A caller verifies
+            // what it receives by re-derivation regardless of who served it, so authenticating
+            // the SERVER would buy nothing the verification does not already give.
+            name: "dig.getCollateralEpoch",
+            served: "shell",
+            summary: "This node's record for one mirror-coin collateral epoch, with the census \
+                      inputs a caller re-derives it from. Params { epoch }; result { record } or \
+                      { record: null, reason } naming why this node cannot answer. OPEN.",
+            requires_auth: false,
+        },
+        MethodInfo {
             // #1997: served by the SHELL from the catalogue below — the agent self-describe
             // (§6.2) that must not depend on an upstream being configured.
             name: "dig.methods",

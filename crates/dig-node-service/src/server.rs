@@ -1073,6 +1073,25 @@ async fn rpc(
         );
     }
 
+    // `dig.getCollateralEpoch` — the gossip serve half of the per-epoch collateral record
+    // (dig-node#387). A peer asking about a PAST epoch is answered from this node's own store
+    // rather than sent off to re-census a week of chain history.
+    //
+    // Answered by the shell, like `dig.health`, and for the same reason: a node states what it
+    // holds on its own authority, and needing an upstream to answer would make a node that has
+    // recorded an epoch unable to say so.
+    //
+    // A record this build cannot interpret is NOT served as a record. It is served as a refusal
+    // naming the version, so the caller learns the useful fact — this node is behind the ruleset —
+    // instead of receiving figures neither end can vouch for.
+    if method == "dig.getCollateralEpoch" {
+        let result = collateral_epoch_answer(req.get("params").unwrap_or(&Value::Null));
+        return (
+            StatusCode::OK,
+            Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
+        );
+    }
+
     // PAIRING plane (#280): `pairing.request` / `pairing.poll` are OPEN (no token) —
     // an MV3 extension can't read the control-token file, so it bootstraps a scoped
     // credential here. They are NOT under `control.` (so the gate below leaves them
@@ -2079,6 +2098,15 @@ where
     let wallet_backend = state.wallet.clone();
     let wallet_cert = state.wallet_cert.clone();
 
+    // Bring the per-epoch collateral record store up (dig-node#387). Two steps, both cheap and
+    // both synchronous, because a node that answered `dig.getCollateralEpoch` before its own
+    // genesis record existed would report "not recorded" for an epoch it can derive from nothing.
+    //
+    // This is the store's PRODUCTION WRITER. Until it existed the store was written only by its
+    // own tests, so `control.collateral.requirement` answered `unknown / not_censused` on every
+    // node in the network — a correct answer, and a permanently unchanging one.
+    bring_up_collateral_records();
+
     // §14 autonomous sync (#213): bring up the L7 peer network — the connected peer
     // pool, the content-location DHT + P2P content engine, PEX, and the chain-watch +
     // generation gap-fill loop — so a running node tracks the chain and PROACTIVELY
@@ -2419,6 +2447,118 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
     tracing::info!("dig-node shutting down");
+}
+
+
+/// Answer `dig.getCollateralEpoch` from this node's own record store.
+///
+/// # Every non-answer is a NAMED refusal, never a shaped-like-success zero
+///
+/// The four ways this can fail to produce a record — an unreadable epoch parameter, an epoch never
+/// recorded, a line that cannot be read, and a record governed by a ruleset this build does not
+/// implement — are four different facts with four different remedies, and each is returned as
+/// `record: null` beside its own `reason` token. This node's own read path pays for that
+/// distinction already (`crate::collateral::StoredEpoch`), and discarding it at the wire boundary
+/// would hand every caller the same unactionable sentence.
+///
+/// It matters more here than locally, because the caller is a peer deciding whether to re-census a
+/// week of chain history. "I never recorded it" means ask someone else; "I cannot read my copy"
+/// means this node is broken and should not be asked again; "your ruleset is newer than mine"
+/// means the fault is not the caller's at all.
+///
+/// # Why the read is unauthenticated, and what bounds it
+///
+/// An epoch record is a recomputable consensus value carrying nothing secret, and a caller
+/// verifies it by re-derivation whatever its source — so authenticating the server would buy
+/// nothing. The cost is one read of the record file per request. That file holds one line per
+/// epoch and an epoch is a week, so it is on the order of tens of lines even under the default
+/// keep-everything retention; it is bounded by the calendar rather than by anything a caller
+/// controls.
+fn collateral_epoch_answer(params: &Value) -> Value {
+    use crate::collateral::{EpochRecordStore, StoredEpoch};
+
+    // Read typed and refuse what will not decode. A `params.epoch` that is absent, negative, or
+    // not a number must NOT fall through to a default — epoch 0 is not an epoch, and epoch 1 is a
+    // real record that a defaulting reader would serve in answer to a question nobody asked.
+    let Some(epoch) = params.get("epoch").and_then(Value::as_u64).filter(|e| *e >= 1) else {
+        return json!({
+            "record": Value::Null,
+            "reason": "invalid_epoch",
+            "detail": "params.epoch is required and is a one-based epoch number",
+        });
+    };
+
+    match EpochRecordStore::in_state_dir().get(epoch) {
+        // The protocol-version ceiling, applied on the SERVE side too. A record this build cannot
+        // interpret is one it cannot vouch for, and passing it on unremarked would launder an
+        // unverifiable record through a node that never checked it.
+        StoredEpoch::Found(record) if !record.is_interpretable() => json!({
+            "record": Value::Null,
+            "reason": "unimplemented_ruleset",
+            "protocol_version": record.record.protocol_version.0,
+        }),
+        StoredEpoch::Found(record) => match serde_json::to_value(&*record) {
+            Ok(record) => json!({ "record": record }),
+            Err(e) => json!({
+                "record": Value::Null,
+                "reason": "record_unreadable",
+                "detail": e.to_string(),
+            }),
+        },
+        StoredEpoch::Absent => json!({ "record": Value::Null, "reason": "not_recorded" }),
+        StoredEpoch::Unreadable => json!({ "record": Value::Null, "reason": "record_unreadable" }),
+    }
+}
+
+
+/// Seed the collateral record store and apply the operator's retention preference.
+///
+/// Best-effort and never fatal: a node that cannot write its record store still serves content,
+/// and taking the whole node down over it would trade a missing figure for an outage. Every
+/// failure is logged at WARN rather than swallowed, because the observable symptom otherwise is
+/// `control.collateral.requirement` answering `unknown` forever with no stated cause.
+fn bring_up_collateral_records() {
+    use crate::collateral::{
+        current_epoch_now, ensure_bootstrap, CollateralConfig, CurrentEpoch, EpochRecordStore,
+        PutOutcome,
+    };
+
+    let store = EpochRecordStore::in_state_dir();
+    match ensure_bootstrap(&store) {
+        Ok(PutOutcome::Written) => {
+            tracing::info!(path = %store.path().display(), "recorded the genesis collateral epoch")
+        }
+        Ok(PutOutcome::AlreadyPresent) => {}
+        // A genesis record that disagrees with this build's own `EpochRecord::bootstrap` is not a
+        // write to retry — it means the node's history was written under different rules, or was
+        // tampered with. It is kept and reported; overwriting it is the one thing that must not
+        // happen quietly.
+        Ok(PutOutcome::Conflict { held }) => tracing::warn!(
+            path = %store.path().display(),
+            held_protocol_version = held.record.protocol_version.0,
+            "the stored genesis collateral epoch differs from this build's; keeping the stored one"
+        ),
+        Err(e) => tracing::warn!(
+            path = %store.path().display(),
+            error = %e,
+            "could not record the genesis collateral epoch"
+        ),
+    }
+
+    // Retention. `KeepEverything` — the default — reads nothing and writes nothing, so a node that
+    // never opted in never rewrites this file at all.
+    let policy = CollateralConfig::load().retention();
+    if let CurrentEpoch::Final(epoch) = current_epoch_now() {
+        match store.prune(policy, epoch) {
+            Ok(0) => {}
+            Ok(dropped) => tracing::info!(
+                dropped,
+                policy = ?policy,
+                "truncated the collateral record history at the operator's configured retention"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not apply the collateral retention policy"),
+        }
+    }
 }
 
 #[cfg(test)]

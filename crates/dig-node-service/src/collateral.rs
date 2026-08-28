@@ -50,6 +50,21 @@ pub struct CollateralConfig {
     /// cushion they were never offered.
     #[serde(default = "default_margin_bp")]
     pub margin_bp: u64,
+
+    /// How many epochs of history to keep, or `None` to keep everything.
+    ///
+    /// **`None` is the default, and the default is the point.** The model's premise is that any
+    /// node can recompute any past epoch and reach the same answer, so a node that discarded
+    /// history by default would quietly erode the network's ability to audit itself — and it would
+    /// do so on every node at once, since a default is what almost every operator runs. Truncation
+    /// is a deliberate choice about one's own disk, made once, and never made on an operator's
+    /// behalf.
+    ///
+    /// `default` rather than required for the same reason `margin_bp` is: a config written before
+    /// this field existed expressed no retention preference, and reading one into it would be
+    /// inventing a decision the operator never made.
+    #[serde(default)]
+    pub retention_epochs: Option<u64>,
 }
 
 fn default_margin_bp() -> u64 {
@@ -60,11 +75,30 @@ impl Default for CollateralConfig {
     fn default() -> Self {
         CollateralConfig {
             margin_bp: SAFETY_MARGIN_BP_DEFAULT,
+            // Keep everything. See the field's own documentation for why this is not a tuning
+            // choice.
+            retention_epochs: None,
         }
     }
 }
 
 impl CollateralConfig {
+    /// The retention policy this configuration expresses.
+    ///
+    /// A named method rather than a field read at each call site, so that "no preference means
+    /// keep everything" is stated once instead of being re-decided by whoever is holding the
+    /// `Option` — which is how a default comes to differ between two surfaces.
+    #[must_use]
+    pub fn retention(&self) -> RetentionPolicy {
+        match self.retention_epochs {
+            // Zero is not "keep nothing"; it is a value no operator can act on, and honouring it
+            // would delete the whole history including the epoch currently in force. It reads as
+            // the default, which is the direction that cannot lose data.
+            None | Some(0) => RetentionPolicy::KeepEverything,
+            Some(epochs) => RetentionPolicy::KeepEpochs(epochs),
+        }
+    }
+
     /// Load from the node's own machine-wide state directory.
     ///
     /// The production entry point. It resolves the directory ITSELF via [`crate::state::state_dir`]
@@ -889,6 +923,180 @@ mod tests {
     }
 
     #[test]
+    fn a_record_that_contradicts_a_held_epoch_is_refused_and_the_held_one_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        let held = StoredRecord::censused(record(9, 1_000_000, 1_000, 40), 7_000);
+        assert_eq!(store.put(&held).expect("put"), PutOutcome::Written);
+
+        // A DIFFERENT record for the same epoch: the shape of an attacker walking a node off the
+        // network's history one epoch at a time. It differs in the requirement, which is the field
+        // that decides how much $DIG this operator posts.
+        let contradiction = StoredRecord::censused(record(9, 500_000, 600, 25), 7_001);
+        assert_ne!(contradiction.record, held.record, "the fixture must differ");
+        match store.put(&contradiction).expect("put") {
+            PutOutcome::Conflict { held: kept } => assert_eq!(kept.record, held.record),
+            other => panic!("a contradiction must be refused, got {other:?}"),
+        }
+        // And the refusal is not merely reported — the store still answers with the ORIGINAL.
+        match store.get(9) {
+            StoredEpoch::Found(rec) => assert_eq!(rec.record, held.record),
+            other => panic!("the held record must survive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_identical_record_records_stronger_evidence_but_never_weaker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        let figures = record(5, 900_000, 700, 30);
+        let adopted = StoredRecord {
+            record: figures,
+            census_height: Some(6_000),
+            provenance: RecordProvenance::AdoptedFromPeers {
+                agreed: 7,
+                sampled: 9,
+            },
+        };
+        let censused = StoredRecord::censused(figures, 6_000);
+
+        assert_eq!(store.put(&adopted).expect("put"), PutOutcome::Written);
+        // Censusing an epoch previously adopted from peers is a genuine improvement in what this
+        // node can vouch for, and the consensus figures do not move.
+        assert_eq!(store.put(&censused).expect("put"), PutOutcome::Written);
+        match store.get(5) {
+            StoredEpoch::Found(rec) => assert_eq!(rec.provenance, RecordProvenance::Censused),
+            other => panic!("expected the censused record, got {other:?}"),
+        }
+        // The reverse is not recorded: evidence does not weaken on re-offer. Without this half the
+        // test would pass for a store that simply takes the newest line.
+        assert_eq!(store.put(&adopted).expect("put"), PutOutcome::AlreadyPresent);
+        match store.get(5) {
+            StoredEpoch::Found(rec) => assert_eq!(rec.provenance, RecordProvenance::Censused),
+            other => panic!("expected the censused record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_config_that_expresses_no_retention_keeps_everything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(COLLATERAL_CONFIG_FILE), b"{}").expect("write");
+        assert_eq!(
+            CollateralConfig::load_from(dir.path()).retention(),
+            RetentionPolicy::KeepEverything,
+            "retention is OFF by default; a node keeps everything unless told otherwise"
+        );
+        // Zero is not a retention of nothing. Honouring it would delete the epoch in force.
+        assert_eq!(
+            CollateralConfig {
+                margin_bp: 0,
+                retention_epochs: Some(0)
+            }
+            .retention(),
+            RetentionPolicy::KeepEverything
+        );
+    }
+
+    #[test]
+    fn keep_everything_drops_nothing_and_a_retention_drops_only_what_falls_outside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        for epoch in 1..=10u64 {
+            store
+                .put(&StoredRecord::censused(
+                    record(epoch, 1_000_000, 100 + epoch, 10 + epoch),
+                    1_000 + epoch as u32,
+                ))
+                .expect("put");
+        }
+
+        // The default is the control: without it this test cannot tell a correct policy from one
+        // that truncates regardless.
+        assert_eq!(
+            store
+                .prune(RetentionPolicy::KeepEverything, 10)
+                .expect("prune"),
+            0
+        );
+        assert_eq!(store.records().expect("records").len(), 10);
+
+        // KeepEpochs(3) as of epoch 10 keeps 8, 9 and 10 — the bound is pinned from BOTH sides:
+        // epoch 8 must survive and epoch 7 must not, so an off-by-one in either direction fails.
+        assert_eq!(store.prune(RetentionPolicy::KeepEpochs(3), 10).expect("p"), 7);
+        let kept: Vec<u64> = store
+            .records()
+            .expect("records")
+            .iter()
+            .map(|rec| rec.record.epoch)
+            .collect();
+        assert_eq!(kept, vec![8, 9, 10]);
+        // The survivors are still whole records, not truncated lines.
+        match store.get(8) {
+            StoredEpoch::Found(rec) => assert_eq!(rec.census_height, Some(1_008)),
+            other => panic!("epoch 8 must survive intact, got {other:?}"),
+        }
+        assert_eq!(store.get(7), StoredEpoch::Absent);
+    }
+
+    #[test]
+    fn a_record_from_an_unimplemented_ruleset_is_not_served_as_a_requirement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        // The honest record for the same epoch is the control. It must answer `Known`, or this
+        // test would pass for a `requirement` that refuses everything.
+        let honest = StoredRecord::censused(record(6, 1_000_000, 1_000, 40), 5_000);
+        store.put(&honest).expect("put");
+        assert!(matches!(
+            requirement(&store, CurrentEpoch::Final(6)),
+            CollateralRequirementResult::Known { .. }
+        ));
+
+        // Same epoch, same figures, a ruleset this build does not implement. Every field parses,
+        // which is exactly why nothing downstream would question the number: a forged record of
+        // this shape drove an 18,482,313.402 DIG recommendation in a probe.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        let mut forged = honest;
+        forged.record.protocol_version = dig_mirror_collateral::ProtocolVersion(u16::MAX);
+        store.put(&forged).expect("put");
+        assert_eq!(
+            requirement(&store, CurrentEpoch::Final(6)),
+            CollateralRequirementResult::Unknown {
+                reason: CollateralUnknownReason::RecordUnreadable
+            },
+            "a record this build cannot interpret is unknown, never a figure"
+        );
+    }
+
+    #[test]
+    fn the_genesis_record_is_written_once_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        // Before: the node has censused nothing, and says so.
+        assert_eq!(
+            requirement(&store, CurrentEpoch::Final(1)),
+            CollateralRequirementResult::Unknown {
+                reason: CollateralUnknownReason::NotCensused
+            }
+        );
+        assert_eq!(
+            ensure_bootstrap(&store).expect("bootstrap"),
+            PutOutcome::Written
+        );
+        // After: a real answer, from a record derived from nothing.
+        assert!(matches!(
+            requirement(&store, CurrentEpoch::Final(1)),
+            CollateralRequirementResult::Known { epoch: 1, .. }
+        ));
+        // A node restarts more than once, and a second line for epoch 1 would be a second answer.
+        assert_eq!(
+            ensure_bootstrap(&store).expect("bootstrap"),
+            PutOutcome::AlreadyPresent
+        );
+        assert_eq!(store.records().expect("records").len(), 1);
+    }
+
+    #[test]
     fn a_config_predating_the_margin_field_loads_as_the_default_not_zero() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(COLLATERAL_CONFIG_FILE), b"{}").expect("write");
@@ -906,7 +1114,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // Deliberately not the default: a save/load that silently discarded the value would still
         // pass if the fixture used the default.
-        CollateralConfig { margin_bp: 250 }
+        CollateralConfig {
+            margin_bp: 250,
+            retention_epochs: None,
+        }
             .save_to(dir.path())
             .expect("save");
         assert_eq!(CollateralConfig::load_from(dir.path()).margin_bp, 250);
