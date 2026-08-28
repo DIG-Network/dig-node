@@ -417,10 +417,16 @@ CREATE TABLE IF NOT EXISTS cat_admission_pending (
     created_timestamp INTEGER,
     spent_timestamp INTEGER,
     derived_asset_id TEXT NOT NULL,
-    derived_owner_p2 TEXT NOT NULL
+    derived_owner_p2 TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_cat_admission_pending_created
     ON cat_admission_pending (created_height);
+-- The promotion queue's ORDER BY. Fewest attempts first, then arrival order: a row that keeps
+-- failing sinks, so it can never hold the queue head against a row that has never been tried.
+CREATE INDEX IF NOT EXISTS idx_cat_admission_pending_queue
+    ON cat_admission_pending (attempts, seq);
 
 CREATE TABLE IF NOT EXISTS derivations (
     hardened INTEGER NOT NULL,
@@ -625,6 +631,10 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     // rows banned before this column existed, which sorts them first and so evicts them first --
     // the right order, since they are by definition the oldest bans on the machine.
     "ALTER TABLE peers ADD COLUMN banned_at INTEGER",
+    // The CAT staging queue's attempt accounting (dig-node#394). A replica that ran an earlier
+    // build of this branch already has the table without them.
+    "ALTER TABLE cat_admission_pending ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE cat_admission_pending ADD COLUMN last_attempt_at INTEGER",
 ];
 
 // ---- one-shot data-migration ladder ---------------------------------------
@@ -1705,21 +1715,68 @@ impl WalletDb {
         Ok(())
     }
 
-    /// The oldest `limit` staged rows — the promotion pass's work queue.
+    /// The promotion pass's work queue: up to `limit` staged rows, FEWEST ATTEMPTS FIRST, and
+    /// only rows not tried since `retry_cutoff`.
     ///
-    /// Oldest-first so a backlog drains in arrival order rather than starving the earliest coin,
-    /// and `limit` so one pass performs a bounded number of chain reads regardless of how many
-    /// rows an attacker staged.
-    pub async fn staged_cat_admissions(&self, limit: i64) -> sqlx::Result<Vec<StagedCatRow>> {
+    /// # Why the ordering is attempts-then-arrival rather than arrival alone (dig-node#394)
+    ///
+    /// Arrival order alone is a denial primitive. A promotion that cannot conclude leaves its row
+    /// staged — deliberately, because deleting on an unreadable parent would let a source that is
+    /// merely behind erase real money — so `limit` rows whose parents never resolve occupy the
+    /// head of an arrival-ordered queue permanently. Every later pass re-reads the same `limit`
+    /// rows and no honest coin behind them is ever reached. The gate reproduced it: `deferred: 64`
+    /// on every pass, reads climbing 64, 128, ... unbounded, and the victim's $DIG balance zero
+    /// for ever, bought for 64 mojos.
+    ///
+    /// Ordering by `attempts` first fixes both halves at once. A row that has never been tried
+    /// always precedes one that has, so nothing can hold the head; and a row that keeps failing
+    /// sinks below every other row at its attempt level, so the reads an attacker buys are spread
+    /// across the whole table rather than concentrated on their own coins.
+    ///
+    /// # Why the cutoff, on top of the ordering
+    ///
+    /// The ordering removes starvation but not amplification: with a table of only poisoned rows,
+    /// every pass would still spend `limit` reads on them. `retry_cutoff` bounds a row to one read
+    /// per cooldown, so the total read rate an attacker can buy is `rows / cooldown` — bounded,
+    /// and independent of how often a pass runs.
+    ///
+    /// A row is never deleted for failing. Absence is the accepted failure direction here;
+    /// erasing a coin because a source was briefly behind is not.
+    pub async fn staged_cat_admissions(
+        &self,
+        limit: i64,
+        retry_cutoff: i64,
+    ) -> sqlx::Result<Vec<StagedCatRow>> {
         sqlx::query_as::<_, StagedCatRow>(
             "SELECT coin_id, parent_coin_info, puzzle_hash, amount, created_height,
                     spent_height, created_timestamp, spent_timestamp,
                     derived_asset_id, derived_owner_p2
-             FROM cat_admission_pending ORDER BY seq ASC LIMIT ?",
+             FROM cat_admission_pending
+             WHERE last_attempt_at IS NULL OR last_attempt_at <= ?
+             ORDER BY attempts ASC, seq ASC LIMIT ?",
         )
+        .bind(retry_cutoff)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Record that a promotion pass SPENT A READ on `coin_id` at `now` and could not conclude.
+    ///
+    /// Called on every inconclusive outcome — an unreadable parent, a source-reported absence, an
+    /// unconfirmed coin — because the resource being metered is the read, not the verdict.
+    /// A conclusive outcome deletes the row instead, so it never needs an attempt recorded.
+    pub async fn record_promotion_attempt(&self, coin_id: &str, now: i64) -> sqlx::Result<()> {
+        sqlx::query(
+            "UPDATE cat_admission_pending
+                SET attempts = attempts + 1, last_attempt_at = ?
+              WHERE coin_id = ?",
+        )
+        .bind(now)
+        .bind(Self::normalise_hex(coin_id))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Which of `coin_ids` already have a row in `coins`.

@@ -386,11 +386,22 @@ pub async fn reconstruct_coins(
         if !is_candidate(c, plain_puzzle_hashes) {
             continue;
         }
-        let Some(parent) = lineage
-            .parent_spend(&c.parent_coin_info, created as u32)
-            .await?
-        else {
-            continue;
+        // Per-coin resilience, deliberately (dig-node#394). `parent_spend` used to report an
+        // unreadable parent as `Ok(None)`, so one flaky read skipped one coin; now that it reports
+        // the failure honestly, propagating it here would let a single timeout abandon attribution
+        // for every remaining coin in the pass. Skip and log, exactly as before — the difference is
+        // that the cause is now visible rather than indistinguishable from a chain fact.
+        let parent = match lineage.parent_spend(&c.parent_coin_info, created as u32).await {
+            Ok(Some(parent)) => parent,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    coin_id = %c.coin_id,
+                    error = %e,
+                    "attribution: parent spend unreadable; leaving the coin unattributed"
+                );
+                continue;
+            }
         };
         let child = coin_from_row(c)?;
         match reconstruct(prefix, Some(created as u32), &parent, child)? {

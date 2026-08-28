@@ -50,14 +50,37 @@ use super::{singleton, Result};
 
 /// How many staged coins one promotion pass will read parent spends for.
 ///
-/// This is the amplification bound. An attacker who stages `N` coins buys at most this many chain
-/// reads per pass, and because promotion is **terminal** — a coin is promoted or refused once and
-/// never re-read — the total reads they can buy is `N`, not `N` per pass forever. Against a coin
-/// each of which cost them a `CREATE_COIN` and at least one mojo, that is roughly 1x.
+/// The per-pass bound. A pass stays short — each read is a network round trip — while an honest
+/// wallet's whole backlog still clears in a handful of passes.
 ///
-/// Small enough that a pass stays short (each read is a network round trip), large enough that an
-/// honest wallet's whole backlog clears in a handful of passes.
+/// This is NOT on its own the amplification bound, and an earlier version of this comment claimed
+/// it was: it asserted that promotion is terminal, so an attacker who stages `N` coins buys `N`
+/// reads in total. That is true of a coin whose promotion CONCLUDES, and false of one whose
+/// parent cannot be read — which is the case an attacker chooses. Such a row stays staged by
+/// design, so it was re-read on every pass, for ever. The real bound is one read per staged row
+/// per [`PROMOTION_RETRY_COOLDOWN`], enforced in [`crate::sage::db::WalletDb::staged_cat_admissions`].
 pub const MAX_CAT_PROMOTIONS_PER_PASS: i64 = 64;
+
+/// The least time between two parent-spend reads for the SAME staged coin (dig-node#394).
+///
+/// # What this bounds, and why a classification does not replace it
+///
+/// A parent spend that cannot be read has two causes with opposite correct handling: the parent
+/// never existed (an invented ancestry, and the row will never resolve), or the source has not
+/// got there yet (pruned, behind, offline — and the row will resolve later). Distinguishing them
+/// would let the first be refused terminally.
+///
+/// The distinction is not soundly available. A coinset source answers a null `coin_solution` for
+/// BOTH — a spend it has never heard of and a spend it is simply behind on — so a terminal
+/// refusal built on that answer converts a source that is briefly behind into permanent erasure of
+/// a real coin. That is the one failure direction this whole design refuses to take: absence is
+/// acceptable, a wrong figure is not, and erasing money is worse than either.
+///
+/// So the cost is bounded instead of the cause classified. With attempts-ordered fetch, a row that
+/// never resolves cannot starve one that would, and this cooldown holds each row to one read per
+/// hour. An attacker who spends 64 mojos buys 64 reads an hour rather than 64 reads a pass, and
+/// an honest coin behind a source outage still promotes the moment the source recovers.
+pub const PROMOTION_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3_600);
 
 /// The outer CAT puzzle hashes this wallet would own, and what each one was derived FROM.
 ///
@@ -194,8 +217,12 @@ pub async fn promote_staged_cats(
     lineage: &dyn LineageSource,
 ) -> Result<PromoteStats> {
     let mut stats = PromoteStats::default();
+    // Read from the wall clock ONCE, so every row in this pass is metered against the same
+    // instant and a long pass cannot let its own duration widen the cooldown.
+    let now = unix_now();
+    let retry_cutoff = now - i64::try_from(PROMOTION_RETRY_COOLDOWN.as_secs()).unwrap_or(3_600);
     for row in db
-        .staged_cat_admissions(MAX_CAT_PROMOTIONS_PER_PASS)
+        .staged_cat_admissions(MAX_CAT_PROMOTIONS_PER_PASS, retry_cutoff)
         .await?
     {
         // A coin already spent on chain can never contribute to a balance or be selected as a
@@ -209,7 +236,10 @@ pub async fn promote_staged_cats(
             continue;
         }
         let Some(created) = row.created_height else {
-            // Unconfirmed: there is no height to read a parent spend at yet. Left staged.
+            // Unconfirmed: there is no height to read a parent spend at yet. Left staged, and
+            // metered — a coin that is never confirmed is exactly as unresolvable as one whose
+            // parent is never readable, and it must not hold the queue head either.
+            db.record_promotion_attempt(&row.coin_id, now).await?;
             stats.deferred += 1;
             continue;
         };
@@ -218,18 +248,24 @@ pub async fn promote_staged_cats(
             .await
         {
             Ok(Some(parent)) => parent,
-            // `Ok(None)` is "the parent spend is not available", NOT "the parent is not a CAT".
-            // Treating it as a disproof would delete real coins whenever a source is behind.
+            // `Ok(None)` is "the source ANSWERED, and has no spend for this parent" — which is
+            // consistent with an invented ancestry AND with a source that is merely behind.
+            // Treating it as a disproof would delete real coins whenever a source is behind, so it
+            // is a deferral; the cost of retrying it for ever is bounded by the cooldown instead.
             Ok(None) => {
+                db.record_promotion_attempt(&row.coin_id, now).await?;
                 stats.deferred += 1;
                 continue;
             }
+            // The source did not answer at all — transport, timeout, a malformed reply. Strictly
+            // less informative than `Ok(None)`, and handled the same way.
             Err(e) => {
                 tracing::debug!(
                     coin_id = %row.coin_id,
                     error = %e,
                     "cat promotion: parent spend unreadable; leaving the coin staged"
                 );
+                db.record_promotion_attempt(&row.coin_id, now).await?;
                 stats.deferred += 1;
                 continue;
             }
@@ -242,6 +278,14 @@ pub async fn promote_staged_cats(
         }
     }
     Ok(stats)
+}
+
+/// Seconds since the Unix epoch, saturating at zero on a clock set before it.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// The address prefix reconstruction wants. CAT attribution never produces an address — only NFT
@@ -779,7 +823,7 @@ mod tests {
             CAT_ADMISSION_PENDING_MAX_ROWS
         );
         let held = db
-            .staged_cat_admissions(CAT_ADMISSION_PENDING_MAX_ROWS)
+            .staged_cat_admissions(CAT_ADMISSION_PENDING_MAX_ROWS, i64::MAX)
             .await
             .unwrap();
         assert!(
@@ -808,7 +852,7 @@ mod tests {
 
         db.rollback_above(150).await.unwrap();
 
-        let held = db.staged_cat_admissions(100).await.unwrap();
+        let held = db.staged_cat_admissions(100, i64::MAX).await.unwrap();
         assert_eq!(held.len(), 1, "only the row above the fork is unmade");
         assert_eq!(held[0].coin_id, hex::encode(below.coin_id()));
     }

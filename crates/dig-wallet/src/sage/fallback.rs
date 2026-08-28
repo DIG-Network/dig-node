@@ -509,14 +509,32 @@ impl super::singleton::LineageSource for ChiaQueryLineage {
         spent_height: u32,
     ) -> Result<Option<super::singleton::ParentSpend>> {
         let coin_id = format!("0x{}", CoinsetFallback::norm_hex(parent_coin_id));
+        // A FAILED READ IS REPORTED AS A FAILED READ (dig-node#394).
+        //
+        // This used to be `Err(_) => return Ok(None)`, described as "a clean no lineage". It was
+        // not clean: `Ok(None)` is the value a caller reads as "the chain has no such spend", and
+        // this arm produced it for a DNS failure, a timeout, a 500 and a malformed reply alike. An
+        // outage therefore arrived at the promotion path wearing the costume of a chain fact —
+        // which matters because the two want opposite handling, and the one place that could tell
+        // them apart was here.
+        //
+        // `ChiaQuery`'s facade cannot yet distinguish "the source answered: no spend" from "the
+        // source did not answer" — only its inner coinset client exposes the absence-aware
+        // `get_puzzle_and_solution_opt`, and lifting that onto the facade is a chia-query release
+        // this PR will not take. So this impl reports the weaker but TRUE thing: every unsuccessful
+        // read is an `Err`, and `Ok(None)` is never manufactured from one. Callers already treat
+        // `Err` as "retry later", which is the correct handling for both causes.
         let cs = match self
             .query
             .get_puzzle_and_solution(&coin_id, Some(spent_height))
             .await
         {
             Ok(cs) => cs,
-            // The parent spend is not available (unspent / not found) — a clean "no lineage".
-            Err(_) => return Ok(None),
+            Err(e) => {
+                return Err(Error::internal(format!(
+                    "lineage: parent spend {coin_id} could not be read: {e}"
+                )))
+            }
         };
         let decode = |field: &str, s: &str| -> Result<Vec<u8>> {
             hex::decode(s.strip_prefix("0x").unwrap_or(s))
