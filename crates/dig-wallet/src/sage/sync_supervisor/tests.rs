@@ -890,10 +890,19 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
     h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
         .await;
 
+    // ADMISSION: the custodied p2 hashes, and nothing else. A derived CAT hash here is a coin
+    // admitted to the money table on a claim anybody could make.
     assert_eq!(
         h.script.catch_ups.lock().unwrap()[0],
-        subscribed_for(&expected),
-        "the subscribed set must be exactly the custodied p2 hashes and their derived CAT hashes"
+        expected,
+        "the ADMISSION set must be exactly the custodied p2 hashes"
+    );
+    // COVERAGE: the union actually put on the wire. Asserting only the line above would be
+    // satisfied by a catch-up that stopped asking about CAT hashes altogether, which is #380.
+    assert_eq!(
+        h.script.requested.lock().unwrap()[0],
+        requested_for(&expected),
+        "the REQUESTED set must be the custodied p2 hashes and their derived CAT hashes"
     );
     assert!(
         db.is_synced().await.unwrap(),
@@ -1048,8 +1057,13 @@ async fn a_wallet_created_after_boot_is_subscribed_without_waiting_for_a_disconn
     .await;
     assert_eq!(
         h.script.catch_ups.lock().unwrap()[0],
-        subscribed_for(&[created]),
-        "the catch-up must subscribe exactly the new wallet's hash and its derived CAT hash"
+        vec![created],
+        "the catch-up ADMITS exactly the new wallet's own hash"
+    );
+    assert_eq!(
+        h.script.requested.lock().unwrap()[0],
+        requested_for(&[created]),
+        "and REQUESTS that hash together with its derived CAT hash"
     );
     h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
         .await;
@@ -1171,7 +1185,12 @@ fn as_wire_matches_the_serialized_token_for_every_phase() {
 /// hashes are exactly `cat_puzzle_hash(address, DIG_ASSET_ID)` and nothing else; an implementation
 /// that subscribed one hash too many, or the wrong curry, fails just as loudly as one that
 /// subscribed too few.
-fn subscribed_for(addresses: &[Bytes32]) -> Vec<Bytes32> {
+///
+/// This is the set REQUESTED FROM THE PEER, and it is deliberately not the set that admits coins
+/// into `coins` (dig-node#394). The two were one value once, and that is exactly how a coin at a
+/// derived CAT hash came to be admitted and counted as XCH. Every caller below therefore asserts
+/// both: `catch_ups` for admission, this for coverage.
+fn requested_for(addresses: &[Bytes32]) -> Vec<Bytes32> {
     let mut all: Vec<Bytes32> = addresses.to_vec();
     all.extend(
         addresses

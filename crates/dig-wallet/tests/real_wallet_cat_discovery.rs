@@ -113,7 +113,9 @@ async fn the_real_wallet_reports_its_real_dig_balance() {
     db.stage_cat_admissions(&rows).await.unwrap();
 
     let lineage = CapturedLineage::load(&parents_json);
-    let stats = promote_staged_cats(&db, &lineage).await.unwrap();
+    let stats = promote_staged_cats(&db, &lineage, &std::collections::HashSet::new())
+        .await
+        .unwrap();
     println!("[PROMOTE] {stats:?}");
 
     let balance = db.balance(Some(&asset_hex)).await.unwrap();

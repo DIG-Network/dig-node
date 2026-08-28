@@ -220,9 +220,11 @@ where
             believed.push(row.clone());
             continue;
         }
-        let Some(owner) = hex_to_bytes32(&row.puzzle_hash).and_then(|h| derived.owner_of(&h)) else {
-            continue;
-        };
+        // Everything else was found by HINT and is a CLAIM. A derived hash additionally tells us
+        // which asset to expect; anything else is staged with the empty sentinel and proven purely
+        // from its parent spend. Nothing is dropped, so no CAT this path used to surface is lost —
+        // what changes is that none of it is BELIEVED before the proof.
+        let predicted = hex_to_bytes32(&row.puzzle_hash).and_then(|h| derived.owner_of(&h));
         if already_promoted(&row.coin_id) {
             // Already proven once; its later states update `coins` normally, exactly as on the
             // frame path, or a promoted coin would stay unspent in the replica for ever.
@@ -240,8 +242,8 @@ where
             // away would make a promoted coin's history poorer than the row it came from.
             created_timestamp: row.created_timestamp,
             spent_timestamp: row.spent_timestamp,
-            derived_asset_id: hex::encode(owner.asset_id),
-            derived_owner_p2: hex::encode(owner.owner_p2),
+            derived_asset_id: predicted.map(|o| hex::encode(o.asset_id)).unwrap_or_default(),
+            derived_owner_p2: predicted.map(|o| hex::encode(o.owner_p2)).unwrap_or_default(),
         });
     }
     (believed, staged)
@@ -288,6 +290,7 @@ pub struct PromoteStats {
 pub async fn promote_staged_cats(
     db: &WalletDb,
     lineage: &dyn LineageSource,
+    owned_p2: &HashSet<String>,
 ) -> Result<PromoteStats> {
     let mut stats = PromoteStats::default();
     // Read from the wall clock ONCE, so every row in this pass is metered against the same
@@ -343,7 +346,7 @@ pub async fn promote_staged_cats(
                 continue;
             }
         };
-        if promote_one(db, lineage_prefix(), &row, &parent).await? {
+        if promote_one(db, lineage_prefix(), &row, &parent, owned_p2).await? {
             stats.promoted += 1;
         } else {
             db.discard_cat_admission(&row.coin_id).await?;
@@ -373,6 +376,7 @@ async fn promote_one(
     prefix: &str,
     row: &StagedCatRow,
     parent: &super::singleton::ParentSpend,
+    owned_p2: &HashSet<String>,
 ) -> Result<bool> {
     let coin_row = staged_as_coin(row);
     let child: Coin = coin_from_row(&coin_row)?;
@@ -398,12 +402,32 @@ async fn promote_one(
         // The parent read succeeded and this coin is not a CAT child of it at all. Disproven.
         return Ok(false);
     };
-    // The reconstruction must agree with the derivation on BOTH halves. Checking only the asset id
-    // would admit a real CAT of the right asset owned by somebody else; checking only the owner
-    // would admit a CAT of a different asset counted as this one. Both are money-visible.
-    let agrees = coin_id.eq_ignore_ascii_case(&row.coin_id)
-        && asset_id.eq_ignore_ascii_case(&row.derived_asset_id)
-        && hint.eq_ignore_ascii_case(&row.derived_owner_p2);
+    // The reconstruction must agree on BOTH halves — which coin, and whose. Checking only the
+    // asset id would admit a real CAT of the right asset owned by somebody else; checking only the
+    // owner would admit a CAT of a different asset counted as this one. Both are money-visible.
+    //
+    // WHAT "AGREE" MEANS DEPENDS ON WHETHER ANYTHING WAS PREDICTED (dig-node#394). A coin found at
+    // a DERIVED hash arrives with a predicted (asset, owner) pair, and the reconstruction must
+    // match that pair exactly — the derivation said where to look, and a coin that turns out to be
+    // something else is disproven. A coin found by HINT arrives with no prediction: nothing was
+    // derived, so there is nothing to match against, and the row carries the empty sentinel.
+    //
+    // The proof is equally strong in both cases, because it is the same proof: the parent spend
+    // reconstructs this coin id as a CAT of asset A hinted to p2 H. When H is one of the wallet's
+    // own p2 hashes, that IS "this coin is a unit of asset A and only this wallet can spend it" —
+    // which is the entire claim being made. The predicted case additionally checks that the
+    // derivation was not lying about which asset it expected.
+    let asset_agrees = row.derived_asset_id.is_empty()
+        || asset_id.eq_ignore_ascii_case(&row.derived_asset_id);
+    let owner_agrees = if row.derived_owner_p2.is_empty() {
+        // Unpredicted: the reconstruction's own hint must name an address this wallet controls.
+        // Without this the hint would be attacker-controlled all the way to `coins`, which is the
+        // defect being fixed rather than a smaller version of it.
+        owned_p2.contains(&hint.to_ascii_lowercase())
+    } else {
+        hint.eq_ignore_ascii_case(&row.derived_owner_p2)
+    };
+    let agrees = coin_id.eq_ignore_ascii_case(&row.coin_id) && asset_agrees && owner_agrees;
     if !agrees {
         tracing::warn!(
             coin_id = %row.coin_id,
@@ -509,6 +533,17 @@ mod tests {
         }
     }
 
+    /// The wallet's own p2 hashes, for the tests whose staged rows all carry a PREDICTED owner.
+    ///
+    /// Empty on purpose, and only sound because of that precondition: `owned_p2` is consulted
+    /// solely on the unpredicted branch, so an empty set here cannot make a predicted-row test
+    /// pass for the wrong reason. The unpredicted branch has its own fixture with a real set --
+    /// see `an_unpredicted_hinted_coin_promotes_only_to_an_address_we_control`, without which this
+    /// helper would be exactly the uniform-fixture collapse this family keeps paying for.
+    fn owned() -> HashSet<String> {
+        HashSet::new()
+    }
+
     /// A [`LineageSource`] over a fixed parent map, which COUNTS its reads and can be told to fail
     /// for one specific parent.
     ///
@@ -605,7 +640,7 @@ mod tests {
         lineage
             .by_parent
             .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
-        let stats = promote_staged_cats(&db, &lineage).await.unwrap();
+        let stats = promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
 
         assert_eq!(stats.promoted, 1, "{stats:?}");
         assert_eq!(db.staged_cat_admission_count().await.unwrap(), 0);
@@ -657,7 +692,7 @@ mod tests {
             .by_parent
             .insert(hex::encode(fake.parent_coin_info), f.parent.clone());
 
-        let stats = promote_staged_cats(&db, &lineage).await.unwrap();
+        let stats = promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
         assert_eq!(stats.promoted, 1, "{stats:?}");
         assert_eq!(stats.refused, 1, "{stats:?}");
 
@@ -689,7 +724,7 @@ mod tests {
         let rows = stage_from_states(&[state(f.child, Some(10), None)], &derived, |_| false);
         db.stage_cat_admissions(&rows).await.unwrap();
         // A source that can read nothing at all: every coin stays staged.
-        let stats = promote_staged_cats(&db, &CountingLineage::default())
+        let stats = promote_staged_cats(&db, &CountingLineage::default(), &owned())
             .await
             .unwrap();
         assert_eq!(stats.deferred, 1, "{stats:?}");
@@ -741,7 +776,7 @@ mod tests {
             .by_parent
             .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
 
-        let stats = promote_staged_cats(&db, &lineage)
+        let stats = promote_staged_cats(&db, &lineage, &owned())
             .await
             .expect("a failing parent read must not fail the whole pass");
         assert_eq!(
@@ -773,7 +808,7 @@ mod tests {
             .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
         let real = stage_from_states(&[state(f.child, Some(10), None)], &derived, |_| false);
         db.stage_cat_admissions(&real).await.unwrap();
-        promote_staged_cats(&db, &lineage).await.unwrap();
+        promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
         assert_eq!(
             lineage.reads(),
             1,
@@ -797,7 +832,7 @@ mod tests {
         db.stage_cat_admissions(&rows).await.unwrap();
 
         let before = lineage.reads();
-        let stats = promote_staged_cats(&db, &lineage).await.unwrap();
+        let stats = promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
         let first_pass = lineage.reads() - before;
         assert_eq!(
             first_pass,
@@ -814,7 +849,7 @@ mod tests {
         // row was eligible again immediately. With the retry cooldown the correct number is zero,
         // and zero is what distinguishes a bounded queue from an unbounded one.
         let before = lineage.reads();
-        promote_staged_cats(&db, &lineage).await.unwrap();
+        promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
         let second = lineage.reads() - before;
         // EXACTLY ONE, and the number is the assertion. `over` is one past the per-pass cap, so
         // after pass one there is precisely one row that has never been read; the other 64 are
@@ -885,7 +920,7 @@ mod tests {
         db.stage_cat_admissions(&honest).await.unwrap();
 
         // Pass one spends its whole budget on the wall, exactly as before the fix.
-        let first = promote_staged_cats(&db, &lineage).await.unwrap();
+        let first = promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
         assert_eq!(first.promoted, 0, "the wall owns the head on pass one");
         assert_eq!(
             usize::try_from(first.deferred).unwrap(),
@@ -896,7 +931,7 @@ mod tests {
         // Pass two is the one the old ordering could never reach. The wall has been read once and
         // is inside its cooldown; the honest coin has never been read, so it is served.
         let before = lineage.reads();
-        let second = promote_staged_cats(&db, &lineage).await.unwrap();
+        let second = promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
         assert_eq!(
             second.promoted, 1,
             "an honest coin behind a wall of unresolvable ones must still promote: {second:?}"

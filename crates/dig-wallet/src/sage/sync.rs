@@ -826,7 +826,7 @@ impl CatAttributor<'_> {
     /// A swallowed failure costs a delay and nothing else: the staged rows are untouched, so the
     /// next pass retries them. Absent, never wrong.
     async fn promote(&self, db: &WalletDb) {
-        match cat_discovery::promote_staged_cats(db, self.lineage).await {
+        match cat_discovery::promote_staged_cats(db, self.lineage, self.plain_puzzle_hashes).await {
             Ok(stats) if stats.promoted > 0 || stats.refused > 0 => {
                 tracing::info!(
                     promoted = stats.promoted,

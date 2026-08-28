@@ -3150,7 +3150,7 @@ impl WalletBackend {
             // discovered at a derived hash becomes spendable on this tier too. Best-effort for
             // the same reason attribution is: a chain-read failure must not make a fresh XCH sync
             // look like a hard error.
-            let _ = super::cat_discovery::promote_staged_cats(&self.db, lineage).await;
+            let _ = super::cat_discovery::promote_staged_cats(&self.db, lineage, &owned).await;
             let plain: HashSet<String> = phs.iter().cloned().collect();
             let _ =
                 singleton::reconstruct_all(&self.db, lineage, &self.config.address_prefix, &plain)
@@ -9493,8 +9493,23 @@ mod tests {
         );
 
         // The wallet coin-DB sync: read the wallet's own coins from chain + attribute the CAT.
+        //
+        // The return value counts rows written DIRECTLY into `coins`, and a hinted coin is no
+        // longer one of them (dig-node#394): a hint is attacker-controlled, so it is staged and
+        // admitted only once its parent spend proves what it is. Zero here is the whole re-route,
+        // and the assertions below are what prove the re-route costs no capability — the same
+        // coin, the same TAIL, the same selectability, reached through a proof instead of trust.
         let n = be.refresh_tracked_coins().await.unwrap();
-        assert_eq!(n, 1, "the hinted CAT coin was synced into the DB");
+        assert_eq!(
+            n, 0,
+            "a coin found by HINT is staged, never upserted straight into `coins`"
+        );
+        assert_eq!(
+            be.db.staged_cat_admission_count().await.unwrap(),
+            0,
+            "and the staging table is empty afterwards because the coin was PROMOTED out of it, \
+             not because it was never staged -- the next assertion is what tells those apart"
+        );
 
         // AFTER the sync: the coin is in the DB, attributed to its TAIL, and selectable.
         let unspent = be.db.unspent_coins(Some(&asset_hex)).await.unwrap();
