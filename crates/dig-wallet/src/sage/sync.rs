@@ -13,7 +13,7 @@
 //! mainnet-safely against synthetic `CoinState`s AND the Chia peer simulator — no real
 //! spends (this PR has none).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chia_protocol::Bytes32;
@@ -510,9 +510,7 @@ impl DerivedCats {
         let mut map = HashMap::new();
         for owner_p2 in owner_p2_hashes {
             for asset_id in asset_ids {
-                let outer = Bytes32::from(digstore_chain::cat::cat_puzzle_hash(
-                    *owner_p2, *asset_id,
-                ));
+                let outer = digstore_chain::cat::cat_puzzle_hash(*owner_p2, *asset_id);
                 map.insert(
                     outer,
                     CatIdentity {
@@ -1189,7 +1187,7 @@ pub async fn run_update_loop(
             ProtocolMessageTypes::CoinStateUpdate => {
                 if let Ok(update) = decode::<CoinStateUpdate>(&message) {
                     let applied =
-                        handle_coin_state_update(db, &update, events, session, attributor).await?;
+                        handle_coin_state_update(db, &update, events, session).await?;
                     // Only after a frame that actually WROTE something. A dropped frame leaves the
                     // replica byte-identical, so a pass over it can only re-examine rows an
                     // earlier pass already settled — work a peer gets to schedule for free by

@@ -96,9 +96,7 @@ pub struct ReconstructStats {
 /// unreachable now and a retry is the remedy — so a caller that sees it re-opens the session and
 /// asks again. A budget refusal is a STANDING property of this node under its current load, so a
 /// caller that reads it as transient reconnects forever without ever making progress. This is the
-/// same distinction [`super::sync::NotAdmitted::AttributionDisabled`] draws against
-/// [`super::sync::NotAdmitted::LineageUnavailable`], applied to the reason a remote peer can
-/// actually choose.
+/// distinction the attribution pass needs in order to decide whether asking again can help.
 #[derive(Debug, Clone)]
 pub enum LineageAnswer {
     /// The parent spend, as read.
@@ -131,8 +129,8 @@ impl LineageAnswer {
     /// [`Self::Absent`]. Nothing in production ever called it — but it was the constructor every
     /// test double reached for, so **every** double in this crate modelled an unresolvable parent
     /// as a settled absence while the production source modelled it as unreadable. The suite was
-    /// therefore structurally unable to reach `SyncError::IncompleteBatch` by the ordinary route,
-    /// which is how dig-node#383 survived a review round that was hunting exactly that class.
+    /// therefore structurally unable to reach production's unreadable-parent path by the ordinary
+    /// route, which is how dig-node#383 survived a review round hunting exactly that class.
     ///
     /// A fixture map cannot know which of the two a miss represents, so it has to say. Making the
     /// caller name it is the whole point: a double that cannot express production's failure mode

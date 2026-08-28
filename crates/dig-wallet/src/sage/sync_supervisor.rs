@@ -56,7 +56,6 @@ use chia_puzzle_types::standard::StandardArgs;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
-use super::lineage_guard;
 use super::quorum::{self, Verdict};
 use super::singleton;
 use super::sync::{self, PeerTrust, SyncError};
@@ -814,7 +813,7 @@ pub trait SyncSession: Send + Sync {
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
-        attributor: Option<&sync::CatAttributor<'_>>,
+        derived_cats: &sync::DerivedCats,
     ) -> Result<(), SyncError>;
 
     /// Consume peer pushes until the peer disconnects. Consumes the session.
@@ -1217,6 +1216,18 @@ impl StallWatch {
     }
 }
 
+/// The CAT asset ids this node can recognise on sight.
+///
+/// Every entry here becomes a derived outer puzzle hash per wallet address, and therefore a
+/// subscription — so a coin of that asset arrives already typed. An asset NOT listed here is
+/// simply not followed: its coins are never admitted and it reads as ABSENT rather than as a
+/// wrong number, which is the failure direction this wallet must have.
+///
+/// $DIG is the only entry because it is the only asset the node has a compile-time id for.
+/// Discovering CATs whose ids are unknown in advance cannot be done by local derivation at all
+/// and is deliberately not attempted here (SPEC 18.11).
+const KNOWN_CAT_ASSET_IDS: [Bytes32; 1] = [digstore_chain::dig::DIG_ASSET_ID];
+
 /// The read-only inputs a CAT/singleton attribution pass needs, held for the life of the
 /// supervisor so every session it opens attributes the coins that session syncs.
 ///
@@ -1229,79 +1240,25 @@ impl StallWatch {
 /// created, unlocked and watched, so the supervisor takes them from the subscription set it
 /// resolved for the current attempt rather than from a snapshot taken at boot.
 pub struct Attribution {
-    /// Resolves a parent coin's spend, through the read bound. Production passes the shared
-    /// `chia_query` lineage source, so attribution reads through the SAME peer pool as every
-    /// other chain read.
+    /// Resolves a parent coin's spend for the background whole-replica pass. Production passes
+    /// the shared `chia_query` lineage source, so attribution reads through the SAME peer pool as
+    /// every other chain read.
     ///
-    /// Private, and reachable only via [`Attribution::new`], so no caller can assemble an
-    /// attributor whose lineage reads are unmetered. The bound is not advice a call site may
-    /// decline: attribution is the one chain read a REMOTE PEER chooses the volume of.
-    admission: Arc<dyn singleton::LineageSource>,
-    /// Resolves a parent coin's spend for the background whole-replica pass, through its OWN read
-    /// bound.
-    ///
-    /// A second guard over the same underlying source, not a second source. What must not be
-    /// shared is the ALLOWANCE.
-    scan: Arc<dyn singleton::LineageSource>,
+    /// ONE source, unmetered, and deliberately so. An earlier shape wrapped two legs in separate
+    /// read bounds because a second leg resolved lineage on the frame path, where a remote peer
+    /// chose the volume. Nothing reads lineage on the frame path now — an arriving CAT coin is
+    /// recognised by a locally derived puzzle hash — so this pass is ordinary background work over
+    /// rows the replica already holds, paced by the sync loop rather than by a peer.
+    lineage: Arc<dyn singleton::LineageSource>,
     /// The address bech32m prefix used for any reconstructed NFT/DID addresses.
     prefix: String,
 }
 
 impl Attribution {
-    /// Wrap `lineage` in a read bound ([`lineage_guard::BoundedLineage`]) **once per leg**, and
-    /// take `prefix` for any reconstructed NFT/DID addresses.
-    ///
-    /// The wrapping happens HERE rather than at the call site because a bound a call site may
-    /// decline is not a bound: attribution is the one chain read a remote peer chooses the volume
-    /// of. The fields are private for the same reason — a struct literal elsewhere would compile
-    /// an unmetered attributor into existence by omission.
-    ///
-    /// # Two guards, because one was a money-lie
-    ///
-    /// The first version of this bound gave both legs one bucket. The background pass re-read
-    /// every stable row on every frame, so it drained that bucket; `admit_hinted` then refused a
-    /// genuine incoming $DIG coin, which is dropped rather than stored, while the catch-up
-    /// completed and latched the replica as authoritative. The wallet answered
-    /// `{"balance":0,"synced":true}` on a funded wallet — the exact defect dig-node#382 was filed
-    /// for, reintroduced by its own fix.
-    ///
-    /// Two buckets make the starvation inexpressible rather than merely unlikely. It is the
-    /// second half of the remedy; the first is that the pass no longer re-reads stable rows at all
-    /// (see [`singleton::reconstruct_coins`]).
+    /// Take `lineage` as the background pass's parent-spend source and `prefix` for any
+    /// reconstructed NFT/DID addresses.
     pub fn new(lineage: Arc<dyn singleton::LineageSource>, prefix: String) -> Self {
-        Self {
-            admission: Arc::new(lineage_guard::BoundedLineage::new(lineage.clone())),
-            scan: Arc::new(lineage_guard::BoundedLineage::new(lineage)),
-            prefix,
-        }
-    }
-
-    /// The same attributor with an explicit per-leg burst, so a test can state the exhausted
-    /// state directly instead of having to produce the production burst to reach it.
-    ///
-    /// `refill_per_sec` is zero on both legs, which makes each bucket a fixed pool and each
-    /// assertion exact rather than wall-clock dependent.
-    #[cfg(test)]
-    pub(crate) fn with_bursts(
-        lineage: Arc<dyn singleton::LineageSource>,
-        prefix: String,
-        admission_burst: f64,
-        scan_burst: f64,
-    ) -> Self {
-        let guard = |inner: Arc<dyn singleton::LineageSource>, burst| {
-            Arc::new(lineage_guard::BoundedLineage::with_budget(
-                inner,
-                burst,
-                0.0,
-                lineage_guard::MAX_NEGATIVE_CACHE,
-                lineage_guard::NEGATIVE_TTL,
-            )) as Arc<dyn singleton::LineageSource>
-        };
-        Self {
-            admission: guard(lineage.clone(), admission_burst),
-            scan: guard(lineage, scan_burst),
-            prefix,
-        }
+        Self { lineage, prefix }
     }
 }
 
@@ -1424,7 +1381,25 @@ impl Supervisor {
                 PeerTrust::Operator | PeerTrust::Corroborated => self.puzzle_hashes.puzzle_hashes(),
                 PeerTrust::Discovered => Vec::new(),
             };
-            let subscribed: sync::SubscribedHashes = puzzle_hashes.iter().copied().collect();
+            // The CAT outer hashes this wallet can recognise, derived locally from the p2 set
+            // above crossed with the assets whose ids the node knows. A coin at one of these IS
+            // that asset and IS this wallet's, because the outer hash curries the TAIL around the
+            // p2 hash — so subscribing them is what makes an incoming $DIG coin arrive already
+            // attributed, with no chain read on the frame path (dig-node#380, #382).
+            let derived_cats = sync::DerivedCats::derive(&puzzle_hashes, &KNOWN_CAT_ASSET_IDS);
+            // The SUBSCRIPTION set, and the only place the derived hashes are allowed to widen
+            // anything. Three neighbouring sets mean different things and a leak between them is a
+            // different money bug, so each is built from its own source:
+            //   * `plain_puzzle_hashes` below stays the p2 set — it means "hashes we can sign
+            //     for", and a CAT outer hash there would be read as a spendable ordinary coin;
+            //   * `handle.set_watched` counts ADDRESSES, and a CAT outer hash is not an address;
+            //   * `crate::sage::spend::WalletSigner::puzzle_hashes` is the signer's own set and is
+            //     not reached from here at all.
+            let subscribed: sync::SubscribedHashes = puzzle_hashes
+                .iter()
+                .copied()
+                .chain(derived_cats.hashes())
+                .collect();
             let nothing_subscribed = puzzle_hashes.is_empty();
             // Built per ATTEMPT, from the set this attempt actually resolved: these are the coins
             // an ordinary XCH holding sits at, and a coin at one of them is skipped rather than
@@ -1433,8 +1408,7 @@ impl Supervisor {
             let plain_puzzle_hashes: HashSet<String> =
                 puzzle_hashes.iter().map(hex::encode).collect();
             let attributor = self.attribution.as_ref().map(|a| sync::CatAttributor {
-                lineage: a.admission.as_ref(),
-                scan_lineage: a.scan.as_ref(),
+                lineage: a.lineage.as_ref(),
                 prefix: &a.prefix,
                 plain_puzzle_hashes: &plain_puzzle_hashes,
             });
@@ -1478,7 +1452,7 @@ impl Supervisor {
                         self.genesis_challenge,
                         &self.events,
                         authority,
-                        attributor.as_ref(),
+                        &derived_cats,
                     ) => result.map_err(CatchUpFailure::Failed),
                     () = self.time.sleep(CATCH_UP_DEADLINE) => Err(CatchUpFailure::TimedOut),
                     // Dropping the `catch_up` future closes the peer. Nothing is aborted mid-write:
@@ -1550,7 +1524,8 @@ impl Supervisor {
             // Captured HERE, while the session is still owned: the address is needed after the
             // select, by which point the session may already have been dropped.
             let peer_addr_to_avoid = session.peer_addr();
-            let mut state = sync::SessionState::with_authority(&subscribed, authority);
+            let mut state =
+                sync::SessionState::with_authority(&subscribed, &derived_cats, authority);
             let outcome = tokio::select! {
                 result = session.run(&self.db, &self.events, &mut state, attributor.as_ref()) => {
                     if let Err(e) = result {
@@ -2428,7 +2403,7 @@ impl SyncSession for ChiaPeerSession {
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
-        attributor: Option<&sync::CatAttributor<'_>>,
+        derived_cats: &sync::DerivedCats,
     ) -> Result<(), SyncError> {
         // The EFFECTIVE authority, not `self.trust`: a corroborated discovered peer must reach the
         // floor check as corroborated, or clearing the quorum would buy it nothing.
@@ -2440,7 +2415,7 @@ impl SyncSession for ChiaPeerSession {
             &self.ip,
             events,
             authority,
-            attributor,
+            derived_cats,
         )
         .await
     }

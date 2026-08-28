@@ -521,10 +521,10 @@ impl super::singleton::LineageSource for ChiaQueryLineage {
         //
         // The non-`_opt` `get_puzzle_and_solution` returns `Result<CoinSpend, _>`, so a parent
         // that does not exist arrives as an `Err` indistinguishable from an outage. Mapping that
-        // to `Unavailable` was the only safe direction available — and it made
-        // `NotAdmitted::ParentAbsent` unreachable in production for the exact case it was written
-        // for, so a peer naming 32 random bytes as a `parent_coin_info` produced "this node could
-        // not read the chain", ended the session, and could repeat it indefinitely (dig-node#383).
+        // to `Unavailable` was the only safe direction available — and it made a settled absence
+        // unreachable in production for the exact case it was written for, so a parent that simply
+        // does not exist produced "this node could not read the chain" and the attribution pass
+        // retried it forever instead of concluding anything (dig-node#383).
         //
         // `get_coin_spend_opt` carries the distinction the caller needs, and carries it graded:
         // it routes through `peer_then_coinset_opt`, so `Ok(None)` is a CORROBORATED absence —
@@ -890,13 +890,13 @@ mod chain_failure_tests {
     ///
     /// # Why this test is about a call, not a branch
     ///
-    /// `SyncError::IncompleteBatch` documents that "a peer cannot make the wallet doubt itself by
-    /// naming parents that do not exist", and that claim was false in the commit that wrote it.
-    /// The spend read went through the non-`_opt` `get_puzzle_and_solution`, which returns
-    /// `Result<CoinSpend, _>` — so a nonexistent parent arrived as an `Err` indistinguishable from
-    /// a dead network and was mapped, correctly for what it knew, to `Unavailable`. That made
-    /// `NotAdmitted::ParentAbsent` unreachable in production for the exact case it was written for,
-    /// and one ~82-byte fabricated `CoinState` was enough to end every session the wallet opened.
+    /// The attribution pass distinguishes "the chain says there is no such parent" from "this node
+    /// could not read the chain", and only the first is a settled judgement it can act on. That
+    /// distinction was unreachable in production: the spend read went through the non-`_opt`
+    /// `get_puzzle_and_solution`, which returns `Result<CoinSpend, _>`, so a nonexistent parent
+    /// arrived as an `Err` indistinguishable from a dead network and was mapped, correctly for what
+    /// it knew, to [`LineageAnswer::Unavailable`]. A row whose parent genuinely does not exist was
+    /// therefore re-read on every pass, forever, and never concluded.
     ///
     /// So the defect was not a branch that decided wrongly; it was a CALL that could not carry the
     /// answer. This asserts on the answer the production impl gives for the honest wire shape,
