@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use chia_protocol::{Message, NewPeakWallet, ProtocolMessageTypes, RespondPuzzleState};
 
 use super::*;
+use crate::sage::cat_discovery::DerivedCats;
 use crate::sage::fallback::ChainPeerTier;
 use crate::sage::routing::{self, Source};
 use crate::sage::sync::PuzzleStateSource;
@@ -262,6 +263,7 @@ impl SyncSession for ScriptedSession {
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
+        _derived: &DerivedCats,
     ) -> Result<(), SyncError> {
         self.script
             .catch_ups

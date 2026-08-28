@@ -3111,6 +3111,11 @@ impl WalletBackend {
         // Attribute CATs (fills `asset_id`/`hint`) when a lineage source is attached — best-effort:
         // an attribution read failure must never make a fresh XCH sync look like a hard error.
         if let Some(lineage) = self.lineage.as_deref() {
+            // Promote whatever the CAT staging table can prove (dig-node#380), so a coin
+            // discovered at a derived hash becomes spendable on this tier too. Best-effort for
+            // the same reason attribution is: a chain-read failure must not make a fresh XCH sync
+            // look like a hard error.
+            let _ = super::cat_discovery::promote_staged_cats(&self.db, lineage).await;
             let plain: HashSet<String> = phs.iter().cloned().collect();
             let _ =
                 singleton::reconstruct_all(&self.db, lineage, &self.config.address_prefix, &plain)

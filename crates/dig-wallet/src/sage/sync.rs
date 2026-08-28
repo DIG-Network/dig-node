@@ -804,11 +804,46 @@ pub struct CatAttributor<'a> {
 impl CatAttributor<'_> {
     /// Attribute every not-yet-attributed coin currently in `db` (idempotent: already-spent
     /// or already-attributed coins are skipped by [`singleton::reconstruct_coins`]).
+    ///
+    /// Runs the CAT admission PROMOTION pass first (dig-node#380), so a coin discovered at a
+    /// derived hash becomes a believed coin in the same out-of-band pass that attributes the rest.
     pub async fn attribute(&self, db: &WalletDb) -> Result<(), SyncError> {
+        self.promote(db).await;
         singleton::reconstruct_all(db, self.lineage, self.prefix, self.plain_puzzle_hashes)
             .await
             .map(|_| ())
             .map_err(|e| SyncError::Attribution(e.to_string()))
+    }
+
+    /// Promote whatever the staging table can prove, and SWALLOW every failure.
+    ///
+    /// Returning nothing is the point, not an oversight. [`run_update_loop`] calls
+    /// `attribute(db).await?` on the peer frame path, so any error this pass could produce would
+    /// propagate out of the update loop and END A LIVE SESSION. Promotion reads the chain, and a
+    /// chain read fails for reasons a peer can arrange — which would hand that peer a denial
+    /// primitive, the precise defect that earlier rounds of this work introduced twice.
+    ///
+    /// A swallowed failure costs a delay and nothing else: the staged rows are untouched, so the
+    /// next pass retries them. Absent, never wrong.
+    async fn promote(&self, db: &WalletDb) {
+        match cat_discovery::promote_staged_cats(db, self.lineage).await {
+            Ok(stats) if stats.promoted > 0 || stats.refused > 0 => {
+                tracing::info!(
+                    promoted = stats.promoted,
+                    refused = stats.refused,
+                    deferred = stats.deferred,
+                    "wallet sync: CAT admission promotion pass"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "wallet sync: CAT admission promotion failed; the staged coins are retried \
+                     on the next pass"
+                );
+            }
+        }
     }
 }
 
@@ -1268,7 +1303,7 @@ mod tests {
             state(coin(1, 9, 1_000), Some(10), None),
             state(coin(2, 9, 2_000), Some(11), None),
         ];
-        apply_coin_states(&db, &states, &subscribed_owned())
+        apply_coin_states(&db, &states, &subscribed_owned(), &DerivedCats::default())
             .await
             .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 3_000);
@@ -1279,12 +1314,12 @@ mod tests {
     async fn later_spend_state_marks_coin_spent() {
         let db = WalletDb::open_in_memory().await.unwrap();
         let c = coin(1, 9, 500);
-        apply_coin_states(&db, &[state(c, Some(10), None)], &subscribed_owned())
+        apply_coin_states(&db, &[state(c, Some(10), None)], &subscribed_owned(), &DerivedCats::default())
             .await
             .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 500);
         // The peer later reports the same coin as spent.
-        apply_coin_states(&db, &[state(c, Some(10), Some(20))], &subscribed_owned())
+        apply_coin_states(&db, &[state(c, Some(10), Some(20))], &subscribed_owned(), &DerivedCats::default())
             .await
             .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 0);
@@ -1308,6 +1343,7 @@ mod tests {
                 state(coin(2, OWNED, 7_000), Some(20), None),
             ],
             &subscribed,
+            &DerivedCats::default(),
         )
         .await
         .unwrap();
@@ -1323,6 +1359,7 @@ mod tests {
                 state(coin(2, OWNED, 7_000), Some(20), None),
             ],
             &subscribed,
+            &DerivedCats::default(),
         )
         .await
         .unwrap();
@@ -1427,6 +1464,7 @@ mod tests {
             &db,
             &[state(coin(1, 9, 5), Some(10), Some(30))],
             &subscribed_owned(),
+            &DerivedCats::default(),
         )
         .await
         .unwrap();
@@ -1458,6 +1496,7 @@ mod tests {
             &db,
             &[state(coin(1, 9, 5), Some(10), None)],
             &subscribed_owned(),
+            &DerivedCats::default(),
         )
         .await
         .unwrap();
@@ -1499,6 +1538,7 @@ mod tests {
                 None,
             )],
             &subscribed_owned(),
+            &DerivedCats::default(),
         )
         .await
         .unwrap();
@@ -2962,6 +3002,7 @@ mod tests {
             &db,
             &[state(coin(1, OWNED, 5_000), Some(anchor - 5), None)],
             &subscribed_owned(),
+            &DerivedCats::default(),
         )
         .await
         .unwrap();
