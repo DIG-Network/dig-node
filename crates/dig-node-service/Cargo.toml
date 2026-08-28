@@ -89,7 +89,17 @@ dig-node-core = { path = "../dig-node-core" }
 # "0.6.0" the suite went green over a `control.wallet.coinById` the contract had never heard of --
 # it checked nothing about the very method the change added. A caret range keeps the pin moving
 # with the published catalog instead of silently narrowing what CI can see.
-dig-node-control-interface = "0.21"
+dig-node-control-interface = "0.23"
+
+# The deterministic mirror-coin collateral model: the per-epoch requirement, the controller
+# multiplier, the small-network handicap, the floor clamp, and the safety-margin arithmetic.
+#
+# Depended on rather than restated. `required_per_store` is the WHOLE answer -- writing
+# `equilibrium x multiplier - handicap` at a call site omits the floor clamp, which is a
+# money-path understatement, and a lane has already been refused for putting exactly that
+# formula in a SPEC. Every figure this node reports for `control.collateral.requirement`
+# comes out of this crate so that a second derivation cannot drift from the consensus one.
+dig-mirror-collateral = "0.3"
 
 # The OS CSPRNG for all authorization material — the control token, pairing ids/tokens
 # (§7), and the relay loop-probe id (`control::fill_random`). Wraps `getrandom(2)` /
@@ -162,7 +172,7 @@ serde_json = "1"
 # reusable `logs` CLI verbs + the bundle-time redaction engine. Every DIG service binary
 # gets logging from HERE rather than hand-rolling a subscriber. Sourced from crates.io (no
 # git/path dep) per the ecosystem crates.io policy (#681).
-dig-logging = "0.1"
+dig-logging = "0.2"
 # The logging facade the shell emits through. dig-node-core already depends on `tracing`;
 # the service shell now emits its own bring-up/lifecycle events through it, captured by the
 # `dig-logging` subscriber installed at the serve entrypoints.
@@ -195,7 +205,7 @@ dig-urn-resolver = "0.5.3"
 # for client→node connections; `config.rs`'s DEFAULT_PORT reads it rather than re-declaring the
 # literal. Held in lockstep with dig-node-core's pin (#2072) — 0.11.2, on dig-node's chia 0.36.1
 # line (dig_ecosystem#3161) — so the two node crates can never disagree about a canonical value.
-dig-constants = "0.11.2"
+dig-constants = "0.13.0"
 
 # Windows Service Control Protocol. service-manager only REGISTERS the service in the
 # SCM; the binary the SCM launches must itself speak the service protocol

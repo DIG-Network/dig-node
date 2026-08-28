@@ -368,7 +368,7 @@ dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "48a14ed
 # consumer cannot edit. Collapsing to a single copy needs each of those to release against 0.9 —
 # the release-first cascade on #2072. Do NOT pin this BACK to widen a window: the fix is upstream
 # moving forward, never dig-node drifting backward.
-dig-constants = "0.11.2"
+dig-constants = "0.13.0"
 # -- Portable profile body format (DPB) — epic #3008 W6 -----------------------------------------------
 #
 # `default-features = false` deliberately: the default `chia` feature pulls dig-did/dig-store/
