@@ -7414,7 +7414,18 @@ The reasons are distinct because their remedies differ:
 Collapsing them into one "unavailable" hands every client the same unactionable sentence.
 
 **A record the node never wrote and one it wrote and cannot read are different answers**
-(`not_censused` vs `record_unreadable`).
+(`not_censused` vs `record_unreadable`). This is decided by the record file itself, not only by its
+contents: a file that is MISSING is `not_censused`, and a file that EXISTS and cannot be read is
+`record_unreadable` even when no line was parsed. Reporting an unreadable state directory as
+`not_censused` sends the operator to run a census that writes to the very file it cannot read.
+
+**A client MUST NOT render a requirement it cannot decode as a figure.** `state` is an open tag and
+the reason taxonomy is open with it, so a client will meet values it does not know — including from
+a node newer than itself, since the CLI and the node are installed separately. A client that guards
+positively on the states it knows and formats everything else from absent fields renders a real
+epoch beside a zero requirement, which reads as authoritative rather than degraded. An answer this
+build cannot decode MUST be reported as undecodable, and MUST NOT borrow the `unknown` rendering
+either: `unknown` asserts that the node NAMED a missing fact, which an undecodable answer did not.
 
 ### 24.3. The epoch is DERIVED from the canonical clock, and never re-derived locally
 
@@ -7555,6 +7566,8 @@ A malformed operator-supplied balance is REFUSED, never parsed as zero, which wo
   OVERRIDE, so a person can get a figure before the node can enumerate its served set; they are never
   a fallback the node applies itself. Either way it states an AMOUNT to add, not an adjective, and
   shows the working: roots served, per-store requirement, margin, the three terms, and the horizon
-  with its ceiling.
+  with its ceiling. When the root count came from `--roots`, the output MUST say so: the operand and
+  the node's own measurement otherwise render identically, which would make an operator's guess
+  indistinguishable from a measurement in every figure derived from it.
 
 Every verb offers `--json` beside the human output, with stable field names (§6.2).
