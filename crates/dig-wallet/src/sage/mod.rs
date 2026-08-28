@@ -60,6 +60,7 @@
 
 pub mod actions;
 pub mod arrivals;
+pub mod cat_discovery;
 pub mod chain;
 pub mod coverage;
 pub mod custody;

@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use chia_protocol::{Message, NewPeakWallet, ProtocolMessageTypes, RespondPuzzleState};
 
 use super::*;
+use crate::sage::cat_discovery::DerivedCats;
 use crate::sage::fallback::ChainPeerTier;
 use crate::sage::routing::{self, Source};
 use crate::sage::sync::PuzzleStateSource;
@@ -42,16 +43,24 @@ const CATCH_UP_HEIGHT: u32 = 6_000_000;
 
 /// A peer that reports "caught up, nothing to send" — what a real full node answers to a
 /// subscription it has already satisfied.
-struct CaughtUpAtOnce;
+struct CaughtUpAtOnce {
+    /// Every puzzle-hash vector the catch-up actually put ON THE WIRE.
+    ///
+    /// Recorded because coverage and admission are different sets (dig-node#394) and a suite that
+    /// can only see one of them cannot tell a correct split from a collapsed one: the address set
+    /// is visible at the call site, the REQUESTED set is visible only here.
+    requested: std::sync::Arc<Mutex<Vec<Vec<Bytes32>>>>,
+}
 
 #[async_trait::async_trait]
 impl PuzzleStateSource for CaughtUpAtOnce {
     async fn request_puzzle_state(
         &self,
-        _puzzle_hashes: Vec<Bytes32>,
+        puzzle_hashes: Vec<Bytes32>,
         _previous_height: Option<u32>,
         _header_hash: Bytes32,
     ) -> Result<RespondPuzzleState, SyncError> {
+        self.requested.lock().unwrap().push(puzzle_hashes);
         Ok(RespondPuzzleState {
             puzzle_hashes: vec![],
             coin_states: vec![],
@@ -65,8 +74,11 @@ impl PuzzleStateSource for CaughtUpAtOnce {
 /// Everything the scripted factory and its sessions share with the test.
 #[derive(Default)]
 struct Script {
-    /// One entry per `catch_up`, holding the exact set that was subscribed.
+    /// One entry per `catch_up`, holding the exact ADMISSION set the supervisor handed down.
     catch_ups: Mutex<Vec<Vec<Bytes32>>>,
+    /// One entry per catch-up round trip, holding the set actually REQUESTED from the peer --
+    /// the union of the admission set with the derived CAT hashes.
+    requested: std::sync::Arc<Mutex<Vec<Vec<Bytes32>>>>,
     /// One entry per `catch_up`, holding the EFFECTIVE authority the supervisor resolved.
     ///
     /// The ceiling has exactly one production construction site (`trust_for_session`), and until
@@ -258,16 +270,17 @@ impl SyncSession for ScriptedSession {
     async fn catch_up(
         &self,
         db: &WalletDb,
-        puzzle_hashes: Vec<Bytes32>,
+        addresses: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
+        derived: &DerivedCats,
     ) -> Result<(), SyncError> {
         self.script
             .catch_ups
             .lock()
             .unwrap()
-            .push(puzzle_hashes.clone());
+            .push(addresses.clone());
         self.script.authorities.lock().unwrap().push(authority);
         if self.script.catch_up_parks.load(Ordering::SeqCst) {
             // Recorded FIRST, so a test can still prove the catch-up was entered.
@@ -276,9 +289,11 @@ impl SyncSession for ScriptedSession {
         // The REAL catch-up, so the empty-set guard and the completion-flag write are both
         // exercised exactly as production would exercise them.
         sync::initial_sync_with_authority(
-            &CaughtUpAtOnce,
+            &CaughtUpAtOnce {
+                requested: std::sync::Arc::clone(&self.script.requested),
+            },
             db,
-            puzzle_hashes,
+            addresses,
             genesis_challenge,
             &self.peer_ip(),
             events,
@@ -286,6 +301,9 @@ impl SyncSession for ScriptedSession {
             // reading `self.trust` here would make the elevation invisible to the floor check and
             // quietly re-create the bug this suite exists to exclude.
             authority,
+            // FORWARDED, never defaulted: the supervisor's own derived set reaches the real
+            // catch-up, so the coverage/admission split is under test on every catch-up path.
+            derived,
         )
         .await
     }
@@ -872,10 +890,19 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
     h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
         .await;
 
+    // ADMISSION: the custodied p2 hashes, and nothing else. A derived CAT hash here is a coin
+    // admitted to the money table on a claim anybody could make.
     assert_eq!(
         h.script.catch_ups.lock().unwrap()[0],
         expected,
-        "the subscribed set must be exactly the custodied p2 puzzle hashes"
+        "the ADMISSION set must be exactly the custodied p2 hashes"
+    );
+    // COVERAGE: the union actually put on the wire. Asserting only the line above would be
+    // satisfied by a catch-up that stopped asking about CAT hashes altogether, which is #380.
+    assert_eq!(
+        h.script.requested.lock().unwrap()[0],
+        requested_for(&expected),
+        "the REQUESTED set must be the custodied p2 hashes and their derived CAT hashes"
     );
     assert!(
         db.is_synced().await.unwrap(),
@@ -1031,7 +1058,12 @@ async fn a_wallet_created_after_boot_is_subscribed_without_waiting_for_a_disconn
     assert_eq!(
         h.script.catch_ups.lock().unwrap()[0],
         vec![created],
-        "the catch-up must subscribe exactly the newly-created wallet's hash"
+        "the catch-up ADMITS exactly the new wallet's own hash"
+    );
+    assert_eq!(
+        h.script.requested.lock().unwrap()[0],
+        requested_for(&[created]),
+        "and REQUESTS that hash together with its derived CAT hash"
     );
     h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
         .await;
@@ -1142,6 +1174,32 @@ fn as_wire_matches_the_serialized_token_for_every_phase() {
             "as_wire disagrees with serde for {phase:?}"
         );
     }
+}
+
+/// The set a catch-up is expected to subscribe: the wallet's own addresses PLUS the outer CAT
+/// hash each of them would hold a `$DIG` coin at (dig-node#380).
+///
+/// Written as a DERIVATION rather than a widened expectation. A CAT coin does not sit at its
+/// owner's address, so subscribing addresses alone means the peer never sends the wallet its own
+/// CAT coins — the ingestion drop #380 measured. Asserting the union here pins that the extra
+/// hashes are exactly `cat_puzzle_hash(address, DIG_ASSET_ID)` and nothing else; an implementation
+/// that subscribed one hash too many, or the wrong curry, fails just as loudly as one that
+/// subscribed too few.
+///
+/// This is the set REQUESTED FROM THE PEER, and it is deliberately not the set that admits coins
+/// into `coins` (dig-node#394). The two were one value once, and that is exactly how a coin at a
+/// derived CAT hash came to be admitted and counted as XCH. Every caller below therefore asserts
+/// both: `catch_ups` for admission, this for coverage.
+fn requested_for(addresses: &[Bytes32]) -> Vec<Bytes32> {
+    let mut all: Vec<Bytes32> = addresses.to_vec();
+    all.extend(
+        addresses
+            .iter()
+            .map(|&p2| digstore_chain::cat::cat_puzzle_hash(p2, digstore_chain::dig::DIG_ASSET_ID)),
+    );
+    all.sort();
+    all.dedup();
+    all
 }
 
 /// **Proves (#2609):** an authoritative peer attached over a GENUINELY empty custody set reports

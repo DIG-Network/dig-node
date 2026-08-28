@@ -53,6 +53,7 @@ use chia_bls::PublicKey;
 use chia_protocol::Bytes32;
 use chia_puzzle_types::standard::StandardArgs;
 
+use super::cat_discovery::DerivedCats;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
@@ -727,6 +728,22 @@ impl PuzzleHashSource for UnionPuzzleHashSource {
     }
 }
 
+/// The CAT asset ids this node derives discovery hashes for.
+///
+/// `$DIG` alone today, taken from `digstore_chain::dig::DIG_ASSET_ID` so it can never drift from
+/// the canonical definition the balance and send paths already use.
+///
+/// Deliberately NOT read from the `cats` table, which would look more general and is not: that
+/// table is POPULATED by attribution, so an asset absent from it is precisely an asset whose coins
+/// have never been attributed — the state discovery exists to escape. Reading it would make
+/// discovery depend on the thing discovery produces.
+///
+/// This is the extension point for supporting further assets; widening it costs one subscribed
+/// puzzle hash per (address, asset) pair and no new trust, since every arrival is staged either way.
+fn known_cat_asset_ids() -> Vec<Bytes32> {
+    vec![digstore_chain::dig::DIG_ASSET_ID]
+}
+
 /// The p2 puzzle hash a public key controls.
 ///
 /// `pub(crate)` because the read router needs the SAME mapping to decide whether an address is
@@ -792,8 +809,13 @@ pub trait SyncSession: Send + Sync {
     /// wrong answer for elevation purposes, and treated the same way: no elevation.
     async fn header_hash_at(&self, height: u32) -> Result<Option<Bytes32>, SyncError>;
 
-    /// Subscribe `puzzle_hashes` and catch the replica up, under the EFFECTIVE trust the
+    /// Subscribe over `addresses` and catch the replica up, under the EFFECTIVE trust the
     /// supervisor resolved for this session.
+    ///
+    /// `addresses` is the wallet's own p2 hashes and NOTHING else: it is the set that decides what
+    /// enters `coins`. `derived` widens the peer REQUEST only, and that widening happens inside
+    /// [`sync::initial_sync_with_authority`] so no implementor of this trait can collapse the two
+    /// (dig-node#394).
     ///
     /// `authority` is passed in rather than read from [`SyncSession::trust`] because the two can
     /// legitimately differ: a discovered peer that cleared corroboration runs as
@@ -808,10 +830,11 @@ pub trait SyncSession: Send + Sync {
     async fn catch_up(
         &self,
         db: &WalletDb,
-        puzzle_hashes: Vec<Bytes32>,
+        addresses: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
+        derived: &DerivedCats,
     ) -> Result<(), SyncError>;
 
     /// Consume peer pushes until the peer disconnects. Consumes the session.
@@ -1320,6 +1343,16 @@ impl Supervisor {
                 PeerTrust::Operator | PeerTrust::Corroborated => self.puzzle_hashes.puzzle_hashes(),
                 PeerTrust::Discovered => Vec::new(),
             };
+            // CAT DISCOVERY (dig-node#380). A CAT coin does not sit at its owner's address: it
+            // sits at `cat_puzzle_hash(owner_p2, asset_id)` and is merely HINTED to the address.
+            // `CoinState` carries no hint, so subscribing the addresses alone means the peer never
+            // sends the wallet its own CAT coins — measured on a real wallet, 50 of the 51 puzzle
+            // hashes holding its coins were dropped at ingest for exactly this reason.
+            //
+            // These hashes are subscribed so the coins ARRIVE. Nothing here decides that they are
+            // genuine: arrivals at them are staged, and only a lineage proof admits one to `coins`
+            // (see [`crate::sage::cat_discovery`]).
+            let derived = DerivedCats::derive(&puzzle_hashes, &known_cat_asset_ids());
             let subscribed: sync::SubscribedHashes = puzzle_hashes.iter().copied().collect();
             let nothing_subscribed = puzzle_hashes.is_empty();
             // The MEASUREMENT of the subscription set. Paired with the trust recorded above, the
@@ -1350,13 +1383,19 @@ impl Supervisor {
                 // end the session, and ending a session mid-catch-up discards the work — but a
                 // TOTAL deadline and shutdown both can, and shutdown is not optional at any
                 // duration.
+                // ADDRESSES ONLY here, and `derived` alongside. The union that widens the peer
+                // REQUEST is performed inside `sync::initial_sync_with_authority`, which is also
+                // the only thing that builds the admission set -- so this call site cannot widen
+                // what enters `coins` even by mistake (dig-node#394). Building the union here is
+                // exactly what let a fabricated coin be admitted as XCH.
                 let catch_up = tokio::select! {
                     result = session.catch_up(
                         &self.db,
-                        puzzle_hashes,
+                        puzzle_hashes.clone(),
                         self.genesis_challenge,
                         &self.events,
                         authority,
+                        &derived,
                     ) => result.map_err(CatchUpFailure::Failed),
                     () = self.time.sleep(CATCH_UP_DEADLINE) => Err(CatchUpFailure::TimedOut),
                     // Dropping the `catch_up` future closes the peer. Nothing is aborted mid-write:
@@ -1411,7 +1450,8 @@ impl Supervisor {
             // Captured HERE, while the session is still owned: the address is needed after the
             // select, by which point the session may already have been dropped.
             let peer_addr_to_avoid = session.peer_addr();
-            let mut state = sync::SessionState::with_authority(&subscribed, authority);
+            let mut state = sync::SessionState::with_authority(&subscribed, authority)
+                .following_derived_cats(&derived);
             let outcome = tokio::select! {
                 result = session.run(&self.db, &self.events, &mut state) => {
                     if let Err(e) = result {
@@ -2282,21 +2322,23 @@ impl SyncSession for ChiaPeerSession {
     async fn catch_up(
         &self,
         db: &WalletDb,
-        puzzle_hashes: Vec<Bytes32>,
+        addresses: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
+        derived: &DerivedCats,
     ) -> Result<(), SyncError> {
         // The EFFECTIVE authority, not `self.trust`: a corroborated discovered peer must reach the
         // floor check as corroborated, or clearing the quorum would buy it nothing.
         sync::initial_sync_with_authority(
             &self.peer,
             db,
-            puzzle_hashes,
+            addresses,
             genesis_challenge,
             &self.ip,
             events,
             authority,
+            derived,
         )
         .await
     }

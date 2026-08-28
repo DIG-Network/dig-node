@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use chia_protocol::{Bytes32, Coin, Program};
 use chia_puzzle_types::nft::NftMetadata;
-use chia_wallet_sdk::driver::{Cat, Did, Nft, Puzzle, SpendContext};
+use chia_wallet_sdk::driver::{Cat, Did, Nft, Puzzle, SingletonInfo, SpendContext};
 use chia_wallet_sdk::utils::Address;
 use clvmr::NodePtr;
 
@@ -43,9 +43,23 @@ pub struct ParentSpend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reconstructed {
     /// The coin is an NFT singleton.
-    Nft(Box<NftDbRow>),
-    /// The coin is a DID singleton.
-    Did(Box<DidDbRow>),
+    ///
+    /// `owner_p2` is the inner p2 puzzle hash the singleton is currently owned by, carried
+    /// alongside the row for the same reason [`Reconstructed::Cat`] carries `hint`: the row alone
+    /// says WHAT the coin is, and an admission decision additionally needs to know WHOSE it is.
+    Nft {
+        /// The NFT as it will be stored.
+        row: Box<NftDbRow>,
+        /// The inner p2 puzzle hash (hex) that owns the singleton.
+        owner_p2: String,
+    },
+    /// The coin is a DID singleton (the DID twin of [`Reconstructed::Nft`]).
+    Did {
+        /// The DID as it will be stored.
+        row: Box<DidDbRow>,
+        /// The inner p2 puzzle hash (hex) that owns the singleton.
+        owner_p2: String,
+    },
     /// The coin is a CAT — attribute it to this asset id (+ inner p2 hint).
     Cat {
         /// The child coin id (hex).
@@ -132,14 +146,39 @@ pub fn reconstruct_parsed(
     // NFT: parse_child computes the single child singleton coin itself.
     if let Ok(Some(nft)) = Nft::parse_child(ctx, parent_coin, parent_puzzle, parent_solution) {
         if nft.coin.coin_id() == child_id {
-            return Reconstructed::Nft(Box::new(nft_row(ctx, prefix, created_height, &nft)));
+            return Reconstructed::Nft {
+                owner_p2: hexb(nft.info.p2_puzzle_hash),
+                row: Box::new(nft_row(ctx, prefix, created_height, &nft)),
+            };
         }
     }
 
-    // DID: parse_child validates the given child coin.
+    // DID: `parse_child` takes the child coin but does NOT bind it to what it parsed. It reads the
+    // owner out of the parent spend's CREATE_COIN memo *hint* and stores it verbatim
+    // (`DidInfo::p2_puzzle_hash = hint`), which anybody who can spend any DID may write to name any
+    // p2 hash they like. So the parse alone proves nothing about ownership, and the check the SDK's
+    // own construction path makes — `inner_puzzle_hash() == create_coin.puzzle_hash` — has no
+    // counterpart on the read path.
+    //
+    // Recomputing the singleton puzzle hash FROM the parsed info and requiring it to equal the real
+    // child coin's is what turns the hint back into a proof: `puzzle_hash()` is curried over
+    // `p2_puzzle_hash`, so a lie about the owner cannot reproduce the on-chain coin. An honest DID
+    // pays nothing — its child is built from that same hash, so the two are equal by construction.
+    // (The NFT arm above needs no equivalent: `nft.coin` is derived from `nft.info`, and the coin-id
+    // equality at that arm already commits to it.)
     if let Ok(Some(did)) = Did::parse_child(ctx, parent_coin, parent_puzzle, parent_solution, child)
     {
-        return Reconstructed::Did(Box::new(did_row(prefix, created_height, &did)));
+        let reconstructed_puzzle_hash: Bytes32 = did.info.puzzle_hash().into();
+        if reconstructed_puzzle_hash == child.puzzle_hash {
+            return Reconstructed::Did {
+                owner_p2: hexb(did.info.p2_puzzle_hash),
+                row: Box::new(did_row(prefix, created_height, &did)),
+            };
+        }
+        tracing::warn!(
+            coin_id = %hexb(child_id),
+            "DID reconstruction: the parent spend's owner hint does not reproduce the coin's puzzle hash; refusing"
+        );
     }
 
     // CAT: parse_children returns every child; match ours by coin id.
@@ -386,19 +425,33 @@ pub async fn reconstruct_coins(
         if !is_candidate(c, plain_puzzle_hashes) {
             continue;
         }
-        let Some(parent) = lineage
+        // Per-coin resilience, deliberately (dig-node#394). `parent_spend` used to report an
+        // unreadable parent as `Ok(None)`, so one flaky read skipped one coin; now that it reports
+        // the failure honestly, propagating it here would let a single timeout abandon attribution
+        // for every remaining coin in the pass. Skip and log, exactly as before — the difference is
+        // that the cause is now visible rather than indistinguishable from a chain fact.
+        let parent = match lineage
             .parent_spend(&c.parent_coin_info, created as u32)
-            .await?
-        else {
-            continue;
+            .await
+        {
+            Ok(Some(parent)) => parent,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    coin_id = %c.coin_id,
+                    error = %e,
+                    "attribution: parent spend unreadable; leaving the coin unattributed"
+                );
+                continue;
+            }
         };
         let child = coin_from_row(c)?;
         match reconstruct(prefix, Some(created as u32), &parent, child)? {
-            Reconstructed::Nft(row) => {
+            Reconstructed::Nft { row, .. } => {
                 db.upsert_nft(&row).await?;
                 stats.nfts += 1;
             }
-            Reconstructed::Did(row) => {
+            Reconstructed::Did { row, .. } => {
                 db.upsert_did(&row).await?;
                 stats.dids += 1;
             }
@@ -429,7 +482,7 @@ pub async fn reconstruct_all(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chia_sdk_test::Simulator;
     use chia_traits::Streamable;
@@ -492,16 +545,11 @@ mod tests {
 
     /// Mint a DID + an NFT on the simulator, transfer both to self, and return the parent
     /// spends + the child coins a syncing wallet would observe.
-    #[allow(clippy::type_complexity)]
-    fn mint_did_and_nft() -> (
-        Simulator,
-        ParentSpend,
-        Coin,
-        ParentSpend,
-        Coin,
-        Bytes32,
-        Bytes32,
-    ) {
+    ///
+    /// Shared with `cat_discovery`'s tests rather than re-minted there: a second copy of this
+    /// fixture would be a second definition of what an owned singleton looks like, and the two
+    /// would drift.
+    pub(crate) fn mint_did_and_nft() -> MintedSingletons {
         let mut sim = Simulator::new();
         let ctx = &mut SpendContext::new();
         let alice = sim.bls(2);
@@ -552,25 +600,177 @@ mod tests {
 
         let did_parent = parent_spend_from_sim(&sim, did.coin);
         let nft_parent = parent_spend_from_sim(&sim, nft.coin);
-        (
-            sim,
+        MintedSingletons {
+            _sim: sim,
             did_parent,
-            child_did.coin,
+            did_child: child_did.coin,
             nft_parent,
-            child_nft.coin,
-            did.info.launcher_id,
-            nft.info.launcher_id,
+            nft_child: child_nft.coin,
+            did_launcher: did.info.launcher_id,
+            nft_launcher: nft.info.launcher_id,
+            owner_p2: alice.puzzle_hash,
+        }
+    }
+
+    /// What [`mint_did_and_nft`] hands back: the two child singleton coins a wallet observes,
+    /// the parent spends that prove them, and the p2 hash that owns both.
+    pub(crate) struct MintedSingletons {
+        /// Held so the simulator's spend store outlives the parent spends taken from it.
+        pub(crate) _sim: Simulator,
+        pub(crate) did_parent: ParentSpend,
+        pub(crate) did_child: Coin,
+        pub(crate) nft_parent: ParentSpend,
+        pub(crate) nft_child: Coin,
+        pub(crate) did_launcher: Bytes32,
+        pub(crate) nft_launcher: Bytes32,
+        /// The p2 puzzle hash both singletons are owned by — the wallet's own hash in these tests.
+        pub(crate) owner_p2: Bytes32,
+    }
+
+    /// Mint a DID that MALLORY owns, then spend it so the child singleton keeps MALLORY's inner
+    /// puzzle while the `CREATE_COIN` memo **hint** names the VICTIM.
+    ///
+    /// FIXTURE DESIGN — the hint is varied INDEPENDENTLY of the true owner, which is the one thing
+    /// no previous fixture did. [`mint_did_and_nft`] transfers with `Did::transfer`, which derives
+    /// the hint FROM the destination p2 hash, so hint and owner agree in every row it produces —
+    /// and a fixture in which two fields can never disagree cannot see a guard that reads the wrong
+    /// one. Every value here is chain-valid: the simulator accepts the spend, because a memo is
+    /// free-form data the consensus does not constrain.
+    pub(crate) fn mint_did_hinted_to_a_stranger() -> ForgedDid {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let mallory = sim.bls(2);
+        let mallory_layer = StandardLayer::new(mallory.pk);
+        // The p2 hash the forgery names as owner. Arbitrary: a victim's wallet recognises its own
+        // hashes by value, and Mallory needs only to know one of them (a hint is public).
+        let victim_p2 = Bytes32::new([0x5a; 32]);
+
+        let (create_did, did) = Launcher::new(mallory.coin.coin_id(), 1)
+            .create_simple_did(ctx, &mallory_layer)
+            .unwrap();
+        mallory_layer.spend(ctx, mallory.coin, create_did).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&mallory.sk))
+            .unwrap();
+
+        // THE FORGERY. The created coin is the singleton Mallory still controls — its inner puzzle
+        // hash is curried over HER p2 hash — but the memo hint, which is the only place
+        // `Did::parse_child` reads an owner from, names the victim instead.
+        let child = did.child(did.info.p2_puzzle_hash, did.info.metadata, did.coin.amount);
+        let memos = ctx.hint(victim_p2).unwrap();
+        did.spend_with(
+            ctx,
+            &mallory_layer,
+            Conditions::new().create_coin(
+                child.info.inner_puzzle_hash().into(),
+                did.coin.amount,
+                memos,
+            ),
         )
+        .unwrap();
+        sim.spend_coins(ctx.take(), &[mallory.sk]).unwrap();
+
+        ForgedDid {
+            parent: parent_spend_from_sim(&sim, did.coin),
+            _sim: sim,
+            child: child.coin,
+            victim_p2,
+            mallory_p2: did.info.p2_puzzle_hash,
+            launcher: did.info.launcher_id,
+        }
+    }
+
+    /// What [`mint_did_hinted_to_a_stranger`] hands back: a chain-valid DID spend whose memo hint
+    /// and whose actual owner are DIFFERENT p2 hashes.
+    pub(crate) struct ForgedDid {
+        /// Held so the simulator's spend store outlives the parent spend taken from it.
+        pub(crate) _sim: Simulator,
+        pub(crate) parent: ParentSpend,
+        pub(crate) child: Coin,
+        /// The p2 hash the memo hint names — the one the victim's wallet controls.
+        pub(crate) victim_p2: Bytes32,
+        /// The p2 hash the coin's puzzle is actually curried over — Mallory's.
+        pub(crate) mallory_p2: Bytes32,
+        pub(crate) launcher: Bytes32,
+    }
+
+    /// A DID whose memo hint disagrees with the puzzle the coin is actually locked to is NOT
+    /// reconstructed — the hint is attacker-written and proves nothing about ownership.
+    ///
+    /// The pure-core half of the end-to-end proof in `cat_discovery::tests`. Both are kept: this
+    /// one pins WHERE the binding lives (in the reconstruction, so `reconstruct_coins` is covered
+    /// by it too), and the other pins that production routing reaches it.
+    #[test]
+    fn a_did_whose_hint_disagrees_with_its_puzzle_is_not_reconstructed() {
+        let f = mint_did_hinted_to_a_stranger();
+        assert_ne!(
+            f.victim_p2, f.mallory_p2,
+            "the fixture is only meaningful if the hint and the real owner differ"
+        );
+
+        assert_eq!(
+            reconstruct("xch", Some(7), &f.parent, f.child).unwrap(),
+            Reconstructed::Unknown,
+            "a DID whose owner hint does not reproduce the coin's puzzle hash is not a DID this \
+             wallet may attribute to anybody"
+        );
+
+        // THE CONTROL. The same code path, the same driver call, and the one varied thing is
+        // whether the hint tells the truth: an honest DID still reconstructs.
+        let honest = mint_did_and_nft();
+        assert!(
+            matches!(
+                reconstruct("xch", Some(7), &honest.did_parent, honest.did_child).unwrap(),
+                Reconstructed::Did { .. }
+            ),
+            "an honest DID pays nothing for the binding"
+        );
+    }
+
+    /// The wider path the binding also closes: [`reconstruct_coins`] writes `dids` rows with no
+    /// ownership test of its own, so before the binding a forged hint minted a `dids` row there
+    /// too — a path the promotion-site guard never sees.
+    #[tokio::test]
+    async fn reconstruct_coins_writes_no_did_row_for_a_forged_hint() {
+        let f = mint_did_hinted_to_a_stranger();
+        let mut lineage = MockLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let rows = vec![coin_row(f.child, 100)];
+        let stats = reconstruct_coins(&db, &lineage, "xch", &HashSet::new(), &rows)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.dids, 0, "the forged DID is not reconstructed");
+        assert!(
+            db.all_dids().await.unwrap().is_empty(),
+            "and no row naming the victim as owner of Mallory's launcher {} reaches `dids`",
+            hex::encode(f.launcher)
+        );
     }
 
     #[test]
     fn reconstruct_parses_nft_and_did_from_parent_spends() {
-        let (_sim, did_parent, did_child, nft_parent, nft_child, did_launcher, nft_launcher) =
-            mint_did_and_nft();
+        let m = mint_did_and_nft();
+        let (did_parent, did_child, nft_parent, nft_child, did_launcher, nft_launcher) = (
+            m.did_parent,
+            m.did_child,
+            m.nft_parent,
+            m.nft_child,
+            m.did_launcher,
+            m.nft_launcher,
+        );
 
         match reconstruct("xch", Some(42), &nft_parent, nft_child).unwrap() {
-            Reconstructed::Nft(row) => {
+            Reconstructed::Nft { row, owner_p2 } => {
                 assert_eq!(row.launcher_id, hex::encode(nft_launcher));
+                assert_eq!(
+                    owner_p2,
+                    hex::encode(m.owner_p2),
+                    "the reconstruction names the p2 hash that owns the NFT"
+                );
                 let rec: NftRecord = serde_json::from_str(&row.record_json).unwrap();
                 assert_eq!(rec.royalty_ten_thousandths, 300);
                 assert_eq!(rec.data_uris, vec!["https://example.com/a.png".to_string()]);
@@ -581,8 +781,13 @@ mod tests {
         }
 
         match reconstruct("xch", Some(7), &did_parent, did_child).unwrap() {
-            Reconstructed::Did(row) => {
+            Reconstructed::Did { row, owner_p2 } => {
                 assert_eq!(row.launcher_id, hex::encode(did_launcher));
+                assert_eq!(
+                    owner_p2,
+                    hex::encode(m.owner_p2),
+                    "the reconstruction names the p2 hash that owns the DID"
+                );
                 let rec: DidRecord = serde_json::from_str(&row.record_json).unwrap();
                 assert!(rec.address.starts_with("xch1"));
             }
@@ -639,7 +844,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconstruct_coins_populates_db_and_get_reads() {
-        let (_sim, did_parent, did_child, nft_parent, nft_child, _dl, _nl) = mint_did_and_nft();
+        let m = mint_did_and_nft();
+        let (did_parent, did_child, nft_parent, nft_child) =
+            (m.did_parent, m.did_child, m.nft_parent, m.nft_child);
 
         let db = WalletDb::open_in_memory().await.unwrap();
         // The wallet has synced the two child singleton coins (odd amount = 1).

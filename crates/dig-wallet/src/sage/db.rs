@@ -13,6 +13,7 @@
 //! Amounts are stored as **decimal TEXT** (full `u64`/`u128` range, no `i64` overflow);
 //! heights/timestamps as INTEGER (`i64`) and narrowed to `u32`/`u64` at the wire boundary.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use dig_node_control_interface::params::MAX_BANNED_CHIA_PEERS;
@@ -333,6 +334,63 @@ pub struct PeerRow {
     pub banned: bool,
 }
 
+/// How many discovered-but-unproven CAT coins the staging table holds.
+///
+/// A staged row is a dozen short hex fields — call it 400 bytes with SQLite's overhead — so
+/// 20 000 rows is roughly **8 MiB**, comfortably below the chain caches this file already budgets
+/// (`CHAIN_READ_CACHE_MAX_ROWS` alone is ~20 MiB) because a staged row is strictly shorter-lived.
+///
+/// The number is chosen from what an ATTACKER must spend, not from what a wallet needs. Every
+/// staged row costs its creator at least one `CREATE_COIN` and one mojo, and a legitimate wallet
+/// stages one row per genuinely-received CAT coin — so 20 000 is several orders of magnitude
+/// above any honest backlog while still bounding the table against a spend crafted to fill it.
+pub const CAT_ADMISSION_PENDING_MAX_ROWS: i64 = 20_000;
+
+/// Which singleton table a proven staged coin belongs in.
+///
+/// Borrowed rather than owned because the caller already holds the reconstructed row and the write
+/// is the last thing done with it.
+#[derive(Debug, Clone, Copy)]
+pub enum PromotedSingleton<'a> {
+    /// Write the coin to `nfts`.
+    Nft(&'a NftDbRow),
+    /// Write the coin to `dids`.
+    Did(&'a DidDbRow),
+}
+
+/// A discovered CAT coin awaiting a lineage proof.
+///
+/// Deliberately NOT a [`CoinRow`]. The two types describe different claims: a `CoinRow` is a coin
+/// the wallet BELIEVES it owns as the asset it is typed with, and every balance, coin-selection
+/// and arrival-notification read is entitled to trust it. A `StagedCatRow` is a coin the wallet has
+/// merely FOUND at a hash it derived, together with the derivation that found it — a hypothesis.
+/// Sharing one type between the two would make the difference a field rather than a table, which
+/// is exactly the shape this design rejects.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct StagedCatRow {
+    /// The coin id (hex, 64 chars).
+    pub coin_id: String,
+    /// The parent coin id (hex) — what promotion reads the spend of.
+    pub parent_coin_info: String,
+    /// The outer puzzle hash the coin sits at (hex).
+    pub puzzle_hash: String,
+    /// The amount, decimal string.
+    pub amount: String,
+    /// The created block height, if confirmed.
+    pub created_height: Option<i64>,
+    /// The spent block height, if spent.
+    pub spent_height: Option<i64>,
+    /// The created timestamp.
+    pub created_timestamp: Option<i64>,
+    /// The spent timestamp.
+    pub spent_timestamp: Option<i64>,
+    /// The asset id whose derived hash this coin was found at — the CLAIM promotion must confirm
+    /// against the parent spend, never a fact.
+    pub derived_asset_id: String,
+    /// The owner p2 hash the derivation curried — likewise a claim, confirmed at promotion.
+    pub derived_owner_p2: String,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sync_state (
     id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -359,6 +417,28 @@ CREATE TABLE IF NOT EXISTS arrival_pending (
     coin_id TEXT PRIMARY KEY,
     created_height INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS cat_admission_pending (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    coin_id TEXT NOT NULL UNIQUE,
+    parent_coin_info TEXT NOT NULL,
+    puzzle_hash TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    created_height INTEGER,
+    spent_height INTEGER,
+    created_timestamp INTEGER,
+    spent_timestamp INTEGER,
+    derived_asset_id TEXT NOT NULL,
+    derived_owner_p2 TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_cat_admission_pending_created
+    ON cat_admission_pending (created_height);
+-- The promotion queue's ORDER BY. Fewest attempts first, then arrival order: a row that keeps
+-- failing sinks, so it can never hold the queue head against a row that has never been tried.
+CREATE INDEX IF NOT EXISTS idx_cat_admission_pending_queue
+    ON cat_admission_pending (attempts, seq);
 
 CREATE TABLE IF NOT EXISTS derivations (
     hardened INTEGER NOT NULL,
@@ -563,6 +643,10 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     // rows banned before this column existed, which sorts them first and so evicts them first --
     // the right order, since they are by definition the oldest bans on the machine.
     "ALTER TABLE peers ADD COLUMN banned_at INTEGER",
+    // The CAT staging queue's attempt accounting (dig-node#394). A replica that ran an earlier
+    // build of this branch already has the table without them.
+    "ALTER TABLE cat_admission_pending ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE cat_admission_pending ADD COLUMN last_attempt_at INTEGER",
 ];
 
 // ---- one-shot data-migration ladder ---------------------------------------
@@ -1578,6 +1662,283 @@ impl WalletDb {
         Ok(())
     }
 
+    // ---- CAT admission staging (dig-node#380) -----------------------------
+    //
+    // A coin sitting at `cat_puzzle_hash(our_p2, asset_id)` is DISCOVERED, not BELIEVED. The
+    // derivation is injective and proves only "if this coin is ever spent, only this wallet can
+    // spend it, as this asset" — it does NOT prove the coin is a unit of that asset, because
+    // `CREATE_COIN` is unconstrained in its destination. Anyone holding the victim's public
+    // address can therefore place a coin at the derived hash for 1 mojo per displayed base unit.
+    //
+    // So discovered coins land HERE and never in `coins`. Only [`Self::promote_cat_admission`],
+    // which runs off the frame path after a lineage proof, moves one across. Every one of the 22
+    // production readers of `coins` is thereby clean by ABSENCE rather than by a predicate each of
+    // them has to remember — the distinction that matters, because the enumeration of those
+    // readers has already been found incomplete twice in this family.
+
+    /// Stage discovered derived-hash coins, then hold the table to
+    /// [`CAT_ADMISSION_PENDING_MAX_ROWS`] by evicting the OLDEST rows first.
+    ///
+    /// # Why eviction rather than refusal
+    ///
+    /// A single spend may carry many `CREATE_COIN`s, so an attacker chooses how many rows arrive.
+    /// The bound must therefore exist — but it must **delay**, never **error**: a staging insert
+    /// that could fail would sit on the peer frame path, and a peer able to fail a frame can deny
+    /// a catch-up. An evicted row is a coin that is *absent*, which is the stated and acceptable
+    /// failure direction; an errored frame is a session kill, which is not.
+    ///
+    /// A re-pushed coin re-stages, so eviction is recoverable rather than terminal.
+    pub async fn stage_cat_admissions(&self, rows: &[StagedCatRow]) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for r in rows {
+            sqlx::query(
+                "INSERT INTO cat_admission_pending
+                    (coin_id, parent_coin_info, puzzle_hash, amount, created_height,
+                     spent_height, created_timestamp, spent_timestamp,
+                     derived_asset_id, derived_owner_p2)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(coin_id) DO UPDATE SET
+                    created_height = excluded.created_height,
+                    spent_height = excluded.spent_height,
+                    created_timestamp = excluded.created_timestamp,
+                    spent_timestamp = excluded.spent_timestamp",
+            )
+            .bind(Self::normalise_hex(&r.coin_id))
+            .bind(Self::normalise_hex(&r.parent_coin_info))
+            .bind(Self::normalise_hex(&r.puzzle_hash))
+            .bind(&r.amount)
+            .bind(r.created_height)
+            .bind(r.spent_height)
+            .bind(r.created_timestamp)
+            .bind(r.spent_timestamp)
+            .bind(Self::normalise_hex(&r.derived_asset_id))
+            .bind(Self::normalise_hex(&r.derived_owner_p2))
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "DELETE FROM cat_admission_pending WHERE seq NOT IN
+                (SELECT seq FROM cat_admission_pending ORDER BY seq DESC LIMIT ?)",
+        )
+        .bind(CAT_ADMISSION_PENDING_MAX_ROWS)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The promotion pass's work queue: up to `limit` staged rows, FEWEST ATTEMPTS FIRST, and
+    /// only rows not tried since `retry_cutoff`.
+    ///
+    /// # Why the ordering is attempts-then-arrival rather than arrival alone (dig-node#394)
+    ///
+    /// Arrival order alone is a denial primitive. A promotion that cannot conclude leaves its row
+    /// staged — deliberately, because deleting on an unreadable parent would let a source that is
+    /// merely behind erase real money — so `limit` rows whose parents never resolve occupy the
+    /// head of an arrival-ordered queue permanently. Every later pass re-reads the same `limit`
+    /// rows and no honest coin behind them is ever reached. The gate reproduced it: `deferred: 64`
+    /// on every pass, reads climbing 64, 128, ... unbounded, and the victim's $DIG balance zero
+    /// for ever, bought for 64 mojos.
+    ///
+    /// Ordering by `attempts` first fixes both halves at once. A row that has never been tried
+    /// always precedes one that has, so nothing can hold the head; and a row that keeps failing
+    /// sinks below every other row at its attempt level, so the reads an attacker buys are spread
+    /// across the whole table rather than concentrated on their own coins.
+    ///
+    /// # Why the cutoff, on top of the ordering
+    ///
+    /// The ordering removes starvation but not amplification: with a table of only poisoned rows,
+    /// every pass would still spend `limit` reads on them. `retry_cutoff` bounds a row to one read
+    /// per cooldown, so the total read rate an attacker can buy is `rows / cooldown` — bounded,
+    /// and independent of how often a pass runs.
+    ///
+    /// A row is never deleted for failing. Absence is the accepted failure direction here;
+    /// erasing a coin because a source was briefly behind is not.
+    pub async fn staged_cat_admissions(
+        &self,
+        limit: i64,
+        retry_cutoff: i64,
+    ) -> sqlx::Result<Vec<StagedCatRow>> {
+        sqlx::query_as::<_, StagedCatRow>(
+            "SELECT coin_id, parent_coin_info, puzzle_hash, amount, created_height,
+                    spent_height, created_timestamp, spent_timestamp,
+                    derived_asset_id, derived_owner_p2
+             FROM cat_admission_pending
+             WHERE last_attempt_at IS NULL OR last_attempt_at <= ?
+             ORDER BY attempts ASC, seq ASC LIMIT ?",
+        )
+        .bind(retry_cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Record that a promotion pass SPENT A READ on `coin_id` at `now` and could not conclude.
+    ///
+    /// Called on every inconclusive outcome — an unreadable parent, a source-reported absence, an
+    /// unconfirmed coin — because the resource being metered is the read, not the verdict.
+    /// A conclusive outcome deletes the row instead, so it never needs an attempt recorded.
+    pub async fn record_promotion_attempt(&self, coin_id: &str, now: i64) -> sqlx::Result<()> {
+        sqlx::query(
+            "UPDATE cat_admission_pending
+                SET attempts = attempts + 1, last_attempt_at = ?
+              WHERE coin_id = ?",
+        )
+        .bind(now)
+        .bind(Self::normalise_hex(coin_id))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Which of `coin_ids` already have a row in `coins`.
+    ///
+    /// The routing question for an already-PROMOTED coin: once a coin has cleared promotion its
+    /// spend must update `coins` normally, exactly as `origin/main` does, or a promoted coin would
+    /// stay unspent in the replica forever and be re-selected after it was spent.
+    ///
+    /// ONE query, not one per coin. This sits on the peer frame path, where the batch size is
+    /// chosen by the peer, so a round trip per coin hands that peer a knob on the wallet's own
+    /// database. Nothing here reads the chain — the frame path's zero-chain-reads property is
+    /// unaffected either way — but a bounded number of local round trips is worth having when the
+    /// bound costs one query.
+    pub async fn existing_coin_ids(&self, coin_ids: &[String]) -> sqlx::Result<HashSet<String>> {
+        if coin_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let placeholders = std::iter::repeat_n("?", coin_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT coin_id FROM coins WHERE coin_id IN ({placeholders})");
+        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        for id in coin_ids {
+            query = query.bind(Self::normalise_hex(id));
+        }
+        Ok(query.fetch_all(&self.pool).await?.into_iter().collect())
+    }
+
+    /// Move one staged coin into `coins`, FULLY ATTRIBUTED, and drop its staging row — in one
+    /// transaction, so no reader can ever observe the coin in both tables or in neither.
+    ///
+    /// `asset_id` and `hint` come from the parent spend's own reconstruction, never from the
+    /// derivation that discovered the coin. That is the whole content of the proof: the derivation
+    /// said where to look, the parent spend says what the coin IS.
+    ///
+    /// # The DELETE comes first, and its row count is the gate
+    ///
+    /// Promotion spans a network round trip: the row is read, a parent spend is fetched, and only
+    /// then is this called. A reorg rollback can delete the staged row inside that window, and
+    /// deleting it is the rollback saying the coin no longer exists at that height. Inserting
+    /// first and deleting afterwards would write a coin the replica had just decided to forget,
+    /// and the delete would then quietly remove nothing.
+    ///
+    /// So the delete runs first and `Ok(false)` is returned when it removed nothing: no staged
+    /// row, no promotion. The whole thing is one transaction, so a concurrent rollback either
+    /// happens entirely before this (the row is gone, and nothing is written) or entirely after
+    /// (the rollback removes the promoted coin by the same predicate).
+    pub async fn promote_cat_admission(
+        &self,
+        row: &StagedCatRow,
+        asset_id: &str,
+        hint: &str,
+    ) -> sqlx::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let claimed = sqlx::query("DELETE FROM cat_admission_pending WHERE coin_id = ?")
+            .bind(Self::normalise_hex(&row.coin_id))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if claimed != 1 {
+            // Rolled back underneath us. Nothing to promote, and nothing to undo.
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO coins
+                (coin_id, parent_coin_info, puzzle_hash, amount, created_height,
+                 spent_height, asset_id, hint, created_timestamp, spent_timestamp)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(coin_id) DO UPDATE SET
+                created_height = excluded.created_height,
+                spent_height = excluded.spent_height,
+                created_timestamp = excluded.created_timestamp,
+                spent_timestamp = excluded.spent_timestamp,
+                asset_id = COALESCE(excluded.asset_id, coins.asset_id),
+                hint = COALESCE(excluded.hint, coins.hint)",
+        )
+        .bind(Self::normalise_hex(&row.coin_id))
+        .bind(Self::normalise_hex(&row.parent_coin_info))
+        .bind(Self::normalise_hex(&row.puzzle_hash))
+        .bind(&row.amount)
+        .bind(row.created_height)
+        .bind(row.spent_height)
+        .bind(Self::normalise_hex(asset_id))
+        .bind(Self::normalise_hex(hint))
+        .bind(row.created_timestamp)
+        .bind(row.spent_timestamp)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Promote a staged coin the parent spend proved is an owned NFT or DID singleton.
+    ///
+    /// The twin of [`WalletDb::promote_cat_admission`], and it claims the staging row FIRST for the
+    /// same reason: the DELETE's `rows_affected` is what decides whether this promotion still owns
+    /// the coin, so a reorg rollback that lands mid-read loses the race rather than being
+    /// overwritten by it. `false` means the row was already gone — nothing was written.
+    ///
+    /// # Why the coin does NOT enter `coins`
+    ///
+    /// A singleton sits at its own puzzle hash, not one of the wallet's p2 hashes, and carries no
+    /// asset id — so a row for it in `coins` would read as XCH and inflate the spendable balance by
+    /// its (odd, ~1 mojo) amount while being unselectable. `nfts`/`dids` are keyed by launcher id
+    /// and are the tables that describe it truthfully.
+    pub async fn promote_singleton_admission(
+        &self,
+        coin_id: &str,
+        singleton: &PromotedSingleton<'_>,
+    ) -> sqlx::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let claimed = sqlx::query("DELETE FROM cat_admission_pending WHERE coin_id = ?")
+            .bind(Self::normalise_hex(coin_id))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if claimed != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        match singleton {
+            PromotedSingleton::Nft(n) => Self::upsert_nft_on(&mut *tx, n).await?,
+            PromotedSingleton::Did(d) => Self::upsert_did_on(&mut *tx, d).await?,
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Drop a staged coin that a SUCCESSFUL parent read proved is not a unit of the derived asset.
+    ///
+    /// Terminal, and that is what bounds the read cost: a refused coin is never read again, so an
+    /// attacker's amplification is ~1x against a coin they had to pay at least 1 mojo to create.
+    /// Never called for an UNAVAILABLE read — an unavailable answer leaves the row staged, because
+    /// deleting on "I could not tell" would let a peer that withholds parent spends erase real money.
+    pub async fn discard_cat_admission(&self, coin_id: &str) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM cat_admission_pending WHERE coin_id = ?")
+            .bind(Self::normalise_hex(coin_id))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// How many coins are currently staged (diagnostics + tests).
+    pub async fn staged_cat_admission_count(&self) -> sqlx::Result<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM cat_admission_pending")
+            .fetch_one(&self.pool)
+            .await
+    }
+
     /// Roll back chain state above `height` after a reorg (design B.3):
     /// - coins **created** above `height` never existed → delete them;
     /// - coins **spent** above `height` are unspent again → clear the spend;
@@ -1610,6 +1971,38 @@ impl WalletDb {
             .bind(h)
             .execute(&mut *tx)
             .await?;
+        // A staged CAT admission is UNMADE with the coin it describes, by the same predicate and
+        // in the same transaction (dig-node#380).
+        //
+        // A staged row is not a record of money; it is a record of an OBSERVATION — "the chain
+        // showed me a coin at a hash I derived". A rollback deletes the chain state that
+        // observation was made against, so the row's justification is gone even though the row
+        // would survive. Left behind, it is later promoted against a fork the chain no longer has,
+        // and promotion writes into `coins` — so a coin enters the believed set on the strength of
+        // history that was undone. That is the same defect class as everything else this table
+        // exists to prevent: a check trusting a value whose meaning it never established.
+        //
+        // Nothing is lost by deleting. A coin that re-confirms after the reorg is pushed again by
+        // the peer and re-staged, exactly as `coins` is re-populated.
+        sqlx::query(
+            "DELETE FROM cat_admission_pending
+             WHERE created_height IS NOT NULL AND created_height > ?",
+        )
+        .bind(h)
+        .execute(&mut *tx)
+        .await?;
+        // A staged coin SPENT above the fork is unspent again. The spend is cleared rather than
+        // the row deleted: the coin itself is still confirmed at or below the fork, so it is still
+        // a legitimate promotion candidate, and deleting it here would lose a real coin to a reorg
+        // that did not touch its creation.
+        sqlx::query(
+            "UPDATE cat_admission_pending
+                SET spent_height = NULL, spent_timestamp = NULL
+             WHERE spent_height > ?",
+        )
+        .bind(h)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE sync_state SET arrival_baseline_height = ?
              WHERE id = 0 AND arrival_baseline_height > ?",
@@ -2611,6 +3004,15 @@ impl WalletDb {
     /// Insert or update a reconstructed NFT (keyed by launcher id; a later coin overwrites
     /// the mutable fields — the current coin, owner, and wire record).
     pub async fn upsert_nft(&self, n: &NftDbRow) -> sqlx::Result<()> {
+        Self::upsert_nft_on(&self.pool, n).await
+    }
+
+    /// The NFT upsert, against any executor, so a promotion can run it inside the SAME
+    /// transaction that claims the staging row (see [`WalletDb::promote_singleton_admission`]).
+    async fn upsert_nft_on<'e, E>(exec: E, n: &NftDbRow) -> sqlx::Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         sqlx::query(
             "INSERT INTO nfts
                 (launcher_id, coin_id, collection_id, minter_did, owner_did, name,
@@ -2634,7 +3036,7 @@ impl WalletDb {
         .bind(n.visible)
         .bind(n.created_height)
         .bind(&n.record_json)
-        .execute(&self.pool)
+        .execute(exec)
         .await?;
         Ok(())
     }
@@ -2696,6 +3098,14 @@ impl WalletDb {
 
     /// Insert or update a reconstructed DID (keyed by launcher id).
     pub async fn upsert_did(&self, d: &DidDbRow) -> sqlx::Result<()> {
+        Self::upsert_did_on(&self.pool, d).await
+    }
+
+    /// The DID upsert, against any executor (the twin of [`WalletDb::upsert_nft_on`]).
+    async fn upsert_did_on<'e, E>(exec: E, d: &DidDbRow) -> sqlx::Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         sqlx::query(
             "INSERT INTO dids (launcher_id, coin_id, name, visible, created_height, record_json)
              VALUES (?, ?, ?, ?, ?, ?)
@@ -2711,7 +3121,7 @@ impl WalletDb {
         .bind(d.visible)
         .bind(d.created_height)
         .bind(&d.record_json)
-        .execute(&self.pool)
+        .execute(exec)
         .await?;
         Ok(())
     }
