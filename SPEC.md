@@ -7703,7 +7703,10 @@ alone. The sample is the only defence against that residue, and it is bounded:
 * The census height is this node's bookkeeping and is excluded from the tally key, so agreeing
   responders may still differ on it. A node MUST carry the LOWEST height offered by the agreeing
   cohort. Taking any responder-chosen height would let one member of an honest cohort name a height
-  no later census can advance past, denying every subsequent epoch.
+  no later census can advance past, denying every subsequent epoch. **This clause and the
+  missing-height refusal above are only correct together**: an absent height orders below every
+  present one, so taking the lowest without refusing absent heights would let one responder strip
+  the height from an honest cohort and disable the next epoch's advancing check instead.
 
 **A known limitation, stated rather than assumed away:** the plan counts distinct collateralised
 owners, while a node samples distinct peers, and a peer's owner attribution is not proven on this
@@ -7716,9 +7719,15 @@ Preferring its own computation is a requirement on the STORE, and it binds preci
 disagree. §24.9 makes a held record immutable so that no peer can walk a node off the network's
 history; that immutability MUST NOT also prevent a node correcting itself. A record held with
 `AdoptedFromPeers` provenance MUST be superseded by one this node censused for the same epoch, even
-when the two records differ. No other pair may supersede: a peer answer can only ever carry
-`AdoptedFromPeers` provenance, so no responder — however many identities it holds — can reach the
-superseding side, and any other differing record remains a conflict.
+when the two records differ. No other pair may supersede, and any other differing record remains a
+conflict.
+
+**What keeps a peer off the superseding side is a discipline, not a type.** `StoredRecord` carries
+its provenance as an ordinary deserialisable field, so a wire record naming `censused` decodes as
+`Censused` and would supersede if it were handed to the store unchanged. It is not: the adoption
+path DISCARDS whatever provenance a responder sent and stamps `AdoptedFromPeers` from its own tally.
+Any future path that admits a record from the network MUST do the same. A node MUST NOT treat a
+record's own claim about its provenance as evidence of that provenance.
 
 **A second stated limitation:** re-derivation is only as sound as the oracle it runs through. This
 node trusts `dig_mirror_collateral::EpochRecord::advance` to be the network's arithmetic, and checks

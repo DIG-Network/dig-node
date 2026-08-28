@@ -229,9 +229,19 @@ impl RecordProvenance {
 /// two disagree, which is the only case where superseding changes an answer.
 ///
 /// Deliberately not expressed as a `strength()` comparison. Strength orders EVIDENCE for one
-/// record; this orders two different records, which strength explicitly refuses to do. Naming the
-/// one permitted pair also makes the security argument checkable by reading it: a peer answer can
-/// only ever be [`RecordProvenance::AdoptedFromPeers`], so no peer can reach the `incoming` side.
+/// record; this orders two different records, which strength explicitly refuses to do.
+///
+/// # What keeps a peer off the `incoming` side, stated exactly
+///
+/// Not the type. [`RecordProvenance`] is an ordinary deserialisable field, so a wire record naming
+/// `censused` decodes as [`RecordProvenance::Censused`] and WOULD supersede here if it reached this
+/// function unchanged. What prevents that is [`crate::collateral_sync::adopt`], which discards the
+/// provenance a responder sent and stamps [`RecordProvenance::AdoptedFromPeers`] from its own
+/// tally.
+///
+/// So this is a discipline held in one function, and any future path that admits a record from the
+/// network must hold it too. A caller that passes a deserialised peer record straight to
+/// [`EpochRecordStore::put`] reopens the hole this predicate exists to close.
 fn own_census_supersedes(held: RecordProvenance, incoming: RecordProvenance) -> bool {
     matches!(held, RecordProvenance::AdoptedFromPeers { .. })
         && matches!(incoming, RecordProvenance::Censused)

@@ -63,8 +63,12 @@
 //! can census an epoch itself must prefer its own computation. [`crate::collateral::put`] is where
 //! that is enforced, and it binds precisely where the two DISAGREE: a record held as
 //! `AdoptedFromPeers` is superseded by one this node censused for the same epoch even when the
-//! figures differ, while every other differing pair remains a conflict. A peer answer can only ever
-//! carry `AdoptedFromPeers` provenance, so no responder can reach the superseding side.
+//! figures differ, while every other differing pair remains a conflict.
+//!
+//! What keeps a responder off the superseding side is [`adopt`] below, which DISCARDS the
+//! provenance a peer sent and stamps `AdoptedFromPeers` from its own tally — not the type, which
+//! deserialises `censused` from the wire perfectly happily. It is a discipline in one function, and
+//! any future path admitting a record from the network must hold it too.
 
 use std::collections::BTreeMap;
 
@@ -343,6 +347,13 @@ pub fn adopt(
         // which already refuses any height that does not advance past the predecessor's. So the
         // minimum is still strictly above the prior epoch's, and choosing it costs at most a
         // slightly conservative floor for the next epoch's check.
+        //
+        // THIS AND THE `CensusHeightMissing` REFUSAL IN `verify` ARE ONLY CORRECT TOGETHER. Rust
+        // orders `None` BELOW every `Some`, so taking the minimum without that refusal would let
+        // one responder inside an honest cohort strip the height entirely — and an adopted record
+        // with no height silently disables the NEXT epoch's advancing check, which is the same
+        // denial surface reached from the other end. Do not remove either one believing they are
+        // independent.
         if record.census_height < entry.1.census_height {
             entry.1.census_height = record.census_height;
         }
@@ -852,6 +863,51 @@ mod tests {
                 );
             }
             other => panic!("the cohort agreed and should adopt, got {other:?}"),
+        }
+    }
+
+    /// The coupling between findings 3 and 4, pinned rather than only documented.
+    ///
+    /// `None` orders BELOW every `Some` in Rust, so the lowest-height rule alone would let one
+    /// responder inside an agreeing cohort strip the height and have that carried — leaving an
+    /// adopted record with no height, which silently disables the NEXT epoch's advancing check.
+    /// `verify`'s `CensusHeightMissing` refusal is what stops the stripped answer being tallied at
+    /// all. Removing either fix alone reopens the denial from one end or the other.
+    #[test]
+    fn a_stripped_census_height_is_not_carried_by_the_lowest_height_rule() {
+        let prior = genesis();
+        let agreed = honest(&prior, 5_625, 40, 9_000);
+        let mut stripped = agreed;
+        stripped.census_height = None;
+        assert_eq!(
+            stripped.record, agreed.record,
+            "the stripper must AGREE on the consensus record, or it is simply outvoted"
+        );
+
+        let mut responses = vec![PeerRecord {
+            // Sorts first, and offers the value that `Ord` ranks lowest of all.
+            responder: "aaa-stripper".to_string(),
+            record: stripped,
+        }];
+        for i in 0..7 {
+            responses.push(PeerRecord {
+                responder: format!("honest-{i}"),
+                record: agreed,
+            });
+        }
+
+        match adopt(&prior, Some(PLATEAU_POPULATION), &responses) {
+            AdoptOutcome::Adopted { record } => {
+                assert_eq!(
+                    record.census_height,
+                    Some(9_000),
+                    "an absent height must not win the minimum"
+                );
+                // The consequence, not just the field: the next epoch is still checkable.
+                let next = honest(&record, 6_000, 41, 9_500);
+                assert_eq!(verify(&record, &next), Ok(()));
+            }
+            other => panic!("seven honest responders agreed and should adopt, got {other:?}"),
         }
     }
 
