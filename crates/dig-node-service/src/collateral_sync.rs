@@ -45,6 +45,10 @@
 //!   `SYNC_MIN_POPULATION` the plan says `advisory_only` and this node does not adopt.
 //! * Hearing from **more distinct owners than the chain says exist** is not noise, it is a
 //!   detectable lie, and it refuses the whole sample rather than the excess responses.
+//! * The threshold is a supermajority **of the planned sample**, and the plan CAPS the sample at 9
+//!   — so the threshold is a fixed 7 whether the population is 20 or 20,000. Counting that 7
+//!   against a larger responder set would turn a supermajority into a plurality, so more
+//!   responders than the plan drew for refuses the whole sample too, for the same reason.
 //! * **Disagreement never resolves to a majority of a tiny sample.** No supermajority means
 //!   [`AdoptOutcome::NoAgreement`], which is an `unknown` with a reason — never a best guess, never
 //!   the most popular answer, and never a neighbouring epoch's figure.
@@ -56,8 +60,11 @@
 //! identities therefore looks like many owners to the sampler, which is precisely the assumption
 //! the confidence figure rests on. This is why adoption is never load-bearing: the sample buys the
 //! ability to SKIP an expensive historical re-derivation, never the right to be wrong. A node that
-//! can census an epoch itself must prefer its own computation, and [`crate::collateral::put`]'s
-//! provenance ranking is what lets a later census supersede an adopted record without a conflict.
+//! can census an epoch itself must prefer its own computation. [`crate::collateral::put`] is where
+//! that is enforced, and it binds precisely where the two DISAGREE: a record held as
+//! `AdoptedFromPeers` is superseded by one this node censused for the same epoch even when the
+//! figures differ, while every other differing pair remains a conflict. A peer answer can only ever
+//! carry `AdoptedFromPeers` provenance, so no responder can reach the superseding side.
 
 use std::collections::BTreeMap;
 
