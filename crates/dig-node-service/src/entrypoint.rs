@@ -438,6 +438,9 @@ enum SpendsCommand {
         /// Only this outcome: `pending`, `submitted`, `confirmed`, `failed` or `unresolved`.
         #[arg(long)]
         status: Option<String>,
+        /// Resume strictly after this audit id -- the `cursor` the previous page printed.
+        #[arg(long)]
+        after_id: Option<String>,
         /// Keep at most this many rows, newest first.
         #[arg(long)]
         limit: Option<usize>,
@@ -816,6 +819,7 @@ fn spends_action(cmd: Option<SpendsCommand>) -> crate::spend_audit_cli::SpendsAc
             store,
             kind,
             status,
+            after_id,
             limit,
         }) => SpendsAction::List(SpendQuery {
             since_ms,
@@ -823,6 +827,7 @@ fn spends_action(cmd: Option<SpendsCommand>) -> crate::spend_audit_cli::SpendsAc
             store_id: store,
             kind,
             status,
+            after_id,
             limit,
         }),
         Some(SpendsCommand::Show { id }) => SpendsAction::Show { id },
