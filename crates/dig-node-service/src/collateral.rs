@@ -1,0 +1,725 @@
+//! The node's side of the deterministic mirror-coin collateral model.
+//!
+//! Three things live here, and the split matters because two of them are consensus values and one
+//! is an operator preference:
+//!
+//! * the **per-epoch record store** — what this node has censused, keyed by epoch;
+//! * the **safety margin** — a LOCAL preference, persisted, that never reaches a consensus input;
+//! * the **funding advice** — how much $DIG this operator should hold, and whether they are short.
+//!
+//! # Every figure comes out of `dig-mirror-collateral`
+//!
+//! Not one formula is restated here. `required_per_store` is the WHOLE answer: writing
+//! `equilibrium x multiplier - handicap` at a call site silently omits the floor clamp, which
+//! understates what an advertisement must post, and under-posting costs the operator that epoch's
+//! rewards. The same applies to [`apply_safety_margin`] — it rounds UP, and a re-derivation that
+//! rounded down would post a base unit short. Call the crate; never repeat its arithmetic.
+//!
+//! # Units
+//!
+//! Every amount here is **DIG base units**: `1 DIG = 1_000`, so the smallest expressible amount is
+//! `0.001 DIG`. They are never mojos. A mojo is XCH's base unit, `1e-12 XCH`, nine orders of
+//! magnitude away, and the two names must not meet in this module.
+
+use std::path::{Path, PathBuf};
+
+use dig_mirror_collateral::{
+    apply_safety_margin, EpochRecord, MULT_SCALE, SAFETY_MARGIN_BP_DEFAULT, UP_STEP_DENOM,
+};
+use dig_node_control_interface::results::{CollateralRequirementResult, CollateralUnknownReason};
+use serde::{Deserialize, Serialize};
+
+/// The file holding this node's local collateral preferences.
+const COLLATERAL_CONFIG_FILE: &str = "collateral.json";
+
+/// The file holding the per-epoch records this node has censused, one JSON record per line.
+const EPOCH_RECORD_FILE: &str = "collateral-epochs.jsonl";
+
+/// How many epochs of multiplier escalation the recommended buffer covers.
+///
+/// Escalation COMPOUNDS, so a horizon is a choice rather than a constant, and the choice is the
+/// difference between advice an operator acts on and advice they dismiss. At the per-epoch ceiling
+/// of `+12.5%` the factors run 1 epoch 1.12x, 2 1.27x, 4 1.60x, 8 2.57x, 13 4.62x. Telling someone
+/// to hold 4.6x their current lock against a quarter of uninterrupted worst-case escalation is
+/// advice nobody follows; four epochs is about a month, reads as prudent, and is small enough that
+/// the resulting number is one a person will actually fund.
+///
+/// The horizon is reported alongside the figure ([`BufferAdvice::horizon_epochs`]) because a buffer
+/// whose assumption is invisible cannot be argued with.
+pub const BUFFER_HORIZON_EPOCHS: u32 = 4;
+
+/// This node's local collateral preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollateralConfig {
+    /// The safety margin in basis points over the requirement (`100` is `+1%`).
+    ///
+    /// `default` rather than required, and the default is
+    /// [`SAFETY_MARGIN_BP_DEFAULT`] rather than `0`. A config written before this field existed
+    /// must not load as a zero margin: zero is a deliberate choice to post the requirement exactly,
+    /// and reporting it for a config that never expressed one tells the operator they declined a
+    /// cushion they were never offered.
+    #[serde(default = "default_margin_bp")]
+    pub margin_bp: u64,
+}
+
+fn default_margin_bp() -> u64 {
+    SAFETY_MARGIN_BP_DEFAULT
+}
+
+impl Default for CollateralConfig {
+    fn default() -> Self {
+        CollateralConfig {
+            margin_bp: SAFETY_MARGIN_BP_DEFAULT,
+        }
+    }
+}
+
+impl CollateralConfig {
+    /// Load from `dir`, falling back to the default for a missing OR unreadable file.
+    ///
+    /// An unreadable file yields the default rather than an error because the margin is a cushion:
+    /// refusing to start over a corrupt preference file would take the node down over the one
+    /// setting whose absence is survivable. The fallback is the `+1%` default, never `0`, so the
+    /// degraded path still errs toward over-posting.
+    pub fn load_from(dir: &Path) -> Self {
+        std::fs::read_to_string(dir.join(COLLATERAL_CONFIG_FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist to `dir`, creating the state directory with restricted permissions if needed.
+    pub fn save_to(&self, dir: &Path) -> std::io::Result<()> {
+        crate::state::ensure_dir_restricted(dir)?;
+        let path = dir.join(COLLATERAL_CONFIG_FILE);
+        let body = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(&path, body)?;
+        crate::control::restrict_permissions(&path);
+        Ok(())
+    }
+}
+
+/// The per-epoch collateral records this node has censused.
+///
+/// Append-only JSONL, highest revision of an epoch winning, mirroring the spend-audit record's
+/// shape for the same reason: a census that rewrote history in place could not be audited.
+#[derive(Debug, Clone)]
+pub struct EpochRecordStore {
+    path: PathBuf,
+}
+
+/// What the store holds for the epoch that was asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredEpoch {
+    /// A record was found and parsed.
+    Found(Box<EpochRecord>),
+    /// No record for this epoch.
+    Absent,
+    /// A record for this epoch exists and could not be read.
+    ///
+    /// Distinct from [`Absent`](Self::Absent) on purpose: "I have not censused this epoch" and "I
+    /// censused it and lost the answer" have different remedies, and collapsing them would hand the
+    /// operator the same unactionable sentence for both.
+    Unreadable,
+}
+
+impl EpochRecordStore {
+    /// A store at an explicit path.
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        EpochRecordStore { path: path.into() }
+    }
+
+    /// The node's own store, in the machine-wide state directory.
+    pub fn in_state_dir() -> Self {
+        EpochRecordStore::at(crate::state::state_dir().join(EPOCH_RECORD_FILE))
+    }
+
+    /// The file backing this store.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Append one censused record.
+    pub fn put(&self, record: &EpochRecord) -> std::io::Result<()> {
+        if let Some(dir) = self.path.parent() {
+            crate::state::ensure_dir_restricted(dir)?;
+        }
+        let mut line = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        f.write_all(&line)?;
+        f.flush()?;
+        crate::control::restrict_permissions(&self.path);
+        Ok(())
+    }
+
+    /// What this store holds for `epoch`.
+    ///
+    /// A line that names the epoch but does not parse yields [`StoredEpoch::Unreadable`] rather
+    /// than [`StoredEpoch::Absent`]. That distinction is why the scan reads the raw `epoch` field
+    /// separately from the full record: a record that fails to deserialise still usually carries a
+    /// readable epoch number, and attributing it is the difference between the node saying "I lost
+    /// this" and the node saying "this never happened".
+    pub fn get(&self, epoch: u64) -> StoredEpoch {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return StoredEpoch::Absent;
+        };
+        let mut best: Option<EpochRecord> = None;
+        let mut saw_unreadable = false;
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            match serde_json::from_str::<EpochRecord>(line) {
+                Ok(rec) if rec.epoch == epoch => {
+                    best = Some(rec);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if line_names_epoch(line, epoch) {
+                        saw_unreadable = true;
+                    }
+                }
+            }
+        }
+        match best {
+            Some(rec) => StoredEpoch::Found(Box::new(rec)),
+            None if saw_unreadable => StoredEpoch::Unreadable,
+            None => StoredEpoch::Absent,
+        }
+    }
+}
+
+/// Does an unparseable line claim to be about `epoch`?
+///
+/// A deliberately shallow probe: it reads only the `epoch` field, because the line already failed
+/// to deserialise as a whole and any deeper interpretation of it would be guessing.
+fn line_names_epoch(line: &str, epoch: u64) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("epoch").and_then(serde_json::Value::as_u64))
+        == Some(epoch)
+}
+
+/// What the node knows about which epoch is currently in force.
+///
+/// The node does not derive the epoch from the clock. The collateral epoch schedule is a consensus
+/// fact anchored on chain, and a node that guessed it would post against the wrong epoch — so the
+/// census names the epoch it is working on, and this type carries that answer or the reason there
+/// is not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentEpoch {
+    /// The census settled on this epoch and its inputs are final.
+    Final(u64),
+    /// The census reached this epoch but its inputs are still inside the finality depth.
+    ///
+    /// The figure would still move, so it is not answerable — but the remedy is only to WAIT,
+    /// which is a different sentence from "run the census".
+    BehindFinalityDepth,
+    /// The node has not censused an epoch.
+    NotCensused,
+    /// The node cannot see the chain, so it cannot know whether a record should exist.
+    NoChainSource,
+}
+
+/// This epoch's per-store requirement, or the named reason the node cannot state it.
+///
+/// The margin is deliberately not consulted. `required_per_store_dig_base_units` is the PRE-margin,
+/// consensus-derived figure every node derives identically; folding a local preference into it here
+/// would make this operator's cushion look like the network's price.
+pub fn requirement(store: &EpochRecordStore, current: CurrentEpoch) -> CollateralRequirementResult {
+    let unknown = |reason| CollateralRequirementResult::Unknown { reason };
+    let epoch = match current {
+        CurrentEpoch::Final(e) => e,
+        CurrentEpoch::BehindFinalityDepth => {
+            return unknown(CollateralUnknownReason::BehindFinalityDepth)
+        }
+        CurrentEpoch::NotCensused => return unknown(CollateralUnknownReason::NotCensused),
+        CurrentEpoch::NoChainSource => return unknown(CollateralUnknownReason::NoChainSource),
+    };
+    match store.get(epoch) {
+        StoredEpoch::Found(rec) => CollateralRequirementResult::Known {
+            epoch: rec.epoch,
+            // The version that COMPUTED the epoch, read off the record, never the newest version
+            // this build implements. The two differ exactly when a node has upgraded mid-schedule,
+            // which is the one case where the client needs to know the difference.
+            protocol_version: rec.protocol_version.0,
+            required_per_store_dig_base_units: rec.required_per_store_dig_base_units,
+            stores: rec.census.stores,
+            owners: rec.census.owners,
+            multiplier_micros: rec.multiplier_micros,
+            handicap_dig_base_units: rec.handicap_dig_base_units,
+        },
+        StoredEpoch::Absent => unknown(CollateralUnknownReason::NotCensused),
+        StoredEpoch::Unreadable => unknown(CollateralUnknownReason::RecordUnreadable),
+    }
+}
+
+/// How much $DIG an operator should hold, and whether they are currently short.
+///
+/// See [`FundingState`] for what the states mean and which of them may notify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BufferAdvice {
+    /// `(store, root)` advertisements this node serves and must collateralise.
+    pub pairs: u64,
+    /// The pre-margin per-store requirement this advice was computed from.
+    pub required_per_store_dig_base_units: u64,
+    /// The margin applied, in basis points.
+    pub margin_bp: u64,
+    /// What one epoch's posting costs, margin included: `pairs x margined requirement`.
+    pub one_epoch_lock_dig_base_units: u64,
+    /// What the node must be able to cover next epoch if the multiplier rises at its ceiling.
+    pub next_epoch_ceiling_dig_base_units: u64,
+    /// The recommended holding — see [`BufferAdvice::recommended_dig_base_units`]'s derivation in
+    /// [`buffer_advice`].
+    pub recommended_dig_base_units: u64,
+    /// The escalation horizon the recommendation assumes, in epochs.
+    pub horizon_epochs: u32,
+    /// The balance this advice was judged against, or `None` when the node does not know it.
+    pub balance_dig_base_units: Option<u64>,
+    /// Where the operator stands.
+    pub state: FundingState,
+    /// How much more $DIG to hold to reach [`Self::recommended_dig_base_units`], or `None` when the
+    /// balance is unknown.
+    ///
+    /// The number a person acts on. "Balance low" is not actionable; "add 3.250 DIG" is.
+    pub shortfall_to_recommended_dig_base_units: Option<u64>,
+}
+
+/// Where an operator's $DIG balance stands against their collateral obligations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FundingState {
+    /// The node cannot determine its requirement, its served pairs, or its balance.
+    ///
+    /// **Never notifies, and never degrades to a number.** An unknown requirement rendered as a
+    /// zero cost is the money lie this whole surface exists to prevent, so the absence is carried
+    /// as a state rather than as a `0`.
+    Unknown,
+    /// Cannot cover the CURRENT epoch: stores are already going uncollateralised.
+    ShortNow,
+    /// Covers the current epoch but could not cover the next one if the multiplier rises at its
+    /// ceiling.
+    DangerouslyLow,
+    /// Fine for several epochs, with no cushion for a delayed reclaim or sustained escalation.
+    ///
+    /// **Readout only — this state MUST NOT raise a notification.** A healthy node sits here much
+    /// of the time, and a recurring alert an operator learns to dismiss is how they come to dismiss
+    /// [`ShortNow`](Self::ShortNow) and [`DangerouslyLow`](Self::DangerouslyLow) too.
+    BelowRecommendedBuffer,
+    /// At or above the recommended buffer.
+    Adequate,
+}
+
+impl FundingState {
+    /// May this state raise a notification?
+    ///
+    /// Exactly two states may. Stated as a function rather than left to each surface to decide,
+    /// because two surfaces deciding independently is how the readout-only state acquires an alert.
+    pub fn is_notification(self) -> bool {
+        matches!(self, FundingState::ShortNow | FundingState::DangerouslyLow)
+    }
+
+    /// The stable snake_case token, for CLI and JSON output.
+    pub const fn token(self) -> &'static str {
+        match self {
+            FundingState::Unknown => "unknown",
+            FundingState::ShortNow => "short_now",
+            FundingState::DangerouslyLow => "dangerously_low",
+            FundingState::BelowRecommendedBuffer => "below_recommended_buffer",
+            FundingState::Adequate => "adequate",
+        }
+    }
+}
+
+/// The most the multiplier can be after `epochs` of uninterrupted escalation, in millionths.
+///
+/// `UP_STEP_DENOM` is 8, so the per-epoch ceiling is `+12.5%` and the bound COMPOUNDS: `(9/8)^n`.
+/// Computed in `u128` from the crate's own constant rather than from a table of pre-multiplied
+/// factors, so raising the horizon cannot leave a stale factor behind.
+///
+/// This is a **worst case, not a forecast**. Inside the controller's dead band the multiplier does
+/// not move at all, and a network that is not contracting will never approach this line.
+fn escalation_ceiling_micros(epochs: u32) -> u128 {
+    let mut num: u128 = u128::from(MULT_SCALE);
+    for _ in 0..epochs {
+        num = num * u128::from(UP_STEP_DENOM + 1) / u128::from(UP_STEP_DENOM);
+    }
+    num
+}
+
+/// Scale `amount` by a millionths factor, saturating rather than wrapping.
+fn scale_micros(amount: u64, micros: u128) -> u64 {
+    u64::try_from(u128::from(amount) * micros / u128::from(MULT_SCALE)).unwrap_or(u64::MAX)
+}
+
+/// Compute the funding advice.
+///
+/// # Why the recommendation is not "requirement x epochs of runway"
+///
+/// **Collateral is RECLAIMED, not spent.** Each pass creates the coins for `(store, root, epoch n)`
+/// and reclaims epoch `n-1`, and the reclaims run FIRST and are never gated on funds — so the
+/// returned collateral funds the creates behind it. Steady state is therefore roughly ONE epoch's
+/// lock, not one per epoch. Multiplying by a runway would overstate the answer by the epoch count
+/// and tell an operator to buy many times what they need, which is advice they would rightly
+/// ignore.
+///
+/// The real peak is the **transition overlap**: epoch `n`'s coins exist before `n-1`'s are
+/// reclaimed, or a reclaim is delayed or fails. So the recommendation covers holding the current
+/// epoch's lock and the next one's simultaneously, with the next one allowed to have escalated over
+/// the horizon:
+///
+/// ```text
+/// recommended = lock + lock x (9/8)^HORIZON
+/// ```
+///
+/// which is one epoch's lock, plus the overlap, plus escalation headroom — the three things named,
+/// in one expression rather than three that could double-count each other.
+pub fn buffer_advice(
+    pairs: u64,
+    requirement: &CollateralRequirementResult,
+    margin_bp: u64,
+    balance_dig_base_units: Option<u64>,
+) -> BufferAdvice {
+    let CollateralRequirementResult::Known {
+        required_per_store_dig_base_units,
+        ..
+    } = *requirement
+    else {
+        return BufferAdvice {
+            pairs,
+            required_per_store_dig_base_units: 0,
+            margin_bp,
+            one_epoch_lock_dig_base_units: 0,
+            next_epoch_ceiling_dig_base_units: 0,
+            recommended_dig_base_units: 0,
+            horizon_epochs: BUFFER_HORIZON_EPOCHS,
+            balance_dig_base_units,
+            state: FundingState::Unknown,
+            shortfall_to_recommended_dig_base_units: None,
+        };
+    };
+
+    // The margined per-store posting, from the crate — it rounds UP, and a re-derivation that
+    // rounded down would post a base unit short of what qualifies.
+    let per_store = apply_safety_margin(required_per_store_dig_base_units, margin_bp);
+    let lock = u64::try_from(u128::from(pairs) * u128::from(per_store)).unwrap_or(u64::MAX);
+
+    let one_epoch_ceiling = escalation_ceiling_micros(1);
+    let next_epoch_ceiling = scale_micros(lock, one_epoch_ceiling);
+    let horizon_ceiling = escalation_ceiling_micros(BUFFER_HORIZON_EPOCHS);
+    let recommended = lock.saturating_add(scale_micros(lock, horizon_ceiling));
+
+    let (state, shortfall) = match balance_dig_base_units {
+        None => (FundingState::Unknown, None),
+        Some(balance) => {
+            let state = if balance < lock {
+                FundingState::ShortNow
+            } else if balance < next_epoch_ceiling {
+                FundingState::DangerouslyLow
+            } else if balance < recommended {
+                FundingState::BelowRecommendedBuffer
+            } else {
+                FundingState::Adequate
+            };
+            (state, Some(recommended.saturating_sub(balance)))
+        }
+    };
+
+    BufferAdvice {
+        pairs,
+        required_per_store_dig_base_units,
+        margin_bp,
+        one_epoch_lock_dig_base_units: lock,
+        next_epoch_ceiling_dig_base_units: next_epoch_ceiling,
+        recommended_dig_base_units: recommended,
+        horizon_epochs: BUFFER_HORIZON_EPOCHS,
+        balance_dig_base_units,
+        state,
+        shortfall_to_recommended_dig_base_units: shortfall,
+    }
+}
+
+/// Render a DIG base-unit amount as decimal DIG, e.g. `1_047` -> `"1.047"`.
+///
+/// Formatted from the integer rather than through a float: `1e-3` steps are exactly the resolution
+/// an `f64` starts rounding at scale, and a rounded figure about somebody's money is the class of
+/// lie this module exists to avoid.
+pub fn format_dig(base_units: u64) -> String {
+    format!("{}.{:03}", base_units / 1_000, base_units % 1_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dig_mirror_collateral::{required_per_store, EpochCensus};
+
+    /// A record with independently-chosen fields.
+    ///
+    /// Every parameter is varied by at least one test. A helper that pinned any of them would make
+    /// that field untestable through this module, which is exactly how three defects hid in this
+    /// crate family in a single day.
+    fn record(epoch: u64, multiplier_micros: u64, owners: u64, stores: u64) -> EpochRecord {
+        let mut rec = EpochRecord::bootstrap();
+        rec.epoch = epoch;
+        rec.multiplier_micros = multiplier_micros;
+        rec.census = EpochCensus {
+            stores,
+            owners,
+            ..rec.census
+        };
+        rec.required_per_store_dig_base_units = required_per_store(multiplier_micros, owners);
+        rec
+    }
+
+    fn store_at(dir: &Path) -> EpochRecordStore {
+        EpochRecordStore::at(dir.join(EPOCH_RECORD_FILE))
+    }
+
+    #[test]
+    fn a_config_predating_the_margin_field_loads_as_the_default_not_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(COLLATERAL_CONFIG_FILE), b"{}").expect("write");
+        // Zero is a deliberate choice to post exactly; a config that never expressed one must not
+        // be reported as having declined the cushion.
+        assert_eq!(
+            CollateralConfig::load_from(dir.path()).margin_bp,
+            SAFETY_MARGIN_BP_DEFAULT
+        );
+        assert_ne!(SAFETY_MARGIN_BP_DEFAULT, 0, "the default must not be zero");
+    }
+
+    #[test]
+    fn a_stored_margin_survives_a_round_trip_at_a_value_that_is_not_the_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Deliberately not the default: a save/load that silently discarded the value would still
+        // pass if the fixture used the default.
+        CollateralConfig { margin_bp: 250 }
+            .save_to(dir.path())
+            .expect("save");
+        assert_eq!(CollateralConfig::load_from(dir.path()).margin_bp, 250);
+    }
+
+    #[test]
+    fn requirement_reports_the_stored_epochs_figures_not_a_recomputation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        // Two epochs present, with DIFFERENT multipliers and owner counts, so answering with the
+        // wrong one is observable. A single-record fixture could not see that.
+        store.put(&record(7, 1_000_000, 1_000, 40)).expect("put");
+        store.put(&record(8, 500_000, 600, 25)).expect("put");
+
+        let answer = requirement(&store, CurrentEpoch::Final(8));
+        let CollateralRequirementResult::Known {
+            epoch,
+            required_per_store_dig_base_units,
+            stores,
+            owners,
+            multiplier_micros,
+            ..
+        } = answer
+        else {
+            panic!("expected a known requirement, got {answer:?}");
+        };
+        assert_eq!(epoch, 8);
+        assert_eq!(multiplier_micros, 500_000);
+        assert_eq!(owners, 600);
+        assert_eq!(stores, 25);
+        // Pinned against the crate AND against a concrete value: a symbolic assertion alone would
+        // move with a mutation that changed both sides.
+        assert_eq!(
+            required_per_store_dig_base_units,
+            required_per_store(500_000, 600)
+        );
+        assert_eq!(required_per_store_dig_base_units, 900);
+    }
+
+    #[test]
+    fn each_missing_fact_gets_its_own_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        store.put(&record(3, 1_000_000, 1_000, 10)).expect("put");
+
+        let reason = |c| match requirement(&store, c) {
+            CollateralRequirementResult::Unknown { reason } => reason,
+            other => panic!("expected unknown, got {other:?}"),
+        };
+        // An epoch the node holds no record for is NOT the same as having no chain to look at,
+        // and neither is the same as waiting for finality. The remedies differ, so the tokens must.
+        assert_eq!(reason(CurrentEpoch::Final(4)), CollateralUnknownReason::NotCensused);
+        assert_eq!(reason(CurrentEpoch::NotCensused), CollateralUnknownReason::NotCensused);
+        assert_eq!(
+            reason(CurrentEpoch::BehindFinalityDepth),
+            CollateralUnknownReason::BehindFinalityDepth
+        );
+        assert_eq!(
+            reason(CurrentEpoch::NoChainSource),
+            CollateralUnknownReason::NoChainSource
+        );
+    }
+
+    #[test]
+    fn a_corrupt_record_for_the_asked_epoch_is_unreadable_not_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        // A healthy neighbouring record, so the fixture keeps an honest control: a store that was
+        // entirely corrupt could not show that the corruption was ATTRIBUTED to epoch 5.
+        store.put(&record(4, 1_000_000, 1_000, 10)).expect("put");
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.path())
+            .expect("open");
+        writeln!(f, r#"{{"epoch":5,"multiplier_micros":"corrupt"}}"#).expect("write");
+        drop(f);
+
+        assert_eq!(store.get(5), StoredEpoch::Unreadable);
+        assert!(matches!(
+            requirement(&store, CurrentEpoch::Final(5)),
+            CollateralRequirementResult::Unknown {
+                reason: CollateralUnknownReason::RecordUnreadable
+            }
+        ));
+        // The neighbour is still answerable — the corruption did not swallow the store.
+        assert!(matches!(
+            requirement(&store, CurrentEpoch::Final(4)),
+            CollateralRequirementResult::Known { .. }
+        ));
+        // And an epoch nobody wrote anything about is still ABSENT, not unreadable.
+        assert_eq!(store.get(6), StoredEpoch::Absent);
+    }
+
+    /// A `Known` requirement with an explicitly-chosen figure, so the buffer tests never depend on
+    /// the record store.
+    fn known(required: u64) -> CollateralRequirementResult {
+        CollateralRequirementResult::Known {
+            epoch: 9,
+            protocol_version: 1,
+            required_per_store_dig_base_units: required,
+            stores: 12,
+            owners: 300,
+            multiplier_micros: 800_000,
+            handicap_dig_base_units: 0,
+        }
+    }
+
+    #[test]
+    fn the_recommendation_is_about_two_epochs_of_lock_not_one_per_epoch() {
+        // 10 pairs x 1.000 DIG, no margin, so the lock is exactly 10.000 DIG.
+        let a = buffer_advice(10, &known(1_000), 0, Some(0));
+        assert_eq!(a.one_epoch_lock_dig_base_units, 10_000);
+        // (9/8)^4 = 1.601806x, so the recommendation is lock x 2.601806 -- NOT lock x 4 (a runway),
+        // which is the overstatement this shape exists to avoid.
+        assert_eq!(a.recommended_dig_base_units, 26_018);
+        assert!(
+            a.recommended_dig_base_units < a.one_epoch_lock_dig_base_units * 3,
+            "a runway-shaped recommendation would be at least 4x the lock"
+        );
+        assert_eq!(a.horizon_epochs, BUFFER_HORIZON_EPOCHS);
+    }
+
+    #[test]
+    fn the_margin_raises_the_lock_and_is_reported() {
+        // Same pairs and requirement as above, margin the ONLY thing varied, so the effect is
+        // attributable to it.
+        let none = buffer_advice(10, &known(1_000), 0, Some(0));
+        let generous = buffer_advice(10, &known(1_000), 500, Some(0));
+        assert_eq!(generous.margin_bp, 500);
+        // +5% on 1.000 DIG is 1.050, ten of them 10.500.
+        assert_eq!(generous.one_epoch_lock_dig_base_units, 10_500);
+        assert!(generous.one_epoch_lock_dig_base_units > none.one_epoch_lock_dig_base_units);
+    }
+
+    #[test]
+    fn the_three_states_sit_at_the_boundaries_they_name() {
+        let req = known(1_000);
+        // lock = 10.000, next-epoch ceiling = 11.250, recommended = 26.018.
+        let at = |balance| buffer_advice(10, &req, 0, Some(balance)).state;
+
+        // Each bound is pinned from BOTH sides: one under must move the state, at-bound must not.
+        assert_eq!(at(9_999), FundingState::ShortNow);
+        assert_eq!(at(10_000), FundingState::DangerouslyLow);
+        assert_eq!(at(11_249), FundingState::DangerouslyLow);
+        assert_eq!(at(11_250), FundingState::BelowRecommendedBuffer);
+        assert_eq!(at(26_017), FundingState::BelowRecommendedBuffer);
+        assert_eq!(at(26_018), FundingState::Adequate);
+    }
+
+    #[test]
+    fn only_the_two_urgent_states_may_notify() {
+        assert!(FundingState::ShortNow.is_notification());
+        assert!(FundingState::DangerouslyLow.is_notification());
+        // The one that must stay quiet. A normal node sits here much of the time, and an alert an
+        // operator learns to dismiss teaches them to dismiss the two above it.
+        assert!(!FundingState::BelowRecommendedBuffer.is_notification());
+        assert!(!FundingState::Adequate.is_notification());
+        assert!(!FundingState::Unknown.is_notification());
+    }
+
+    #[test]
+    fn an_unknown_requirement_never_becomes_a_zero_cost_or_an_alert() {
+        let unknown = CollateralRequirementResult::Unknown {
+            reason: CollateralUnknownReason::NotCensused,
+        };
+        // A balance of zero would look exactly like ShortNow to any implementation that rendered
+        // an absent requirement as a number.
+        let a = buffer_advice(10, &unknown, 100, Some(0));
+        assert_eq!(a.state, FundingState::Unknown);
+        assert!(!a.state.is_notification());
+        assert_eq!(a.shortfall_to_recommended_dig_base_units, None);
+    }
+
+    #[test]
+    fn an_unknown_balance_is_not_a_shortfall() {
+        // The requirement is perfectly known here; only the BALANCE is missing. An implementation
+        // treating a missing balance as zero would report ShortNow and alarm the operator.
+        let a = buffer_advice(10, &known(1_000), 100, None);
+        assert_eq!(a.state, FundingState::Unknown);
+        assert_eq!(a.shortfall_to_recommended_dig_base_units, None);
+        // The advice still carries the figures it does know, so a surface can show the working.
+        assert!(a.one_epoch_lock_dig_base_units > 0);
+    }
+
+    #[test]
+    fn the_shortfall_is_the_number_to_add() {
+        let a = buffer_advice(10, &known(1_000), 0, Some(20_000));
+        // recommended 26.018 - held 20.000 = add 6.018 DIG.
+        assert_eq!(a.shortfall_to_recommended_dig_base_units, Some(6_018));
+        assert_eq!(format_dig(6_018), "6.018");
+        // Above the recommendation there is nothing to add, and it must not underflow.
+        let rich = buffer_advice(10, &known(1_000), 0, Some(90_000));
+        assert_eq!(rich.shortfall_to_recommended_dig_base_units, Some(0));
+        assert_eq!(rich.state, FundingState::Adequate);
+    }
+
+    #[test]
+    fn escalation_compounds_rather_than_multiplying() {
+        // A linear bound would give 1 + 4 x 0.125 = 1.5x; the compounding one gives 1.6018x. The
+        // two differ by enough that a fixture at any single horizon could not tell them apart --
+        // hence checking the shape across several.
+        assert_eq!(escalation_ceiling_micros(0), 1_000_000);
+        assert_eq!(escalation_ceiling_micros(1), 1_125_000);
+        assert_eq!(escalation_ceiling_micros(2), 1_265_625);
+        assert_eq!(escalation_ceiling_micros(4), 1_601_806);
+    }
+
+    #[test]
+    fn pairs_scale_the_lock_linearly() {
+        // Pairs is the field a fixture is most likely to pin at 1; vary it.
+        let one = buffer_advice(1, &known(2_500), 0, Some(0));
+        let forty = buffer_advice(40, &known(2_500), 0, Some(0));
+        assert_eq!(one.one_epoch_lock_dig_base_units, 2_500);
+        assert_eq!(forty.one_epoch_lock_dig_base_units, 100_000);
+        assert_eq!(forty.pairs, 40);
+    }
+
+    #[test]
+    fn format_dig_keeps_three_decimals() {
+        // The base unit is 0.001 DIG; dropping a trailing zero would misstate an amount by 100x.
+        assert_eq!(format_dig(1), "0.001");
+        assert_eq!(format_dig(1_000), "1.000");
+        assert_eq!(format_dig(1_047), "1.047");
+        assert_eq!(format_dig(10_500), "10.500");
+    }
+}
