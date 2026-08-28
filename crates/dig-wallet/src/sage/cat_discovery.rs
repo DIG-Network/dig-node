@@ -731,19 +731,26 @@ mod tests {
             usize::try_from(MAX_CAT_PROMOTIONS_PER_PASS).unwrap(),
             "one pass must read exactly the cap, never the whole backlog"
         );
-        // Every one of them was refused (their parents are unknown to the map -> but the map
-        // returns None, which is UNAVAILABLE, so they stay staged and ARE re-read). Assert the
-        // honest thing instead: the pass is capped and the already-PROMOTED coin is never re-read.
+        // None of them promotes: their parents are unknown to the map, which answers "unavailable"
+        // rather than "not a CAT", so they stay staged rather than being refused.
         assert_eq!(stats.promoted, 0, "{stats:?}");
 
-        // TERMINALITY: the coin promoted in the calibration is out of the staging table, so no
-        // later pass can read its parent again however many passes run.
+        // NOT REPEATED — the property this test is named for, and which it did not previously
+        // assert. An earlier version settled for `second <= cap`, which is satisfied by the
+        // defect: every one of those rows WAS re-read on every pass, for ever, because a deferred
+        // row was eligible again immediately. With the retry cooldown the correct number is zero,
+        // and zero is what distinguishes a bounded queue from an unbounded one.
         let before = lineage.reads();
         promote_staged_cats(&db, &lineage).await.unwrap();
         let second = lineage.reads() - before;
-        assert!(
-            second <= usize::try_from(MAX_CAT_PROMOTIONS_PER_PASS).unwrap(),
-            "every pass stays capped, got {second}"
+        // EXACTLY ONE, and the number is the assertion. `over` is one past the per-pass cap, so
+        // after pass one there is precisely one row that has never been read; the other 64 are
+        // inside their retry cooldown. So the second pass reads the new row and RE-reads nothing.
+        // Zero would be wrong -- it would mean a row that had never been tried was skipped -- and
+        // any number above one means the defect is back.
+        assert_eq!(
+            second, 1,
+            "a second pass may read only the row that has never been read, and must re-read none              of the rows it already tried"
         );
         assert!(
             !db.all_coins()
@@ -752,6 +759,168 @@ mod tests {
                 .iter()
                 .any(|c| c.coin_id != hex::encode(f.child.coin_id())),
             "no unproven coin may have entered `coins` at any point"
+        );
+    }
+
+    /// **Proves (dig-node#394, gate finding 2):** a wall of unresolvable staged coins cannot starve
+    /// an honest one out of the promotion queue.
+    ///
+    /// THE BUG THIS PINS. A promotion that cannot read its parent leaves the row staged, on
+    /// purpose — deleting it would let a source that is merely behind erase real money. The queue
+    /// was served `ORDER BY seq ASC LIMIT 64`, so exactly 64 coins with invented parents occupied
+    /// the head permanently: every pass re-read the same 64, the read count climbed 64, 128, 192
+    /// without bound, and the honest coin sitting behind them was never reached. The gate
+    /// reproduced it at ten passes with the victim's $DIG balance still zero. The whole primitive
+    /// costs 64 mojos and needs only the victim's public address.
+    ///
+    /// FIXTURE DESIGN — the honest coin is the point. A fixture in which EVERY staged coin is
+    /// unresolvable is the blindest possible one for this defect: with nothing left that could
+    /// promote, a starved queue and a healthy one produce identical output. So the wall is exactly
+    /// `MAX_CAT_PROMOTIONS_PER_PASS` coins, staged FIRST so they own the head under the old
+    /// ordering, and one real simulator-built CAT is staged behind them as the truthful control.
+    /// The assertion is that the control promotes — which is false under the old ordering for any
+    /// number of passes, and true here on the second.
+    #[tokio::test]
+    async fn a_wall_of_unresolvable_coins_cannot_starve_an_honest_one() {
+        let f = real_cat();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+        let mut lineage = CountingLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
+
+        // The wall: exactly one pass's worth, so it fills the head and nothing more. Their parents
+        // are absent from the map, which is the "unresolvable" answer.
+        let wall = usize::try_from(MAX_CAT_PROMOTIONS_PER_PASS).unwrap();
+        let poisoned: Vec<CoinState> = (0..wall)
+            .map(|i| {
+                state(
+                    fabricated_at(f.child.puzzle_hash, 1_000 + i as u64, 0x40),
+                    Some(20 + i as u32),
+                    None,
+                )
+            })
+            .collect();
+        let rows = stage_from_states(&poisoned, &derived, |_| false);
+        assert_eq!(rows.len(), wall, "the wall must actually stage");
+        db.stage_cat_admissions(&rows).await.unwrap();
+
+        // The honest coin, staged BEHIND the wall — the position that made it unreachable.
+        let honest = stage_from_states(&[state(f.child, Some(10), None)], &derived, |_| false);
+        assert_eq!(honest.len(), 1);
+        db.stage_cat_admissions(&honest).await.unwrap();
+
+        // Pass one spends its whole budget on the wall, exactly as before the fix.
+        let first = promote_staged_cats(&db, &lineage).await.unwrap();
+        assert_eq!(first.promoted, 0, "the wall owns the head on pass one");
+        assert_eq!(
+            usize::try_from(first.deferred).unwrap(),
+            wall,
+            "and consumes the whole budget: {first:?}"
+        );
+
+        // Pass two is the one the old ordering could never reach. The wall has been read once and
+        // is inside its cooldown; the honest coin has never been read, so it is served.
+        let before = lineage.reads();
+        let second = promote_staged_cats(&db, &lineage).await.unwrap();
+        assert_eq!(
+            second.promoted, 1,
+            "an honest coin behind a wall of unresolvable ones must still promote: {second:?}"
+        );
+        assert_eq!(
+            lineage.reads() - before,
+            1,
+            "and the wall must not be re-read while it is inside its cooldown"
+        );
+
+        // The money answer, concretely: the honest coin's own amount, and nothing the wall claimed.
+        assert_eq!(
+            db.balance(Some(&hex::encode(f.asset_id))).await.unwrap(),
+            u128::from(f.amount),
+            "the promoted CAT must be counted, and only it"
+        );
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            0u128,
+            "and nothing staged may ever be counted as XCH"
+        );
+    }
+
+    /// **Proves (dig-node#394):** the promotion queue is ordered by ATTEMPTS before arrival, and a
+    /// row inside its retry cooldown is not served at all.
+    ///
+    /// The mechanism under the test above, asserted directly so a regression names itself. Time is
+    /// PINNED to an explicit `NOW` rather than taken from the clock: `staged_cat_admissions` takes
+    /// its cutoff as a parameter precisely so a test can choose one, and a fixture that passed a
+    /// small number through a wall-clock comparison would place every row roughly 1.8 billion
+    /// seconds in the past and assert the expired path while claiming to test the fresh one.
+    #[tokio::test]
+    async fn the_queue_serves_fewest_attempts_first_and_honours_the_cooldown() {
+        const NOW: i64 = 1_800_000_000;
+        const COOLDOWN: i64 = 3_600;
+        let cutoff = NOW - COOLDOWN;
+
+        let f = real_cat();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+        let states: Vec<CoinState> = (0..3)
+            .map(|i| {
+                state(
+                    fabricated_at(f.child.puzzle_hash, 500 + i as u64, 0x50),
+                    Some(30 + i as u32),
+                    None,
+                )
+            })
+            .collect();
+        let rows = stage_from_states(&states, &derived, |_| false);
+        assert_eq!(rows.len(), 3);
+        db.stage_cat_admissions(&rows).await.unwrap();
+        let first_id = rows[0].coin_id.clone();
+        let last_id = rows[2].coin_id.clone();
+
+        // Arrival order, with nothing attempted yet.
+        let queue = db.staged_cat_admissions(3, cutoff).await.unwrap();
+        assert_eq!(
+            queue[0].coin_id, first_id,
+            "an untried queue is served in arrival order"
+        );
+
+        // The head is read, LONG ago — outside the cooldown, so it stays eligible.
+        db.record_promotion_attempt(&first_id, cutoff - 1)
+            .await
+            .unwrap();
+        let queue = db.staged_cat_admissions(3, cutoff).await.unwrap();
+        assert_eq!(queue.len(), 3, "a row outside its cooldown is still served");
+        assert_ne!(
+            queue[0].coin_id, first_id,
+            "but it must have SUNK: a row that has been tried never precedes one that has not"
+        );
+        assert_eq!(
+            queue[2].coin_id, first_id,
+            "specifically, to the back of the queue"
+        );
+
+        // Read again, this time RECENTLY. Now the cooldown excludes it outright.
+        db.record_promotion_attempt(&first_id, NOW).await.unwrap();
+        let queue = db.staged_cat_admissions(3, cutoff).await.unwrap();
+        assert_eq!(
+            queue.len(),
+            2,
+            "a row read inside its cooldown must not be served at all"
+        );
+        assert!(
+            queue.iter().all(|r| r.coin_id != first_id),
+            "and it is that row that is missing"
+        );
+
+        // AT the boundary, the row is eligible again: pinned from both sides, so a cutoff
+        // comparison that drifted by one would fail here rather than pass quietly.
+        db.record_promotion_attempt(&last_id, cutoff).await.unwrap();
+        let queue = db.staged_cat_admissions(3, cutoff).await.unwrap();
+        assert!(
+            queue.iter().any(|r| r.coin_id == last_id),
+            "a row last read exactly AT the cutoff is eligible"
         );
     }
 
