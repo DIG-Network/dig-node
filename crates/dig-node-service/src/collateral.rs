@@ -35,6 +35,14 @@ const COLLATERAL_CONFIG_FILE: &str = "collateral.json";
 /// The file holding the per-epoch records this node has censused, one JSON record per line.
 const EPOCH_RECORD_FILE: &str = "collateral-epochs.jsonl";
 
+/// The file naming the epoch the census has SETTLED on.
+///
+/// Written by the census, read here. It exists because the node must not derive the collateral
+/// epoch from its own clock: the schedule is a consensus fact anchored on chain, and a node that
+/// guessed it would post against the wrong epoch. The census is the only component that knows,
+/// so it says so, in one place both halves read.
+const CURRENT_EPOCH_FILE: &str = "collateral-current-epoch";
+
 /// How many epochs of multiplier escalation the recommended buffer covers.
 ///
 /// Escalation COMPOUNDS, so a horizon is a choice rather than a constant, and the choice is the
@@ -221,6 +229,32 @@ pub enum CurrentEpoch {
     NotCensused,
     /// The node cannot see the chain, so it cannot know whether a record should exist.
     NoChainSource,
+}
+
+/// Read the epoch the census has settled on, from `dir`.
+///
+/// Absent means the census has not run, which is [`CurrentEpoch::NotCensused`] — a first-class
+/// answer, never a zero and never a guess. An unparseable marker is the same answer for the same
+/// reason: a node that cannot read which epoch it is on does not know which epoch it is on.
+///
+/// # The staleness this cannot detect, and who owns it
+///
+/// A marker left behind by a census that has stopped running names an epoch that is no longer
+/// current, and this node would then report an old epoch's figure. Keeping the marker fresh is the
+/// CENSUS's obligation (dig-node#387), not this reader's — there is no second source here to check
+/// it against, and inventing one from the clock is exactly the guess this seam exists to avoid.
+/// The epoch number travels with every answer so the discrepancy is at least VISIBLE to a client
+/// rather than silent.
+pub fn current_epoch_from(dir: &Path) -> CurrentEpoch {
+    match std::fs::read_to_string(dir.join(CURRENT_EPOCH_FILE)) {
+        Ok(text) => match text.trim().parse::<u64>() {
+            // The epoch is ONE-based, so a zero is not a valid epoch and must not be treated as
+            // one; it means the marker is malformed.
+            Ok(epoch) if epoch > 0 => CurrentEpoch::Final(epoch),
+            _ => CurrentEpoch::NotCensused,
+        },
+        Err(_) => CurrentEpoch::NotCensused,
+    }
 }
 
 /// This epoch's per-store requirement, or the named reason the node cannot state it.
@@ -453,7 +487,7 @@ pub fn format_dig(base_units: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dig_mirror_collateral::{required_per_store, EpochCensus};
+    use dig_mirror_collateral::{base_per_store, handicap_for_owners, required_per_store, EpochCensus};
 
     /// A record with independently-chosen fields.
     ///
@@ -469,6 +503,11 @@ mod tests {
             owners,
             ..rec.census
         };
+        // Every derived field is recomputed, not just the headline one. A helper that left the
+        // handicap at the bootstrap value would build a record no census could produce, and a test
+        // reading that field would then pin a fixture artefact rather than the model.
+        rec.handicap_dig_base_units = handicap_for_owners(owners);
+        rec.base_price_dig_base_units = base_per_store(multiplier_micros);
         rec.required_per_store_dig_base_units = required_per_store(multiplier_micros, owners);
         rec
     }
@@ -588,6 +627,78 @@ mod tests {
         ));
         // And an epoch nobody wrote anything about is still ABSENT, not unreadable.
         assert_eq!(store.get(6), StoredEpoch::Absent);
+    }
+
+
+    #[test]
+    fn the_census_marker_is_read_and_a_bad_one_is_not_a_guess() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No marker: the census has not run.
+        assert_eq!(current_epoch_from(dir.path()), CurrentEpoch::NotCensused);
+
+        // A real marker, at a value that is not 1 -- a fixture pinned at the bootstrap epoch could
+        // not tell a parsed number from a hard-coded one.
+        std::fs::write(dir.path().join(CURRENT_EPOCH_FILE), "42
+").expect("write");
+        assert_eq!(current_epoch_from(dir.path()), CurrentEpoch::Final(42));
+
+        // The epoch is ONE-based, so zero is malformed rather than an epoch, and neither it nor a
+        // non-number may become a Final(0) the requirement lookup would then miss silently.
+        for bad in ["0", "", "  ", "eight", "-3", "1.5"] {
+            std::fs::write(dir.path().join(CURRENT_EPOCH_FILE), bad).expect("write");
+            assert_eq!(
+                current_epoch_from(dir.path()),
+                CurrentEpoch::NotCensused,
+                "marker {bad:?} must not resolve to an epoch"
+            );
+        }
+    }
+
+    /// The exact JSON `control.collateral.requirement` puts on the wire.
+    ///
+    /// Pinned as literal keys and values rather than by round-tripping the Rust type, because a
+    /// round-trip proves only that the type agrees with itself. dig-app reads these names, and a
+    /// rename that both sides performed together would be invisible to a symmetric test.
+    #[test]
+    fn the_known_answer_carries_the_census_inputs_a_client_needs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        store.put(&record(12, 800_000, 750, 31)).expect("put");
+
+        let wire = serde_json::to_value(requirement(&store, CurrentEpoch::Final(12)))
+            .expect("serialise");
+        assert_eq!(wire["state"], "known");
+        assert_eq!(wire["epoch"], 12);
+        assert_eq!(wire["protocol_version"], 1);
+        assert_eq!(wire["multiplier_micros"], 800_000);
+        assert_eq!(wire["stores"], 31);
+        assert_eq!(wire["owners"], 750);
+        // 5.000 DIG equilibrium x 0.8 = 4.000, less the 750-owner handicap. Pinned as a concrete
+        // number as well as against the crate, so a mutation moving both sides is still caught.
+        assert_eq!(
+            wire["required_per_store_dig_base_units"],
+            required_per_store(800_000, 750)
+        );
+        assert_eq!(wire["required_per_store_dig_base_units"], 3_000);
+        assert_eq!(wire["handicap_dig_base_units"], 1_000);
+        // The margin MUST NOT appear here. It is a local preference, and a client reading it from
+        // this method would render one operator's cushion as the network's price.
+        assert!(wire.get("margin_bp").is_none());
+    }
+
+    /// The unknown branch is a first-class ANSWER on the wire, not an error and not a zero.
+    #[test]
+    fn the_unknown_answer_names_its_reason_and_carries_no_figure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+
+        let wire = serde_json::to_value(requirement(&store, CurrentEpoch::NoChainSource))
+            .expect("serialise");
+        assert_eq!(wire["state"], "unknown");
+        assert_eq!(wire["reason"], "no_chain_source");
+        // The field a client would render as a cost is ABSENT, not zero. A zero here reads as
+        // "no collateral required", and under-posting costs the operator that epoch's rewards.
+        assert!(wire.get("required_per_store_dig_base_units").is_none());
     }
 
     /// A `Known` requirement with an explicitly-chosen figure, so the buffer tests never depend on

@@ -715,6 +715,127 @@ fn summarize(method: &str, result: &Value) -> String {
 }
 
 
+
+/// `dign collateral buffer` — how much $DIG to hold, and whether this operator is short.
+///
+/// Composed from three control reads rather than served by one method, because each of the three
+/// is already the authoritative home for its own fact: the requirement is consensus-derived, the
+/// margin is a local preference, and the served-pair count belongs to the hosted-store surface.
+/// Adding a fourth method that re-derived any of them would be a second opinion on the money path.
+///
+/// The BALANCE is supplied by the caller. This node cannot know which address holds an operator's
+/// $DIG, and inventing one would be worse than asking: a balance read of the wrong address returns
+/// a confident number about the wrong money. With no `--balance` the advice reports what it costs
+/// and says the standing is UNKNOWN, which is the honest answer and raises no alarm.
+pub fn collateral_buffer(config: &Config, balance_dig_base_units: Option<u64>) -> std::io::Result<Outcome> {
+    use crate::collateral::{buffer_advice, format_dig, FundingState};
+
+    let requirement_json = call_control(
+        config,
+        ControlAction::CollateralRequirement.method(),
+        json!({}),
+    )?;
+    let requirement: dig_node_control_interface::results::CollateralRequirementResult =
+        serde_json::from_value(requirement_json).map_err(std::io::Error::other)?;
+    let margin_json = call_control(
+        config,
+        ControlAction::CollateralMarginGet.method(),
+        json!({}),
+    )?;
+    let margin_bp = margin_json["margin_bp"].as_u64().unwrap_or(0);
+
+    // One `(store, root)` advertisement per hosted store. An advertisement count, never a node
+    // count -- the same distinction the census draws.
+    //
+    // A missing or non-array `stores` is UNKNOWN, never zero. Zero obligations and an unreadable
+    // store list produce the same arithmetic -- a 0.000 DIG recommendation that every balance
+    // clears -- so defaulting to zero would answer "funded" to an operator whose node could not
+    // tell how much it owes. That is the reassuring-answer-to-an-unknown failure this whole
+    // surface exists to prevent, and it is indistinguishable from the honest case downstream.
+    let hosted = call_control(config, ControlAction::StoresList.method(), json!({}))?;
+    let Some(pairs) = hosted["stores"].as_array().map(|a| a.len() as u64) else {
+        return Ok(Outcome::new(
+            "collateral buffer UNKNOWN — this node could not read how many store advertisements              it serves, so it cannot say what you should hold."
+                .to_string(),
+            json!({ "state": "unknown", "reason": "hosted_stores_unreadable" }),
+        ));
+    };
+
+    let advice = buffer_advice(pairs, &requirement, margin_bp, balance_dig_base_units);
+
+    // The working is shown, briefly. A figure nobody can sanity-check is a figure nobody acts on.
+    let mut summary = if advice.state == FundingState::Unknown
+        && !matches!(
+            requirement,
+            dig_node_control_interface::results::CollateralRequirementResult::Known { .. }
+        ) {
+        // Unknown because the REQUIREMENT is unknown -- there is no cost to quote at all.
+        return Ok(Outcome::new(
+            format!(
+                "collateral buffer UNKNOWN — this node cannot state its per-store requirement yet, \
+                 so it cannot say what you should hold.\n  \
+                 Run `dign collateral requirement` to see which fact is missing."
+            ),
+            serde_json::to_value(&advice).map_err(std::io::Error::other)?,
+        ));
+    } else {
+        format!(
+            "serving {} store advertisement(s) at {} DIG each ({} bp margin) — one epoch locks {} DIG\n  \
+             next epoch could rise to {} DIG at the +12.5%/epoch ceiling\n  \
+             recommended holding {} DIG (covers the reclaim overlap plus {} epochs of escalation; \
+             a worst case, not a forecast)",
+            advice.pairs,
+            format_dig(advice.required_per_store_dig_base_units),
+            advice.margin_bp,
+            format_dig(advice.one_epoch_lock_dig_base_units),
+            format_dig(advice.next_epoch_ceiling_dig_base_units),
+            format_dig(advice.recommended_dig_base_units),
+            advice.horizon_epochs,
+        )
+    };
+
+    // The number a person acts on goes LAST, where the eye lands, and it is an amount rather than
+    // an adjective: "balance low" is not actionable, "add 3.250 DIG" is.
+    summary.push_str("\n  ");
+    summary.push_str(&match (advice.state, advice.shortfall_to_recommended_dig_base_units) {
+        (FundingState::Unknown, _) => {
+            "holding UNKNOWN — pass --balance <DIG> to see where you stand".to_string()
+        }
+        (FundingState::ShortNow, Some(short)) => format!(
+            "SHORT NOW — you cannot cover this epoch; stores are going uncollateralised. \
+             Add at least {} DIG now, {} DIG to reach the recommendation.",
+            format_dig(
+                advice
+                    .one_epoch_lock_dig_base_units
+                    .saturating_sub(advice.balance_dig_base_units.unwrap_or(0))
+            ),
+            format_dig(short),
+        ),
+        (FundingState::DangerouslyLow, Some(short)) => format!(
+            "DANGEROUSLY LOW — this epoch is covered, but a rise at the ceiling would not be. \
+             Add {} DIG to reach the recommendation.",
+            format_dig(short),
+        ),
+        (FundingState::BelowRecommendedBuffer, Some(short)) => format!(
+            "below the recommended buffer — fine for now, no cushion. Add {} DIG to reach it.",
+            format_dig(short),
+        ),
+        // Nothing to collateralise is NOT the same sentence as "your funding is sufficient", even
+        // though the arithmetic agrees. Saying "funded" to an operator hosting nothing implies
+        // their stores are covered, and they have none.
+        (FundingState::Adequate, _) if advice.pairs == 0 => {
+            "no store advertisements to collateralise yet — nothing to fund.".to_string()
+        }
+        (FundingState::Adequate, _) => "funded — at or above the recommended buffer.".to_string(),
+        (_, None) => "holding UNKNOWN".to_string(),
+    });
+
+    Ok(Outcome::new(
+        summary,
+        serde_json::to_value(&advice).map_err(std::io::Error::other)?,
+    ))
+}
+
 /// A concise human line for `control.collateral.requirement`.
 ///
 /// The census inputs travel with the figure on purpose: a surface that can show only the number can

@@ -192,11 +192,6 @@ enum Command {
         #[command(subcommand)]
         action: Option<PeersCommand>,
     },
-    /// Add, list and remove a TRUSTED Chia full-node peer.
-    ///
-    /// A different network from `peers`, which manages DIG gossip peers. Trusting a Chia peer
-    /// grants it authority over this node's wallet replica without corroboration — see
-    /// `chia-peers add --help`.
     /// Inspect the collateral this node must post, and set your local safety margin.
     ///
     /// The requirement is decided by the network and is the same on every node. The margin is
@@ -206,6 +201,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<CollateralCommand>,
     },
+    /// Add, list and remove a TRUSTED Chia full-node peer.
+    ///
+    /// A different network from `peers`, which manages DIG gossip peers. Trusting a Chia peer
+    /// grants it authority over this node's wallet replica without corroboration — see
+    /// `chia-peers add --help`.
     ChiaPeers {
         #[command(subcommand)]
         action: Option<ChiaPeersCommand>,
@@ -593,6 +593,17 @@ enum CollateralCommand {
     /// and every node derives it identically. If this node has not censused the epoch yet, it says
     /// so and why — it never reports a requirement it does not have as zero.
     Requirement,
+    /// Show how much $DIG to hold against your collateral obligations.
+    ///
+    /// Collateral is RECLAIMED, not spent: each epoch returns the previous epoch's coins, so the
+    /// steady state is roughly one epoch's lock rather than one per epoch. The recommendation
+    /// covers that lock, the overlap while a reclaim is still in flight, and some headroom for the
+    /// price rising -- a worst case, not a forecast.
+    Buffer {
+        /// How much $DIG you hold, in DIG (e.g. `12.5`). Without it, the standing is not guessed.
+        #[arg(long)]
+        balance: Option<String>,
+    },
     /// Show your local safety margin, and what it adds.
     Margin {
         #[command(subcommand)]
@@ -837,6 +848,12 @@ pub fn run() -> std::process::ExitCode {
             Ok(a) => render(peers::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
         },
+        Command::Collateral {
+            action: Some(CollateralCommand::Buffer { balance }),
+        } => match parse_dig_amount(balance.as_deref()) {
+            Ok(b) => render(control_cli::collateral_buffer(&config, b), action, json),
+            Err(e) => emit_error(&e, action, json),
+        },
         Command::Collateral { action: cmd } => match collateral_action(cmd) {
             Ok(a) => render(control_cli::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
@@ -1017,12 +1034,46 @@ fn subscriptions_action(cmd: Option<SubscriptionsCommand>) -> ControlAction {
 ///
 /// An unrecognised word is REFUSED, never silently treated as a number or as the default: a typo
 /// that fell through to the default would change what this node posts without saying so.
+/// Parse a `--balance` operand in DIG into DIG base units.
+///
+/// $DIG has THREE decimals and its base unit is 0.001 DIG. Parsed as text and scaled by integer
+/// arithmetic rather than through a float: 0.001 steps are where an f64 starts rounding, and a
+/// rounded figure about somebody's money is the class of lie this surface exists to avoid.
+///
+/// A malformed amount is REFUSED. Falling back to zero would report SHORT NOW over a typo.
+fn parse_dig_amount(raw: Option<&str>) -> std::io::Result<Option<u64>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let refuse = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{raw:?} is not an amount of DIG (at most 3 decimal places, e.g. 12.500)"),
+        )
+    };
+    let (whole, frac) = match raw.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (raw, ""),
+    };
+    if frac.len() > 3 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse());
+    }
+    let whole: u64 = whole.parse().map_err(|_| refuse())?;
+    // Right-pad so "5" after the point means 500 milli-DIG, not 5.
+    let millis: u64 = format!("{frac:0<3}").parse().map_err(|_| refuse())?;
+    whole
+        .checked_mul(1_000)
+        .and_then(|w| w.checked_add(millis))
+        .map(Some)
+        .ok_or_else(refuse)
+}
+
 fn collateral_action(cmd: Option<CollateralCommand>) -> std::io::Result<ControlAction> {
     use dig_mirror_collateral::{
         SAFETY_MARGIN_BP_DEFAULT, SAFETY_MARGIN_BP_GENEROUS, SAFETY_MARGIN_BP_TIGHT,
     };
     match cmd {
         None | Some(CollateralCommand::Requirement) => Ok(ControlAction::CollateralRequirement),
+        // Handled before this mapper: it composes three control reads rather than dispatching one.
+        Some(CollateralCommand::Buffer { .. }) => Ok(ControlAction::CollateralRequirement),
         Some(CollateralCommand::Margin { action: None }) => Ok(ControlAction::CollateralMarginGet),
         Some(CollateralCommand::Margin {
             action: Some(MarginCommand::Set { value }),

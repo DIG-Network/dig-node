@@ -3246,12 +3246,12 @@ fn spend_row(r: &crate::spend_audit::SpendRecord) -> Value {
 /// This node's view of which collateral epoch is in force.
 ///
 /// The epoch is NOT derived from the clock here. The collateral epoch schedule is a consensus fact
-/// anchored on chain, and a node that guessed it would post against the wrong epoch — so until the
-/// census names an epoch (dig-node#387), the honest answer is that nothing has been censused. That
-/// is a first-class answer, not an error, and it is why `control.collateral.requirement` returns a
-/// reason rather than a zero.
-fn current_collateral_epoch(_ctx: &ControlCtx) -> crate::collateral::CurrentEpoch {
-    crate::collateral::CurrentEpoch::NotCensused
+/// anchored on chain, and a node that guessed it would post against the wrong epoch — so the epoch
+/// is whatever the CENSUS has settled on and recorded. Until a census runs (dig-node#387) that
+/// marker is absent, and the honest answer is that nothing has been censused: a first-class
+/// answer, not an error, and the reason this method returns a named reason rather than a zero.
+fn current_collateral_epoch(ctx: &ControlCtx) -> crate::collateral::CurrentEpoch {
+    crate::collateral::current_epoch_from(&ctx.state_dir)
 }
 
 /// `control.collateral.requirement` — this epoch's per-store requirement, or a named reason.
