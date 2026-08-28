@@ -627,6 +627,130 @@ pub(crate) mod tests {
         pub(crate) owner_p2: Bytes32,
     }
 
+    /// Mint a DID that MALLORY owns, then spend it so the child singleton keeps MALLORY's inner
+    /// puzzle while the `CREATE_COIN` memo **hint** names the VICTIM.
+    ///
+    /// FIXTURE DESIGN — the hint is varied INDEPENDENTLY of the true owner, which is the one thing
+    /// no previous fixture did. [`mint_did_and_nft`] transfers with `Did::transfer`, which derives
+    /// the hint FROM the destination p2 hash, so hint and owner agree in every row it produces —
+    /// and a fixture in which two fields can never disagree cannot see a guard that reads the wrong
+    /// one. Every value here is chain-valid: the simulator accepts the spend, because a memo is
+    /// free-form data the consensus does not constrain.
+    pub(crate) fn mint_did_hinted_to_a_stranger() -> ForgedDid {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let mallory = sim.bls(2);
+        let mallory_layer = StandardLayer::new(mallory.pk);
+        // The p2 hash the forgery names as owner. Arbitrary: a victim's wallet recognises its own
+        // hashes by value, and Mallory needs only to know one of them (a hint is public).
+        let victim_p2 = Bytes32::new([0x5a; 32]);
+
+        let (create_did, did) = Launcher::new(mallory.coin.coin_id(), 1)
+            .create_simple_did(ctx, &mallory_layer)
+            .unwrap();
+        mallory_layer.spend(ctx, mallory.coin, create_did).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&mallory.sk))
+            .unwrap();
+
+        // THE FORGERY. The created coin is the singleton Mallory still controls — its inner puzzle
+        // hash is curried over HER p2 hash — but the memo hint, which is the only place
+        // `Did::parse_child` reads an owner from, names the victim instead.
+        let child = did.child(did.info.p2_puzzle_hash, did.info.metadata, did.coin.amount);
+        let memos = ctx.hint(victim_p2).unwrap();
+        did.spend_with(
+            ctx,
+            &mallory_layer,
+            Conditions::new().create_coin(
+                child.info.inner_puzzle_hash().into(),
+                did.coin.amount,
+                memos,
+            ),
+        )
+        .unwrap();
+        sim.spend_coins(ctx.take(), &[mallory.sk]).unwrap();
+
+        ForgedDid {
+            parent: parent_spend_from_sim(&sim, did.coin),
+            _sim: sim,
+            child: child.coin,
+            victim_p2,
+            mallory_p2: did.info.p2_puzzle_hash,
+            launcher: did.info.launcher_id,
+        }
+    }
+
+    /// What [`mint_did_hinted_to_a_stranger`] hands back: a chain-valid DID spend whose memo hint
+    /// and whose actual owner are DIFFERENT p2 hashes.
+    pub(crate) struct ForgedDid {
+        /// Held so the simulator's spend store outlives the parent spend taken from it.
+        pub(crate) _sim: Simulator,
+        pub(crate) parent: ParentSpend,
+        pub(crate) child: Coin,
+        /// The p2 hash the memo hint names — the one the victim's wallet controls.
+        pub(crate) victim_p2: Bytes32,
+        /// The p2 hash the coin's puzzle is actually curried over — Mallory's.
+        pub(crate) mallory_p2: Bytes32,
+        pub(crate) launcher: Bytes32,
+    }
+
+    /// A DID whose memo hint disagrees with the puzzle the coin is actually locked to is NOT
+    /// reconstructed — the hint is attacker-written and proves nothing about ownership.
+    ///
+    /// The pure-core half of the end-to-end proof in `cat_discovery::tests`. Both are kept: this
+    /// one pins WHERE the binding lives (in the reconstruction, so `reconstruct_coins` is covered
+    /// by it too), and the other pins that production routing reaches it.
+    #[test]
+    fn a_did_whose_hint_disagrees_with_its_puzzle_is_not_reconstructed() {
+        let f = mint_did_hinted_to_a_stranger();
+        assert_ne!(
+            f.victim_p2, f.mallory_p2,
+            "the fixture is only meaningful if the hint and the real owner differ"
+        );
+
+        assert_eq!(
+            reconstruct("xch", Some(7), &f.parent, f.child).unwrap(),
+            Reconstructed::Unknown,
+            "a DID whose owner hint does not reproduce the coin's puzzle hash is not a DID this \
+             wallet may attribute to anybody"
+        );
+
+        // THE CONTROL. The same code path, the same driver call, and the one varied thing is
+        // whether the hint tells the truth: an honest DID still reconstructs.
+        let honest = mint_did_and_nft();
+        assert!(
+            matches!(
+                reconstruct("xch", Some(7), &honest.did_parent, honest.did_child).unwrap(),
+                Reconstructed::Did { .. }
+            ),
+            "an honest DID pays nothing for the binding"
+        );
+    }
+
+    /// The wider path the binding also closes: [`reconstruct_coins`] writes `dids` rows with no
+    /// ownership test of its own, so before the binding a forged hint minted a `dids` row there
+    /// too — a path the promotion-site guard never sees.
+    #[tokio::test]
+    async fn reconstruct_coins_writes_no_did_row_for_a_forged_hint() {
+        let f = mint_did_hinted_to_a_stranger();
+        let mut lineage = MockLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let rows = vec![coin_row(f.child, 100)];
+        let stats = reconstruct_coins(&db, &lineage, "xch", &HashSet::new(), &rows)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.dids, 0, "the forged DID is not reconstructed");
+        assert!(
+            db.all_dids().await.unwrap().is_empty(),
+            "and no row naming the victim as owner of Mallory's launcher {} reaches `dids`",
+            hex::encode(f.launcher)
+        );
+    }
+
     #[test]
     fn reconstruct_parses_nft_and_did_from_parent_spends() {
         let m = mint_did_and_nft();

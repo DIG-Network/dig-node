@@ -1458,6 +1458,77 @@ mod tests {
         );
     }
 
+    /// A DID hinted to this wallet but LOCKED TO SOMEBODY ELSE is refused, end to end.
+    ///
+    /// `Did::parse_child` reads the owner out of the parent spend's `CREATE_COIN` memo hint and
+    /// stores it verbatim, so before the binding in [`crate::sage::singleton::reconstruct_parsed`]
+    /// the ownership guard tested an attacker-written value: Mallory spends her own DID keeping her
+    /// p2 hash, hints the victim, and the victim's wallet writes the row to `dids` as `Resolved` —
+    /// the SUCCESS outcome — rendering the victim's own address as owner of Mallory's launcher.
+    ///
+    /// FIXTURE DESIGN — an honest DID rides alongside the forged one, and both p2 hashes are in
+    /// `ours`. A guard that refuses every DID would close the hole and break the wallet, and with
+    /// only the forged row present that regression is indistinguishable from the fix. The entry
+    /// point is [`route_point_read_rows`] -> [`promote_staged_cats`], ABOVE the narrowing, because
+    /// a probe entering at `db.upsert_coin` would stay green whether or not routing reaches the
+    /// binding at all.
+    #[tokio::test]
+    async fn a_did_hinted_to_us_but_owned_by_a_stranger_is_refused() {
+        let forged = crate::sage::singleton::tests::mint_did_hinted_to_a_stranger();
+        let honest = crate::sage::singleton::tests::mint_did_and_nft();
+        let mut lineage = CountingLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(forged.child.parent_coin_info), forged.parent);
+        lineage.by_parent.insert(
+            hex::encode(honest.did_child.parent_coin_info),
+            honest.did_parent,
+        );
+
+        // Both p2 hashes are the wallet's. The forged coin is hinted to `victim_p2`, which is why
+        // `coin_records_by_hints` returned it in the first place.
+        let ours: HashSet<String> = [
+            hex::encode(forged.victim_p2),
+            hex::encode(honest.owner_p2),
+        ]
+        .into_iter()
+        .collect();
+        let rows = vec![
+            coin_row_of(forged.child, 100),
+            coin_row_of(honest.did_child, 100),
+        ];
+        let (believed, staged) =
+            route_point_read_rows(&rows, &ours, &DerivedCats::default(), |_| false);
+        assert!(believed.is_empty(), "singletons are never believed outright");
+        assert_eq!(staged.len(), 2);
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.stage_cat_admissions(&staged).await.unwrap();
+        let stats = promote_staged_cats(&db, &lineage, &ours).await.unwrap();
+
+        assert_eq!(
+            (stats.resolved, stats.refused, stats.promoted),
+            (1, 1, 0),
+            "the honest DID resolves and the forged one is refused: {stats:?}"
+        );
+        let dids = db.all_dids().await.unwrap();
+        assert_eq!(
+            dids.len(),
+            1,
+            "exactly one DID row — the forged launcher must not be among them"
+        );
+        assert_eq!(
+            dids[0].launcher_id,
+            hex::encode(honest.did_launcher),
+            "and it is the honest one, not Mallory's {}",
+            hex::encode(forged.launcher)
+        );
+        assert!(
+            db.all_coins().await.unwrap().is_empty(),
+            "no forged balance either"
+        );
+    }
+
     /// A staged row already SPENT on chain is dropped without a parent read at all.
     ///
     /// One of two early exits in [`promote_staged_cats`] that had no coverage: neutering either
