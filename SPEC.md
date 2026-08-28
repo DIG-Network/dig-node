@@ -5490,10 +5490,19 @@ The two states are held in **different tables**, and this separation is normativ
 - **A resolved singleton MUST be owned.** Admission requires the inner p2 hash the RECONSTRUCTION names
   to be one the wallet controls — the same test an unpredicted CAT is held to, and never the hint, which
   anybody may write.
-- **Disproven covers four cases**, all terminal deletions: a coin already spent on chain (dropped without
+- **A reconstructed singleton MUST reproduce its own coin.** The reconstruction is only a proof of
+  ownership if the p2 hash it names is one the coin's puzzle is actually locked to, so §18.11
+  reconstruction MUST recompute the singleton puzzle hash from the parsed info and refuse the coin unless
+  it equals the child coin's own puzzle hash. Without this the preceding clause is vacuous for DIDs: the
+  DID driver's read path takes the owner from the parent spend's `CREATE_COIN` memo hint and stores it
+  verbatim, so anybody able to spend any DID could name any wallet as owner of their singleton. The NFT
+  path needs no separate check — its child coin is derived from the parsed info, and the coin-id equality
+  that path already requires commits to it.
+- **Disproven covers five cases**, all terminal deletions: a coin already spent on chain (dropped without
   a parent read, since it can neither be counted nor selected); a staged row whose coin id does not bind
   its own parent, puzzle hash and amount; a reconstruction that disagrees with the derivation, or whose
-  hint names an address the wallet does not control; and a singleton owned by another p2 hash.
+  hint names an address the wallet does not control; a singleton owned by another p2 hash; and a coin
+  whose parent spend reconstructs to nothing the wallet may hold at all.
 - A promotion write MUST claim its staged row before writing the coin: the staging row is deleted first
   and the write proceeds only if exactly one row was removed, all in one transaction. Promotion spans a
   network round trip, and a reorg rollback inside that window must not be overwritten by a coin the

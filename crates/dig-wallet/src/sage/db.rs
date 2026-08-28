@@ -346,14 +346,6 @@ pub struct PeerRow {
 /// above any honest backlog while still bounding the table against a spend crafted to fill it.
 pub const CAT_ADMISSION_PENDING_MAX_ROWS: i64 = 20_000;
 
-/// A discovered CAT coin awaiting a lineage proof.
-///
-/// Deliberately NOT a [`CoinRow`]. The two types describe different claims: a `CoinRow` is a coin
-/// the wallet BELIEVES it owns as the asset it is typed with, and every balance, coin-selection
-/// and arrival-notification read is entitled to trust it. A `StagedCatRow` is a coin the wallet has
-/// merely FOUND at a hash it derived, together with the derivation that found it — a hypothesis.
-/// Sharing one type between the two would make the difference a field rather than a table, which
-/// is exactly the shape this design rejects.
 /// Which singleton table a proven staged coin belongs in.
 ///
 /// Borrowed rather than owned because the caller already holds the reconstructed row and the write
@@ -366,6 +358,14 @@ pub enum PromotedSingleton<'a> {
     Did(&'a DidDbRow),
 }
 
+/// A discovered CAT coin awaiting a lineage proof.
+///
+/// Deliberately NOT a [`CoinRow`]. The two types describe different claims: a `CoinRow` is a coin
+/// the wallet BELIEVES it owns as the asset it is typed with, and every balance, coin-selection
+/// and arrival-notification read is entitled to trust it. A `StagedCatRow` is a coin the wallet has
+/// merely FOUND at a hash it derived, together with the derivation that found it — a hypothesis.
+/// Sharing one type between the two would make the difference a field rather than a table, which
+/// is exactly the shape this design rejects.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct StagedCatRow {
     /// The coin id (hex, 64 chars).

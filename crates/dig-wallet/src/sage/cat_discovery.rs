@@ -1487,19 +1487,19 @@ mod tests {
 
         // Both p2 hashes are the wallet's. The forged coin is hinted to `victim_p2`, which is why
         // `coin_records_by_hints` returned it in the first place.
-        let ours: HashSet<String> = [
-            hex::encode(forged.victim_p2),
-            hex::encode(honest.owner_p2),
-        ]
-        .into_iter()
-        .collect();
+        let ours: HashSet<String> = [hex::encode(forged.victim_p2), hex::encode(honest.owner_p2)]
+            .into_iter()
+            .collect();
         let rows = vec![
             coin_row_of(forged.child, 100),
             coin_row_of(honest.did_child, 100),
         ];
         let (believed, staged) =
             route_point_read_rows(&rows, &ours, &DerivedCats::default(), |_| false);
-        assert!(believed.is_empty(), "singletons are never believed outright");
+        assert!(
+            believed.is_empty(),
+            "singletons are never believed outright"
+        );
         assert_eq!(staged.len(), 2);
 
         let db = WalletDb::open_in_memory().await.unwrap();
