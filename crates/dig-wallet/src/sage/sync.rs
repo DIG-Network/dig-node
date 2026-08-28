@@ -23,6 +23,7 @@ use chia_protocol::{
 };
 use chia_wallet_sdk::client::Peer;
 
+use super::cat_discovery::{self, DerivedCats};
 use super::db::{CatchUpReplay, CoinRow, WalletDb};
 use super::events::{EventBus, SyncEvent};
 use super::singleton::{self, LineageSource};
@@ -463,6 +464,15 @@ pub fn coin_state_to_row(state: &CoinState) -> CoinRow {
 /// wallet *does* own. That is what [`handle_coin_state_update`]'s fail-closed latch is for.
 pub type SubscribedHashes = HashSet<Bytes32>;
 
+/// The empty derived-CAT set, for a session that follows none.
+///
+/// A shared `'static` so [`SessionState`] can hold a plain borrow rather than an `Option`, which
+/// keeps every read of the field a single lookup with no "derives nothing" branch to forget.
+fn no_derived_cats() -> &'static DerivedCats {
+    static NONE: std::sync::OnceLock<DerivedCats> = std::sync::OnceLock::new();
+    NONE.get_or_init(DerivedCats::default)
+}
+
 /// Everything one peer session carries across the frames it handles: what it subscribed, how
 /// far its peer is trusted, and how much of its rollback allowance it has spent.
 ///
@@ -472,7 +482,17 @@ pub type SubscribedHashes = HashSet<Bytes32>;
 /// and lends it to every [`handle_coin_state_update`] call.
 pub struct SessionState<'a> {
     /// The puzzle hashes this session subscribed. Empty when the session subscribes nothing.
+    ///
+    /// **The wallet's own p2 hashes only** — never the derived CAT outer hashes below. Two
+    /// consumers read this field expecting *addresses*: the `coins` admission filter, and
+    /// `record_arrivals`, which turns it into "you were paid" notifications. Widening it to
+    /// include outer CAT hashes is exactly the defect that produced a false payment notice
+    /// earlier in this ticket family, so the two sets stay separate fields rather than one union.
     pub subscribed: &'a SubscribedHashes,
+    /// The outer CAT puzzle hashes this session ALSO subscribed, with the derivation that produced
+    /// each. Coins arriving at these are STAGED, never admitted — see
+    /// [`crate::sage::cat_discovery`].
+    pub derived: &'a DerivedCats,
     /// What this session's peer is entitled to write, and up to what height.
     pub authority: WriteAuthority,
     /// The session's remaining allowance for walking the peak backwards.
@@ -486,10 +506,22 @@ impl<'a> SessionState<'a> {
     pub fn with_authority(subscribed: &'a SubscribedHashes, authority: WriteAuthority) -> Self {
         Self {
             subscribed,
+            derived: no_derived_cats(),
             authority,
             rollback: RollbackBudget::new(),
             refused_peaks: 0,
         }
+    }
+
+    /// Also follow `derived`, the outer CAT hashes this session subscribed (dig-node#380).
+    ///
+    /// Chained rather than added to [`Self::with_authority`] so that a session which derives
+    /// nothing — a node with no known CAT assets, or a locked wallet — keeps the exact shape it
+    /// has on `main`, and so that every existing caller states its intent by its absence.
+    #[must_use]
+    pub fn following_derived_cats(mut self, derived: &'a DerivedCats) -> Self {
+        self.derived = derived;
+        self
     }
 
     /// Check `claimed` against this session's [`PeakCeiling`], charging a strike if it is refused.
@@ -695,23 +727,60 @@ impl CatchUpBudget {
 /// Coins at a puzzle hash outside `subscribed` are dropped — they were never requested, so a
 /// peer offering them is either confused or hostile, and either way the replica must not grow a
 /// row the wallet cannot account for.
+///
+/// # This function ROUTES; it never TYPES (dig-node#380)
+///
+/// Three destinations, decided purely by which locally-derived set a coin's puzzle hash is in:
+///
+/// - **`subscribed`** — the wallet's own p2 hashes. Straight into `coins`, exactly as on `main`.
+/// - **`derived`** — an outer CAT hash this wallet computed for a known asset. The coin is
+///   **staged**, not admitted: sitting at that hash is a claim anybody could have made
+///   ([`crate::sage::cat_discovery`] carries the full argument), and belief costs a lineage proof
+///   that this function deliberately cannot perform.
+/// - **neither** — dropped and warned about, as before.
+///
+/// A derived-hash coin that has ALREADY been promoted is the one exception: it is a believed coin
+/// now, so its later states — its spend above all — update `coins` normally. Without that, a
+/// promoted coin would remain unspent in the replica forever and be re-selected after it was spent.
+///
+/// **Zero chain reads**, structurally: every decision here is a hash-set membership test against
+/// values derived locally, and the staging path takes no lineage source to read through.
 pub async fn apply_coin_states(
     db: &WalletDb,
     states: &[CoinState],
     subscribed: &SubscribedHashes,
+    derived: &DerivedCats,
 ) -> Result<(), SyncError> {
+    // A derived-hash coin already in `coins` has cleared promotion; asked once for the whole
+    // batch rather than per coin.
+    let derived_ids: Vec<String> = states
+        .iter()
+        .filter(|s| derived.owner_of(&s.coin.puzzle_hash).is_some())
+        .map(|s| hex::encode(s.coin.coin_id()))
+        .collect();
+    let promoted = db.existing_coin_ids(&derived_ids).await?;
+
     let rows: Vec<CoinRow> = states
         .iter()
-        .filter(|s| subscribed.contains(&s.coin.puzzle_hash))
+        .filter(|s| {
+            subscribed.contains(&s.coin.puzzle_hash)
+                || (derived.owner_of(&s.coin.puzzle_hash).is_some()
+                    && promoted.contains(&hex::encode(s.coin.coin_id())))
+        })
         .map(coin_state_to_row)
         .collect();
-    if rows.len() != states.len() {
+    let staged = cat_discovery::stage_from_states(states, derived, |id| promoted.contains(id));
+    let accounted = rows.len() + staged.len();
+    if accounted != states.len() {
         tracing::warn!(
-            dropped = states.len() - rows.len(),
+            dropped = states.len() - accounted,
             "wallet sync: peer pushed coin states outside the subscribed puzzle-hash set"
         );
     }
     db.upsert_coins(&rows).await?;
+    if !staged.is_empty() {
+        db.stage_cat_admissions(&staged).await?;
+    }
     Ok(())
 }
 
@@ -823,7 +892,7 @@ pub async fn handle_coin_state_update(
         );
         db.set_initial_sync_complete(false).await?;
     }
-    apply_coin_states(db, &update.items, session.subscribed).await?;
+    apply_coin_states(db, &update.items, session.subscribed, session.derived).await?;
     db.record_peak(admitted, &hex::encode(update.peak_hash))
         .await?;
     // Incoming-funds arrivals (dig_ecosystem#2548), recorded AFTER the batch has committed and
@@ -906,6 +975,7 @@ pub async fn initial_sync_with_authority(
     peer_ip: &str,
     events: &EventBus,
     authority: WriteAuthority,
+    derived: &DerivedCats,
 ) -> Result<(), SyncError> {
     let trust = authority.trust();
     // THE TRUST BOUNDARY. This is the only place a PEER can set `initial_sync_complete`, and
@@ -987,7 +1057,7 @@ pub async fn initial_sync_with_authority(
             }
         }
 
-        apply_coin_states(db, &respond.coin_states, &subscribed).await?;
+        apply_coin_states(db, &respond.coin_states, &subscribed, derived).await?;
         events.publish(SyncEvent::PuzzleBatchSynced);
 
         if respond.is_finished {
@@ -1717,6 +1787,7 @@ mod tests {
                 "127.0.0.1",
                 &events,
                 WriteAuthority::Operator,
+                &DerivedCats::default(),
             ),
         )
         .await
@@ -1757,6 +1828,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Operator,
+            &DerivedCats::default(),
         )
         .await
         .expect_err("an empty subscription set must be refused, not performed");
@@ -1827,6 +1899,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Operator,
+            &DerivedCats::default(),
         )
         .await
         .expect("a non-empty subscription set catches up normally");
@@ -1933,6 +2006,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Discovered,
+            &DerivedCats::default(),
         )
         .await
         .expect_err("a discovered peer must not be allowed to run a catch-up");
@@ -2003,6 +2077,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Discovered,
+            &DerivedCats::default(),
         )
         .await
         .expect_err("the reconnect must not buy a fresh catch-up");
@@ -2308,6 +2383,7 @@ mod tests {
             "127.0.0.1",
             &events,
             WriteAuthority::Operator,
+            &DerivedCats::default(),
         )
         .await
         .expect_err("a non-advancing catch-up must be refused");
@@ -2437,6 +2513,7 @@ mod tests {
             "1.2.3.4",
             &events,
             authority,
+            &DerivedCats::default(),
         )
         .await
     }

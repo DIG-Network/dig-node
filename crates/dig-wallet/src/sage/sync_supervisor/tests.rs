@@ -286,6 +286,7 @@ impl SyncSession for ScriptedSession {
             // reading `self.trust` here would make the elevation invisible to the floor check and
             // quietly re-create the bug this suite exists to exclude.
             authority,
+            &DerivedCats::default(),
         )
         .await
     }
