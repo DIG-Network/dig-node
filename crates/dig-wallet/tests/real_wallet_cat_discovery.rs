@@ -58,6 +58,33 @@ async fn report_the_real_wallets_dig_discovery_surface() {
         at_derived, 0,
         "before this change the replica holds NO row at the derived hash -- that is #380"
     );
+
+    // THE OBSERVABLE THIS ROUND PREDICTS (dig-node#394). The point-read tier stages every row that
+    // is not at one of the wallet's OWN p2 hashes, and until this round a staged row that proved to
+    // be an NFT or DID singleton was refused terminally. So the figures that matter to a real
+    // wallet are: how many of its rows the tier stages at all, and whether its NFT/DID tables
+    // survive a pass. `refused > 0` on a wallet holding singletons is the defect, visible here.
+    let nfts = db.all_nfts().await.expect("read nfts").len();
+    let dids = db.all_dids().await.expect("read dids").len();
+    println!("[REPLICA] nfts={nfts} dids={dids}");
+    println!(
+        "[REPLICA] dig_balance={} xch_balance={}",
+        db.balance(Some(&hex::encode(asset))).await.unwrap(),
+        db.balance(None).await.unwrap()
+    );
+
+    let owned: HashSet<String> = addresses.iter().cloned().collect();
+    let (believed, staged) =
+        dig_wallet::sage::cat_discovery::route_point_read_rows(&coins, &owned, &derived, |_| false);
+    println!(
+        "[ROUTE] point-read tier: believed={} staged={}",
+        believed.len(),
+        staged.len()
+    );
+    println!(
+        "[ROUTE] staged rows are the ones a promotion pass reads a parent spend for; before this \
+         round any of them that proved to be an NFT or DID was deleted"
+    );
 }
 
 fn hex_to_b32(h: &str) -> Bytes32 {
