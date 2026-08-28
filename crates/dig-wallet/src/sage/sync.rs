@@ -1002,17 +1002,24 @@ impl PuzzleStateSource for Peer {
 /// This is where the terminal height meets the session's [`PeakCeiling`] — see
 /// [`CatchUpReplay::finished_at`], which refuses an over-ceiling terminal rather than arming
 /// `initial_sync_complete` over it.
-// The subscription is genuinely two sets with different meanings -- addresses, which the replica
-// and the arrivals notifier read as "ours", and derived CAT hashes, which only discovery reads.
-// Collapsing them into one parameter to satisfy the count is precisely the union this design keeps
-// apart (see `SessionState::subscribed`). A `Subscription { addresses, derived }` type would carry
-// both without the union and is the right shape; it is left for a follow-up rather than done here,
-// because it touches every catch-up call site and this change is already money-visible.
+/// # The two sets are NOT one set (dig-node#394)
+///
+/// A catch-up needs COVERAGE over addresses AND derived CAT hashes -- the peer must be asked about
+/// both, or a discovered CAT coin is never seen at all. It needs ADMISSION over addresses only:
+/// a coin at a derived hash is a claim anybody could have made, and admitting it writes a coin the
+/// schema types `asset_id: None`, which means XCH, into the money table.
+///
+/// Those are different sets, and an earlier round of this work passed ONE vector serving both
+/// roles. That is why the union is performed HERE and cannot be performed by a caller: `addresses`
+/// is the admission set, `derived` is the widening, and `requested` -- the union -- exists only
+/// inside this function and only reaches the peer request. A caller that wanted to widen admission
+/// would have to hand a derived hash in `addresses`, and the `subscribed` construction below
+/// FILTERS those out, so even that does not work. One admission point, structurally unwidenable.
 #[allow(clippy::too_many_arguments)]
 pub async fn initial_sync_with_authority(
     peer: &dyn PuzzleStateSource,
     db: &WalletDb,
-    puzzle_hashes: Vec<Bytes32>,
+    addresses: Vec<Bytes32>,
     genesis_challenge: Bytes32,
     peer_ip: &str,
     events: &EventBus,
@@ -1040,11 +1047,34 @@ pub async fn initial_sync_with_authority(
     // wallet-scoped read (`routing::route(true, true) == Source::Db`). The guard lives HERE,
     // at the floor, and not only in the supervisor that calls it: a caller-side check is one
     // refactor away from gone, and this function is the only thing that can set the flag.
-    if puzzle_hashes.is_empty() {
+    if addresses.is_empty() {
         return Err(SyncError::NoPuzzleHashes);
     }
 
-    let subscribed: SubscribedHashes = puzzle_hashes.iter().copied().collect();
+    // ADMISSION. Addresses only, and derived hashes actively removed rather than merely not added:
+    // this set decides what enters `coins`, and `coins` is the money table. The filter is what
+    // makes the guarantee structural instead of a convention every caller has to remember.
+    let subscribed: SubscribedHashes = addresses
+        .iter()
+        .copied()
+        .filter(|h| derived.owner_of(h).is_none())
+        .collect();
+    if subscribed.len() != addresses.len() {
+        tracing::warn!(
+            removed = addresses.len() - subscribed.len(),
+            "wallet sync: a derived CAT hash was offered as an address; refused admission"
+        );
+    }
+
+    // COVERAGE. The union, built here and used for nothing but the peer request. A coin arriving
+    // at a derived hash is routed to staging by `apply_coin_states`, never to `coins`.
+    let requested: Vec<Bytes32> = {
+        let mut all = addresses.clone();
+        all.extend(derived.hashes());
+        all.sort();
+        all.dedup();
+        all
+    };
     let mut previous_height: Option<u32> = None;
     let mut header_hash = genesis_challenge;
     events.publish(SyncEvent::Start {
@@ -1069,7 +1099,7 @@ pub async fn initial_sync_with_authority(
         // path, which drops the peer and backs off.
         let respond = tokio::time::timeout(
             PEER_REQUEST_TIMEOUT,
-            peer.request_puzzle_state(puzzle_hashes.clone(), previous_height, header_hash),
+            peer.request_puzzle_state(requested.clone(), previous_height, header_hash),
         )
         .await
         .map_err(|_| {
@@ -1111,7 +1141,11 @@ pub async fn initial_sync_with_authority(
                 authority.ceiling(),
                 respond.height,
                 hex::encode(respond.header_hash),
-                &puzzle_hashes,
+                // Coverage recorded as ADDRESSES, matching every reader of
+                // `covered_puzzle_hashes` (`covers` is a containment test over the wallet's own
+                // hashes). Recording the union here would make the replica claim coverage of a
+                // set it does not answer for.
+                &addresses,
             )?)
             .await?;
             return Ok(());

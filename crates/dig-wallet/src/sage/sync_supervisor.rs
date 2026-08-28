@@ -809,8 +809,13 @@ pub trait SyncSession: Send + Sync {
     /// wrong answer for elevation purposes, and treated the same way: no elevation.
     async fn header_hash_at(&self, height: u32) -> Result<Option<Bytes32>, SyncError>;
 
-    /// Subscribe `puzzle_hashes` and catch the replica up, under the EFFECTIVE trust the
+    /// Subscribe over `addresses` and catch the replica up, under the EFFECTIVE trust the
     /// supervisor resolved for this session.
+    ///
+    /// `addresses` is the wallet's own p2 hashes and NOTHING else: it is the set that decides what
+    /// enters `coins`. `derived` widens the peer REQUEST only, and that widening happens inside
+    /// [`sync::initial_sync_with_authority`] so no implementor of this trait can collapse the two
+    /// (dig-node#394).
     ///
     /// `authority` is passed in rather than read from [`SyncSession::trust`] because the two can
     /// legitimately differ: a discovered peer that cleared corroboration runs as
@@ -825,7 +830,7 @@ pub trait SyncSession: Send + Sync {
     async fn catch_up(
         &self,
         db: &WalletDb,
-        puzzle_hashes: Vec<Bytes32>,
+        addresses: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
@@ -1378,17 +1383,15 @@ impl Supervisor {
                 // end the session, and ending a session mid-catch-up discards the work — but a
                 // TOTAL deadline and shutdown both can, and shutdown is not optional at any
                 // duration.
-                // The REQUEST carries addresses AND derived CAT hashes; `set_watched` above
-                // counted the addresses only, because that number is reported to the user as
-                // "watched addresses" and an outer CAT hash is not one.
-                let mut requested = puzzle_hashes.clone();
-                requested.extend(derived.hashes());
-                requested.sort();
-                requested.dedup();
+                // ADDRESSES ONLY here, and `derived` alongside. The union that widens the peer
+                // REQUEST is performed inside `sync::initial_sync_with_authority`, which is also
+                // the only thing that builds the admission set -- so this call site cannot widen
+                // what enters `coins` even by mistake (dig-node#394). Building the union here is
+                // exactly what let a fabricated coin be admitted as XCH.
                 let catch_up = tokio::select! {
                     result = session.catch_up(
                         &self.db,
-                        requested,
+                        puzzle_hashes.clone(),
                         self.genesis_challenge,
                         &self.events,
                         authority,
@@ -2319,7 +2322,7 @@ impl SyncSession for ChiaPeerSession {
     async fn catch_up(
         &self,
         db: &WalletDb,
-        puzzle_hashes: Vec<Bytes32>,
+        addresses: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
@@ -2330,7 +2333,7 @@ impl SyncSession for ChiaPeerSession {
         sync::initial_sync_with_authority(
             &self.peer,
             db,
-            puzzle_hashes,
+            addresses,
             genesis_challenge,
             &self.ip,
             events,

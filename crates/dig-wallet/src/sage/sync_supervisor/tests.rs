@@ -43,16 +43,24 @@ const CATCH_UP_HEIGHT: u32 = 6_000_000;
 
 /// A peer that reports "caught up, nothing to send" — what a real full node answers to a
 /// subscription it has already satisfied.
-struct CaughtUpAtOnce;
+struct CaughtUpAtOnce {
+    /// Every puzzle-hash vector the catch-up actually put ON THE WIRE.
+    ///
+    /// Recorded because coverage and admission are different sets (dig-node#394) and a suite that
+    /// can only see one of them cannot tell a correct split from a collapsed one: the address set
+    /// is visible at the call site, the REQUESTED set is visible only here.
+    requested: std::sync::Arc<Mutex<Vec<Vec<Bytes32>>>>,
+}
 
 #[async_trait::async_trait]
 impl PuzzleStateSource for CaughtUpAtOnce {
     async fn request_puzzle_state(
         &self,
-        _puzzle_hashes: Vec<Bytes32>,
+        puzzle_hashes: Vec<Bytes32>,
         _previous_height: Option<u32>,
         _header_hash: Bytes32,
     ) -> Result<RespondPuzzleState, SyncError> {
+        self.requested.lock().unwrap().push(puzzle_hashes);
         Ok(RespondPuzzleState {
             puzzle_hashes: vec![],
             coin_states: vec![],
@@ -66,8 +74,11 @@ impl PuzzleStateSource for CaughtUpAtOnce {
 /// Everything the scripted factory and its sessions share with the test.
 #[derive(Default)]
 struct Script {
-    /// One entry per `catch_up`, holding the exact set that was subscribed.
+    /// One entry per `catch_up`, holding the exact ADMISSION set the supervisor handed down.
     catch_ups: Mutex<Vec<Vec<Bytes32>>>,
+    /// One entry per catch-up round trip, holding the set actually REQUESTED from the peer --
+    /// the union of the admission set with the derived CAT hashes.
+    requested: std::sync::Arc<Mutex<Vec<Vec<Bytes32>>>>,
     /// One entry per `catch_up`, holding the EFFECTIVE authority the supervisor resolved.
     ///
     /// The ceiling has exactly one production construction site (`trust_for_session`), and until
@@ -259,17 +270,17 @@ impl SyncSession for ScriptedSession {
     async fn catch_up(
         &self,
         db: &WalletDb,
-        puzzle_hashes: Vec<Bytes32>,
+        addresses: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
         authority: sync::WriteAuthority,
-        _derived: &DerivedCats,
+        derived: &DerivedCats,
     ) -> Result<(), SyncError> {
         self.script
             .catch_ups
             .lock()
             .unwrap()
-            .push(puzzle_hashes.clone());
+            .push(addresses.clone());
         self.script.authorities.lock().unwrap().push(authority);
         if self.script.catch_up_parks.load(Ordering::SeqCst) {
             // Recorded FIRST, so a test can still prove the catch-up was entered.
@@ -278,9 +289,11 @@ impl SyncSession for ScriptedSession {
         // The REAL catch-up, so the empty-set guard and the completion-flag write are both
         // exercised exactly as production would exercise them.
         sync::initial_sync_with_authority(
-            &CaughtUpAtOnce,
+            &CaughtUpAtOnce {
+                requested: std::sync::Arc::clone(&self.script.requested),
+            },
             db,
-            puzzle_hashes,
+            addresses,
             genesis_challenge,
             &self.peer_ip(),
             events,
@@ -288,7 +301,9 @@ impl SyncSession for ScriptedSession {
             // reading `self.trust` here would make the elevation invisible to the floor check and
             // quietly re-create the bug this suite exists to exclude.
             authority,
-            &DerivedCats::default(),
+            // FORWARDED, never defaulted: the supervisor's own derived set reaches the real
+            // catch-up, so the coverage/admission split is under test on every catch-up path.
+            derived,
         )
         .await
     }
