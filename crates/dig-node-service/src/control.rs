@@ -3245,13 +3245,17 @@ fn spend_row(r: &crate::spend_audit::SpendRecord) -> Value {
 
 /// This node's view of which collateral epoch is in force.
 ///
-/// The epoch is NOT derived from the clock here. The collateral epoch schedule is a consensus fact
-/// anchored on chain, and a node that guessed it would post against the wrong epoch — so the epoch
-/// is whatever the CENSUS has settled on and recorded. Until a census runs (dig-node#387) that
-/// marker is absent, and the honest answer is that nothing has been censused: a first-class
-/// answer, not an error, and the reason this method returns a named reason rather than a zero.
-fn current_collateral_epoch(ctx: &ControlCtx) -> crate::collateral::CurrentEpoch {
-    crate::collateral::current_epoch_from(&ctx.state_dir)
+/// The mirror-coin epoch schedule is a WALL-CLOCK one published by `dig-constants` — 7-day epochs
+/// from a fixed genesis — so the current epoch is derived, not guessed and not stored. It is read
+/// through `dig_constants::mirror_epoch_at_unix_ms` rather than recomputed here: the epoch number
+/// is an input to coin identity, so a second implementation of the arithmetic would derive
+/// different coins rather than merely a different label.
+///
+/// Deriving it is also what makes a STALE answer unrepresentable. The requirement is looked up for
+/// the epoch that is current NOW, so a node whose census has stopped running reports
+/// `not_censused` for the present epoch instead of confidently serving last week's figure.
+fn current_collateral_epoch(_ctx: &ControlCtx) -> crate::collateral::CurrentEpoch {
+    crate::collateral::current_epoch_now()
 }
 
 /// `control.collateral.requirement` — this epoch's per-store requirement, or a named reason.

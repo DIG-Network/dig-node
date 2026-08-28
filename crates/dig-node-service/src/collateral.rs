@@ -35,14 +35,6 @@ const COLLATERAL_CONFIG_FILE: &str = "collateral.json";
 /// The file holding the per-epoch records this node has censused, one JSON record per line.
 const EPOCH_RECORD_FILE: &str = "collateral-epochs.jsonl";
 
-/// The file naming the epoch the census has SETTLED on.
-///
-/// Written by the census, read here. It exists because the node must not derive the collateral
-/// epoch from its own clock: the schedule is a consensus fact anchored on chain, and a node that
-/// guessed it would post against the wrong epoch. The census is the only component that knows,
-/// so it says so, in one place both halves read.
-const CURRENT_EPOCH_FILE: &str = "collateral-current-epoch";
-
 /// How many epochs of multiplier escalation the recommended buffer covers.
 ///
 /// Escalation COMPOUNDS, so a horizon is a choice rather than a constant, and the choice is the
@@ -231,30 +223,36 @@ pub enum CurrentEpoch {
     NoChainSource,
 }
 
-/// Read the epoch the census has settled on, from `dir`.
+/// The mirror-coin epoch containing `now_unix_ms`.
 ///
-/// Absent means the census has not run, which is [`CurrentEpoch::NotCensused`] — a first-class
-/// answer, never a zero and never a guess. An unparseable marker is the same answer for the same
-/// reason: a node that cannot read which epoch it is on does not know which epoch it is on.
+/// Delegated to `dig_constants::mirror_epoch_at_unix_ms`, never re-derived. The epoch number is an
+/// INPUT TO COIN IDENTITY — `dig_mirror_coin::mirror_hint` takes it — so a node computing a
+/// different epoch than its peers does not display a wrong label, it derives a different coin and
+/// orphans the epoch's collateral. There must be exactly one implementation of this arithmetic in
+/// the ecosystem, and it is not this one.
 ///
-/// # The staleness this cannot detect, and who owns it
+/// Two properties worth naming because a plausible reimplementation loses both: the epoch is
+/// **one-based** (the genesis instant is epoch 1, not 0), and it uses `div_euclid`, so an instant
+/// one millisecond BEFORE genesis is epoch 0 rather than colliding with epoch 1 as a truncating
+/// `/` would.
 ///
-/// A marker left behind by a census that has stopped running names an epoch that is no longer
-/// current, and this node would then report an old epoch's figure. Keeping the marker fresh is the
-/// CENSUS's obligation (dig-node#387), not this reader's — there is no second source here to check
-/// it against, and inventing one from the clock is exactly the guess this seam exists to avoid.
-/// The epoch number travels with every answer so the discrepancy is at least VISIBLE to a client
-/// rather than silent.
-pub fn current_epoch_from(dir: &Path) -> CurrentEpoch {
-    match std::fs::read_to_string(dir.join(CURRENT_EPOCH_FILE)) {
-        Ok(text) => match text.trim().parse::<u64>() {
-            // The epoch is ONE-based, so a zero is not a valid epoch and must not be treated as
-            // one; it means the marker is malformed.
-            Ok(epoch) if epoch > 0 => CurrentEpoch::Final(epoch),
-            _ => CurrentEpoch::NotCensused,
-        },
-        Err(_) => CurrentEpoch::NotCensused,
+/// A clock before genesis yields a non-positive epoch, which is not an epoch. It is reported as
+/// [`CurrentEpoch::NotCensused`] rather than clamped to 1: a machine whose clock is wrong should
+/// not be handed epoch 1's requirement as though it were current.
+pub fn current_epoch_at(now_unix_ms: i64) -> CurrentEpoch {
+    match dig_constants::mirror_epoch_at_unix_ms(now_unix_ms) {
+        epoch if epoch >= 1 => CurrentEpoch::Final(epoch as u64),
+        _ => CurrentEpoch::NotCensused,
     }
+}
+
+/// The mirror-coin epoch in force right now, by the system clock.
+pub fn current_epoch_now() -> CurrentEpoch {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    current_epoch_at(now)
 }
 
 /// This epoch's per-store requirement, or the named reason the node cannot state it.
@@ -638,31 +636,37 @@ mod tests {
     }
 
     #[test]
-    fn the_census_marker_is_read_and_a_bad_one_is_not_a_guess() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // No marker: the census has not run.
-        assert_eq!(current_epoch_from(dir.path()), CurrentEpoch::NotCensused);
+    fn the_epoch_comes_from_the_canonical_clock_and_is_one_based() {
+        use dig_constants::{
+            MIRROR_EPOCH_GENESIS_UNIX_MS as GENESIS, MIRROR_EPOCH_LENGTH_MS as WEEK,
+        };
 
-        // A real marker, at a value that is not 1 -- a fixture pinned at the bootstrap epoch could
-        // not tell a parsed number from a hard-coded one.
-        std::fs::write(
-            dir.path().join(CURRENT_EPOCH_FILE),
-            "42
-",
-        )
-        .expect("write");
-        assert_eq!(current_epoch_from(dir.path()), CurrentEpoch::Final(42));
+        // The genesis instant is epoch ONE, not zero. An off-by-one here derives a different coin
+        // for every store on the network, so it is pinned explicitly rather than inferred.
+        assert_eq!(current_epoch_at(GENESIS), CurrentEpoch::Final(1));
+        assert_eq!(current_epoch_at(GENESIS + WEEK - 1), CurrentEpoch::Final(1));
+        assert_eq!(current_epoch_at(GENESIS + WEEK), CurrentEpoch::Final(2));
+        assert_eq!(
+            current_epoch_at(GENESIS + 51 * WEEK),
+            CurrentEpoch::Final(52)
+        );
 
-        // The epoch is ONE-based, so zero is malformed rather than an epoch, and neither it nor a
-        // non-number may become a Final(0) the requirement lookup would then miss silently.
-        for bad in ["0", "", "  ", "eight", "-3", "1.5"] {
-            std::fs::write(dir.path().join(CURRENT_EPOCH_FILE), bad).expect("write");
-            assert_eq!(
-                current_epoch_from(dir.path()),
-                CurrentEpoch::NotCensused,
-                "marker {bad:?} must not resolve to an epoch"
-            );
-        }
+        // One millisecond BEFORE genesis. A truncating `/` puts this in epoch 1 alongside genesis
+        // itself; `div_euclid` does not, and the boundary is the only input that can tell them
+        // apart -- which is why the fixture is this instant and not an arbitrary earlier one.
+        assert_eq!(current_epoch_at(GENESIS - 1), CurrentEpoch::NotCensused);
+        assert_eq!(current_epoch_at(0), CurrentEpoch::NotCensused);
+
+        // And the live clock agrees with the constant it is supposed to be reading.
+        assert_eq!(
+            current_epoch_now(),
+            current_epoch_at(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("after 1970")
+                    .as_millis() as i64
+            )
+        );
     }
 
     /// The exact JSON `control.collateral.requirement` puts on the wire.
