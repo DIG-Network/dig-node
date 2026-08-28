@@ -7500,7 +7500,7 @@ The states, of which only two leave an epoch uncovered:
 | `short_now` | cannot cover the current epoch; roots are already uncollateralised | **yes** |
 | `dangerously_low` | covers now; could not cover the next epoch at the escalation ceiling | **yes** |
 | `below_recommended_buffer` | every epoch covered, no cushion | **NO — readout only** |
-| `adequate` | at or above the recommendation | no |
+| `funded` | at or above the recommendation | no |
 
 `below_recommended_buffer` MUST be excluded from `is_shortfall()` and MUST NOT raise a notification.
 Every epoch it covers *is* covered; a healthy node sits there much of the time, and a recurring alert
@@ -7508,15 +7508,26 @@ an operator learns to dismiss teaches them to dismiss the two above it.
 
 ### 24.6. UNKNOWN must be UNREPRESENTABLE as a number
 
+`control.collateral.buffer` is a **separate method** from `control.collateral.requirement`, not a
+widening of it: the requirement is consensus-derived and identical on every node, while the buffer
+depends on this node's own served set, an operator preference, and a horizon this node chose. The
+funding state is **carried, not re-derived by clients** — two clients deriving it will disagree, and
+the one that disagrees about a funding warning is the one an operator acts on.
+
 The buffer answer is a **tagged variant**: the unknown case carries `state` and `reason` and **no
 numeric field at all**. This is a shape requirement, not a convention — a struct with optional
 numbers can hold a `0`, and a zero buffer reads as *no buffer needed*.
 
 | `reason` | the missing fact |
 |---|---|
+| `requirement_unknown` | the node cannot state this epoch's per-store requirement |
 | `served_set_unknown` | the node cannot enumerate the roots it serves |
 | `reclaim_state_unknown` | the node cannot tell which of last epoch's coins are reclaimed |
 | `balance_unknown` | the operator's spendable $DIG is not known to this node |
+
+`requirement_unknown` is distinct from the rest and from §24.2's reasons on purpose: a missing
+requirement is a NETWORK gap, while the other three are LOCAL. Reporting one as the other sends the
+operator to fix the wrong thing.
 
 **None of these has a counterpart in §24.2's census taxonomy**, which is the structural reason the
 buffer is its own method rather than a widening of the requirement: collapsing `served_set_unknown`
@@ -7539,9 +7550,11 @@ A malformed operator-supplied balance is REFUSED, never parsed as zero, which wo
   `dig-mirror-collateral`'s own constant, never to a number spelled out in the CLI; a second spelling is
   how two surfaces post different amounts for one choice. An unrecognised word is REFUSED, never treated
   as the default.
-* `collateral buffer [--roots <N>] [--balance <DIG>]` — §24.5/§24.6. States an AMOUNT to add, not an
-  adjective, and shows the working: roots served, per-store requirement, margin, the three terms, and
-  the horizon with its ceiling. `--roots` is an operand until `control.collateral.buffer` publishes,
-  because no published method reports the served set and the nearest-looking one is a different set.
+* `collateral buffer [--roots <N>] [--balance <DIG>]` — §24.5/§24.6. With no operands it asks the
+  node, which is the authority on its own served set, preference and balance. The operands are an
+  OVERRIDE, so a person can get a figure before the node can enumerate its served set; they are never
+  a fallback the node applies itself. Either way it states an AMOUNT to add, not an adjective, and
+  shows the working: roots served, per-store requirement, margin, the three terms, and the horizon
+  with its ceiling.
 
 Every verb offers `--json` beside the human output, with stable field names (§6.2).
