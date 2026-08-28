@@ -25,7 +25,12 @@ async fn report_the_real_wallets_dig_discovery_surface() {
     let coins = db.all_coins().await.expect("read coins");
     let addresses: HashSet<String> = coins.iter().map(|c| c.puzzle_hash.clone()).collect();
     let attributed = coins.iter().filter(|c| c.asset_id.is_some()).count();
-    println!("[REPLICA] coins={} distinct_puzzle_hashes={} attributed={}", coins.len(), addresses.len(), attributed);
+    println!(
+        "[REPLICA] coins={} distinct_puzzle_hashes={} attributed={}",
+        coins.len(),
+        addresses.len(),
+        attributed
+    );
 
     let p2: Vec<Bytes32> = addresses
         .iter()
@@ -39,7 +44,10 @@ async fn report_the_real_wallets_dig_discovery_surface() {
     let derived = DerivedCats::derive(&p2, &[asset]);
     println!("[DERIVED] dig_asset_id={}", hex::encode(asset));
     for h in derived.hashes() {
-        println!("[DERIVED] a $DIG coin of this wallet sits at {}", hex::encode(h));
+        println!(
+            "[DERIVED] a $DIG coin of this wallet sits at {}",
+            hex::encode(h)
+        );
     }
     let at_derived = coins
         .iter()
@@ -95,7 +103,10 @@ async fn the_real_wallet_reports_its_real_dig_balance() {
     .into_iter()
     .map(CapturedCoin::into_state)
     .collect();
-    println!("[CHAIN] coins captured at the derived hash = {}", states.len());
+    println!(
+        "[CHAIN] coins captured at the derived hash = {}",
+        states.len()
+    );
 
     let rows = stage_from_states(&states, &derived, |_| false);
     println!("[STAGE] staged = {}", rows.len());

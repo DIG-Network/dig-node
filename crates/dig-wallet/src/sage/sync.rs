@@ -1002,6 +1002,13 @@ impl PuzzleStateSource for Peer {
 /// This is where the terminal height meets the session's [`PeakCeiling`] — see
 /// [`CatchUpReplay::finished_at`], which refuses an over-ceiling terminal rather than arming
 /// `initial_sync_complete` over it.
+// The subscription is genuinely two sets with different meanings -- addresses, which the replica
+// and the arrivals notifier read as "ours", and derived CAT hashes, which only discovery reads.
+// Collapsing them into one parameter to satisfy the count is precisely the union this design keeps
+// apart (see `SessionState::subscribed`). A `Subscription { addresses, derived }` type would carry
+// both without the union and is the right shape; it is left for a follow-up rather than done here,
+// because it touches every catch-up call site and this change is already money-visible.
+#[allow(clippy::too_many_arguments)]
 pub async fn initial_sync_with_authority(
     peer: &dyn PuzzleStateSource,
     db: &WalletDb,
@@ -1329,7 +1336,10 @@ mod tests {
 
         apply_coin_states(
             &db,
-            &[state(plain_coin, Some(10), None), state(cat_coin, Some(10), None)],
+            &[
+                state(plain_coin, Some(10), None),
+                state(cat_coin, Some(10), None),
+            ],
             &subscribed,
             &derived,
         )
@@ -1344,7 +1354,11 @@ mod tests {
         );
         // … and it is not BELIEVED, which is the whole of the round-5 rejection.
         let believed = db.all_coins().await.unwrap();
-        assert_eq!(believed.len(), 1, "only the ordinary p2 coin may enter `coins`");
+        assert_eq!(
+            believed.len(),
+            1,
+            "only the ordinary p2 coin may enter `coins`"
+        );
         assert_eq!(believed[0].coin_id, hex::encode(plain_coin.coin_id()));
         assert_eq!(
             db.balance(None).await.unwrap(),
@@ -1369,9 +1383,14 @@ mod tests {
         };
         let subscribed: SubscribedHashes = [owner].into_iter().collect();
 
-        apply_coin_states(&db, &[state(stranger, Some(10), None)], &subscribed, &derived)
-            .await
-            .unwrap();
+        apply_coin_states(
+            &db,
+            &[state(stranger, Some(10), None)],
+            &subscribed,
+            &derived,
+        )
+        .await
+        .unwrap();
 
         assert!(db.all_coins().await.unwrap().is_empty());
         assert_eq!(db.staged_cat_admission_count().await.unwrap(), 0);
@@ -1425,14 +1444,24 @@ mod tests {
     async fn later_spend_state_marks_coin_spent() {
         let db = WalletDb::open_in_memory().await.unwrap();
         let c = coin(1, 9, 500);
-        apply_coin_states(&db, &[state(c, Some(10), None)], &subscribed_owned(), &DerivedCats::default())
-            .await
-            .unwrap();
+        apply_coin_states(
+            &db,
+            &[state(c, Some(10), None)],
+            &subscribed_owned(),
+            &DerivedCats::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 500);
         // The peer later reports the same coin as spent.
-        apply_coin_states(&db, &[state(c, Some(10), Some(20))], &subscribed_owned(), &DerivedCats::default())
-            .await
-            .unwrap();
+        apply_coin_states(
+            &db,
+            &[state(c, Some(10), Some(20))],
+            &subscribed_owned(),
+            &DerivedCats::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 0);
     }
 

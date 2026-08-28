@@ -334,7 +334,6 @@ pub struct PeerRow {
     pub banned: bool,
 }
 
-
 /// How many discovered-but-unproven CAT coins the staging table holds.
 ///
 /// A staged row is a dozen short hex fields — call it 400 bytes with SQLite's overhead — so

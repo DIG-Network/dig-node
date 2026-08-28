@@ -90,13 +90,7 @@ impl DerivedCats {
         for &owner_p2 in owner_p2_hashes {
             for &asset_id in asset_ids {
                 let outer = digstore_chain::cat::cat_puzzle_hash(owner_p2, asset_id);
-                by_hash.insert(
-                    outer,
-                    DerivedOwner {
-                        asset_id,
-                        owner_p2,
-                    },
-                );
+                by_hash.insert(outer, DerivedOwner { asset_id, owner_p2 });
             }
         }
         Self { by_hash }
@@ -131,8 +125,8 @@ impl DerivedCats {
 ///
 /// Takes no [`LineageSource`], which is how the zero-chain-reads-on-the-frame-path property is
 /// guaranteed: it is not a discipline the body observes, it is a fact about the signature.
-pub fn stage_from_states<'a, F>(
-    states: &'a [CoinState],
+pub fn stage_from_states<F>(
+    states: &[CoinState],
     derived: &DerivedCats,
     mut already_promoted: F,
 ) -> Vec<StagedCatRow>
@@ -200,7 +194,10 @@ pub async fn promote_staged_cats(
     lineage: &dyn LineageSource,
 ) -> Result<PromoteStats> {
     let mut stats = PromoteStats::default();
-    for row in db.staged_cat_admissions(MAX_CAT_PROMOTIONS_PER_PASS).await? {
+    for row in db
+        .staged_cat_admissions(MAX_CAT_PROMOTIONS_PER_PASS)
+        .await?
+    {
         // A coin already spent on chain can never contribute to a balance or be selected as a
         // spend input, so proving it would buy nothing and cost a round trip. Dropped without a
         // read, which also stops a spent coin sitting in staging forever waiting for a promotion
@@ -273,7 +270,8 @@ async fn promote_one(
         );
         return Ok(false);
     }
-    let reconstructed = singleton::reconstruct(prefix, row.created_height.map(|h| h as u32), parent, child)?;
+    let reconstructed =
+        singleton::reconstruct(prefix, row.created_height.map(|h| h as u32), parent, child)?;
     let Reconstructed::Cat {
         coin_id,
         asset_id,
@@ -326,7 +324,9 @@ mod tests {
     use crate::sage::db::{CoinRow, CAT_ADMISSION_PENDING_MAX_ROWS};
     use crate::sage::singleton::ParentSpend;
     use chia_sdk_test::Simulator;
-    use chia_wallet_sdk::driver::{Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer};
+    use chia_wallet_sdk::driver::{
+        Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer,
+    };
     use chia_wallet_sdk::types::Conditions;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -517,14 +517,15 @@ mod tests {
         let fake = fabricated_at(f.child.puzzle_hash, 999_999_999, 0xAB);
 
         let rows = stage_from_states(
-            &[
-                state(f.child, Some(10), None),
-                state(fake, Some(11), None),
-            ],
+            &[state(f.child, Some(10), None), state(fake, Some(11), None)],
             &derived,
             |_| false,
         );
-        assert_eq!(rows.len(), 2, "both coins are DISCOVERED; neither is believed");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both coins are DISCOVERED; neither is believed"
+        );
         db.stage_cat_admissions(&rows).await.unwrap();
 
         let mut lineage = CountingLineage::default();
@@ -606,7 +607,10 @@ mod tests {
         let hostile = fabricated_at(f.child.puzzle_hash, 7, 0xCD);
 
         let rows = stage_from_states(
-            &[state(hostile, Some(9), None), state(f.child, Some(10), None)],
+            &[
+                state(hostile, Some(9), None),
+                state(f.child, Some(10), None),
+            ],
             &derived,
             |_| false,
         );
@@ -623,7 +627,10 @@ mod tests {
         let stats = promote_staged_cats(&db, &lineage)
             .await
             .expect("a failing parent read must not fail the whole pass");
-        assert_eq!(stats.promoted, 1, "the honest coin is still promoted: {stats:?}");
+        assert_eq!(
+            stats.promoted, 1,
+            "the honest coin is still promoted: {stats:?}"
+        );
         assert_eq!(stats.deferred, 1, "{stats:?}");
         // Left staged, NOT deleted: an unreadable answer is not a disproof, and deleting on one
         // would let a peer that withholds parent spends erase real money.
@@ -650,7 +657,11 @@ mod tests {
         let real = stage_from_states(&[state(f.child, Some(10), None)], &derived, |_| false);
         db.stage_cat_admissions(&real).await.unwrap();
         promote_staged_cats(&db, &lineage).await.unwrap();
-        assert_eq!(lineage.reads(), 1, "the counter must be able to move at all");
+        assert_eq!(
+            lineage.reads(),
+            1,
+            "the counter must be able to move at all"
+        );
 
         // One over the per-pass cap, so the bound is pinned from BOTH sides in one run: the pass
         // must read exactly the cap, and must NOT read the extra coin.
@@ -710,11 +721,9 @@ mod tests {
         let f = real_cat();
         let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
         let promoted = hex::encode(f.child.coin_id());
-        let rows = stage_from_states(
-            &[state(f.child, Some(10), Some(11))],
-            &derived,
-            |id| id == promoted,
-        );
+        let rows = stage_from_states(&[state(f.child, Some(10), Some(11))], &derived, |id| {
+            id == promoted
+        });
         assert!(
             rows.is_empty(),
             "a believed coin must never be pushed back into the staging table"

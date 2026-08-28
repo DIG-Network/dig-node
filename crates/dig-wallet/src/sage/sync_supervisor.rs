@@ -53,8 +53,8 @@ use chia_bls::PublicKey;
 use chia_protocol::Bytes32;
 use chia_puzzle_types::standard::StandardArgs;
 
-use super::custody::WalletCustody;
 use super::cat_discovery::DerivedCats;
+use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
 use super::quorum::{self, Verdict};
