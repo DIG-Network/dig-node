@@ -3150,7 +3150,33 @@ impl WalletBackend {
             // discovered at a derived hash becomes spendable on this tier too. Best-effort for
             // the same reason attribution is: a chain-read failure must not make a fresh XCH sync
             // look like a hard error.
-            let _ = super::cat_discovery::promote_staged_cats(&self.db, lineage, &owned).await;
+            // The ONE promotion site that runs on the shipped node today: `CatAttributor` is
+            // constructed only under `cfg(test)`, so the frame-path pass does not run in
+            // production (dig-node#382, the wiring half, is PR
+            // https://github.com/DIG-Network/dig-node/pull/391). Until that lands, this is where a
+            // staged coin becomes spendable, and it must not be silent about it: a `let _ =`
+            // discarded both the counts and the cause, so a wallet whose $DIG never appeared
+            // produced no evidence of why anywhere.
+            //
+            // Still best-effort, and deliberately: a chain-read failure must not turn a successful
+            // XCH refresh into a hard error.
+            match super::cat_discovery::promote_staged_cats(&self.db, lineage, &owned).await {
+                Ok(stats) if stats.promoted > 0 || stats.refused > 0 => tracing::info!(
+                    promoted = stats.promoted,
+                    refused = stats.refused,
+                    deferred = stats.deferred,
+                    "wallet sync: CAT admission promotion pass (point-read tier)"
+                ),
+                Ok(stats) if stats.deferred > 0 => tracing::debug!(
+                    deferred = stats.deferred,
+                    "wallet sync: staged CAT coins are awaiting a readable parent spend"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "wallet sync: the CAT promotion pass failed; staged coins are unchanged"
+                ),
+            }
             let plain: HashSet<String> = phs.iter().cloned().collect();
             let _ =
                 singleton::reconstruct_all(&self.db, lineage, &self.config.address_prefix, &plain)

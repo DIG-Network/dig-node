@@ -346,11 +346,16 @@ pub async fn promote_staged_cats(
                 continue;
             }
         };
-        if promote_one(db, lineage_prefix(), &row, &parent, owned_p2).await? {
-            stats.promoted += 1;
-        } else {
-            db.discard_cat_admission(&row.coin_id).await?;
-            stats.refused += 1;
+        match promote_one(db, lineage_prefix(), &row, &parent, owned_p2).await? {
+            Promotion::Promoted => stats.promoted += 1,
+            Promotion::Disproven => {
+                db.discard_cat_admission(&row.coin_id).await?;
+                stats.refused += 1;
+            }
+            // The staged row was rolled back while its parent spend was being read. Nothing was
+            // written and there is nothing to discard; the coin re-stages if it reappears above
+            // the fork. Counted as deferred because that is what it is — no verdict was reached.
+            Promotion::Vanished => stats.deferred += 1,
         }
     }
     Ok(stats)
@@ -370,14 +375,30 @@ fn lineage_prefix() -> &'static str {
     "xch"
 }
 
-/// Decide and apply one coin's promotion. `Ok(true)` promoted, `Ok(false)` disproven.
+/// What deciding one coin's promotion concluded.
+///
+/// Three outcomes rather than a bool, because "not promoted" covers two situations that must not
+/// be treated alike: a coin the parent spend DISPROVES is finished with and its staging row is
+/// deleted, while a coin whose row a reorg removed mid-read reached no verdict at all and must not
+/// be recorded as refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Promotion {
+    /// The parent spend proves the coin, and it is now in `coins`.
+    Promoted,
+    /// The parent spend was read and does not support the claim. Terminal.
+    Disproven,
+    /// The staged row was gone by the time the write ran — a reorg rollback inside the read.
+    Vanished,
+}
+
+/// Decide and apply one coin's promotion.
 async fn promote_one(
     db: &WalletDb,
     prefix: &str,
     row: &StagedCatRow,
     parent: &super::singleton::ParentSpend,
     owned_p2: &HashSet<String>,
-) -> Result<bool> {
+) -> Result<Promotion> {
     let coin_row = staged_as_coin(row);
     let child: Coin = coin_from_row(&coin_row)?;
     // THE BINDING CHECK. The staged row's coin id is re-derived from the fields the row itself
@@ -389,7 +410,7 @@ async fn promote_one(
             coin_id = %row.coin_id,
             "cat promotion: staged row's coin id does not bind its own fields; refusing"
         );
-        return Ok(false);
+        return Ok(Promotion::Disproven);
     }
     let reconstructed =
         singleton::reconstruct(prefix, row.created_height.map(|h| h as u32), parent, child)?;
@@ -400,7 +421,7 @@ async fn promote_one(
     } = reconstructed
     else {
         // The parent read succeeded and this coin is not a CAT child of it at all. Disproven.
-        return Ok(false);
+        return Ok(Promotion::Disproven);
     };
     // The reconstruction must agree on BOTH halves — which coin, and whose. Checking only the
     // asset id would admit a real CAT of the right asset owned by somebody else; checking only the
@@ -435,11 +456,14 @@ async fn promote_one(
             derived_asset = %row.derived_asset_id,
             "cat promotion: the parent spend disagrees with the derivation; refusing"
         );
-        return Ok(false);
+        return Ok(Promotion::Disproven);
     }
     // Attributed from the RECONSTRUCTION's own values, which is the whole content of the proof.
-    db.promote_cat_admission(row, &asset_id, &hint).await?;
-    Ok(true)
+    Ok(if db.promote_cat_admission(row, &asset_id, &hint).await? {
+        Promotion::Promoted
+    } else {
+        Promotion::Vanished
+    })
 }
 
 /// A staged row viewed as a coin, for reconstruction only. Never written to `coins` from here —

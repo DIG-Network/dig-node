@@ -1784,19 +1784,25 @@ impl WalletDb {
     /// The routing question for an already-PROMOTED coin: once a coin has cleared promotion its
     /// spend must update `coins` normally, exactly as `origin/main` does, or a promoted coin would
     /// stay unspent in the replica forever and be re-selected after it was spent.
+    ///
+    /// ONE query, not one per coin. This sits on the peer frame path, where the batch size is
+    /// chosen by the peer, so a round trip per coin hands that peer a knob on the wallet's own
+    /// database. Nothing here reads the chain — the frame path's zero-chain-reads property is
+    /// unaffected either way — but a bounded number of local round trips is worth having when the
+    /// bound costs one query.
     pub async fn existing_coin_ids(&self, coin_ids: &[String]) -> sqlx::Result<HashSet<String>> {
-        let mut found = HashSet::new();
-        for id in coin_ids {
-            let hit: Option<String> =
-                sqlx::query_scalar("SELECT coin_id FROM coins WHERE coin_id = ?")
-                    .bind(Self::normalise_hex(id))
-                    .fetch_optional(&self.pool)
-                    .await?;
-            if let Some(hit) = hit {
-                found.insert(hit);
-            }
+        if coin_ids.is_empty() {
+            return Ok(HashSet::new());
         }
-        Ok(found)
+        let placeholders = std::iter::repeat_n("?", coin_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT coin_id FROM coins WHERE coin_id IN ({placeholders})");
+        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        for id in coin_ids {
+            query = query.bind(Self::normalise_hex(id));
+        }
+        Ok(query.fetch_all(&self.pool).await?.into_iter().collect())
     }
 
     /// Move one staged coin into `coins`, FULLY ATTRIBUTED, and drop its staging row — in one
@@ -1805,13 +1811,36 @@ impl WalletDb {
     /// `asset_id` and `hint` come from the parent spend's own reconstruction, never from the
     /// derivation that discovered the coin. That is the whole content of the proof: the derivation
     /// said where to look, the parent spend says what the coin IS.
+    ///
+    /// # The DELETE comes first, and its row count is the gate
+    ///
+    /// Promotion spans a network round trip: the row is read, a parent spend is fetched, and only
+    /// then is this called. A reorg rollback can delete the staged row inside that window, and
+    /// deleting it is the rollback saying the coin no longer exists at that height. Inserting
+    /// first and deleting afterwards would write a coin the replica had just decided to forget,
+    /// and the delete would then quietly remove nothing.
+    ///
+    /// So the delete runs first and `Ok(false)` is returned when it removed nothing: no staged
+    /// row, no promotion. The whole thing is one transaction, so a concurrent rollback either
+    /// happens entirely before this (the row is gone, and nothing is written) or entirely after
+    /// (the rollback removes the promoted coin by the same predicate).
     pub async fn promote_cat_admission(
         &self,
         row: &StagedCatRow,
         asset_id: &str,
         hint: &str,
-    ) -> sqlx::Result<()> {
+    ) -> sqlx::Result<bool> {
         let mut tx = self.pool.begin().await?;
+        let claimed = sqlx::query("DELETE FROM cat_admission_pending WHERE coin_id = ?")
+            .bind(Self::normalise_hex(&row.coin_id))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if claimed != 1 {
+            // Rolled back underneath us. Nothing to promote, and nothing to undo.
+            tx.rollback().await?;
+            return Ok(false);
+        }
         sqlx::query(
             "INSERT INTO coins
                 (coin_id, parent_coin_info, puzzle_hash, amount, created_height,
@@ -1837,12 +1866,8 @@ impl WalletDb {
         .bind(row.spent_timestamp)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM cat_admission_pending WHERE coin_id = ?")
-            .bind(Self::normalise_hex(&row.coin_id))
-            .execute(&mut *tx)
-            .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Drop a staged coin that a SUCCESSFUL parent read proved is not a unit of the derived asset.
