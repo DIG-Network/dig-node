@@ -600,6 +600,13 @@ enum CollateralCommand {
     /// covers that lock, the overlap while a reclaim is still in flight, and some headroom for the
     /// price rising -- a worst case, not a forecast.
     Buffer {
+        /// How many store roots you serve and must collateralise.
+        ///
+        /// Supplied by you for now: no published node method reports the served set, and the
+        /// nearest-looking one (the hosted-store list) is a different set. Without it the answer
+        /// is UNKNOWN rather than a guess, because a wrong count is a wrong amount of money.
+        #[arg(long)]
+        roots: Option<u64>,
         /// How much $DIG you hold, in DIG (e.g. `12.5`). Without it, the standing is not guessed.
         #[arg(long)]
         balance: Option<String>,
@@ -849,9 +856,13 @@ pub fn run() -> std::process::ExitCode {
             Err(e) => emit_error(&e, action, json),
         },
         Command::Collateral {
-            action: Some(CollateralCommand::Buffer { balance }),
+            action: Some(CollateralCommand::Buffer { roots, balance }),
         } => match parse_dig_amount(balance.as_deref()) {
-            Ok(b) => render(control_cli::collateral_buffer(&config, b), action, json),
+            Ok(b) => render(
+                control_cli::collateral_buffer(&config, roots, b),
+                action,
+                json,
+            ),
             Err(e) => emit_error(&e, action, json),
         },
         Command::Collateral { action: cmd } => match collateral_action(cmd) {
