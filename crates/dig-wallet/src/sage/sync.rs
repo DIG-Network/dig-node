@@ -1401,6 +1401,197 @@ mod tests {
         );
     }
 
+    /// A peer that answers one batch with whatever coin states it was built with, and RECORDS the
+    /// puzzle-hash vector it was asked about.
+    ///
+    /// Recording the request is the half that makes the test two-sided. Asserting only "the coin
+    /// did not enter `coins`" is satisfied identically by a correct split and by a catch-up that
+    /// never asked about the derived hash at all — and the second is the #380 starvation this
+    /// family already fixed once. Coverage and admission must both be observable, or a regression
+    /// can trade one for the other and stay green.
+    struct RecordingPeer {
+        states: Vec<CoinState>,
+        requested: std::sync::Arc<std::sync::Mutex<Vec<Bytes32>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PuzzleStateSource for RecordingPeer {
+        async fn request_puzzle_state(
+            &self,
+            puzzle_hashes: Vec<Bytes32>,
+            _previous_height: Option<u32>,
+            _header_hash: Bytes32,
+        ) -> Result<RespondPuzzleState, SyncError> {
+            *self.requested.lock().unwrap() = puzzle_hashes;
+            Ok(RespondPuzzleState {
+                puzzle_hashes: vec![],
+                coin_states: self.states.clone(),
+                height: 6_000_000,
+                header_hash: Bytes32::new([9; 32]),
+                is_finished: true,
+            })
+        }
+    }
+
+    /// **Proves (dig-node#394, gate finding 1):** the CATCH-UP path routes a derived-hash coin to
+    /// staging, and never into `coins` as XCH — while still ASKING the peer about that hash.
+    ///
+    /// THE BUG THIS PINS. `sync_supervisor.rs` unioned the addresses with the derived CAT hashes
+    /// and passed one vector down; `initial_sync_with_authority` then built the admission set from
+    /// that widened vector, so a coin at any derived hash was admitted and typed `asset_id: None`
+    /// — which means XCH in this schema. One `CREATE_COIN` at `cat_puzzle_hash(victim_p2, asset)`,
+    /// needing only the victim's public address, bought a fabricated XCH balance plus a permanent
+    /// send kill-switch, and the catch-up re-runs on every reconnect.
+    ///
+    /// FIXTURE DESIGN — three things, each load-bearing:
+    ///
+    /// - `derived` is NOT `DerivedCats::default()`. Every pre-existing catch-up test passed the
+    ///   default, and a field every fixture sets to the same value is a field the suite cannot
+    ///   test. That collapse is the entire reason this defect reached a security gate.
+    /// - An ORDINARY p2 coin rides in the same batch, as a truthful control. Without it,
+    ///   `all_coins().len() == 0` would also be satisfied by a catch-up that admitted nothing at
+    ///   all, which is a different bug wearing this one's assertion.
+    /// - The FABRICATED amount is large and the honest one small, so the XCH balance assertion is
+    ///   a concrete figure rather than a symbol that moves with the code under test.
+    #[tokio::test]
+    async fn the_catch_up_never_admits_a_derived_hash_coin_as_xch() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let events = EventBus::default();
+        let owner = Bytes32::new([OWNED; 32]);
+        let asset = Bytes32::new([0xDA; 32]);
+        let derived = DerivedCats::derive(&[owner], &[asset]);
+        let outer = derived.hashes()[0];
+
+        let honest = Coin {
+            parent_coin_info: Bytes32::new([1; 32]),
+            puzzle_hash: owner,
+            amount: 5_000,
+        };
+        // What an attacker places: one CREATE_COIN at the derived hash, for a number the victim
+        // will read as their balance.
+        let fabricated = Coin {
+            parent_coin_info: Bytes32::new([2; 32]),
+            puzzle_hash: outer,
+            amount: 999_999_999,
+        };
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peer = RecordingPeer {
+            states: vec![
+                state(honest, Some(10), None),
+                state(fabricated, Some(10), None),
+            ],
+            requested: std::sync::Arc::clone(&requested),
+        };
+
+        initial_sync_with_authority(
+            &peer,
+            &db,
+            // ADDRESSES ONLY, exactly as the supervisor now passes them.
+            vec![owner],
+            Bytes32::new([0; 32]),
+            "127.0.0.1",
+            &events,
+            WriteAuthority::Operator,
+            &derived,
+        )
+        .await
+        .unwrap();
+
+        // COVERAGE: the peer WAS asked about the derived hash. Drop this and the fix could be
+        // "stop subscribing derived hashes", which re-opens #380's starvation.
+        let asked = requested.lock().unwrap().clone();
+        assert!(
+            asked.contains(&outer),
+            "the catch-up must still ASK about the derived CAT hash: coverage is not admission"
+        );
+        assert!(asked.contains(&owner), "and about the wallet's own address");
+
+        // ADMISSION: the fabricated coin is staged, not believed.
+        let believed = db.all_coins().await.unwrap();
+        assert_eq!(
+            believed.len(),
+            1,
+            "only the ordinary p2 coin may enter `coins` on the catch-up path"
+        );
+        assert_eq!(believed[0].coin_id, hex::encode(honest.coin_id()));
+        assert_eq!(
+            db.staged_cat_admission_count().await.unwrap(),
+            1,
+            "the derived-hash coin must be STAGED, not dropped"
+        );
+
+        // The money figures, pinned concretely. `999_999_999` is the value the gate reproduced as
+        // a fabricated XCH balance against the previous head.
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            5_000,
+            "a coin at a derived CAT hash must never be counted as XCH"
+        );
+        // Selection is largest-first and a fabricated coin is unspendable by anyone, so admitting
+        // one is a permanent XCH send kill-switch, not merely a wrong figure.
+        assert_eq!(
+            db.unspent_coins(None).await.unwrap().len(),
+            1,
+            "and must never become a selectable XCH spend input"
+        );
+    }
+
+    /// **Proves (dig-node#394):** admission cannot be widened THROUGH the address parameter either.
+    ///
+    /// The companion to the test above, and the one that makes the guarantee structural rather
+    /// than a convention. Above, the caller behaves; here the caller misbehaves and hands a
+    /// derived hash in the ADDRESS vector — the exact shape of the defect, one refactor away from
+    /// returning. `initial_sync_with_authority` filters it back out, so there is no vector of any
+    /// kind by which a derived hash reaches the admission set.
+    #[tokio::test]
+    async fn a_derived_hash_offered_as_an_address_is_refused_admission() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let events = EventBus::default();
+        let owner = Bytes32::new([OWNED; 32]);
+        let derived = DerivedCats::derive(&[owner], &[Bytes32::new([0xDA; 32])]);
+        let outer = derived.hashes()[0];
+
+        let fabricated = Coin {
+            parent_coin_info: Bytes32::new([2; 32]),
+            puzzle_hash: outer,
+            amount: 999_999_999,
+        };
+        let peer = RecordingPeer {
+            states: vec![state(fabricated, Some(10), None)],
+            requested: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+
+        initial_sync_with_authority(
+            &peer,
+            &db,
+            // The MISBEHAVING caller: the derived hash smuggled in as an address.
+            vec![owner, outer],
+            Bytes32::new([0; 32]),
+            "127.0.0.1",
+            &events,
+            WriteAuthority::Operator,
+            &derived,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.all_coins().await.unwrap().len(),
+            0,
+            "a derived hash passed as an address must still not admit its coin"
+        );
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            0,
+            "and must contribute nothing to the XCH balance"
+        );
+        assert_eq!(
+            db.staged_cat_admission_count().await.unwrap(),
+            1,
+            "it is staged instead — discovered, not believed"
+        );
+    }
+
     /// A coin at a hash NEITHER set knows is still dropped, exactly as on `main`.
     ///
     /// The control for the test above: staging must widen what the wallet accepts by precisely the
