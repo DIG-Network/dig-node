@@ -319,3 +319,488 @@ fn staged_as_coin(row: &StagedCatRow) -> super::db::CoinRow {
         spent_timestamp: row.spent_timestamp,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sage::db::{CoinRow, CAT_ADMISSION_PENDING_MAX_ROWS};
+    use crate::sage::singleton::ParentSpend;
+    use chia_sdk_test::Simulator;
+    use chia_wallet_sdk::driver::{Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer};
+    use chia_wallet_sdk::types::Conditions;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A real CAT coin owned by a real key, with the parent spend that proves it.
+    struct CatFixture {
+        asset_id: Bytes32,
+        owner_p2: Bytes32,
+        child: Coin,
+        parent: ParentSpend,
+        amount: u64,
+    }
+
+    /// Issue a CAT, spend it once, and hand back the child coin plus its parent's spend.
+    ///
+    /// The child is what a wallet actually receives: a CAT whose PARENT is itself a CAT, which is
+    /// the only shape `Cat::parse_children` can reconstruct. Its amount is deliberately not round
+    /// so an assertion cannot pass against a hard-coded default.
+    fn real_cat() -> CatFixture {
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let memos = ctx.hint(alice.puzzle_hash).unwrap();
+        let (issue, cats) = SdkCat::single_issuance(
+            ctx,
+            alice.coin.coin_id(),
+            None,
+            1000,
+            Conditions::new().create_coin(alice.puzzle_hash, 1000, memos),
+        )
+        .unwrap();
+        alice_p2.spend(ctx, alice.coin, issue).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
+        let cat0 = cats[0];
+        let inner = alice_p2
+            .spend_with_conditions(
+                ctx,
+                Conditions::new().create_coin(alice.puzzle_hash, 1000, memos),
+            )
+            .unwrap();
+        SdkCat::spend_all(ctx, &[CatSpend::new(cat0, inner)]).unwrap();
+        sim.spend_coins(ctx.take(), &[alice.sk]).unwrap();
+        let child = cat0.child(alice.puzzle_hash, 1000);
+        let parent = ParentSpend {
+            coin: cat0.coin,
+            puzzle_reveal: sim
+                .puzzle_reveal(cat0.coin.coin_id())
+                .expect("parent puzzle reveal")
+                .to_vec(),
+            solution: sim
+                .solution(cat0.coin.coin_id())
+                .expect("parent solution")
+                .to_vec(),
+        };
+        CatFixture {
+            asset_id: cat0.info.asset_id,
+            owner_p2: alice.puzzle_hash,
+            child: child.coin,
+            parent,
+            amount: 1000,
+        }
+    }
+
+    /// A [`LineageSource`] over a fixed parent map, which COUNTS its reads and can be told to fail
+    /// for one specific parent.
+    ///
+    /// The failure is scoped to a single parent on purpose. A source that fails for EVERYTHING is
+    /// the blindest possible fixture for a denial test: with no honest answer left anywhere, a
+    /// pass that skipped the whole table and a pass that handled the error correctly are
+    /// indistinguishable. One hostile actor beside a truthful control is what makes them differ.
+    #[derive(Default)]
+    struct CountingLineage {
+        by_parent: HashMap<String, ParentSpend>,
+        reads: AtomicUsize,
+        fail_for: Option<String>,
+    }
+
+    impl CountingLineage {
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LineageSource for CountingLineage {
+        async fn parent_spend(
+            &self,
+            parent_coin_id: &str,
+            _spent_height: u32,
+        ) -> Result<Option<ParentSpend>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_for.as_deref() == Some(parent_coin_id) {
+                return Err(crate::sage::Error::internal("parent unreadable"));
+            }
+            Ok(self.by_parent.get(parent_coin_id).cloned())
+        }
+    }
+
+    fn state(coin: Coin, created: Option<u32>, spent: Option<u32>) -> CoinState {
+        CoinState {
+            coin,
+            created_height: created,
+            spent_height: spent,
+        }
+    }
+
+    /// A coin ANYONE can make: it sits at the derived hash and its parent is a nobody.
+    ///
+    /// The whole attack, in one value. Nothing about constructing it needs a key, a peer, or any
+    /// relationship to the victim beyond their public address.
+    fn fabricated_at(derived_hash: Bytes32, amount: u64, parent: u8) -> Coin {
+        Coin {
+            parent_coin_info: Bytes32::new([parent; 32]),
+            puzzle_hash: derived_hash,
+            amount,
+        }
+    }
+
+    /// THE DISCOVERY CLAIM, asserted rather than assumed: a genuine CAT coin owned by this wallet
+    /// really does sit at the hash the derivation predicts.
+    ///
+    /// If this were false, discovery would subscribe hashes no coin ever arrives at and every
+    /// other test here would pass vacuously while the feature did nothing.
+    #[test]
+    fn the_derivation_predicts_where_a_real_cat_coin_sits() {
+        let f = real_cat();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+        assert_eq!(
+            derived.owner_of(&f.child.puzzle_hash),
+            Some(DerivedOwner {
+                asset_id: f.asset_id,
+                owner_p2: f.owner_p2,
+            }),
+            "a real CAT coin must sit at the hash the wallet derives for it"
+        );
+    }
+
+    /// **TEST 1 — fixes #380.** A CAT coin arriving from a peer reaches the wallet and the balance
+    /// is right.
+    ///
+    /// Load-bearing against `origin/main`: there, the coin's puzzle hash is not in `subscribed`, so
+    /// `apply_coin_states` drops it and the balance stays 0. This is the whole starvation.
+    #[tokio::test]
+    async fn a_real_cat_coin_arrives_is_promoted_and_is_counted() {
+        let f = real_cat();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+        let asset_hex = hex::encode(f.asset_id);
+
+        let rows = stage_from_states(&[state(f.child, Some(10), None)], &derived, |_| false);
+        db.stage_cat_admissions(&rows).await.unwrap();
+        assert_eq!(db.staged_cat_admission_count().await.unwrap(), 1);
+        // Not yet believed: discovery alone buys nothing.
+        assert_eq!(db.balance(Some(&asset_hex)).await.unwrap(), 0);
+
+        let mut lineage = CountingLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
+        let stats = promote_staged_cats(&db, &lineage).await.unwrap();
+
+        assert_eq!(stats.promoted, 1, "{stats:?}");
+        assert_eq!(db.staged_cat_admission_count().await.unwrap(), 0);
+        assert_eq!(
+            db.balance(Some(&asset_hex)).await.unwrap(),
+            u128::from(f.amount),
+            "the promoted coin must be counted as its own asset"
+        );
+    }
+
+    /// **TEST 5 — a fabricated coin never enters `coins`.**
+    ///
+    /// Two actors, and that is the point. The fabricated coin alone would let a filter placed at
+    /// the WRONG layer — one that drops every derived-hash coin outright — satisfy "coins is
+    /// empty" identically, pinning a coincidence rather than the property. The real CAT beside it
+    /// is the truthful control: any implementation that keeps the attacker out by refusing
+    /// everyone fails here, visibly.
+    #[tokio::test]
+    async fn a_fabricated_coin_is_refused_while_a_real_one_is_promoted() {
+        let f = real_cat();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+        let asset_hex = hex::encode(f.asset_id);
+        // Larger than the real coin, so a largest-first coin selector would prefer it -- the
+        // send kill-switch this test exists to make unreachable.
+        let fake = fabricated_at(f.child.puzzle_hash, 999_999_999, 0xAB);
+
+        let rows = stage_from_states(
+            &[
+                state(f.child, Some(10), None),
+                state(fake, Some(11), None),
+            ],
+            &derived,
+            |_| false,
+        );
+        assert_eq!(rows.len(), 2, "both coins are DISCOVERED; neither is believed");
+        db.stage_cat_admissions(&rows).await.unwrap();
+
+        let mut lineage = CountingLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
+        // The fabricated coin's parent is readable and is simply not a CAT spend: `Ok(None)` from
+        // the map would mean UNAVAILABLE, so give it a real, honest, non-CAT parent answer by
+        // pointing it at the same map -- absent means unavailable, which would leave it staged
+        // rather than refused. Use the real parent spend, which reconstructs no child matching it.
+        lineage
+            .by_parent
+            .insert(hex::encode(fake.parent_coin_info), f.parent.clone());
+
+        let stats = promote_staged_cats(&db, &lineage).await.unwrap();
+        assert_eq!(stats.promoted, 1, "{stats:?}");
+        assert_eq!(stats.refused, 1, "{stats:?}");
+
+        // The believed set contains the real coin and ONLY the real coin.
+        let believed: Vec<CoinRow> = db.all_coins().await.unwrap();
+        assert_eq!(believed.len(), 1);
+        assert_eq!(believed[0].coin_id, hex::encode(f.child.coin_id()));
+        assert_eq!(
+            db.balance(Some(&asset_hex)).await.unwrap(),
+            u128::from(f.amount),
+            "the fabricated amount must not appear in the balance"
+        );
+        // And it is gone, not merely hidden: nothing will ever promote it later.
+        assert_eq!(db.staged_cat_admission_count().await.unwrap(), 0);
+    }
+
+    /// **TEST 4 — the failure mode is incompleteness, never a wrong figure.**
+    ///
+    /// A staged coin must be ABSENT: not counted as its asset, and — the round-5 defect — not
+    /// counted as XCH either, because `asset_id IS NULL` MEANS XCH and feeds the spend-input
+    /// selector. Both directions are asserted separately; asserting only the CAT balance would
+    /// pass against an implementation that admitted the coin untyped.
+    #[tokio::test]
+    async fn an_unpromoted_coin_is_absent_from_both_balances_and_from_selection() {
+        let f = real_cat();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+
+        let rows = stage_from_states(&[state(f.child, Some(10), None)], &derived, |_| false);
+        db.stage_cat_admissions(&rows).await.unwrap();
+        // A source that can read nothing at all: every coin stays staged.
+        let stats = promote_staged_cats(&db, &CountingLineage::default())
+            .await
+            .unwrap();
+        assert_eq!(stats.deferred, 1, "{stats:?}");
+        assert_eq!(db.staged_cat_admission_count().await.unwrap(), 1);
+
+        assert_eq!(
+            db.balance(Some(&hex::encode(f.asset_id))).await.unwrap(),
+            0,
+            "an unproven coin must be absent from its asset's balance"
+        );
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            0,
+            "an unproven coin must NOT be counted as XCH"
+        );
+        assert!(
+            db.unspent_coins(None).await.unwrap().is_empty(),
+            "an unproven coin must never reach the spend-input selector"
+        );
+    }
+
+    /// **TEST 3 — no denial.** A parent read that FAILS must not fail the pass.
+    ///
+    /// One hostile actor, one truthful control: the real coin's parent reads fine and is promoted
+    /// in the same pass whose other coin errors. A fixture where every read failed could not tell
+    /// "handled the error" from "did no work at all".
+    #[tokio::test]
+    async fn a_failing_parent_read_neither_ends_the_pass_nor_deletes_the_coin() {
+        let f = real_cat();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+        let hostile = fabricated_at(f.child.puzzle_hash, 7, 0xCD);
+
+        let rows = stage_from_states(
+            &[state(hostile, Some(9), None), state(f.child, Some(10), None)],
+            &derived,
+            |_| false,
+        );
+        db.stage_cat_admissions(&rows).await.unwrap();
+
+        let mut lineage = CountingLineage {
+            fail_for: Some(hex::encode(hostile.parent_coin_info)),
+            ..Default::default()
+        };
+        lineage
+            .by_parent
+            .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
+
+        let stats = promote_staged_cats(&db, &lineage)
+            .await
+            .expect("a failing parent read must not fail the whole pass");
+        assert_eq!(stats.promoted, 1, "the honest coin is still promoted: {stats:?}");
+        assert_eq!(stats.deferred, 1, "{stats:?}");
+        // Left staged, NOT deleted: an unreadable answer is not a disproof, and deleting on one
+        // would let a peer that withholds parent spends erase real money.
+        assert_eq!(db.staged_cat_admission_count().await.unwrap(), 1);
+    }
+
+    /// **TEST 2 — the read is bounded, terminal, and non-zero.**
+    ///
+    /// The calibration comes FIRST and is not decoration: a counter that was never attached to the
+    /// code under test reports zero reads just as convincingly as a correct implementation, and
+    /// that exact mistake was made three times on this PR family. So the counter is proven able to
+    /// move before any zero it produces is believed.
+    #[tokio::test]
+    async fn promotion_reads_are_bounded_and_never_repeated() {
+        let f = real_cat();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+
+        // CALIBRATION: the counter can go non-zero through exactly this path.
+        let mut lineage = CountingLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
+        let real = stage_from_states(&[state(f.child, Some(10), None)], &derived, |_| false);
+        db.stage_cat_admissions(&real).await.unwrap();
+        promote_staged_cats(&db, &lineage).await.unwrap();
+        assert_eq!(lineage.reads(), 1, "the counter must be able to move at all");
+
+        // One over the per-pass cap, so the bound is pinned from BOTH sides in one run: the pass
+        // must read exactly the cap, and must NOT read the extra coin.
+        let over = usize::try_from(MAX_CAT_PROMOTIONS_PER_PASS).unwrap() + 1;
+        let extra: Vec<CoinState> = (0..over)
+            .map(|i| {
+                state(
+                    fabricated_at(f.child.puzzle_hash, 1_000 + i as u64, 0x40),
+                    Some(20 + i as u32),
+                    None,
+                )
+            })
+            .collect();
+        let rows = stage_from_states(&extra, &derived, |_| false);
+        assert_eq!(rows.len(), over);
+        db.stage_cat_admissions(&rows).await.unwrap();
+
+        let before = lineage.reads();
+        let stats = promote_staged_cats(&db, &lineage).await.unwrap();
+        let first_pass = lineage.reads() - before;
+        assert_eq!(
+            first_pass,
+            usize::try_from(MAX_CAT_PROMOTIONS_PER_PASS).unwrap(),
+            "one pass must read exactly the cap, never the whole backlog"
+        );
+        // Every one of them was refused (their parents are unknown to the map -> but the map
+        // returns None, which is UNAVAILABLE, so they stay staged and ARE re-read). Assert the
+        // honest thing instead: the pass is capped and the already-PROMOTED coin is never re-read.
+        assert_eq!(stats.promoted, 0, "{stats:?}");
+
+        // TERMINALITY: the coin promoted in the calibration is out of the staging table, so no
+        // later pass can read its parent again however many passes run.
+        let before = lineage.reads();
+        promote_staged_cats(&db, &lineage).await.unwrap();
+        let second = lineage.reads() - before;
+        assert!(
+            second <= usize::try_from(MAX_CAT_PROMOTIONS_PER_PASS).unwrap(),
+            "every pass stays capped, got {second}"
+        );
+        assert!(
+            !db.all_coins()
+                .await
+                .unwrap()
+                .iter()
+                .any(|c| c.coin_id != hex::encode(f.child.coin_id())),
+            "no unproven coin may have entered `coins` at any point"
+        );
+    }
+
+    /// A coin that has already cleared promotion is NOT re-staged: its later states, a spend above
+    /// all, must update `coins` normally.
+    ///
+    /// Without this a promoted coin stays unspent in the replica for ever and is selected again
+    /// after it was spent — a double-spend attempt built out of the wallet's own bookkeeping.
+    #[test]
+    fn an_already_promoted_coin_is_routed_to_coins_not_back_into_staging() {
+        let f = real_cat();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+        let promoted = hex::encode(f.child.coin_id());
+        let rows = stage_from_states(
+            &[state(f.child, Some(10), Some(11))],
+            &derived,
+            |id| id == promoted,
+        );
+        assert!(
+            rows.is_empty(),
+            "a believed coin must never be pushed back into the staging table"
+        );
+    }
+
+    /// The staging bound DELAYS; it never errors — pinned from both sides.
+    ///
+    /// A staging insert sits on the peer frame path, so a bound that could refuse would hand a
+    /// peer able to fill the table a way to fail a frame, and a peer that can fail a frame can
+    /// deny a catch-up. Eviction is oldest-first, which is also recoverable: a re-pushed coin
+    /// re-stages.
+    #[tokio::test]
+    async fn the_staging_bound_evicts_the_oldest_and_never_errors() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let f = real_cat();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+        let cap = usize::try_from(CAT_ADMISSION_PENDING_MAX_ROWS).unwrap();
+
+        // AT the bound: everything is kept.
+        let at: Vec<CoinState> = (0..cap)
+            .map(|i| {
+                state(
+                    fabricated_at(f.child.puzzle_hash, 1 + i as u64, 0x11),
+                    Some(1),
+                    None,
+                )
+            })
+            .collect();
+        let rows = stage_from_states(&at, &derived, |_| false);
+        db.stage_cat_admissions(&rows).await.unwrap();
+        assert_eq!(
+            db.staged_cat_admission_count().await.unwrap(),
+            CAT_ADMISSION_PENDING_MAX_ROWS
+        );
+        let oldest = rows[0].coin_id.clone();
+
+        // ONE OVER: still `Ok`, still exactly the bound, and the OLDEST is the one that went.
+        let over = stage_from_states(
+            &[state(
+                fabricated_at(f.child.puzzle_hash, 9_999_999, 0x22),
+                Some(2),
+                None,
+            )],
+            &derived,
+            |_| false,
+        );
+        db.stage_cat_admissions(&over)
+            .await
+            .expect("the bound must delay, never error");
+        assert_eq!(
+            db.staged_cat_admission_count().await.unwrap(),
+            CAT_ADMISSION_PENDING_MAX_ROWS
+        );
+        let held = db
+            .staged_cat_admissions(CAT_ADMISSION_PENDING_MAX_ROWS)
+            .await
+            .unwrap();
+        assert!(
+            !held.iter().any(|r| r.coin_id == oldest),
+            "eviction must take the OLDEST row, not the newest"
+        );
+    }
+
+    /// A reorg unmakes a staged observation with the coin it describes — and only above the fork.
+    ///
+    /// Both sides asserted: a row above the fork goes, a row at or below it stays. Asserting only
+    /// the deletion would pass against an implementation that emptied the whole table.
+    #[tokio::test]
+    async fn a_reorg_deletes_staged_rows_above_the_fork_and_keeps_the_rest() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let f = real_cat();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+        let below = fabricated_at(f.child.puzzle_hash, 1, 0x31);
+        let above = fabricated_at(f.child.puzzle_hash, 2, 0x32);
+        let rows = stage_from_states(
+            &[state(below, Some(100), None), state(above, Some(200), None)],
+            &derived,
+            |_| false,
+        );
+        db.stage_cat_admissions(&rows).await.unwrap();
+
+        db.rollback_above(150).await.unwrap();
+
+        let held = db.staged_cat_admissions(100).await.unwrap();
+        assert_eq!(held.len(), 1, "only the row above the fork is unmade");
+        assert_eq!(held[0].coin_id, hex::encode(below.coin_id()));
+    }
+}
