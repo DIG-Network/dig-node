@@ -714,8 +714,6 @@ fn summarize(method: &str, result: &Value) -> String {
     }
 }
 
-
-
 /// `dign collateral buffer` — how much $DIG to hold, and whether this operator is short.
 ///
 /// Composed from three control reads rather than served by one method, because each of the three
@@ -727,7 +725,10 @@ fn summarize(method: &str, result: &Value) -> String {
 /// $DIG, and inventing one would be worse than asking: a balance read of the wrong address returns
 /// a confident number about the wrong money. With no `--balance` the advice reports what it costs
 /// and says the standing is UNKNOWN, which is the honest answer and raises no alarm.
-pub fn collateral_buffer(config: &Config, balance_dig_base_units: Option<u64>) -> std::io::Result<Outcome> {
+pub fn collateral_buffer(
+    config: &Config,
+    balance_dig_base_units: Option<u64>,
+) -> std::io::Result<Outcome> {
     use crate::collateral::{buffer_advice, format_dig, FundingState};
 
     let requirement_json = call_control(
@@ -797,38 +798,42 @@ pub fn collateral_buffer(config: &Config, balance_dig_base_units: Option<u64>) -
     // The number a person acts on goes LAST, where the eye lands, and it is an amount rather than
     // an adjective: "balance low" is not actionable, "add 3.250 DIG" is.
     summary.push_str("\n  ");
-    summary.push_str(&match (advice.state, advice.shortfall_to_recommended_dig_base_units) {
-        (FundingState::Unknown, _) => {
-            "holding UNKNOWN — pass --balance <DIG> to see where you stand".to_string()
-        }
-        (FundingState::ShortNow, Some(short)) => format!(
-            "SHORT NOW — you cannot cover this epoch; stores are going uncollateralised. \
+    summary.push_str(
+        &match (advice.state, advice.shortfall_to_recommended_dig_base_units) {
+            (FundingState::Unknown, _) => {
+                "holding UNKNOWN — pass --balance <DIG> to see where you stand".to_string()
+            }
+            (FundingState::ShortNow, Some(short)) => format!(
+                "SHORT NOW — you cannot cover this epoch; stores are going uncollateralised. \
              Add at least {} DIG now, {} DIG to reach the recommendation.",
-            format_dig(
-                advice
-                    .one_epoch_lock_dig_base_units
-                    .saturating_sub(advice.balance_dig_base_units.unwrap_or(0))
+                format_dig(
+                    advice
+                        .one_epoch_lock_dig_base_units
+                        .saturating_sub(advice.balance_dig_base_units.unwrap_or(0))
+                ),
+                format_dig(short),
             ),
-            format_dig(short),
-        ),
-        (FundingState::DangerouslyLow, Some(short)) => format!(
-            "DANGEROUSLY LOW — this epoch is covered, but a rise at the ceiling would not be. \
+            (FundingState::DangerouslyLow, Some(short)) => format!(
+                "DANGEROUSLY LOW — this epoch is covered, but a rise at the ceiling would not be. \
              Add {} DIG to reach the recommendation.",
-            format_dig(short),
-        ),
-        (FundingState::BelowRecommendedBuffer, Some(short)) => format!(
-            "below the recommended buffer — fine for now, no cushion. Add {} DIG to reach it.",
-            format_dig(short),
-        ),
-        // Nothing to collateralise is NOT the same sentence as "your funding is sufficient", even
-        // though the arithmetic agrees. Saying "funded" to an operator hosting nothing implies
-        // their stores are covered, and they have none.
-        (FundingState::Adequate, _) if advice.pairs == 0 => {
-            "no store advertisements to collateralise yet — nothing to fund.".to_string()
-        }
-        (FundingState::Adequate, _) => "funded — at or above the recommended buffer.".to_string(),
-        (_, None) => "holding UNKNOWN".to_string(),
-    });
+                format_dig(short),
+            ),
+            (FundingState::BelowRecommendedBuffer, Some(short)) => format!(
+                "below the recommended buffer — fine for now, no cushion. Add {} DIG to reach it.",
+                format_dig(short),
+            ),
+            // Nothing to collateralise is NOT the same sentence as "your funding is sufficient", even
+            // though the arithmetic agrees. Saying "funded" to an operator hosting nothing implies
+            // their stores are covered, and they have none.
+            (FundingState::Adequate, _) if advice.pairs == 0 => {
+                "no store advertisements to collateralise yet — nothing to fund.".to_string()
+            }
+            (FundingState::Adequate, _) => {
+                "funded — at or above the recommended buffer.".to_string()
+            }
+            (_, None) => "holding UNKNOWN".to_string(),
+        },
+    );
 
     Ok(Outcome::new(
         summary,
@@ -861,10 +866,7 @@ fn summarize_collateral_requirement(result: &Value) -> String {
                 "the record for this epoch could not be read",
                 "re-run the census for this epoch",
             ),
-            "no_chain_source" => (
-                "this node cannot see the chain",
-                "configure a chain source",
-            ),
+            "no_chain_source" => ("this node cannot see the chain", "configure a chain source"),
             other => (other, "unknown"),
         };
         // Emphatically NOT "0 DIG". An absent requirement rendered as a zero cost is the money lie
@@ -872,9 +874,7 @@ fn summarize_collateral_requirement(result: &Value) -> String {
         return format!("collateral requirement UNKNOWN — {reason} · {remedy}");
     }
 
-    let dig = |key: &str| {
-        crate::collateral::format_dig(result[key].as_u64().unwrap_or(0))
-    };
+    let dig = |key: &str| crate::collateral::format_dig(result[key].as_u64().unwrap_or(0));
     let multiplier = result["multiplier_micros"].as_u64().unwrap_or(0);
     format!(
         "epoch {} (protocol v{}) — {} DIG per store, before any safety margin\n  \

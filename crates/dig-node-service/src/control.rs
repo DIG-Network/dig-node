@@ -3260,9 +3260,8 @@ fn current_collateral_epoch(ctx: &ControlCtx) -> crate::collateral::CurrentEpoch
 /// every node derives identically, and returning the margined amount would make this operator's
 /// preference look like the network's price.
 fn collateral_requirement(ctx: &ControlCtx, id: Value) -> Value {
-    let store = crate::collateral::EpochRecordStore::at(
-        ctx.state_dir.join("collateral-epochs.jsonl"),
-    );
+    let store =
+        crate::collateral::EpochRecordStore::at(ctx.state_dir.join("collateral-epochs.jsonl"));
     let answer = crate::collateral::requirement(&store, current_collateral_epoch(ctx));
     match serde_json::to_value(&answer) {
         Ok(v) => control_ok(id, v),

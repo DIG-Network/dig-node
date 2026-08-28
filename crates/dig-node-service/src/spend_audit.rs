@@ -1665,7 +1665,10 @@ mod tests {
                 return (seen, requests);
             }
             after = SpendLog::cursor_of(&ledger);
-            assert!(after.is_some(), "an incomplete page must hand back a cursor");
+            assert!(
+                after.is_some(),
+                "an incomplete page must hand back a cursor"
+            );
             assert!(requests < 20, "walk did not terminate");
         }
     }
@@ -1678,7 +1681,10 @@ mod tests {
         // (d, e, f). A descending-id tiebreak would give c,b and f,e,d and is the nearest wrong
         // implementation this ordering has.
         assert_eq!(
-            all.records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            all.records
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
             ["a", "b", "c", "d", "e", "f"]
         );
     }
@@ -1690,7 +1696,10 @@ mod tests {
         // time-based cursor loses or repeats a row. A page size of 6 would see nothing.
         let (seen, requests) = walk(&log, 2);
         assert_eq!(seen, ["a", "b", "c", "d", "e", "f"]);
-        assert!(requests > 1, "page size 2 over 6 rows must take several requests");
+        assert!(
+            requests > 1,
+            "page size 2 over 6 rows must take several requests"
+        );
         // And an odd page size, so the last page is PARTIAL rather than exactly full.
         assert_eq!(walk(&log, 4).0, ["a", "b", "c", "d", "e", "f"]);
     }
@@ -1718,7 +1727,10 @@ mod tests {
             })
             .expect("second");
         assert_eq!(second.records.len(), 3);
-        assert!(second.complete, "an exactly-full LAST page is still complete");
+        assert!(
+            second.complete,
+            "an exactly-full LAST page is still complete"
+        );
         assert_eq!(walk(&log, 3).1, 2, "the walk must stop after two requests");
     }
 
@@ -1766,7 +1778,10 @@ mod tests {
             })
             .expect("filtered page");
         assert_eq!(
-            page.records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            page.records
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
             ["f"]
         );
         assert!(page.complete);
@@ -1814,5 +1829,4 @@ mod tests {
         assert_eq!(page.unreadable_lines, 2);
         assert!(!page.complete);
     }
-
 }

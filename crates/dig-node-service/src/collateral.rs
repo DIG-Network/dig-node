@@ -487,7 +487,9 @@ pub fn format_dig(base_units: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dig_mirror_collateral::{base_per_store, handicap_for_owners, required_per_store, EpochCensus};
+    use dig_mirror_collateral::{
+        base_per_store, handicap_for_owners, required_per_store, EpochCensus,
+    };
 
     /// A record with independently-chosen fields.
     ///
@@ -586,8 +588,14 @@ mod tests {
         };
         // An epoch the node holds no record for is NOT the same as having no chain to look at,
         // and neither is the same as waiting for finality. The remedies differ, so the tokens must.
-        assert_eq!(reason(CurrentEpoch::Final(4)), CollateralUnknownReason::NotCensused);
-        assert_eq!(reason(CurrentEpoch::NotCensused), CollateralUnknownReason::NotCensused);
+        assert_eq!(
+            reason(CurrentEpoch::Final(4)),
+            CollateralUnknownReason::NotCensused
+        );
+        assert_eq!(
+            reason(CurrentEpoch::NotCensused),
+            CollateralUnknownReason::NotCensused
+        );
         assert_eq!(
             reason(CurrentEpoch::BehindFinalityDepth),
             CollateralUnknownReason::BehindFinalityDepth
@@ -629,7 +637,6 @@ mod tests {
         assert_eq!(store.get(6), StoredEpoch::Absent);
     }
 
-
     #[test]
     fn the_census_marker_is_read_and_a_bad_one_is_not_a_guess() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -638,8 +645,12 @@ mod tests {
 
         // A real marker, at a value that is not 1 -- a fixture pinned at the bootstrap epoch could
         // not tell a parsed number from a hard-coded one.
-        std::fs::write(dir.path().join(CURRENT_EPOCH_FILE), "42
-").expect("write");
+        std::fs::write(
+            dir.path().join(CURRENT_EPOCH_FILE),
+            "42
+",
+        )
+        .expect("write");
         assert_eq!(current_epoch_from(dir.path()), CurrentEpoch::Final(42));
 
         // The epoch is ONE-based, so zero is malformed rather than an epoch, and neither it nor a
@@ -665,8 +676,8 @@ mod tests {
         let store = store_at(dir.path());
         store.put(&record(12, 800_000, 750, 31)).expect("put");
 
-        let wire = serde_json::to_value(requirement(&store, CurrentEpoch::Final(12)))
-            .expect("serialise");
+        let wire =
+            serde_json::to_value(requirement(&store, CurrentEpoch::Final(12))).expect("serialise");
         assert_eq!(wire["state"], "known");
         assert_eq!(wire["epoch"], 12);
         assert_eq!(wire["protocol_version"], 1);

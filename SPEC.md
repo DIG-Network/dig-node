@@ -7364,3 +7364,144 @@ the node is stopped or wedged.
 Every verb offers `--json` beside the human output, with stable field names (§6.2). The JSON listing is
 `{ path, count, unreadable_lines, spends[] }`, and each spend carries its raw fields plus `status_token`
 and `chain_reference`.
+
+## 24. Mirror-coin collateral — the requirement, the local margin, and the funding advice (dig_ecosystem#3173)
+
+An advertisement qualifies for an epoch only if it posts that epoch's **collateral**. This section is the
+contract for what the node reports about it. It governs three control methods and three `dign` verbs.
+
+**Every figure MUST come from `dig-mirror-collateral`.** The node MUST NOT restate the model's
+arithmetic. `required_per_store` is the WHOLE answer: `equilibrium × multiplier − handicap` omits the
+floor clamp, and a re-derivation that omitted it would understate what an advertisement must post.
+`apply_safety_margin` rounds UP, and a re-derivation that rounded down would post a base unit short of
+qualifying. A second implementation of either is a money-path drift bug.
+
+**Units.** Every amount is **DIG base units**: `1 DIG = 1_000`, smallest amount `0.001 DIG`. They are
+never mojos — a mojo is XCH's base unit, `1e-12 XCH`, nine orders of magnitude away. The two units MUST
+NOT appear in one expression.
+
+### 24.1. The requirement is CONSENSUS; the margin is LOCAL. They are never one value
+
+`control.collateral.requirement` returns the **pre-margin** per-store requirement, which every node
+derives identically. It MUST NOT include the local safety margin, and the margin MUST NOT be reachable
+from it: returning the margined amount would present one operator's private preference as the network's
+price. The margin is served separately by `control.collateral.margin.get` / `.set`.
+
+The census inputs — `stores`, `owners`, `multiplier_micros`, `handicap_dig_base_units` — travel WITH the
+figure. A client holding only the number can say the price moved; a client holding the inputs can say
+why. `stores` counts qualifying `(owner, store, root)` **advertisements**, never nodes; `owners` counts
+distinct owner puzzle hashes and a surface displaying it MUST say "collateralised owners".
+
+`protocol_version` is the version that **computed** the epoch, read from the record — never the newest
+version the build implements. The two differ exactly when a node has upgraded mid-schedule, which is the
+one case where a client needs the difference.
+
+### 24.2. UNKNOWN is a first-class answer, and it is never a zero
+
+A node that cannot state the requirement MUST return `state: "unknown"` with a `reason`, and MUST NOT
+return a zero, a stale epoch's figure presented as this epoch's, or an error a client would render as
+"no collateral required". Under-posting costs the operator that epoch's rewards.
+
+The reasons are distinct because their remedies differ:
+
+| `reason` | meaning | remedy |
+|---|---|---|
+| `not_censused` | this node holds no record for the epoch | run the census |
+| `behind_finality_depth` | the epoch's inputs are not final | wait for the chain to settle |
+| `record_unreadable` | a record exists and could not be read | re-run the census for the epoch |
+| `no_chain_source` | the node cannot see the chain | configure a chain source |
+
+Collapsing them into one "unavailable" hands every client the same unactionable sentence.
+
+**A record the node never wrote and one it wrote and cannot read are different answers**
+(`not_censused` vs `record_unreadable`).
+
+### 24.3. The epoch is named by the CENSUS, never derived from the clock
+
+The collateral epoch schedule is a consensus fact anchored on chain. The node MUST NOT derive the current
+epoch from its own clock: a guess posts against the wrong epoch. The census records the epoch it settled
+on, and the requirement reader reads that. An absent or malformed marker is `not_censused`; the epoch is
+**one-based**, so a zero is malformed rather than an epoch.
+
+Keeping the marker current is the **census's** obligation. The epoch number travels with every answer so
+that a marker left behind by a stopped census is at least VISIBLE to a client rather than silent.
+
+### 24.4. The safety margin
+
+Basis points, always — `100` is `+1%`. Never a percentage and never a float: a 1 bp margin (`0.01%`) is a
+legal choice and any conversion to whole percent would erase it.
+
+* A stored configuration that **predates** the field MUST load as `DEFAULT_SAFETY_MARGIN_BP` (`100`),
+  never `0`. A zero margin is a deliberate choice to post the requirement exactly; reporting it for a
+  configuration that never expressed one tells the operator they declined a cushion they were never
+  offered.
+* `.set` MUST **persist** the value, so it survives a restart. A margin that lapsed to the default on
+  reboot would silently change what the node posts, so a failed write MUST NOT be reported as a success.
+* A value above `MAX_SAFETY_MARGIN_BP` (`10_000`, i.e. `+100%`) is **REFUSED, never clamped**, and `.set`
+  returns what was actually stored. Clamping and returning the clamped value would leave the caller's
+  stored intent and the node's behaviour disagreeing on the money path.
+* The node is the **authoritative home** for the setting: the flywheel is headless, so a machine with no
+  GUI MUST be able to set it. dig-app is a remote control for the same value.
+
+### 24.5. The funding advice — how much to hold, and the three states
+
+**Collateral is RECLAIMED, not spent.** Each pass creates the coins for `(store, root, epoch n)` and
+reclaims epoch `n−1`; reclaims run FIRST and are never gated on funds, so returned collateral funds the
+creates behind it. **The steady state is roughly ONE epoch's lock, not one per epoch.** A recommendation
+of "requirement × epochs of runway" overstates the answer by the epoch count and tells an operator to
+hold many times what they need.
+
+The recommendation therefore covers the current epoch's lock plus the **transition overlap** — epoch `n`
+existing before `n−1` is reclaimed, or a reclaim delayed or failed — with the next epoch allowed to have
+escalated:
+
+```
+lock        = pairs × apply_safety_margin(required_per_store, margin_bp)
+recommended = lock + lock × (1 + 1/UP_STEP_DENOM)^HORIZON
+```
+
+Escalation **compounds** (`UP_STEP_DENOM = 8`, so at most `+12.5%` per epoch): 1 epoch `1.12×`, 2
+`1.27×`, 4 `1.60×`, 8 `2.57×`, 13 `4.62×`. The horizon is therefore a CHOICE and MUST be reported with
+the figure. The node uses **4 epochs**; a horizon demanding several times the current lock is advice
+nobody acts on. The ceiling is a **worst case, not a forecast** — inside the controller's dead band the
+multiplier does not move at all, and a surface MUST say so.
+
+The three states, of which only two may notify:
+
+| state | meaning | notifies? |
+|---|---|---|
+| `short_now` | cannot cover the current epoch; stores are already uncollateralised | **yes** |
+| `dangerously_low` | covers now; could not cover the next epoch at the escalation ceiling | **yes** |
+| `below_recommended_buffer` | fine for several epochs, no cushion | **NO — readout only** |
+| `adequate` | at or above the recommendation | no |
+| `unknown` | a required fact is missing | **NO** |
+
+`below_recommended_buffer` MUST NOT raise a notification. A healthy node sits there much of the time, and
+a recurring alert an operator learns to dismiss teaches them to dismiss the two that matter.
+
+### 24.6. Never answer an unknown with a reassuring number
+
+If the node cannot determine its requirement, its served-advertisement count, or the operator's balance,
+the state is `unknown`. It MUST NOT be a zero and MUST NOT be an alarm.
+
+This is a live hazard rather than a theoretical one, because **an unknown and a genuine zero produce
+identical arithmetic**: an unreadable hosted-store list read as zero advertisements yields a `0.000 DIG`
+recommendation that every balance clears, so a node that could not tell how much it owes would report
+"funded". A surface MUST distinguish "nothing to collateralise" from "your funding is sufficient" for the
+same reason.
+
+A malformed operator-supplied balance is REFUSED, never parsed as zero, which would report `short_now`
+over a typo. Amounts are scaled by integer arithmetic: `0.001 DIG` steps are where an `f64` starts
+rounding, and a rounded figure about somebody's money is the lie this section exists to prevent.
+
+### 24.7. The `dign` verbs
+
+* `collateral requirement` — §24.1/§24.2. Prints the reason and its remedy on `unknown`, never a zero.
+* `collateral margin [set <tight|default|generous|BP>]` — §24.4. A preset resolves to
+  `dig-mirror-collateral`'s own constant, never to a number spelled out in the CLI; a second spelling is
+  how two surfaces post different amounts for one choice. An unrecognised word is REFUSED, never treated
+  as the default.
+* `collateral buffer [--balance <DIG>]` — §24.5/§24.6. States an AMOUNT to add, not an adjective, and
+  shows the working: advertisements served, per-store requirement, margin, and the horizon used.
+
+Every verb offers `--json` beside the human output, with stable field names (§6.2).
