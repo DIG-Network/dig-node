@@ -5405,50 +5405,97 @@ The sync loop runs this attribution as a post-apply step (`sync::CatAttributor`,
 newly-synced candidate coins, so a synced CAT coin — stored initially with `asset_id: None` — gains its
 TAIL and surfaces in `get_cats` (this is how `$DIG` resolves from the node).
 
-18.11a. **CAT discovery is not CAT authenticity — staged admission (#380).** A `CoinState` carries a
+18.11a. **CAT discovery is not CAT authenticity — staged admission (#380, #394).** A `CoinState` carries a
 parent, a puzzle hash and an amount, and **no hint**, so a wallet cannot recognise its own CAT coins from
 the frame that delivers them. The node therefore DERIVES, for each address it follows and each asset id it
-knows, the outer hash `cat_puzzle_hash(owner_p2, asset_id)`, and subscribes those hashes alongside the
+knows, the outer hash `cat_puzzle_hash(owner_p2, asset_id)`, and REQUESTS those hashes alongside the
 addresses. Without this the peer never sends the wallet its CAT coins at all: a CAT coin does not sit at
 its owner's address.
 
-Subscribing a derived hash is **discovery** and MUST NOT be read as ownership of that asset. The
+Requesting a derived hash is **discovery** and MUST NOT be read as ownership of that asset. The
 derivation is injective — it commits to the CAT2 module, the asset id and the inner p2 together — but it
 establishes only *"if this coin is ever spent, only this wallet can spend it, as this asset"*. It does
 NOT establish that the coin is a unit of that asset, because `CREATE_COIN` is unconstrained in its
 destination: anybody may place a coin at any puzzle hash, at a cost of one mojo per displayed base unit,
-knowing nothing but the victim's public address.
+knowing nothing but the victim's public address. The same is true of a coin's HINT, which is likewise
+chosen freely by whoever creates it.
 
-The two states are therefore held in **different tables**, and this separation is normative:
+**The coverage set and the admission set are different sets, and MUST NOT be the same value.**
 
-- A coin arriving at a derived hash MUST be written to `cat_admission_pending`, never to `coins`. The
+- The **coverage** set is what the node asks a peer about: the addresses UNION the derived hashes. It
+  determines what the wallet can SEE.
+- The **admission** set is the wallet's own p2 addresses, and nothing else. It determines what may be
+  written to `coins`.
+- The union that produces the coverage set MUST be performed at the point that issues the request, and a
+  derived hash MUST NOT be admissible even if one is supplied to that point as an address. One vector
+  serving both roles is the defect this clause exists to exclude: it admitted every coin at a derived
+  hash and typed it `asset_id: None`, which means XCH.
+- The recorded coverage a replica claims (§18.13's authoritative-read routing) is the ADDRESS set, since
+  that is the set its readers ask about.
+
+The two states are held in **different tables**, and this separation is normative:
+
+- A coin arriving at a derived hash, on ANY tier, MUST be written to `cat_admission_pending` and never to
+  `coins`. This binds the peer catch-up, the peer frame path, and the point-read tier alike. The one
   exception is a coin already PRESENT in `coins` — one that has cleared promotion — whose later states,
   including its spend, MUST update `coins` as any other coin's would.
-- A coin MUST enter `coins` only when a read of its parent spend reconstructs it as a CAT whose asset id
-  AND inner p2 hash both equal the ones the derivation predicted. It is then written **fully attributed**,
-  from the reconstruction's values and never from the derivation's.
-- `coins` MUST retain exactly the semantics it has without this feature. No reader of `coins` — the
-  balance, the spend-input selector, `get_cats`, the arrivals notifier — may be required to apply a
-  predicate to remain correct.
-- The address set and the derived set MUST remain distinct. Only the address set is presented to the
-  arrivals notifier (§18.13), which reports payments to a user.
+- A coin discovered by HINT rather than at a derived hash MUST be staged on the same terms. A hint is a
+  claim its creator chose; admitting a hinted coin as an untyped row is the same fabricated-balance
+  primitive reached without a peer.
+- A coin sitting at one of the wallet's OWN p2 hashes is an ordinary XCH coin and is admitted directly.
+  This is the only direct admission.
+- A coin MUST enter `coins` only when a read of its parent spend reconstructs it as a CAT, and:
+  - the reconstruction's coin id equals the staged row's; AND
+  - where the coin was discovered at a derived hash, the reconstructed asset id and inner p2 hash both
+    equal the ones the derivation predicted; OR
+  - where the coin was discovered by hint and nothing was predicted, the reconstructed inner p2 hash is
+    one the wallet controls.
+
+  It is then written **fully attributed**, from the reconstruction's values and never from the
+  derivation's or the hint's.
+- `coins` retains exactly the semantics it has without this feature. No reader of `coins` — the balance,
+  the spend-input selector, `get_cats`, the arrivals notifier — is required to apply a predicate to
+  remain correct.
+- Only the address set is presented to the arrivals notifier (§18.13), which reports payments to a user.
 
 **Promotion** runs off the peer frame path, in the same out-of-band pass as §18.11 attribution:
 
 - The frame path performs **zero** chain reads. Routing is a membership test against locally derived
   hashes, and the staging write takes no `LineageSource`.
-- Promotion performs at most one parent-spend read per staged coin and is **terminal**: a coin proven or
-  disproven is never read again. A pass is capped (`MAX_CAT_PROMOTIONS_PER_PASS`).
+- A pass reads at most `MAX_CAT_PROMOTIONS_PER_PASS` parent spends.
+- **Promotion is terminal per VERDICT, not per coin, and the read cost is bounded by RATE.** A coin that
+  is proven or disproven is never read again, because its staged row is deleted. A coin whose parent
+  cannot be read reaches no verdict and MUST remain staged, so it will be read again — which is why a
+  per-coin bound cannot be claimed. The queue is therefore served ordered by attempt count first and
+  arrival order second, and a row is eligible only if it has not been read within
+  `PROMOTION_RETRY_COOLDOWN`. Together these give: a row that never resolves can never hold the head of
+  the queue against one that has never been tried, and the total read rate is bounded by
+  `staged rows / cooldown` rather than by `cap` per pass.
+- **A never-existing parent is NOT distinguished from an unreadable one, deliberately.** A source
+  answers identically for a spend it has never heard of and one it is merely behind on, so a terminal
+  refusal built on that answer would convert a brief outage into permanent erasure of a real coin. The
+  cost is bounded instead of the cause classified.
 - The three outcomes are distinct. **Proven** promotes. **Disproven** — a parent read that SUCCEEDED and
-  does not reconstruct the coin as that asset — deletes the staged row. **Unavailable** — a read that
-  could not be performed — leaves the row staged for retry, and MUST NOT delete it; treating an
-  unavailable answer as a disproof would let a peer erase real money by withholding parent spends.
+  does not reconstruct the coin as claimed — deletes the staged row. **Unavailable** — a read that could
+  not be performed, or that the source answered emptily — leaves the row staged for retry, and MUST NOT
+  delete it; treating an unavailable answer as a disproof would let a peer erase real money by
+  withholding parent spends.
+- A promotion write MUST claim its staged row before writing the coin: the staging row is deleted first
+  and the write proceeds only if exactly one row was removed, all in one transaction. Promotion spans a
+  network round trip, and a reorg rollback inside that window must not be overwritten by a coin the
+  replica has already decided to forget.
 - A promotion failure MUST NOT propagate into the peer update loop. A chain read fails for reasons a peer
   can arrange, and an error reaching the update loop would end a live session.
 - `cat_admission_pending` MUST be bounded, evicting oldest-first. The bound MUST delay and MUST NOT
   error: the staging write is on the frame path, and a peer that can fail a frame can deny a catch-up.
 - Staged rows are rolled back with the coins they describe. A reorg deletes every staged row created
   above the fork and clears any spend recorded above it.
+
+**Where promotion runs today.** On the shipped node the promotion pass runs on the POINT-READ tier
+(`refresh_tracked_coins`) only. The peer frame path's promotion is reachable but its `CatAttributor` is
+constructed under `cfg(test)` alone, so it does not run in production; wiring it is #382. A staged coin
+therefore becomes spendable on a point-read refresh rather than on the frame that delivered it. This is a
+statement of current behaviour, not a licence: nothing above is relaxed by it.
 
 **The stated failure mode is INCOMPLETENESS.** A real coin that cannot yet be proven is *absent* — not
 counted as its asset, and in particular not counted as XCH, which `asset_id IS NULL` means and which
