@@ -911,13 +911,13 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.peerCounts" => peer_counts(ctx, id).await,
         // The automated-spend audit record (dig-node#385) -- a READ of this node's own spending
         // history, and the only sanctioned reader of a node-private append-only file.
-        "control.spends.list" => spends_list(ctx, id, params),
+        "control.spends.list" => spends_list(id, params),
         // The deterministic mirror-coin collateral model (dig_ecosystem#3173). The requirement is
         // consensus-derived and identical on every node; the margin is a LOCAL preference and the
         // two are deliberately served by different methods so neither can be mistaken for the other.
-        "control.collateral.requirement" => collateral_requirement(ctx, id),
-        "control.collateral.margin.get" => collateral_margin_get(ctx, id),
-        "control.collateral.margin.set" => collateral_margin_set(ctx, id, params),
+        "control.collateral.requirement" => collateral_requirement(id),
+        "control.collateral.margin.get" => collateral_margin_get(id),
+        "control.collateral.margin.set" => collateral_margin_set(id, params),
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
@@ -3134,7 +3134,7 @@ async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
 /// the page bound inside its own `Deserialize`, so a limit of `0` or one above the cap is refused
 /// here without this handler having to remember to check. A `0` page makes no progress and a caller
 /// looping until `complete` would loop forever.
-fn spends_list(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+fn spends_list(id: Value, params: &Value) -> Value {
     use dig_node_control_interface::params::SpendsListParams;
 
     let params: SpendsListParams = match serde_json::from_value(params.clone()) {
@@ -3154,7 +3154,9 @@ fn spends_list(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         limit: Some(limit),
     };
 
-    let log = crate::spend_audit::SpendLog::at(ctx.state_dir.join("spend-audit.jsonl"));
+    // `in_state_dir` rather than a path built from `ctx.state_dir`: the audit file has ONE home,
+    // and `SpendLog` is the component that knows where it is.
+    let log = crate::spend_audit::SpendLog::in_state_dir();
     let ledger = match log.query(&query) {
         Ok(l) => l,
         // A cursor the record does not know is the caller's mistake, not a broken record.
@@ -3254,7 +3256,7 @@ fn spend_row(r: &crate::spend_audit::SpendRecord) -> Value {
 /// Deriving it is also what makes a STALE answer unrepresentable. The requirement is looked up for
 /// the epoch that is current NOW, so a node whose census has stopped running reports
 /// `not_censused` for the present epoch instead of confidently serving last week's figure.
-fn current_collateral_epoch(_ctx: &ControlCtx) -> crate::collateral::CurrentEpoch {
+fn current_collateral_epoch() -> crate::collateral::CurrentEpoch {
     crate::collateral::current_epoch_now()
 }
 
@@ -3263,10 +3265,9 @@ fn current_collateral_epoch(_ctx: &ControlCtx) -> crate::collateral::CurrentEpoc
 /// The local safety margin is deliberately not consulted: this figure is the consensus-derived one
 /// every node derives identically, and returning the margined amount would make this operator's
 /// preference look like the network's price.
-fn collateral_requirement(ctx: &ControlCtx, id: Value) -> Value {
-    let store =
-        crate::collateral::EpochRecordStore::at(ctx.state_dir.join("collateral-epochs.jsonl"));
-    let answer = crate::collateral::requirement(&store, current_collateral_epoch(ctx));
+fn collateral_requirement(id: Value) -> Value {
+    let store = crate::collateral::EpochRecordStore::in_state_dir();
+    let answer = crate::collateral::requirement(&store, current_collateral_epoch());
     match serde_json::to_value(&answer) {
         Ok(v) => control_ok(id, v),
         Err(e) => control_error(id, ErrorCode::ControlError, e.to_string()),
@@ -3274,8 +3275,8 @@ fn collateral_requirement(ctx: &ControlCtx, id: Value) -> Value {
 }
 
 /// `control.collateral.margin.get` — the node's local safety margin, in basis points.
-fn collateral_margin_get(ctx: &ControlCtx, id: Value) -> Value {
-    let cfg = crate::collateral::CollateralConfig::load_from(&ctx.state_dir);
+fn collateral_margin_get(id: Value) -> Value {
+    let cfg = crate::collateral::CollateralConfig::load();
     control_ok(id, json!({ "margin_bp": cfg.margin_bp }))
 }
 
@@ -3284,7 +3285,7 @@ fn collateral_margin_get(ctx: &ControlCtx, id: Value) -> Value {
 /// A value above the contract's ceiling is REFUSED rather than clamped, and the returned figure is
 /// what was actually stored. Clamping and returning the clamped value would leave the caller's
 /// stored intent and the node's behaviour disagreeing on the money path.
-fn collateral_margin_set(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+fn collateral_margin_set(id: Value, params: &Value) -> Value {
     use dig_node_control_interface::params::CollateralMarginSetParams;
 
     let parsed: CollateralMarginSetParams = match serde_json::from_value(params.clone()) {
@@ -3301,7 +3302,7 @@ fn collateral_margin_set(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     };
     // Persisted before it is reported. A margin that lapsed to the default on reboot would silently
     // change what the node posts, so a write failure must not be answered with a success.
-    if let Err(e) = cfg.save_to(&ctx.state_dir) {
+    if let Err(e) = cfg.save() {
         return control_error(
             id,
             ErrorCode::ControlError,

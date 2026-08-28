@@ -68,6 +68,25 @@ impl CollateralConfig {
     /// refusing to start over a corrupt preference file would take the node down over the one
     /// setting whose absence is survivable. The fallback is the `+1%` default, never `0`, so the
     /// degraded path still errs toward over-posting.
+    /// Load from the node's own machine-wide state directory.
+    ///
+    /// The production entry point. It resolves the directory ITSELF via [`crate::state::state_dir`]
+    /// rather than accepting one, so there is exactly one answer to "where does this node keep its
+    /// state" — the same shape [`crate::spend_audit::SpendLog::in_state_dir`] uses. Handing the
+    /// directory in from a caller made the path depend on a value that entered the process from the
+    /// environment, which is both a second resolver for one fact and a taint flow CodeQL flags.
+    pub fn load() -> Self {
+        CollateralConfig::load_from(&crate::state::state_dir())
+    }
+
+    /// Persist to the node's own machine-wide state directory.
+    pub fn save(&self) -> std::io::Result<()> {
+        self.save_to(&crate::state::state_dir())
+    }
+
+    /// Load from an explicit directory.
+    ///
+    /// For tests and for callers that already own a directory. Production uses [`Self::load`].
     pub fn load_from(dir: &Path) -> Self {
         std::fs::read_to_string(dir.join(COLLATERAL_CONFIG_FILE))
             .ok()
@@ -117,6 +136,9 @@ impl EpochRecordStore {
     }
 
     /// The node's own store, in the machine-wide state directory.
+    ///
+    /// The production entry point, for the same reason as [`CollateralConfig::load`]: one resolver
+    /// for one fact.
     pub fn in_state_dir() -> Self {
         EpochRecordStore::at(crate::state::state_dir().join(EPOCH_RECORD_FILE))
     }
