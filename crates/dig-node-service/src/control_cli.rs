@@ -779,12 +779,11 @@ pub fn collateral_buffer(
         ) {
         // Unknown because the REQUIREMENT is unknown -- there is no cost to quote at all.
         return Ok(Outcome::new(
-            format!(
-                "collateral buffer UNKNOWN — this node cannot state its per-store requirement yet, \
-                 so it cannot say what you should hold.\n  \
-                 Run `dign collateral requirement` to see which fact is missing."
-            ),
-            serde_json::to_value(&advice).map_err(std::io::Error::other)?,
+            "collateral buffer UNKNOWN — this node cannot state its per-store requirement yet, \
+             so it cannot say what you should hold.\n  \
+             Run `dign collateral requirement` to see which fact is missing."
+                .to_string(),
+            serde_json::to_value(advice).map_err(std::io::Error::other)?,
         ));
     } else {
         format!(
@@ -844,7 +843,7 @@ pub fn collateral_buffer(
 
     Ok(Outcome::new(
         summary,
-        serde_json::to_value(&advice).map_err(std::io::Error::other)?,
+        serde_json::to_value(advice).map_err(std::io::Error::other)?,
     ))
 }
 
