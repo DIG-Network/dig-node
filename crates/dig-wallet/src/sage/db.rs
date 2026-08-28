@@ -1842,6 +1842,38 @@ impl WalletDb {
             .bind(h)
             .execute(&mut *tx)
             .await?;
+        // A staged CAT admission is UNMADE with the coin it describes, by the same predicate and
+        // in the same transaction (dig-node#380).
+        //
+        // A staged row is not a record of money; it is a record of an OBSERVATION — "the chain
+        // showed me a coin at a hash I derived". A rollback deletes the chain state that
+        // observation was made against, so the row's justification is gone even though the row
+        // would survive. Left behind, it is later promoted against a fork the chain no longer has,
+        // and promotion writes into `coins` — so a coin enters the believed set on the strength of
+        // history that was undone. That is the same defect class as everything else this table
+        // exists to prevent: a check trusting a value whose meaning it never established.
+        //
+        // Nothing is lost by deleting. A coin that re-confirms after the reorg is pushed again by
+        // the peer and re-staged, exactly as `coins` is re-populated.
+        sqlx::query(
+            "DELETE FROM cat_admission_pending
+             WHERE created_height IS NOT NULL AND created_height > ?",
+        )
+        .bind(h)
+        .execute(&mut *tx)
+        .await?;
+        // A staged coin SPENT above the fork is unspent again. The spend is cleared rather than
+        // the row deleted: the coin itself is still confirmed at or below the fork, so it is still
+        // a legitimate promotion candidate, and deleting it here would lose a real coin to a reorg
+        // that did not touch its creation.
+        sqlx::query(
+            "UPDATE cat_admission_pending
+                SET spent_height = NULL, spent_timestamp = NULL
+             WHERE spent_height > ?",
+        )
+        .bind(h)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE sync_state SET arrival_baseline_height = ?
              WHERE id = 0 AND arrival_baseline_height > ?",
