@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use crate::cli::Outcome;
 use crate::config::Config;
 use crate::control_client::call_control;
+use dig_node_control_interface::results::{CollateralBufferResult, CollateralFundingState};
 
 /// One control-parity CLI action, clap-agnostic (mapped from the subcommand in `entrypoint.rs`).
 /// Each variant names the single `control.*` method it dispatches — see [`ControlAction::method`].
@@ -713,6 +714,7 @@ fn summarize(method: &str, result: &Value) -> String {
             format!("{coins} direct child coin(s) — one hop, not a lineage{more}")
         }
         "control.collateral.requirement" => summarize_collateral_requirement(result),
+        "control.collateral.buffer" => summarize_collateral_buffer(result),
         // Shown with its real cost, not as a bare setting: a margin is a number of basis points
         // until someone says what it costs to hold.
         "control.collateral.margin.get" | "control.collateral.margin.set" => {
@@ -748,9 +750,8 @@ pub fn collateral_buffer(
     pairs_served: Option<u64>,
     spendable_dig_base_units: Option<u64>,
 ) -> std::io::Result<Outcome> {
-    use crate::collateral::{buffer_advice, buffer_remedy, format_dig, one_epoch_lock};
+    use crate::collateral::buffer_advice;
     use dig_node_control_interface::params::DEFAULT_BUFFER_HORIZON_EPOCHS;
-    use dig_node_control_interface::results::{CollateralBufferResult, CollateralFundingState};
 
     let requirement_json = call_control(
         config,
@@ -774,19 +775,25 @@ pub fn collateral_buffer(
         DEFAULT_BUFFER_HORIZON_EPOCHS,
     );
     let result = serde_json::to_value(advice).map_err(std::io::Error::other)?;
+    Ok(Outcome::new(render_buffer(&advice), result))
+}
 
-    let known = match advice {
+/// Render a buffer answer as the human line, for BOTH the node-computed and the
+/// operator-supplied forms.
+///
+/// One renderer on purpose: two renderings of one money figure is how an operator comes to
+/// trust the wrong one.
+fn render_buffer(advice: &CollateralBufferResult) -> String {
+    use crate::collateral::{buffer_remedy, format_dig, one_epoch_lock};
+    let known = match *advice {
         CollateralBufferResult::Unknown { reason } => {
             // Names the missing fact and what would resolve it. Emphatically not a zero: a zero
             // buffer reads as "no buffer needed", which is the reassuring rendering of an unknown.
-            return Ok(Outcome::new(
-                format!(
-                    "collateral buffer UNKNOWN — {}.\n  Run `dign collateral requirement` to see \
-                     what this node does know.",
-                    buffer_remedy(reason)
-                ),
-                result,
-            ));
+            return format!(
+                "collateral buffer UNKNOWN — {}.\n  Run `dign collateral requirement` to see \
+                 what this node does know.",
+                buffer_remedy(reason)
+            );
         }
         known @ CollateralBufferResult::Known { .. } => known,
     };
@@ -867,7 +874,22 @@ pub fn collateral_buffer(
         }
     });
 
-    Ok(Outcome::new(summary, result))
+    summary
+}
+
+/// A concise human line for `control.collateral.buffer` — the node's OWN answer.
+///
+/// Shares [`render_buffer`] with the operator-supplied form of `dign collateral buffer`, so the two
+/// cannot describe the same figures differently. Two renderings of one money figure is how an
+/// operator comes to trust the wrong one.
+fn summarize_collateral_buffer(result: &Value) -> String {
+    match serde_json::from_value::<CollateralBufferResult>(result.clone()) {
+        Ok(answer) => render_buffer(&answer),
+        // A payload this build cannot decode is reported as such, never as a figure. Guessing at a
+        // partially-understood money answer is worse than saying the node spoke a shape we do not
+        // know.
+        Err(e) => format!("collateral buffer: unreadable answer from the node ({e})"),
+    }
 }
 
 /// A concise human line for `control.collateral.requirement`.

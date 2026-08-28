@@ -858,6 +858,15 @@ pub fn run() -> std::process::ExitCode {
         Command::Collateral {
             action: Some(CollateralCommand::Buffer { roots, balance }),
         } => match parse_dig_amount(balance.as_deref()) {
+            // With no operands the NODE is asked -- it is the authority on its own served set,
+            // preference and balance, and `control.collateral.buffer` is that answer. Operands are
+            // an override for the operator who wants a figure before the node can enumerate its own
+            // served set, and they are computed locally FROM the node's requirement and margin.
+            Ok(None) if roots.is_none() => render(
+                control_cli::run(&config, ControlAction::CollateralBuffer),
+                action,
+                json,
+            ),
             Ok(b) => render(
                 control_cli::collateral_buffer(&config, roots, b),
                 action,
@@ -1084,7 +1093,7 @@ fn collateral_action(cmd: Option<CollateralCommand>) -> std::io::Result<ControlA
     match cmd {
         None | Some(CollateralCommand::Requirement) => Ok(ControlAction::CollateralRequirement),
         // Handled before this mapper: it composes three control reads rather than dispatching one.
-        Some(CollateralCommand::Buffer { .. }) => Ok(ControlAction::CollateralRequirement),
+        Some(CollateralCommand::Buffer { .. }) => Ok(ControlAction::CollateralBuffer),
         Some(CollateralCommand::Margin { action: None }) => Ok(ControlAction::CollateralMarginGet),
         Some(CollateralCommand::Margin {
             action: Some(MarginCommand::Set { value }),
