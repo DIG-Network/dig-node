@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use chia_protocol::{Bytes32, Coin, CoinState};
 use dig_wallet::sage::cat_discovery::{promote_staged_cats, stage_from_states, DerivedCats};
 use dig_wallet::sage::db::WalletDb;
-use dig_wallet::sage::singleton::{LineageSource, ParentSpend};
+use dig_wallet::sage::singleton::{LineageAnswer, LineageSource, ParentSpend};
 
 /// Where the real replica's addresses live, and what a `$DIG` coin of theirs would sit at.
 #[tokio::test]
@@ -216,7 +216,15 @@ impl LineageSource for CapturedLineage {
         &self,
         parent_coin_id: &str,
         _spent_height: u32,
-    ) -> dig_wallet::sage::Result<Option<ParentSpend>> {
-        Ok(self.0.get(parent_coin_id).cloned())
+    ) -> dig_wallet::sage::Result<LineageAnswer> {
+        // A miss is `Unavailable`, NOT `Absent`. This capture holds the parents that were
+        // recorded, so a parent missing from it means "this fixture did not capture that spend" --
+        // a gap in what could be learned, never a chain fact that no such spend exists. Folding it
+        // to `Absent` would let the fixture assert a settled absence it has no evidence for, which
+        // is the exact double-side lie `LineageAnswer::from_lookup` exists to make impossible.
+        Ok(LineageAnswer::from_lookup(
+            self.0.get(parent_coin_id).cloned(),
+            LineageAnswer::Unavailable,
+        ))
     }
 }

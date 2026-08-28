@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use chia_protocol::{Bytes32, Coin, CoinState};
 
 use super::db::{CoinRow, PromotedSingleton, StagedCatRow, WalletDb};
-use super::singleton::{coin_from_row, LineageSource, Reconstructed};
+use super::singleton::{coin_from_row, LineageAnswer, LineageSource, Reconstructed};
 use super::{singleton, Result};
 
 /// How many staged coins one promotion pass will read parent spends for.
@@ -339,18 +339,34 @@ pub async fn promote_staged_cats(
             .parent_spend(&row.parent_coin_info, created as u32)
             .await
         {
-            Ok(Some(parent)) => parent,
-            // `Ok(None)` is "the source ANSWERED, and has no spend for this parent" — which is
-            // consistent with an invented ancestry AND with a source that is merely behind.
-            // Treating it as a disproof would delete real coins whenever a source is behind, so it
-            // is a deferral; the cost of retrying it for ever is bounded by the cooldown instead.
-            Ok(None) => {
+            Ok(LineageAnswer::Found(parent)) => *parent,
+            // A source ANSWERED, and has no spend for this parent.
+            //
+            // #393 reasoned about this as `Ok(None)` and DEFERRED it, and that stays exactly
+            // right even though the answer is strictly stronger now: with `LineageAnswer` this
+            // arm is a CORROBORATED absence (chia-query settles an uncorroborated one as an
+            // `Err`), so one hostile peer can no longer produce it. Corroboration is agreement,
+            // NOT currency -- every source can agree and every source can be behind the chain,
+            // which is the ordinary case for a coin created seconds ago. So a corroborated
+            // absence still does not disprove ancestry, and promoting it to `Disproven` would
+            // delete real coins whenever the sources lag. Deferred, with the cooldown bounding
+            // the cost of retrying for ever.
+            Ok(LineageAnswer::Absent) => {
                 db.record_promotion_attempt(&row.coin_id, now).await?;
                 stats.deferred += 1;
                 continue;
             }
-            // The source did not answer at all — transport, timeout, a malformed reply. Strictly
-            // less informative than `Ok(None)`, and handled the same way.
+            // No source answered at all -- transport, timeout, an uncorroborated claim, or two
+            // sources that contradict each other. Strictly less informative than an absence, and
+            // handled the same way.
+            Ok(LineageAnswer::Unavailable) => {
+                db.record_promotion_attempt(&row.coin_id, now).await?;
+                stats.deferred += 1;
+                continue;
+            }
+            // A source answered with something unusable (a malformed reveal, undecodable hex).
+            // Narrower than #393's `Err` arm, which also caught outages; those are `Unavailable`
+            // above. Handled identically, so no promotion decision changes.
             Err(e) => {
                 tracing::debug!(
                     coin_id = %row.coin_id,
@@ -645,6 +661,24 @@ mod tests {
         HashSet::new()
     }
 
+    /// What a MISS from [`CountingLineage`] means. Named rather than left implicit because the
+    /// two are different chain facts that `Option<ParentSpend>` could not tell apart: `Absent` is
+    /// "the sources agree there is no such spend", `Unavailable` is "nothing could be learned".
+    ///
+    /// The field exists so a double is not forced to pick one and pretend it is both. A fixture
+    /// map cannot know which a missing key represents, so it has to say -- and a double that can
+    /// only express one of production's two miss modes makes every test over it a partial green
+    /// (see [`LineageAnswer::from_lookup`]).
+    #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+    enum Miss {
+        /// Nothing could be learned. The default, because it is the WEAKER claim: a double that
+        /// silently asserted a settled absence would let a test read a deferral as a disproof.
+        #[default]
+        Unavailable,
+        /// The sources agree there is no such spend.
+        Absent,
+    }
+
     /// A [`LineageSource`] over a fixed parent map, which COUNTS its reads and can be told to fail
     /// for one specific parent.
     ///
@@ -657,6 +691,8 @@ mod tests {
         by_parent: HashMap<String, ParentSpend>,
         reads: AtomicUsize,
         fail_for: Option<String>,
+        /// What a parent absent from `by_parent` reports. See [`Miss`].
+        miss: Miss,
     }
 
     impl CountingLineage {
@@ -671,12 +707,18 @@ mod tests {
             &self,
             parent_coin_id: &str,
             _spent_height: u32,
-        ) -> Result<Option<ParentSpend>> {
+        ) -> Result<LineageAnswer> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             if self.fail_for.as_deref() == Some(parent_coin_id) {
                 return Err(crate::sage::Error::internal("parent unreadable"));
             }
-            Ok(self.by_parent.get(parent_coin_id).cloned())
+            Ok(LineageAnswer::from_lookup(
+                self.by_parent.get(parent_coin_id).cloned(),
+                match self.miss {
+                    Miss::Unavailable => LineageAnswer::Unavailable,
+                    Miss::Absent => LineageAnswer::Absent,
+                },
+            ))
         }
     }
 
@@ -1592,6 +1634,110 @@ mod tests {
             (second.deferred, second.refused, second.promoted),
             (0, 0, 0),
             "a second pass inside the cooldown must not touch it again: {second:?}"
+        );
+    }
+
+    /// **Proves:** a CORROBORATED absence defers exactly like an unreadable parent -- it never
+    /// disproves the coin, and never discards the staged row.
+    ///
+    /// # Why this test exists
+    ///
+    /// `LineageAnswer` split what used to be one `Ok(None)` into `Absent` ("the sources AGREE
+    /// there is no such spend") and `Unavailable` ("nothing could be learned"). `Absent` is the
+    /// stronger claim, and the tempting next step is to treat it as a disproof and discard the
+    /// row. That would be wrong, and wrong in the money-losing direction: corroboration is
+    /// agreement, NOT currency. Every source can agree and every source can be behind the chain,
+    /// which is the ordinary case for a coin created seconds ago -- so discarding on `Absent`
+    /// deletes real coins whenever the sources lag. This test goes red on that change.
+    ///
+    /// # The fixture varies ONE actor
+    ///
+    /// The honest CAT is present in both runs with its parent resolvable, so it must promote in
+    /// both. Only the SECOND coin's miss answer varies. A fixture where every parent missed would
+    /// be the blindest possible one here: with no promotion left to observe, a pass that deferred
+    /// correctly and a pass that abandoned the whole table on the first miss look identical.
+    #[tokio::test]
+    async fn a_corroborated_absence_defers_the_row_exactly_as_an_unreadable_parent_does() {
+        /// Run one promotion pass in which the honest CAT resolves and a second staged coin
+        /// MISSES, with the miss reported as `miss`. Returns
+        /// `(stats, rows still staged, rows believed)`.
+        async fn pass_with(miss: Miss) -> (PromoteStats, i64, usize) {
+            let f = real_cat();
+            let db = WalletDb::open_in_memory().await.unwrap();
+            let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+            // A second coin at the SAME derived hash, so it is staged for the same reason the
+            // honest one is; only its parent differs, and that parent is deliberately absent from
+            // the lineage map.
+            let missing = fabricated_at(f.child.puzzle_hash, 1_234, 0xCD);
+
+            let rows = stage_from_states(
+                &[
+                    state(f.child, Some(10), None),
+                    state(missing, Some(11), None),
+                ],
+                &derived,
+                |_| false,
+            );
+            assert_eq!(rows.len(), 2, "both coins are staged, neither believed");
+            db.stage_cat_admissions(&rows).await.unwrap();
+
+            let mut lineage = CountingLineage {
+                miss,
+                ..Default::default()
+            };
+            // ONLY the honest coin's parent is resolvable. The other falls through to `miss`.
+            lineage
+                .by_parent
+                .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
+
+            let stats = promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
+            let staged_left = db.staged_cat_admission_count().await.unwrap();
+            let believed = db.all_coins().await.unwrap().len();
+            (stats, staged_left, believed)
+        }
+
+        let (absent, absent_staged, absent_believed) = pass_with(Miss::Absent).await;
+        let (unavail, unavail_staged, unavail_believed) = pass_with(Miss::Unavailable).await;
+
+        // The truthful control: the honest CAT promotes under BOTH miss answers. Without this, a
+        // pass that abandoned the table on the first miss would satisfy every assertion below.
+        assert_eq!(
+            (absent.promoted, unavail.promoted),
+            (1, 1),
+            "the honest CAT must promote regardless of what the OTHER coin's parent reported -- \
+             one unresolvable row must never abandon the pass: absent={absent:?} \
+             unavailable={unavail:?}"
+        );
+
+        // The missing coin is DEFERRED under both, never refused.
+        assert_eq!(
+            (absent.deferred, absent.refused),
+            (1, 0),
+            "a corroborated absence must DEFER the row, not disprove it: sources can agree and \
+             still be behind the chain, so refusing here deletes real coins whenever they lag. \
+             {absent:?}"
+        );
+        assert_eq!(
+            (absent.deferred, absent.refused),
+            (unavail.deferred, unavail.refused),
+            "and it must be handled identically to an unreadable parent -- the promotion path \
+             deliberately does not act on the Absent/Unavailable distinction. absent={absent:?} \
+             unavailable={unavail:?}"
+        );
+
+        // The row SURVIVES, so a later pass can promote it once the sources catch up. This is the
+        // assertion a discard-on-Absent implementation fails.
+        assert_eq!(
+            (absent_staged, unavail_staged),
+            (1, 1),
+            "the unresolved row must stay STAGED under both answers, or a source that is merely \
+             behind permanently deletes a real coin"
+        );
+        assert_eq!(
+            (absent_believed, unavail_believed),
+            (1, 1),
+            "and exactly one coin is believed -- the proven one. An unresolved coin must never \
+             enter `coins`, where a NULL asset id would read as XCH"
         );
     }
 }

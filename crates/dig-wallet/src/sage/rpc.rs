@@ -3148,13 +3148,14 @@ impl WalletBackend {
             // discovered at a derived hash becomes spendable on this tier too. Best-effort for
             // the same reason attribution is: a chain-read failure must not make a fresh XCH sync
             // look like a hard error.
-            // The ONE promotion site that runs on the shipped node today: `CatAttributor` is
-            // constructed only under `cfg(test)`, so the frame-path pass does not run in
-            // production (dig-node#382, the wiring half, is PR
-            // https://github.com/DIG-Network/dig-node/pull/391). Until that lands, this is where a
-            // staged coin becomes spendable, and it must not be silent about it: a `let _ =`
-            // discarded both the counts and the cause, so a wallet whose $DIG never appeared
-            // produced no evidence of why anywhere.
+            // ONE OF TWO promotion sites. The other is the supervisor's `CatAttributor` on the
+            // peer path, which #391 wired into production (dig-node#382) -- until then
+            // `CatAttributor` was constructed under `cfg(test)` alone and this was the only site
+            // that ran on a shipped node. Both are still needed: this tier promotes on a
+            // point-read refresh, the peer tier on the sync that delivers the coin.
+            //
+            // It must not be silent either way: a `let _ =` discarded both the counts and the
+            // cause, so a wallet whose $DIG never appeared produced no evidence of why anywhere.
             //
             // Still best-effort, and deliberately: a chain-read failure must not turn a successful
             // XCH refresh into a hard error.
@@ -3395,6 +3396,7 @@ impl WalletBackend {
             let parent = lineage
                 .parent_spend(&row.parent_coin_info, created)
                 .await?
+                .found()
                 .ok_or_else(|| Error::internal("CAT parent spend unavailable"))?;
             let child = singleton::coin_from_row(row)?;
             let cat = singleton::resolve_cat(&parent, child)?
@@ -3535,6 +3537,7 @@ impl WalletBackend {
         let parent = lineage
             .parent_spend(&row.parent_coin_info, created)
             .await?
+            .found()
             .ok_or_else(|| Error::internal("parent spend unavailable"))?;
         let child = singleton::coin_from_row(&row)?;
         Ok((parent, child))
@@ -9374,8 +9377,13 @@ mod tests {
                 &self,
                 parent_coin_id: &str,
                 _spent_height: u32,
-            ) -> Result<Option<ParentSpend>> {
-                Ok((parent_coin_id == self.parent_id).then(|| self.spend.clone()))
+            ) -> Result<singleton::LineageAnswer> {
+                // A parent this double does not hold is one the node could not READ, which is
+                // what the production source reports for an unresolvable parent.
+                Ok(singleton::LineageAnswer::from_lookup(
+                    (parent_coin_id == self.parent_id).then(|| self.spend.clone()),
+                    singleton::LineageAnswer::Unavailable,
+                ))
             }
         }
 
@@ -9552,8 +9560,13 @@ mod tests {
                 &self,
                 parent_coin_id: &str,
                 _spent_height: u32,
-            ) -> Result<Option<ParentSpend>> {
-                Ok((parent_coin_id == self.parent_id).then(|| self.spend.clone()))
+            ) -> Result<singleton::LineageAnswer> {
+                // A parent this double does not hold is one the node could not READ, which is
+                // what the production source reports for an unresolvable parent.
+                Ok(singleton::LineageAnswer::from_lookup(
+                    (parent_coin_id == self.parent_id).then(|| self.spend.clone()),
+                    singleton::LineageAnswer::Unavailable,
+                ))
             }
         }
 
