@@ -1227,7 +1227,6 @@ fn compact(result: &Value) -> String {
     serde_json::to_string(result).unwrap_or_else(|_| "{}".to_string())
 }
 
-
 /// `dign collateral history` — the epochs this node has recorded, and how it came by each.
 ///
 /// Read from the record file directly rather than over a control call, like `dign spends`: the
@@ -1249,7 +1248,7 @@ pub fn collateral_history(epoch: Option<u64>) -> std::io::Result<Outcome> {
     // unreadable". The listing cannot make that distinction and does not pretend to.
     if let Some(epoch) = epoch {
         let (human, result) = match store.get(epoch) {
-            StoredEpoch::Found(record) => (render_record(&record), serde_json::to_value(&*record)?),
+            StoredEpoch::Found(record) => (render_record(&record), serde_json::to_value(*record)?),
             StoredEpoch::Absent => (
                 format!(
                     "epoch {epoch}: NOT RECORDED — this node has not censused it and has not \

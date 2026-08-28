@@ -7611,4 +7611,103 @@ A malformed operator-supplied balance is REFUSED, never parsed as zero, which wo
   the node's own measurement otherwise render identically, which would make an operator's guess
   indistinguishable from a measurement in every figure derived from it.
 
+* `collateral history [--epoch <N>]` — §24.8. Read from this node's own record store rather than
+  over a control call, so it answers on a node that is not running. Each line names the provenance,
+  because a bootstrap record, a censused one and one adopted from untrusted peers are three
+  different claims. An epoch never recorded MUST read as NOT RECORDED, distinctly from one recorded
+  and no longer readable.
+
 Every verb offers `--json` beside the human output, with stable field names (§6.2).
+
+### 24.8. The per-epoch record store
+
+The node MUST persist one record per collateral epoch, in `collateral-epochs.jsonl` under its
+machine-wide state directory, one JSON object per line. Each record carries the consensus
+`EpochRecord` — the census inputs (advertised stores, collateralised owners, multiplier, handicap),
+the derived `required_per_store_dig_base_units`, and the `protocol_version` that computed it — plus
+two node-local fields:
+
+* `census_height` — the block height the census behind the record was taken at, or `null` at epoch 1,
+  which is derived from nothing and was taken at no height. `null` MUST mean "no census was taken",
+  never "the height was lost".
+* `provenance` — `bootstrap`, `censused`, or `adopted_from_peers` with the counts that agreed and
+  answered. The three are different claims about what this node verified and MUST NOT be rendered
+  identically.
+
+The census height MUST NOT enter the arithmetic. Two nodes reading the same chain at the same height
+derive the same record whether or not either records the height; it is carried so a disputed census
+names the block it can be re-run against.
+
+**Historical records are permanent and immutable.** A record that DIFFERS from one already held for
+that epoch MUST be refused and the held one kept. A node that let the newest writer win could be
+walked off the network's history one epoch at a time by whoever spoke last, and every figure below
+it — including the amount of $DIG the operator posts — would follow. An identical record offered
+with stronger provenance MAY be recorded, because the consensus figures do not move; the reverse
+MUST NOT be, because evidence does not weaken on re-offer.
+
+A node MUST record the epoch-1 record at start-up if it holds none. It depends on nothing, so every
+node can produce it, and it is the base case that makes the recurrence well founded.
+
+**A record whose `protocol_version` exceeds what the build implements MUST NOT be served as
+authoritative** — not by `control.collateral.requirement`, not by `dig.getCollateralEpoch`, and not
+into a verification. Every field of such a record parses, so nothing downstream would question its
+figures.
+
+### 24.9. Serving an epoch to a peer
+
+`dig.getCollateralEpoch` is an OPEN node method taking `{ epoch }` and returning `{ record }` or
+`{ record: null, reason }`. It is unauthenticated because an epoch record carries nothing secret and
+a caller verifies what it receives by re-derivation whatever the source, so authenticating the
+server would buy nothing the verification does not already give.
+
+Each way of not producing a record MUST be a distinct named `reason` — `invalid_epoch`,
+`not_recorded`, `record_unreadable`, `unimplemented_ruleset` — never a zero, a default, or a
+neighbouring epoch's record. The caller is deciding whether to re-census a week of chain history,
+and the three refusals mean "ask someone else", "this node is broken", and "your ruleset is newer
+than mine".
+
+### 24.10. Adopting an epoch from peers
+
+Every dialled peer is untrusted (NC-12), and the requirement a record names is the amount this
+operator posts as collateral. **A record from a peer is adopted because it is recomputable, never
+because the peer is trusted.**
+
+A receiving node MUST re-derive a candidate from a predecessor it already holds, through
+`EpochRecord::advance`, and MUST require every field of the result to match — not only the
+requirement. It MUST NOT restate the model's arithmetic to perform that check. Consequently a peer
+cannot lie about any derived quantity while keeping its census inputs, cannot lie about the ruleset,
+and cannot skip an epoch.
+
+A receiving node CANNOT check the census inputs against the chain. A record whose arithmetic is
+impeccable and whose inputs are fiction is indistinguishable from an honest one by re-derivation
+alone. The sample is the only defence against that residue, and it is bounded:
+
+* The sample MUST be sized by `dig_mirror_collateral::sync_sample_plan` against a chain-derived
+  owner population. A node that does not know the population MUST NOT adopt; a sample drawn from an
+  unknown population supports no confidence claim.
+* Below `SYNC_MIN_POPULATION` the plan is advisory and the node MUST derive from chain instead.
+* Adoption requires the plan's strict two-thirds agreement threshold, tallied over the FULL record.
+  A plurality MUST NOT be adopted: the plurality is what an attacker holding a minority of
+  identities is trying to produce.
+* More distinct responders than the chain-derived population is a detectable identity lie and MUST
+  refuse the whole sample rather than trim it.
+* A responder that answers twice, differently, MUST have both answers discarded.
+
+**A known limitation, stated rather than assumed away:** the plan counts distinct collateralised
+owners, while a node samples distinct peers, and a peer's owner attribution is not proven on this
+path. One adversary holding many peer identities therefore looks like many owners to the sampler.
+This is why adoption is never load-bearing — the sample buys the ability to skip an expensive
+historical re-derivation, never the right to be wrong — and why a node that can census an epoch
+itself MUST prefer its own computation.
+
+### 24.11. Retention
+
+Retention is **off by default**: a node keeps every epoch forever unless the operator sets
+`retention_epochs` in `collateral.json`. The model's premise is that any node can recompute any past
+epoch and reach the same answer, so a default that discarded history would erode that on every node
+at once.
+
+`retention_epochs` counts back from the current epoch inclusive. A value of `0` MUST read as the
+default rather than as "keep nothing", which would discard the epoch currently in force. **Epoch 1
+MUST NOT be pruned under any policy**: it is the base case every verification walk terminates at, so
+a node that discarded it could no longer check anything a peer offered it.

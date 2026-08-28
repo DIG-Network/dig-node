@@ -981,7 +981,10 @@ mod tests {
         }
         // The reverse is not recorded: evidence does not weaken on re-offer. Without this half the
         // test would pass for a store that simply takes the newest line.
-        assert_eq!(store.put(&adopted).expect("put"), PutOutcome::AlreadyPresent);
+        assert_eq!(
+            store.put(&adopted).expect("put"),
+            PutOutcome::AlreadyPresent
+        );
         match store.get(5) {
             StoredEpoch::Found(rec) => assert_eq!(rec.provenance, RecordProvenance::Censused),
             other => panic!("expected the censused record, got {other:?}"),
@@ -1036,7 +1039,10 @@ mod tests {
         // Epoch 1 survives regardless: it is the base case every verification walk starts from,
         // and a node that discarded it could no longer check anything a peer offered it. So 6 of
         // the 7 outside the window go, not all 7.
-        assert_eq!(store.prune(RetentionPolicy::KeepEpochs(3), 10).expect("p"), 6);
+        assert_eq!(
+            store.prune(RetentionPolicy::KeepEpochs(3), 10).expect("p"),
+            6
+        );
         let kept: Vec<u64> = store
             .records()
             .expect("records")
@@ -1132,8 +1138,8 @@ mod tests {
             margin_bp: 250,
             retention_epochs: None,
         }
-            .save_to(dir.path())
-            .expect("save");
+        .save_to(dir.path())
+        .expect("save");
         assert_eq!(CollateralConfig::load_from(dir.path()).margin_bp, 250);
     }
 
@@ -1143,8 +1149,15 @@ mod tests {
         let store = store_at(dir.path());
         // Two epochs present, with DIFFERENT multipliers and owner counts, so answering with the
         // wrong one is observable. A single-record fixture could not see that.
-        store.put(&StoredRecord::censused(record(7, 1_000_000, 1_000, 40), 5_100)).expect("put");
-        store.put(&StoredRecord::censused(record(8, 500_000, 600, 25), 5_200)).expect("put");
+        store
+            .put(&StoredRecord::censused(
+                record(7, 1_000_000, 1_000, 40),
+                5_100,
+            ))
+            .expect("put");
+        store
+            .put(&StoredRecord::censused(record(8, 500_000, 600, 25), 5_200))
+            .expect("put");
 
         let answer = requirement(&store, CurrentEpoch::Final(8));
         let CollateralRequirementResult::Known {
@@ -1175,7 +1188,12 @@ mod tests {
     fn each_missing_fact_gets_its_own_reason() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store_at(dir.path());
-        store.put(&StoredRecord::censused(record(3, 1_000_000, 1_000, 10), 4_000)).expect("put");
+        store
+            .put(&StoredRecord::censused(
+                record(3, 1_000_000, 1_000, 10),
+                4_000,
+            ))
+            .expect("put");
 
         let reason = |c| match requirement(&store, c) {
             CollateralRequirementResult::Unknown { reason } => reason,
@@ -1246,7 +1264,12 @@ mod tests {
         let store = store_at(dir.path());
         // A healthy neighbouring record, so the fixture keeps an honest control: a store that was
         // entirely corrupt could not show that the corruption was ATTRIBUTED to epoch 5.
-        store.put(&StoredRecord::censused(record(4, 1_000_000, 1_000, 10), 4_100)).expect("put");
+        store
+            .put(&StoredRecord::censused(
+                record(4, 1_000_000, 1_000, 10),
+                4_100,
+            ))
+            .expect("put");
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -1314,7 +1337,9 @@ mod tests {
     fn the_known_answer_carries_the_census_inputs_a_client_needs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store_at(dir.path());
-        store.put(&StoredRecord::censused(record(12, 800_000, 750, 31), 6_000)).expect("put");
+        store
+            .put(&StoredRecord::censused(record(12, 800_000, 750, 31), 6_000))
+            .expect("put");
 
         let wire =
             serde_json::to_value(requirement(&store, CurrentEpoch::Final(12))).expect("serialise");

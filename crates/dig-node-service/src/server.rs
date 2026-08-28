@@ -2449,7 +2449,6 @@ async fn shutdown_signal() {
     tracing::info!("dig-node shutting down");
 }
 
-
 /// Answer `dig.getCollateralEpoch` from this node's own record store.
 ///
 /// # Every non-answer is a NAMED refusal, never a shaped-like-success zero
@@ -2480,7 +2479,11 @@ fn collateral_epoch_answer(params: &Value) -> Value {
     // Read typed and refuse what will not decode. A `params.epoch` that is absent, negative, or
     // not a number must NOT fall through to a default — epoch 0 is not an epoch, and epoch 1 is a
     // real record that a defaulting reader would serve in answer to a question nobody asked.
-    let Some(epoch) = params.get("epoch").and_then(Value::as_u64).filter(|e| *e >= 1) else {
+    let Some(epoch) = params
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .filter(|e| *e >= 1)
+    else {
         return json!({
             "record": Value::Null,
             "reason": "invalid_epoch",
@@ -2497,7 +2500,7 @@ fn collateral_epoch_answer(params: &Value) -> Value {
             "reason": "unimplemented_ruleset",
             "protocol_version": record.record.protocol_version.0,
         }),
-        StoredEpoch::Found(record) => match serde_json::to_value(&*record) {
+        StoredEpoch::Found(record) => match serde_json::to_value(*record) {
             Ok(record) => json!({ "record": record }),
             Err(e) => json!({
                 "record": Value::Null,
@@ -2509,7 +2512,6 @@ fn collateral_epoch_answer(params: &Value) -> Value {
         StoredEpoch::Unreadable => json!({ "record": Value::Null, "reason": "record_unreadable" }),
     }
 }
-
 
 /// Seed the collateral record store and apply the operator's retention preference.
 ///

@@ -509,7 +509,10 @@ mod tests {
         // A DIFFERENT but internally honest record: a real disagreement about the census, which is
         // the residue re-derivation cannot resolve. Both camps verify; neither reaches 7 of 9.
         let other = honest(&prior, 121, 30, 5_000);
-        assert_ne!(good.record, other.record, "the two camps must really differ");
+        assert_ne!(
+            good.record, other.record,
+            "the two camps must really differ"
+        );
         let responses = sample(&[
             ("a", good),
             ("b", good),
