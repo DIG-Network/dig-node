@@ -750,33 +750,55 @@ pub fn collateral_buffer(
     pairs_served: Option<u64>,
     spendable_dig_base_units: Option<u64>,
 ) -> std::io::Result<Outcome> {
-    use crate::collateral::buffer_advice;
-    use dig_node_control_interface::params::DEFAULT_BUFFER_HORIZON_EPOCHS;
-
     let requirement_json = call_control(
         config,
         ControlAction::CollateralRequirement.method(),
         json!({}),
     )?;
-    let requirement: dig_node_control_interface::results::CollateralRequirementResult =
-        serde_json::from_value(requirement_json).map_err(std::io::Error::other)?;
     let margin_json = call_control(
         config,
         ControlAction::CollateralMarginGet.method(),
         json!({}),
     )?;
+    buffer_outcome(
+        requirement_json,
+        margin_json,
+        pairs_served,
+        spendable_dig_base_units,
+    )
+}
+
+/// Turn the two control answers into the buffer outcome — everything after the I/O.
+///
+/// # Why this is separate from [`collateral_buffer`]
+///
+/// Both guards this function carries are observable ONLY in the string it returns: that an
+/// undecodable margin is refused rather than defaulted to zero, and that an operator-supplied root
+/// count is marked as such. Left inline behind two `call_control` round trips, neither could be
+/// exercised without a listening node, and both duly went unpinned — a round-2 gate reverted them
+/// together and the suite stayed green. A defect in what a person reads needs a test that reads it.
+fn buffer_outcome(
+    requirement_json: Value,
+    margin_json: Value,
+    pairs_served: Option<u64>,
+    spendable_dig_base_units: Option<u64>,
+) -> std::io::Result<Outcome> {
+    use crate::collateral::buffer_advice;
+    use dig_node_control_interface::params::DEFAULT_BUFFER_HORIZON_EPOCHS;
+
+    let requirement: dig_node_control_interface::results::CollateralRequirementResult =
+        serde_json::from_value(requirement_json).map_err(std::io::Error::other)?;
     // Decoded typed and REFUSED if undecodable, never defaulted to zero. A zero margin is a
     // legitimate setting, so a missing one substituted for it is indistinguishable from a real
     // answer — and it understates the recommendation by exactly the cushion the operator chose,
     // which is enough to render `BelowRecommendedBuffer` as `Funded`.
     let margin: dig_node_control_interface::results::CollateralMarginResult =
         serde_json::from_value(margin_json).map_err(std::io::Error::other)?;
-    let margin_bp = margin.margin_bp;
 
     let advice = buffer_advice(
         pairs_served,
         &requirement,
-        margin_bp,
+        margin.margin_bp,
         spendable_dig_base_units,
         DEFAULT_BUFFER_HORIZON_EPOCHS,
     );
@@ -1276,6 +1298,152 @@ mod tests {
         );
         assert!(line.contains("0.900000x"), "{line}");
         assert!(line.contains("0.720 DIG"), "{line}");
+    }
+
+    /// A well-formed `known` requirement, for the buffer fixtures below.
+    fn known_requirement_json() -> Value {
+        json!({
+            "state": "known",
+            "epoch": 104,
+            "protocol_version": 1,
+            "required_per_store_dig_base_units": 3_780u64,
+            "stores": 17,
+            "owners": 820,
+            "multiplier_micros": 1_000_000u64,
+            "handicap_dig_base_units": 0u64,
+        })
+    }
+
+    /// The recommendation the buffer reaches for `margin_bp`, read off the machine result.
+    fn recommendation_at(margin_bp: u64) -> u64 {
+        let outcome = buffer_outcome(
+            known_requirement_json(),
+            json!({ "margin_bp": margin_bp }),
+            Some(3),
+            Some(u64::MAX / 2),
+        )
+        .expect("a well-formed pair decodes");
+        outcome.result["recommended_buffer_dig_base_units"]
+            .as_u64()
+            .expect("a known answer carries its recommendation")
+    }
+
+    /// An undecodable margin must ABORT the buffer, never be substituted with zero.
+    ///
+    /// # Why this asserts the FLIP and not merely an error
+    ///
+    /// The nearest wrong implementation is `unwrap_or(0)`, and it fails in the dangerous
+    /// direction: it understates the recommendation by exactly the cushion the operator chose, so
+    /// a node that is `BelowRecommendedBuffer` reads as `Funded` and nobody adds the $DIG. An
+    /// `is_err()` assertion alone would pin the refusal while saying nothing about why it matters —
+    /// and would still pass if the cushion had quietly stopped affecting the figure.
+    ///
+    /// So the balance is pinned at the ZERO-margin recommendation: the exact point at which the
+    /// two implementations disagree about the funding state. A margin of zero calls that funded; a
+    /// real 500 bp margin does not. The fixture is calibrated at run time from the machine result
+    /// rather than from a hard-coded figure, so it cannot drift out of the band it is testing.
+    #[test]
+    fn an_undecodable_margin_aborts_the_buffer_rather_than_becoming_a_zero_cushion() {
+        let at_zero = recommendation_at(0);
+        let at_500 = recommendation_at(500);
+        // The cushion is real money, and it is the money the defaulted-to-zero path would drop.
+        assert!(
+            at_500 > at_zero,
+            "a 500 bp margin must recommend more than none: {at_500} vs {at_zero}"
+        );
+
+        // Held at exactly the zero-margin recommendation: funded only if the cushion is ignored.
+        let human = |margin_bp: u64| {
+            buffer_outcome(
+                known_requirement_json(),
+                json!({ "margin_bp": margin_bp }),
+                Some(3),
+                Some(at_zero),
+            )
+            .expect("a well-formed pair decodes")
+            .summary
+        };
+        let fabricated = human(0);
+        let truthful = human(500);
+        assert!(
+            fabricated.contains("funded"),
+            "the zero-margin reading should be the reassuring one: {fabricated}"
+        );
+        assert!(
+            !truthful.contains("funded — at or above"),
+            "a real 500 bp margin must not read as funded at the zero-margin figure: {truthful}"
+        );
+        assert!(
+            truthful.contains("Add "),
+            "the truthful reading must state an amount to add: {truthful}"
+        );
+
+        // And the defect itself: an undecodable margin produces NO reading at all.
+        for (label, margin) in [
+            ("empty object", json!({})),
+            ("wrong type", json!({ "margin_bp": "500" })),
+            ("misspelled field", json!({ "marginBp": 500 })),
+        ] {
+            let outcome = buffer_outcome(known_requirement_json(), margin, Some(3), Some(at_zero));
+            assert!(
+                outcome.is_err(),
+                "{label} produced a buffer reading from an unknown margin: {:?}",
+                outcome.map(|o| o.summary)
+            );
+        }
+    }
+
+    /// An operand-supplied root count is MARKED, and the shared renderer does not mark anything.
+    ///
+    /// # Why the second assertion is the load-bearing one
+    ///
+    /// This is a PLACEMENT, not an outcome: the marker is correct only when it sits on the operand
+    /// path. Put it inside [`render_buffer`] instead — the obvious "simplification", since that is
+    /// where the line is built — and the node's OWN measured answer starts claiming the operator
+    /// supplied a count they never typed, which is the same confusion inverted. Asserting only
+    /// that the operand path carries the marker would pass under that mislocation.
+    ///
+    /// So the second actor is the shared renderer, given the SAME advice: it must stay silent.
+    #[test]
+    fn an_operand_supplied_root_count_is_marked_and_only_on_the_operand_path() {
+        const MARKER: &str = "supplied by you via `--roots`";
+
+        let operand = buffer_outcome(
+            known_requirement_json(),
+            json!({ "margin_bp": 100 }),
+            Some(3),
+            Some(u64::MAX / 2),
+        )
+        .expect("a well-formed pair decodes")
+        .summary;
+        assert!(
+            operand.contains(MARKER),
+            "an operand-supplied count must say so where the figure is read: {operand}"
+        );
+        assert!(
+            operand.contains("not measured by this node"),
+            "the marker must say what it is NOT, not merely name the flag: {operand}"
+        );
+
+        // The same advice through the shared renderer — the node's own measured answer. Silent.
+        let requirement: dig_node_control_interface::results::CollateralRequirementResult =
+            serde_json::from_value(known_requirement_json()).expect("fixture decodes");
+        let advice = crate::collateral::buffer_advice(
+            Some(3),
+            &requirement,
+            100,
+            Some(u64::MAX / 2),
+            dig_node_control_interface::params::DEFAULT_BUFFER_HORIZON_EPOCHS,
+        );
+        let measured = render_buffer(&advice);
+        assert!(
+            !measured.contains(MARKER),
+            "the node's own measured count must not claim an operator supplied it: {measured}"
+        );
+        // The control: both really are describing the same three roots, so the difference above
+        // is the marker and not two unrelated answers.
+        assert!(measured.contains("serving 3 store root(s)"), "{measured}");
+        assert!(operand.contains("serving 3 store root(s)"), "{operand}");
     }
 
     /// A payload this build cannot decode must render as UNREADABLE — never as a figure, and never

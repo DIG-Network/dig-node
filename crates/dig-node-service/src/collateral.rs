@@ -65,12 +65,6 @@ impl Default for CollateralConfig {
 }
 
 impl CollateralConfig {
-    /// Load from `dir`, falling back to the default for a missing OR unreadable file.
-    ///
-    /// An unreadable file yields the default rather than an error because the margin is a cushion:
-    /// refusing to start over a corrupt preference file would take the node down over the one
-    /// setting whose absence is survivable. The fallback is the `+1%` default, never `0`, so the
-    /// degraded path still errs toward over-posting.
     /// Load from the node's own machine-wide state directory.
     ///
     /// The production entry point. It resolves the directory ITSELF via [`crate::state::state_dir`]
@@ -90,11 +84,47 @@ impl CollateralConfig {
     /// Load from an explicit directory.
     ///
     /// For tests and for callers that already own a directory. Production uses [`Self::load`].
+    ///
+    /// # Why an unreadable preference file yields the default rather than an error
+    ///
+    /// The margin is a cushion, and refusing to start over a corrupt preference file would take
+    /// the node down over the one setting whose absence is survivable. The fallback is the `+1%`
+    /// default, never `0`, so the degraded path still errs toward OVER-posting.
+    ///
+    /// # But it is not SILENT about which case it is in
+    ///
+    /// A missing file and a file that exists and cannot be read are different facts, exactly as
+    /// they are for [`EpochRecordStore::get`]. Collapsing them here is bounded — both land on the
+    /// same survivable default, the result is visible on `dign collateral margin`, and it reaches
+    /// no spend path — but silence is how an operator whose margin has quietly reverted to the
+    /// default learns about it only from a figure that looks deliberate. Falling back is the right
+    /// behaviour; doing it without saying so is not.
     pub fn load_from(dir: &Path) -> Self {
-        std::fs::read_to_string(dir.join(COLLATERAL_CONFIG_FILE))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        let path = dir.join(COLLATERAL_CONFIG_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // Nothing written yet: the default IS the answer, and there is nothing to report.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "the collateral preference file could not be read; using the default safety margin"
+                );
+                return Self::default();
+            }
+        };
+        match serde_json::from_str(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "the collateral preference file could not be parsed; using the default safety margin"
+                );
+                Self::default()
+            }
+        }
     }
 
     /// Persist to `dir`, creating the state directory with restricted permissions if needed.
@@ -283,11 +313,13 @@ pub fn current_epoch_now() -> CurrentEpoch {
 /// and the buffer scales it — a forged multiplier yields a recommendation in the millions of DIG.
 ///
 /// It is not defended here for three reasons. Writing that record requires write access to the
-/// node's state directory, which is also where the margin, the config and the identity key live —
-/// an attacker holding it does not need this path. Arbitrary corruption already fails closed, as
-/// an unparseable line is [`StoredEpoch::Unreadable`] rather than a figure. And a plausibility
-/// bound derived here would be a rival implementation of the controller `dig-mirror-collateral`
-/// owns, which is how two surfaces come to disagree about one price.
+/// node's machine-wide state directory, which is where the CONTROL TOKEN lives — a strictly
+/// greater capability than a false requirement, since it authorises every `control.*` call. (The
+/// identity key is NOT there: [`crate::state`] holds only the control/auth state and is
+/// identity-independent by design. The bounding rests on the token.) Arbitrary corruption already
+/// fails closed, as an unparseable line is [`StoredEpoch::Unreadable`] rather than a figure. And a
+/// plausibility bound derived here would be a rival implementation of the controller
+/// `dig-mirror-collateral` owns, which is how two surfaces come to disagree about one price.
 ///
 /// The honest remedy is a check the record can make against its OWN published invariants — chiefly
 /// that `protocol_version` does not exceed what this build implements, since a record from a newer
