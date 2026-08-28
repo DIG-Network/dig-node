@@ -138,6 +138,172 @@ impl CollateralConfig {
     }
 }
 
+/// How this node came to hold a record.
+///
+/// Carried, and displayed, because the three ways differ in **what was verified**, and an operator
+/// reading a requirement is entitled to know which one produced it. A bootstrap record depends on
+/// nothing and cannot be wrong. A censused record rests on this node's own chain reads. An adopted
+/// one rests on a sample of untrusted peers whose *arithmetic* this node re-derived but whose
+/// *census inputs* it did not check against chain — the weakest of the three, and the one that
+/// would be most damaging to present with the authority of the strongest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecordProvenance {
+    /// Epoch 1, derived from nothing: the anchor the recurrence unrolls from.
+    Bootstrap,
+    /// Censused by this node from its own chain reads.
+    Censused,
+    /// Adopted from a sample of peers, every counted response re-derived first.
+    AdoptedFromPeers {
+        /// How many distinct owners returned the record that was adopted.
+        agreed: u64,
+        /// How many distinct owners answered at all.
+        sampled: u64,
+    },
+}
+
+impl RecordProvenance {
+    /// How strong the evidence behind a record is, for comparison only.
+    ///
+    /// Used in exactly one place — deciding whether a re-`put` of an IDENTICAL record may record
+    /// stronger evidence for it (see [`EpochRecordStore::put`]). It never orders two different
+    /// records, because a record is not made true by the confidence of whoever offered it.
+    fn strength(self) -> u8 {
+        match self {
+            RecordProvenance::AdoptedFromPeers { .. } => 0,
+            RecordProvenance::Censused => 1,
+            RecordProvenance::Bootstrap => 2,
+        }
+    }
+}
+
+/// One epoch as this node stores it: the consensus record, plus how this node came by it.
+///
+/// # Why the census height is here and not in `EpochRecord`
+///
+/// `EpochRecord` is the consensus object — the thing every node must derive identically, and the
+/// thing `EpochRecord::advance` reproduces from its predecessor and a census. The height at which
+/// the census was TAKEN is not one of its inputs: two nodes reading the same chain at the same
+/// height derive the same record whether or not either records the height. It is carried here
+/// because it is what makes a record auditable — it names the block a disputed census can be
+/// re-run against — and because it must never be able to change the arithmetic.
+///
+/// It is `Option` rather than required for one honest reason: epoch 1 is derived from nothing and
+/// was taken at no height. `None` therefore means "no census was taken", not "the height was lost",
+/// and [`RecordProvenance`] beside it says which case a reader is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRecord {
+    /// The consensus record, flattened onto the line.
+    ///
+    /// Flattened rather than nested so that a line written before this envelope existed — a bare
+    /// `EpochRecord` — still parses, with `census_height` absent and the provenance defaulted to
+    /// the weakest reading. The store had no production writer before dig-node#387, so no such
+    /// line exists in the wild; the compatibility costs one attribute and removes the class of
+    /// migration bug entirely.
+    #[serde(flatten)]
+    pub record: EpochRecord,
+
+    /// The block height the census behind this record was taken at, absent at epoch 1.
+    #[serde(default)]
+    pub census_height: Option<u32>,
+
+    /// How this node came by the record.
+    #[serde(default = "weakest_provenance")]
+    pub provenance: RecordProvenance,
+}
+
+/// The provenance a line that does not state one is read as.
+///
+/// The WEAKEST, deliberately. A line with no provenance is one this node cannot account for, and
+/// reading it as `Censused` would upgrade an unexplained record to "I verified this myself".
+fn weakest_provenance() -> RecordProvenance {
+    RecordProvenance::AdoptedFromPeers {
+        agreed: 0,
+        sampled: 0,
+    }
+}
+
+impl StoredRecord {
+    /// Epoch 1: the record that depends on nothing.
+    #[must_use]
+    pub fn bootstrap() -> Self {
+        StoredRecord {
+            record: EpochRecord::bootstrap(),
+            census_height: None,
+            provenance: RecordProvenance::Bootstrap,
+        }
+    }
+
+    /// A record this node censused itself, at `census_height`.
+    #[must_use]
+    pub fn censused(record: EpochRecord, census_height: u32) -> Self {
+        StoredRecord {
+            record,
+            census_height: Some(census_height),
+            provenance: RecordProvenance::Censused,
+        }
+    }
+
+    /// Is this record governed by a ruleset this build implements?
+    ///
+    /// The **protocol-version ceiling check** (dig-node#387, D1's remedy). A record naming a
+    /// version above what this build knows is one this binary cannot interpret even though every
+    /// field of it parses: the arithmetic that produced it is not the arithmetic this build has.
+    /// Serving it as authoritative is how a forged record reached an 18,482,313.402 DIG
+    /// recommendation in a probe — the figure parsed, so nothing downstream questioned it.
+    ///
+    /// Delegated to `ProtocolVersion::implemented`, never to a comparison against a local
+    /// constant: the set of implemented versions is `dig-mirror-collateral`'s to state, and a
+    /// second copy of it here would be a rival implementation of the one fact that decides whether
+    /// this node speaks the network's rules.
+    #[must_use]
+    pub fn is_interpretable(&self) -> bool {
+        self.record.protocol_version.implemented().is_ok()
+    }
+}
+
+/// What a [`put`](EpochRecordStore::put) did.
+///
+/// A refusal is a RESULT here, not an error. History is immutable: a record that contradicts one
+/// already held is refused, and the caller — a sampled sync adopting from peers — needs to tell
+/// "already had it" from "a peer told me something different" in order to report the second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutOutcome {
+    /// The record was appended.
+    Written,
+    /// This exact record was already held, with evidence at least as strong.
+    AlreadyPresent,
+    /// A DIFFERENT record is already held for this epoch, and was kept.
+    ///
+    /// The stored one wins, always. A node that let the newest writer win could be walked off the
+    /// network's history one epoch at a time by whoever spoke last.
+    Conflict {
+        /// What this node holds, and continues to hold.
+        held: Box<StoredRecord>,
+    },
+}
+
+/// How much history to keep.
+///
+/// **The default is [`RetentionPolicy::KeepEverything`]**, and the default is the point: the model's
+/// whole premise is that any node can recompute any past epoch and reach the same answer, and a
+/// node that discarded history by default would quietly erode the network's ability to audit
+/// itself. Truncation is an operator's deliberate choice about their own disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionPolicy {
+    /// Keep every epoch, forever. The default.
+    KeepEverything,
+    /// Keep the newest `epochs` epochs, counting back from the current one.
+    KeepEpochs(u64),
+}
+
+/// A year of epochs, derived from the epoch length rather than stated as a number.
+///
+/// `dig_constants::MIRROR_EPOCH_LENGTH_MS` is seven days, so this is 52. Writing `52` here would be
+/// a second statement of the schedule that a retune of the epoch length would silently contradict.
+pub const RETENTION_ONE_YEAR_EPOCHS: u64 =
+    (365 * 24 * 60 * 60 * 1_000) / (dig_constants::MIRROR_EPOCH_LENGTH_MS as u64);
+
 /// The per-epoch collateral records this node has censused.
 ///
 /// Append-only JSONL, highest revision of an epoch winning, mirroring the spend-audit record's
@@ -151,7 +317,7 @@ pub struct EpochRecordStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredEpoch {
     /// A record was found and parsed.
-    Found(Box<EpochRecord>),
+    Found(Box<StoredRecord>),
     /// No record for this epoch.
     Absent,
     /// A record for this epoch exists and could not be read.
@@ -181,8 +347,64 @@ impl EpochRecordStore {
         &self.path
     }
 
-    /// Append one censused record.
-    pub fn put(&self, record: &EpochRecord) -> std::io::Result<()> {
+    /// Record one epoch, refusing to contradict an epoch already held.
+    ///
+    /// **This is the store's production writer** (dig-node#387). Before it existed the store was
+    /// written only by its own tests, so `control.collateral.requirement` answered
+    /// `unknown / not_censused` on every node in the network, forever.
+    ///
+    /// # Historical records are permanent and immutable
+    ///
+    /// The model's premise is that any node can recompute any past epoch and get the same answer.
+    /// A store that let a later write replace an earlier one would break that at the only point
+    /// where it matters: an attacker who can get a record in front of this node could walk it off
+    /// the network's history one epoch at a time, and every downstream figure — including the
+    /// amount of $DIG this operator posts — would follow. So a record that DIFFERS from one
+    /// already held is refused as [`PutOutcome::Conflict`] and the held one is kept.
+    ///
+    /// An identical record offered with STRONGER evidence is appended, because the consensus
+    /// figures do not change — only this node's account of how it came by them improves, and an
+    /// operator who later censuses an epoch they had adopted from peers should see that. The
+    /// reverse is not appended: evidence does not weaken on re-offer.
+    ///
+    /// # Errors
+    ///
+    /// The underlying write, and an [`std::io::ErrorKind::InvalidData`] when the file holds a line
+    /// for this epoch that cannot be read. Refusing there is deliberate: appending beside a record
+    /// that cannot be compared would silently create two answers for one epoch.
+    pub fn put(&self, record: &StoredRecord) -> std::io::Result<PutOutcome> {
+        match self.get(record.record.epoch) {
+            StoredEpoch::Found(held) if held.record != record.record => {
+                return Ok(PutOutcome::Conflict { held })
+            }
+            StoredEpoch::Found(held)
+                if held.provenance.strength() >= record.provenance.strength() =>
+            {
+                return Ok(PutOutcome::AlreadyPresent)
+            }
+            StoredEpoch::Found(_) => {}
+            StoredEpoch::Unreadable => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "epoch {} is already recorded in a line that cannot be read; \
+                         refusing to write a second answer beside it",
+                        record.record.epoch
+                    ),
+                ))
+            }
+            StoredEpoch::Absent => {}
+        }
+        self.append(record)?;
+        Ok(PutOutcome::Written)
+    }
+
+    /// Append one line, with no regard for what is already held.
+    ///
+    /// Private, and the only writer. [`Self::put`] owns the immutability decision; keeping the
+    /// bytes-to-disk step separate is what stops a second caller from acquiring the ability to
+    /// overwrite history by reaching past that decision.
+    fn append(&self, record: &StoredRecord) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             crate::state::ensure_dir_restricted(dir)?;
         }
@@ -217,11 +439,11 @@ impl EpochRecordStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StoredEpoch::Absent,
             Err(_) => return StoredEpoch::Unreadable,
         };
-        let mut best: Option<EpochRecord> = None;
+        let mut best: Option<StoredRecord> = None;
         let mut saw_unreadable = false;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            match serde_json::from_str::<EpochRecord>(line) {
-                Ok(rec) if rec.epoch == epoch => {
+            match serde_json::from_str::<StoredRecord>(line) {
+                Ok(rec) if rec.record.epoch == epoch => {
                     best = Some(rec);
                 }
                 Ok(_) => {}
@@ -238,6 +460,91 @@ impl EpochRecordStore {
             None => StoredEpoch::Absent,
         }
     }
+
+    /// Every epoch held, newest revision of each, in ascending epoch order.
+    ///
+    /// Unreadable lines are SKIPPED rather than reported here, and that is the one place in this
+    /// module where collapsing them is right: this is a listing, its caller is showing an operator
+    /// what the node holds, and [`Self::get`] remains the authority on any single epoch. A listing
+    /// that refused wholesale because one line of a thousand had rotted would hide the 999 that
+    /// are fine.
+    ///
+    /// # Errors
+    ///
+    /// The underlying read. A MISSING file is an empty list, not an error: a node that has never
+    /// recorded an epoch holds no epochs, which is a fact rather than a fault.
+    pub fn records(&self) -> std::io::Result<Vec<StoredRecord>> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut by_epoch: std::collections::BTreeMap<u64, StoredRecord> =
+            std::collections::BTreeMap::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(rec) = serde_json::from_str::<StoredRecord>(line) {
+                by_epoch.insert(rec.record.epoch, rec);
+            }
+        }
+        Ok(by_epoch.into_values().collect())
+    }
+
+    /// Apply a retention policy, as of `current_epoch`. Returns how many epochs were dropped.
+    ///
+    /// [`RetentionPolicy::KeepEverything`] — the default — reads nothing and writes nothing, so a
+    /// node that never opts in never rewrites this file at all.
+    ///
+    /// Truncation rewrites the file from the surviving records rather than editing it in place, so
+    /// the result is exactly one line per surviving epoch and a partially-written rewrite cannot
+    /// leave a half-line behind: the new content is written beside the old and renamed over it.
+    ///
+    /// # Errors
+    ///
+    /// The underlying read, write, or rename.
+    pub fn prune(&self, policy: RetentionPolicy, current_epoch: u64) -> std::io::Result<u64> {
+        let RetentionPolicy::KeepEpochs(keep) = policy else {
+            return Ok(0);
+        };
+        // `keep` epochs INCLUDING the current one, so a policy of 1 keeps exactly the current
+        // epoch. Saturating, so a `keep` larger than the epoch number keeps everything rather than
+        // wrapping to a cutoff near `u64::MAX` that would discard the entire history.
+        let oldest_kept = current_epoch.saturating_sub(keep.saturating_sub(1));
+        let held = self.records()?;
+        let (kept, dropped): (Vec<_>, Vec<_>) = held
+            .into_iter()
+            .partition(|rec| rec.record.epoch >= oldest_kept);
+        if dropped.is_empty() {
+            return Ok(0);
+        }
+        let mut body = Vec::new();
+        for rec in &kept {
+            body.extend_from_slice(&serde_json::to_vec(rec).map_err(std::io::Error::other)?);
+            body.push(b'\n');
+        }
+        let temp = self.path.with_extension("jsonl.rewrite");
+        std::fs::write(&temp, &body)?;
+        crate::control::restrict_permissions(&temp);
+        std::fs::rename(&temp, &self.path)?;
+        crate::control::restrict_permissions(&self.path);
+        Ok(dropped.len() as u64)
+    }
+}
+
+/// Write epoch 1's record if this node holds none, and report whether it did.
+///
+/// The genesis half of the production writer, and the only record any node can produce with no
+/// chain access and no peers: [`EpochRecord::bootstrap`] depends on nothing. It is what makes the
+/// recurrence well-founded, and it is what a fresh node's sampled sync verifies its first peer
+/// answer against.
+///
+/// Idempotent, and safe against a store that already holds a DIFFERENT epoch-1 record: [`put`]
+/// refuses the contradiction and this reports it rather than overwriting.
+///
+/// # Errors
+///
+/// The underlying write.
+pub fn ensure_bootstrap(store: &EpochRecordStore) -> std::io::Result<PutOutcome> {
+    store.put(&StoredRecord::bootstrap())
 }
 
 /// Does an unparseable line claim to be about `epoch`?
@@ -321,11 +628,10 @@ pub fn current_epoch_now() -> CurrentEpoch {
 /// plausibility bound derived here would be a rival implementation of the controller
 /// `dig-mirror-collateral` owns, which is how two surfaces come to disagree about one price.
 ///
-/// The honest remedy is a check the record can make against its OWN published invariants — chiefly
-/// that `protocol_version` does not exceed what this build implements, since a record from a newer
-/// model is one this build cannot interpret even when every field parses. That belongs with the
-/// census writer, where those invariants live, and is tracked on dig-node#387 rather than bolted
-/// on at the read side.
+/// The one check the record CAN make against its own published invariants is made, below: a
+/// record whose `protocol_version` exceeds what this build implements is refused rather than
+/// served, because a record from a newer model is one this build cannot interpret even when every
+/// field of it parses.
 ///
 /// The margin is deliberately not consulted. `required_per_store_dig_base_units` is the PRE-margin,
 /// consensus-derived figure every node derives identically; folding a local preference into it here
@@ -341,17 +647,32 @@ pub fn requirement(store: &EpochRecordStore, current: CurrentEpoch) -> Collatera
         CurrentEpoch::NoChainSource => return unknown(CollateralUnknownReason::NoChainSource),
     };
     match store.get(epoch) {
+        // THE PROTOCOL-VERSION CEILING (dig-node#387, D1's remedy). A record naming a ruleset this
+        // build does not implement is refused BEFORE its figures are read, not after: every field
+        // of such a record parses, so nothing downstream would question the number, and a forged
+        // one drove an 18,482,313.402 DIG recommendation in a probe. `RecordUnreadable` is the
+        // honest reason — the node holds a record for the epoch and cannot READ it, in the exact
+        // sense that matters, which is that it does not have the arithmetic that produced it.
+        StoredEpoch::Found(rec) if !rec.is_interpretable() => {
+            tracing::warn!(
+                epoch = rec.record.epoch,
+                protocol_version = rec.record.protocol_version.0,
+                "the stored collateral record names a ruleset this build does not implement; \
+                 refusing to serve its figures"
+            );
+            unknown(CollateralUnknownReason::RecordUnreadable)
+        }
         StoredEpoch::Found(rec) => CollateralRequirementResult::Known {
-            epoch: rec.epoch,
+            epoch: rec.record.epoch,
             // The version that COMPUTED the epoch, read off the record, never the newest version
             // this build implements. The two differ exactly when a node has upgraded mid-schedule,
             // which is the one case where the client needs to know the difference.
-            protocol_version: rec.protocol_version.0,
-            required_per_store_dig_base_units: rec.required_per_store_dig_base_units,
-            stores: rec.census.stores,
-            owners: rec.census.owners,
-            multiplier_micros: rec.multiplier_micros,
-            handicap_dig_base_units: rec.handicap_dig_base_units,
+            protocol_version: rec.record.protocol_version.0,
+            required_per_store_dig_base_units: rec.record.required_per_store_dig_base_units,
+            stores: rec.record.census.stores,
+            owners: rec.record.census.owners,
+            multiplier_micros: rec.record.multiplier_micros,
+            handicap_dig_base_units: rec.record.handicap_dig_base_units,
         },
         StoredEpoch::Absent => unknown(CollateralUnknownReason::NotCensused),
         StoredEpoch::Unreadable => unknown(CollateralUnknownReason::RecordUnreadable),
@@ -597,8 +918,8 @@ mod tests {
         let store = store_at(dir.path());
         // Two epochs present, with DIFFERENT multipliers and owner counts, so answering with the
         // wrong one is observable. A single-record fixture could not see that.
-        store.put(&record(7, 1_000_000, 1_000, 40)).expect("put");
-        store.put(&record(8, 500_000, 600, 25)).expect("put");
+        store.put(&StoredRecord::censused(record(7, 1_000_000, 1_000, 40), 5_100)).expect("put");
+        store.put(&StoredRecord::censused(record(8, 500_000, 600, 25), 5_200)).expect("put");
 
         let answer = requirement(&store, CurrentEpoch::Final(8));
         let CollateralRequirementResult::Known {
@@ -629,7 +950,7 @@ mod tests {
     fn each_missing_fact_gets_its_own_reason() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store_at(dir.path());
-        store.put(&record(3, 1_000_000, 1_000, 10)).expect("put");
+        store.put(&StoredRecord::censused(record(3, 1_000_000, 1_000, 10), 4_000)).expect("put");
 
         let reason = |c| match requirement(&store, c) {
             CollateralRequirementResult::Unknown { reason } => reason,
@@ -700,7 +1021,7 @@ mod tests {
         let store = store_at(dir.path());
         // A healthy neighbouring record, so the fixture keeps an honest control: a store that was
         // entirely corrupt could not show that the corruption was ATTRIBUTED to epoch 5.
-        store.put(&record(4, 1_000_000, 1_000, 10)).expect("put");
+        store.put(&StoredRecord::censused(record(4, 1_000_000, 1_000, 10), 4_100)).expect("put");
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -768,7 +1089,7 @@ mod tests {
     fn the_known_answer_carries_the_census_inputs_a_client_needs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store_at(dir.path());
-        store.put(&record(12, 800_000, 750, 31)).expect("put");
+        store.put(&StoredRecord::censused(record(12, 800_000, 750, 31), 6_000)).expect("put");
 
         let wire =
             serde_json::to_value(requirement(&store, CurrentEpoch::Final(12))).expect("serialise");
