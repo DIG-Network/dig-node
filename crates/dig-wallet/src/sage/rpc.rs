@@ -8574,6 +8574,133 @@ mod tests {
         );
     }
 
+    /// **Proves (dig-node#394):** a coin found by HINT never reaches `coins` on the point-read
+    /// tier, and never becomes a selectable XCH input — while a coin at the wallet's OWN puzzle
+    /// hash still does.
+    ///
+    /// THE BUG THIS PINS. `refresh_tracked_coins` fetched by puzzle hash AND by hint and upserted
+    /// both. A row with no `asset_id` means XCH, and anybody may `CREATE_COIN` with any hint, so
+    /// one mojo per displayed base unit bought a fabricated XCH balance from an attacker holding
+    /// nothing but the victim's public address. Worse than the wrong figure: selection is
+    /// largest-first and nobody can spend the coin, so it is a permanent XCH send kill-switch.
+    /// This tier needs no peer at all — the coinset oracle serves it.
+    ///
+    /// FIXTURE DESIGN — the honest coin is what makes this a PLACEMENT test rather than an
+    /// outcome test. "The balance is 999999999 short" is satisfied identically by a correct
+    /// re-route and by a refresh that fetched nothing at all, and the second is a different bug.
+    /// So an ordinary XCH coin at the wallet's own p2 hash rides along as a truthful control: it
+    /// must still be admitted, still be selectable, and still be the ENTIRE balance. And the
+    /// fabricated coin is asserted present in STAGING, so "not in `coins`" cannot be satisfied by
+    /// dropping it on the floor either — the two assertions together pin where it went, not
+    /// merely where it did not go.
+    #[tokio::test]
+    async fn a_hinted_coin_is_staged_while_a_coin_at_our_own_hash_is_admitted() {
+        use super::super::fallback::ChainFallback;
+
+        struct TwoTierFallback {
+            at_our_hash: FallbackCoin,
+            hinted: FallbackCoin,
+        }
+        #[async_trait::async_trait]
+        impl ChainFallback for TwoTierFallback {
+            async fn coin_records_by_puzzle_hashes(
+                &self,
+                _phs: &[String],
+            ) -> Result<Vec<FallbackCoin>> {
+                Ok(vec![self.at_our_hash.clone()])
+            }
+            async fn coin_records_by_hints(&self, _hints: &[String]) -> Result<Vec<FallbackCoin>> {
+                Ok(vec![self.hinted.clone()])
+            }
+            async fn coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
+                Ok(None)
+            }
+            async fn coin_spend(&self, _coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+                Ok(None)
+            }
+            async fn coin_records_by_parent(&self, _p: &str) -> Result<Vec<FallbackCoin>> {
+                Ok(vec![])
+            }
+            fn is_live(&self) -> bool {
+                true
+            }
+        }
+
+        let pair = BlsPair::new(3);
+        let signer = Arc::new(WalletSigner::new(vec![pair.sk], Bytes32::new([0u8; 32])));
+        let ph = *signer.puzzle_hashes().iter().next().unwrap();
+        let ph_hex = hex::encode(ph);
+
+        // What the attacker places: a coin at the derived $DIG hash for this victim, hinted to
+        // them, for a number they will read as their balance. It costs one mojo per base unit and
+        // needs only `ph`, which is public.
+        let derived_hash = digstore_chain::cat::cat_puzzle_hash(ph, digstore_chain::dig::DIG_ASSET_ID);
+        let fallback = TwoTierFallback {
+            at_our_hash: FallbackCoin {
+                coin_id: "aa".repeat(32),
+                parent_coin_info: "11".repeat(32),
+                puzzle_hash: ph_hex.clone(),
+                amount: 7_000,
+                created_height: Some(5),
+                spent_height: None,
+                created_timestamp: Some(1),
+                spent_timestamp: None,
+            },
+            hinted: FallbackCoin {
+                coin_id: "bb".repeat(32),
+                parent_coin_info: "22".repeat(32),
+                puzzle_hash: hex::encode(derived_hash),
+                amount: 999_999_999,
+                created_height: Some(6),
+                spent_height: None,
+                created_timestamp: Some(2),
+                spent_timestamp: None,
+            },
+        };
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![ph_hex.clone()],
+            address_prefix: "txch".into(),
+            ..Default::default()
+        };
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            Arc::new(fallback),
+            cfg,
+        )
+        .with_signer(signer);
+
+        // No lineage source is attached, so nothing can prove the fabricated coin — which is the
+        // attacker's own situation, since no parent spend exists that would.
+        let n = be.refresh_tracked_coins().await.unwrap();
+        assert_eq!(n, 1, "only the coin at our own puzzle hash is admitted");
+
+        // WHERE THE FABRICATED COIN WENT: staging, awaiting a proof it cannot get.
+        assert_eq!(
+            be.db.staged_cat_admission_count().await.unwrap(),
+            1,
+            "the hinted coin must be STAGED -- not admitted, and not silently dropped"
+        );
+
+        // WHAT THE MONEY SURFACES SAY. The control's amount, exactly, and nothing else.
+        assert_eq!(
+            be.db.balance(None).await.unwrap(),
+            7_000,
+            "the fabricated coin must contribute nothing to the XCH balance"
+        );
+        let selectable = be.db.unspent_coins(None).await.unwrap();
+        assert_eq!(
+            selectable.len(),
+            1,
+            "and must never become a selectable XCH input: selection is largest-first, so one \\
+             unspendable coin at the head is a permanent send kill-switch"
+        );
+        assert_eq!(
+            selectable[0].coin_id,
+            "aa".repeat(32),
+            "the one selectable coin is the honest one"
+        );
+    }
+
     /// A locked wallet (no signer ⇒ no tracked puzzle hashes) is a clean no-op refresh — never an
     /// error, never a spurious sync.
     #[tokio::test]

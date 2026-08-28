@@ -1032,6 +1032,82 @@ mod tests {
         );
     }
 
+    /// **Proves (dig-node#394):** an UNPREDICTED staged coin — one found by hint, with no derived
+    /// pair to check against — promotes only when the parent spend hints it to an address this
+    /// wallet actually controls.
+    ///
+    /// THE RISK THIS PINS. A coin found by hint carries no prediction, so the asset-id and owner
+    /// comparisons the derived path relies on have nothing to compare with. If that branch simply
+    /// skipped the owner check, the hint would reach `coins` attacker-controlled — the whole of
+    /// #394, moved one layer inwards rather than fixed.
+    ///
+    /// FIXTURE DESIGN — the same coin, twice, with ONE thing varied. The lineage source, the
+    /// staged row, the reconstruction and the asset are identical across both halves; only the
+    /// set of addresses the wallet claims to control differs. So a pass cannot be explained by
+    /// anything except the owner check, and an implementation that ignored `owned_p2` fails the
+    /// second half while still passing the first.
+    #[tokio::test]
+    async fn an_unpredicted_hinted_coin_promotes_only_to_an_address_we_control() {
+        let f = real_cat();
+        let mut lineage = CountingLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(f.child.parent_coin_info), f.parent.clone());
+
+        // The staged row as the HINT path builds it: both derived fields empty, because nothing
+        // was predicted. Everything else is the real coin.
+        let unpredicted = StagedCatRow {
+            coin_id: hex::encode(f.child.coin_id()),
+            parent_coin_info: hex::encode(f.child.parent_coin_info),
+            puzzle_hash: hex::encode(f.child.puzzle_hash),
+            amount: f.child.amount.to_string(),
+            created_height: Some(10),
+            spent_height: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+            derived_asset_id: String::new(),
+            derived_owner_p2: String::new(),
+        };
+
+        // HALF ONE — the wallet controls the address the parent spend hints to.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.stage_cat_admissions(std::slice::from_ref(&unpredicted))
+            .await
+            .unwrap();
+        let ours: HashSet<String> = [hex::encode(f.owner_p2)].into_iter().collect();
+        let stats = promote_staged_cats(&db, &lineage, &ours).await.unwrap();
+        assert_eq!(
+            stats.promoted, 1,
+            "a hinted coin whose parent proves it ours must promote: {stats:?}"
+        );
+        assert_eq!(
+            db.balance(Some(&hex::encode(f.asset_id))).await.unwrap(),
+            u128::from(f.amount),
+            "and be counted under the asset the PARENT SPEND named, not one anybody claimed"
+        );
+
+        // HALF TWO — the identical coin, the identical proof, and the one varied thing: this
+        // wallet does not control the address it is hinted to.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.stage_cat_admissions(std::slice::from_ref(&unpredicted))
+            .await
+            .unwrap();
+        let stranger: HashSet<String> = [hex::encode(Bytes32::new([0x77; 32]))]
+            .into_iter()
+            .collect();
+        let stats = promote_staged_cats(&db, &lineage, &stranger).await.unwrap();
+        assert_eq!(
+            stats.refused, 1,
+            "a hinted coin belonging to somebody else must be REFUSED: {stats:?}"
+        );
+        assert_eq!(stats.promoted, 0);
+        assert_eq!(
+            db.all_coins().await.unwrap().len(),
+            0,
+            "and must not reach `coins` by any route"
+        );
+    }
+
     /// A coin that has already cleared promotion is NOT re-staged: its later states, a spend above
     /// all, must update `coins` normally.
     ///
