@@ -877,8 +877,8 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
 
     assert_eq!(
         h.script.catch_ups.lock().unwrap()[0],
-        expected,
-        "the subscribed set must be exactly the custodied p2 puzzle hashes"
+        subscribed_for(&expected),
+        "the subscribed set must be exactly the custodied p2 hashes and their derived CAT hashes"
     );
     assert!(
         db.is_synced().await.unwrap(),
@@ -1033,8 +1033,8 @@ async fn a_wallet_created_after_boot_is_subscribed_without_waiting_for_a_disconn
     .await;
     assert_eq!(
         h.script.catch_ups.lock().unwrap()[0],
-        vec![created],
-        "the catch-up must subscribe exactly the newly-created wallet's hash"
+        subscribed_for(&[created]),
+        "the catch-up must subscribe exactly the new wallet's hash and its derived CAT hash"
     );
     h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
         .await;
@@ -1145,6 +1145,27 @@ fn as_wire_matches_the_serialized_token_for_every_phase() {
             "as_wire disagrees with serde for {phase:?}"
         );
     }
+}
+
+/// The set a catch-up is expected to subscribe: the wallet's own addresses PLUS the outer CAT
+/// hash each of them would hold a `$DIG` coin at (dig-node#380).
+///
+/// Written as a DERIVATION rather than a widened expectation. A CAT coin does not sit at its
+/// owner's address, so subscribing addresses alone means the peer never sends the wallet its own
+/// CAT coins — the ingestion drop #380 measured. Asserting the union here pins that the extra
+/// hashes are exactly `cat_puzzle_hash(address, DIG_ASSET_ID)` and nothing else; an implementation
+/// that subscribed one hash too many, or the wrong curry, fails just as loudly as one that
+/// subscribed too few.
+fn subscribed_for(addresses: &[Bytes32]) -> Vec<Bytes32> {
+    let mut all: Vec<Bytes32> = addresses.to_vec();
+    all.extend(
+        addresses
+            .iter()
+            .map(|&p2| digstore_chain::cat::cat_puzzle_hash(p2, digstore_chain::dig::DIG_ASSET_ID)),
+    );
+    all.sort();
+    all.dedup();
+    all
 }
 
 /// **Proves (#2609):** an authoritative peer attached over a GENUINELY empty custody set reports
