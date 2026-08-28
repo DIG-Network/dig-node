@@ -597,6 +597,7 @@ impl Harness {
             chain_tip,
             session_lifetime,
             None,
+            KNOWN_CAT_ASSET_IDS.to_vec(),
         )
         .await
     }
@@ -614,6 +615,9 @@ impl Harness {
         chain_tip: Option<Arc<dyn ChainTipObserver>>,
         session_lifetime: Duration,
         attribution: Option<Arc<Attribution>>,
+        // The CAT asset ids whose outer puzzle hashes the supervisor derives and subscribes.
+        // Taken from the caller so a fixture can name the asset it actually issued.
+        cat_asset_ids: Vec<Bytes32>,
     ) -> Self {
         let factory = Arc::new(ScriptedFactory {
             script: script.clone(),
@@ -621,6 +625,7 @@ impl Harness {
             trust,
         });
         let (handle, join) = spawn_supervisor(Supervisor {
+            cat_asset_ids,
             db: db.clone(),
             puzzle_hashes: hashes,
             factory,
@@ -1920,6 +1925,7 @@ async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let factory = Arc::new(ChiaPeerSessionFactory::mainnet(db.clone()));
     let (handle, join) = spawn_supervisor(Supervisor {
+        cat_asset_ids: KNOWN_CAT_ASSET_IDS.to_vec(),
         db: db.clone(),
         puzzle_hashes: Arc::new(FixedHashes::none()),
         factory,
@@ -4464,6 +4470,15 @@ async fn the_supervisor_attributes_the_hinted_cat_coins_its_catch_up_syncs() {
             Arc::new(lineage),
             "xch".to_string(),
         ))),
+        // BOTH asset ids are known to the wallet, deliberately. Naming only ours would let the
+        // stranger's coin be refused for the wrong reason -- an unknown asset -- and the control
+        // would then pass against an implementation that ignored ownership entirely. With both
+        // assets derivable, the ONLY thing that can refuse the stranger's coin is that its owner
+        // p2 hash is not ours, which is the property under test.
+        vec![
+            Bytes32::new(hex::decode(&ours.asset_id).unwrap().try_into().unwrap()),
+            Bytes32::new(hex::decode(&stranger.asset_id).unwrap().try_into().unwrap()),
+        ],
     )
     .await;
 

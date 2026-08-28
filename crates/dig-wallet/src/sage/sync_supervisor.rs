@@ -1226,7 +1226,7 @@ impl StallWatch {
 /// $DIG is the only entry because it is the only asset the node has a compile-time id for.
 /// Discovering CATs whose ids are unknown in advance cannot be done by local derivation at all
 /// and is deliberately not attempted here (SPEC 18.11).
-const KNOWN_CAT_ASSET_IDS: [Bytes32; 1] = [digstore_chain::dig::DIG_ASSET_ID];
+pub const KNOWN_CAT_ASSET_IDS: [Bytes32; 1] = [digstore_chain::dig::DIG_ASSET_ID];
 
 /// The read-only inputs a CAT/singleton attribution pass needs, held for the life of the
 /// supervisor so every session it opens attributes the coins that session syncs.
@@ -1293,6 +1293,12 @@ pub struct Supervisor {
     /// "the check ran and found nothing" must not look the same. A supervisor built without one
     /// behaves exactly as it did before this field existed.
     pub chain_tip: Option<Arc<dyn ChainTipObserver>>,
+    /// The CAT asset ids whose outer puzzle hashes this supervisor derives and subscribes.
+    ///
+    /// Production passes [`KNOWN_CAT_ASSET_IDS`]. It is a field rather than a constant read at the
+    /// use site so a test can subscribe an asset its fixture actually issued — a suite that could
+    /// only ever exercise $DIG could not tell a working derivation from a hard-coded hash.
+    pub cat_asset_ids: Vec<Bytes32>,
     /// The CAT/singleton attribution inputs, or `None` for no attribution at all.
     ///
     /// `None` is honest and load-bearing rather than a silent default: a supervisor with no
@@ -1386,7 +1392,7 @@ impl Supervisor {
             // that asset and IS this wallet's, because the outer hash curries the TAIL around the
             // p2 hash — so subscribing them is what makes an incoming $DIG coin arrive already
             // attributed, with no chain read on the frame path (dig-node#380, #382).
-            let derived_cats = sync::DerivedCats::derive(&puzzle_hashes, &KNOWN_CAT_ASSET_IDS);
+            let derived_cats = sync::DerivedCats::derive(&puzzle_hashes, &self.cat_asset_ids);
             // The SUBSCRIPTION set, and the only place the derived hashes are allowed to widen
             // anything. Three neighbouring sets mean different things and a leak between them is a
             // different money bug, so each is built from its own source:

@@ -34,7 +34,7 @@ use super::spend::{
 use super::sync_supervisor::{
     spawn_supervisor, Attribution, ChiaPeerSessionFactory, ChiaQuorumCorroborator,
     FallbackChainTip, Supervisor, SyncHandle, TokioTime, UnionPuzzleHashSource,
-    SESSION_MAX_LIFETIME,
+    KNOWN_CAT_ASSET_IDS, SESSION_MAX_LIFETIME,
 };
 use super::tipping::{ChainOwnerResolver, NodeTipSpender, SystemClock, TipEventBus, TippingEngine};
 use super::transport::SharedCert;
@@ -253,6 +253,7 @@ impl WalletService {
         let sync = if cfg.enable_chain_sync {
             Some(spawn_supervisor(Supervisor {
                 attribution,
+                cat_asset_ids: KNOWN_CAT_ASSET_IDS.to_vec(),
                 db: db.clone(),
                 puzzle_hashes: Arc::new(UnionPuzzleHashSource::new(
                     custody.clone(),
