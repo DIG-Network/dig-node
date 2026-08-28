@@ -176,9 +176,16 @@ impl EpochRecordStore {
     /// separately from the full record: a record that fails to deserialise still usually carries a
     /// readable epoch number, and attributing it is the difference between the node saying "I lost
     /// this" and the node saying "this never happened".
+    /// A file that is MISSING is [`StoredEpoch::Absent`]; a file that exists and cannot be read is
+    /// [`StoredEpoch::Unreadable`]. An earlier version returned `Absent` for both, which sent an
+    /// operator whose state directory had become unreadable off to "run the census for this epoch"
+    /// — a remedy that writes to the very file it cannot read, and so fails again without ever
+    /// naming the real fault.
     pub fn get(&self, epoch: u64) -> StoredEpoch {
-        let Ok(text) = std::fs::read_to_string(&self.path) else {
-            return StoredEpoch::Absent;
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StoredEpoch::Absent,
+            Err(_) => return StoredEpoch::Unreadable,
         };
         let mut best: Option<EpochRecord> = None;
         let mut saw_unreadable = false;
@@ -268,6 +275,25 @@ pub fn current_epoch_now() -> CurrentEpoch {
 }
 
 /// This epoch's per-store requirement, or the named reason the node cannot state it.
+///
+/// # Why a stored record is served verbatim, and what that does NOT cover
+///
+/// A record that parses is trusted as this node's own bookkeeping. Deliberate, with a bound worth
+/// stating: a record that is well-formed but FALSE produces a correspondingly false requirement,
+/// and the buffer scales it — a forged multiplier yields a recommendation in the millions of DIG.
+///
+/// It is not defended here for three reasons. Writing that record requires write access to the
+/// node's state directory, which is also where the margin, the config and the identity key live —
+/// an attacker holding it does not need this path. Arbitrary corruption already fails closed, as
+/// an unparseable line is [`StoredEpoch::Unreadable`] rather than a figure. And a plausibility
+/// bound derived here would be a rival implementation of the controller `dig-mirror-collateral`
+/// owns, which is how two surfaces come to disagree about one price.
+///
+/// The honest remedy is a check the record can make against its OWN published invariants — chiefly
+/// that `protocol_version` does not exceed what this build implements, since a record from a newer
+/// model is one this build cannot interpret even when every field parses. That belongs with the
+/// census writer, where those invariants live, and is tracked on dig-node#387 rather than bolted
+/// on at the read side.
 ///
 /// The margin is deliberately not consulted. `required_per_store_dig_base_units` is the PRE-margin,
 /// consensus-derived figure every node derives identically; folding a local preference into it here
@@ -594,6 +620,45 @@ mod tests {
         assert_eq!(
             reason(CurrentEpoch::NoChainSource),
             CollateralUnknownReason::NoChainSource
+        );
+    }
+
+    /// A record file that EXISTS but cannot be read is `Unreadable`; only a missing one is
+    /// `Absent`.
+    ///
+    /// The two fixtures differ in exactly one way — whether the path is there — and they must
+    /// produce DIFFERENT answers. A single fixture could not show that, because the old code
+    /// returned `Absent` for both and would satisfy either assertion alone.
+    ///
+    /// The distinction is a remedy, not a figure: `Absent` becomes "run the census for this
+    /// epoch", which writes to the very file that cannot be read, so an operator with a broken
+    /// state directory is sent to a remedy that fails again without naming the fault.
+    ///
+    /// A directory standing in for the file is the portable way to provoke a non-`NotFound` read
+    /// error — chmod is a no-op for an administrator on Windows, so a permission fixture would
+    /// pass here by not being unreadable at all.
+    #[test]
+    fn an_unreadable_record_file_is_not_reported_as_a_missing_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Control: genuinely nothing there. Still `Absent`, still "this never happened".
+        assert_eq!(store_at(dir.path()).get(7), StoredEpoch::Absent);
+
+        // The variable: the path exists and cannot be read as a file.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).expect("create_dir");
+        let store = EpochRecordStore::at(blocked.join(EPOCH_RECORD_FILE));
+        std::fs::create_dir(store.path()).expect("directory in the record's place");
+
+        assert_eq!(store.get(7), StoredEpoch::Unreadable);
+        assert!(
+            matches!(
+                requirement(&store, CurrentEpoch::Final(7)),
+                CollateralRequirementResult::Unknown {
+                    reason: CollateralUnknownReason::RecordUnreadable
+                }
+            ),
+            "an unreadable state directory must not be reported as an uncensused epoch"
         );
     }
 

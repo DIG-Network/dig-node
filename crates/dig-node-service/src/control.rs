@@ -3326,6 +3326,18 @@ fn collateral_margin_get(id: Value) -> Value {
 /// A value above the contract's ceiling is REFUSED rather than clamped, and the returned figure is
 /// what was actually stored. Clamping and returning the clamped value would leave the caller's
 /// stored intent and the node's behaviour disagreeing on the money path.
+///
+/// # Known: the margin OUTLIVES the pairing that set it
+///
+/// This method is reachable from the paired tier, and the margin it writes persists across
+/// `pairing.revoke` — so a revoked client leaves a setting behind that the operator never chose and
+/// cannot see was inherited. Bounded today because the margin reaches no spend path: it scales a
+/// displayed recommendation and nothing posts from it.
+///
+/// Deliberately NOT fixed here. "Which paired-tier state should a revoke reclaim" is a question
+/// about the pairing lifecycle as a whole — the margin is one instance of it, and answering it for
+/// this one setting would establish a rule by accident that the other paired-tier writes do not
+/// follow. Tracked as a pairing-lifecycle question rather than as a collateral one.
 fn collateral_margin_set(id: Value, params: &Value) -> Value {
     use dig_node_control_interface::params::CollateralMarginSetParams;
 

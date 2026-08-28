@@ -781,7 +781,20 @@ pub fn collateral_buffer(
         DEFAULT_BUFFER_HORIZON_EPOCHS,
     );
     let result = serde_json::to_value(advice).map_err(std::io::Error::other)?;
-    Ok(Outcome::new(render_buffer(&advice), result))
+
+    // PROVENANCE. `pairs_served_by_this_node` is named as though the node counted it, and on the
+    // node's own answer it did. Here it is whatever the operator typed after `--roots`, and the
+    // rendered line is otherwise identical — so an operator's guess would be indistinguishable
+    // from a measurement, including in the recommendation derived from it. Marking it makes the
+    // named limitation visible where the figure is read rather than only in the help text. The
+    // marker goes away when the node serves its own served-set count (dig-node#387).
+    let mut human = render_buffer(&advice);
+    if pairs_served.is_some() {
+        human.push_str(
+            "\n  (store-root count supplied by you via `--roots`, not measured by this node)",
+        );
+    }
+    Ok(Outcome::new(human, result))
 }
 
 /// Render a buffer answer as the human line, for BOTH the node-computed and the
