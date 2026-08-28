@@ -1296,6 +1296,117 @@ mod tests {
         }
     }
 
+    /// **THE #380 INGESTION DROP.** A coin at a DERIVED CAT hash must reach the wallet at all.
+    ///
+    /// This is the starvation the ticket measured: on `origin/main` `apply_coin_states` keeps only
+    /// coins whose puzzle hash is in `subscribed`, and a CAT coin never sits at its owner's
+    /// address — it sits at the outer hash that curries the asset id around it. On a real wallet
+    /// that dropped **50 of the 51** puzzle hashes actually holding its coins, so the attributor
+    /// downstream was starved rather than broken.
+    ///
+    /// Deliberately paired with an ORDINARY p2 coin in the same batch. Without it the assertion
+    /// "`coins` has one row" would be satisfied by an implementation that admitted the CAT coin
+    /// straight into `coins` — the round-5 defect — and by one that routed it correctly, alike.
+    #[tokio::test]
+    async fn a_derived_cat_hash_coin_is_staged_while_a_p2_coin_is_admitted() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let owner = Bytes32::new([OWNED; 32]);
+        let asset = Bytes32::new([0xDA; 32]);
+        let derived = DerivedCats::derive(&[owner], &[asset]);
+        let outer = derived.hashes()[0];
+
+        let plain_coin = Coin {
+            parent_coin_info: Bytes32::new([1; 32]),
+            puzzle_hash: owner,
+            amount: 5_000,
+        };
+        let cat_coin = Coin {
+            parent_coin_info: Bytes32::new([2; 32]),
+            puzzle_hash: outer,
+            amount: 7_000,
+        };
+        let subscribed: SubscribedHashes = [owner].into_iter().collect();
+
+        apply_coin_states(
+            &db,
+            &[state(plain_coin, Some(10), None), state(cat_coin, Some(10), None)],
+            &subscribed,
+            &derived,
+        )
+        .await
+        .unwrap();
+
+        // The CAT coin ARRIVED — it is not dropped, which is the whole of #380 …
+        assert_eq!(
+            db.staged_cat_admission_count().await.unwrap(),
+            1,
+            "a coin at a derived CAT hash must be staged, not dropped at ingest"
+        );
+        // … and it is not BELIEVED, which is the whole of the round-5 rejection.
+        let believed = db.all_coins().await.unwrap();
+        assert_eq!(believed.len(), 1, "only the ordinary p2 coin may enter `coins`");
+        assert_eq!(believed[0].coin_id, hex::encode(plain_coin.coin_id()));
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            5_000,
+            "the staged CAT coin must not be counted as XCH"
+        );
+    }
+
+    /// A coin at a hash NEITHER set knows is still dropped, exactly as on `main`.
+    ///
+    /// The control for the test above: staging must widen what the wallet accepts by precisely the
+    /// derived set and by nothing else.
+    #[tokio::test]
+    async fn an_unknown_puzzle_hash_is_still_dropped() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let owner = Bytes32::new([OWNED; 32]);
+        let derived = DerivedCats::derive(&[owner], &[Bytes32::new([0xDA; 32])]);
+        let stranger = Coin {
+            parent_coin_info: Bytes32::new([3; 32]),
+            puzzle_hash: Bytes32::new([0x77; 32]),
+            amount: 1,
+        };
+        let subscribed: SubscribedHashes = [owner].into_iter().collect();
+
+        apply_coin_states(&db, &[state(stranger, Some(10), None)], &subscribed, &derived)
+            .await
+            .unwrap();
+
+        assert!(db.all_coins().await.unwrap().is_empty());
+        assert_eq!(db.staged_cat_admission_count().await.unwrap(), 0);
+    }
+
+    /// A derived CAT hash can never reach the arrivals notifier, because the two sets are separate
+    /// FIELDS and only the address set is passed to it.
+    ///
+    /// This is the `sync.rs:957` defect class made unreachable rather than guarded: a false
+    /// *"you were paid"* notice came from exactly this seam earlier in the ticket family. The
+    /// ordinary p2 coin in the same batch is the truthful control — an implementation that simply
+    /// stopped recording arrivals altogether would satisfy the first assertion and fail the second.
+    #[tokio::test]
+    async fn a_derived_cat_hash_never_reaches_the_arrivals_notifier() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let owner = Bytes32::new([OWNED; 32]);
+        let derived = DerivedCats::derive(&[owner], &[Bytes32::new([0xDA; 32])]);
+        let subscribed: SubscribedHashes = [owner].into_iter().collect();
+
+        // The set handed to `record_arrivals` is `session.subscribed`, which holds ADDRESSES only.
+        let state = SessionState::with_authority(&subscribed, WriteAuthority::Operator)
+            .following_derived_cats(&derived);
+        let watched: Vec<String> = state.subscribed.iter().map(hex::encode).collect();
+
+        assert!(
+            watched.contains(&hex::encode(owner)),
+            "the notifier must still see the wallet's own addresses"
+        );
+        assert!(
+            !watched.contains(&hex::encode(derived.hashes()[0])),
+            "an outer CAT hash must never be presented to the notifier as an address"
+        );
+        let _ = &db;
+    }
+
     #[tokio::test]
     async fn apply_coin_states_persists_and_computes_balance() {
         let db = WalletDb::open_in_memory().await.unwrap();
