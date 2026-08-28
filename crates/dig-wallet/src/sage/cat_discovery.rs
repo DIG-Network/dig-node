@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 
 use chia_protocol::{Bytes32, Coin, CoinState};
 
-use super::db::{CoinRow, StagedCatRow, WalletDb};
+use super::db::{CoinRow, PromotedSingleton, StagedCatRow, WalletDb};
 use super::singleton::{coin_from_row, LineageSource, Reconstructed};
 use super::{singleton, Result};
 
@@ -198,10 +198,12 @@ where
 /// already; this routes the third tier through the SAME staging table, so there is one admission
 /// point and it is the one that demands a lineage proof.
 ///
-/// A hinted coin that is not at a derived hash for a known asset is DROPPED rather than believed.
-/// That is a deliberate narrowing: such a coin cannot be selected as an XCH input (its puzzle hash
-/// is not ours) and carries no asset id, so admitting it only ever produced a wrong XCH figure.
-/// Absence is this design's accepted failure direction; a wrong figure is not.
+/// A hinted coin that is not at a derived hash for a known asset is STAGED with the empty
+/// sentinel, not believed and not discarded: nothing was predicted about it, so there is nothing to
+/// match against, and its parent spend alone decides what it is. What the narrowing removes is
+/// BELIEF before the proof — such a coin used to enter `coins` with no asset id, where it read as
+/// XCH and produced a wrong figure. Absence until proven is this design's accepted failure
+/// direction; a wrong figure is not.
 pub fn route_point_read_rows<F>(
     rows: &[CoinRow],
     owned_puzzle_hashes: &HashSet<String>,
@@ -265,6 +267,8 @@ fn hex_to_bytes32(s: &str) -> Option<Bytes32> {
 pub struct PromoteStats {
     /// Coins whose parent spend proved them units of the derived asset, and which are now in `coins`.
     pub promoted: u32,
+    /// Coins whose parent spend proved them owned NFT/DID singletons, now in `nfts`/`dids`.
+    pub resolved: u32,
     /// Coins a SUCCESSFUL parent read proved are not units of the derived asset — deleted.
     pub refused: u32,
     /// Coins left staged because their parent spend could not be read this pass.
@@ -273,14 +277,22 @@ pub struct PromoteStats {
 
 /// Promote every staged coin a parent spend proves, and refuse every one it disproves.
 ///
-/// # The three outcomes, and why the third is not the second
+/// # The four outcomes, and why they are four
 ///
 /// - **Proven** — the parent spend reconstructs the coin as a CAT, and both the asset id and the
 ///   inner p2 hash it reconstructs to equal the ones the derivation predicted. The coin moves into
 ///   `coins` attributed from the RECONSTRUCTION, never from the derivation.
-/// - **Disproven** — the parent spend was read successfully and does not reconstruct this coin as a
-///   CAT of that asset. The staged row is deleted, terminally: this is what makes an attacker's
-///   read amplification ~1x rather than perpetual.
+/// - **Resolved** — the parent spend reconstructs the coin as an NFT or DID singleton this wallet's
+///   p2 hash owns. Equally proven, by the same machinery, so it is admitted — to `nfts`/`dids`,
+///   because a singleton in `coins` would read as XCH. Kept apart from *Disproven* deliberately:
+///   one says the derivation was a lie, the other says it was true about something this function
+///   does not itself handle, and collapsing them deletes real assets (dig-node#394).
+/// - **Disproven** — the parent spend was read successfully and refutes the claim: the coin is not
+///   a CAT of that asset, or is a singleton belonging to another p2 hash, or reconstructs to
+///   nothing at all. The staged row is deleted, terminally: this is what makes an attacker's read
+///   amplification ~1x rather than perpetual. It is also the outcome for a row already spent on
+///   chain, which is dropped without a read at all, and for a row whose coin id does not bind its
+///   own fields.
 /// - **Unavailable** — the parent spend could not be read. The row stays staged, unmarked, and is
 ///   retried. Deleting here would let a peer that simply withholds parent spends erase real money;
 ///   leaving the row staged means the coin is *absent*, which is the acceptable direction.
@@ -352,6 +364,9 @@ pub async fn promote_staged_cats(
         };
         match promote_one(db, lineage_prefix(), &row, &parent, owned_p2).await? {
             Promotion::Promoted => stats.promoted += 1,
+            // The staging row was consumed inside `promote_singleton_admission`, in the same
+            // transaction that wrote the singleton. Nothing left to discard.
+            Promotion::Resolved => stats.resolved += 1,
             Promotion::Disproven => {
                 db.discard_cat_admission(&row.coin_id).await?;
                 stats.refused += 1;
@@ -381,18 +396,57 @@ fn lineage_prefix() -> &'static str {
 
 /// What deciding one coin's promotion concluded.
 ///
-/// Three outcomes rather than a bool, because "not promoted" covers two situations that must not
-/// be treated alike: a coin the parent spend DISPROVES is finished with and its staging row is
-/// deleted, while a coin whose row a reorg removed mid-read reached no verdict at all and must not
-/// be recorded as refused.
+/// Four outcomes rather than a bool, because "not promoted into `coins`" covers three situations
+/// that must not be treated alike: a coin the parent spend DISPROVES is finished with and its
+/// staging row is deleted; a coin the parent spend PROVES to be a singleton is equally finished
+/// with but was written to `nfts`/`dids` instead; and a coin whose row a reorg removed mid-read
+/// reached no verdict at all and must not be recorded as either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Promotion {
     /// The parent spend proves the coin, and it is now in `coins`.
     Promoted,
+    /// The parent spend proves the coin is an owned NFT or DID, now in `nfts`/`dids`. Terminal,
+    /// and a SUCCESS — distinct from `Disproven`, which is a refutation.
+    Resolved,
     /// The parent spend was read and does not support the claim. Terminal.
     Disproven,
     /// The staged row was gone by the time the write ran — a reorg rollback inside the read.
     Vanished,
+}
+
+/// Admit a proven NFT/DID singleton to its own table, if this wallet owns it.
+///
+/// The ownership test is the SAME one an unpredicted CAT gets: the reconstruction's own inner p2
+/// hash must be one the wallet controls. Without it a hint would be enough to make the wallet
+/// display a stranger's NFT as its own — the hint is attacker-controlled, and the reconstruction is
+/// the only thing that says who the singleton actually belongs to.
+///
+/// A singleton owned by somebody else is `Disproven`: the claim that staged it was "this coin is
+/// for me", and the parent spend refutes exactly that claim.
+async fn promote_singleton(
+    db: &WalletDb,
+    row: &StagedCatRow,
+    reconstructed_owner_p2: &str,
+    owned_p2: &HashSet<String>,
+    singleton: PromotedSingleton<'_>,
+) -> Result<Promotion> {
+    if !owned_p2.contains(&reconstructed_owner_p2.to_ascii_lowercase()) {
+        tracing::warn!(
+            coin_id = %row.coin_id,
+            "singleton promotion: the parent spend proves the coin is owned by another p2 hash; refusing"
+        );
+        return Ok(Promotion::Disproven);
+    }
+    Ok(
+        if db
+            .promote_singleton_admission(&row.coin_id, &singleton)
+            .await?
+        {
+            Promotion::Resolved
+        } else {
+            Promotion::Vanished
+        },
+    )
 }
 
 /// Decide and apply one coin's promotion.
@@ -418,14 +472,33 @@ async fn promote_one(
     }
     let reconstructed =
         singleton::reconstruct(prefix, row.created_height.map(|h| h as u32), parent, child)?;
-    let Reconstructed::Cat {
-        coin_id,
-        asset_id,
-        hint,
-    } = reconstructed
-    else {
-        // The parent read succeeded and this coin is not a CAT child of it at all. Disproven.
-        return Ok(Promotion::Disproven);
+    let (coin_id, asset_id, hint) = match reconstructed {
+        Reconstructed::Cat {
+            coin_id,
+            asset_id,
+            hint,
+        } => (coin_id, asset_id, hint),
+        // PROVEN, BUT NOT A CAT (dig-node#394). An NFT or DID singleton reached the same proof by
+        // the same machinery — the parent spend reconstructs THIS coin id as that singleton — so it
+        // is admissible by the same standard; it simply belongs in a different table.
+        //
+        // Refusing it here would conflate two verdicts that must never share an outcome: "the
+        // derivation was a lie" is a security finding, while "the derivation was true and about
+        // something this function does not handle" is a routing gap. Treating the second as the
+        // first deleted the row terminally, and since the point-read tier is the only production
+        // path that reaches `reconstruct_all`, it silently emptied the wallet's NFTs and DIDs and
+        // re-paid the chain read for each of them on every refresh.
+        Reconstructed::Nft { row: nft, owner_p2 } => {
+            return promote_singleton(db, row, &owner_p2, owned_p2, PromotedSingleton::Nft(&nft))
+                .await;
+        }
+        Reconstructed::Did { row: did, owner_p2 } => {
+            return promote_singleton(db, row, &owner_p2, owned_p2, PromotedSingleton::Did(&did))
+                .await;
+        }
+        // A plain XCH coin, or a shape no driver recognises. The read succeeded and produced no
+        // claim this coin is anything the wallet may hold, so the hint that staged it is refuted.
+        Reconstructed::Unknown => return Ok(Promotion::Disproven),
     };
     // The reconstruction must agree on BOTH halves — which coin, and whose. Checking only the
     // asset id would admit a real CAT of the right asset owned by somebody else; checking only the
@@ -1236,5 +1309,218 @@ mod tests {
         let held = db.staged_cat_admissions(100, i64::MAX).await.unwrap();
         assert_eq!(held.len(), 1, "only the row above the fork is unmade");
         assert_eq!(held[0].coin_id, hex::encode(below.coin_id()));
+    }
+
+    /// A `CoinRow` as the point-read tier materialises one from a coin record.
+    fn coin_row_of(c: Coin, height: i64) -> CoinRow {
+        CoinRow {
+            coin_id: hex::encode(c.coin_id()),
+            parent_coin_info: hex::encode(c.parent_coin_info),
+            puzzle_hash: hex::encode(c.puzzle_hash),
+            amount: c.amount.to_string(),
+            created_height: Some(height),
+            spent_height: None,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    /// The staged row the HINT path builds for a real CAT: both derived fields empty, because
+    /// nothing was predicted about it.
+    fn staged_row_of(f: &CatFixture) -> StagedCatRow {
+        StagedCatRow {
+            coin_id: hex::encode(f.child.coin_id()),
+            parent_coin_info: hex::encode(f.child.parent_coin_info),
+            puzzle_hash: hex::encode(f.child.puzzle_hash),
+            amount: f.child.amount.to_string(),
+            created_height: Some(10),
+            spent_height: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+            derived_asset_id: String::new(),
+            derived_owner_p2: String::new(),
+        }
+    }
+
+    /// THE POINT-READ TIER MUST NOT DELETE THE WALLET'S NFTs AND DIDs (dig-node#394).
+    ///
+    /// An NFT or DID coin sits at a SINGLETON puzzle hash — never one of the wallet's own p2
+    /// hashes — and is hinted to the owner, so the point-read tier stages it exactly as it stages
+    /// an unpredicted CAT. Promotion then reconstructs it correctly as a singleton, which is not a
+    /// CAT; an outcome set with no place for that verdict refused it, and the refusal is TERMINAL.
+    /// Since this tier is the only production path that reaches `reconstruct_all`, that silently
+    /// emptied `nfts`/`dids` and re-paid the chain read for every singleton on every refresh.
+    ///
+    /// FIXTURE DESIGN — production routing, and nothing beneath it. The rows go through
+    /// [`route_point_read_rows`] and [`promote_staged_cats`], the two functions the point-read tier
+    /// actually calls, because the defect lives in the seam BETWEEN them: a test that injected with
+    /// `db.upsert_coin` (as `singleton::tests` does) sits one layer below the narrowing and stays
+    /// green whether or not the narrowing eats the coin — which is precisely why nothing caught
+    /// this. Both singleton kinds are present rather than one, because NFT and DID reconstruct
+    /// through different driver calls and a fix handling only one would still pass with either
+    /// alone.
+    #[tokio::test]
+    async fn an_owned_nft_and_did_survive_the_point_read_tier() {
+        let m = crate::sage::singleton::tests::mint_did_and_nft();
+        let mut lineage = CountingLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(m.nft_child.parent_coin_info), m.nft_parent);
+        lineage
+            .by_parent
+            .insert(hex::encode(m.did_child.parent_coin_info), m.did_parent);
+
+        let rows = vec![coin_row_of(m.nft_child, 100), coin_row_of(m.did_child, 100)];
+        // The wallet's own p2 hashes. The singletons are NOT at them — that is the whole reason
+        // routing stages these rows rather than believing them.
+        let ours: HashSet<String> = [hex::encode(m.owner_p2)].into_iter().collect();
+        let (believed, staged) =
+            route_point_read_rows(&rows, &ours, &DerivedCats::default(), |_| false);
+        assert!(
+            believed.is_empty(),
+            "a singleton coin is never at an owned p2 hash, so nothing may be believed outright"
+        );
+        assert_eq!(staged.len(), 2, "both singletons are staged for a proof");
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.stage_cat_admissions(&staged).await.unwrap();
+        let stats = promote_staged_cats(&db, &lineage, &ours).await.unwrap();
+
+        assert_eq!(
+            (stats.resolved, stats.refused, stats.deferred),
+            (2, 0, 0),
+            "both singletons are PROVEN, not refused: {stats:?}"
+        );
+        let nfts = db.all_nfts().await.unwrap();
+        let dids = db.all_dids().await.unwrap();
+        assert_eq!(
+            nfts.len(),
+            1,
+            "the NFT reaches the table the wallet reads NFTs from"
+        );
+        assert_eq!(dids.len(), 1, "and the DID reaches the DID table");
+        assert_eq!(
+            nfts[0].launcher_id,
+            hex::encode(m.nft_launcher),
+            "and it is the NFT that was minted, identified by its launcher"
+        );
+        assert_eq!(dids[0].launcher_id, hex::encode(m.did_launcher));
+        // THE PLACEMENT HALF. A singleton carries no asset id, so a row for it in `coins` would
+        // read as XCH and inflate the spendable balance. Admitting it to the right table is the
+        // fix; admitting it to `coins` would also satisfy "not deleted", and would reintroduce
+        // the fabricated-balance defect this whole PR closes.
+        assert!(
+            db.all_coins().await.unwrap().is_empty(),
+            "a singleton must never enter `coins`, where a missing asset id means XCH"
+        );
+        assert_eq!(
+            db.staged_cat_admission_count().await.unwrap(),
+            0,
+            "and staging is cleared, so the chain read is not re-paid on every refresh"
+        );
+    }
+
+    /// The ownership half: the SAME NFT, the SAME proof, and the one varied thing is whether this
+    /// wallet controls the p2 hash the parent spend proves owns it.
+    ///
+    /// Without this check a hint — which anybody may write — would be enough to make the wallet
+    /// display a stranger's NFT as its own. The reconstruction is the only thing that says whose
+    /// the singleton is, and it is the same standard an unpredicted CAT is held to.
+    #[tokio::test]
+    async fn a_singleton_owned_by_a_stranger_is_refused() {
+        let m = crate::sage::singleton::tests::mint_did_and_nft();
+        let mut lineage = CountingLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(m.nft_child.parent_coin_info), m.nft_parent);
+
+        let rows = vec![coin_row_of(m.nft_child, 100)];
+        let stranger: HashSet<String> = [hex::encode(Bytes32::new([0x77; 32]))]
+            .into_iter()
+            .collect();
+        let (_believed, staged) =
+            route_point_read_rows(&rows, &stranger, &DerivedCats::default(), |_| false);
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.stage_cat_admissions(&staged).await.unwrap();
+        let stats = promote_staged_cats(&db, &lineage, &stranger).await.unwrap();
+
+        assert_eq!(
+            (stats.resolved, stats.refused),
+            (0, 1),
+            "a singleton the parent spend proves belongs to somebody else is REFUSED: {stats:?}"
+        );
+        assert!(
+            db.all_nfts().await.unwrap().is_empty(),
+            "and never reaches the NFT table"
+        );
+    }
+
+    /// A staged row already SPENT on chain is dropped without a parent read at all.
+    ///
+    /// One of two early exits in [`promote_staged_cats`] that had no coverage: neutering either
+    /// left the whole suite green, so nothing pinned the behaviour that bounds the read cost of a
+    /// spent coin (and stops it sitting in staging for ever awaiting a promotion that could not
+    /// matter).
+    #[tokio::test]
+    async fn a_spent_staged_row_is_dropped_without_a_parent_read() {
+        let f = real_cat();
+        let lineage = CountingLineage::default(); // deliberately EMPTY: no read may occur
+        let mut spent = staged_row_of(&f);
+        spent.spent_height = Some(11);
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.stage_cat_admissions(std::slice::from_ref(&spent))
+            .await
+            .unwrap();
+        let stats = promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
+
+        assert_eq!(
+            (stats.refused, stats.promoted, stats.deferred),
+            (1, 0, 0),
+            "a spent coin is dropped, not promoted and not left staged: {stats:?}"
+        );
+        assert_eq!(lineage.reads(), 0, "and costs no chain read at all");
+        assert_eq!(db.staged_cat_admission_count().await.unwrap(), 0);
+    }
+
+    /// A staged row with no created height is UNCONFIRMED: there is no height to read a parent
+    /// spend at, so it is deferred and METERED — it must not hold the queue head for ever.
+    ///
+    /// The second uncovered early exit. The metering is the load-bearing half: without
+    /// `record_promotion_attempt` an unconfirmable row is re-read every pass, which is exactly the
+    /// amplification the cooldown exists to bound.
+    #[tokio::test]
+    async fn an_unconfirmed_staged_row_is_deferred_and_metered() {
+        let f = real_cat();
+        let lineage = CountingLineage::default();
+        let mut unconfirmed = staged_row_of(&f);
+        unconfirmed.created_height = None;
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.stage_cat_admissions(std::slice::from_ref(&unconfirmed))
+            .await
+            .unwrap();
+        let first = promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
+        assert_eq!(
+            (first.deferred, first.refused, first.promoted),
+            (1, 0, 0),
+            "unconfirmed is deferred, never refused: {first:?}"
+        );
+        assert_eq!(
+            db.staged_cat_admission_count().await.unwrap(),
+            1,
+            "and the row stays staged, because it may confirm later"
+        );
+
+        // METERED: the attempt was recorded, so the cooldown now holds the row back.
+        let second = promote_staged_cats(&db, &lineage, &owned()).await.unwrap();
+        assert_eq!(
+            (second.deferred, second.refused, second.promoted),
+            (0, 0, 0),
+            "a second pass inside the cooldown must not touch it again: {second:?}"
+        );
     }
 }

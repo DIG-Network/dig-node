@@ -43,9 +43,23 @@ pub struct ParentSpend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reconstructed {
     /// The coin is an NFT singleton.
-    Nft(Box<NftDbRow>),
-    /// The coin is a DID singleton.
-    Did(Box<DidDbRow>),
+    ///
+    /// `owner_p2` is the inner p2 puzzle hash the singleton is currently owned by, carried
+    /// alongside the row for the same reason [`Reconstructed::Cat`] carries `hint`: the row alone
+    /// says WHAT the coin is, and an admission decision additionally needs to know WHOSE it is.
+    Nft {
+        /// The NFT as it will be stored.
+        row: Box<NftDbRow>,
+        /// The inner p2 puzzle hash (hex) that owns the singleton.
+        owner_p2: String,
+    },
+    /// The coin is a DID singleton (the DID twin of [`Reconstructed::Nft`]).
+    Did {
+        /// The DID as it will be stored.
+        row: Box<DidDbRow>,
+        /// The inner p2 puzzle hash (hex) that owns the singleton.
+        owner_p2: String,
+    },
     /// The coin is a CAT — attribute it to this asset id (+ inner p2 hint).
     Cat {
         /// The child coin id (hex).
@@ -132,14 +146,20 @@ pub fn reconstruct_parsed(
     // NFT: parse_child computes the single child singleton coin itself.
     if let Ok(Some(nft)) = Nft::parse_child(ctx, parent_coin, parent_puzzle, parent_solution) {
         if nft.coin.coin_id() == child_id {
-            return Reconstructed::Nft(Box::new(nft_row(ctx, prefix, created_height, &nft)));
+            return Reconstructed::Nft {
+                owner_p2: hexb(nft.info.p2_puzzle_hash),
+                row: Box::new(nft_row(ctx, prefix, created_height, &nft)),
+            };
         }
     }
 
     // DID: parse_child validates the given child coin.
     if let Ok(Some(did)) = Did::parse_child(ctx, parent_coin, parent_puzzle, parent_solution, child)
     {
-        return Reconstructed::Did(Box::new(did_row(prefix, created_height, &did)));
+        return Reconstructed::Did {
+            owner_p2: hexb(did.info.p2_puzzle_hash),
+            row: Box::new(did_row(prefix, created_height, &did)),
+        };
     }
 
     // CAT: parse_children returns every child; match ours by coin id.
@@ -408,11 +428,11 @@ pub async fn reconstruct_coins(
         };
         let child = coin_from_row(c)?;
         match reconstruct(prefix, Some(created as u32), &parent, child)? {
-            Reconstructed::Nft(row) => {
+            Reconstructed::Nft { row, .. } => {
                 db.upsert_nft(&row).await?;
                 stats.nfts += 1;
             }
-            Reconstructed::Did(row) => {
+            Reconstructed::Did { row, .. } => {
                 db.upsert_did(&row).await?;
                 stats.dids += 1;
             }
@@ -443,7 +463,7 @@ pub async fn reconstruct_all(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chia_sdk_test::Simulator;
     use chia_traits::Streamable;
@@ -506,16 +526,11 @@ mod tests {
 
     /// Mint a DID + an NFT on the simulator, transfer both to self, and return the parent
     /// spends + the child coins a syncing wallet would observe.
-    #[allow(clippy::type_complexity)]
-    fn mint_did_and_nft() -> (
-        Simulator,
-        ParentSpend,
-        Coin,
-        ParentSpend,
-        Coin,
-        Bytes32,
-        Bytes32,
-    ) {
+    ///
+    /// Shared with `cat_discovery`'s tests rather than re-minted there: a second copy of this
+    /// fixture would be a second definition of what an owned singleton looks like, and the two
+    /// would drift.
+    pub(crate) fn mint_did_and_nft() -> MintedSingletons {
         let mut sim = Simulator::new();
         let ctx = &mut SpendContext::new();
         let alice = sim.bls(2);
@@ -566,25 +581,53 @@ mod tests {
 
         let did_parent = parent_spend_from_sim(&sim, did.coin);
         let nft_parent = parent_spend_from_sim(&sim, nft.coin);
-        (
-            sim,
+        MintedSingletons {
+            _sim: sim,
             did_parent,
-            child_did.coin,
+            did_child: child_did.coin,
             nft_parent,
-            child_nft.coin,
-            did.info.launcher_id,
-            nft.info.launcher_id,
-        )
+            nft_child: child_nft.coin,
+            did_launcher: did.info.launcher_id,
+            nft_launcher: nft.info.launcher_id,
+            owner_p2: alice.puzzle_hash,
+        }
+    }
+
+    /// What [`mint_did_and_nft`] hands back: the two child singleton coins a wallet observes,
+    /// the parent spends that prove them, and the p2 hash that owns both.
+    pub(crate) struct MintedSingletons {
+        /// Held so the simulator's spend store outlives the parent spends taken from it.
+        pub(crate) _sim: Simulator,
+        pub(crate) did_parent: ParentSpend,
+        pub(crate) did_child: Coin,
+        pub(crate) nft_parent: ParentSpend,
+        pub(crate) nft_child: Coin,
+        pub(crate) did_launcher: Bytes32,
+        pub(crate) nft_launcher: Bytes32,
+        /// The p2 puzzle hash both singletons are owned by — the wallet's own hash in these tests.
+        pub(crate) owner_p2: Bytes32,
     }
 
     #[test]
     fn reconstruct_parses_nft_and_did_from_parent_spends() {
-        let (_sim, did_parent, did_child, nft_parent, nft_child, did_launcher, nft_launcher) =
-            mint_did_and_nft();
+        let m = mint_did_and_nft();
+        let (did_parent, did_child, nft_parent, nft_child, did_launcher, nft_launcher) = (
+            m.did_parent,
+            m.did_child,
+            m.nft_parent,
+            m.nft_child,
+            m.did_launcher,
+            m.nft_launcher,
+        );
 
         match reconstruct("xch", Some(42), &nft_parent, nft_child).unwrap() {
-            Reconstructed::Nft(row) => {
+            Reconstructed::Nft { row, owner_p2 } => {
                 assert_eq!(row.launcher_id, hex::encode(nft_launcher));
+                assert_eq!(
+                    owner_p2,
+                    hex::encode(m.owner_p2),
+                    "the reconstruction names the p2 hash that owns the NFT"
+                );
                 let rec: NftRecord = serde_json::from_str(&row.record_json).unwrap();
                 assert_eq!(rec.royalty_ten_thousandths, 300);
                 assert_eq!(rec.data_uris, vec!["https://example.com/a.png".to_string()]);
@@ -595,8 +638,13 @@ mod tests {
         }
 
         match reconstruct("xch", Some(7), &did_parent, did_child).unwrap() {
-            Reconstructed::Did(row) => {
+            Reconstructed::Did { row, owner_p2 } => {
                 assert_eq!(row.launcher_id, hex::encode(did_launcher));
+                assert_eq!(
+                    owner_p2,
+                    hex::encode(m.owner_p2),
+                    "the reconstruction names the p2 hash that owns the DID"
+                );
                 let rec: DidRecord = serde_json::from_str(&row.record_json).unwrap();
                 assert!(rec.address.starts_with("xch1"));
             }
@@ -653,7 +701,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconstruct_coins_populates_db_and_get_reads() {
-        let (_sim, did_parent, did_child, nft_parent, nft_child, _dl, _nl) = mint_did_and_nft();
+        let m = mint_did_and_nft();
+        let (did_parent, did_child, nft_parent, nft_child) =
+            (m.did_parent, m.did_child, m.nft_parent, m.nft_child);
 
         let db = WalletDb::open_in_memory().await.unwrap();
         // The wallet has synced the two child singleton coins (odd amount = 1).

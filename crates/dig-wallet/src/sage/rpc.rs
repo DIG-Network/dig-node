@@ -3159,12 +3159,15 @@ impl WalletBackend {
             // Still best-effort, and deliberately: a chain-read failure must not turn a successful
             // XCH refresh into a hard error.
             match super::cat_discovery::promote_staged_cats(&self.db, lineage, &owned).await {
-                Ok(stats) if stats.promoted > 0 || stats.refused > 0 => tracing::info!(
-                    promoted = stats.promoted,
-                    refused = stats.refused,
-                    deferred = stats.deferred,
-                    "wallet sync: CAT admission promotion pass (point-read tier)"
-                ),
+                Ok(stats) if stats.promoted > 0 || stats.resolved > 0 || stats.refused > 0 => {
+                    tracing::info!(
+                        promoted = stats.promoted,
+                        resolved = stats.resolved,
+                        refused = stats.refused,
+                        deferred = stats.deferred,
+                        "wallet sync: CAT admission promotion pass (point-read tier)"
+                    )
+                }
                 Ok(stats) if stats.deferred > 0 => tracing::debug!(
                     deferred = stats.deferred,
                     "wallet sync: staged CAT coins are awaiting a readable parent spend"

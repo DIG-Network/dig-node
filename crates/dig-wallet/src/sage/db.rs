@@ -354,6 +354,18 @@ pub const CAT_ADMISSION_PENDING_MAX_ROWS: i64 = 20_000;
 /// merely FOUND at a hash it derived, together with the derivation that found it — a hypothesis.
 /// Sharing one type between the two would make the difference a field rather than a table, which
 /// is exactly the shape this design rejects.
+/// Which singleton table a proven staged coin belongs in.
+///
+/// Borrowed rather than owned because the caller already holds the reconstructed row and the write
+/// is the last thing done with it.
+#[derive(Debug, Clone, Copy)]
+pub enum PromotedSingleton<'a> {
+    /// Write the coin to `nfts`.
+    Nft(&'a NftDbRow),
+    /// Write the coin to `dids`.
+    Did(&'a DidDbRow),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct StagedCatRow {
     /// The coin id (hex, 64 chars).
@@ -1870,6 +1882,42 @@ impl WalletDb {
         Ok(true)
     }
 
+    /// Promote a staged coin the parent spend proved is an owned NFT or DID singleton.
+    ///
+    /// The twin of [`WalletDb::promote_cat_admission`], and it claims the staging row FIRST for the
+    /// same reason: the DELETE's `rows_affected` is what decides whether this promotion still owns
+    /// the coin, so a reorg rollback that lands mid-read loses the race rather than being
+    /// overwritten by it. `false` means the row was already gone — nothing was written.
+    ///
+    /// # Why the coin does NOT enter `coins`
+    ///
+    /// A singleton sits at its own puzzle hash, not one of the wallet's p2 hashes, and carries no
+    /// asset id — so a row for it in `coins` would read as XCH and inflate the spendable balance by
+    /// its (odd, ~1 mojo) amount while being unselectable. `nfts`/`dids` are keyed by launcher id
+    /// and are the tables that describe it truthfully.
+    pub async fn promote_singleton_admission(
+        &self,
+        coin_id: &str,
+        singleton: &PromotedSingleton<'_>,
+    ) -> sqlx::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let claimed = sqlx::query("DELETE FROM cat_admission_pending WHERE coin_id = ?")
+            .bind(Self::normalise_hex(coin_id))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if claimed != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        match singleton {
+            PromotedSingleton::Nft(n) => Self::upsert_nft_on(&mut *tx, n).await?,
+            PromotedSingleton::Did(d) => Self::upsert_did_on(&mut *tx, d).await?,
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Drop a staged coin that a SUCCESSFUL parent read proved is not a unit of the derived asset.
     ///
     /// Terminal, and that is what bounds the read cost: a refused coin is never read again, so an
@@ -2956,6 +3004,15 @@ impl WalletDb {
     /// Insert or update a reconstructed NFT (keyed by launcher id; a later coin overwrites
     /// the mutable fields — the current coin, owner, and wire record).
     pub async fn upsert_nft(&self, n: &NftDbRow) -> sqlx::Result<()> {
+        Self::upsert_nft_on(&self.pool, n).await
+    }
+
+    /// The NFT upsert, against any executor, so a promotion can run it inside the SAME
+    /// transaction that claims the staging row (see [`WalletDb::promote_singleton_admission`]).
+    async fn upsert_nft_on<'e, E>(exec: E, n: &NftDbRow) -> sqlx::Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         sqlx::query(
             "INSERT INTO nfts
                 (launcher_id, coin_id, collection_id, minter_did, owner_did, name,
@@ -2979,7 +3036,7 @@ impl WalletDb {
         .bind(n.visible)
         .bind(n.created_height)
         .bind(&n.record_json)
-        .execute(&self.pool)
+        .execute(exec)
         .await?;
         Ok(())
     }
@@ -3041,6 +3098,14 @@ impl WalletDb {
 
     /// Insert or update a reconstructed DID (keyed by launcher id).
     pub async fn upsert_did(&self, d: &DidDbRow) -> sqlx::Result<()> {
+        Self::upsert_did_on(&self.pool, d).await
+    }
+
+    /// The DID upsert, against any executor (the twin of [`WalletDb::upsert_nft_on`]).
+    async fn upsert_did_on<'e, E>(exec: E, d: &DidDbRow) -> sqlx::Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         sqlx::query(
             "INSERT INTO dids (launcher_id, coin_id, name, visible, created_height, record_json)
              VALUES (?, ?, ?, ?, ?, ?)
@@ -3056,7 +3121,7 @@ impl WalletDb {
         .bind(d.visible)
         .bind(d.created_height)
         .bind(&d.record_json)
-        .execute(&self.pool)
+        .execute(exec)
         .await?;
         Ok(())
     }
