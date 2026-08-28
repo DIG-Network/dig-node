@@ -5475,11 +5475,25 @@ The two states are held in **different tables**, and this separation is normativ
   answers identically for a spend it has never heard of and one it is merely behind on, so a terminal
   refusal built on that answer would convert a brief outage into permanent erasure of a real coin. The
   cost is bounded instead of the cause classified.
-- The three outcomes are distinct. **Proven** promotes. **Disproven** — a parent read that SUCCEEDED and
-  does not reconstruct the coin as claimed — deletes the staged row. **Unavailable** — a read that could
-  not be performed, or that the source answered emptily — leaves the row staged for retry, and MUST NOT
-  delete it; treating an unavailable answer as a disproof would let a peer erase real money by
-  withholding parent spends.
+- The four outcomes are distinct. **Proven** promotes into `coins`. **Resolved** — the parent read
+  reconstructs the coin as an NFT or DID singleton owned by a p2 hash the wallet controls — writes it to
+  `nfts`/`dids` and deletes the staged row. **Disproven** — a parent read that SUCCEEDED and refutes the
+  claim — deletes the staged row. **Unavailable** — a read that could not be performed, or that the
+  source answered emptily — leaves the row staged for retry, and MUST NOT delete it; treating an
+  unavailable answer as a disproof would let a peer erase real money by withholding parent spends.
+- **A proven non-CAT MUST NOT be refused.** *Resolved* and *Disproven* are separate outcomes because one
+  says the derivation was true about something the CAT path does not itself handle, and the other says
+  the derivation was a lie. Collapsing them makes a routing gap indistinguishable from a security verdict
+  and deletes real assets terminally — the point-read tier is the only production path that reaches
+  §18.11 reconstruction, so a wallet's NFTs and DIDs vanish and their chain reads are re-paid on every
+  refresh. A singleton MUST NOT be written to `coins`: it carries no asset id, where absence means XCH.
+- **A resolved singleton MUST be owned.** Admission requires the inner p2 hash the RECONSTRUCTION names
+  to be one the wallet controls — the same test an unpredicted CAT is held to, and never the hint, which
+  anybody may write.
+- **Disproven covers four cases**, all terminal deletions: a coin already spent on chain (dropped without
+  a parent read, since it can neither be counted nor selected); a staged row whose coin id does not bind
+  its own parent, puzzle hash and amount; a reconstruction that disagrees with the derivation, or whose
+  hint names an address the wallet does not control; and a singleton owned by another p2 hash.
 - A promotion write MUST claim its staged row before writing the coin: the staging row is deleted first
   and the write proceeds only if exactly one row was removed, all in one transaction. Promotion spans a
   network round trip, and a reorg rollback inside that window must not be overwritten by a coin the
