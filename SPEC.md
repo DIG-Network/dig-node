@@ -5398,12 +5398,18 @@ self-custody is again the only model, §18.20.)
 18.11. **NFT/DID/CAT reconstruction.** A raw `CoinState` does not reveal a coin's asset kind — that lives
 in the coin's puzzle, revealed only when its parent is spent. Reconstruction uncurries the parent spend
 (via the `Nft`/`Did`/`Cat` driver parsers) to populate the `nfts`/`dids`/`nft_collections` tables and to
-attribute CAT coins to their asset id (TAIL hash) in the `coins` table (so `get_cats`/`get_token` become
-complete). Parent spends are fetched through a `LineageSource` (out-of-DB lineage reads, B.5). Reads only.
-The sync loop runs this attribution as a post-apply step (`sync::CatAttributor`, threaded into
-`run_update_loop`): every `coin_state_update` is followed by an attribution pass that uncurries the
-newly-synced candidate coins, so a synced CAT coin — stored initially with `asset_id: None` — gains its
-TAIL and surfaces in `get_cats` (this is how `$DIG` resolves from the node).
+attribute CAT coins to their asset id (TAIL hash) in the `coins` table, which is what makes such a coin
+visible to `get_cats`/`get_token` at all. Parent spends are fetched through a `LineageSource` (out-of-DB
+lineage reads, B.5). Reads only. Neither reader becomes COMPLETE by this: a coin the replica never
+ingested cannot be attributed by a pass over rows it does not hold, and a row whose parent could not be
+read is left for a later pass.
+
+The attributor is owned by the SUPERVISOR, which builds it from the subscription set it resolved for the
+current attempt and threads it into the update loop; a supervisor with no lineage source attaches none,
+and that absence MUST be honest rather than silent. The pass also runs ONCE after a completed catch-up,
+so a replica that syncs and then receives no further pushes still attributes what it holds. The pass MUST
+NOT run after a frame that was refused before any database write — otherwise an empty, already-refused
+frame buys a whole-replica scan and a chain read per candidate row.
 
 18.11a. **CAT discovery is not CAT authenticity — staged admission (#380, #394).** A `CoinState` carries a
 parent, a puzzle hash and an amount, and **no hint**, so a wallet cannot recognise its own CAT coins from
@@ -5514,16 +5520,51 @@ The two states are held in **different tables**, and this separation is normativ
 - Staged rows are rolled back with the coins they describe. A reorg deletes every staged row created
   above the fork and clears any spend recorded above it.
 
-**Where promotion runs today.** On the shipped node the promotion pass runs on the POINT-READ tier
-(`refresh_tracked_coins`) only. The peer frame path's promotion is reachable but its `CatAttributor` is
-constructed under `cfg(test)` alone, so it does not run in production; wiring it is #382. A staged coin
-therefore becomes spendable on a point-read refresh rather than on the frame that delivered it. This is a
-statement of current behaviour, not a licence: nothing above is relaxed by it.
+**Where promotion runs.** The promotion pass runs on BOTH tiers. On the point-read tier it is driven by
+`refresh_tracked_coins`. On the peer path it is driven by the supervisor's `CatAttributor`, which runs it
+once after a completed catch-up and again after every frame that actually WROTE something — so a staged
+coin becomes spendable on the sync that delivers it rather than waiting for a point-read refresh. Until
+#382 the peer path's attributor was constructed under `cfg(test)` alone and the production call site
+passed a hard-coded `None`, so this tier existed and never ran; that is fixed, and the wording here is
+the behaviour, not a licence — nothing above is relaxed by it.
 
 **The stated failure mode is INCOMPLETENESS.** A real coin that cannot yet be proven is *absent* — not
 counted as its asset, and in particular not counted as XCH, which `asset_id IS NULL` means and which
 feeds coin selection. A wallet may under-report; it must never report a figure that is wrong.
 
+
+18.11b. **A parent spend binds to the coin it was asked for.** A coin id is self-certifying —
+`SHA256(parent ‖ puzzle_hash ‖ amount)` — so a `LineageSource` MUST check that the coin a spend answer
+carries hashes to the coin that was requested, and MUST NOT return one that does not. Where it does not,
+the coin is repaired from the coin record; where it still does not bind, the answer is NO LINEAGE rather
+than a placeholder. This is a correctness requirement and not defence-in-depth: every CAT/singleton
+driver derives its children's coin ids FROM that coin, so a placeholder makes `Cat::parse_children`
+compute children matching nothing and the caller conclude the coin is not a CAT.
+
+18.11c. **The attribution pass remembers its OUTCOMES, and distinguishes an absence from an outage.**
+A coin's parent spend is settled chain history, so a row a pass RESOLVED and could not attribute answers
+identically for ever. Those rows are ordinary: an NFT or DID coin row keeps `asset_id` NULL because the
+reconstruction is written to its own table, and an odd-amount plain coin at the wallet's own p2 hash
+reconstructs to nothing. A memory of failed LOOKUPS cannot cover them, because their lookups succeed — so
+without an outcome mark each costs one outbound chain read per push frame for the life of the replica. A
+row whose parent could NOT be read MUST NOT be marked: nothing was learned about it. The pass MUST
+therefore cost work proportional to newly-arrived rows.
+
+**A lineage answer distinguishes ABSENT from UNAVAILABLE, and the SOURCE must be able to tell them
+apart.** "A source answered and there is no such spend" and "no source could be reached" MUST NOT be the
+same value. Only an absence may be remembered or treated as a settled judgement; an unavailability is a
+statement about this node's reachability and MUST be treated as *unknown*, so that a later pass asks
+again.
+
+The distinction MUST be carried by the chain READ, not merely by the enum. A source that reads spends
+through an API which collapses "no such spend" into the same error as "the read failed" cannot produce an
+absence at all, whatever its mapping says. The production source MUST therefore use an absence-aware,
+corroborated read (`chia-query`'s `get_coin_spend_opt`), whose `Ok(None)` requires agreement across
+independent sources and whose every transport failure, rejection and disagreement remains an error.
+
+**A failed lineage read is NO LINEAGE, never an error.** An error propagates out of the attribution pass
+and ends the peer session, which hands a denial of service to whoever made the read fail. The same
+reasoning binds §18.11b's repair read, which fails to NO LINEAGE rather than propagating.
 
 18.12. **Live broadcaster bring-up — real mainnet $DIG spends behind a config gate (#428).** The
 node-custodied wallet BUILDS + SIGNS + VALIDATES spends (§18.9/§18.21) and the tip engine (§18.23)

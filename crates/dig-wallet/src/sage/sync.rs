@@ -793,7 +793,11 @@ pub async fn apply_coin_states(
 /// with an even amount is an ordinary XCH coin and is skipped (never fetches a parent
 /// spend). Attribution reads only; it never signs or broadcasts.
 pub struct CatAttributor<'a> {
-    /// The parent-spend source (coinset/peer point-read) uncurrying reads through.
+    /// The parent-spend source (coinset/peer point-read) the whole-replica pass reads through.
+    ///
+    /// ONE source, unmetered, and deliberately so: this pass runs on the node's own schedule over
+    /// rows the replica already holds, so its volume is set by what has newly arrived rather than
+    /// by anything a remote peer chooses to send.
     pub lineage: &'a dyn LineageSource,
     /// The address bech32m prefix for any reconstructed NFT/DID addresses.
     pub prefix: &'a str,
@@ -883,13 +887,13 @@ pub async fn handle_coin_state_update(
     update: &CoinStateUpdate,
     events: &EventBus,
     session: &mut SessionState<'_>,
-) -> Result<(), SyncError> {
+) -> Result<FrameApplied, SyncError> {
     if !session.authority.trust().is_authoritative() {
         tracing::debug!(
             claimed_height = update.height,
             "wallet sync: dropping a coin_state_update from a discovered peer"
         );
-        return Ok(());
+        return Ok(FrameApplied::Dropped);
     }
     // Judged BEFORE the frame acts, not at the write. A guard sitting on the `set_peak` call would
     // satisfy "the peak is unchanged" identically while the rollback below had already deleted
@@ -898,7 +902,7 @@ pub async fn handle_coin_state_update(
     // coins included, which is also the conservative reading of coins offered alongside one.
     let admitted = match session.admit_peak(update.height)? {
         PeakClaim::Admitted(peak) => peak,
-        PeakClaim::Refused => return Ok(()),
+        PeakClaim::Refused => return Ok(FrameApplied::Dropped),
     };
     let current_peak = db.sync_state().await?.peak_height;
     let mut moved_backwards = false;
@@ -952,7 +956,23 @@ pub async fn handle_coin_state_update(
         );
     }
     events.publish(SyncEvent::CoinState);
-    Ok(())
+    Ok(FrameApplied::Applied)
+}
+
+/// Whether a `coin_state_update` frame reached the database at all.
+///
+/// Returned so the caller can decide whether the follow-up attribution pass is worth running. A
+/// frame dropped for coming from a discovered peer, or for claiming a peak this session will not
+/// admit, changed nothing — so a pass after it can only re-examine rows an earlier pass already
+/// settled. Without the distinction, an *empty, refused* frame from an untrusted peer still buys a
+/// whole-replica scan and a chain read per candidate row, which is roughly forty bytes on the wire
+/// for an unbounded amount of this node's work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameApplied {
+    /// The frame's coins and peak were written.
+    Applied,
+    /// The frame was refused before any database write.
+    Dropped,
 }
 
 /// The one peer call [`initial_sync_with_authority`] makes, behind a trait.
@@ -1182,9 +1202,12 @@ pub async fn run_update_loop(
         match message.msg_type {
             ProtocolMessageTypes::CoinStateUpdate => {
                 if let Ok(update) = decode::<CoinStateUpdate>(&message) {
-                    handle_coin_state_update(db, &update, events, session).await?;
-                    if let Some(a) = attributor {
-                        a.attribute(db).await?;
+                    let applied = handle_coin_state_update(db, &update, events, session).await?;
+                    // Only after a frame that actually WROTE something. See [`FrameApplied`].
+                    if applied == FrameApplied::Applied {
+                        if let Some(a) = attributor {
+                            a.attribute(db).await?;
+                        }
                     }
                 }
             }
@@ -2813,7 +2836,7 @@ mod tests {
     /// CAT can be attributed. (The full uncurry→`get_cats` path is proven in `sage::rpc`.)
     #[tokio::test]
     async fn run_update_loop_runs_attribution_when_attributor_present() {
-        use crate::sage::singleton::{LineageSource, ParentSpend};
+        use crate::sage::singleton::{LineageAnswer, LineageSource};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -2826,9 +2849,9 @@ mod tests {
                 &self,
                 _parent_coin_id: &str,
                 _spent_height: u32,
-            ) -> crate::sage::Result<Option<ParentSpend>> {
+            ) -> crate::sage::Result<LineageAnswer> {
                 self.hits.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
+                Ok(LineageAnswer::Absent)
             }
         }
 
@@ -2874,6 +2897,110 @@ mod tests {
             hits.load(Ordering::SeqCst),
             1,
             "attributor fetched the candidate coin's parent spend"
+        );
+    }
+
+    /// **Proves (dig-node#383):** a frame the node REFUSED schedules no attribution pass.
+    ///
+    /// # The fixture varies one actor and keeps an honest control
+    ///
+    /// Two runs over the same replica, the same seeded candidate row and the same frame. Only the
+    /// session's trust differs. An operator session MUST run the pass — that is the control, and
+    /// without it "zero reads" would be satisfied by an attributor that was simply never wired, or
+    /// by a fixture that presented no candidate row to read. A discovered session must not, because
+    /// its frame is dropped before any database write.
+    ///
+    /// The frame is EMPTY on purpose. An empty, refused frame is the cheapest thing on the wire, so
+    /// a peer that gets a whole-replica pass for it has an amplifier however the pass is bounded.
+    #[tokio::test]
+    async fn a_refused_frame_schedules_no_attribution_pass() {
+        use crate::sage::singleton::{LineageAnswer, LineageSource};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingLineage {
+            hits: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl LineageSource for CountingLineage {
+            async fn parent_spend(
+                &self,
+                _parent_coin_id: &str,
+                _spent_height: u32,
+            ) -> crate::sage::Result<LineageAnswer> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                Ok(LineageAnswer::Absent)
+            }
+        }
+
+        /// Run one empty `coin_state_update` through the production loop and report how many
+        /// parent-spend reads the seeded candidate row cost.
+        async fn reads_for_one_empty_frame(authoritative: bool) -> usize {
+            let db = WalletDb::open_in_memory().await.unwrap();
+            db.set_peak(10, "aa").await.unwrap();
+            // One unattributed, unspent, confirmed coin at an unsubscribed hash: a candidate the
+            // pass will want to read the moment it runs.
+            db.upsert_coins(&[CoinRow {
+                coin_id: hex::encode([9u8; 32]),
+                parent_coin_info: hex::encode([8u8; 32]),
+                puzzle_hash: hex::encode([7u8; 32]),
+                amount: "1".into(),
+                created_height: Some(5),
+                spent_height: None,
+                asset_id: None,
+                hint: None,
+                created_timestamp: None,
+                spent_timestamp: None,
+            }])
+            .await
+            .unwrap();
+
+            let events = EventBus::with_capacity(8);
+            let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(4);
+            let update = CoinStateUpdate {
+                height: 11,
+                fork_height: 10,
+                peak_hash: Bytes32::new([2; 32]),
+                items: vec![],
+            };
+            tx.send(Message {
+                msg_type: ProtocolMessageTypes::CoinStateUpdate,
+                id: None,
+                data: chia_traits::Streamable::to_bytes(&update).unwrap().into(),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+
+            let hits = Arc::new(AtomicUsize::new(0));
+            let lineage = CountingLineage { hits: hits.clone() };
+            let plain = HashSet::new();
+            let attributor = CatAttributor {
+                lineage: &lineage,
+                prefix: "xch",
+                plain_puzzle_hashes: &plain,
+            };
+            let subscribed = subscribed_owned();
+            let mut session = if authoritative {
+                operator(&subscribed)
+            } else {
+                discovered(&subscribed)
+            };
+            run_update_loop(&db, receiver, &events, Some(&attributor), &mut session)
+                .await
+                .unwrap();
+            hits.load(Ordering::SeqCst)
+        }
+
+        assert_eq!(
+            reads_for_one_empty_frame(true).await,
+            1,
+            "control: an APPLIED frame runs the pass, so the fixture really does present a              candidate row that costs a read"
+        );
+        assert_eq!(
+            reads_for_one_empty_frame(false).await,
+            0,
+            "a frame dropped before any database write must schedule no work at all; running the              pass after it lets a peer buy a whole-replica scan for an empty frame it already              knows will be refused"
         );
     }
 
@@ -3231,7 +3358,7 @@ mod tests {
         db: &WalletDb,
         session: &mut SessionState<'_>,
         update: CoinStateUpdate,
-    ) -> Result<(), SyncError> {
+    ) -> Result<FrameApplied, SyncError> {
         handle_coin_state_update(db, &update, &EventBus::default(), session).await
     }
 

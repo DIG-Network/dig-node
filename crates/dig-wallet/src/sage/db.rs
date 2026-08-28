@@ -460,7 +460,8 @@ CREATE TABLE IF NOT EXISTS coins (
     asset_id TEXT,
     hint TEXT,
     created_timestamp INTEGER,
-    spent_timestamp INTEGER
+    spent_timestamp INTEGER,
+    attribution_examined INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_coins_ph ON coins (puzzle_hash);
 CREATE INDEX IF NOT EXISTS idx_coins_asset ON coins (asset_id);
@@ -647,6 +648,10 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     // build of this branch already has the table without them.
     "ALTER TABLE cat_admission_pending ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE cat_admission_pending ADD COLUMN last_attempt_at INTEGER",
+    // Set once a CAT/singleton attribution pass has RESOLVED this coin's parent spend and acted
+    // on what it said (dig-node#383). NULL means "not examined yet", which is the right reading
+    // for every row written before this column existed: they are re-examined once and then settle.
+    "ALTER TABLE coins ADD COLUMN attribution_examined INTEGER",
 ];
 
 // ---- one-shot data-migration ladder ---------------------------------------
@@ -709,6 +714,10 @@ const POST_MIGRATION_INDEXES: &[&str] = &[
     // The eviction order is `ORDER BY last_used_at`, run on every cache write (dig_ecosystem#3035).
     "CREATE INDEX IF NOT EXISTS idx_chain_read_cache_last_used ON chain_read_cache (last_used_at)",
     "CREATE INDEX IF NOT EXISTS idx_chain_spend_cache_last_used ON chain_spend_cache (last_used_at)",
+    // `unexamined_attribution_candidates` runs after every applied push frame. Without this it is
+    // a full table scan per frame; with it, a quiet wallet's pass touches no rows at all.
+    "CREATE INDEX IF NOT EXISTS idx_coins_attribution_pending ON coins (attribution_examined) \
+     WHERE spent_height IS NULL AND asset_id IS NULL AND attribution_examined IS NULL",
 ];
 
 // ---- chain-read cache budget (dig_ecosystem#3035) -------------------------
@@ -2997,6 +3006,53 @@ impl WalletDb {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Record that an attribution pass RESOLVED this coin's parent spend and acted on the answer,
+    /// so no later pass reads it again (dig-node#383).
+    ///
+    /// # Why the outcome is remembered rather than the lookup
+    ///
+    /// A CAT gains an `asset_id` and so is self-marking, but the other resolved outcomes are not:
+    /// [`Self::upsert_nft`] and [`Self::upsert_did`] write their own tables and leave
+    /// `coins.asset_id` NULL, and an odd-amount plain XCH coin at the wallet's own p2 hash
+    /// reconstructs to *nothing at all*. Every one of those rows is a candidate again on the next
+    /// pass, resolves again, and costs another outbound chain read — forever, at whatever cadence
+    /// a peer chooses to send frames at.
+    ///
+    /// A cache over the *lookup* cannot fix that, because these lookups succeed. Only the
+    /// attribution OUTCOME is stable enough to remember, and it is stable for the strongest
+    /// possible reason: a coin's parent spend is settled chain history and cannot change.
+    ///
+    /// The mark is set ONLY on a resolved read. A parent that could not be reached leaves the row
+    /// unmarked, because remembering "we could not ask" as "we asked" is how an outage turns into
+    /// a permanent wrong balance.
+    pub async fn mark_attribution_examined(&self, coin_id: &str) -> sqlx::Result<()> {
+        sqlx::query("UPDATE coins SET attribution_examined = 1 WHERE coin_id = ?")
+            .bind(Self::normalise_hex(coin_id))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The coins an attribution pass could still learn something from: unspent, unattributed,
+    /// confirmed, and not yet examined.
+    ///
+    /// Narrowed in SQL rather than by filtering [`Self::all_coins`] in Rust. The pass runs after
+    /// every applied push frame, so a whole-table read there is a standing per-frame cost
+    /// proportional to everything the replica has ever synced; here it is proportional to what
+    /// has newly arrived, and on a quiet wallet it returns nothing.
+    pub async fn unexamined_attribution_candidates(&self) -> sqlx::Result<Vec<CoinRow>> {
+        let rows = sqlx::query(
+            "SELECT * FROM coins
+              WHERE spent_height IS NULL
+                AND asset_id IS NULL
+                AND created_height IS NOT NULL
+                AND attribution_examined IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(Self::coin_from_row).collect())
     }
 
     // ---- NFTs -------------------------------------------------------------

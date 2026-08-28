@@ -313,9 +313,13 @@ impl SyncSession for ScriptedSession {
         db: &WalletDb,
         events: &EventBus,
         session: &mut sync::SessionState<'_>,
+        attributor: Option<&sync::CatAttributor<'_>>,
     ) -> Result<(), SyncError> {
         let receiver = self.receiver.lock().await.take().expect("run called once");
-        let result = sync::run_update_loop(db, receiver, events, None, session).await;
+        // Forwarded exactly as `ChiaPeerSession::run` forwards it. Substituting `None` here would
+        // make this double structurally incapable of observing dig-node#382, which is the defect
+        // the double is used to prove absent.
+        let result = sync::run_update_loop(db, receiver, events, attributor, session).await;
         let lifetime = *self.script.session_lifetime.lock().unwrap();
         self.script.advance(lifetime);
         result
@@ -589,6 +593,34 @@ impl Harness {
         chain_tip: Option<Arc<dyn ChainTipObserver>>,
         session_lifetime: Duration,
     ) -> Self {
+        Self::start_with_attribution(
+            db,
+            hashes,
+            script,
+            addrs,
+            trust,
+            corroborator,
+            chain_tip,
+            session_lifetime,
+            None,
+        )
+        .await
+    }
+
+    /// Start a supervisor with a CAT/singleton attribution source attached — the production
+    /// shape, and the only one that can observe dig-node#382.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_attribution(
+        db: WalletDb,
+        hashes: Arc<dyn PuzzleHashSource>,
+        script: Arc<Script>,
+        addrs: Vec<String>,
+        trust: PeerTrust,
+        corroborator: Option<Arc<dyn Corroborator>>,
+        chain_tip: Option<Arc<dyn ChainTipObserver>>,
+        session_lifetime: Duration,
+        attribution: Option<Arc<Attribution>>,
+    ) -> Self {
         let factory = Arc::new(ScriptedFactory {
             script: script.clone(),
             addrs,
@@ -603,6 +635,7 @@ impl Harness {
             time: script.clone(),
             corroborator: corroborator.clone(),
             chain_tip,
+            attribution,
             session_lifetime,
         });
         Self {
@@ -1943,6 +1976,8 @@ async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
         // The acceptance step watches a REAL peer follow mainnet; a stall deadline would only
         // add a second reason for the session to end and blur what the run proves.
         chain_tip: None,
+        // This fixture holds no wallet, so there is nothing to attribute.
+        attribution: None,
         session_lifetime: SESSION_MAX_LIFETIME,
     });
 
@@ -4280,4 +4315,556 @@ async fn a_refused_writer_is_not_reported_as_synced() {
          reporting synced tells the user a partition or a hostile peer set is fine"
     );
     assert_eq!(status.phase, SyncPhase::Syncing);
+}
+
+// ---------------------------------------------------------------------------
+// dig-node#382 -- the $DIG balance that read zero on a funded wallet
+// ---------------------------------------------------------------------------
+
+use crate::sage::db::CoinRow;
+use crate::sage::singleton::LineageAnswer;
+
+/// A [`crate::sage::singleton::LineageSource`] backed by an in-memory
+/// `parent_coin_id -> ParentSpend` map, populated from a `Simulator`. The production source reads
+/// the same two fields off the chain.
+///
+/// A miss answers [`LineageAnswer::Unavailable`], which is what the production source reports for
+/// a parent it cannot resolve. Modelling a miss as a settled `Absent` instead would make every
+/// test over this double blind to production's unreadable-parent path -- see
+/// [`LineageAnswer::from_lookup`].
+#[derive(Default)]
+struct FixtureLineage {
+    by_parent: std::collections::HashMap<String, crate::sage::singleton::ParentSpend>,
+}
+
+#[async_trait::async_trait]
+impl crate::sage::singleton::LineageSource for FixtureLineage {
+    async fn parent_spend(
+        &self,
+        parent_coin_id: &str,
+        _spent_height: u32,
+    ) -> crate::sage::Result<LineageAnswer> {
+        Ok(LineageAnswer::from_lookup(
+            self.by_parent.get(parent_coin_id).cloned(),
+            LineageAnswer::Unavailable,
+        ))
+    }
+}
+
+/// One issued CAT and the child coin a syncing wallet observes.
+struct CatFixture {
+    child: chia_protocol::Coin,
+    parent: crate::sage::singleton::ParentSpend,
+    asset_id: String,
+    owner_p2: Bytes32,
+}
+
+/// Issue one CAT on a simulator and return the child coin plus the parent spend that proves what
+/// it is -- the two things a real attribution pass reads off the chain.
+fn issue_cat() -> CatFixture {
+    use chia_sdk_test::Simulator;
+    use chia_traits::Streamable;
+    use chia_wallet_sdk::driver::{
+        Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer,
+    };
+    use chia_wallet_sdk::types::Conditions;
+
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+    let holder = sim.bls(1000);
+    let p2 = StandardLayer::new(holder.pk);
+    let memos = ctx.hint(holder.puzzle_hash).unwrap();
+    let (issue, cats) = SdkCat::single_issuance(
+        ctx,
+        holder.coin.coin_id(),
+        None,
+        1000,
+        Conditions::new().create_coin(holder.puzzle_hash, 1000, memos),
+    )
+    .unwrap();
+    p2.spend(ctx, holder.coin, issue).unwrap();
+    let keys = vec![holder.sk.clone()];
+    sim.spend_coins(ctx.take(), &keys).unwrap();
+
+    // Spend the eve CAT once, so the coin the wallet holds has a CAT coin as its parent -- the
+    // shape `Cat::parse_children` reconstructs from.
+    let cat = cats[0];
+    let inner = p2
+        .spend_with_conditions(
+            ctx,
+            Conditions::new().create_coin(holder.puzzle_hash, 1000, memos),
+        )
+        .unwrap();
+    SdkCat::spend_all(ctx, &[CatSpend::new(cat, inner)]).unwrap();
+    sim.spend_coins(ctx.take(), &keys).unwrap();
+
+    CatFixture {
+        child: cat.child(holder.puzzle_hash, 1000).coin,
+        parent: crate::sage::singleton::ParentSpend {
+            coin: cat.coin,
+            puzzle_reveal: sim
+                .puzzle_reveal(cat.coin.coin_id())
+                .expect("parent puzzle reveal")
+                .to_bytes()
+                .unwrap(),
+            solution: sim
+                .solution(cat.coin.coin_id())
+                .expect("parent solution")
+                .to_bytes()
+                .unwrap(),
+        },
+        asset_id: hex::encode(cat.info.asset_id),
+        owner_p2: holder.puzzle_hash,
+    }
+}
+
+/// An unattributed replica row for `coin` -- unspent, confirmed, `asset_id` NULL. This is exactly
+/// what `apply_coin_states` writes for a CAT coin, because a `CoinState` frame carries no TAIL.
+fn unattributed_row(coin: chia_protocol::Coin) -> CoinRow {
+    CoinRow {
+        coin_id: hex::encode(coin.coin_id()),
+        parent_coin_info: hex::encode(coin.parent_coin_info),
+        puzzle_hash: hex::encode(coin.puzzle_hash),
+        amount: coin.amount.to_string(),
+        created_height: Some(i64::from(CATCH_UP_HEIGHT - 1)),
+        spent_height: None,
+        asset_id: None,
+        hint: None,
+        created_timestamp: None,
+        spent_timestamp: None,
+    }
+}
+
+/// **Proves (dig-node#382):** the supervisor BUILDS and THREADS a `CatAttributor`, so an
+/// unattributed CAT row in the replica gains its `asset_id` and becomes selectable by
+/// `unspent_coins(Some(asset))` -- the query every $DIG balance and every coin selection runs.
+///
+/// # Why this test and not the one that already existed
+///
+/// `sync::run_update_loop_runs_attribution_when_attributor_present` hands `run_update_loop` an
+/// attributor directly and asserts it is used. That proves the CAPABILITY, and it was green for
+/// the entire life of the defect, because the only production call site passed a hard-coded
+/// `None`. This test never names `run_update_loop` or `CatAttributor`: it starts the real
+/// [`Supervisor`] and asserts on the DATABASE afterwards, so it can only pass if production
+/// genuinely constructs the attributor and hands it to the session.
+///
+/// # Why the row is SEEDED rather than synced
+///
+/// Ingesting a CAT coin from a peer frame is a separate defect (dig-node#380): a CAT coin sits at
+/// its outer puzzle hash, which is not in the subscribed p2 set, so `apply_coin_states` drops it.
+/// That half is deliberately out of this change. The row seeded here is the one that genuinely
+/// exists in the wild -- a coin already in the replica, permanently unattributed because the pass
+/// that would name it was never reached.
+///
+/// # The control
+///
+/// The same fixture run with `attribution: None` must leave `asset_id` NULL. Without it, a green
+/// here would also be produced by a replica that had somehow been attributed by something else,
+/// and the assertion would pin a coincidence rather than the wiring.
+#[tokio::test]
+async fn the_supervisor_attributes_an_unattributed_cat_row_in_its_replica() {
+    /// Run one supervisor over a seeded, unattributed CAT row and report the row's `asset_id`.
+    async fn asset_id_after_sync(cat: &CatFixture, attach_attribution: bool) -> Option<String> {
+        let mut lineage = FixtureLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(cat.child.parent_coin_info), cat.parent.clone());
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&[unattributed_row(cat.child)])
+            .await
+            .unwrap();
+
+        let attribution = attach_attribution.then(|| {
+            Arc::new(Attribution::new(
+                Arc::new(lineage) as Arc<dyn crate::sage::singleton::LineageSource>,
+                "xch".to_string(),
+            ))
+        });
+
+        let h = Harness::start_with_attribution(
+            db.clone(),
+            Arc::new(FixedHashes::unlocked(vec![cat.owner_p2])),
+            Script::new(),
+            vec!["203.0.113.1:8444".into()],
+            PeerTrust::Operator,
+            None,
+            None,
+            NO_ROTATION,
+            attribution,
+        )
+        .await;
+
+        // The pass runs immediately AFTER the catch-up latches `initial_sync_complete`, so the
+        // flag alone is too early to read the row on. Waiting for the flag and then letting the
+        // session settle gives the pass its chance -- which is what makes the NULL control
+        // meaningful rather than a measurement taken before the work could have happened.
+        h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
+            .await;
+        h.settle().await;
+        let row = db
+            .all_coins()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.coin_id == hex::encode(cat.child.coin_id()))
+            .expect("the seeded row must still be present");
+        h.stop().await;
+        row.asset_id
+    }
+
+    let cat = issue_cat();
+
+    assert_eq!(
+        asset_id_after_sync(&cat, true).await.as_deref(),
+        Some(cat.asset_id.as_str()),
+        "the supervisor must build and thread a CatAttributor, so a CAT row in the replica gains \
+         its asset id; without it `unspent_coins(Some(asset))` matches nothing and a funded \
+         wallet reports a $DIG balance of zero"
+    );
+    assert_eq!(
+        asset_id_after_sync(&cat, false).await,
+        None,
+        "control: with no lineage source attached the row stays unattributed, so the assertion \
+         above is pinning the wiring rather than something else in the fixture"
+    );
+}
+
+/// **Proves (dig-node#380 + #382):** with the attributor wired, an ordinary sync PROMOTES a
+/// staged CAT admission -- so a coin discovered at a derived hash becomes a believed, spendable,
+/// correctly-attributed row without anyone calling the promotion pass by hand.
+///
+/// # Why this test enters where it does
+///
+/// The sibling test above seeds `coins` directly with `upsert_coins` and proves the
+/// `reconstruct_all` half. That entry point is BESIDE #393's narrowing, not above it: a coin
+/// placed straight into `coins` has already been believed, so the staging table, the admission
+/// decision and `promote_staged_cats` are all bypassed. A test entering beside a narrowing proves
+/// nothing about it.
+///
+/// This one enters at the TOP of #393's chain and touches no other rung by hand:
+/// `route_point_read_rows` decides the coin is a claim and stages it, `stage_cat_admissions`
+/// persists it, and then the only thing that runs is the real [`Supervisor`]. Nothing in the test
+/// names `promote_staged_cats`, `CatAttributor` or `run_update_loop`, so it can only pass if
+/// production genuinely builds the attributor and reaches the promotion pass through it.
+///
+/// # The control, and why it is the load-bearing half
+///
+/// The same fixture with `attribution: None` must leave the coin STAGED and `coins` empty. That is
+/// the state the shipped node is in today: #393's staging and promotion machinery is present and
+/// correct, and never runs during ordinary sync, so a funded wallet reports a confident zero. The
+/// control asserts that failure still reproduces when the wiring is removed -- without it, a green
+/// above would also be produced by a promotion that happened for some other reason.
+#[tokio::test]
+async fn the_supervisor_promotes_a_staged_cat_admission_during_an_ordinary_sync() {
+    use crate::sage::cat_discovery::{route_point_read_rows, DerivedCats};
+
+    /// Stage one CAT admission through the real routing decision, run one supervisor over it, and
+    /// report `(the promoted row's asset id, how many rows are still staged)`.
+    async fn promote_after_sync(
+        cat: &CatFixture,
+        attach_attribution: bool,
+    ) -> (Option<String>, usize) {
+        let mut lineage = FixtureLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(cat.child.parent_coin_info), cat.parent.clone());
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+
+        // ---- ABOVE the narrowing: the routing decision itself, on an un-staged point read. ----
+        //
+        // `owned` holds the wallet's PLAIN p2 hash. The CAT coin does not sit there -- it sits at
+        // the CAT outer hash curried from (owner p2, asset id) -- so this row is a CLAIM, and
+        // `route_point_read_rows` must stage it rather than believe it. Asserted below rather than
+        // assumed, because a fixture whose coin was quietly believed would make the whole test
+        // exercise the ordinary XCH path while reading exactly like a promotion proof.
+        let asset = crate::sage::singleton::bytes32_from_hex(&cat.asset_id).unwrap();
+        let derived = DerivedCats::derive(&[cat.owner_p2], &[asset]);
+        let owned: std::collections::HashSet<String> =
+            std::iter::once(hex::encode(cat.owner_p2)).collect();
+        let (believed, staged) =
+            route_point_read_rows(&[unattributed_row(cat.child)], &owned, &derived, |_| false);
+        assert!(
+            believed.is_empty() && staged.len() == 1,
+            "fixture precondition: the CAT coin must be routed as a staged CLAIM, not believed. \
+             If it were believed, this test would prove nothing about the promotion path it \
+             exists to cover. believed={believed:?} staged={staged:?}"
+        );
+        assert_eq!(
+            staged[0].derived_asset_id, cat.asset_id,
+            "fixture precondition: the coin must be recognised at its DERIVED hash, so promotion \
+             takes the predicted branch this test is about"
+        );
+        db.stage_cat_admissions(&staged).await.unwrap();
+        assert!(
+            db.all_coins().await.unwrap().is_empty(),
+            "fixture precondition: nothing is believed yet -- `coins` must be empty before the \
+             supervisor runs, or the assertion below could read a row the test itself wrote"
+        );
+
+        let attribution = attach_attribution.then(|| {
+            Arc::new(Attribution::new(
+                Arc::new(lineage) as Arc<dyn crate::sage::singleton::LineageSource>,
+                "xch".to_string(),
+            ))
+        });
+
+        let h = Harness::start_with_attribution(
+            db.clone(),
+            Arc::new(FixedHashes::unlocked(vec![cat.owner_p2])),
+            Script::new(),
+            vec!["203.0.113.1:8444".into()],
+            PeerTrust::Operator,
+            None,
+            None,
+            NO_ROTATION,
+            attribution,
+        )
+        .await;
+        h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
+            .await;
+        h.settle().await;
+
+        // Read through the query a $DIG balance and every coin selection actually run, not through
+        // `all_coins`. A row that exists but is not selectable by `unspent_coins(Some(asset))` is
+        // still a wallet reporting zero, which is the user-visible defect.
+        let selectable = db.unspent_coins(Some(&cat.asset_id)).await.unwrap();
+        let still_staged = db.staged_cat_admissions(64, i64::MAX).await.unwrap().len();
+        h.stop().await;
+        (
+            selectable
+                .into_iter()
+                .find(|r| r.coin_id == hex::encode(cat.child.coin_id()))
+                .and_then(|r| r.asset_id),
+            still_staged,
+        )
+    }
+
+    let cat = issue_cat();
+
+    let (attributed, staged_left) = promote_after_sync(&cat, true).await;
+    assert_eq!(
+        attributed.as_deref(),
+        Some(cat.asset_id.as_str()),
+        "an ordinary sync must promote the staged admission, so the coin becomes selectable by \
+         `unspent_coins(Some(asset))` -- the query behind every $DIG balance. Without the \
+         attributor threaded into the production session this never runs and a funded wallet \
+         reports zero (dig-node#380/#382)"
+    );
+    assert_eq!(
+        staged_left, 0,
+        "a promoted coin must leave the staging queue, or it is re-proven on every pass for ever"
+    );
+
+    let (control, control_staged) = promote_after_sync(&cat, false).await;
+    assert_eq!(
+        control, None,
+        "control: with no attributor attached the promotion pass is never reached, so the coin \
+         stays unattributed. This is the shipped node's behaviour today, and the assertion above \
+         is only meaningful because this one reproduces it"
+    );
+    assert_eq!(
+        control_staged, 1,
+        "control: the admission is still STAGED rather than lost -- #393's machinery is present \
+         and correct, it is simply never run. That distinction is the whole of this PR"
+    );
+}
+
+/// A [`crate::sage::singleton::LineageSource`] that answers
+/// [`LineageAnswer::Unavailable`] until it is ARMED, and resolves from its map afterwards.
+///
+/// The gate is what separates the supervisor's two attribution call sites. The post-catch-up pass
+/// runs once, immediately after the catch-up latches; arming only AFTER that pass has been given
+/// its chance means anything attributed later can ONLY have come from the update loop. Without the
+/// gate both call sites reach the same rows and a test cannot tell which one did the work -- which
+/// is exactly how the production `None` survived: every existing test was satisfied by the other
+/// site.
+#[derive(Default)]
+struct GatedLineage {
+    by_parent: std::collections::HashMap<String, crate::sage::singleton::ParentSpend>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl GatedLineage {
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::sage::singleton::LineageSource for GatedLineage {
+    async fn parent_spend(
+        &self,
+        parent_coin_id: &str,
+        _spent_height: u32,
+    ) -> crate::sage::Result<LineageAnswer> {
+        if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            // UNAVAILABLE, never `Absent`: nothing has been learned about this parent yet, and an
+            // `Absent` here would settle the row permanently (`mark_attribution_examined`), so the
+            // later pass would never look at it again and this test would pass for the wrong
+            // reason -- against a build with no update-loop wiring at all.
+            return Ok(LineageAnswer::Unavailable);
+        }
+        Ok(LineageAnswer::from_lookup(
+            self.by_parent.get(parent_coin_id).cloned(),
+            LineageAnswer::Unavailable,
+        ))
+    }
+}
+
+/// A `CoinStateUpdate` frame carrying one coin, which `apply_coin_states` WRITES (the coin sits at
+/// a subscribed puzzle hash). Only an APPLIED frame triggers the update loop's attribution pass.
+fn coin_update_message(coin: chia_protocol::Coin, height: u32) -> Message {
+    let update = chia_protocol::CoinStateUpdate {
+        height,
+        fork_height: height,
+        peak_hash: Bytes32::new([3; 32]),
+        items: vec![chia_protocol::CoinState {
+            coin,
+            created_height: Some(height),
+            spent_height: None,
+        }],
+    };
+    Message {
+        msg_type: ProtocolMessageTypes::CoinStateUpdate,
+        id: None,
+        data: chia_traits::Streamable::to_bytes(&update).unwrap().into(),
+    }
+}
+
+/// **Proves (dig-node#382):** the attributor the supervisor builds reaches
+/// [`sync::run_update_loop`] THROUGH THE SESSION TRAIT, so a frame applied on a live session
+/// attributes the replica -- while that session is still the first one.
+///
+/// # What this test does and does not pin, measured rather than assumed
+///
+/// Reverting the production line this PR exists to change --
+/// `ChiaPeerSession::run`'s `sync::run_update_loop(db, receiver, events, attributor, session)`
+/// back to the shipped `None` -- leaves this test, and the whole 706-test dig-wallet suite, GREEN.
+/// That is not a weakness in the assertions; it is structural. The supervisor holds its session as
+/// a `dyn SyncSession`, and every unit test substitutes `ScriptedSession`, so
+/// `ChiaPeerSession::run` is never executed here: it is only ever constructed against a real TLS
+/// peer connection. No unit test in this crate can cover that line, and claiming otherwise would
+/// be worse than saying so.
+///
+/// What this test DOES pin is everything upstream of it, which is where the rest of the wiring
+/// lives: that the supervisor CONSTRUCTS a `CatAttributor` from its `Attribution`, that it hands
+/// it to `SyncSession::run`, and that an implementation receiving it and forwarding it to
+/// `run_update_loop` attributes on an applied frame. Blanking the supervisor's construction
+/// (`let attributor = ...` -> `None`) turns this test red, and that is production code.
+///
+/// # The gate, and the second-catch-up pin
+///
+/// The lineage source answers nothing until ARMED, and is armed only after the post-catch-up pass
+/// has already run and failed -- so the attribution asserted here cannot have come from that pass.
+/// The `catch_up_count() == 1` assertion closes the remaining hole: a reconnect reruns the
+/// catch-up, and the SECOND attempt's post-catch-up pass would otherwise attribute the row with
+/// the now-armed source and produce a green that had nothing to do with the update loop. The first
+/// version of this test lacked that pin and passed for exactly that reason.
+#[tokio::test]
+async fn a_frame_on_a_live_session_attributes_through_the_update_loop() {
+    let cat = issue_cat();
+    let mut gated = GatedLineage::default();
+    gated
+        .by_parent
+        .insert(hex::encode(cat.child.parent_coin_info), cat.parent.clone());
+    let gated = Arc::new(gated);
+
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.upsert_coins(&[unattributed_row(cat.child)])
+        .await
+        .unwrap();
+
+    let h = Harness::start_with_attribution(
+        db.clone(),
+        Arc::new(FixedHashes::unlocked(vec![cat.owner_p2])),
+        Script::new(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        None,
+        NO_ROTATION,
+        Some(Arc::new(Attribution::new(
+            gated.clone() as Arc<dyn crate::sage::singleton::LineageSource>,
+            "xch".to_string(),
+        ))),
+    )
+    .await;
+
+    h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
+        .await;
+    h.settle().await;
+
+    // THE PRECONDITION THAT MAKES THIS TEST LOAD-BEARING. The post-catch-up pass has run and could
+    // not resolve anything, so the row is still unattributed. If this ever starts failing, the
+    // assertion below has stopped isolating the update loop and is measuring the other call site.
+    let before = db
+        .all_coins()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.coin_id == hex::encode(cat.child.coin_id()))
+        .expect("the seeded row must be present")
+        .asset_id;
+    assert_eq!(
+        before, None,
+        "precondition: the post-catch-up pass must NOT have attributed the row while the lineage \
+         source was gated -- otherwise this test cannot tell the two call sites apart"
+    );
+
+    // Now the chain can answer, and a frame arrives on the LIVE session.
+    gated.arm();
+    push_peak_to_a_live_session(
+        &h,
+        coin_update_message(
+            chia_protocol::Coin {
+                parent_coin_info: Bytes32::new([9; 32]),
+                puzzle_hash: cat.owner_p2,
+                amount: 42,
+            },
+            CATCH_UP_HEIGHT + 1,
+        ),
+    )
+    .await;
+
+    // Poll rather than assert once: the frame is handled asynchronously by the live session, so
+    // a single read races the update loop and would flake in whichever direction the scheduler
+    // happened to pick. Bounded, so a genuine failure to attribute still fails rather than hangs.
+    let want = hex::encode(cat.child.coin_id());
+    let mut attributed = None;
+    for _ in 0..200 {
+        h.settle().await;
+        attributed = db
+            .all_coins()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.coin_id == want)
+            .and_then(|r| r.asset_id);
+        // A SECOND catch-up ends the window, and the assertion below then fails. This is the
+        // whole isolation, and it was added because the first version of this test did NOT have
+        // it and passed under the mutation: a reconnect reruns the catch-up, and the post-catch-up
+        // pass of that SECOND attempt attributes the row with the now-armed source. Stopping the
+        // poll here is what keeps the measurement inside the first session.
+        if attributed.is_some() || h.script.catch_up_count() > 1 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        h.script.catch_up_count(),
+        1,
+        "isolation: the row must be attributed while the FIRST session is still live. A second          catch-up means the post-catch-up pass could explain the result, and this test would no          longer be about `run_update_loop`'s attributor at all"
+    );
+
+    assert_eq!(
+        attributed.as_deref(),
+        Some(cat.asset_id.as_str()),
+        "a frame applied on a live session must run the attribution pass, so the replica names \
+         its CAT. This is the assertion that goes red when the supervisor stops BUILDING \
+         the attributor it threads into the session (dig-node#382)"
+    );
+
+    h.stop().await;
 }
