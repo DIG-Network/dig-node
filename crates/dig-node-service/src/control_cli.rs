@@ -1227,6 +1227,101 @@ fn compact(result: &Value) -> String {
     serde_json::to_string(result).unwrap_or_else(|_| "{}".to_string())
 }
 
+
+/// `dign collateral history` — the epochs this node has recorded, and how it came by each.
+///
+/// Read from the record file directly rather than over a control call, like `dign spends`: the
+/// store is this node's own state on this node's own disk, and an operator diagnosing a node that
+/// will not start is exactly the person who most needs to read it.
+///
+/// # Provenance is shown, never summarised away
+///
+/// A bootstrap record, a censused one and one adopted from a sample of untrusted peers are three
+/// different claims about how much this node knows, and the recommendation an operator funds is
+/// derived from whichever it holds. Rendering them identically would present the weakest with the
+/// authority of the strongest.
+pub fn collateral_history(epoch: Option<u64>) -> std::io::Result<Outcome> {
+    use crate::collateral::{EpochRecordStore, StoredEpoch};
+
+    let store = EpochRecordStore::in_state_dir();
+
+    // A single epoch goes through `get`, which distinguishes "never recorded" from "recorded and
+    // unreadable". The listing cannot make that distinction and does not pretend to.
+    if let Some(epoch) = epoch {
+        let (human, result) = match store.get(epoch) {
+            StoredEpoch::Found(record) => (render_record(&record), serde_json::to_value(&*record)?),
+            StoredEpoch::Absent => (
+                format!(
+                    "epoch {epoch}: NOT RECORDED — this node has not censused it and has not \
+                     adopted it from peers."
+                ),
+                json!({ "epoch": epoch, "record": Value::Null, "reason": "not_recorded" }),
+            ),
+            StoredEpoch::Unreadable => (
+                format!(
+                    "epoch {epoch}: RECORDED BUT UNREADABLE — the line for this epoch in {} could \
+                     not be parsed. The figures are lost, not absent.",
+                    store.path().display()
+                ),
+                json!({ "epoch": epoch, "record": Value::Null, "reason": "record_unreadable" }),
+            ),
+        };
+        return Ok(Outcome::new(human, result));
+    }
+
+    let records = store.records()?;
+    let human = if records.is_empty() {
+        format!(
+            "no collateral epochs recorded yet ({}).",
+            store.path().display()
+        )
+    } else {
+        let mut lines = Vec::with_capacity(records.len() + 1);
+        lines.push(format!("{} epoch(s) recorded:", records.len()));
+        lines.extend(records.iter().map(render_record));
+        lines.join("\n")
+    };
+    let result = json!({
+        "path": store.path().display().to_string(),
+        "records": records
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?,
+    });
+    Ok(Outcome::new(human, result))
+}
+
+/// One recorded epoch, as a single operator-readable line.
+fn render_record(record: &crate::collateral::StoredRecord) -> String {
+    use crate::collateral::{format_dig, RecordProvenance};
+
+    let provenance = match record.provenance {
+        RecordProvenance::Bootstrap => "genesis (derived from nothing)".to_string(),
+        RecordProvenance::Censused => "censused by this node".to_string(),
+        RecordProvenance::AdoptedFromPeers { agreed, sampled } => {
+            format!("adopted from peers ({agreed} of {sampled} agreed, each re-derived here)")
+        }
+    };
+    // An absent census height is stated as absent. A "0" here would read as a real block.
+    let height = match record.census_height {
+        Some(height) => format!("census height {height}"),
+        None => "no census (epoch 1 is derived from nothing)".to_string(),
+    };
+    format!(
+        "  epoch {} · {} DIG per store · v{} rules · {} advertisement(s) across {} \
+         collateralised owner(s) · multiplier {}.{:06}x · {} · {}",
+        record.record.epoch,
+        format_dig(record.record.required_per_store_dig_base_units),
+        record.record.protocol_version.0,
+        record.record.census.stores,
+        record.record.census.owners,
+        record.record.multiplier_micros / 1_000_000,
+        record.record.multiplier_micros % 1_000_000,
+        height,
+        provenance,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

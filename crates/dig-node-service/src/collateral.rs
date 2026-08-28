@@ -38,6 +38,12 @@ const COLLATERAL_CONFIG_FILE: &str = "collateral.json";
 /// The file holding the per-epoch records this node has censused, one JSON record per line.
 const EPOCH_RECORD_FILE: &str = "collateral-epochs.jsonl";
 
+/// The one-based first epoch, which no retention policy may discard.
+///
+/// Named rather than written as `1` at the one place it is used, because what makes it exempt is
+/// not that it is small — it is that it is the base case the recurrence unrolls from.
+const GENESIS_EPOCH: u64 = 1;
+
 /// This node's local collateral preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollateralConfig {
@@ -544,9 +550,14 @@ impl EpochRecordStore {
         // wrapping to a cutoff near `u64::MAX` that would discard the entire history.
         let oldest_kept = current_epoch.saturating_sub(keep.saturating_sub(1));
         let held = self.records()?;
+        // Epoch 1 is NEVER pruned, whatever the policy says. It is the base case the whole
+        // recurrence unrolls from: every peer record this node verifies is checked against a chain
+        // of predecessors that terminates there, so a node that discarded it to save one line
+        // could no longer verify anything it was offered. Found by running a two-epoch retention on
+        // a real node, which dropped it and left the store empty.
         let (kept, dropped): (Vec<_>, Vec<_>) = held
             .into_iter()
-            .partition(|rec| rec.record.epoch >= oldest_kept);
+            .partition(|rec| rec.record.epoch >= oldest_kept || rec.record.epoch == GENESIS_EPOCH);
         if dropped.is_empty() {
             return Ok(0);
         }
@@ -1022,14 +1033,17 @@ mod tests {
 
         // KeepEpochs(3) as of epoch 10 keeps 8, 9 and 10 — the bound is pinned from BOTH sides:
         // epoch 8 must survive and epoch 7 must not, so an off-by-one in either direction fails.
-        assert_eq!(store.prune(RetentionPolicy::KeepEpochs(3), 10).expect("p"), 7);
+        // Epoch 1 survives regardless: it is the base case every verification walk starts from,
+        // and a node that discarded it could no longer check anything a peer offered it. So 6 of
+        // the 7 outside the window go, not all 7.
+        assert_eq!(store.prune(RetentionPolicy::KeepEpochs(3), 10).expect("p"), 6);
         let kept: Vec<u64> = store
             .records()
             .expect("records")
             .iter()
             .map(|rec| rec.record.epoch)
             .collect();
-        assert_eq!(kept, vec![8, 9, 10]);
+        assert_eq!(kept, vec![1, 8, 9, 10]);
         // The survivors are still whole records, not truncated lines.
         match store.get(8) {
             StoredEpoch::Found(rec) => assert_eq!(rec.census_height, Some(1_008)),
