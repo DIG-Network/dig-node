@@ -1090,6 +1090,94 @@ mod tests {
     use super::*;
     use crate::control::CONTROL_METHODS;
 
+    /// The requirement summary MUST NOT render an absent figure as a number.
+    ///
+    /// This is the rendering half of the money-lie rule: the wire is already honest (an `unknown`
+    /// answer carries no figure at all), and this asserts the human line does not invent one on the
+    /// way out. Each reason must also carry ITS OWN remedy, because a node that has not censused
+    /// needs to run the census while one inside the finality depth only needs to wait — one shared
+    /// sentence for both is unactionable.
+    #[test]
+    fn an_unknown_requirement_renders_a_reason_and_never_a_figure() {
+        let cases = [
+            ("not_censused", "censused"),
+            ("behind_finality_depth", "final"),
+            ("record_unreadable", "could not be read"),
+            ("no_chain_source", "chain"),
+        ];
+        let mut remedies = std::collections::BTreeSet::new();
+        for (reason, needle) in cases {
+            let line = summarize_collateral_requirement(&json!({
+                "state": "unknown",
+                "reason": reason,
+            }));
+            assert!(line.contains("UNKNOWN"), "{reason}: {line}");
+            assert!(line.contains(needle), "{reason}: {line}");
+            // No amount of DIG anywhere. "0.000" would read as "no collateral required", and
+            // under-posting costs the operator that epoch's rewards.
+            assert!(
+                !line.contains("0.000"),
+                "{reason} rendered a zero cost: {line}"
+            );
+            assert!(
+                !line.contains("per store"),
+                "{reason} implied a figure: {line}"
+            );
+            remedies.insert(line.rsplit('·').next().unwrap_or("").trim().to_string());
+        }
+        // Four distinct remedies, not one sentence reused four times.
+        assert_eq!(remedies.len(), 4, "the remedies collapsed: {remedies:?}");
+    }
+
+    #[test]
+    fn a_known_requirement_shows_the_census_inputs_behind_the_figure() {
+        let line = summarize_collateral_requirement(&json!({
+            "state": "known",
+            "epoch": 104,
+            "protocol_version": 1,
+            "required_per_store_dig_base_units": 3_780u64,
+            "stores": 17,
+            "owners": 820,
+            "multiplier_micros": 900_000u64,
+            "handicap_dig_base_units": 720u64,
+        }));
+        // The figure, at three decimals -- 3_780 base units is 3.780 DIG, not 3.78 and not 3780.
+        assert!(line.contains("3.780 DIG per store"), "{line}");
+        // And it says the figure is PRE-margin, so nobody reads it as what they must hold.
+        assert!(line.contains("before any safety margin"), "{line}");
+        // The inputs, so a person can say WHY the price moved rather than only that it did.
+        assert!(line.contains("104"), "{line}");
+        assert!(line.contains("17 advertisement"), "{line}");
+        // "collateralised owner(s)", never "nodes" -- one owner hash may back many nodes.
+        assert!(line.contains("820 collateralised owner"), "{line}");
+        assert!(
+            !line.contains("node(s)"),
+            "owners must not be rendered as nodes: {line}"
+        );
+        assert!(line.contains("0.900000x"), "{line}");
+        assert!(line.contains("0.720 DIG"), "{line}");
+    }
+
+    #[test]
+    fn the_margin_line_names_its_preset_and_keeps_sub_percent_values() {
+        // A 1 bp margin is 0.01%, and rounding it to whole percent would erase a legal choice
+        // entirely -- the value would read as no margin at all.
+        assert!(summarize_margin(&json!({ "margin_bp": 1 })).contains("+0.01%"));
+        assert!(summarize_margin(&json!({ "margin_bp": 1 })).contains("(tight)"));
+        assert!(summarize_margin(&json!({ "margin_bp": 100 })).contains("+1.00%"));
+        assert!(summarize_margin(&json!({ "margin_bp": 100 })).contains("(default)"));
+        assert!(summarize_margin(&json!({ "margin_bp": 500 })).contains("+5.00%"));
+        assert!(summarize_margin(&json!({ "margin_bp": 500 })).contains("(generous)"));
+        // A value that is nobody's preset is shown plainly rather than mislabelled as the nearest.
+        let odd = summarize_margin(&json!({ "margin_bp": 250 }));
+        assert!(odd.contains("250 bp"), "{odd}");
+        assert!(odd.contains("+2.50%"), "{odd}");
+        assert!(
+            !odd.contains('('),
+            "an unnamed margin must not borrow a preset name: {odd}"
+        );
+    }
+
     #[test]
     fn every_action_maps_to_a_control_method() {
         // A representative of each variant → its method is a real `control.*` name.
