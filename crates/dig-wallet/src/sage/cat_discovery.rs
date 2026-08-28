@@ -40,11 +40,11 @@
 //! - **Off the frame path**: [`promote_staged_cats`] performs roughly **one** parent-spend read per
 //!   newly staged coin, **terminal** on both success and definitive refusal, and capped per pass.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chia_protocol::{Bytes32, Coin, CoinState};
 
-use super::db::{StagedCatRow, WalletDb};
+use super::db::{CoinRow, StagedCatRow, WalletDb};
 use super::singleton::{coin_from_row, LineageSource, Reconstructed};
 use super::{singleton, Result};
 
@@ -179,6 +179,79 @@ where
         });
     }
     rows
+}
+
+/// Split already-materialised [`CoinRow`]s into the ones that may be BELIEVED and the ones that
+/// must be STAGED — the point-read tier's half of the same routing `stage_from_states` performs on
+/// the peer frame path (dig-node#394).
+///
+/// # Why this exists rather than a second guard
+///
+/// `refresh_tracked_coins` reads coins two ways: by PUZZLE HASH, which finds coins sitting at the
+/// wallet's own p2 hashes, and by HINT, which finds coins that merely *claim* to be for this
+/// wallet. It upserted both straight into `coins`, where a row with no `asset_id` means XCH — so a
+/// hint is attacker-controlled input that minted a balance. Anyone may `CREATE_COIN` with any
+/// hint, so this was the same fabricated-balance and send-kill-switch primitive as the catch-up
+/// path, at a third tier and reachable without a peer at all.
+///
+/// The fix is not a third guard. Three guards that must agree is what produced this defect twice
+/// already; this routes the third tier through the SAME staging table, so there is one admission
+/// point and it is the one that demands a lineage proof.
+///
+/// A hinted coin that is not at a derived hash for a known asset is DROPPED rather than believed.
+/// That is a deliberate narrowing: such a coin cannot be selected as an XCH input (its puzzle hash
+/// is not ours) and carries no asset id, so admitting it only ever produced a wrong XCH figure.
+/// Absence is this design's accepted failure direction; a wrong figure is not.
+pub fn route_point_read_rows<F>(
+    rows: &[CoinRow],
+    owned_puzzle_hashes: &HashSet<String>,
+    derived: &DerivedCats,
+    mut already_promoted: F,
+) -> (Vec<CoinRow>, Vec<StagedCatRow>)
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut believed = Vec::new();
+    let mut staged = Vec::new();
+    for row in rows {
+        // A coin at one of the wallet's OWN p2 hashes is an ordinary XCH coin: the wallet can
+        // spend it and its amount is XCH. Unchanged, and the only thing that stays unchanged.
+        if owned_puzzle_hashes.contains(&row.puzzle_hash) {
+            believed.push(row.clone());
+            continue;
+        }
+        let Some(owner) = hex_to_bytes32(&row.puzzle_hash).and_then(|h| derived.owner_of(&h)) else {
+            continue;
+        };
+        if already_promoted(&row.coin_id) {
+            // Already proven once; its later states update `coins` normally, exactly as on the
+            // frame path, or a promoted coin would stay unspent in the replica for ever.
+            believed.push(row.clone());
+            continue;
+        }
+        staged.push(StagedCatRow {
+            coin_id: row.coin_id.clone(),
+            parent_coin_info: row.parent_coin_info.clone(),
+            puzzle_hash: row.puzzle_hash.clone(),
+            amount: row.amount.clone(),
+            created_height: row.created_height,
+            spent_height: row.spent_height,
+            // Preserved here, unlike the frame path: a point read carries them and throwing them
+            // away would make a promoted coin's history poorer than the row it came from.
+            created_timestamp: row.created_timestamp,
+            spent_timestamp: row.spent_timestamp,
+            derived_asset_id: hex::encode(owner.asset_id),
+            derived_owner_p2: hex::encode(owner.owner_p2),
+        });
+    }
+    (believed, staged)
+}
+
+/// Parse a 32-byte hex puzzle hash, tolerating a `0x` prefix and either case.
+fn hex_to_bytes32(s: &str) -> Option<Bytes32> {
+    let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(Bytes32::new(arr))
 }
 
 /// What one promotion pass did.

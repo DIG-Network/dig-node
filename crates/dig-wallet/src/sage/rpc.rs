@@ -3103,10 +3103,45 @@ impl WalletBackend {
         // XCH coins sitting at our puzzle hashes + CAT coins hinted to them (unspent + recent).
         let mut fetched = self.fallback.coin_records_by_puzzle_hashes(&phs).await?;
         fetched.extend(self.fallback.coin_records_by_hints(&phs).await?);
-        let rows: Vec<CoinRow> = fetched.iter().map(fallback_coin_to_row).collect();
+        let fetched_rows: Vec<CoinRow> = fetched.iter().map(fallback_coin_to_row).collect();
+
+        // A HINT IS A CLAIM, NOT A FACT (dig-node#394). `coin_records_by_hints` finds coins that
+        // merely say they are for this wallet, and anybody may `CREATE_COIN` with any hint. These
+        // rows carry `asset_id: None`, which in this schema means XCH — so upserting them straight
+        // into `coins`, as this path used to, let one mojo per displayed base unit mint a
+        // fabricated XCH balance and, since selection is largest-first over a coin nobody can
+        // spend, a permanent send kill-switch. No peer required: the coinset oracle serves it.
+        //
+        // Routed through the SAME staging table as the peer frame path rather than guarded
+        // separately. One admission point that demands a lineage proof is the shape; three guards
+        // that must agree is what produced this defect at three tiers.
+        let owned_hashes: Vec<_> = signer.puzzle_hashes().into_iter().collect();
+        let derived = super::cat_discovery::DerivedCats::derive(
+            &owned_hashes,
+            &[digstore_chain::dig::DIG_ASSET_ID],
+        );
+        let owned: HashSet<String> = phs.iter().cloned().collect();
+        let promoted = self
+            .db
+            .existing_coin_ids(
+                &fetched_rows
+                    .iter()
+                    .map(|r| r.coin_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        let (rows, staged) = super::cat_discovery::route_point_read_rows(
+            &fetched_rows,
+            &owned,
+            &derived,
+            |id| promoted.contains(id),
+        );
         let n = rows.len();
         if n > 0 {
             self.db.upsert_coins(&rows).await?;
+        }
+        if !staged.is_empty() {
+            self.db.stage_cat_admissions(&staged).await?;
         }
         // Attribute CATs (fills `asset_id`/`hint`) when a lineage source is attached — best-effort:
         // an attribution read failure must never make a fresh XCH sync look like a hard error.
