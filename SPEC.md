@@ -7416,15 +7416,30 @@ Collapsing them into one "unavailable" hands every client the same unactionable 
 **A record the node never wrote and one it wrote and cannot read are different answers**
 (`not_censused` vs `record_unreadable`).
 
-### 24.3. The epoch is named by the CENSUS, never derived from the clock
+### 24.3. The epoch is DERIVED from the canonical clock, and never re-derived locally
 
-The collateral epoch schedule is a consensus fact anchored on chain. The node MUST NOT derive the current
-epoch from its own clock: a guess posts against the wrong epoch. The census records the epoch it settled
-on, and the requirement reader reads that. An absent or malformed marker is `not_censused`; the epoch is
-**one-based**, so a zero is malformed rather than an epoch.
+The mirror-coin epoch schedule is a **wall-clock** one published by `dig-constants`: 7-day epochs
+from a fixed genesis. The current epoch MUST be obtained from
+`dig_constants::mirror_epoch_at_unix_ms` and MUST NOT be recomputed. The epoch number is an **input
+to coin identity** — `dig_mirror_coin::mirror_hint` takes it — so a node computing a different epoch
+than its peers does not display a wrong label, it derives different coins and orphans that epoch's
+collateral.
 
-Keeping the marker current is the **census's** obligation. The epoch number travels with every answer so
-that a marker left behind by a stopped census is at least VISIBLE to a client rather than silent.
+Two properties a plausible reimplementation loses, and both are load-bearing:
+
+* the epoch is **one-based** — the genesis instant is epoch 1, not 0;
+* it uses **`div_euclid`**, so an instant one millisecond before genesis is epoch 0 rather than
+  colliding with epoch 1 as a truncating `/` would.
+
+An instant before genesis yields a non-positive epoch, which is not an epoch. It MUST be reported as
+`not_censused` rather than clamped to 1: a machine whose clock is wrong MUST NOT be handed epoch 1's
+requirement as though it were current.
+
+**Deriving the epoch is what makes a stale answer unrepresentable.** The requirement is looked up for
+the epoch that is current NOW, so a node whose census has stopped running reports `not_censused` for
+the present epoch rather than confidently serving a previous epoch's figure. A stored "current
+epoch" marker would reintroduce exactly that hazard, because a marker left behind by a stopped census
+names an epoch that is no longer current and nothing local can detect it.
 
 ### 24.4. The safety margin
 
