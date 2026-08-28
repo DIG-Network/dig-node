@@ -4510,3 +4510,102 @@ async fn the_supervisor_attributes_the_hinted_cat_coins_its_catch_up_syncs() {
 
     h.stop().await;
 }
+
+/// **Proves (dig-node#383, the decider's hazard 1):** a derived CAT outer puzzle hash MUST NOT
+/// reach `plain_puzzle_hashes`.
+///
+/// # Three similarly-named sets, and a leak between them is a DIFFERENT money bug
+///
+/// `plain_puzzle_hashes` means "p2 hashes the wallet can sign for". `singleton::is_candidate`
+/// reads it to skip ordinary XCH coins: an EVEN-amount coin sitting at one of those hashes is
+/// treated as plain XCH and never has its parent spend fetched. A CAT outer hash leaked into that
+/// set therefore silences attribution for every even-amount CAT coin sitting at it — the coins are
+/// present in the replica and permanently unattributed, which is dig-node#382's observable reached
+/// by a new route.
+///
+/// # Why the fixture seeds the row instead of syncing it
+///
+/// A CAT of a KNOWN asset is attributed on ARRIVAL now, by the derived-hash subscription, so a
+/// coin that arrives through the catch-up is already typed and the attribution pass has nothing to
+/// decide about it. That fixture cannot see this defect at all. The row this test seeds is the one
+/// that genuinely exists in the wild: a coin written by an EARLIER version of this node, before
+/// the subscription derived its hash, which only the out-of-band pass can rescue.
+///
+/// The fixture amount is 1000 — EVEN, deliberately. `is_candidate` admits any odd amount
+/// regardless of the set, so an odd-amount coin would be attributed either way and the test would
+/// pass against the leak it exists to catch.
+#[tokio::test]
+async fn a_derived_cat_hash_never_reaches_the_plain_p2_set() {
+    let cats = issue_cats(1);
+    let ours = &cats[0];
+
+    // The premise the whole test rests on: the coin sits at the DERIVED outer hash, and its
+    // amount is even. Asserted rather than assumed, because a fixture change that made the amount
+    // odd would silently turn this into a test of nothing.
+    let asset_id = Bytes32::new(hex::decode(&ours.asset_id).unwrap().try_into().unwrap());
+    assert_eq!(
+        ours.child.puzzle_hash,
+        digstore_chain::cat::cat_puzzle_hash(ours.owner_p2, asset_id),
+        "the fixture coin must sit at the derived CAT outer hash"
+    );
+    assert_eq!(ours.child.amount % 2, 0, "the fixture amount must be EVEN");
+
+    let mut lineage = FixtureLineage::default();
+    lineage.by_parent.insert(
+        hex::encode(ours.child.parent_coin_info),
+        ours.parent.clone(),
+    );
+
+    let db = WalletDb::open_in_memory().await.unwrap();
+    // Seeded UNATTRIBUTED, as an older node would have written it.
+    let mut row = crate::sage::sync::coin_state_to_row(&unspent_coin_state(ours.child));
+    row.asset_id = None;
+    row.hint = None;
+    db.upsert_coins(&[row]).await.unwrap();
+
+    let script = Script::new();
+    let h = Harness::start_with_attribution(
+        db.clone(),
+        Arc::new(FixedHashes::unlocked(vec![ours.owner_p2])),
+        script,
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        None,
+        NO_ROTATION,
+        Some(Arc::new(Attribution::new(
+            Arc::new(lineage),
+            "xch".to_string(),
+        ))),
+        vec![asset_id],
+    )
+    .await;
+
+    h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
+        .await;
+
+    // The pass runs once after a completed catch-up. Bounded poll rather than a fixed sleep: a
+    // sleep long enough to be reliable is long enough to hide a regression that merely got slower.
+    for _ in 0..200 {
+        if db
+            .all_coins()
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.asset_id.is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let attributed = db.unspent_coins(Some(&ours.asset_id)).await.unwrap();
+    assert_eq!(
+        attributed.len(),
+        1,
+        "the seeded CAT row must be attributed by the out-of-band pass; a derived CAT hash in \
+         plain_puzzle_hashes makes is_candidate skip it as ordinary XCH; found {attributed:?}"
+    );
+
+    h.stop().await;
+}
