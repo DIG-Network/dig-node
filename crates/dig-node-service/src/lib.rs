@@ -36,6 +36,10 @@ pub mod cli;
 /// safety margin, and the funding advice built on them. Every figure comes out of
 /// `dig-mirror-collateral`; no formula is restated.
 pub mod collateral;
+/// Adopting an epoch history from untrusted peers, and serving one to them: the
+/// re-derivation every candidate record must survive, and the sampling plan that bounds
+/// what a sample of peers is allowed to decide.
+pub mod collateral_sync;
 pub mod config;
 /// Pure HTTP helpers for the local plaintext content-serve surface (#289): `/s/...` route parsing,
 /// `<base>`/Referer store-root rerooting, the content-type map, the SPA-vs-asset classifier, and the

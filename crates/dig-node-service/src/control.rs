@@ -3350,8 +3350,13 @@ fn collateral_margin_set(id: Value, params: &Value) -> Value {
         Err(e) => return control_error(id, ErrorCode::InvalidParams, e.message),
     };
 
+    // LOADED, then modified. A struct literal here would name every field, so each preference
+    // added to the config in future would be silently reset to its default by a caller setting the
+    // margin — the operator's retention choice erased by an unrelated command, with a success
+    // reported. Setting one field must change one field.
     let cfg = crate::collateral::CollateralConfig {
         margin_bp: parsed.margin_bp,
+        ..crate::collateral::CollateralConfig::load()
     };
     // Persisted before it is reported. A margin that lapsed to the default on reboot would silently
     // change what the node posts, so a write failure must not be answered with a success.

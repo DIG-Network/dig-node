@@ -611,6 +611,19 @@ enum CollateralCommand {
         #[arg(long)]
         balance: Option<String>,
     },
+    /// Show the collateral epochs this node has recorded, and how it came by each.
+    ///
+    /// Read from this node's own state directory, so it works whether or not the node is running.
+    /// Each line says whether the epoch was derived from nothing, censused by this node, or
+    /// adopted from a sample of peers — three different claims about how much this node knows.
+    History {
+        /// Show one epoch instead of the whole history.
+        ///
+        /// An epoch this node never recorded is reported as NOT RECORDED, distinctly from one it
+        /// recorded and can no longer read.
+        #[arg(long)]
+        epoch: Option<u64>,
+    },
     /// Show your local safety margin, and what it adds.
     Margin {
         #[command(subcommand)]
@@ -874,6 +887,9 @@ pub fn run() -> std::process::ExitCode {
             ),
             Err(e) => emit_error(&e, action, json),
         },
+        Command::Collateral {
+            action: Some(CollateralCommand::History { epoch }),
+        } => render(control_cli::collateral_history(epoch), action, json),
         Command::Collateral { action: cmd } => match collateral_action(cmd) {
             Ok(a) => render(control_cli::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
@@ -1089,6 +1105,12 @@ fn collateral_action(cmd: Option<CollateralCommand>) -> std::io::Result<ControlA
         None | Some(CollateralCommand::Requirement) => Ok(ControlAction::CollateralRequirement),
         // Handled before this mapper: it composes three control reads rather than dispatching one.
         Some(CollateralCommand::Buffer { .. }) => Ok(ControlAction::CollateralBuffer),
+        // Also handled before this mapper: it reads this node's own record file directly, so it
+        // answers on a node that is not running. Mapping it to a control method would make the
+        // one command an operator reaches for while diagnosing a dead node need a live one.
+        Some(CollateralCommand::History { .. }) => Err(std::io::Error::other(
+            "collateral history is served from the local record store, not a control method",
+        )),
         Some(CollateralCommand::Margin { action: None }) => Ok(ControlAction::CollateralMarginGet),
         Some(CollateralCommand::Margin {
             action: Some(MarginCommand::Set { value }),
