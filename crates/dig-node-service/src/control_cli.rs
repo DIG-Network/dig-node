@@ -745,8 +745,15 @@ pub fn collateral_buffer(
     )?;
     let margin_bp = margin_json["margin_bp"].as_u64().unwrap_or(0);
 
-    // One `(store, root)` advertisement per hosted store. An advertisement count, never a node
-    // count -- the same distinction the census draws.
+    // One `(store, root)` advertisement per hosted store, read from THIS NODE's hosted-store
+    // surface.
+    //
+    // It is emphatically NOT `control.collateral.requirement`'s `stores` or `owners`. Those are
+    // NETWORK census figures -- the contract says in as many words that neither is a node count --
+    // so multiplying either by the requirement yields the whole network's collateral bill and
+    // presents it to one operator as their own. On a money surface that is a confident wrong
+    // number, which is worse than no number. The buffer's first term is local by definition, and
+    // it is sourced locally.
     //
     // A missing or non-array `stores` is UNKNOWN, never zero. Zero obligations and an unreadable
     // store list produce the same arithmetic -- a 0.000 DIG recommendation that every balance

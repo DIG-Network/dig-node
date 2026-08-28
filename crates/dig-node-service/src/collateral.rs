@@ -718,6 +718,10 @@ mod tests {
 
     /// A `Known` requirement with an explicitly-chosen figure, so the buffer tests never depend on
     /// the record store.
+    /// `stores` and `owners` are deliberately set to values that are NOT the `pairs` any caller
+    /// passes. They are NETWORK census figures, and a buffer that multiplied one of them by the
+    /// requirement would bill one operator for the whole network's collateral -- so the fixture is
+    /// built so that mistake changes the answer instead of hiding inside it.
     fn known(required: u64) -> CollateralRequirementResult {
         CollateralRequirementResult::Known {
             epoch: 9,
