@@ -42,7 +42,10 @@ const EPOCH_RECORD_FILE: &str = "collateral-epochs.jsonl";
 ///
 /// Named rather than written as `1` at the one place it is used, because what makes it exempt is
 /// not that it is small — it is that it is the base case the recurrence unrolls from.
-const GENESIS_EPOCH: u64 = 1;
+///
+/// It is also the one epoch with no census height, which is why [`crate::collateral_sync::verify`]
+/// needs the same name to refuse a missing height on any LATER epoch.
+pub(crate) const GENESIS_EPOCH: u64 = 1;
 
 /// This node's local collateral preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +218,23 @@ impl RecordProvenance {
             RecordProvenance::Bootstrap => 2,
         }
     }
+}
+
+/// Whether a record `held` may be replaced by a DIFFERING record offered with provenance
+/// `incoming`.
+///
+/// True in exactly one direction: this node's own census superseding what it had adopted from a
+/// sample of peers. That is the case the prefer-own-computation rule exists for, and — because
+/// `held.record != incoming.record` is what brings a caller here — it is reachable only when the
+/// two disagree, which is the only case where superseding changes an answer.
+///
+/// Deliberately not expressed as a `strength()` comparison. Strength orders EVIDENCE for one
+/// record; this orders two different records, which strength explicitly refuses to do. Naming the
+/// one permitted pair also makes the security argument checkable by reading it: a peer answer can
+/// only ever be [`RecordProvenance::AdoptedFromPeers`], so no peer can reach the `incoming` side.
+fn own_census_supersedes(held: RecordProvenance, incoming: RecordProvenance) -> bool {
+    matches!(held, RecordProvenance::AdoptedFromPeers { .. })
+        && matches!(incoming, RecordProvenance::Censused)
 }
 
 /// One epoch as this node stores it: the consensus record, plus how this node came by it.
@@ -407,6 +427,21 @@ impl EpochRecordStore {
     /// operator who later censuses an epoch they had adopted from peers should see that. The
     /// reverse is not appended: evidence does not weaken on re-offer.
     ///
+    /// # This node's own census supersedes one adopted from peers, precisely when they disagree
+    ///
+    /// Immutability above is a defence against a PEER walking this node off the network's history,
+    /// and it must not also prevent this node correcting itself. A sampled adoption is explicitly
+    /// not load-bearing (see [`crate::collateral_sync`]): it buys the right to skip an expensive
+    /// re-derivation, never the right to be wrong. So when this node later censuses an epoch it had
+    /// adopted, and its own arithmetic DISAGREES with what the peers said, the census wins and the
+    /// record is superseded.
+    ///
+    /// Restricting that to `AdoptedFromPeers` → `Censused` is what keeps it from reopening the
+    /// hole. Every record reachable from the network carries `AdoptedFromPeers` provenance
+    /// ([`crate::collateral_sync::adopt`] stamps it, and it is the only provenance a peer answer
+    /// can acquire), so no peer — however many identities it holds — can satisfy this arm. A
+    /// disagreeing record from any other source is still a [`PutOutcome::Conflict`].
+    ///
     /// # Errors
     ///
     /// The underlying write, and an [`std::io::ErrorKind::InvalidData`] when the file holds a line
@@ -414,7 +449,10 @@ impl EpochRecordStore {
     /// that cannot be compared would silently create two answers for one epoch.
     pub fn put(&self, record: &StoredRecord) -> std::io::Result<PutOutcome> {
         match self.get(record.record.epoch) {
-            StoredEpoch::Found(held) if held.record != record.record => {
+            StoredEpoch::Found(held)
+                if held.record != record.record
+                    && !own_census_supersedes(held.provenance, record.provenance) =>
+            {
                 return Ok(PutOutcome::Conflict { held })
             }
             StoredEpoch::Found(held)
@@ -954,6 +992,92 @@ mod tests {
             StoredEpoch::Found(rec) => assert_eq!(rec.record, held.record),
             other => panic!("the held record must survive, got {other:?}"),
         }
+    }
+
+    /// GATING finding 2 (dig-node#398 round 2), written as the exploit.
+    ///
+    /// The prefer-own-census rule was guarded behind `held.record != record.record`, so it was
+    /// reachable only when the peers and this node already AGREED — it held in every case except
+    /// the one it exists for. Combined with finding 1 that made an adopted lie permanent: nothing
+    /// this node could later compute would ever displace it.
+    ///
+    /// Two hops are exercised on purpose. Asserting only that the second `put` returns `Written`
+    /// would pass for an implementation that appended without superseding, so the stored answer is
+    /// read back and compared to the census.
+    #[test]
+    fn this_nodes_own_census_supersedes_a_peer_adopted_record_they_disagree_with() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        let adopted = StoredRecord {
+            record: record(9, 500_000, 600, 25),
+            census_height: Some(7_000),
+            provenance: RecordProvenance::AdoptedFromPeers {
+                agreed: 7,
+                sampled: 9,
+            },
+        };
+        assert_eq!(store.put(&adopted).expect("put"), PutOutcome::Written);
+
+        // What this node computes for itself, DISAGREEING with what it adopted. The requirement is
+        // higher, so believing the peers would have left this operator under-collateralised.
+        let censused = StoredRecord::censused(record(9, 1_000_000, 1_000, 40), 7_001);
+        assert_ne!(
+            censused.record, adopted.record,
+            "the fixture must DISAGREE, or it exercises the identical-record path instead"
+        );
+        assert!(
+            censused.record.required_per_store_dig_base_units
+                > adopted.record.required_per_store_dig_base_units
+        );
+        assert_eq!(store.put(&censused).expect("put"), PutOutcome::Written);
+        match store.get(9) {
+            StoredEpoch::Found(rec) => {
+                assert_eq!(rec.record, censused.record, "the census must win");
+                assert_eq!(rec.provenance, RecordProvenance::Censused);
+            }
+            other => panic!("expected the censused record, got {other:?}"),
+        }
+    }
+
+    /// The other half of the same rule, and the reason it is not a `strength()` comparison: a peer
+    /// still cannot overwrite anything. Every record reachable from the network carries
+    /// `AdoptedFromPeers`, which is never on the winning side of `own_census_supersedes`.
+    #[test]
+    fn a_peer_still_cannot_overwrite_a_record_this_node_censused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        let censused = StoredRecord::censused(record(9, 1_000_000, 1_000, 40), 7_000);
+        assert_eq!(store.put(&censused).expect("put"), PutOutcome::Written);
+
+        let from_peers = StoredRecord {
+            record: record(9, 500_000, 600, 25),
+            census_height: Some(7_001),
+            provenance: RecordProvenance::AdoptedFromPeers {
+                agreed: 9,
+                sampled: 9,
+            },
+        };
+        match store.put(&from_peers).expect("put") {
+            PutOutcome::Conflict { held } => assert_eq!(held.record, censused.record),
+            other => panic!("a peer must not displace this node's census, got {other:?}"),
+        }
+        // And an adopted record cannot displace another adopted record either: the permitted
+        // direction is named, not merely "stronger evidence wins".
+        let second_peer_answer = StoredRecord {
+            record: record(9, 400_000, 500, 20),
+            census_height: Some(7_002),
+            provenance: RecordProvenance::AdoptedFromPeers {
+                agreed: 8,
+                sampled: 9,
+            },
+        };
+        let fresh = tempfile::tempdir().expect("tempdir");
+        let store = store_at(fresh.path());
+        assert_eq!(store.put(&from_peers).expect("put"), PutOutcome::Written);
+        assert!(matches!(
+            store.put(&second_peer_answer).expect("put"),
+            PutOutcome::Conflict { .. }
+        ));
     }
 
     #[test]

@@ -7689,9 +7689,21 @@ alone. The sample is the only defence against that residue, and it is bounded:
 * Adoption requires the plan's strict two-thirds agreement threshold, tallied over the FULL record.
   A plurality MUST NOT be adopted: the plurality is what an attacker holding a minority of
   identities is trying to produce.
+* The threshold is a supermajority **of the planned sample**, and the plan caps `sample_size`, so
+  the threshold does not grow with the population. A node MUST therefore refuse a sample with more
+  distinct responders than `sample_size`, whole and untrimmed. Counting a fixed threshold against a
+  larger responder set would adopt a plurality, which the clause above forbids.
 * More distinct responders than the chain-derived population is a detectable identity lie and MUST
   refuse the whole sample rather than trim it.
 * A responder that answers twice, differently, MUST have both answers discarded.
+* Every epoch after the first is produced by a census, so a candidate for an epoch greater than 1
+  that carries no census height MUST be refused. A node MUST NOT treat an absent height as a check
+  that does not apply, which would let a responder opt out of the advancing requirement by omitting
+  a field.
+* The census height is this node's bookkeeping and is excluded from the tally key, so agreeing
+  responders may still differ on it. A node MUST carry the LOWEST height offered by the agreeing
+  cohort. Taking any responder-chosen height would let one member of an honest cohort name a height
+  no later census can advance past, denying every subsequent epoch.
 
 **A known limitation, stated rather than assumed away:** the plan counts distinct collateralised
 owners, while a node samples distinct peers, and a peer's owner attribution is not proven on this
@@ -7699,6 +7711,21 @@ path. One adversary holding many peer identities therefore looks like many owner
 This is why adoption is never load-bearing — the sample buys the ability to skip an expensive
 historical re-derivation, never the right to be wrong — and why a node that can census an epoch
 itself MUST prefer its own computation.
+
+Preferring its own computation is a requirement on the STORE, and it binds precisely where the two
+disagree. §24.9 makes a held record immutable so that no peer can walk a node off the network's
+history; that immutability MUST NOT also prevent a node correcting itself. A record held with
+`AdoptedFromPeers` provenance MUST be superseded by one this node censused for the same epoch, even
+when the two records differ. No other pair may supersede: a peer answer can only ever carry
+`AdoptedFromPeers` provenance, so no responder — however many identities it holds — can reach the
+superseding side, and any other differing record remains a conflict.
+
+**A second stated limitation:** re-derivation is only as sound as the oracle it runs through. This
+node trusts `dig_mirror_collateral::EpochRecord::advance` to be the network's arithmetic, and checks
+a candidate by comparing against what that function produces. A defect in `advance` is therefore not
+detectable on this path — it would be reproduced identically by every node that verified through it.
+The mitigation is that `advance` is the single published implementation the whole network derives
+from, so a divergence is a release-level event rather than a per-peer one.
 
 ### 24.11. Retention
 

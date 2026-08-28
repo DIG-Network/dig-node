@@ -63,7 +63,7 @@ use std::collections::BTreeMap;
 
 use dig_mirror_collateral::{sync_sample_plan, SyncSamplePlan};
 
-use crate::collateral::{RecordProvenance, StoredRecord};
+use crate::collateral::{RecordProvenance, StoredRecord, GENESIS_EPOCH};
 
 /// One peer's answer for one epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +109,14 @@ pub enum Rejection {
         /// The height claimed.
         found: u32,
     },
+    /// The record is for an epoch a census produced, but carries no census height.
+    ///
+    /// Only genesis has no height. A later record without one cannot be checked for advancing, so
+    /// accepting it would let a peer opt out of that check by omitting a field.
+    CensusHeightMissing {
+        /// The epoch the record claimed.
+        epoch: u64,
+    },
     /// This responder had already answered, differently. Both answers are discarded.
     ///
     /// Discarding BOTH is deliberate. Keeping the first would let a peer that equivocates still
@@ -142,6 +150,20 @@ pub enum AdoptOutcome {
     PopulationExceeded {
         /// The chain-derived population.
         population: u64,
+        /// How many distinct responders answered.
+        responders: u64,
+    },
+    /// More distinct responders answered than the plan drew for.
+    ///
+    /// The agreement threshold is a supermajority OF THE PLANNED SAMPLE — at any population of 20
+    /// or more it is a fixed 7 of 9, because the sample size is capped. Counting that 7 against a
+    /// responder set larger than 9 turns a supermajority into a plurality, and 7 identities out of
+    /// a 1000-strong population would carry a record this node then treats as history. So a sample
+    /// larger than the one planned is refused whole, exactly as `PopulationExceeded` is: the
+    /// threshold is only meaningful against the set it was computed for.
+    SampleExceeded {
+        /// How many responders the plan drew for.
+        sample_size: u64,
         /// How many distinct responders answered.
         responders: u64,
     },
@@ -199,12 +221,23 @@ pub fn verify(prior: &StoredRecord, candidate: &StoredRecord) -> Result<(), Reje
         return Err(Rejection::ArithmeticMismatch);
     }
 
-    // A census for a later epoch is taken at a later block. Only checkable when both heights are
-    // present; epoch 1 has none, because no census produced it.
-    if let (Some(previous), Some(found)) = (prior.census_height, candidate.census_height) {
-        if found <= previous {
-            return Err(Rejection::CensusHeightNotAdvancing { previous, found });
+    // A census for a later epoch is taken at a later block.
+    //
+    // Genesis is the one record with no height, because no census produced it. Every epoch from 2
+    // on is the output of a census, so a record for one that carries no height is malformed — and
+    // it must be REFUSED rather than skipped. Matching on both heights being present made the
+    // guard opt-out: a peer omitting the field passed the check trivially, which is the weaker
+    // half of the same denial surface the tally's height choice closes.
+    match (prior.census_height, candidate.census_height) {
+        (Some(previous), Some(found)) if found <= previous => {
+            return Err(Rejection::CensusHeightNotAdvancing { previous, found })
         }
+        (_, None) if candidate.record.epoch > GENESIS_EPOCH => {
+            return Err(Rejection::CensusHeightMissing {
+                epoch: candidate.record.epoch,
+            })
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -259,6 +292,16 @@ pub fn adopt(
             responders,
         };
     }
+    // ...and the same discipline against the SAMPLE, which is the set the threshold below was
+    // computed for. `plan.population` is the wrong bound to stop at: it can be in the thousands
+    // while `agreement_threshold` stays 7, so a check that only refuses on population lets 7
+    // agreeing identities out of 1000 clear a bar that means "seven ninths".
+    if responders > plan.sample_size {
+        return AdoptOutcome::SampleExceeded {
+            sample_size: plan.sample_size,
+            responders,
+        };
+    }
 
     // Verify, then tally by the FULL record. Two records that agree on the requirement but differ
     // anywhere else are different answers, and counting them together would let a disagreement
@@ -279,6 +322,23 @@ pub fn adopt(
         };
         let entry = tally.entry(key).or_insert((0, **record));
         entry.0 += 1;
+        // The census height is not part of the tally key, so agreeing responders may still offer
+        // different heights — and one of them has to be carried forward. Take the LOWEST, never
+        // the first seen.
+        //
+        // "First seen" was first in `BTreeMap` order over a PEER-SUPPLIED responder id, so a
+        // single peer inside an otherwise honest cohort could name itself early, answer with the
+        // correct record and `census_height: u32::MAX`, and wedge every later epoch: `verify`
+        // requires the height to advance, and nothing advances past `u32::MAX`. That turns a guard
+        // into a denial primitive.
+        //
+        // The lowest is safe in the other direction because every tallied record passed `verify`,
+        // which already refuses any height that does not advance past the predecessor's. So the
+        // minimum is still strictly above the prior epoch's, and choosing it costs at most a
+        // slightly conservative floor for the next epoch's check.
+        if record.census_height < entry.1.census_height {
+            entry.1.census_height = record.census_height;
+        }
     }
 
     let best = tally.values().map(|(count, _)| *count).max().unwrap_or(0);
@@ -570,15 +630,30 @@ mod tests {
             }
         );
 
-        // At the bound the same honest sample is adopted. Without this the test could not tell a
-        // correct guard from one that refuses every sample.
-        let at_bound = &over[..SYNC_MIN_POPULATION as usize];
+        // Exactly AT the population is not a population excess — but it is still more responders
+        // than the plan drew for, and the round-2 gate on dig-node#398 showed why that must also
+        // refuse: the agreement threshold was computed for a sample of 9, so counting it against
+        // 20 responders would accept 7 of 20. This assertion previously expected `Adopted`, which
+        // encoded exactly that defect.
+        let at_population = &over[..SYNC_MIN_POPULATION as usize];
+        assert_eq!(
+            adopt(&prior, Some(SYNC_MIN_POPULATION), at_population),
+            AdoptOutcome::SampleExceeded {
+                sample_size: 9,
+                responders: SYNC_MIN_POPULATION,
+            },
+            "at the population but over the sample is a sample excess, not a population one"
+        );
+
+        // At the SAMPLE bound the same honest responses are adopted. Without this the test could
+        // not tell a correct guard from one that refuses every sample.
+        let at_sample = &over[..9];
         assert!(
             matches!(
-                adopt(&prior, Some(SYNC_MIN_POPULATION), at_bound),
+                adopt(&prior, Some(SYNC_MIN_POPULATION), at_sample),
                 AdoptOutcome::Adopted { .. }
             ),
-            "exactly at the population is not an excess"
+            "exactly at the planned sample is not an excess"
         );
     }
 
@@ -607,6 +682,184 @@ mod tests {
                 agreed: 0,
                 sampled: 0
             }
+        );
+    }
+
+    /// A population far above the plateau, where the capped sample makes the FIXED threshold of 7
+    /// a plurality rather than a supermajority. Chosen from the plan's own arithmetic — anything
+    /// at or above `SYNC_MIN_POPULATION` caps `sample_size` at 9 — not because it looked large.
+    const POPULATION_ABOVE_THE_SAMPLE_CAP: u64 = 1_000;
+
+    /// Two internally-consistent records that disagree about the money.
+    ///
+    /// Both pass `verify`: each is `advance`d from the same predecessor, so the arithmetic is
+    /// impeccable in both. They differ only in the CENSUS INPUT, which is the one thing a peer
+    /// supplies and this node cannot re-derive — the whole reason adoption is not load-bearing.
+    /// Only the OWNER count varies. `stores` and `locked` are held equal so the multiplier — and
+    /// with it the base price — is identical in both, leaving the handicap as the single moving
+    /// part. A fixture that varied several inputs at once could not say which one carried the lie.
+    fn truth_and_a_consistent_lie(prior: &StoredRecord) -> (StoredRecord, StoredRecord) {
+        let truth = honest(prior, 5_625, 40, 9_000);
+        let lie = honest(prior, 5_625, 2, 9_000);
+        assert_eq!(verify(prior, &truth), Ok(()));
+        assert_eq!(
+            verify(prior, &lie),
+            Ok(()),
+            "the lie must be VERIFIABLE, or the test proves only that verify works"
+        );
+        assert!(
+            lie.record.required_per_store_dig_base_units
+                < truth.record.required_per_store_dig_base_units,
+            "the forgery must under-post, which is the stated threat direction"
+        );
+        (truth, lie)
+    }
+
+    /// GATING finding 1 (dig-node#398 round 2), written as the exploit rather than as an assertion
+    /// about the code.
+    ///
+    /// Seven sybils out of a thousand-strong population return a consistent lie; five honest peers
+    /// answer truthfully. `agreement_threshold` is a fixed 7 at any population of 20 or more, so
+    /// counting it as an absolute against a 12-strong responder set adopts a 7/12 PLURALITY — and
+    /// `SPEC.md` §24.10 says a plurality MUST NOT be adopted.
+    ///
+    /// The five honest responders are the control: without a truthful cohort present the sample
+    /// would fail to converge for an unrelated reason, and the test would pass while proving
+    /// nothing about the threshold.
+    #[test]
+    fn a_seven_strong_plurality_is_not_adopted_when_responders_exceed_the_planned_sample() {
+        let prior = genesis();
+        let (truth, lie) = truth_and_a_consistent_lie(&prior);
+
+        let mut responses = Vec::new();
+        for i in 0..7 {
+            responses.push(PeerRecord {
+                responder: format!("sybil-{i}"),
+                record: lie,
+            });
+        }
+        for i in 0..5 {
+            responses.push(PeerRecord {
+                responder: format!("honest-{i}"),
+                record: truth,
+            });
+        }
+
+        let outcome = adopt(&prior, Some(POPULATION_ABOVE_THE_SAMPLE_CAP), &responses);
+        assert_eq!(
+            outcome,
+            AdoptOutcome::SampleExceeded {
+                sample_size: 9,
+                responders: 12,
+            },
+            "7 of 12 is a plurality and must not be adopted"
+        );
+        // Stated separately and deliberately: the point is not which refusal was returned, it is
+        // that the forged figure did not become this node's history.
+        assert!(
+            !matches!(outcome, AdoptOutcome::Adopted { .. }),
+            "the under-posting record must not be adopted by any route"
+        );
+    }
+
+    /// The bound from BOTH sides, so it cannot be confirmed only from below.
+    ///
+    /// At the planned sample of 9 a 7-agreeing cohort is the designed supermajority and is still
+    /// adopted; one responder over, the same 7 no longer carries. Without the first half a fix
+    /// that refused every sample would pass.
+    #[test]
+    fn seven_of_nine_still_adopts_and_seven_of_ten_does_not() {
+        let prior = genesis();
+        let (truth, lie) = truth_and_a_consistent_lie(&prior);
+        let at_bound: Vec<PeerRecord> = (0..7)
+            .map(|i| PeerRecord {
+                responder: format!("agreeing-{i}"),
+                record: lie,
+            })
+            .chain((0..2).map(|i| PeerRecord {
+                responder: format!("dissenting-{i}"),
+                record: truth,
+            }))
+            .collect();
+        assert_eq!(at_bound.len(), 9);
+        match adopt(&prior, Some(POPULATION_ABOVE_THE_SAMPLE_CAP), &at_bound) {
+            AdoptOutcome::Adopted { record } => assert_eq!(record.record, lie.record),
+            other => panic!("7 of the planned 9 is the designed supermajority, got {other:?}"),
+        }
+
+        let mut one_over = at_bound;
+        one_over.push(PeerRecord {
+            responder: "dissenting-2".to_string(),
+            record: truth,
+        });
+        assert_eq!(
+            adopt(&prior, Some(POPULATION_ABOVE_THE_SAMPLE_CAP), &one_over),
+            AdoptOutcome::SampleExceeded {
+                sample_size: 9,
+                responders: 10,
+            }
+        );
+    }
+
+    /// Finding 3: one peer inside an agreeing cohort must not be able to wedge every later epoch.
+    ///
+    /// The census height is excluded from the tally key, so agreeing responders can still differ
+    /// on it. The wedger sorts FIRST by responder id — the order the tally used to take its answer
+    /// from — and offers `u32::MAX`, past which no later census can ever advance.
+    #[test]
+    fn a_hostile_census_height_inside_an_agreeing_cohort_does_not_wedge_later_epochs() {
+        let prior = genesis();
+        let agreed = honest(&prior, 5_625, 40, 9_000);
+        let mut wedge = agreed;
+        wedge.census_height = Some(u32::MAX);
+        assert_eq!(
+            wedge.record, agreed.record,
+            "the wedger must AGREE on the consensus record, or it is simply outvoted"
+        );
+
+        let mut responses = vec![PeerRecord {
+            // Sorts before every "honest-*" id, which is what made "first seen" attacker-chosen.
+            responder: "aaa-wedger".to_string(),
+            record: wedge,
+        }];
+        for i in 0..6 {
+            responses.push(PeerRecord {
+                responder: format!("honest-{i}"),
+                record: agreed,
+            });
+        }
+
+        match adopt(&prior, Some(PLATEAU_POPULATION), &responses) {
+            AdoptOutcome::Adopted { record } => {
+                assert_eq!(
+                    record.census_height,
+                    Some(9_000),
+                    "the honest height must be carried, not the wedger's"
+                );
+                // The property that actually matters: a later epoch can still advance past it.
+                let next = honest(&record, 6_000, 41, 9_500);
+                assert_eq!(
+                    verify(&record, &next),
+                    Ok(()),
+                    "a hostile height inside the cohort must not deny every later epoch"
+                );
+            }
+            other => panic!("the cohort agreed and should adopt, got {other:?}"),
+        }
+    }
+
+    /// Finding 4: omitting the census height must not be a way to opt out of the advancing check.
+    #[test]
+    fn a_record_for_a_censused_epoch_with_no_height_is_refused_rather_than_skipped() {
+        let prior = genesis();
+        let mut heightless = honest(&prior, 5_625, 40, 9_000);
+        heightless.census_height = None;
+        assert!(heightless.record.epoch > GENESIS_EPOCH);
+        assert_eq!(
+            verify(&prior, &heightless),
+            Err(Rejection::CensusHeightMissing {
+                epoch: heightless.record.epoch
+            })
         );
     }
 }
