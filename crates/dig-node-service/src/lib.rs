@@ -32,6 +32,10 @@
 //! - [`service`] — OS-service install/uninstall/start/stop/status.
 
 pub mod cli;
+/// The deterministic mirror-coin collateral model: the per-epoch record store, the local
+/// safety margin, and the funding advice built on them. Every figure comes out of
+/// `dig-mirror-collateral`; no formula is restated.
+pub mod collateral;
 pub mod config;
 /// Pure HTTP helpers for the local plaintext content-serve surface (#289): `/s/...` route parsing,
 /// `<base>`/Referer store-root rerooting, the content-type map, the SPA-vs-asset classifier, and the

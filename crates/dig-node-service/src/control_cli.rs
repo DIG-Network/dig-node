@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use crate::cli::Outcome;
 use crate::config::Config;
 use crate::control_client::call_control;
+use dig_node_control_interface::results::{CollateralBufferResult, CollateralFundingState};
 
 /// One control-parity CLI action, clap-agnostic (mapped from the subcommand in `entrypoint.rs`).
 /// Each variant names the single `control.*` method it dispatches — see [`ControlAction::method`].
@@ -151,6 +152,30 @@ pub enum ControlAction {
     /// `control.chiaPeers.list` — the tracked Chia full-node peers, with the `user_managed` flag
     /// that says which of them are trusted without corroboration.
     ChiaPeersList,
+    /// `control.collateral.requirement` — this epoch's per-store collateral requirement, with the
+    /// census inputs behind it, or a NAMED reason the node cannot state it.
+    ///
+    /// The answer is consensus-derived and identical on every node. It carries no safety margin:
+    /// the margin is this operator's local preference, and folding it in here would make a private
+    /// choice look like the network's price.
+    CollateralRequirement,
+    /// `control.collateral.margin.get` — the node's local safety margin, in basis points.
+    CollateralMarginGet,
+    /// `control.collateral.buffer` — the node's OWN answer: what it recommends holding and
+    /// the funding state it is in, from the served set and balance the node itself knows.
+    ///
+    /// Distinct from the operator-supplied form of `dign collateral buffer`, which computes the
+    /// same figures from operands a person types. The node is authoritative; the operands exist
+    /// so a person can get a number before the node can enumerate its own served set.
+    CollateralBuffer,
+    /// `control.collateral.margin.set` — persist the local safety margin.
+    ///
+    /// The node is the authoritative home for this setting: the flywheel is headless, so a machine
+    /// with no GUI must be able to set it from the command line.
+    CollateralMarginSet {
+        /// The margin in BASIS POINTS (`100` is +1%), already resolved from any preset name.
+        margin_bp: u64,
+    },
     /// `control.chiaPeers.remove` — stop trusting a Chia full node (`ban` keeps it excluded so
     /// discovery cannot re-add it).
     ChiaPeersRemove { ip: String, ban: bool },
@@ -205,6 +230,10 @@ impl ControlAction {
             ControlAction::SubsRemove { .. } => "control.unsubscribe",
             ControlAction::ChiaPeersAdd { .. } => "control.chiaPeers.add",
             ControlAction::ChiaPeersList => "control.chiaPeers.list",
+            ControlAction::CollateralRequirement => "control.collateral.requirement",
+            ControlAction::CollateralMarginGet => "control.collateral.margin.get",
+            ControlAction::CollateralBuffer => "control.collateral.buffer",
+            ControlAction::CollateralMarginSet { .. } => "control.collateral.margin.set",
             ControlAction::ChiaPeersRemove { .. } => "control.chiaPeers.remove",
         }
     }
@@ -235,6 +264,9 @@ impl ControlAction {
 
         match self {
             ControlAction::ConfigSetUpstream { url } => json!({ "upstream": url }),
+            // Basis points, never a percentage and never a float. A 1 bp margin (0.01%) is a legal
+            // choice and any conversion to whole percent would erase it.
+            ControlAction::CollateralMarginSet { margin_bp } => json!({ "margin_bp": margin_bp }),
             ControlAction::CacheSetCap { bytes } => json!({ "cap_bytes": bytes }),
             ControlAction::StoresPin { store }
             | ControlAction::StoresUnpin { store }
@@ -445,6 +477,12 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         // (dig_ecosystem#2870).
         ControlAction::ChiaPeersAdd { ip: String::new() }.method(),
         ControlAction::ChiaPeersList.method(),
+        // `dign collateral requirement` and `dign collateral margin [set …]` drive the
+        // deterministic mirror-coin collateral surface (dig_ecosystem#3173).
+        ControlAction::CollateralRequirement.method(),
+        ControlAction::CollateralMarginGet.method(),
+        ControlAction::CollateralBuffer.method(),
+        ControlAction::CollateralMarginSet { margin_bp: 0 }.method(),
         ControlAction::ChiaPeersRemove {
             ip: String::new(),
             ban: false,
@@ -462,6 +500,12 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         "control.peerStatus",
         "control.peers.connect",
         "control.peers.ping",
+        // `dign spends list` drives the automated-spend audit record (dig-node#385). It reads the
+        // same node-private file through the same `SpendLog`, so the CLI and the control method
+        // cannot disagree about what the record says -- which is the property the contract's
+        // "only sanctioned reader" rule is protecting, and the reason this is one verb rather than
+        // a second parser.
+        "control.spends.list",
         // `dig-node pair …` drives the pairing-admin methods (#280).
         "control.pairing.list",
         "control.pairing.approve",
@@ -669,9 +713,352 @@ fn summarize(method: &str, result: &Value) -> String {
             };
             format!("{coins} direct child coin(s) — one hop, not a lineage{more}")
         }
+        "control.collateral.requirement" => summarize_collateral_requirement(result),
+        "control.collateral.buffer" => summarize_collateral_buffer(result),
+        // Shown with its real cost, not as a bare setting: a margin is a number of basis points
+        // until someone says what it costs to hold.
+        "control.collateral.margin.get" | "control.collateral.margin.set" => {
+            summarize_margin(result)
+        }
         "control.updater.status" => summarize_updater_status(result),
         _ => compact(result),
     }
+}
+
+/// `dign collateral buffer` — how much $DIG to hold, and whether this operator is short.
+///
+/// # Why the served-pair count is an OPERAND and not a lookup
+///
+/// The buffer's first term is the number of `(owner, store, root)` triples THIS NODE serves. No
+/// published control method exposes that set: `control.collateral.requirement`'s `stores` and
+/// `owners` are NETWORK census figures — the contract says in as many words that neither is a node
+/// count — and `control.hostedStores.list` is a list of pinned and cached stores, which is a
+/// different set that merely resembles it.
+///
+/// An earlier version of this command substituted `hostedStores.list`, and that was wrong: a
+/// resemblance is not an identity, and the error is invisible because both produce a plausible
+/// number. Until `control.collateral.buffer` publishes (dig-node-control-interface#36), the count
+/// is supplied by the caller, and its absence is reported as
+/// [`BufferUnknownReason::ServedSetUnknown`] rather than guessed. Adoption is then a wiring step:
+/// the operand is replaced by the node's own served set, and nothing else here changes.
+///
+/// The **balance** is an operand for the same reason. This node cannot know which address holds an
+/// operator's $DIG, and a balance read of the wrong address returns a confident number about the
+/// wrong money.
+pub fn collateral_buffer(
+    config: &Config,
+    pairs_served: Option<u64>,
+    spendable_dig_base_units: Option<u64>,
+) -> std::io::Result<Outcome> {
+    let requirement_json = call_control(
+        config,
+        ControlAction::CollateralRequirement.method(),
+        json!({}),
+    )?;
+    let margin_json = call_control(
+        config,
+        ControlAction::CollateralMarginGet.method(),
+        json!({}),
+    )?;
+    buffer_outcome(
+        requirement_json,
+        margin_json,
+        pairs_served,
+        spendable_dig_base_units,
+    )
+}
+
+/// Turn the two control answers into the buffer outcome — everything after the I/O.
+///
+/// # Why this is separate from [`collateral_buffer`]
+///
+/// Both guards this function carries are observable ONLY in the string it returns: that an
+/// undecodable margin is refused rather than defaulted to zero, and that an operator-supplied root
+/// count is marked as such. Left inline behind two `call_control` round trips, neither could be
+/// exercised without a listening node, and both duly went unpinned — a round-2 gate reverted them
+/// together and the suite stayed green. A defect in what a person reads needs a test that reads it.
+fn buffer_outcome(
+    requirement_json: Value,
+    margin_json: Value,
+    pairs_served: Option<u64>,
+    spendable_dig_base_units: Option<u64>,
+) -> std::io::Result<Outcome> {
+    use crate::collateral::buffer_advice;
+    use dig_node_control_interface::params::DEFAULT_BUFFER_HORIZON_EPOCHS;
+
+    let requirement: dig_node_control_interface::results::CollateralRequirementResult =
+        serde_json::from_value(requirement_json).map_err(std::io::Error::other)?;
+    // Decoded typed and REFUSED if undecodable, never defaulted to zero. A zero margin is a
+    // legitimate setting, so a missing one substituted for it is indistinguishable from a real
+    // answer — and it understates the recommendation by exactly the cushion the operator chose,
+    // which is enough to render `BelowRecommendedBuffer` as `Funded`.
+    let margin: dig_node_control_interface::results::CollateralMarginResult =
+        serde_json::from_value(margin_json).map_err(std::io::Error::other)?;
+
+    let advice = buffer_advice(
+        pairs_served,
+        &requirement,
+        margin.margin_bp,
+        spendable_dig_base_units,
+        DEFAULT_BUFFER_HORIZON_EPOCHS,
+    );
+    let result = serde_json::to_value(advice).map_err(std::io::Error::other)?;
+
+    // PROVENANCE. `pairs_served_by_this_node` is named as though the node counted it, and on the
+    // node's own answer it did. Here it is whatever the operator typed after `--roots`, and the
+    // rendered line is otherwise identical — so an operator's guess would be indistinguishable
+    // from a measurement, including in the recommendation derived from it. Marking it makes the
+    // named limitation visible where the figure is read rather than only in the help text. The
+    // marker goes away when the node serves its own served-set count (dig-node#387).
+    let mut human = render_buffer(&advice);
+    if pairs_served.is_some() {
+        human.push_str(
+            "\n  (store-root count supplied by you via `--roots`, not measured by this node)",
+        );
+    }
+    Ok(Outcome::new(human, result))
+}
+
+/// Render a buffer answer as the human line, for BOTH the node-computed and the
+/// operator-supplied forms.
+///
+/// One renderer on purpose: two renderings of one money figure is how an operator comes to
+/// trust the wrong one.
+fn render_buffer(advice: &CollateralBufferResult) -> String {
+    use crate::collateral::{buffer_remedy, format_dig, one_epoch_lock};
+    let known = match *advice {
+        CollateralBufferResult::Unknown { reason } => {
+            // Names the missing fact and what would resolve it. Emphatically not a zero: a zero
+            // buffer reads as "no buffer needed", which is the reassuring rendering of an unknown.
+            return format!(
+                "collateral buffer UNKNOWN — {}.\n  Run `dign collateral requirement` to see \
+                 what this node does know.",
+                buffer_remedy(reason)
+            );
+        }
+        known @ CollateralBufferResult::Known { .. } => known,
+    };
+    let CollateralBufferResult::Known {
+        funding_state,
+        recommended_buffer_dig_base_units,
+        spendable_dig_base_units,
+        pairs_served_by_this_node,
+        required_per_store_dig_base_units,
+        margin_bp,
+        overlap_dig_base_units,
+        escalation_headroom_dig_base_units,
+        horizon_epochs,
+        escalation_ceiling_micros,
+        ..
+    } = known
+    else {
+        unreachable!("the unknown arm returned above")
+    };
+    // Derived rather than carried: the contract publishes the three inputs, so a client and this
+    // node compute the same lock instead of trusting a fourth field that could disagree with them.
+    let lock = one_epoch_lock(
+        pairs_served_by_this_node,
+        required_per_store_dig_base_units,
+        margin_bp,
+    );
+
+    // The working is shown, briefly. A figure nobody can sanity-check is a figure nobody acts on,
+    // and the horizon is stated because a buffer without its horizon is a magic number.
+    let mut summary = format!(
+        "serving {} store root(s) at {} DIG each ({} bp margin)\n  \
+         this epoch locks {} DIG · reclaim overlap {} DIG · escalation headroom {} DIG over {} \
+         epochs (x{}.{:06} ceiling — a worst case, not a forecast)\n  \
+         recommended holding {} DIG",
+        pairs_served_by_this_node,
+        format_dig(required_per_store_dig_base_units),
+        margin_bp,
+        format_dig(lock),
+        format_dig(overlap_dig_base_units),
+        format_dig(escalation_headroom_dig_base_units),
+        horizon_epochs,
+        escalation_ceiling_micros / 1_000_000,
+        escalation_ceiling_micros % 1_000_000,
+        format_dig(recommended_buffer_dig_base_units),
+    );
+
+    // The number a person acts on goes LAST, where the eye lands, and it is an amount rather than
+    // an adjective: "balance low" is not actionable, "add 3.250 DIG" is.
+    // Derived, not carried: the contract publishes the recommendation and the balance, so a
+    // shortfall field would be a fourth number that could disagree with the two it comes from.
+    let short =
+        format_dig(recommended_buffer_dig_base_units.saturating_sub(spendable_dig_base_units));
+    summary.push_str("\n  ");
+    summary.push_str(&match funding_state {
+        CollateralFundingState::ShortNow => format!(
+            "SHORT NOW — you cannot cover this epoch; store roots are going uncollateralised. \
+             Add at least {} DIG now, {short} DIG to reach the recommendation.",
+            format_dig(lock.saturating_sub(spendable_dig_base_units)),
+        ),
+        CollateralFundingState::DangerouslyLow => format!(
+            "DANGEROUSLY LOW — this epoch is covered, but a rise at the ceiling would not be. \
+             Add {short} DIG to reach the recommendation."
+        ),
+        // Deliberately unalarming prose: every epoch this state covers IS covered, and it is a
+        // readout rather than a shortfall (`CollateralFundingState::is_shortfall`).
+        CollateralFundingState::BelowRecommendedBuffer => format!(
+            "below the recommended buffer — every epoch is covered, but there is no cushion. \
+             Add {short} DIG to reach it."
+        ),
+        // Zero served roots is NOT the same sentence as "your funding is sufficient", even though
+        // the arithmetic agrees: saying "funded" to an operator serving nothing implies their store
+        // roots are covered, and they have none.
+        CollateralFundingState::Funded if pairs_served_by_this_node == 0 => {
+            "no store roots to collateralise — nothing to fund.".to_string()
+        }
+        CollateralFundingState::Funded => {
+            "funded — at or above the recommended buffer.".to_string()
+        }
+    });
+
+    summary
+}
+
+/// A concise human line for `control.collateral.buffer` — the node's OWN answer.
+///
+/// Shares [`render_buffer`] with the operator-supplied form of `dign collateral buffer`, so the two
+/// cannot describe the same figures differently. Two renderings of one money figure is how an
+/// operator comes to trust the wrong one.
+fn summarize_collateral_buffer(result: &Value) -> String {
+    match serde_json::from_value::<CollateralBufferResult>(result.clone()) {
+        Ok(answer) => render_buffer(&answer),
+        // A payload this build cannot decode is reported as such, never as a figure. Guessing at a
+        // partially-understood money answer is worse than saying the node spoke a shape we do not
+        // know.
+        Err(e) => format!("collateral buffer: unreadable answer from the node ({e})"),
+    }
+}
+
+/// A concise human line for `control.collateral.requirement`.
+///
+/// The census inputs travel with the figure on purpose: a surface that can show only the number can
+/// say the price moved, while one holding `stores`, `owners`, the multiplier and the handicap can
+/// say WHY it moved — the difference between a figure an operator can weigh and one they can only
+/// accept.
+///
+/// The unknown branch prints the REASON, never a zero. Each reason names a different missing fact
+/// because the remedies differ: a node that has not censused the epoch needs to run the census,
+/// whereas one inside the finality depth only needs to wait.
+///
+/// # Why this decodes typed instead of guarding on the `state` string
+///
+/// An earlier version tested `state == "unknown"` positively and let EVERY other payload fall
+/// through to a formatter whose fields were each `unwrap_or(0)`. That renders an unrecognised state
+/// as a real epoch number beside a fabricated `0.000 DIG per store` — which reads as authoritative
+/// rather than degraded, and is the exact money lie the unknown branch exists to prevent. An
+/// operator acting on it posts nothing and leaves every store root uncollateralised.
+///
+/// The trigger is a PLANNED event, not a failure. [`CollateralRequirementResult`] is
+/// `#[serde(tag = "state")]`, so a new variant is an ADDITIVE contract change, and `dign` and the
+/// node are separately installed binaries — so the next minor would make every already-installed
+/// `dign` print it. Decoding typed means an undecodable payload is reported as undecodable, exactly
+/// as [`summarize_collateral_buffer`] already does.
+fn summarize_collateral_requirement(result: &Value) -> String {
+    use dig_node_control_interface::results::{
+        CollateralRequirementResult, CollateralUnknownReason,
+    };
+
+    let answer = match serde_json::from_value::<CollateralRequirementResult>(result.clone()) {
+        Ok(answer) => answer,
+        // A payload this build cannot decode is reported as such, never as a figure. Guessing at a
+        // partially-understood money answer is worse than saying the node spoke a shape we do not
+        // know.
+        Err(e) => return format!("collateral requirement: unreadable answer from the node ({e})"),
+    };
+
+    let (epoch, protocol_version, required, stores, owners, multiplier, handicap) = match answer {
+        CollateralRequirementResult::Unknown { reason } => {
+            let (reason, remedy) = match reason {
+                CollateralUnknownReason::NotCensused => (
+                    "this node has not censused the epoch",
+                    "run the census for this epoch",
+                ),
+                CollateralUnknownReason::BehindFinalityDepth => (
+                    "the epoch's census inputs are not final yet",
+                    "wait for the chain to settle",
+                ),
+                CollateralUnknownReason::RecordUnreadable => (
+                    "the record for this epoch could not be read",
+                    "re-run the census for this epoch",
+                ),
+                CollateralUnknownReason::NoChainSource => {
+                    ("this node cannot see the chain", "configure a chain source")
+                }
+            };
+            // Emphatically NOT "0 DIG". An absent requirement rendered as a zero cost is the money
+            // lie this surface exists to prevent.
+            return format!("collateral requirement UNKNOWN — {reason} · {remedy}");
+        }
+        CollateralRequirementResult::Known {
+            epoch,
+            protocol_version,
+            required_per_store_dig_base_units,
+            stores,
+            owners,
+            multiplier_micros,
+            handicap_dig_base_units,
+        } => (
+            epoch,
+            protocol_version,
+            required_per_store_dig_base_units,
+            stores,
+            owners,
+            multiplier_micros,
+            handicap_dig_base_units,
+        ),
+    };
+
+    let dig = crate::collateral::format_dig;
+    format!(
+        "epoch {} (protocol v{}) — {} DIG per store, before any safety margin\n  \
+         from {} advertisement(s) across {} collateralised owner(s) · multiplier {}.{:06}x · \
+         handicap {} DIG",
+        epoch,
+        protocol_version,
+        dig(required),
+        stores,
+        owners,
+        multiplier / 1_000_000,
+        multiplier % 1_000_000,
+        dig(handicap),
+    )
+}
+
+/// A concise human line for the local safety margin, WITH what it costs.
+///
+/// A margin shown alone is a number of basis points and nothing more. Shown beside the per-store
+/// amount it adds, it is a decision an operator can make — which is the whole point of exposing the
+/// setting rather than just storing it.
+///
+/// Decoded typed for the same reason as [`summarize_collateral_requirement`]: zero is a legitimate
+/// margin, so an absent one substituted for it reads as a deliberate choice the operator did not
+/// make — and this line is what they check after `margin set`, which makes it the one place a
+/// silently-defaulted zero would be believed.
+fn summarize_margin(result: &Value) -> String {
+    let bp = match serde_json::from_value::<
+        dig_node_control_interface::results::CollateralMarginResult,
+    >(result.clone())
+    {
+        Ok(margin) => margin.margin_bp,
+        Err(e) => return format!("safety margin: unreadable answer from the node ({e})"),
+    };
+    let preset = match bp {
+        b if b == dig_mirror_collateral::SAFETY_MARGIN_BP_TIGHT => " (tight)",
+        b if b == dig_mirror_collateral::SAFETY_MARGIN_BP_DEFAULT => " (default)",
+        b if b == dig_mirror_collateral::SAFETY_MARGIN_BP_GENEROUS => " (generous)",
+        _ => "",
+    };
+    // Percent is shown for readability only; the STORED unit is basis points, and a 1 bp margin
+    // must still read as 0.01% rather than rounding away to zero.
+    format!(
+        "safety margin {bp} bp{preset} = +{}.{:02}% over the per-store requirement",
+        bp / 100,
+        bp % 100,
+    )
 }
 
 /// A concise human line for the auto-update beacon status (`control.updater.status`). The rich
@@ -844,6 +1231,365 @@ fn compact(result: &Value) -> String {
 mod tests {
     use super::*;
     use crate::control::CONTROL_METHODS;
+
+    /// The requirement summary MUST NOT render an absent figure as a number.
+    ///
+    /// This is the rendering half of the money-lie rule: the wire is already honest (an `unknown`
+    /// answer carries no figure at all), and this asserts the human line does not invent one on the
+    /// way out. Each reason must also carry ITS OWN remedy, because a node that has not censused
+    /// needs to run the census while one inside the finality depth only needs to wait — one shared
+    /// sentence for both is unactionable.
+    #[test]
+    fn an_unknown_requirement_renders_a_reason_and_never_a_figure() {
+        let cases = [
+            ("not_censused", "censused"),
+            ("behind_finality_depth", "final"),
+            ("record_unreadable", "could not be read"),
+            ("no_chain_source", "chain"),
+        ];
+        let mut remedies = std::collections::BTreeSet::new();
+        for (reason, needle) in cases {
+            let line = summarize_collateral_requirement(&json!({
+                "state": "unknown",
+                "reason": reason,
+            }));
+            assert!(line.contains("UNKNOWN"), "{reason}: {line}");
+            assert!(line.contains(needle), "{reason}: {line}");
+            // No amount of DIG anywhere. "0.000" would read as "no collateral required", and
+            // under-posting costs the operator that epoch's rewards.
+            assert!(
+                !line.contains("0.000"),
+                "{reason} rendered a zero cost: {line}"
+            );
+            assert!(
+                !line.contains("per store"),
+                "{reason} implied a figure: {line}"
+            );
+            remedies.insert(line.rsplit('·').next().unwrap_or("").trim().to_string());
+        }
+        // Four distinct remedies, not one sentence reused four times.
+        assert_eq!(remedies.len(), 4, "the remedies collapsed: {remedies:?}");
+    }
+
+    #[test]
+    fn a_known_requirement_shows_the_census_inputs_behind_the_figure() {
+        let line = summarize_collateral_requirement(&json!({
+            "state": "known",
+            "epoch": 104,
+            "protocol_version": 1,
+            "required_per_store_dig_base_units": 3_780u64,
+            "stores": 17,
+            "owners": 820,
+            "multiplier_micros": 900_000u64,
+            "handicap_dig_base_units": 720u64,
+        }));
+        // The figure, at three decimals -- 3_780 base units is 3.780 DIG, not 3.78 and not 3780.
+        assert!(line.contains("3.780 DIG per store"), "{line}");
+        // And it says the figure is PRE-margin, so nobody reads it as what they must hold.
+        assert!(line.contains("before any safety margin"), "{line}");
+        // The inputs, so a person can say WHY the price moved rather than only that it did.
+        assert!(line.contains("104"), "{line}");
+        assert!(line.contains("17 advertisement"), "{line}");
+        // "collateralised owner(s)", never "nodes" -- one owner hash may back many nodes.
+        assert!(line.contains("820 collateralised owner"), "{line}");
+        assert!(
+            !line.contains("node(s)"),
+            "owners must not be rendered as nodes: {line}"
+        );
+        assert!(line.contains("0.900000x"), "{line}");
+        assert!(line.contains("0.720 DIG"), "{line}");
+    }
+
+    /// A well-formed `known` requirement, for the buffer fixtures below.
+    fn known_requirement_json() -> Value {
+        json!({
+            "state": "known",
+            "epoch": 104,
+            "protocol_version": 1,
+            "required_per_store_dig_base_units": 3_780u64,
+            "stores": 17,
+            "owners": 820,
+            "multiplier_micros": 1_000_000u64,
+            "handicap_dig_base_units": 0u64,
+        })
+    }
+
+    /// The recommendation the buffer reaches for `margin_bp`, read off the machine result.
+    fn recommendation_at(margin_bp: u64) -> u64 {
+        let outcome = buffer_outcome(
+            known_requirement_json(),
+            json!({ "margin_bp": margin_bp }),
+            Some(3),
+            Some(u64::MAX / 2),
+        )
+        .expect("a well-formed pair decodes");
+        outcome.result["recommended_buffer_dig_base_units"]
+            .as_u64()
+            .expect("a known answer carries its recommendation")
+    }
+
+    /// An undecodable margin must ABORT the buffer, never be substituted with zero.
+    ///
+    /// # Why this asserts the FLIP and not merely an error
+    ///
+    /// The nearest wrong implementation is `unwrap_or(0)`, and it fails in the dangerous
+    /// direction: it understates the recommendation by exactly the cushion the operator chose, so
+    /// a node that is `BelowRecommendedBuffer` reads as `Funded` and nobody adds the $DIG. An
+    /// `is_err()` assertion alone would pin the refusal while saying nothing about why it matters —
+    /// and would still pass if the cushion had quietly stopped affecting the figure.
+    ///
+    /// So the balance is pinned at the ZERO-margin recommendation: the exact point at which the
+    /// two implementations disagree about the funding state. A margin of zero calls that funded; a
+    /// real 500 bp margin does not. The fixture is calibrated at run time from the machine result
+    /// rather than from a hard-coded figure, so it cannot drift out of the band it is testing.
+    #[test]
+    fn an_undecodable_margin_aborts_the_buffer_rather_than_becoming_a_zero_cushion() {
+        let at_zero = recommendation_at(0);
+        let at_500 = recommendation_at(500);
+        // The cushion is real money, and it is the money the defaulted-to-zero path would drop.
+        assert!(
+            at_500 > at_zero,
+            "a 500 bp margin must recommend more than none: {at_500} vs {at_zero}"
+        );
+
+        // Held at exactly the zero-margin recommendation: funded only if the cushion is ignored.
+        let human = |margin_bp: u64| {
+            buffer_outcome(
+                known_requirement_json(),
+                json!({ "margin_bp": margin_bp }),
+                Some(3),
+                Some(at_zero),
+            )
+            .expect("a well-formed pair decodes")
+            .summary
+        };
+        let fabricated = human(0);
+        let truthful = human(500);
+        assert!(
+            fabricated.contains("funded"),
+            "the zero-margin reading should be the reassuring one: {fabricated}"
+        );
+        assert!(
+            !truthful.contains("funded — at or above"),
+            "a real 500 bp margin must not read as funded at the zero-margin figure: {truthful}"
+        );
+        assert!(
+            truthful.contains("Add "),
+            "the truthful reading must state an amount to add: {truthful}"
+        );
+
+        // And the defect itself: an undecodable margin produces NO reading at all.
+        for (label, margin) in [
+            ("empty object", json!({})),
+            ("wrong type", json!({ "margin_bp": "500" })),
+            ("misspelled field", json!({ "marginBp": 500 })),
+        ] {
+            let outcome = buffer_outcome(known_requirement_json(), margin, Some(3), Some(at_zero));
+            assert!(
+                outcome.is_err(),
+                "{label} produced a buffer reading from an unknown margin: {:?}",
+                outcome.map(|o| o.summary)
+            );
+        }
+    }
+
+    /// An operand-supplied root count is MARKED, and the shared renderer does not mark anything.
+    ///
+    /// # Why the second assertion is the load-bearing one
+    ///
+    /// This is a PLACEMENT, not an outcome: the marker is correct only when it sits on the operand
+    /// path. Put it inside [`render_buffer`] instead — the obvious "simplification", since that is
+    /// where the line is built — and the node's OWN measured answer starts claiming the operator
+    /// supplied a count they never typed, which is the same confusion inverted. Asserting only
+    /// that the operand path carries the marker would pass under that mislocation.
+    ///
+    /// So the second actor is the shared renderer, given the SAME advice: it must stay silent.
+    #[test]
+    fn an_operand_supplied_root_count_is_marked_and_only_on_the_operand_path() {
+        const MARKER: &str = "supplied by you via `--roots`";
+
+        let operand = buffer_outcome(
+            known_requirement_json(),
+            json!({ "margin_bp": 100 }),
+            Some(3),
+            Some(u64::MAX / 2),
+        )
+        .expect("a well-formed pair decodes")
+        .summary;
+        assert!(
+            operand.contains(MARKER),
+            "an operand-supplied count must say so where the figure is read: {operand}"
+        );
+        assert!(
+            operand.contains("not measured by this node"),
+            "the marker must say what it is NOT, not merely name the flag: {operand}"
+        );
+
+        // The same advice through the shared renderer — the node's own measured answer. Silent.
+        let requirement: dig_node_control_interface::results::CollateralRequirementResult =
+            serde_json::from_value(known_requirement_json()).expect("fixture decodes");
+        let advice = crate::collateral::buffer_advice(
+            Some(3),
+            &requirement,
+            100,
+            Some(u64::MAX / 2),
+            dig_node_control_interface::params::DEFAULT_BUFFER_HORIZON_EPOCHS,
+        );
+        let measured = render_buffer(&advice);
+        assert!(
+            !measured.contains(MARKER),
+            "the node's own measured count must not claim an operator supplied it: {measured}"
+        );
+        // The control: both really are describing the same three roots, so the difference above
+        // is the marker and not two unrelated answers.
+        assert!(measured.contains("serving 3 store root(s)"), "{measured}");
+        assert!(operand.contains("serving 3 store root(s)"), "{operand}");
+    }
+
+    /// A payload this build cannot decode must render as UNREADABLE — never as a figure, and never
+    /// as the `unknown` branch either.
+    ///
+    /// # What each fixture distinguishes
+    ///
+    /// The nearest wrong implementation is the one this replaced: guard positively on
+    /// `state == "unknown"`, and let everything else fall through to a formatter of
+    /// `unwrap_or(0)`s. It renders a REAL epoch number beside a fabricated `0.000 DIG per store`,
+    /// which reads as authoritative rather than degraded.
+    ///
+    /// So the fixtures carry `epoch: 104` — the SAME epoch as the truthful control above — and the
+    /// assertions forbid it appearing. A renderer that leaked any real field through would print
+    /// `104` and fail here; asserting only the absence of `0.000` would not catch a formatter that
+    /// happened to be given a non-zero requirement.
+    ///
+    /// The `known`-with-a-missing-field case is the one that separates a typed decode from a
+    /// hybrid that matches the state string and then falls back per field: the state token is
+    /// perfectly valid there, and only a decode of the whole variant refuses it.
+    ///
+    /// This matters because the trigger is a PLANNED event: `CollateralRequirementResult` is
+    /// `#[serde(tag = "state")]`, so a new variant is additive, and `dign` ships separately from
+    /// the node — the next minor would put an unrecognised state in front of every installed CLI.
+    #[test]
+    fn an_undecodable_requirement_renders_unreadable_and_never_a_figure() {
+        let cases = [
+            // A state this build has never heard of — the additive-variant case.
+            (
+                "unrecognised state",
+                json!({ "state": "suspended", "epoch": 104 }),
+            ),
+            // No state tag at all.
+            ("empty object", json!({})),
+            // A VALID state token whose payload is short a required field. A positive guard on the
+            // string cannot tell this from a complete answer.
+            (
+                "known missing owners",
+                json!({
+                    "state": "known",
+                    "epoch": 104,
+                    "protocol_version": 1,
+                    "required_per_store_dig_base_units": 3_780u64,
+                    "stores": 17,
+                    "multiplier_micros": 900_000u64,
+                    "handicap_dig_base_units": 720u64,
+                }),
+            ),
+            // An unknown whose REASON this build does not recognise: the reason taxonomy is
+            // additive too, and a reason rendered as an empty remedy is its own small lie.
+            (
+                "unrecognised reason",
+                json!({ "state": "unknown", "reason": "awaiting_peer_quorum" }),
+            ),
+        ];
+
+        for (label, payload) in cases {
+            let line = summarize_collateral_requirement(&payload);
+            assert!(
+                line.contains("unreadable answer from the node"),
+                "{label} was not reported as unreadable: {line}"
+            );
+            // Not a figure, at any value.
+            assert!(
+                !line.contains("per store"),
+                "{label} rendered a per-store figure: {line}"
+            );
+            assert!(
+                !line.contains("0.000"),
+                "{label} rendered a zero cost: {line}"
+            );
+            // Not a real field leaked from the payload. `104` is the live epoch in the truthful
+            // control above, so its presence here means the formatter ran.
+            assert!(
+                !line.contains("104"),
+                "{label} leaked a real field into a degraded line: {line}"
+            );
+            // And not misreported as the node having NAMED a missing fact, which would send the
+            // operator to run a census that would not help.
+            assert!(
+                !line.contains("UNKNOWN"),
+                "{label} borrowed the unknown branch: {line}"
+            );
+        }
+    }
+
+    /// An undecodable margin must not render as `0 bp`.
+    ///
+    /// Zero is a LEGITIMATE margin, which is what makes the old `unwrap_or(0)` dangerous here:
+    /// unlike an absent requirement, an absent margin substituted for zero is indistinguishable
+    /// from a real answer, and this line is what an operator reads back after `margin set` to
+    /// confirm the setting took. The `250` fixture is the distinguishing one — a renderer that
+    /// leaked the payload through would still find no `margin_bp`, so the fixture instead proves
+    /// the ADJACENT well-formed value renders, keeping a truthful control beside the refusal.
+    #[test]
+    fn an_undecodable_margin_renders_unreadable_and_never_zero_bp() {
+        for (label, payload) in [
+            ("empty object", json!({})),
+            ("wrong type", json!({ "margin_bp": "250" })),
+            ("negative", json!({ "margin_bp": -1 })),
+            ("misspelled field", json!({ "marginBp": 250 })),
+        ] {
+            let line = summarize_margin(&payload);
+            assert!(
+                line.contains("unreadable answer from the node"),
+                "{label} was not reported as unreadable: {line}"
+            );
+            assert!(
+                !line.contains("0 bp"),
+                "{label} rendered a fabricated zero margin: {line}"
+            );
+            assert!(
+                !line.contains('%'),
+                "{label} rendered a percentage from an unknown: {line}"
+            );
+        }
+        // The truthful control: the same shape, well-formed, still renders its real value.
+        assert!(summarize_margin(&json!({ "margin_bp": 250 })).contains("250 bp"));
+        // And a genuine zero margin is still reportable as itself.
+        let zero = summarize_margin(&json!({ "margin_bp": 0 }));
+        assert!(zero.contains("0 bp"), "{zero}");
+        assert!(
+            !zero.contains("unreadable"),
+            "a real zero margin must not be reported as unreadable: {zero}"
+        );
+    }
+
+    #[test]
+    fn the_margin_line_names_its_preset_and_keeps_sub_percent_values() {
+        // A 1 bp margin is 0.01%, and rounding it to whole percent would erase a legal choice
+        // entirely -- the value would read as no margin at all.
+        assert!(summarize_margin(&json!({ "margin_bp": 1 })).contains("+0.01%"));
+        assert!(summarize_margin(&json!({ "margin_bp": 1 })).contains("(tight)"));
+        assert!(summarize_margin(&json!({ "margin_bp": 100 })).contains("+1.00%"));
+        assert!(summarize_margin(&json!({ "margin_bp": 100 })).contains("(default)"));
+        assert!(summarize_margin(&json!({ "margin_bp": 500 })).contains("+5.00%"));
+        assert!(summarize_margin(&json!({ "margin_bp": 500 })).contains("(generous)"));
+        // A value that is nobody's preset is shown plainly rather than mislabelled as the nearest.
+        let odd = summarize_margin(&json!({ "margin_bp": 250 }));
+        assert!(odd.contains("250 bp"), "{odd}");
+        assert!(odd.contains("+2.50%"), "{odd}");
+        assert!(
+            !odd.contains('('),
+            "an unnamed margin must not borrow a preset name: {odd}"
+        );
+    }
 
     #[test]
     fn every_action_maps_to_a_control_method() {

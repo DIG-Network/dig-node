@@ -403,6 +403,14 @@ pub struct SpendQuery {
     pub kind: Option<String>,
     /// Only this status token ([`SpendStatus::token`]).
     pub status: Option<String>,
+    /// Resume STRICTLY AFTER this audit id, in the read's documented order. `None` starts at the
+    /// newest matching row.
+    ///
+    /// Positional, not a filter, which is why [`SpendQuery::matches`] does not consider it: it
+    /// names a place in an ordering rather than a property of a record. Resuming by TIME instead
+    /// would drop every spend sharing the boundary millisecond, and automated spends are issued by
+    /// a cycle, so several routinely share one.
+    pub after_id: Option<String>,
     /// Cap the number of rows returned, newest first. `None` = every match.
     pub limit: Option<usize>,
 }
@@ -446,6 +454,17 @@ pub struct SpendLedger {
     pub records: Vec<SpendRecord>,
     /// Lines in the file that could not be parsed as a record.
     pub unreadable_lines: usize,
+    /// Is this the WHOLE matching set, or was it TRUNCATED?
+    ///
+    /// Stated rather than inferred from the row count. A caller cannot tell "there are no more
+    /// spends" from "we stopped telling you" by length alone -- a matching set that is an exact
+    /// multiple of the page size makes the last full page indistinguishable from a truncated one --
+    /// and on an audit record those two read the same and mean opposite things.
+    ///
+    /// Spelled positively so that the reading a caller falls into when the field is defaulted is
+    /// the SAFE one: `false` means "there may be more", which costs at worst one redundant request,
+    /// whereas a `truncated` flag would default to "this is everything" and end a walk early.
+    pub complete: bool,
 }
 
 /// The append-only audit file.
@@ -499,20 +518,61 @@ impl SpendLog {
     pub fn ledger(&self) -> std::io::Result<SpendLedger> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SpendLedger::default()),
+            // A node that has never spent automatically is the ordinary case, and its answer is
+            // COMPLETE -- `SpendLedger::default()` alone would say "there may be more", which is
+            // the safe default for a page but the wrong answer for the whole record.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SpendLedger {
+                    complete: true,
+                    ..SpendLedger::default()
+                })
+            }
             Err(e) => return Err(e),
         };
         Ok(fold(&text))
     }
 
-    /// The ledger, filtered. Newest-initiated first, then `limit` applied.
+    /// One PAGE of the ledger: filtered, ordered, resumed from `after_id`, then capped by `limit`.
+    ///
+    /// The returned [`SpendLedger::complete`] states whether the page is the whole matching set.
+    /// It is computed from whether rows were actually withheld, never from whether the page came
+    /// out full, because a matching set that is an exact multiple of the page size fills the last
+    /// page and would read as truncated forever.
+    ///
+    /// # An unknown cursor is an ERROR, not an empty page and not a restart
+    ///
+    /// A caller passing an `after_id` that is not in the matching set has lost its place. Silently
+    /// restarting from the newest row would repeat rows it has already seen, and returning an empty
+    /// page would either end its walk early (with `complete`) or leave it with no cursor to advance
+    /// (without), i.e. looping forever. Refusing says what happened and terminates.
     pub fn query(&self, q: &SpendQuery) -> std::io::Result<SpendLedger> {
         let mut ledger = self.ledger()?;
         ledger.records.retain(|r| q.matches(r));
+
+        if let Some(after) = &q.after_id {
+            let Some(at) = ledger.records.iter().position(|r| &r.id == after) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown cursor {after:?}: no matching spend has that id"),
+                ));
+            };
+            ledger.records.drain(..=at);
+        }
+
         if let Some(n) = q.limit {
+            ledger.complete = ledger.records.len() <= n;
             ledger.records.truncate(n);
         }
         Ok(ledger)
+    }
+
+    /// The id to resume this page from -- the id of the last row actually HANDED to the caller, or
+    /// `None` for an empty page.
+    ///
+    /// A method on the log rather than on the ledger's caller so that the cursor and the ordering
+    /// cannot be defined in two places. It is never a marker for where the record "got to".
+    pub fn cursor_of(ledger: &SpendLedger) -> Option<String> {
+        ledger.records.last().map(|r| r.id.clone())
     }
 }
 
@@ -545,6 +605,9 @@ fn fold(text: &str) -> SpendLedger {
     SpendLedger {
         records,
         unreadable_lines: unreadable,
+        // The whole file was folded, so this is the entire record by construction. Paging narrows
+        // it afterwards, in `SpendLog::query`, which is the only place that can withhold a row.
+        complete: true,
     }
 }
 
@@ -1320,6 +1383,8 @@ mod tests {
                 },
             ],
             unreadable_lines: 0,
+            // A hand-built whole record, not a page.
+            complete: true,
         };
         let chain = FakeChain(vec![
             "coin-agreed".to_string(),
@@ -1350,6 +1415,8 @@ mod tests {
         let ledger = SpendLedger {
             records: vec![r],
             unreadable_lines: 0,
+            // A hand-built whole record, not a page.
+            complete: true,
         };
 
         let report =
@@ -1374,6 +1441,8 @@ mod tests {
         let ledger = SpendLedger {
             records: vec![r],
             unreadable_lines: 0,
+            // A hand-built whole record, not a page.
+            complete: true,
         };
         let report = reconcile(&ledger, &FakeChain(vec![]), "ph").expect("reconcile");
         assert!(report.is_clean());
@@ -1435,6 +1504,8 @@ mod tests {
         let ledger = SpendLedger {
             records: vec![broadcast_failed, signing_failed],
             unreadable_lines: 0,
+            // A hand-built whole record, not a page.
+            complete: true,
         };
         // The broadcast-failed spend DID land; a coin nobody recorded is also present.
         let chain = FakeChain(vec![
@@ -1547,5 +1618,215 @@ mod tests {
         // Round-trips, so an older line written by a previous build still folds.
         let back: SpendRecord = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, r);
+    }
+
+    /// Six spends across THREE distinct timestamps, two sharing a millisecond.
+    ///
+    /// The shared millisecond is the whole point: automated spends are issued by a cycle, so
+    /// several routinely land in one instant, and a cursor that resumed by TIME rather than by id
+    /// would drop one of a tied pair. A fixture whose timestamps were all distinct could not tell a
+    /// correct cursor from a time-based one.
+    ///
+    /// The kinds and store ids are varied too, so a filter that ignored its argument would be
+    /// visible rather than vacuously satisfied.
+    fn paging_log() -> (tempfile::TempDir, SpendLog) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+        let rows = [
+            ("a", 300u64, kinds::MIRROR_COIN, Some("store-1")),
+            ("b", 200, kinds::MIRROR_COIN, Some("store-1")),
+            ("c", 200, kinds::MIRROR_COIN, Some("store-2")),
+            ("d", 100, "profile-mint", Some("store-2")),
+            ("e", 100, kinds::MIRROR_COIN, None),
+            ("f", 100, kinds::MIRROR_COIN, Some("store-1")),
+        ];
+        for (id, ms, kind, store) in rows {
+            let rec = record_at(id, ms, kind, store);
+            log.append(&rec).expect("append");
+        }
+        (dir, log)
+    }
+
+    /// Walk the whole record one page at a time, as a client would.
+    fn walk(log: &SpendLog, page: usize) -> (Vec<String>, usize) {
+        let mut seen = Vec::new();
+        let mut after = None;
+        let mut requests = 0;
+        loop {
+            let q = SpendQuery {
+                after_id: after.clone(),
+                limit: Some(page),
+                ..SpendQuery::default()
+            };
+            let ledger = log.query(&q).expect("page");
+            requests += 1;
+            seen.extend(ledger.records.iter().map(|r| r.id.clone()));
+            if ledger.complete {
+                return (seen, requests);
+            }
+            after = SpendLog::cursor_of(&ledger);
+            assert!(
+                after.is_some(),
+                "an incomplete page must hand back a cursor"
+            );
+            assert!(requests < 20, "walk did not terminate");
+        }
+    }
+
+    #[test]
+    fn the_documented_order_is_newest_first_then_id_ascending() {
+        let (_dir, log) = paging_log();
+        let all = log.query(&SpendQuery::default()).expect("all");
+        // 300 first; then the 200-tie broken by ASCENDING id (b before c); then the 100-tie
+        // (d, e, f). A descending-id tiebreak would give c,b and f,e,d and is the nearest wrong
+        // implementation this ordering has.
+        assert_eq!(
+            all.records
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d", "e", "f"]
+        );
+    }
+
+    #[test]
+    fn a_walk_visits_every_row_exactly_once_across_a_tied_millisecond() {
+        let (_dir, log) = paging_log();
+        // Page size 2 puts a boundary INSIDE the 100ms tie (d|e), which is precisely where a
+        // time-based cursor loses or repeats a row. A page size of 6 would see nothing.
+        let (seen, requests) = walk(&log, 2);
+        assert_eq!(seen, ["a", "b", "c", "d", "e", "f"]);
+        assert!(
+            requests > 1,
+            "page size 2 over 6 rows must take several requests"
+        );
+        // And an odd page size, so the last page is PARTIAL rather than exactly full.
+        assert_eq!(walk(&log, 4).0, ["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn complete_is_not_inferred_from_a_full_page() {
+        let (_dir, log) = paging_log();
+        // Six rows, page size 3: the first page is exactly full AND truncated, the second is
+        // exactly full AND the end. Any implementation deriving `complete` from
+        // `records.len() < limit` reports both as incomplete and walks forever.
+        let first = log
+            .query(&SpendQuery {
+                limit: Some(3),
+                ..SpendQuery::default()
+            })
+            .expect("first");
+        assert_eq!(first.records.len(), 3);
+        assert!(!first.complete, "rows were withheld");
+
+        let second = log
+            .query(&SpendQuery {
+                after_id: SpendLog::cursor_of(&first),
+                limit: Some(3),
+                ..SpendQuery::default()
+            })
+            .expect("second");
+        assert_eq!(second.records.len(), 3);
+        assert!(
+            second.complete,
+            "an exactly-full LAST page is still complete"
+        );
+        assert_eq!(walk(&log, 3).1, 2, "the walk must stop after two requests");
+    }
+
+    #[test]
+    fn an_unlimited_read_and_an_empty_record_are_both_complete() {
+        let (_dir, log) = paging_log();
+        assert!(log.query(&SpendQuery::default()).expect("all").complete);
+        // A node that has never spent automatically: an empty COMPLETE answer, never a defaulted
+        // "there may be more" that would send a client back for a second look forever.
+        let empty = SpendLog::at(
+            tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .join("never-written.jsonl"),
+        );
+        let page = empty.query(&SpendQuery::default()).expect("empty");
+        assert!(page.records.is_empty());
+        assert!(page.complete);
+        assert_eq!(SpendLog::cursor_of(&page), None);
+    }
+
+    #[test]
+    fn the_cursor_is_the_last_row_handed_over_not_the_end_of_the_record() {
+        let (_dir, log) = paging_log();
+        let first = log
+            .query(&SpendQuery {
+                limit: Some(2),
+                ..SpendQuery::default()
+            })
+            .expect("first");
+        // "b", the last row the caller was HANDED -- not "f", where the record got to.
+        assert_eq!(SpendLog::cursor_of(&first), Some("b".to_string()));
+    }
+
+    #[test]
+    fn a_cursor_narrowed_by_a_filter_still_names_a_position_in_that_filtered_order() {
+        let (_dir, log) = paging_log();
+        // store-1 holds a, b, f. Resuming after "b" within that filter must give exactly [f] --
+        // not [c, d, e, f], which is what a cursor resolved against the UNFILTERED order returns.
+        let page = log
+            .query(&SpendQuery {
+                store_id: Some("store-1".to_string()),
+                after_id: Some("b".to_string()),
+                ..SpendQuery::default()
+            })
+            .expect("filtered page");
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["f"]
+        );
+        assert!(page.complete);
+    }
+
+    #[test]
+    fn an_unknown_cursor_is_refused_rather_than_restarting_or_ending_the_walk() {
+        let (_dir, log) = paging_log();
+        // "d" exists in the record but NOT in the store-1 matching set, so this is the realistic
+        // form of a lost place rather than an obviously bogus id -- an implementation that only
+        // rejected ids absent from the whole file would accept it and silently restart.
+        let err = log
+            .query(&SpendQuery {
+                store_id: Some("store-1".to_string()),
+                after_id: Some("d".to_string()),
+                ..SpendQuery::default()
+            })
+            .expect_err("an unknown cursor must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("cursor"), "{err}");
+    }
+
+    #[test]
+    fn unreadable_lines_survive_paging_and_are_not_a_page_count() {
+        let (_dir, log) = paging_log();
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log.path())
+            .expect("open");
+        writeln!(f, "{{not json").expect("write");
+        writeln!(f, "also not json").expect("write");
+        drop(f);
+
+        // Reported on EVERY page, and it counts the whole record -- a corrupt entry has no parsed
+        // timestamp and no parsed id, so it cannot be attributed to a page. A per-page count would
+        // read as "two rows are missing from THIS page", which is a different and false claim.
+        let page = log
+            .query(&SpendQuery {
+                limit: Some(1),
+                ..SpendQuery::default()
+            })
+            .expect("page");
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.unreadable_lines, 2);
+        assert!(!page.complete);
     }
 }
