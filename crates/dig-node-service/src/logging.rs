@@ -96,12 +96,16 @@ pub fn init(run_context: RunContext) {
     }
 }
 
-/// Why the rolling JSONL file sink is disabled for this process, or `None` when it is live (or
-/// when this process never installed logging at all — see [`initialized`]).
+/// Why the rolling JSONL file sink FAILED TO OPEN when this process installed logging, or `None`
+/// when it opened successfully (or when this process never installed logging at all — see
+/// [`initialized`]).
 ///
-/// Console logging is installed either way, so this is a health signal, not a failure: a node
-/// that reported healthy logging while writing to nothing would be the exact untruth the
-/// `dig-logging` 0.2.0 uplift exists to remove.
+/// This is a START-UP verdict and never changes. `dig-logging` 0.2.0 computes `file_error` once
+/// during `init` and exposes no mutator, so a sink failure that happens LATER — the log directory
+/// deleted, the volume filled, a rotation failure — is NOT detected here and this stays `None`.
+/// Reading it as "the file sink is working right now" over-claims.
+///
+/// Console logging is installed either way, so this is a health signal, not a failure.
 pub fn file_error() -> Option<String> {
     GUARD.get()?.file_error().map(str::to_owned)
 }
@@ -117,12 +121,18 @@ pub fn initialized() -> bool {
     GUARD.get().is_some()
 }
 
-/// The node's own logging health, as reported by `control.status`. Pure in its inputs so both
-/// arms are testable without a process-global subscriber: `file_error` is
-/// [`dig_logging::LogGuard::file_error`], `dir` the resolved directory.
+/// The node's own logging health AS OF LOGGER INITIALIZATION, as reported by `control.status`.
+/// Pure in its inputs so both arms are testable without a process-global subscriber: `file_error`
+/// is [`dig_logging::LogGuard::file_error`], `dir` the resolved directory.
+///
+/// `file_logging: true` asserts that the rolling JSONL sink OPENED SUCCESSFULLY at start-up — not
+/// that it is writing now. `dig-logging` 0.2.0 fixes `file_error` at init and offers no way to
+/// revise it, so a post-init sink failure (directory deleted, volume full, rotation failure) is
+/// NOT detected and this keeps reporting `true`. Widening that to live health needs post-init
+/// revalidation in `dig-logging` first.
 ///
 /// The nearest wrong implementation reports `file_logging: true` whenever logging initialised —
-/// which is precisely the lie a degraded file sink makes possible.
+/// ignoring `file_error` entirely, which is the lie a start-up sink failure would then tell.
 pub fn health(initialized: bool, dir: Option<&std::path::Path>, file_error: Option<&str>) -> Value {
     json!({
         "initialized": initialized,
