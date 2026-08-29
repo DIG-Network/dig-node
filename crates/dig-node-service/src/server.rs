@@ -2626,8 +2626,9 @@ pub(crate) fn log_census_observation(observed: &crate::collateral_census::Census
 /// node that was a few blocks early records the epoch on its next pass rather than at the next
 /// epoch.
 ///
-/// Re-attempting costs nothing once a node is current: `catch_up` performs NO chain read when the
-/// store already holds the target epoch.
+/// Re-attempting once a node is current costs one census of the CURRENT epoch, and none of any
+/// earlier one: `catch_up` re-censuses the target so a record written under a briefly degraded
+/// chain view cannot stay sealed (dig-node#405).
 const COLLATERAL_CENSUS_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(dig_constants::MIRROR_ROUND_LENGTH_MS as u64);
 
@@ -2668,6 +2669,19 @@ fn spawn_collateral_census(chain: Arc<dig_wallet::sage::chain::ChainTransport>) 
                         Ok(outcome) => {
                             for observed in &outcome.recorded {
                                 log_census_observation(observed);
+                            }
+                            // A repair, not a routine record: this node's chain view had been
+                            // showing it a SMALLER network than the chain holds, and the
+                            // requirement it derived was correspondingly low. WARN, because the
+                            // figure it replaces was served to the operator in the meantime.
+                            if let Some(repaired) = &outcome.superseded {
+                                tracing::warn!(
+                                    epoch = repaired.epoch,
+                                    census_height = repaired.census_height,
+                                    stores = repaired.stores,
+                                    "a re-census of the current epoch counted MORE stores than the record this node held; the earlier, lower answer was superseded"
+                                );
+                                log_census_observation(repaired);
                             }
                             if let Some(stop) = outcome.stopped {
                                 // WARN rather than ERROR: several stops — an epoch the chain has

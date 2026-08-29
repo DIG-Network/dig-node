@@ -41,7 +41,9 @@
 use dig_chainsource_interface::ChainSource;
 use dig_mirror_coin::{census, census_height, CensusOutcome, Exclusions, MirrorError};
 
-use crate::collateral::{EpochRecordStore, PutOutcome, StoredEpoch, StoredRecord, GENESIS_EPOCH};
+use crate::collateral::{
+    EpochRecordStore, PutOutcome, RecordProvenance, StoredEpoch, StoredRecord, GENESIS_EPOCH,
+};
 
 /// Why a catch-up stopped before reaching the target epoch.
 ///
@@ -199,9 +201,18 @@ pub struct CensusObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatchUp {
     /// What each newly recorded epoch's census found, in ascending epoch order. Empty is the
-    /// ordinary steady state: a node already current has nothing to compute and performs no chain
-    /// read at all.
+    /// ordinary steady state: a node already current has no NEW epoch to compute, and its one
+    /// census of the target epoch is reported through `superseded` only if it repaired something.
     pub recorded: Vec<CensusObservation>,
+    /// The re-census of the target epoch that REPLACED a lower answer this node had already
+    /// recorded for it, when one did (dig-node#405).
+    ///
+    /// `None` is the ordinary outcome and covers two different ordinary things: the target was
+    /// recorded for the first time by this very walk, so `recorded` already describes it; or it was
+    /// re-censused and the answer had not moved. Only a genuine repair appears here, because only a
+    /// genuine repair is worth an operator's attention — it says this node's chain view had been
+    /// showing it a smaller network than the chain holds.
+    pub superseded: Option<CensusObservation>,
     /// Why the walk stopped short of the target, or `None` when it reached it.
     pub stopped: Option<CensusStop>,
 }
@@ -211,8 +222,10 @@ pub struct CatchUp {
 /// Returns what it recorded and, when it stopped early, why. **A stop writes nothing**: this
 /// function never invents, defaults, or carries forward a figure.
 ///
-/// The walk performs NO chain read when the store is already current, so calling it on a timer is
-/// cheap in the steady state.
+/// A walk whose store is already current still censuses the TARGET epoch once, so that a record
+/// written under a briefly degraded chain view cannot stay sealed (dig-node#405, see [`refresh`]).
+/// It censuses no epoch before the target, so history is computed exactly once and the cost of
+/// running this on a timer is one epoch's census per pass.
 ///
 /// # The census height is derived, never chosen
 ///
@@ -232,6 +245,7 @@ pub fn catch_up<S: ChainSource>(
         Err(detail) => {
             return CatchUp {
                 recorded,
+                superseded: None,
                 stopped: Some(CensusStop::Store { detail }),
             }
         }
@@ -243,16 +257,92 @@ pub fn catch_up<S: ChainSource>(
             Err(stopped) => {
                 return CatchUp {
                     recorded,
+                    superseded: None,
                     stopped: Some(stopped),
                 }
             }
         }
     }
 
+    // The store was already at the target, so nothing above ran. Take the census again: this is the
+    // ONE epoch whose answer is still repairable, and the pass costs one census of one epoch.
+    if highest >= target_epoch {
+        return match refresh(source, store, target_epoch) {
+            Ok(superseded) => CatchUp {
+                recorded,
+                superseded,
+                stopped: None,
+            },
+            Err(stopped) => CatchUp {
+                recorded,
+                superseded: None,
+                stopped: Some(stopped),
+            },
+        };
+    }
+
     CatchUp {
         recorded,
+        superseded: None,
         stopped: None,
     }
+}
+
+/// Re-census an epoch this node has ALREADY recorded, and replace its record if the new census
+/// counts more stores.
+///
+/// # Why the walk is no longer read-free once it is current (dig-node#405)
+///
+/// It used to perform no chain read at all when the store held the target, and that cheapness was
+/// exactly what made a degraded read permanent: the record written by one thin ten-minute window
+/// was never looked at again. So the steady state now costs one census of ONE epoch per pass, and
+/// buys back the property that an under-count has to be sustained for the whole epoch rather than
+/// merely be well timed.
+///
+/// # What is deliberately NOT re-censused
+///
+/// Every epoch before the target. History stays computed exactly once
+/// ([`EpochRecordStore::put`] would refuse to change it anyway), so the cold-start cost of a node
+/// catching up across many epochs (dig-node#404) is untouched: this adds one census, to the epoch
+/// the walk was asked for, and only when that epoch was already held.
+///
+/// # A LOWER re-census is a stop, not a silence
+///
+/// [`EpochRecordStore::put`] admits only a strictly higher count, so a re-census that comes back
+/// smaller lands on [`PutOutcome::Conflict`] and is reported as [`CensusStop::Contradiction`]. That
+/// is the honest reading: this node's stored answer and its current chain view disagree about a
+/// block that is already buried, and the held record — the higher one — stands.
+fn refresh<S: ChainSource>(
+    source: &S,
+    store: &EpochRecordStore,
+    epoch: u64,
+) -> Result<Option<CensusObservation>, CensusStop> {
+    let held_stores = match store.get(epoch) {
+        // Only a CENSUS is worth repeating. `put` demands `Censused` on both sides of the repair,
+        // so re-censusing anything else spends a whole population read to reach a refusal.
+        //
+        // **This is also what protects the genesis epoch**, and it is the only guard that does.
+        // Epoch 1 is derived from nothing and has no predecessor, so re-entering `record_one` for
+        // it stops at `PriorEpochMissing { epoch: 0 }` — an epoch that cannot exist — on every pass
+        // forever. It is reached here as a BOOTSTRAP record, never a censused one: no path writes a
+        // censused epoch 1 (`put` answers `AlreadyPresent` for an identical record offered with
+        // weaker evidence, and `Conflict` for a differing one, since a bootstrap record is on
+        // neither superseding side). An explicit `epoch <= GENESIS_EPOCH` arm was tried and removed
+        // — it sat in front of this one, could never fire, and so masked the guard that does the
+        // work: mutating it away left the suite green, which is the whole argument against keeping
+        // a second guard that nothing can witness.
+        StoredEpoch::Found(held) if !matches!(held.provenance, RecordProvenance::Censused) => {
+            return Ok(None)
+        }
+        StoredEpoch::Found(held) => held.record.census.stores,
+        // Not a state this function is reached in — `catch_up` only calls it for an epoch
+        // `highest_recorded` just reported — and answered honestly rather than assumed away.
+        StoredEpoch::Absent => return Ok(None),
+        StoredEpoch::Unreadable => return Err(CensusStop::EpochLineUnreadable { epoch }),
+    };
+
+    let observed = record_one(source, store, epoch)?;
+    Ok((observed.stores > held_stores).then_some(observed))
 }
 
 /// The newest epoch `store` holds a record for.
@@ -553,6 +643,13 @@ mod tests {
         }
     }
 
+    /// A plausible consensus record for `epoch`, for seeding a store the walk must then re-census.
+    fn record_for(epoch: u64) -> dig_mirror_collateral::EpochRecord {
+        let mut rec = EpochRecord::bootstrap();
+        rec.epoch = epoch;
+        rec
+    }
+
     /// A store in a fresh temp dir, holding only the genesis record the bring-up writes.
     fn seeded_store(name: &str) -> (EpochRecordStore, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -605,28 +702,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// **A node already current performs NO chain read.**
+    /// **A node already current re-censuses the TARGET epoch, and records nothing new.**
     ///
-    /// The steady state, and the property that makes running this on a timer cheap. It is asserted
-    /// against a source that fails on every read: if the walk touched the chain at all the target
-    /// would be unreachable and `stopped` would be `Some`.
+    /// The steady state after dig-node#405. It used to perform no chain read at all, and that
+    /// cheapness is exactly what sealed a record written under a briefly degraded view: the walk
+    /// never looked at the epoch again. So a read is now expected, and its absence would mean the
+    /// repair path is unreachable.
+    ///
+    /// Asserted against a source that fails on every read, so the read is observable in TWO
+    /// independent ways — the counter, and a stop that could only have come from attempting it.
     #[test]
-    fn a_store_already_at_the_target_reads_no_chain() {
+    fn a_store_already_at_the_target_recensuses_it() {
+        // The target is epoch 2, NOT genesis. Genesis is derived from nothing and is deliberately
+        // never re-censused (see `refresh`), so a fixture aimed at it asserts the guard rather than
+        // the repair and reads as "no chain read" for the wrong reason — which is exactly how this
+        // test first passed against a walk that could not repair anything.
         let (store, dir) = seeded_store("current");
+        store
+            .put(&StoredRecord::censused(record_for(2), 1_002))
+            .expect("seed epoch 2");
+        let source = UnreachableSource::new();
+
+        let outcome = catch_up(&source, &store, 2);
+
+        assert_eq!(outcome.recorded, Vec::<CensusObservation>::new());
+        assert_eq!(outcome.superseded, None, "nothing was repaired to report");
+        assert!(
+            source.reads() > 0,
+            "the target epoch was not re-censused, so a degraded record could never be repaired"
+        );
+        match outcome.stopped {
+            Some(CensusStop::ChainUnavailable { epoch, .. }) => assert_eq!(
+                epoch, 2,
+                "the re-census must be of the TARGET epoch and of no earlier one"
+            ),
+            other => panic!("expected the refused read to be reported, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **A record that is not a census is never re-censused — which is what protects genesis.**
+    ///
+    /// Epoch 1 is derived from nothing and has no predecessor, so re-entering the census for it
+    /// stops at `PriorEpochMissing { epoch: 0 }` — an epoch that cannot exist — on every pass,
+    /// forever, on the one node state that is unambiguously correct. It is held as a BOOTSTRAP
+    /// record, so the provenance arm in `refresh` is the guard that fires.
+    ///
+    /// Written against the provenance arm rather than against an epoch-number arm deliberately. An
+    /// explicit `epoch <= GENESIS_EPOCH` guard was tried, sat in front of this one, and could never
+    /// fire; mutating it away left this test green, which is exactly what a masked guard looks like
+    /// and why it was removed rather than kept for reassurance.
+    #[test]
+    fn a_record_that_is_not_a_census_is_never_re_censused() {
+        let (store, dir) = seeded_store("genesis");
         let source = UnreachableSource::new();
 
         let outcome = catch_up(&source, &store, GENESIS_EPOCH);
 
-        assert_eq!(outcome.recorded, Vec::<CensusObservation>::new());
         assert_eq!(
             outcome.stopped, None,
-            "a current store stopped for a reason"
+            "genesis reported a stop: {outcome:?}"
         );
-        assert_eq!(
-            source.reads(),
-            0,
-            "a current store still performed a chain read"
-        );
+        assert_eq!(source.reads(), 0, "genesis was re-censused");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **History is computed exactly once; only the target is ever re-censused.**
+    ///
+    /// The bound that keeps the repair from multiplying a cold-start walk (dig-node#404) by every
+    /// pass. A store holding epochs 1..=3 with a target of 3 must attempt a census of 3 and of
+    /// nothing else — so the stop names 3, not 2, even though 2 is equally re-computable.
+    ///
+    /// The fixture varies the held epoch away from genesis deliberately: with the target at
+    /// genesis, "the target" and "the only epoch held" are the same number and a walk that
+    /// re-censused everything would be indistinguishable from one that re-censused the target.
+    #[test]
+    fn no_epoch_before_the_target_is_ever_re_censused() {
+        let (store, dir) = seeded_store("history-once");
+        for epoch in 2..=3u64 {
+            store
+                .put(&StoredRecord::censused(
+                    record_for(epoch),
+                    1_000 + epoch as u32,
+                ))
+                .expect("seed");
+        }
+        let source = UnreachableSource::new();
+
+        let outcome = catch_up(&source, &store, 3);
+
+        match outcome.stopped {
+            Some(CensusStop::ChainUnavailable { epoch, .. }) => assert_eq!(
+                epoch, 3,
+                "an epoch before the target was re-censused; the walk is no longer cheap"
+            ),
+            other => panic!("expected the target's refused read, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(dir);
     }

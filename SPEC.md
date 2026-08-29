@@ -7658,6 +7658,41 @@ it — including the amount of $DIG the operator posts — would follow. An iden
 with stronger provenance MAY be recorded, because the consensus figures do not move; the reverse
 MUST NOT be, because evidence does not weaken on re-offer.
 
+**Immutability MUST NOT seal an under-count this node produced itself.** Exactly one differing pair
+beyond §24.10's may supersede: a record this node censused MUST be replaced by a LATER census OF ITS
+OWN, of the same epoch, taken at the SAME census height, that counted strictly MORE stores. Both
+sides MUST carry `censused` provenance, and both census heights MUST be present and equal.
+
+The repair MUST NOT be able to move the price DOWN. Every counted figure in the incoming census --
+`stores`, `owners` and `locked` -- MUST be non-decreasing against the held record, and the derived
+`required_per_store` MUST be non-decreasing as well, compared DIRECTLY rather than inferred from
+those inputs. Constraining `stores` alone is not sufficient and MUST NOT be implemented: the
+requirement is derived from the multiplier and the OWNER count, so a record counting one more store
+while reporting fewer owners would satisfy a stores-only rule and still cut what every operator
+posts. A re-census failing any of these conditions MUST change nothing.
+
+Constraining the counted figures is likewise not sufficient, and the `required_per_store` clause
+MUST NOT be treated as redundant with them. The multiplier's volume signal is locked collateral
+DIVIDED BY the store count, so counting more stores LOWERS that signal and can drop saturation
+across a dead-band edge, stepping the multiplier down. A re-census with `owners` and `locked` EXACTLY
+EQUAL to the held record -- satisfying every counted clause, collapsing nothing -- can therefore
+still cut `required_per_store` by as much as 57.7%. Only the direct comparison of the derived figure
+refuses it.
+
+The direction is the whole of the rule, and it is bounded by an assumption that MUST be stated
+rather than assumed. A chain view that is merely DEGRADED can only omit coins, never invent them:
+reporting one more requires a real coin to have been posted, while dropping one requires only
+silence. Admitting only the upward direction therefore keeps a briefly-degraded read from becoming
+permanent without letting a degraded source talk the requirement down. This is NOT a claim that a
+census is unforgeable. Candidate coins are authenticated against their own self-consistency and not
+against consensus -- no header, no inclusion proof -- so a source that FABRICATES rather than
+miscounts is outside what this rule constrains, and is tracked as its own defect. Because a record
+may only ever be replaced by one counting strictly more stores, the relation remains a strict
+one-way ladder and no ordering over records has to be invented.
+
+This does NOT let a peer supersede anything: both sides must be `censused`, and §24.10's discipline
+stamps every record reachable from the network `adopted_from_peers`.
+
 A node MUST record the epoch-1 record at start-up if it holds none. It depends on nothing, so every
 node can produce it, and it is the base case that makes the recurrence well founded.
 
@@ -7708,7 +7743,7 @@ reason and its own remedy:
 | the census height is not yet buried to `CENSUS_FINALITY_DEPTH_BLOCKS` | wait |
 | the candidate population exceeds what can be authenticated | refused whole; never censused as a prefix |
 | the predecessor record is absent, unreadable, or names an unimplemented ruleset | that epoch first |
-| the store already holds a DIFFERENT record for the computed epoch | the held record stands |
+| the store already holds a DIFFERENT record for the computed epoch that the §24.8 repair does not admit | the held record stands |
 | the controller refused to derive the record from the census | its own reason, reported verbatim: the census is not the successor epoch, no activation row governs that epoch, or the version is unimplemented |
 | the record store could not be read or written | the state directory |
 | the store's own line for the computed epoch cannot be read | repair or remove that line |
@@ -7728,8 +7763,15 @@ call for opposite responses and only the first is a fact about the network, so f
 records a node MUST report the census's examined count and its per-rule exclusion counts alongside
 the recorded figure. Reporting the figure alone renders a broken instrument as an answer.
 
-Re-attempting MUST be cheap in the steady state: a node whose store already holds the target epoch
-performs **no chain read at all**.
+**A node MUST re-census the target epoch it already holds, and MUST NOT re-census any epoch before
+it.** The current epoch's record is the one still repairable under §24.8, and a walk that stopped
+looking the moment it had an answer is what made a single degraded read permanent. So the steady
+state costs one census of ONE epoch per pass. Every earlier epoch MUST be computed exactly once,
+which is what keeps a node catching up across many epochs from paying for the repair.
+
+A re-census that comes back SMALLER MUST be reported as the store conflict it is, never silently
+discarded: the node's stored answer and its current chain view disagree about a block that is
+already buried, and the higher held record stands.
 
 ### 24.9. Serving an epoch to a peer
 
@@ -7797,8 +7839,9 @@ Preferring its own computation is a requirement on the STORE, and it binds preci
 disagree. §24.9 makes a held record immutable so that no peer can walk a node off the network's
 history; that immutability MUST NOT also prevent a node correcting itself. A record held with
 `AdoptedFromPeers` provenance MUST be superseded by one this node censused for the same epoch, even
-when the two records differ. No other pair may supersede, and any other differing record remains a
-conflict.
+when the two records differ. The only other pair that may supersede is §24.8's repair of this node's
+own earlier census by a later one of its own counting strictly more stores at the same height; any
+other differing record remains a conflict.
 
 **What keeps a peer off the superseding side is a discipline, not a type.** `StoredRecord` carries
 its provenance as an ordinary deserialisable field, so a wire record naming `censused` decodes as
