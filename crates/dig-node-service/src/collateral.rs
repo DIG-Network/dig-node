@@ -315,9 +315,11 @@ fn own_census_supersedes(held: RecordProvenance, incoming: RecordProvenance) -> 
 ///   this compares two readings of ONE chain instant — where the true count is a fixed number and
 ///   "more" can only mean "less was missed". Two different heights are two different questions, and
 ///   a record claiming one remains a [`PutOutcome::Conflict`].
-/// * **Nothing else about the record is consulted.** The successor is re-derived by
-///   `EpochRecord::advance` from the same predecessor, so a higher store count is the only input
-///   that can differ and the derived figures follow from it.
+/// * **Every field the decision rests on is named here.** The predicate consults exactly six:
+///   both provenances, both census heights, `stores`, `owners`, `locked`, and
+///   `required_per_store_dig_base_units`. Nothing about the record is assumed to follow from
+///   another field — `owners` and `locked` can differ independently of `stores`, and the derived
+///   requirement can FALL as `stores` rises (see above), which is why each is compared directly.
 fn own_recensus_supersedes(held: &StoredRecord, incoming: &StoredRecord) -> bool {
     matches!(held.provenance, RecordProvenance::Censused)
         && matches!(incoming.provenance, RecordProvenance::Censused)
@@ -1322,7 +1324,7 @@ mod tests {
         let store = store_at(dir.path());
         let rec = record(9, 1_000_000, 1_000, 42);
 
-        let held = StoredRecord::censused(rec.clone(), 7_000);
+        let held = StoredRecord::censused(rec, 7_000);
         assert_eq!(store.put(&held).expect("put"), PutOutcome::Written);
 
         let identical = StoredRecord::censused(rec, 7_000);
