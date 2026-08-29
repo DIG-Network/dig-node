@@ -7666,6 +7666,45 @@ authoritative** — not by `control.collateral.requirement`, not by `dig.getColl
 into a verification. Every field of such a record parses, so nothing downstream would question its
 figures.
 
+### 24.8a. Producing a record: the census
+
+A record for an epoch after the first MUST be produced by counting the chain, and by nothing else.
+
+The node MUST obtain the three census inputs from `dig_mirror_coin::census`, at the height
+`dig_mirror_coin::census_height` derives for that epoch — the first transaction block at or after
+the epoch's start instant — and MUST derive the record with
+`dig_mirror_collateral::EpochRecord::advance`. It MUST NOT restate either. A census height chosen
+any other way is a fork, because every node must reach the same height without coordinating.
+
+The chain reads MUST be served through a `dig_chainsource_interface::ChainSource`. The node MUST NOT
+open a second connection to the chain for this purpose: it takes a `ChainSource` view of the one
+transport that already serves its wallet reads, so a node holds one peer pool with one notion of the
+peak.
+
+**The walk is sequential.** Epoch *n* is derived from epoch *n-1*, so the node computes each
+intervening epoch in order from the newest record it holds. It MUST NOT skip forward to the current
+epoch, and it MUST NOT derive a successor from a record whose `protocol_version` exceeds what the
+build implements — the ceiling of §24.8 applies at this boundary too.
+
+**A census that could not be taken MUST record nothing.** Each refusal is reported with its own
+reason and its own remedy:
+
+| the census stopped because | remedy |
+|---|---|
+| a chain read could not be answered | reach a chain source |
+| the chain has not yet reached the epoch's start | wait for a block |
+| the census height is not yet buried to `CENSUS_FINALITY_DEPTH_BLOCKS` | wait |
+| the candidate population exceeds what can be authenticated | refused whole; never censused as a prefix |
+| the predecessor record is absent, unreadable, or names an unimplemented ruleset | that epoch first |
+| the store already holds a DIFFERENT record for the computed epoch | the held record stands |
+
+None of these MUST EVER become a figure — not a zero, not a default, and not the neighbouring
+epoch's answer. The store's own absence then surfaces through §24.2's `unknown` with its reason,
+which is the only answer such a node can defend.
+
+Re-attempting MUST be cheap in the steady state: a node whose store already holds the target epoch
+performs **no chain read at all**.
+
 ### 24.9. Serving an epoch to a peer
 
 `dig.getCollateralEpoch` is an OPEN node method taking `{ epoch }` and returning `{ record }` or
