@@ -100,6 +100,13 @@ pub struct AppState {
     /// The shared self-signed cert the wallet mTLS listener presents (Sage byte-parity, node-class
     /// clients). Held so [`serve_with_shutdown`] can bring up that sibling listener.
     wallet_cert: SharedCert,
+    /// The node's ONE chain transport, shared with the wallet rather than built beside it.
+    ///
+    /// Held so the collateral census (#400) can take a
+    /// [`ChainSource`](dig_chainsource_interface::ChainSource) view of the same peer pool the
+    /// wallet's reads ride. Building a second one would give a live node two independent pools with
+    /// two notions of the peak — the defect dig_ecosystem#2761 removed.
+    wallet_chain: Arc<dig_wallet::sage::chain::ChainTransport>,
     /// The per-source INGRESS bound on OPEN, token-less `control.*` reads (dig_ecosystem#3051).
     ///
     /// The open reads present no credential, so before this existed an anonymous caller could
@@ -580,6 +587,7 @@ pub async fn build_state(config: &Config) -> AppState {
         )),
         wallet: wallet_service.backend,
         wallet_cert: wallet_service.cert,
+        wallet_chain: wallet_service.chain,
         control_ingress: Arc::new(dig_node_core::rate_limit::MissRateLimiter::new(
             CONTROL_INGRESS_BURST,
             CONTROL_INGRESS_REFILL_PER_SEC,
@@ -2107,6 +2115,18 @@ where
     // node in the network — a correct answer, and a permanently unchanging one.
     bring_up_collateral_records();
 
+    // The CENSUS half (#400). `bring_up_collateral_records` writes epoch 1, which is derivable
+    // from nothing; this is what lets the node record epoch n. It runs detached and on a timer
+    // because a census depends on the chain having moved: an epoch that has begun by the clock is
+    // not yet censusable until a block carries its start instant and the census height is buried.
+    //
+    // Gated on `enable_chain_sync` for the same reason the wallet's sync is: that flag already
+    // means "this node talks to the Chia network", and an integration harness sets it false
+    // precisely so nothing dials.
+    if config.enable_chain_sync {
+        spawn_collateral_census(state.wallet_chain.clone());
+    }
+
     // §14 autonomous sync (#213): bring up the L7 peer network — the connected peer
     // pool, the content-location DHT + P2P content engine, PEX, and the chain-watch +
     // generation gap-fill loop — so a running node tracks the chain and PROACTIVELY
@@ -2561,6 +2581,89 @@ fn bring_up_collateral_records() {
             Err(e) => tracing::warn!(error = %e, "could not apply the collateral retention policy"),
         }
     }
+}
+
+
+/// How often the census runner re-attempts a catch-up.
+///
+/// One mirror ROUND, taken from the schedule rather than written as a duration: the round is the
+/// grain the mirror model already moves on, and a retune of it should carry this with it. It is
+/// also comfortably shorter than the finality depth a `BehindFinalityDepth` stop waits out, so a
+/// node that was a few blocks early records the epoch on its next pass rather than at the next
+/// epoch.
+///
+/// Re-attempting costs nothing once a node is current: `catch_up` performs NO chain read when the
+/// store already holds the target epoch.
+const COLLATERAL_CENSUS_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(dig_constants::MIRROR_ROUND_LENGTH_MS as u64);
+
+/// Run the collateral census on a timer, against the node's own chain transport.
+///
+/// Detached and best-effort, exactly like the record bring-up above: a node that cannot census
+/// still serves content, and every outcome is logged rather than swallowed. **A failure records
+/// nothing** — `control.collateral.requirement` then answers `unknown` with its reason, which is
+/// the honest answer and the one this node can defend.
+///
+/// The provider's reads are synchronous, so each pass runs inside [`tokio::task::spawn_blocking`]
+/// and never occupies an async worker.
+fn spawn_collateral_census(chain: Arc<dig_wallet::sage::chain::ChainTransport>) {
+    use crate::collateral::{current_epoch_now, CurrentEpoch, EpochRecordStore};
+
+    tokio::spawn(async move {
+        loop {
+            // Read the epoch on EVERY pass, not once: this task outlives an epoch boundary, and a
+            // target captured at start-up would leave the node permanently one epoch behind from
+            // the moment the schedule rolled over.
+            let CurrentEpoch::Final(target) = current_epoch_now() else {
+                tokio::time::sleep(COLLATERAL_CENSUS_INTERVAL).await;
+                continue;
+            };
+
+            match chain.chain_source(tokio::runtime::Handle::current()).await {
+                Ok(source) => {
+                    let pass = tokio::task::spawn_blocking(move || {
+                        crate::collateral_census::catch_up(
+                            &source,
+                            &EpochRecordStore::in_state_dir(),
+                            target,
+                        )
+                    })
+                    .await;
+
+                    match pass {
+                        Ok(outcome) => {
+                            if !outcome.recorded.is_empty() {
+                                tracing::info!(
+                                    epochs = ?outcome.recorded,
+                                    "censused the collateral network and recorded the epoch(s)"
+                                );
+                            }
+                            if let Some(stop) = outcome.stopped {
+                                // WARN rather than ERROR: several stops — an epoch the chain has
+                                // not reached, a census height not yet buried — are ordinary
+                                // states whose remedy is to wait. The variant says which.
+                                tracing::warn!(
+                                    target_epoch = target,
+                                    reason = ?stop,
+                                    "the collateral census stopped short of the current epoch;                                      no record was written"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "the collateral census task did not complete"
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "no chain source for the collateral census; the requirement stays unknown"
+                ),
+            }
+
+            tokio::time::sleep(COLLATERAL_CENSUS_INTERVAL).await;
+        }
+    });
 }
 
 #[cfg(test)]

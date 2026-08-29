@@ -313,6 +313,18 @@ pub fn adopt(
             responders,
         };
     }
+    // THE COLLECTOR'S OBLIGATION, stated where the refusal is rather than where it would be
+    // discovered. This refusal is a BACKSTOP: it protects the threshold's meaning, and it protects
+    // it by refusing the whole sample. A collector that asked every peer it could reach and passed
+    // the lot in would therefore be denied adoption by any single extra identity answering once —
+    // the bound would be enforced against the honest node instead of the attacker.
+    //
+    // So whoever wires the requesting half MUST stop drawing at `sync_sample_plan(population)
+    // .sample_size` DISTINCT responders, chosen by this node. Truncating the responses here
+    // instead would keep a prefix of a set the attacker contributed to, which is exactly what
+    // `PopulationExceeded` above refuses to do. **No such collector exists yet** — as of this
+    // revision `dig.getCollateralEpoch` is served but never requested, so this paragraph is a
+    // contract for the wiring and not a description of one.
 
     // Verify, then tally by the FULL record. Two records that agree on the requirement but differ
     // anywhere else are different answers, and counting them together would let a disagreement

@@ -35,6 +35,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chia_protocol::SpendBundle;
+// Through `chia-query`'s own re-export rather than a second declaration of
+// `dig-chainsource-interface`: the provider descriptor must be the SAME type `chia-query` compiled
+// against, and a separately declared version could resolve to a different line of the crate and
+// fail to unify (§2.4b's split-family trap).
+use chia_query::provider_registry::interface::{ProviderId, ProviderInfo, ProviderKind};
 
 use super::fallback::{
     ChainFallback, ChainPeerTier, CoinsetFallback, FallbackCoin, FallbackCoinSpend,
@@ -166,6 +171,13 @@ pub trait SignedBundlePusher: Send + Sync {
     async fn push(&self, bundle: &SpendBundle) -> Result<PushOutcome>;
 }
 
+/// The stable identifier this node's chain source registers itself under.
+///
+/// Named once rather than written at the construction site: an identifier a registry orders and
+/// de-duplicates on is a contract with whatever reads it, and two spellings of it are two
+/// providers.
+pub const CHAIN_SOURCE_PROVIDER_ID: &str = "dig-node/chia-query";
+
 /// A shared, lazily-built `chia_query` client serving the wallet's chain reads and its push.
 ///
 /// Also the wallet's [`ChainFallback`] tier, so a balance, a coin read and a push all speak to ONE
@@ -238,6 +250,49 @@ impl ChainTransport {
     /// live wiring — is the one that dials, and every later caller gets that same client.
     pub(crate) async fn shared_client(&self) -> Result<Arc<chia_query::ChiaQuery>> {
         self.client().await
+    }
+
+    /// This transport's chain reads presented as the canonical
+    /// [`ChainSource`](chia_query::provider_registry::interface::ChainSource) — the trait every DIG consumer of
+    /// chain state depends on.
+    ///
+    /// It is a VIEW of the one shared client, never a second one. `chia-query` already implements
+    /// the trait ([`ChiaQueryProvider`]), so nothing here re-derives a chain read; building a
+    /// separate source for a new consumer is what gave a live node two independent peer pools with
+    /// two notions of the peak (dig_ecosystem#2761), and this method exists so the next consumer
+    /// cannot repeat it.
+    ///
+    /// `handle` MUST belong to a **multi-thread** tokio runtime: the returned provider is
+    /// synchronous and bridges each read with `run_blocking`, which fails closed with a clear
+    /// error on a current-thread runtime rather than deadlocking. An async caller must additionally
+    /// wrap each read in [`tokio::task::spawn_blocking`] so a blocking read never occupies an async
+    /// worker.
+    ///
+    /// # Errors
+    ///
+    /// The lazy client build — i.e. this node could not reach a chain at all. Not cached, so a
+    /// later call tries again.
+    pub async fn chain_source(
+        &self,
+        handle: tokio::runtime::Handle,
+    ) -> Result<chia_query::provider_registry::ChiaQueryProvider> {
+        let client = self.shared_client().await?;
+        Ok(chia_query::provider_registry::ChiaQueryProvider::new(
+            client,
+            handle,
+            ProviderInfo {
+                id: ProviderId(std::borrow::Cow::Borrowed(CHAIN_SOURCE_PROVIDER_ID)),
+                // `Custom` rather than `PublicOracle` or `LocalNode`, because the router behind it
+                // is neither: it races this node's own dialled Chia peers against the coinset.org
+                // tier, and which one answered is not knowable from here. Naming either would
+                // describe the source's trust posture more precisely than this node can observe.
+                kind: ProviderKind::Custom,
+                priority: 0,
+                // Answers are believed because the tier that produced them was believed, not
+                // because they carry a proof this node checked.
+                trustless: false,
+            },
+        ))
     }
 
     /// A transport that already HAS its client, so nothing in the test dials.
