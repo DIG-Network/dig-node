@@ -732,6 +732,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(foreign_dir);
     }
 
+    /// **The line an operator reads carries the exclusion counts, not just the figure.**
+    ///
+    /// Asserted on the RENDERED event rather than on the struct, because the struct being right is
+    /// not what an operator sees. The observation is a real one — produced by a census of a source
+    /// answering at the wrong puzzle hash — so the line under test is the one that would be written
+    /// on a node in exactly that state.
+    #[test]
+    fn the_recorded_epoch_is_logged_with_what_the_census_examined() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("the capture buffer").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let (store, dir) = seeded_store("logged");
+        let outcome = catch_up(
+            &PopulatedSource::holding(vec![record_at(chia_protocol::Bytes32::new([9u8; 32]))]),
+            &store,
+            2,
+        );
+        let [observed] = &outcome.recorded[..] else {
+            panic!("nothing was recorded to log: {outcome:?}")
+        };
+
+        let buffer = Captured(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            crate::server::log_census_observation(observed);
+        });
+
+        let line = String::from_utf8(buffer.0.lock().expect("the capture buffer").clone())
+            .expect("the rendered line is utf-8");
+        println!("{line}");
+
+        for field in [
+            "examined=1",
+            "excluded_foreign_puzzle=1",
+            "excluded_unreadable=0",
+            "stores=0",
+        ] {
+            assert!(
+                line.contains(field),
+                "the logged line does not carry {field}: {line}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// **A rotted line for the epoch being computed stops the walk BEFORE any chain read.**
     ///
     /// `records()` skips unparseable lines while `get()` reports them, so a line for epoch 2

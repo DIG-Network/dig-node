@@ -2583,6 +2583,41 @@ fn bring_up_collateral_records() {
     }
 }
 
+/// Report one recorded epoch, including what its census EXAMINED and why it excluded what it did.
+///
+/// # Why the exclusion counts are on the line and not only the figure
+///
+/// A `stores` of zero is produced identically by three situations with opposite remedies: an empty
+/// network, a source answering at a puzzle hash other than the one it was asked for
+/// (`excluded_foreign_puzzle`), and a source that could not supply its candidates' creating spends
+/// (`excluded_unreadable`). Only the first is a fact about the network; the other two are a broken
+/// instrument rendering a reassuring answer, on the path that decides how much collateral this node
+/// posts. `examined` alone separates "nothing was there" from "everything was dropped", and the
+/// per-rule counts say which rule dropped it.
+///
+/// A free function so the line an operator actually reads can be asserted against, rather than
+/// living only inside the timer loop where nothing can reach it.
+pub(crate) fn log_census_observation(observed: &crate::collateral_census::CensusObservation) {
+    tracing::info!(
+        epoch = observed.epoch,
+        census_height = observed.census_height,
+        stores = observed.stores,
+        examined = observed.examined,
+        excluded_foreign_puzzle = observed.excluded.foreign_puzzle,
+        excluded_unreadable = observed.excluded.unreadable,
+        excluded_unattributed = observed.excluded.unattributed,
+        excluded_wrong_epoch = observed.excluded.wrong_epoch,
+        excluded_not_yet_created = observed.excluded.not_yet_created,
+        excluded_spent_by_census_height = observed.excluded.spent_by_census_height,
+        excluded_undated = observed.excluded.undated,
+        excluded_block_reward = observed.excluded.block_reward,
+        excluded_below_requirement_unauthenticated =
+            observed.excluded.below_requirement_unauthenticated,
+        excluded_superseded = observed.excluded.superseded,
+        "censused the collateral network and recorded the epoch"
+    );
+}
+
 /// How often the census runner re-attempts a catch-up.
 ///
 /// One mirror ROUND, taken from the schedule rather than written as a duration: the round is the
@@ -2631,33 +2666,8 @@ fn spawn_collateral_census(chain: Arc<dig_wallet::sage::chain::ChainTransport>) 
 
                     match pass {
                         Ok(outcome) => {
-                            // One line per epoch, carrying what the census EXAMINED and why it
-                            // excluded what it excluded — not only the figure it arrived at. A
-                            // `stores = 0` is produced identically by an empty network, by a
-                            // source answering at the wrong puzzle hash, and by a degraded source
-                            // whose candidates' creating spends were all unavailable; those are
-                            // opposite situations on the path that decides what this node posts,
-                            // and only the exclusion counts separate them.
                             for observed in &outcome.recorded {
-                                tracing::info!(
-                                    epoch = observed.epoch,
-                                    census_height = observed.census_height,
-                                    stores = observed.stores,
-                                    examined = observed.examined,
-                                    excluded_foreign_puzzle = observed.excluded.foreign_puzzle,
-                                    excluded_unreadable = observed.excluded.unreadable,
-                                    excluded_unattributed = observed.excluded.unattributed,
-                                    excluded_wrong_epoch = observed.excluded.wrong_epoch,
-                                    excluded_not_yet_created = observed.excluded.not_yet_created,
-                                    excluded_spent_by_census_height =
-                                        observed.excluded.spent_by_census_height,
-                                    excluded_undated = observed.excluded.undated,
-                                    excluded_block_reward = observed.excluded.block_reward,
-                                    excluded_below_requirement_unauthenticated =
-                                        observed.excluded.below_requirement_unauthenticated,
-                                    excluded_superseded = observed.excluded.superseded,
-                                    "censused the collateral network and recorded the epoch"
-                                );
+                                log_census_observation(observed);
                             }
                             if let Some(stop) = outcome.stopped {
                                 // WARN rather than ERROR: several stops — an epoch the chain has
