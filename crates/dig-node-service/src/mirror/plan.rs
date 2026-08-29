@@ -127,7 +127,27 @@ impl MirrorPlan {
 /// one is needed, but choosing which of two valid bonds to destroy is a decision this function does
 /// not have the information to make, and destroying the wrong one costs a real advertisement. They
 /// stop being duplicates at the next rollover, when both are reclaimed as `EpochEnded`.
-pub fn plan(held: &[Bond], on_chain: &[HeldMirror], current_epoch: i64) -> MirrorPlan {
+///
+/// `in_flight` is the set of bonds whose CURRENT-epoch create has already been submitted and has not
+/// yet resolved — a `pending` or `submitted` mirror-coin entry in the audit record (`SPEC.md`
+/// §25.4.6). They are excluded from the create set, and only from it: an in-flight create says
+/// nothing about whether a DIFFERENT coin should be reclaimed, so passing a bond here can never
+/// withhold a reclaim.
+///
+/// The suppression is necessary because a create is not visible on chain until it confirms, and a
+/// pass that ran in that window would see the bond as uncovered and pay for a second coin. The
+/// chain and the disk remain the only STEADY-STATE truths; this is the in-flight ledger, and it is
+/// consulted for nothing else.
+///
+/// Suppressing is the fail-safe direction: a wrongly-suppressed create leaves money in the wallet
+/// and the node undiscoverable for one pass (§25.9), while a wrongly-permitted one locks a second
+/// epoch's collateral against a bond that already has a coin.
+pub fn plan(
+    held: &[Bond],
+    on_chain: &[HeldMirror],
+    current_epoch: i64,
+    in_flight: &[Bond],
+) -> MirrorPlan {
     let held_set: BTreeSet<&Bond> = held.iter().collect();
 
     let mut reclaim = Vec::new();
@@ -151,9 +171,11 @@ pub fn plan(held: &[Bond], on_chain: &[HeldMirror], current_epoch: i64) -> Mirro
         }
     }
 
+    let in_flight_set: BTreeSet<&Bond> = in_flight.iter().collect();
+
     let mut create: Vec<Bond> = held
         .iter()
-        .filter(|b| !covered.contains(*b))
+        .filter(|b| !covered.contains(*b) && !in_flight_set.contains(*b))
         .cloned()
         .collect();
 
@@ -174,7 +196,7 @@ pub struct FundingSplit {
     pub affordable: Vec<Bond>,
     /// The creates it cannot — what the node must report as uncollateralised.
     pub short: Vec<Bond>,
-    /// How much more $DIG, in CAT mojos, would cover [`Self::short`] entirely.
+    /// How many more DIG base units would cover [`Self::short`] entirely.
     pub shortfall_dig_base_units: u64,
 }
 
@@ -265,9 +287,15 @@ mod tests {
     /// happens to select, and passes for the wrong reason on most days.
     const NOW_EPOCH: i64 = 100;
 
+    /// The ordinary case: nothing submitted and awaiting confirmation.
+    ///
+    /// Named rather than written as a bare `&[]` at every call site so that a reader can tell the
+    /// "no creates are in flight" fixtures from the ones that deliberately exercise suppression.
+    const NOT_IN_FLIGHT: &[Bond] = &[];
+
     #[test]
     fn a_held_capsule_with_no_coin_is_created() {
-        let plan = plan(&[bond("aa", "11")], &[], NOW_EPOCH);
+        let plan = plan(&[bond("aa", "11")], &[], NOW_EPOCH, NOT_IN_FLIGHT);
         assert_eq!(plan.create, vec![bond("aa", "11")]);
         assert!(plan.reclaim.is_empty());
     }
@@ -278,6 +306,7 @@ mod tests {
             &[bond("aa", "11")],
             &[coin("c1", "aa", "11", NOW_EPOCH)],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
         assert!(plan.is_empty(), "steady state must be a no-op: {plan:?}");
     }
@@ -296,6 +325,7 @@ mod tests {
                 coin("c2", "bb", "22", NOW_EPOCH),
             ],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
 
         assert_eq!(
@@ -321,6 +351,7 @@ mod tests {
             &[bond("aa", "11")],
             &[coin("old", "aa", "11", NOW_EPOCH - 1)],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
 
         assert_eq!(
@@ -346,6 +377,7 @@ mod tests {
                 coin("new", "aa", "11", NOW_EPOCH),
             ],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
 
         assert_eq!(
@@ -372,6 +404,7 @@ mod tests {
                 coin("past", "aa", "11", NOW_EPOCH - 1),
             ],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
 
         assert_eq!(
@@ -394,6 +427,7 @@ mod tests {
             &[bond("aa", "11"), bond("aa", "22")],
             &[coin("c1", "aa", "11", NOW_EPOCH)],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
 
         assert_eq!(
@@ -416,6 +450,7 @@ mod tests {
             &[bond("aa", "22")],
             &[coin("c1", "aa", "11", NOW_EPOCH)],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
 
         assert_eq!(
@@ -436,6 +471,7 @@ mod tests {
                 coin("c2", "aa", "11", NOW_EPOCH),
             ],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
         assert!(held.is_empty(), "neither duplicate is destroyed while held");
 
@@ -446,6 +482,7 @@ mod tests {
                 coin("c2", "aa", "11", NOW_EPOCH),
             ],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
         assert_eq!(
             gone.reclaim.len(),
@@ -458,7 +495,7 @@ mod tests {
     /// saw both a legacy and a migrated artifact must not pay 40 $DIG for one advertisement.
     #[test]
     fn a_bond_listed_twice_on_disk_is_created_once() {
-        let plan = plan(&[bond("aa", "11"), bond("aa", "11")], &[], NOW_EPOCH);
+        let plan = plan(&[bond("aa", "11"), bond("aa", "11")], &[], NOW_EPOCH, NOT_IN_FLIGHT);
         assert_eq!(plan.create, vec![bond("aa", "11")]);
     }
 
@@ -468,11 +505,13 @@ mod tests {
             &[bond("aa", "11"), bond("bb", "22"), bond("cc", "33")],
             &[],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
         let reversed = plan(
             &[bond("cc", "33"), bond("bb", "22"), bond("aa", "11")],
             &[],
             NOW_EPOCH,
+            NOT_IN_FLIGHT,
         );
         assert_eq!(
             forward.create, reversed.create,
@@ -613,7 +652,7 @@ mod tests {
     /// advertise nor recover at zero balance, and that is what stranded the money.
     #[test]
     fn a_wallet_at_zero_still_reclaims_what_it_already_locked() {
-        let plan = plan(&[], &[coin("c1", "aa", "11", NOW_EPOCH)], NOW_EPOCH);
+        let plan = plan(&[], &[coin("c1", "aa", "11", NOW_EPOCH)], NOW_EPOCH, NOT_IN_FLIGHT);
         let split = split_by_funds(&plan.create, 0, PER_COIN);
 
         assert_eq!(
@@ -622,5 +661,82 @@ mod tests {
             "reclaim must not be gated on the balance"
         );
         assert!(split.affordable.is_empty());
+    }
+
+    /// A create already submitted and awaiting confirmation is not paid for twice.
+    ///
+    /// The window is real: a create is invisible on chain until it confirms, so a pass that ran
+    /// between submission and confirmation sees the bond as uncovered. The control is a SECOND held
+    /// bond with nothing in flight, which must still be created — without it, an implementation
+    /// that suppressed every create whenever anything was in flight passes identically, and that
+    /// implementation would stall collateralisation of the whole node behind one slow confirmation.
+    #[test]
+    fn a_bond_whose_create_is_in_flight_is_not_created_again() {
+        let plan = plan(
+            &[bond("aa", "11"), bond("bb", "22")],
+            &[],
+            NOW_EPOCH,
+            &[bond("aa", "11")],
+        );
+
+        assert_eq!(
+            plan.create,
+            vec![bond("bb", "22")],
+            "only the bond with a create in flight is suppressed"
+        );
+    }
+
+    /// In-flight suppression touches CREATES only. A bond whose create is in flight, whose capsule
+    /// has since gone, still has its EXISTING coin reclaimed.
+    ///
+    /// This is the assertion that keeps the suppression from becoming a way to withhold money: the
+    /// two coins are different coins, and a filter written over the plan rather than over the create
+    /// set would silently swallow the reclaim.
+    #[test]
+    fn an_in_flight_create_never_suppresses_a_reclaim() {
+        let plan = plan(
+            &[],
+            &[coin("c1", "aa", "11", NOW_EPOCH)],
+            NOW_EPOCH,
+            &[bond("aa", "11")],
+        );
+
+        assert_eq!(
+            plan.reclaim,
+            vec![(coin("c1", "aa", "11", NOW_EPOCH), ReclaimReason::NoLongerHeld)],
+            "a reclaim is never gated on an unrelated create being in flight"
+        );
+        assert!(plan.create.is_empty());
+    }
+
+    /// Suppression is keyed on the BOND, not on the store. Two roots of one store are two coins,
+    /// and a create in flight for one must not withhold the other.
+    ///
+    /// A store-keyed implementation passes every fixture above and fails only this one, which is
+    /// why it is here: the whole point of the per-root shape is that the two are funded separately.
+    #[test]
+    fn an_in_flight_create_for_one_root_does_not_suppress_another_root_of_the_same_store() {
+        let plan = plan(
+            &[bond("aa", "11"), bond("aa", "22")],
+            &[],
+            NOW_EPOCH,
+            &[bond("aa", "11")],
+        );
+
+        assert_eq!(plan.create, vec![bond("aa", "22")]);
+    }
+
+    /// A bond that is in flight AND already covered on chain is simply covered — suppression adds
+    /// nothing and removes nothing. Recorded because the two exclusions compose, and a reader
+    /// should not have to reason about whether one masks the other.
+    #[test]
+    fn a_covered_bond_that_is_also_in_flight_is_still_a_no_op() {
+        let plan = plan(
+            &[bond("aa", "11")],
+            &[coin("c1", "aa", "11", NOW_EPOCH)],
+            NOW_EPOCH,
+            &[bond("aa", "11")],
+        );
+        assert!(plan.is_empty());
     }
 }

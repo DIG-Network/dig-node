@@ -4886,6 +4886,57 @@ mod tests {
         "00".repeat(32)
     }
 
+    /// Opening the node's OWN operating wallet must NOT give the general wallet surface a signer.
+    ///
+    /// `crate::operator_wallet::OperatorWallet` exists so the mirror-coin lifecycle (dig-node#377)
+    /// can sign its own spends. It is deliberately a value the caller holds, never something
+    /// installed here — because installing it would activate every OTHER node-custodied spend path
+    /// at once, default-on auto-tipping included, as an invisible side effect of enabling
+    /// collateralisation. That is a behaviour change to a money path nobody reviewed.
+    ///
+    /// The fixture is built so the two halves are distinguishable. Asserting only that a fresh
+    /// backend has no signer proves nothing about `operator_wallet` — it is true of a backend
+    /// nothing has touched. So the wallet is genuinely opened first (asserted non-degenerate), and
+    /// the backend is then re-read; and the third assertion shows the backend CAN hold a signer, so
+    /// the `None` above is a fact about what was installed rather than about what is possible.
+    #[tokio::test]
+    async fn opening_the_operator_wallet_installs_no_signer_on_the_general_surface() {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+
+        let be = backend_with(vec![], true).await;
+        assert!(
+            be.current_signer().is_none(),
+            "baseline: a backend with nothing installed cannot sign"
+        );
+
+        let operator = crate::operator_wallet::OperatorWallet::from_phrase(
+            PHRASE,
+            Bytes32::from([7u8; 32]),
+        )
+        .expect("the operator wallet really does open");
+        assert_ne!(
+            operator.owner_puzzle_hash(),
+            Bytes32::default(),
+            "so the assertion below is about installation, not about a failed open"
+        );
+
+        assert!(
+            be.current_signer().is_none(),
+            "the operator wallet is held by its caller and installed on nothing"
+        );
+
+        let installed = backend_with(vec![], true)
+            .await
+            .with_signer(Arc::new(crate::sage::spend::WalletSigner::new(
+                vec![],
+                Bytes32::from([7u8; 32]),
+            )));
+        assert!(
+            installed.current_signer().is_some(),
+            "a backend CAN hold a signer, so the `None` above is a measurement and not a tautology"
+        );
+    }
+
     async fn backend_with(coins: Vec<CoinRow>, synced: bool) -> WalletBackend {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coins(&coins).await.unwrap();

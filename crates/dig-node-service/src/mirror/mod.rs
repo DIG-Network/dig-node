@@ -72,4 +72,5 @@
 
 pub mod plan;
 pub mod presence;
+pub mod signer;
 pub mod spends;

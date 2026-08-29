@@ -309,6 +309,30 @@ pub fn open_sealed_with_device_key(
     seed_store::decrypt_seed(sealed, device_key_hex)
 }
 
+/// Open the operator wallet's own mnemonic from `paths`, or `None` when it cannot be opened.
+///
+/// The one route by which anything outside this module obtains the operator phrase. It is deliberately
+/// narrow: it takes no key, mints nothing, and creates nothing. A missing seed, a missing or malformed
+/// device key ([`BootstrapState::Orphaned`]), and a seed that will not decrypt
+/// ([`BootstrapState::Locked`]) all collapse to `None` — a bring-up caller's only correct response to
+/// any of them is the same one, and distinguishing them here would tempt a caller into reporting which
+/// failure it hit, which is a statement about the machine's key state.
+///
+/// **`None` means "no operator wallet is available", never "there is no wallet".** A caller MUST report
+/// the capability as unavailable rather than degrade to some other key.
+///
+/// The phrase comes back in a [`Zeroizing`] wrapper and this function neither logs, formats, nor
+/// returns it in an error: the error type here is `Option` precisely so no failure path can carry a
+/// fragment of key material in a message.
+pub fn open_operator_phrase(paths: &WalletPaths) -> Option<Zeroizing<String>> {
+    // `allow_create: false` is load-bearing. Minting a device key beside an existing seed produces a
+    // key that cannot open it; a READ path must never take that branch, and the bootstrap
+    // ([`ensure_wallet`]) is the only caller entitled to.
+    let key = load_device_key(&paths.device_key, false).ok()?;
+    let sealed = fs::read(&paths.seed).ok()?;
+    open_sealed_with_device_key(&sealed, &key.hex()).ok()
+}
+
 /// Read the sidecar, or `None` when it is absent, unreadable or unparsable.
 ///
 /// Callers must treat `None` as "not disposable" rather than as "auto" — an existing seed with no

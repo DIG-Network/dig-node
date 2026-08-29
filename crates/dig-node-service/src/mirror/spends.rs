@@ -141,3 +141,17 @@ pub fn build_reclaim(
         spends,
     })
 }
+
+/// An empty [`MirrorSpends`] for tests that exercise the SIGNER rather than the builders.
+///
+/// `#[cfg(test)]` so it cannot become a production constructor — the no-public-constructor property
+/// is the whole authority bound, and a test seam that widened it would quietly remove the thing this
+/// module exists to guarantee. It carries [`MirrorOperation::Create`] because a `MirrorSpends` always
+/// names an operation; the operation is irrelevant to an empty spend set.
+#[cfg(test)]
+pub(crate) fn empty_for_tests() -> MirrorSpends {
+    MirrorSpends {
+        operation: MirrorOperation::Create,
+        spends: Vec::new(),
+    }
+}
