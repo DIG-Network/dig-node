@@ -1589,7 +1589,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 
 | Method | Params | Result (essentials) |
 |---|---|---|
-| `control.status` | — | `running`, `service`, `version`, `commit`, `protocol`, `uptime_secs`, `addr`, `upstream`, `cache`, `hosted_store_count`, `cached_capsule_count`, `pinned_store_count`, `sync.available` |
+| `control.status` | — | `running`, `service`, `version`, `commit`, `protocol`, `uptime_secs`, `addr`, `upstream`, `cache`, `hosted_store_count`, `cached_capsule_count`, `pinned_store_count`, `sync.available`, `logging` (`initialized`, `dir`, `file_logging`, `file_error` — a START-UP verdict; see §20.1) |
 | `control.config.get` | — | `addr`, `port`, `upstream`, `upstream_override`, `cache_dir`, `cache_shared`, `config_path`, `sync_available` |
 | `control.config.setUpstream` | `upstream` (URL string; blank clears) | `upstream` (normalized), `requires_restart: true` — persisted, effective on next start (§3.4) |
 | `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
@@ -6702,7 +6702,20 @@ returned guard for the process lifetime:
 
 A one-shot CLI command (`status`, `pair`, `config`, …) does NOT install the subscriber: it neither
 needs a rolling log file nor the maintenance thread. Installation is best-effort — a logging failure
-(unwritable dir, subscriber already set) is reported on stderr and MUST NOT stop the node serving.
+(subscriber already set) is reported on stderr and MUST NOT stop the node serving.
+
+An UNWRITABLE log directory MUST NOT cost the console sink. `dig-logging` 0.2.0 degrades to
+console-only logging and reports the reason via `LogGuard::file_error()`; the node MUST keep serving
+and MUST report that condition on `control.status` (`logging.file_logging: false` plus
+`logging.file_error`).
+
+`logging.file_logging` is a START-UP verdict, not a live one. `dig-logging` 0.2.0 determines file-sink
+health ONCE, while installing the subscriber, and exposes no way to revise it afterwards, so
+`control.status` MUST report it as of logger initialization: `logging.file_logging: true` asserts only
+that the rolling JSONL sink OPENED SUCCESSFULLY at start-up, and `logging.file_error` names the reason
+it did not. A sink failure that occurs AFTER initialization — the log directory deleted, the volume
+filled, a rotation failure — is NOT detected, and the node MUST NOT be read as claiming otherwise.
+Live file-sink health becomes reportable only once `dig-logging` can revise `file_error` after init.
 
 The log directory follows `dig-logging` SPEC §3: the machine root `<…>/DigNetwork/logs/dig-node`
 (`C:\ProgramData\DigNetwork\logs\dig-node`, `/Library/Logs/DigNetwork/dig-node`,
