@@ -1078,7 +1078,10 @@ mod tests {
             owners: 1_100,
             locked: 0,
         };
-        let from_undercount = degraded.record.advance(next).expect("advance the undercount");
+        let from_undercount = degraded
+            .record
+            .advance(next)
+            .expect("advance the undercount");
         let from_repair = healthy.record.advance(next).expect("advance the repair");
         assert_ne!(
             from_undercount.required_per_store_dig_base_units,

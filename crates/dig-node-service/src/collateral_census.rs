@@ -760,7 +760,10 @@ mod tests {
 
         let outcome = catch_up(&source, &store, GENESIS_EPOCH);
 
-        assert_eq!(outcome.stopped, None, "genesis reported a stop: {outcome:?}");
+        assert_eq!(
+            outcome.stopped, None,
+            "genesis reported a stop: {outcome:?}"
+        );
         assert_eq!(source.reads(), 0, "genesis was re-censused");
 
         let _ = std::fs::remove_dir_all(dir);
@@ -780,7 +783,10 @@ mod tests {
         let (store, dir) = seeded_store("history-once");
         for epoch in 2..=3u64 {
             store
-                .put(&StoredRecord::censused(record_for(epoch), 1_000 + epoch as u32))
+                .put(&StoredRecord::censused(
+                    record_for(epoch),
+                    1_000 + epoch as u32,
+                ))
                 .expect("seed");
         }
         let source = UnreachableSource::new();

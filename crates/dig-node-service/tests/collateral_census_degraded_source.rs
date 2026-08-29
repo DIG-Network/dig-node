@@ -36,14 +36,16 @@ mod support;
 
 use std::collections::HashMap;
 
-use chia_protocol::{Bytes32, Coin, CoinSpend};
+use chia_protocol::{Bytes32, CoinSpend};
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_mirror_collateral::{EpochRecord, CENSUS_FINALITY_DEPTH_BLOCKS};
 use dig_node_service::collateral::{EpochRecordStore, StoredEpoch, StoredRecord};
 use dig_node_service::collateral_census::catch_up;
 use num_bigint::BigInt;
-use support::{creating_spend_of_amount, declared_memos, mirror_hint_for, root_1, root_2, store_a,
-    store_b, wallet, Wallet};
+use support::{
+    creating_spend_of_amount, declared_memos, mirror_hint_for, root_1, root_2, store_a, store_b,
+    wallet, Wallet,
+};
 
 /// The epoch the coins are published for, and the epoch the seeded record describes.
 ///
