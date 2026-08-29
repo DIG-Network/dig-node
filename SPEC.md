@@ -7671,6 +7671,14 @@ requirement is derived from the multiplier and the OWNER count, so a record coun
 while reporting fewer owners would satisfy a stores-only rule and still cut what every operator
 posts. A re-census failing any of these conditions MUST change nothing.
 
+Constraining the counted figures is likewise not sufficient, and the `required_per_store` clause
+MUST NOT be treated as redundant with them. The multiplier's volume signal is locked collateral
+DIVIDED BY the store count, so counting more stores LOWERS that signal and can drop saturation
+across a dead-band edge, stepping the multiplier down. A re-census with `owners` and `locked` EXACTLY
+EQUAL to the held record -- satisfying every counted clause, collapsing nothing -- can therefore
+still cut `required_per_store` by as much as 57.7%. Only the direct comparison of the derived figure
+refuses it.
+
 The direction is the whole of the rule, and it is bounded by an assumption that MUST be stated
 rather than assumed. A chain view that is merely DEGRADED can only omit coins, never invent them:
 reporting one more requires a real coin to have been posted, while dropping one requires only

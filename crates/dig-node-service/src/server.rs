@@ -2679,7 +2679,7 @@ fn spawn_collateral_census(chain: Arc<dig_wallet::sage::chain::ChainTransport>) 
                                     epoch = repaired.epoch,
                                     census_height = repaired.census_height,
                                     stores = repaired.stores,
-                                    "a re-census of the current epoch counted MORE stores than the                                      record this node held; the earlier, lower answer was superseded"
+                                    "a re-census of the current epoch counted MORE stores than the record this node held; the earlier, lower answer was superseded"
                                 );
                                 log_census_observation(repaired);
                             }

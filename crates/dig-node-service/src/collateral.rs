@@ -266,10 +266,11 @@ fn own_census_supersedes(held: RecordProvenance, incoming: RecordProvenance) -> 
 ///
 /// A census counts coins that pay the shared mirror puzzle hash and whose creating spend
 /// authenticates them as $DIG collateral for this epoch at or above the requirement. **A source
-/// cannot manufacture such a coin by MISCOUNTING**: to raise this node’s count by one, a source must report
-/// the collateral on chain, which is the behaviour the model exists to pay for. Omitting one, by
-/// contrast, is free — a source need only stay quiet. Of the two directions a re-census can move,
-/// exactly one is unforgeable, and it is the one this predicate admits.
+/// cannot manufacture such a coin by MISCOUNTING**: to raise this node’s count by one, someone must
+/// have POSTED that collateral on chain, which is the behaviour the model exists to pay for.
+/// Omitting one, by contrast, is free — a source need only stay quiet. Of the two directions a
+/// re-census can move, exactly one costs money to the source that miscounts, and it is the one this
+/// predicate admits.
 ///
 /// That argument holds only for a source that MISCOUNTS. It is not a claim that a census cannot
 /// be FABRICATED: `dig-mirror-coin` authenticates a candidate coin against the coin's own
@@ -289,6 +290,15 @@ fn own_census_supersedes(held: RecordProvenance, incoming: RecordProvenance) -> 
 /// inferred from them: the multiplier is a function of saturation signals, so "price rises with
 /// the inputs" is an arithmetic property of `dig-mirror-collateral` that this module must not
 /// assume and could not detect losing.
+///
+/// That property is not merely unproven — it is FALSE, and the direct comparison is the only thing
+/// standing between this repair and the cut it would otherwise admit. The multiplier's volume
+/// signal divides locked collateral BY the store count, so counting more stores LOWERS that signal
+/// and can drop saturation across a dead-band edge, stepping the multiplier down. With `owners` and
+/// `locked` held exactly EQUAL — every counted clause satisfied, no owner collapse anywhere — the
+/// requirement still falls by up to 57.7% (dig-node#406 gate round 3, measured). The
+/// `required_per_store` clause is therefore load-bearing on its own and MUST NOT be removed as
+/// redundant with the counted ones.
 ///
 /// With `stores` strictly increasing the relation stays a strict, one-way ladder rather than a
 /// total order over records — a record can only ever be replaced by one counting strictly more, so
@@ -1117,7 +1127,7 @@ mod tests {
         assert_ne!(
             from_undercount.required_per_store_dig_base_units,
             from_repair.required_per_store_dig_base_units,
-            "a sealed under-count must be shown to change what the next epoch charges, or this              test pins a bookkeeping change with no consequence"
+            "a sealed under-count must be shown to change what the next epoch charges, or this test pins a bookkeeping change with no consequence"
         );
     }
 
@@ -1198,7 +1208,7 @@ mod tests {
         // The fixture must exhibit the hazard, or this test proves nothing about the guard.
         assert!(
             incoming_rec.census.stores > held_rec.census.stores,
-            "the incoming record must clear the stores-only ladder, or the old predicate would               have refused it for the wrong reason"
+            "the incoming record must clear the stores-only ladder, or the old predicate would have refused it for the wrong reason"
         );
         assert!(
             incoming_rec.required_per_store_dig_base_units
@@ -1217,7 +1227,7 @@ mod tests {
         assert_ne!(
             store.put(&incoming).expect("put"),
             PutOutcome::Written,
-            "a re-census that cuts the requirement must never be written, however many stores it               counts"
+            "a re-census that cuts the requirement must never be written, however many stores it counts"
         );
         match store.get(held.record.epoch) {
             StoredEpoch::Found(rec) => assert_eq!(
@@ -1226,6 +1236,149 @@ mod tests {
                 "the served requirement must still be the higher one"
             ),
             other => panic!("the held record must survive, got {other:?}"),
+        }
+    }
+
+    /// **The DIRECT price comparison is load-bearing on its own**, and this is the only test that
+    /// witnesses it.
+    ///
+    /// Every other fixture here that cuts the requirement does so by collapsing `owners`, so the
+    /// `owners >=` clause refuses it first and the `required_per_store >=` clause is never reached
+    /// — deleting that clause changes nothing anywhere else in this suite. It is nonetheless the
+    /// sole defence against a real cut: the multiplier's volume signal divides locked collateral BY
+    /// the store count, so counting MORE stores lowers that signal and can drop saturation across a
+    /// dead-band edge, stepping the multiplier down.
+    ///
+    /// This fixture holds `owners` and `locked` EXACTLY equal — all three counted clauses pass with
+    /// nothing collapsed — and still cuts the requirement. It therefore fails if, and only if, the
+    /// direct comparison is removed.
+    #[test]
+    fn a_re_census_that_cuts_the_price_with_every_counted_figure_intact_is_refused() {
+        let seed = EpochRecord::bootstrap();
+        let advance = |stores| {
+            seed.advance(EpochCensus {
+                epoch: seed.epoch + 1,
+                stores,
+                owners: 0,
+                locked: 141_000,
+            })
+            .expect("advance")
+        };
+
+        let held_rec = advance(100);
+        let incoming_rec = advance(101);
+
+        // The fixture must exhibit the hazard through the volume channel alone, or this test
+        // proves nothing about the clause it exists to pin.
+        assert!(incoming_rec.census.stores > held_rec.census.stores);
+        assert_eq!(
+            (incoming_rec.census.owners, incoming_rec.census.locked),
+            (held_rec.census.owners, held_rec.census.locked),
+            "no counted figure may differ, or a counted clause would refuse this for us"
+        );
+        assert!(
+            incoming_rec.required_per_store_dig_base_units
+                < held_rec.required_per_store_dig_base_units,
+            "the fixture must actually cut the price: held {} vs incoming {}",
+            held_rec.required_per_store_dig_base_units,
+            incoming_rec.required_per_store_dig_base_units
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        let held = StoredRecord::censused(held_rec, 7_000);
+        assert_eq!(store.put(&held).expect("put"), PutOutcome::Written);
+
+        let incoming = StoredRecord::censused(incoming_rec, 7_000);
+        assert_ne!(
+            store.put(&incoming).expect("put"),
+            PutOutcome::Written,
+            "a re-census cutting the price through the volume signal must never be written"
+        );
+        match store.get(held.record.epoch) {
+            StoredEpoch::Found(rec) => assert_eq!(
+                rec.record.required_per_store_dig_base_units,
+                held.record.required_per_store_dig_base_units,
+                "the served requirement must still be the higher one"
+            ),
+            other => panic!("the held record must survive, got {other:?}"),
+        }
+    }
+
+    /// **`stores >` must stay STRICT**, and an identical re-census is the case that shows why.
+    ///
+    /// The older strictness test varies `owners`, so the `owners >=` clause now refuses its fixture
+    /// first and it passes under either operator — the guard was masked by a later one. Equality on
+    /// every field cannot be masked: under `>=` all four clauses hold, `own_recensus_supersedes`
+    /// returns true, `put`'s first arm fires and `append` runs unconditionally. The census timer
+    /// runs every `MIRROR_ROUND_LENGTH_MS`, so that is one duplicate line appended to the epoch
+    /// record file every round, forever — unbounded growth of a file whose unreadability is a hard
+    /// error.
+    ///
+    /// The line count is asserted rather than the outcome alone, because the growth IS the defect.
+    #[test]
+    fn an_identical_re_census_must_not_append_a_second_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        let rec = record(9, 1_000_000, 1_000, 42);
+
+        let held = StoredRecord::censused(rec.clone(), 7_000);
+        assert_eq!(store.put(&held).expect("put"), PutOutcome::Written);
+
+        let identical = StoredRecord::censused(rec, 7_000);
+        assert_eq!(
+            store.put(&identical).expect("put"),
+            PutOutcome::AlreadyPresent,
+            "a re-census that found exactly what was held has nothing to supersede"
+        );
+
+        let lines = std::fs::read_to_string(dir.path().join(EPOCH_RECORD_FILE))
+            .expect("read")
+            .lines()
+            .count();
+        assert_eq!(
+            lines, 1,
+            "an identical re-census must append nothing; repeated every census round this is \
+             unbounded growth"
+        );
+    }
+
+    /// **`locked >=` is witnessed here and nowhere else.**
+    ///
+    /// `locked` is a reading of the same block by the same source, and omitting locked collateral
+    /// is exactly as free as omitting a store. No other fixture in this module varies it — the
+    /// `record` helper inherits the bootstrap value, so every other comparison is `0 >= 0`.
+    ///
+    /// The two records differ ONLY in that `stores` rises while `locked` falls. Every other clause
+    /// passes, the derived requirement is unchanged, and the refusal can therefore come from
+    /// nothing but the `locked` clause.
+    #[test]
+    fn a_re_census_reporting_less_locked_collateral_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+
+        let mut held_rec = record(9, 1_000_000, 1_000, 42);
+        held_rec.census.locked = 9_000;
+        let mut incoming_rec = record(9, 1_000_000, 1_000, 43);
+        incoming_rec.census.locked = 8_000;
+
+        // Only `locked` moves the wrong way: stores rise, owners are equal, and the price the
+        // operator pays is identical. Any other difference would let a different clause refuse it.
+        assert!(incoming_rec.census.stores > held_rec.census.stores);
+        assert_eq!(incoming_rec.census.owners, held_rec.census.owners);
+        assert_eq!(
+            incoming_rec.required_per_store_dig_base_units,
+            held_rec.required_per_store_dig_base_units
+        );
+        assert!(incoming_rec.census.locked < held_rec.census.locked);
+
+        let held = StoredRecord::censused(held_rec, 7_000);
+        assert_eq!(store.put(&held).expect("put"), PutOutcome::Written);
+
+        let incoming = StoredRecord::censused(incoming_rec, 7_000);
+        match store.put(&incoming).expect("put") {
+            PutOutcome::Conflict { held: kept } => assert_eq!(kept.record, held.record),
+            other => panic!("a re-census reporting less locked collateral must be refused, got {other:?}"),
         }
     }
 
