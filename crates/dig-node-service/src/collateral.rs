@@ -1378,7 +1378,9 @@ mod tests {
         let incoming = StoredRecord::censused(incoming_rec, 7_000);
         match store.put(&incoming).expect("put") {
             PutOutcome::Conflict { held: kept } => assert_eq!(kept.record, held.record),
-            other => panic!("a re-census reporting less locked collateral must be refused, got {other:?}"),
+            other => panic!(
+                "a re-census reporting less locked collateral must be refused, got {other:?}"
+            ),
         }
     }
 
