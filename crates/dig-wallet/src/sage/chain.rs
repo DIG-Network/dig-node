@@ -282,10 +282,23 @@ impl ChainTransport {
             handle,
             ProviderInfo {
                 id: ProviderId(std::borrow::Cow::Borrowed(CHAIN_SOURCE_PROVIDER_ID)),
-                // `Custom` rather than `PublicOracle` or `LocalNode`, because the router behind it
-                // is neither: it races this node's own dialled Chia peers against the coinset.org
-                // tier, and which one answered is not knowable from here. Naming either would
-                // describe the source's trust posture more precisely than this node can observe.
+                // `Custom` rather than `LocalNode`, because the router behind it is not this
+                // node's peers: with `coinset_fallback_enabled` — the default every production
+                // fabric is built from — it asks `api.coinset.org` FIRST and consults the peers
+                // this node dialled only when that read fails. It is not a race, and the peers do
+                // not corroborate the answer.
+                //
+                // So this provider's ANSWERS are the oracle's whenever the oracle is reachable,
+                // and a peer-tracked value with no agreement step when it is not. It belongs to
+                // the oracle's independence group for exactly that reason
+                // (`super::sources::independence_group_for`, which derives the group from what a
+                // fabric can REACH after registering one as its own group made a 2-of-2
+                // independent-group custody quorum satisfiable by a single HTTPS endpoint —
+                // measured on a client holding no peers at all).
+                //
+                // Nothing registers this provider in a `ProviderRegistry` today. Anything that
+                // does MUST take its group from `ChiaQueryProvider::independence_group()` rather
+                // than from this `kind`, or it repeats that incident.
                 kind: ProviderKind::Custom,
                 priority: 0,
                 // Answers are believed because the tier that produced them was believed, not
@@ -339,7 +352,15 @@ impl ChainTransport {
     ///
     /// A transport with no peer reads — a bare one built by a test — still falls through to the
     /// router. That path is the oracle-first one, and it is documented as such rather than
-    /// silently retained: nothing in production takes it.
+    /// silently retained: no WALLET read in production takes it.
+    ///
+    /// The router's peak IS taken in production elsewhere, and by exactly one caller: the
+    /// collateral census reads through [`Self::chain_source`], which hands `ChiaQueryProvider`
+    /// straight to the router (dig-node#400). Its peak is therefore the oracle-first one described
+    /// above — uncorroborated — and it gates that path's reorg-finality check. Extending the
+    /// corroborated reads to cover the census's population read is tracked as a sequencing
+    /// constraint against the mirror-coin mint; until it lands, no surface may describe the
+    /// census's peak as agreed across this node's peers.
     pub async fn peak_height(&self) -> Result<Option<u32>> {
         if let Some(peers) = &self.peer_reads {
             return Ok(peers.peak_height().await);

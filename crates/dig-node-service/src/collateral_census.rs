@@ -22,6 +22,15 @@
 //! could not look" into a number that reads exactly like one it did look up. The store's own
 //! absence then surfaces as `unknown` with its reason, which is the honest answer.
 //!
+//! # A census that counted nothing says what it examined
+//!
+//! A stop is not the only ambiguous outcome. A census that SUCCEEDS and counts zero stores is
+//! produced identically by an empty network, by a source answering at the wrong puzzle hash, and by
+//! a degraded source whose candidates' creating spends were all unavailable — three situations with
+//! opposite remedies, on the path that decides how much collateral this node posts. The walk
+//! therefore carries [`CensusObservation`] out for every epoch it records, so the node reports what
+//! was examined and why candidates were excluded, and not only the figure it arrived at.
+//!
 //! # The walk is sequential because the model is
 //!
 //! Epoch *n*'s record is derived from epoch *n-1*'s, so a node cannot skip forward to the current
@@ -30,7 +39,7 @@
 //! already agrees on, and arrives at the same records as a node that never stopped.
 
 use dig_chainsource_interface::ChainSource;
-use dig_mirror_coin::{census, census_height, CensusOutcome, MirrorError};
+use dig_mirror_coin::{census, census_height, CensusOutcome, Exclusions, MirrorError};
 
 use crate::collateral::{EpochRecordStore, PutOutcome, StoredEpoch, StoredRecord, GENESIS_EPOCH};
 
@@ -139,14 +148,60 @@ pub enum CensusStop {
         /// The underlying I/O error.
         detail: String,
     },
+
+    /// The store already holds a line for the epoch being computed, and that line cannot be read.
+    ///
+    /// Distinct from [`Self::Store`], which is an I/O fault, and from [`Self::Contradiction`],
+    /// which is a readable disagreement — this is one rotted line, and its remedy is to repair or
+    /// remove that line.
+    ///
+    /// It is checked BEFORE any chain read, and it is the reason the walk is not silent here.
+    /// [`EpochRecordStore::records`] SKIPS unparseable lines while
+    /// [`EpochRecordStore::get`] reports them, so a line for epoch *n* truncated by a crash or a
+    /// full disk leaves `highest_recorded` answering *n-1*. Without this check the walk would
+    /// recompute *n* — a whole population read and its spend executions — and then fail at `put`,
+    /// on every timer tick, forever, advancing nothing and reporting only a generic store fault.
+    EpochLineUnreadable {
+        /// The epoch whose stored line cannot be read.
+        epoch: u64,
+    },
+}
+
+/// What one epoch's census found, beyond the figures that went into its record.
+///
+/// # Why a count of nothing is not self-explanatory
+///
+/// `stores: 0` has at least three causes that call for opposite responses: the network is
+/// genuinely empty; the source answered at the WRONG puzzle hash (`foreign_puzzle`); or every
+/// candidate's creating spend was unavailable, so a DEGRADED source described a smaller network
+/// than exists (`unreadable`). The record alone cannot tell them apart, and this is the path that
+/// decides how much collateral a node posts — so the census's own account of what it examined and
+/// why candidates were dropped is carried out of the walk and reported, rather than discarded at
+/// the point the record is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CensusObservation {
+    /// The epoch that was censused and recorded.
+    pub epoch: u64,
+    /// The height it was censused at.
+    pub census_height: u32,
+    /// The qualifying advertisement count the record was derived from.
+    pub stores: u64,
+    /// How many candidate coins at the shared mirror puzzle hash were examined to reach it.
+    ///
+    /// A [`CensusOutcome::Final`] examines the WHOLE population, never a prefix, so
+    /// `examined == 0` is the one reading that means the network is empty.
+    pub examined: usize,
+    /// Why the examined candidates that did not qualify did not qualify.
+    pub excluded: Exclusions,
 }
 
 /// What one catch-up did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatchUp {
-    /// The epochs newly recorded, in ascending order. Empty is the ordinary steady state: a node
-    /// already current has nothing to compute and performs no chain read at all.
-    pub recorded: Vec<u64>,
+    /// What each newly recorded epoch's census found, in ascending epoch order. Empty is the
+    /// ordinary steady state: a node already current has nothing to compute and performs no chain
+    /// read at all.
+    pub recorded: Vec<CensusObservation>,
     /// Why the walk stopped short of the target, or `None` when it reached it.
     pub stopped: Option<CensusStop>,
 }
@@ -184,7 +239,7 @@ pub fn catch_up<S: ChainSource>(
 
     for epoch in (highest + 1)..=target_epoch {
         match record_one(source, store, epoch) {
-            Ok(()) => recorded.push(epoch),
+            Ok(observed) => recorded.push(observed),
             Err(stopped) => {
                 return CatchUp {
                     recorded,
@@ -218,7 +273,14 @@ fn record_one<S: ChainSource>(
     source: &S,
     store: &EpochRecordStore,
     epoch: u64,
-) -> Result<(), CensusStop> {
+) -> Result<CensusObservation, CensusStop> {
+    // Before any chain read: a rotted line for THIS epoch is invisible to `highest_recorded` and
+    // would otherwise cost a full census per timer tick, forever, to reach a `put` that cannot
+    // succeed. See `CensusStop::EpochLineUnreadable`.
+    if matches!(store.get(epoch), StoredEpoch::Unreadable) {
+        return Err(CensusStop::EpochLineUnreadable { epoch });
+    }
+
     let prior = prior_record(store, epoch)?;
 
     let at = match census_height(source, epoch_start_unix_secs(epoch)) {
@@ -269,8 +331,15 @@ fn record_one<S: ChainSource>(
     // `censused`, with the height the census was actually taken at — the two facts that make this
     // record auditable and distinguish it from one adopted from peers.
     let stored = StoredRecord::censused(record, counted.height());
+    let observed = CensusObservation {
+        epoch,
+        census_height: counted.height(),
+        stores: record.census.stores,
+        examined: counted.examined(),
+        excluded: counted.excluded(),
+    };
     match store.put(&stored) {
-        Ok(PutOutcome::Written | PutOutcome::AlreadyPresent) => Ok(()),
+        Ok(PutOutcome::Written | PutOutcome::AlreadyPresent) => Ok(observed),
         Ok(PutOutcome::Conflict { .. }) => Err(CensusStop::Contradiction { epoch }),
         Err(e) => Err(CensusStop::Store {
             detail: e.to_string(),
@@ -405,6 +474,85 @@ mod tests {
         }
     }
 
+    /// A source that answers a chain, at a peak far past finality, holding exactly the coin records
+    /// it was built with.
+    ///
+    /// Every height carries a timestamp at or after epoch 2's start, so `census_height` settles on
+    /// height 0 without the fixture having to model a block schedule — the height is not what these
+    /// tests are about.
+    struct PopulatedSource {
+        records: Vec<CoinRecord>,
+    }
+
+    impl PopulatedSource {
+        fn holding(records: Vec<CoinRecord>) -> Self {
+            Self { records }
+        }
+    }
+
+    impl ChainSource for PopulatedSource {
+        type Error = String;
+
+        fn coin_record(
+            &self,
+            _coin_id: chia_protocol::Bytes32,
+        ) -> Result<Option<CoinRecord>, Self::Error> {
+            Ok(None)
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: chia_protocol::Bytes32,
+            _include_spent: bool,
+        ) -> Result<Vec<CoinRecord>, Self::Error> {
+            Ok(self.records.clone())
+        }
+
+        fn coin_records_by_parent(
+            &self,
+            _parent_coin_id: chia_protocol::Bytes32,
+        ) -> Result<Vec<CoinRecord>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn coin_spend(
+            &self,
+            _coin_id: chia_protocol::Bytes32,
+        ) -> Result<Option<chia_protocol::CoinSpend>, Self::Error> {
+            Ok(None)
+        }
+
+        fn resolve_singleton_lineage(
+            &self,
+            _launcher_id: chia_protocol::Bytes32,
+        ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error> {
+            Ok(None)
+        }
+
+        fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+            Ok(Some(10_000))
+        }
+
+        fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+            Ok(Some(epoch_start_unix_secs(2) + u64::from(height)))
+        }
+    }
+
+    /// A coin record at `puzzle_hash`, confirmed well before any census height these tests use.
+    fn record_at(puzzle_hash: chia_protocol::Bytes32) -> CoinRecord {
+        CoinRecord {
+            coin: chia_protocol::Coin {
+                parent_coin_info: chia_protocol::Bytes32::new([7u8; 32]),
+                puzzle_hash,
+                amount: 1_000_000,
+            },
+            confirmed_height: Some(0),
+            spent_height: None,
+            timestamp: Some(epoch_start_unix_secs(2)),
+            coinbase: false,
+        }
+    }
+
     /// A store in a fresh temp dir, holding only the genesis record the bring-up writes.
     fn seeded_store(name: &str) -> (EpochRecordStore, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -469,7 +617,7 @@ mod tests {
 
         let outcome = catch_up(&source, &store, GENESIS_EPOCH);
 
-        assert_eq!(outcome.recorded, Vec::<u64>::new());
+        assert_eq!(outcome.recorded, Vec::<CensusObservation>::new());
         assert_eq!(
             outcome.stopped, None,
             "a current store stopped for a reason"
@@ -520,6 +668,113 @@ mod tests {
             source.reads(),
             0,
             "the ceiling was checked after a chain read rather than before one"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **Two censuses that count nothing are told apart by what the walk reports.**
+    ///
+    /// This is the whole reason `CensusObservation` exists. Both halves record a `stores` of 0 and
+    /// both write a record carrying the floor requirement — identical on every field that reaches
+    /// the record. What separates them is `examined` and the exclusion counts:
+    ///
+    /// * the EMPTY chain examined nothing, so the network really is empty;
+    /// * the WRONG-puzzle-hash source examined a candidate and dropped it as `foreign_puzzle`,
+    ///   which is a fact about the source and says nothing about the network.
+    ///
+    /// The second is a broken instrument rendered as a reassuring answer, on the path that decides
+    /// how much collateral this node posts. Asserting the two observations DIFFER is what fails if
+    /// the fields are dropped again: an assertion on `stores` alone passes in both cases, which is
+    /// exactly the state this test was written against.
+    #[test]
+    fn a_census_of_nothing_reports_whether_it_examined_anything() {
+        let (empty_store, empty_dir) = seeded_store("examined-empty");
+        let empty = catch_up(&PopulatedSource::holding(Vec::new()), &empty_store, 2);
+
+        let (foreign_store, foreign_dir) = seeded_store("examined-foreign");
+        let foreign = catch_up(
+            &PopulatedSource::holding(vec![record_at(chia_protocol::Bytes32::new([9u8; 32]))]),
+            &foreign_store,
+            2,
+        );
+
+        let [empty] = &empty.recorded[..] else {
+            panic!("the empty chain recorded {:?}", empty)
+        };
+        let [foreign] = &foreign.recorded[..] else {
+            panic!("the foreign-puzzle chain recorded {:?}", foreign)
+        };
+
+        // The figure that reaches the record is the same in both. That is the problem.
+        assert_eq!(empty.stores, 0);
+        assert_eq!(foreign.stores, 0);
+
+        assert_eq!(empty.examined, 0, "an empty chain examined a candidate");
+        assert_eq!(empty.excluded, Exclusions::default());
+
+        assert_eq!(
+            foreign.examined, 1,
+            "the candidate the source answered was not counted as examined"
+        );
+        assert_eq!(
+            foreign.excluded.foreign_puzzle, 1,
+            "a record at the wrong puzzle hash was not reported as such"
+        );
+
+        assert_ne!(
+            (empty.examined, empty.excluded),
+            (foreign.examined, foreign.excluded),
+            "an empty network and a source answering at the wrong puzzle hash are indistinguishable"
+        );
+
+        let _ = std::fs::remove_dir_all(empty_dir);
+        let _ = std::fs::remove_dir_all(foreign_dir);
+    }
+
+    /// **A rotted line for the epoch being computed stops the walk BEFORE any chain read.**
+    ///
+    /// `records()` skips unparseable lines while `get()` reports them, so a line for epoch 2
+    /// truncated by a crash or a full disk leaves `highest_recorded` answering 1 and the walk
+    /// heading straight back at epoch 2. Without the pre-check that walk performs a whole
+    /// population read and its spend executions, fails at `put`, and does it all again on the next
+    /// timer tick — forever, advancing nothing.
+    ///
+    /// `reads() == 0` is the load-bearing assertion, and it is what a fix placed anywhere later
+    /// than this would fail: a stop reported AFTER the census is still a correct-looking stop, and
+    /// still burns the census every ten minutes.
+    #[test]
+    fn a_rotted_line_for_the_target_epoch_stops_the_walk_before_reading_the_chain() {
+        let (store, dir) = seeded_store("rotted");
+
+        // Valid JSON that names epoch 2 — so the store can attribute it — and is not a
+        // `StoredRecord`. This is the shape a half-written append leaves behind.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("epochs.jsonl"))
+                .expect("open the store for the rotted append");
+            writeln!(f, "{{\"epoch\":2}}").expect("append the rotted line");
+        }
+        assert!(
+            matches!(store.get(2), StoredEpoch::Unreadable),
+            "the fixture did not produce an unreadable line for epoch 2"
+        );
+
+        let source = UnreachableSource::new();
+        let outcome = catch_up(&source, &store, 3);
+
+        assert!(outcome.recorded.is_empty());
+        assert_eq!(
+            outcome.stopped,
+            Some(CensusStop::EpochLineUnreadable { epoch: 2 }),
+            "the rotted line was not named as the reason"
+        );
+        assert_eq!(
+            source.reads(),
+            0,
+            "a full census was performed against a line that could never be written"
         );
 
         let _ = std::fs::remove_dir_all(dir);

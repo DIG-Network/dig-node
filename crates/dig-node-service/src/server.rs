@@ -2631,10 +2631,32 @@ fn spawn_collateral_census(chain: Arc<dig_wallet::sage::chain::ChainTransport>) 
 
                     match pass {
                         Ok(outcome) => {
-                            if !outcome.recorded.is_empty() {
+                            // One line per epoch, carrying what the census EXAMINED and why it
+                            // excluded what it excluded — not only the figure it arrived at. A
+                            // `stores = 0` is produced identically by an empty network, by a
+                            // source answering at the wrong puzzle hash, and by a degraded source
+                            // whose candidates' creating spends were all unavailable; those are
+                            // opposite situations on the path that decides what this node posts,
+                            // and only the exclusion counts separate them.
+                            for observed in &outcome.recorded {
                                 tracing::info!(
-                                    epochs = ?outcome.recorded,
-                                    "censused the collateral network and recorded the epoch(s)"
+                                    epoch = observed.epoch,
+                                    census_height = observed.census_height,
+                                    stores = observed.stores,
+                                    examined = observed.examined,
+                                    excluded_foreign_puzzle = observed.excluded.foreign_puzzle,
+                                    excluded_unreadable = observed.excluded.unreadable,
+                                    excluded_unattributed = observed.excluded.unattributed,
+                                    excluded_wrong_epoch = observed.excluded.wrong_epoch,
+                                    excluded_not_yet_created = observed.excluded.not_yet_created,
+                                    excluded_spent_by_census_height =
+                                        observed.excluded.spent_by_census_height,
+                                    excluded_undated = observed.excluded.undated,
+                                    excluded_block_reward = observed.excluded.block_reward,
+                                    excluded_below_requirement_unauthenticated =
+                                        observed.excluded.below_requirement_unauthenticated,
+                                    excluded_superseded = observed.excluded.superseded,
+                                    "censused the collateral network and recorded the epoch"
                                 );
                             }
                             if let Some(stop) = outcome.stopped {
@@ -2644,7 +2666,8 @@ fn spawn_collateral_census(chain: Arc<dig_wallet::sage::chain::ChainTransport>) 
                                 tracing::warn!(
                                     target_epoch = target,
                                     reason = ?stop,
-                                    "the collateral census stopped short of the current epoch;                                      no record was written"
+                                    "the collateral census stopped short of the current epoch; \
+                                     no record was written"
                                 );
                             }
                         }

@@ -7678,8 +7678,20 @@ any other way is a fork, because every node must reach the same height without c
 
 The chain reads MUST be served through a `dig_chainsource_interface::ChainSource`. The node MUST NOT
 open a second connection to the chain for this purpose: it takes a `ChainSource` view of the one
-transport that already serves its wallet reads, so a node holds one peer pool with one notion of the
-peak.
+transport that already serves its wallet reads, so a node holds ONE peer pool.
+
+**One pool is not one notion of the peak, and this node has three.** The wallet's peak is settled by
+NC-12 agreement across the full nodes this node dialled itself, and their failure to agree is
+reported as not knowing. The census's peak is not: it is read through the `ChainSource`, whose router
+asks `api.coinset.org` FIRST and consults this node's peers only when that read fails — so on a
+reachable oracle the census's peak is one HTTPS endpoint's answer, and when the oracle is
+unreachable it is a peer-tracked value carried with NO agreement step. That is the peak the
+`CENSUS_FINALITY_DEPTH_BLOCKS` check above is measured against.
+
+A census provider MUST therefore be classified by what it can REACH rather than by its type: a
+fabric that can fall through to the oracle shares the oracle's independence group, however many
+peers it holds. A node MUST NOT count such a provider as an independent chain source, and MUST NOT
+describe the census's peak as corroborated.
 
 **The walk is sequential.** Epoch *n* is derived from epoch *n-1*, so the node computes each
 intervening epoch in order from the newest record it holds. It MUST NOT skip forward to the current
@@ -7697,6 +7709,13 @@ reason and its own remedy:
 | the candidate population exceeds what can be authenticated | refused whole; never censused as a prefix |
 | the predecessor record is absent, unreadable, or names an unimplemented ruleset | that epoch first |
 | the store already holds a DIFFERENT record for the computed epoch | the held record stands |
+| the controller refused to derive the record from the census | a build that implements the ruleset |
+| the record store could not be read or written | the state directory |
+| the store's own line for the computed epoch cannot be read | repair or remove that line |
+
+The last of these MUST be detected BEFORE the chain is read. An unreadable line is invisible to the
+scan that answers "the newest epoch held", so a node that did not check would recensus that epoch on
+every attempt — the whole population and its spend executions — only to fail at the write, forever.
 
 None of these MUST EVER become a figure — not a zero, not a default, and not the neighbouring
 epoch's answer. The store's own absence then surfaces through §24.2's `unknown` with its reason,
