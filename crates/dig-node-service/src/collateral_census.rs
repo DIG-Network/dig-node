@@ -32,9 +32,7 @@
 use dig_chainsource_interface::ChainSource;
 use dig_mirror_coin::{census, census_height, CensusOutcome, MirrorError};
 
-use crate::collateral::{
-    EpochRecordStore, PutOutcome, StoredEpoch, StoredRecord, GENESIS_EPOCH,
-};
+use crate::collateral::{EpochRecordStore, PutOutcome, StoredEpoch, StoredRecord, GENESIS_EPOCH};
 
 /// Why a catch-up stopped before reaching the target epoch.
 ///
@@ -472,7 +470,10 @@ mod tests {
         let outcome = catch_up(&source, &store, GENESIS_EPOCH);
 
         assert_eq!(outcome.recorded, Vec::<u64>::new());
-        assert_eq!(outcome.stopped, None, "a current store stopped for a reason");
+        assert_eq!(
+            outcome.stopped, None,
+            "a current store stopped for a reason"
+        );
         assert_eq!(
             source.reads(),
             0,

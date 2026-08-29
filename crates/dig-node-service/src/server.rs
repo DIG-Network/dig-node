@@ -2583,7 +2583,6 @@ fn bring_up_collateral_records() {
     }
 }
 
-
 /// How often the census runner re-attempts a catch-up.
 ///
 /// One mirror ROUND, taken from the schedule rather than written as a duration: the round is the
