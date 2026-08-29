@@ -266,14 +266,34 @@ fn own_census_supersedes(held: RecordProvenance, incoming: RecordProvenance) -> 
 ///
 /// A census counts coins that pay the shared mirror puzzle hash and whose creating spend
 /// authenticates them as $DIG collateral for this epoch at or above the requirement. **A source
-/// cannot manufacture such a coin**: to raise this node’s count by one, someone must actually post
+/// cannot manufacture such a coin by MISCOUNTING**: to raise this node’s count by one, a source must report
 /// the collateral on chain, which is the behaviour the model exists to pay for. Omitting one, by
 /// contrast, is free — a source need only stay quiet. Of the two directions a re-census can move,
 /// exactly one is unforgeable, and it is the one this predicate admits.
 ///
-/// That makes the relation a strict, monotone, one-way ladder rather than a total order over
-/// records: a record can only ever be replaced by one counting strictly more, so no cycle exists
-/// and no "which census was better" judgement has to be invented.
+/// That argument holds only for a source that MISCOUNTS. It is not a claim that a census cannot
+/// be FABRICATED: `dig-mirror-coin` authenticates a candidate coin against the coin's own
+/// self-consistency — curried asset id, lineage proof, puzzle shape — and never against consensus,
+/// so nothing here proves the coin was ever spent on chain. Forgery is out of scope for this
+/// predicate and tracked separately; what this predicate promises is bounded by that assumption,
+/// and the promise is stated that way everywhere it appears.
+///
+/// # Why every counted figure is constrained, and the price directly
+///
+/// `stores` is the figure the under-count story is about, but it is not the figure that sets the
+/// amount an operator posts. `required_per_store_dig_base_units` is, and it is derived from the
+/// multiplier and the OWNER count — so a record counting one more store while collapsing `owners`
+/// clears a stores-only test and still cuts the requirement, which is the same downward move the
+/// predicate exists to refuse, reached by paying for one coin. The counted fields are therefore
+/// all required to be non-decreasing, and the derived requirement is compared DIRECTLY rather than
+/// inferred from them: the multiplier is a function of saturation signals, so "price rises with
+/// the inputs" is an arithmetic property of `dig-mirror-collateral` that this module must not
+/// assume and could not detect losing.
+///
+/// With `stores` strictly increasing the relation stays a strict, one-way ladder rather than a
+/// total order over records — a record can only ever be replaced by one counting strictly more, so
+/// no cycle exists and no "which census was better" judgement has to be invented. The added
+/// clauses only narrow it, so they cannot introduce one.
 ///
 /// # What it does NOT loosen
 ///
@@ -293,7 +313,16 @@ fn own_recensus_supersedes(held: &StoredRecord, incoming: &StoredRecord) -> bool
         && matches!(incoming.provenance, RecordProvenance::Censused)
         && held.census_height.is_some()
         && held.census_height == incoming.census_height
+        // Every COUNTED quantity moves in the one direction a source cannot fake, not just the
+        // one the repair is named after. `owners` and `locked` are readings of the same block by
+        // the same source, and omitting either is exactly as free as omitting a store.
         && incoming.record.census.stores > held.record.census.stores
+        && incoming.record.census.owners >= held.record.census.owners
+        && incoming.record.census.locked >= held.record.census.locked
+        // And the DERIVED figure the operator actually pays, checked directly rather than
+        // inferred from its inputs (dig-node#406 gate round 2).
+        && incoming.record.required_per_store_dig_base_units
+            >= held.record.required_per_store_dig_base_units
 }
 
 /// One epoch as this node stores it: the consensus record, plus how this node came by it.
@@ -1066,12 +1095,14 @@ mod tests {
 
         // And the repair MATTERS, shown rather than asserted about.
         //
-        // `required_per_store` is a function of the multiplier and the OWNER count, so an
-        // under-counted `stores` does not move the figure in its own epoch — it moves the
-        // SUCCESSOR's, because `advance` reads the seed's census to derive the next multiplier.
-        // That is precisely why sealing one was permanent rather than merely wrong for a week: the
-        // low count propagates into every epoch derived from it. Advancing both records with the
-        // SAME following census isolates the seed as the only difference.
+        // `required_per_store` is a function of the multiplier and the OWNER count. These two
+        // fixtures hold `owners` fixed, so here the under-counted `stores` moves only the
+        // SUCCESSOR's figure, because `advance` reads the seed's census to derive the next
+        // multiplier. A real thin source drops the OWNER along with the coin, which moves the
+        // in-epoch figure too — `tests/collateral_census_degraded_source.rs` asserts that case.
+        // Either way the low count propagates into every epoch derived from it, which is why
+        // sealing one was permanent rather than merely wrong for a week. Advancing both records
+        // with the SAME following census isolates the seed as the only difference.
         let next = EpochCensus {
             epoch: 10,
             stores: 60,
@@ -1134,6 +1165,67 @@ mod tests {
         match store.put(&same_stores_fewer_owners).expect("put") {
             PutOutcome::Conflict { held: kept } => assert_eq!(kept.record, held.record),
             other => panic!("an equal store count must not supersede, got {other:?}"),
+        }
+    }
+
+    /// The gate's own shape: **one extra store bought a 42% cut to what every operator posts.**
+    ///
+    /// `own_recensus_supersedes` was monotone in `stores` alone, but `stores` is not the figure
+    /// that sets the price — `owners` is, through the handicap. A re-census of the same block
+    /// counting one more store while collapsing the owner count therefore satisfied a
+    /// stores-only ladder and walked the requirement DOWN, which is the direction the predicate
+    /// exists to refuse.
+    ///
+    /// Both records are built by the real `EpochRecord::advance` from ONE predecessor, so every
+    /// derived figure is the model's own arithmetic rather than a fixture's opinion, and the seed
+    /// is the only difference between them.
+    #[test]
+    fn one_extra_store_with_collapsed_owners_must_not_walk_the_requirement_down() {
+        let seed = EpochRecord::bootstrap();
+        let advance = |stores, owners| {
+            seed.advance(EpochCensus {
+                epoch: seed.epoch + 1,
+                stores,
+                owners,
+                locked: 500_000,
+            })
+            .expect("advance")
+        };
+
+        let held_rec = advance(420, 300);
+        let incoming_rec = advance(421, 1);
+
+        // The fixture must exhibit the hazard, or this test proves nothing about the guard.
+        assert!(
+            incoming_rec.census.stores > held_rec.census.stores,
+            "the incoming record must clear the stores-only ladder, or the old predicate would               have refused it for the wrong reason"
+        );
+        assert!(
+            incoming_rec.required_per_store_dig_base_units
+                < held_rec.required_per_store_dig_base_units,
+            "the fixture must actually cut the requirement: held {} vs incoming {}",
+            held_rec.required_per_store_dig_base_units,
+            incoming_rec.required_per_store_dig_base_units
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        let held = StoredRecord::censused(held_rec, 7_000);
+        assert_eq!(store.put(&held).expect("put"), PutOutcome::Written);
+
+        let incoming = StoredRecord::censused(incoming_rec, 7_000);
+        assert_ne!(
+            store.put(&incoming).expect("put"),
+            PutOutcome::Written,
+            "a re-census that cuts the requirement must never be written, however many stores it               counts"
+        );
+        match store.get(held.record.epoch) {
+            StoredEpoch::Found(rec) => assert_eq!(
+                rec.record.required_per_store_dig_base_units,
+                held.record.required_per_store_dig_base_units,
+                "the served requirement must still be the higher one"
+            ),
+            other => panic!("the held record must survive, got {other:?}"),
         }
     }
 

@@ -7661,16 +7661,26 @@ MUST NOT be, because evidence does not weaken on re-offer.
 **Immutability MUST NOT seal an under-count this node produced itself.** Exactly one differing pair
 beyond §24.10's may supersede: a record this node censused MUST be replaced by a LATER census OF ITS
 OWN, of the same epoch, taken at the SAME census height, that counted strictly MORE stores. Both
-sides MUST carry `censused` provenance, both census heights MUST be present and equal, and a
-re-census counting the same or fewer stores MUST change nothing.
+sides MUST carry `censused` provenance, and both census heights MUST be present and equal.
 
-The direction is the whole of the rule. A chain view can only OMIT coins from a census, never invent
-them: raising the count by one requires somebody to have posted the collateral on chain, while
-dropping one requires only silence. So the upward direction is unforgeable and the downward one is
-free, and admitting only the upward one keeps a briefly-degraded read from becoming permanent
-without giving any source the ability to talk the requirement down. Because a record may only ever
-be replaced by one counting strictly more, the relation is a strict monotone ladder and no ordering
-over records has to be invented.
+The repair MUST NOT be able to move the price DOWN. Every counted figure in the incoming census --
+`stores`, `owners` and `locked` -- MUST be non-decreasing against the held record, and the derived
+`required_per_store` MUST be non-decreasing as well, compared DIRECTLY rather than inferred from
+those inputs. Constraining `stores` alone is not sufficient and MUST NOT be implemented: the
+requirement is derived from the multiplier and the OWNER count, so a record counting one more store
+while reporting fewer owners would satisfy a stores-only rule and still cut what every operator
+posts. A re-census failing any of these conditions MUST change nothing.
+
+The direction is the whole of the rule, and it is bounded by an assumption that MUST be stated
+rather than assumed. A chain view that is merely DEGRADED can only omit coins, never invent them:
+reporting one more requires a real coin to have been posted, while dropping one requires only
+silence. Admitting only the upward direction therefore keeps a briefly-degraded read from becoming
+permanent without letting a degraded source talk the requirement down. This is NOT a claim that a
+census is unforgeable. Candidate coins are authenticated against their own self-consistency and not
+against consensus -- no header, no inclusion proof -- so a source that FABRICATES rather than
+miscounts is outside what this rule constrains, and is tracked as its own defect. Because a record
+may only ever be replaced by one counting strictly more stores, the relation remains a strict
+one-way ladder and no ordering over records has to be invented.
 
 This does NOT let a peer supersede anything: both sides must be `censused`, and §24.10's discipline
 stamps every record reachable from the network `adopted_from_peers`.
