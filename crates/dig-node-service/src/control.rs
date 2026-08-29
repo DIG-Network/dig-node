@@ -63,6 +63,10 @@ use dig_node_control_interface::params::{
     WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
     WalletReservationsReserveParams,
 };
+use dig_node_control_interface::results::{
+    AutomatedSpend, SpendAsset, SpendAuthority, SpendChainReference, SpendFailureStage, SpendOutcome,
+    SpendsListResult,
+};
 use dig_node_control_interface::ControlMethod;
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
 use dig_node_core::seams::dig_peer::profile_sync::{
@@ -3186,74 +3190,123 @@ fn spends_list(id: Value, params: &Value) -> Value {
         }
     };
 
-    let cursor = crate::spend_audit::SpendLog::cursor_of(&ledger);
-    control_ok(
-        id,
-        json!({
-            "spends": ledger.records.iter().map(spend_row).collect::<Vec<_>>(),
-            "complete": ledger.complete,
-            // Both keys are always PRESENT. `null` is meaningful here, so an absent key must not
-            // decode into it: a truncated payload would otherwise read as a confident "there is
-            // nothing to look up".
-            "cursor": cursor,
-            "unreadable_lines": ledger.unreadable_lines,
-        }),
-    )
+    control_ok(id, spends_list_wire(&ledger))
 }
 
-/// One audit row on the wire.
+/// The `control.spends.list` payload, as the published contract's own type.
 ///
-/// Amounts are decimal STRINGS. They carry the full `u64` range, which does not survive a JSON
-/// number through an f64 parser, and a silently rounded figure about somebody's money is exactly
-/// the lie this record exists to prevent.
-fn spend_row(r: &crate::spend_audit::SpendRecord) -> Value {
-    use crate::spend_audit::SpendStatus;
-
-    // The failure STAGE travels with a failure, never a bare "failed": only `Signing` means the
-    // money definitely did not move, so flattening the stage would make every client structurally
-    // unable to tell a person the truth about their money.
-    let status = match &r.status {
-        SpendStatus::Pending => json!({ "state": "pending" }),
-        SpendStatus::Submitted => json!({ "state": "submitted" }),
-        SpendStatus::Confirmed { height, coin_id } => json!({
-            "state": "confirmed",
-            "height": height,
-            "coin_id": coin_id.to_string(),
-        }),
-        SpendStatus::Failed { stage, reason } => json!({
-            "state": "failed",
-            "stage": stage.to_string(),
-            "reason": reason,
-        }),
-        SpendStatus::Unresolved { reason } => json!({
-            "state": "unresolved",
-            "reason": reason,
-        }),
+/// Separate from the handler so the wire shape can be exercised without a file on disk, and
+/// returning `SpendsListResult` rather than a hand-built `json!` so the COMPILER checks this node's
+/// response against `dig-node-control-interface`. A hand-built object type-checks against nothing:
+/// it once sent `asset` as the `Display` string `"XCH"` while the contract's `SpendAsset` is
+/// internally tagged and needs `{"asset":"xch"}`, which no correct client could decode (#408).
+fn spends_list_wire(ledger: &crate::spend_audit::SpendLedger) -> Value {
+    let result = SpendsListResult {
+        spends: ledger.records.iter().map(spend_row).collect(),
+        complete: ledger.complete,
+        // Both keys are always PRESENT. `null` is meaningful here, so an absent key must not
+        // decode into it: a truncated payload would otherwise read as a confident "there is
+        // nothing to look up". The contract's own `Serialize` is what guarantees that now, rather
+        // than this function remembering to.
+        cursor: crate::spend_audit::SpendLog::cursor_of(ledger),
+        unreadable_lines: ledger.unreadable_lines.min(u32::MAX as usize) as u32,
     };
-    json!({
-        "id": r.id,
-        "revision": r.revision,
-        "kind": r.kind.as_str(),
-        "purpose": r.purpose,
-        "authority": {
-            "principal": r.authority.principal,
-            "grant": r.authority.grant,
+    serde_json::to_value(result).expect("the contract result type is plain data and always serializes")
+}
+
+/// One audit row, as the published contract's own [`AutomatedSpend`].
+///
+/// # Why this returns the contract type rather than a `json!`
+///
+/// It used to hand-build the object, and a hand-built object is checked by nothing. The two drifted:
+/// `asset` went out as the `Display` string `"XCH"` / `"DIG"` / `"CAT:<id>"` while the contract's
+/// `SpendAsset` is internally tagged and needs `{"asset":"dig"}`, so a client doing the CORRECT thing
+/// — deserialising into `SpendsListResult` — could not decode the response at all (#408).
+///
+/// Returning the contract type makes the COMPILER the check. A renamed or dropped field is now a
+/// build error here rather than a decode error on somebody else's machine, which matters more than
+/// the one-off fix: this is the sanctioned reader of the automated-spend record, and that record is
+/// what pays for signing mirror-coin spends without per-spend approval. A response no correct client
+/// can decode makes the accountability half of that bargain unavailable.
+///
+/// Amounts become decimal STRINGS on the way out, as the contract requires: they carry the full
+/// `u64` range, which does not survive a JSON number through an f64 parser, and a silently rounded
+/// figure about somebody's money is exactly the lie this record exists to prevent.
+fn spend_row(r: &crate::spend_audit::SpendRecord) -> AutomatedSpend {
+    AutomatedSpend {
+        id: r.id.clone(),
+        revision: r.revision,
+        // The producer's own token, unchanged. See SPEC 23.1 for why `kind` and `purpose` stay two
+        // fields rather than being conflated into one compound word.
+        kind: r.kind.as_str().to_string(),
+        purpose: r.purpose.clone(),
+        authority: SpendAuthority {
+            principal: r.authority.principal.clone(),
+            grant: r.authority.grant.clone(),
         },
-        "asset": r.asset.to_string(),
-        "amount_mojos": r.amount_mojos.to_string(),
-        "fee_mojos": r.fee_mojos.to_string(),
-        "store_id": r.store_id,
-        "initiated_ms": r.initiated_ms,
-        "updated_ms": r.updated_ms,
-        "status": status,
-        "funding_coin_ids": r.funding_coin_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        asset: spend_asset(&r.asset),
+        amount_mojos: r.amount_mojos.to_string(),
+        fee_mojos: r.fee_mojos.to_string(),
+        store_id: r.store_id.clone(),
+        initiated_ms: r.initiated_ms,
+        updated_ms: r.updated_ms,
+        status: spend_outcome(&r.status),
+        funding_coin_ids: r.funding_coin_ids.iter().map(ToString::to_string).collect(),
         // Carries its own observed/expected flag, so a client never has to re-derive the
         // distinction between the coin the node INTENDS to create and one it has seen on chain.
-        "chain_reference": r.chain_reference().map(|c| json!({
-            "coin_id": c.coin_id.to_string(),
-            "confirmed": c.confirmed,
-        })),
-    })
+        chain_reference: r.chain_reference().map(|c| SpendChainReference {
+            coin_id: c.coin_id,
+            confirmed: c.confirmed,
+        }),
+    }
+}
+
+/// The node's [`Asset`](crate::spend_audit::Asset) as the contract's [`SpendAsset`].
+///
+/// Written as an exhaustive `match` rather than a serde re-encode: the two types happen to share a
+/// representation today, and a round-trip through JSON would silently keep agreeing if one of them
+/// changed. A `match` makes a new variant on either side a compile error, which is the whole reason
+/// this function exists instead of a `to_string`.
+fn spend_asset(asset: &crate::spend_audit::Asset) -> SpendAsset {
+    use crate::spend_audit::Asset;
+
+    match asset {
+        Asset::Xch => SpendAsset::Xch,
+        Asset::Dig => SpendAsset::Dig,
+        Asset::Cat { asset_id } => SpendAsset::Cat {
+            asset_id: asset_id.clone(),
+        },
+    }
+}
+
+/// The node's [`SpendStatus`](crate::spend_audit::SpendStatus) as the contract's [`SpendOutcome`].
+///
+/// The failure STAGE travels with a failure, never a bare "failed": only `Signing` means the money
+/// definitely did not move, so flattening the stage would make every client structurally unable to
+/// tell a person the truth about their money. Exhaustive on both the status and the stage, so
+/// neither side can gain a variant without someone here choosing what it means.
+fn spend_outcome(status: &crate::spend_audit::SpendStatus) -> SpendOutcome {
+    use crate::spend_audit::{FailureStage, SpendStatus};
+
+    match status {
+        SpendStatus::Pending => SpendOutcome::Pending,
+        SpendStatus::Submitted => SpendOutcome::Submitted,
+        SpendStatus::Confirmed { height, coin_id } => SpendOutcome::Confirmed {
+            height: *height,
+            coin_id: coin_id.to_string(),
+        },
+        SpendStatus::Failed { stage, reason } => SpendOutcome::Failed {
+            stage: match stage {
+                FailureStage::Signing => SpendFailureStage::Signing,
+                FailureStage::Broadcast => SpendFailureStage::Broadcast,
+                FailureStage::Confirmation => SpendFailureStage::Confirmation,
+            },
+            reason: reason.clone(),
+        },
+        SpendStatus::Unresolved { reason } => SpendOutcome::Unresolved {
+            reason: reason.clone(),
+        },
+    }
 }
 
 /// This node's view of which collateral epoch is in force.
@@ -4235,6 +4288,165 @@ mod tests {
             response.get("error").is_none(),
             "an absent spend must NOT be an error: {response:?}"
         );
+    }
+
+    /// A ledger whose rows vary the two things a mapper is most likely to get uniformly wrong:
+    /// the ASSET (each of the contract's three variants, including the `Cat` one that carries a
+    /// sibling field) and the STATUS (each of the outcomes whose payload differs).
+    ///
+    /// Deliberately not one row. A single-row fixture cannot tell a correct mapper from one that
+    /// happens to be right about the variant it was handed, and every field a fixture holds
+    /// constant is a field no assertion can see.
+    fn a_ledger_of_every_shape() -> crate::spend_audit::SpendLedger {
+        use crate::spend_audit::{
+            Asset, Authority, FailureStage, FundingCoinId, SpendKind, SpendLedger, SpendRecord,
+            SpendStatus, TargetCoinId,
+        };
+
+        let row = |id: &str, asset: Asset, status: SpendStatus, amount: u64| SpendRecord {
+            id: id.to_string(),
+            revision: 3,
+            kind: SpendKind::new(crate::spend_audit::kinds::MIRROR_COIN),
+            purpose: "collateralise the mirror coin for store aa…".to_string(),
+            authority: Authority {
+                principal: "node".to_string(),
+                grant: "mirror_coin.autosign".to_string(),
+            },
+            asset,
+            amount_mojos: amount,
+            fee_mojos: 4_200,
+            store_id: Some("ee".repeat(32)),
+            initiated_ms: 1_756_000_000_000,
+            updated_ms: 1_756_000_001_000,
+            status,
+            funding_coin_ids: vec![FundingCoinId("ab".repeat(32))],
+            intended_coin_id: Some(TargetCoinId("cd".repeat(32))),
+        };
+
+        SpendLedger {
+            records: vec![
+                // A CAT carries its asset id in a SIBLING field. Renaming the token alone cannot
+                // produce this row, so it is the row that distinguishes serialising the contract
+                // type from patching today's spelling.
+                row(
+                    "spend-cat",
+                    Asset::Cat {
+                        asset_id: "9f".repeat(32),
+                    },
+                    SpendStatus::Confirmed {
+                        height: 9_172_077,
+                        coin_id: TargetCoinId("cd".repeat(32)),
+                    },
+                    // Full u64 range: a JSON number would not survive an f64 parser, and a
+                    // silently rounded figure about somebody's money is the lie this record exists
+                    // to prevent.
+                    u64::MAX,
+                ),
+                // `Signing` is the ONE stage that claims the money did not move. A mapper that
+                // dropped or flattened the stage would leave this row unable to say so.
+                row(
+                    "spend-dig",
+                    Asset::Dig,
+                    SpendStatus::Failed {
+                        stage: FailureStage::Signing,
+                        reason: "insufficient funds".to_string(),
+                    },
+                    1_000,
+                ),
+                row(
+                    "spend-xch",
+                    Asset::Xch,
+                    SpendStatus::Unresolved {
+                        reason: "restarted mid-flight".to_string(),
+                    },
+                    7,
+                ),
+            ],
+            unreadable_lines: 2,
+            complete: false,
+        }
+    }
+
+    /// **Proves:** a `control.spends.list` payload deserialises into the PUBLISHED
+    /// `SpendsListResult` with no hand-written decoder, and re-serialises byte-identically.
+    ///
+    /// **Catches** the #408 defect directly: `spend_row` hand-built the row with `json!` and sent
+    /// `asset` as the `Display` string `"XCH"`/`"DIG"`/`"CAT:<id>"`, which the contract's
+    /// internally-tagged `SpendAsset` cannot decode at all. It equally catches the NEXT such drift,
+    /// which is the point — a hand-built object is checked by nothing, so any future renamed or
+    /// dropped field would ship silently and fail on a client instead of here.
+    ///
+    /// The re-serialisation half is load-bearing: decoding alone would pass while the node emitted
+    /// an EXTRA field the contract silently ignores, which is how a producer and its contract drift
+    /// apart in the direction nobody notices.
+    #[test]
+    fn spends_list_wire_round_trips_through_the_published_contract_type() {
+        use dig_node_control_interface::results::{
+            SpendAsset, SpendFailureStage, SpendOutcome, SpendsListResult,
+        };
+
+        let wire = spends_list_wire(&a_ledger_of_every_shape());
+
+        let decoded: SpendsListResult = serde_json::from_value(wire.clone())
+            .expect("the node's own response must decode as its published contract type");
+
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("re-serialize"),
+            wire,
+            "the response must carry exactly the contract's fields — no extras, none missing"
+        );
+
+        // Concrete values, not just a successful decode: a decode proves the SHAPE, and these
+        // prove the CONTENT survived it.
+        assert_eq!(
+            decoded.spends[0].asset,
+            SpendAsset::Cat {
+                asset_id: "9f".repeat(32)
+            },
+            "a CAT's asset id must survive in its sibling field"
+        );
+        assert_eq!(decoded.spends[1].asset, SpendAsset::Dig);
+        assert_eq!(decoded.spends[2].asset, SpendAsset::Xch);
+
+        assert_eq!(
+            decoded.spends[0].amount_mojos,
+            u64::MAX.to_string(),
+            "the full u64 range must survive as a decimal string"
+        );
+
+        match &decoded.spends[1].status {
+            SpendOutcome::Failed { stage, .. } => {
+                assert_eq!(*stage, SpendFailureStage::Signing);
+                assert!(
+                    !stage.money_may_have_moved(),
+                    "a Signing failure is the one row that may claim the money stayed put"
+                );
+            }
+            other => panic!("expected a failed row, got {other:?}"),
+        }
+
+        // The chain reference carries its observed/expected flag, so an INTENDED coin id can never
+        // be rendered as an on-chain fact.
+        assert_eq!(
+            decoded.spends[0]
+                .chain_reference
+                .as_ref()
+                .expect("a confirmed row has a reference")
+                .confirmed,
+            true
+        );
+        assert!(
+            !decoded.spends[2]
+                .chain_reference
+                .as_ref()
+                .expect("an unresolved row still has its intended coin")
+                .confirmed,
+            "an intended coin id must not be presented as observed"
+        );
+
+        assert_eq!(decoded.unreadable_lines, 2);
+        assert!(!decoded.complete);
+        assert_eq!(decoded.cursor.as_deref(), Some("spend-xch"));
     }
 
     /// **Proves:** `coins_by_parent_wire` emits the paged contract shape, `complete` and `cursor`

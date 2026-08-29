@@ -7336,6 +7336,17 @@ An entry is NOT specific to any producer. It states: `kind` (what for) · `initi
 (when) · `amount_mojos` (how much) · `asset` (which asset) · `authority` (on whose authority) ·
 `purpose` (what for, in prose) · `status` (confirmed or failed) · and a chain reference.
 
+`kind` and `purpose` are TWO fields and MUST NOT be conflated into one compound token. `kind` is the
+PRODUCER's stable machine word — `"mirror-coin"` for the collateral cycle, never `"mirror-coin.collateral"`
+or `"mirror-coin.reclaim"` — and it is what `--kind` filters on. Which DIRECTION a mirror-coin spend moved
+money, collateralise or reclaim, is carried in `purpose`, alongside the rest of the reason.
+
+This split is normative and dig-node is authoritative on it, because a compound `kind` destroys a
+distinction the producer already makes: it forces every consumer to re-parse a word to recover a field the
+record already has, and it makes the filter refuse to name "every mirror-coin spend" without enumerating
+the suffixes a future producer has not invented yet. A consumer MUST read `kind` for the producer and
+`purpose` for the reason, and MUST NOT synthesise a compound word from the two.
+
 `authority` has two fields: `principal` (whose funds moved and whose standing consent is relied on) and
 `grant` (the standing permission relied on, named so an operator can revoke it).
 
@@ -7418,6 +7429,25 @@ the node is stopped or wedged.
 Every verb offers `--json` beside the human output, with stable field names (§6.2). The JSON listing is
 `{ path, count, unreadable_lines, spends[] }`, and each spend carries its raw fields plus `status_token`
 and `chain_reference`.
+
+### 23.7. `control.spends.list` emits the contract type, not a hand-built object
+
+The `control.spends.list` response MUST be produced by serialising
+`dig_node_control_interface::results::SpendsListResult`. It MUST NOT be assembled field-by-field, and a
+row MUST NOT be assembled from a type's `Display`.
+
+This is a requirement about the MECHANISM rather than about any one field, because the failure it
+prevents is silent. A hand-built object is type-checked against nothing, so it drifts from the contract
+one field at a time and each drift ships green: `asset` once went out as the `Display` string `"XCH"` /
+`"DIG"` / `"CAT:<id>"` against a contract whose `SpendAsset` is internally tagged and needs
+`{"asset":"dig"}`, so no client deserialising into the published type could decode the response at all,
+while a client that had reverse-engineered the wire kept working. Serialising the contract type makes a
+renamed or dropped field a build error in the node instead of a decode error on somebody else's machine.
+
+The stake is higher here than on other methods. This method is the only sanctioned reader of the
+automated-spend record, and that record is what pays for the node signing mirror-coin spends without
+per-spend approval. A response no correct client can decode makes the accountability half of that
+bargain unavailable to anyone implementing against the published contract.
 
 ## 24. Mirror-coin collateral — the requirement, the local margin, and the funding advice (dig_ecosystem#3173)
 
