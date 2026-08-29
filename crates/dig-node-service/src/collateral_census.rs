@@ -317,18 +317,20 @@ fn refresh<S: ChainSource>(
     store: &EpochRecordStore,
     epoch: u64,
 ) -> Result<Option<CensusObservation>, CensusStop> {
-    // Epoch 1 is derived from NOTHING and was taken at no height, so there is no census to repeat
-    // and no predecessor to derive one from. Without this guard the walk re-entered `record_one`
-    // for it on every pass and stopped at `PriorEpochMissing { epoch: 0 }` — a stop naming an epoch
-    // that cannot exist, reported forever, on the one node state that is always correct.
-    if epoch <= GENESIS_EPOCH {
-        return Ok(None);
-    }
-
     let held_stores = match store.get(epoch) {
-        // A bootstrap record is not a census either, and `put` would refuse to supersede it
-        // (`own_recensus_supersedes` demands `Censused` on BOTH sides). Re-censusing it would spend
-        // a whole population read to reach a refusal.
+        // Only a CENSUS is worth repeating. `put` demands `Censused` on both sides of the repair,
+        // so re-censusing anything else spends a whole population read to reach a refusal.
+        //
+        // **This is also what protects the genesis epoch**, and it is the only guard that does.
+        // Epoch 1 is derived from nothing and has no predecessor, so re-entering `record_one` for
+        // it stops at `PriorEpochMissing { epoch: 0 }` — an epoch that cannot exist — on every pass
+        // forever. It is reached here as a BOOTSTRAP record, never a censused one: no path writes a
+        // censused epoch 1 (`put` answers `AlreadyPresent` for an identical record offered with
+        // weaker evidence, and `Conflict` for a differing one, since a bootstrap record is on
+        // neither superseding side). An explicit `epoch <= GENESIS_EPOCH` arm was tried and removed
+        // — it sat in front of this one, could never fire, and so masked the guard that does the
+        // work: mutating it away left the suite green, which is the whole argument against keeping
+        // a second guard that nothing can witness.
         StoredEpoch::Found(held) if !matches!(held.provenance, RecordProvenance::Censused) => {
             return Ok(None)
         }
@@ -740,14 +742,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// **Genesis is never re-censused, and never reports a stop for an epoch that cannot exist.**
+    /// **A record that is not a census is never re-censused — which is what protects genesis.**
     ///
-    /// Epoch 1 is derived from nothing, so there is no census to repeat and no predecessor to
-    /// derive one from. Before the guard in `refresh`, a node whose target was genesis re-entered
-    /// the census on every pass and stopped at `PriorEpochMissing { epoch: 0 }` — forever, on the
-    /// one node state that is unambiguously correct.
+    /// Epoch 1 is derived from nothing and has no predecessor, so re-entering the census for it
+    /// stops at `PriorEpochMissing { epoch: 0 }` — an epoch that cannot exist — on every pass,
+    /// forever, on the one node state that is unambiguously correct. It is held as a BOOTSTRAP
+    /// record, so the provenance arm in `refresh` is the guard that fires.
+    ///
+    /// Written against the provenance arm rather than against an epoch-number arm deliberately. An
+    /// explicit `epoch <= GENESIS_EPOCH` guard was tried, sat in front of this one, and could never
+    /// fire; mutating it away left this test green, which is exactly what a masked guard looks like
+    /// and why it was removed rather than kept for reassurance.
     #[test]
-    fn the_genesis_epoch_is_never_re_censused() {
+    fn a_record_that_is_not_a_census_is_never_re_censused() {
         let (store, dir) = seeded_store("genesis");
         let source = UnreachableSource::new();
 

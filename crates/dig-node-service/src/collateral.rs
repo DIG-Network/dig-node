@@ -1108,6 +1108,32 @@ mod tests {
         }
     }
 
+    /// **STRICTLY more, not as-many-or-more.** Relaxing `>` to `>=` survived every other test here,
+    /// because they all vary the store count and the two operators differ only where it is EQUAL.
+    ///
+    /// The equal case is not a curiosity: a record carries `owners` and `locked` beside `stores`,
+    /// and hiding an OWNER is as free to a thin source as hiding a store. Under `>=` a re-census
+    /// that kept the store count while reporting fewer owners would supersede — which is the
+    /// downward direction wearing the shape of a repair, and the requirement is derived from the
+    /// owner count directly.
+    #[test]
+    fn a_re_census_with_the_same_store_count_but_different_figures_is_a_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_at(dir.path());
+        let held = StoredRecord::censused(record(9, 1_000_000, 1_000, 42), 7_000);
+        assert_eq!(store.put(&held).expect("put"), PutOutcome::Written);
+
+        let same_stores_fewer_owners = StoredRecord::censused(record(9, 1_000_000, 900, 42), 7_000);
+        assert_ne!(
+            same_stores_fewer_owners.record, held.record,
+            "the fixture must differ somewhere other than the store count"
+        );
+        match store.put(&same_stores_fewer_owners).expect("put") {
+            PutOutcome::Conflict { held: kept } => assert_eq!(kept.record, held.record),
+            other => panic!("an equal store count must not supersede, got {other:?}"),
+        }
+    }
+
     /// The same-height requirement is load-bearing, not decoration.
     ///
     /// Without it the repair would admit a census of a DIFFERENT block, and a source that could
