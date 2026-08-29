@@ -74,23 +74,25 @@ impl MirrorSpends {
     }
 }
 
-/// Build the spends that lock `collateral_cat_mojos` of $DIG as a mirror for one `(store, root,
+/// Build the spends that lock `collateral_dig_base_units` of $DIG as a mirror for one `(store, root,
 /// epoch)`.
 ///
 /// A thin wrapper over `dig_mirror_coin::create`: it adds no conditions, alters no amount, and
 /// changes no destination. Its whole contribution is that what comes back is a [`MirrorSpends`],
 /// which is the thing the signer will accept.
 ///
-/// `collateral_cat_mojos` is CAT mojos of $DIG — `dig_constants::MIRROR_COIN_COLLATERAL_CAT_MOJOS`,
-/// which is 20 whole $DIG times `CAT_MOJOS_PER_DIG`. Passing the whole-$DIG figure would lock 0.02
-/// $DIG and still look like a successful advertisement.
+/// `collateral_dig_base_units` is $DIG in **base units** (1 DIG = 1_000), and it is the CURRENT
+/// epoch's derived requirement — `apply_safety_margin(required_per_store, margin_bp)` (`SPEC.md`
+/// §25.3) — never a constant. Passing a whole-$DIG figure would lock a thousandth of the intended
+/// amount and still look like a successful advertisement, which is why the parameter name carries
+/// its unit.
 #[allow(clippy::too_many_arguments)]
 pub fn build_create(
     store_launcher_id: Bytes32,
     root_hash: Bytes32,
     epoch: BigInt,
     urls: Vec<String>,
-    collateral_cat_mojos: u64,
+    collateral_dig_base_units: u64,
     dig_coins: Vec<Cat>,
     synthetic_key: PublicKey,
     fee_coins: Vec<Coin>,
@@ -102,7 +104,7 @@ pub fn build_create(
             root_hash,
             epoch,
             urls,
-            collateral: collateral_cat_mojos,
+            collateral: collateral_dig_base_units,
         },
         dig_coins,
         synthetic_key,

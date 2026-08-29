@@ -1,4 +1,4 @@
-//! Debounce — deciding when a `.dig` on disk has been there long enough to be worth 20 $DIG.
+//! Debounce — deciding when a `.dig` on disk has been there long enough to be worth collateralising.
 //!
 //! # What this does NOT guard against
 //!
@@ -27,7 +27,8 @@
 //! # The asymmetry is deliberate
 //!
 //! Both directions are debounced, but they are not equally dangerous, and the window makes that
-//! explicit. Acting early on an APPEARANCE locks 20 $DIG against a capsule that may be gone in a
+//! explicit. Acting early on an APPEARANCE locks an epoch's collateral against a capsule that may be
+//! gone in a
 //! second. Acting late on a DISAPPEARANCE leaves a coin live without its `.dig`, which is the
 //! penalised state. So the settling window is a floor on how long a bond must be stable, and the
 //! start-up reconcile — which has no window, because a scan at start-up IS the settled state —

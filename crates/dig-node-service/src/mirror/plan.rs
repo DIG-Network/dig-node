@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 ///
 /// "Willing to advertise" is not the same as "present on disk". A capsule pulled on a stranger's
 /// behalf is marked `Relayed` and is deliberately never advertised (dig-node#276), so it is not a
-/// bond: staking 20 $DIG on it would be paying for an advertisement that is never published.
+/// bond: locking collateral on it would be paying for an advertisement that is never published.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Bond {
     /// Store launcher id, lowercase 64-hex.
@@ -57,7 +57,7 @@ pub struct HeldMirror {
     /// The epoch this coin declares it bonds.
     pub epoch: i64,
     /// The $DIG locked, in CAT mojos.
-    pub collateral_cat_mojos: u64,
+    pub collateral_dig_base_units: u64,
 }
 
 impl HeldMirror {
@@ -82,7 +82,7 @@ pub enum ReclaimReason {
     /// The coin bonds an epoch that has already ended.
     ///
     /// The legacy had this as an operational step a human ran, and dig-node has no operator — so
-    /// leaving it manual would strand 20 $DIG per store per epoch, forever, with nobody to notice.
+    /// leaving it manual would strand one epoch's collateral per store, forever, with nobody to notice.
     EpochEnded,
 }
 
@@ -175,7 +175,7 @@ pub struct FundingSplit {
     /// The creates it cannot — what the node must report as uncollateralised.
     pub short: Vec<Bond>,
     /// How much more $DIG, in CAT mojos, would cover [`Self::short`] entirely.
-    pub shortfall_cat_mojos: u64,
+    pub shortfall_dig_base_units: u64,
 }
 
 impl FundingSplit {
@@ -188,7 +188,8 @@ impl FundingSplit {
 /// Split `create` at the point the balance runs out.
 ///
 /// Creates STOP at the first unaffordable one rather than skipping it to take a cheaper later one. A
-/// mirror coin is all-or-nothing at 20 $DIG — there is no partial collateralisation — so there is no
+/// mirror coin is all-or-nothing at the epoch's required amount — there is no partial
+/// collateralisation — so there is no
 /// cheaper one to find, and hunting for an affordable subset would only make which stores get
 /// advertised depend on the balance in a way nobody could predict or explain.
 ///
@@ -196,30 +197,43 @@ impl FundingSplit {
 /// balance is the legacy defect where a wallet at zero could neither advertise nor recover what it
 /// had already locked.
 ///
-/// `per_coin` is `dig_constants::MIRROR_COIN_COLLATERAL_CAT_MOJOS` — CAT mojos, never whole $DIG,
-/// which is 1,000x smaller and would make everything look affordable.
-pub fn split_by_funds(create: &[Bond], balance_cat_mojos: u64, per_coin: u64) -> FundingSplit {
+/// `per_coin` is the CURRENT epoch's requirement in DIG base units —
+/// `apply_safety_margin(required_per_store, margin_bp)` (`SPEC.md` §25.3), never a constant and never
+/// a whole-$DIG figure. Whole $DIG is 1,000x smaller than base units and would make everything look
+/// affordable; `dig-constants` removed its fixed `MIRROR_COIN_COLLATERAL_DIG = 20` in 0.13.0 for
+/// exactly that class of error.
+pub fn split_by_funds(create: &[Bond], balance_dig_base_units: u64, per_coin: u64) -> FundingSplit {
     // A zero per-coin collateral would make every bond free and the split meaningless. The crate
     // refuses a zero-collateral mirror anyway, so treat it as "nothing is affordable" rather than
     // dividing by it and reporting infinite capacity.
     let affordable_count = if per_coin == 0 {
         0
     } else {
-        ((balance_cat_mojos / per_coin) as usize).min(create.len())
+        ((balance_dig_base_units / per_coin) as usize).min(create.len())
     };
 
     let (affordable, short) = create.split_at(affordable_count);
     FundingSplit {
         affordable: affordable.to_vec(),
         short: short.to_vec(),
-        shortfall_cat_mojos: (short.len() as u64).saturating_mul(per_coin),
+        shortfall_dig_base_units: (short.len() as u64).saturating_mul(per_coin),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dig_constants::MIRROR_COIN_COLLATERAL_CAT_MOJOS;
+    /// A stand-in for one epoch's requirement, in DIG base units: 1.000 DIG, the schedule's
+    /// starting value. It is a TEST constant, deliberately not imported from anywhere — the
+    /// production amount is derived per epoch (`SPEC.md` §25.3), so a test that pinned it to a
+    /// library constant would go green against an implementation that had hard-coded one.
+    const PER_COIN: u64 = 1_000;
+
+    /// A DIFFERENT requirement, used to prove the split is genuinely parameterised rather than
+    /// agreeing with [`PER_COIN`] by coincidence. The requirement moves in both directions as the
+    /// network's state moves, so any fixture that only ever exercises one amount cannot tell a
+    /// parameter from a constant.
+    const PER_COIN_RAISED: u64 = 2_500;
 
     /// A distinguishable 64-hex id. Real ids are opaque, and tests that use short strings hide
     /// length assumptions in the path builders that consume them.
@@ -242,7 +256,7 @@ mod tests {
             store_id: id(store),
             root: id(root),
             epoch,
-            collateral_cat_mojos: MIRROR_COIN_COLLATERAL_CAT_MOJOS,
+            collateral_dig_base_units: PER_COIN,
         }
     }
 
@@ -471,13 +485,13 @@ mod tests {
         let creates = vec![bond("aa", "11"), bond("bb", "22")];
         let split = split_by_funds(
             &creates,
-            2 * MIRROR_COIN_COLLATERAL_CAT_MOJOS,
-            MIRROR_COIN_COLLATERAL_CAT_MOJOS,
+            2 * PER_COIN,
+            PER_COIN,
         );
 
         assert!(split.is_funded());
         assert_eq!(split.affordable, creates);
-        assert_eq!(split.shortfall_cat_mojos, 0);
+        assert_eq!(split.shortfall_dig_base_units, 0);
     }
 
     /// The bound from BOTH sides. Exactly one coin's worth funds exactly one coin, and one mojo
@@ -488,38 +502,77 @@ mod tests {
 
         let at_bound = split_by_funds(
             &creates,
-            MIRROR_COIN_COLLATERAL_CAT_MOJOS,
-            MIRROR_COIN_COLLATERAL_CAT_MOJOS,
+            PER_COIN,
+            PER_COIN,
         );
-        assert!(at_bound.is_funded(), "exactly 20 $DIG funds exactly one coin");
+        assert!(
+            at_bound.is_funded(),
+            "exactly one requirement's worth funds exactly one coin"
+        );
 
         let one_under = split_by_funds(
             &creates,
-            MIRROR_COIN_COLLATERAL_CAT_MOJOS - 1,
-            MIRROR_COIN_COLLATERAL_CAT_MOJOS,
+            PER_COIN - 1,
+            PER_COIN,
         );
         assert!(
             !one_under.is_funded(),
             "one mojo short must not collateralise anything"
         );
-        assert_eq!(one_under.shortfall_cat_mojos, MIRROR_COIN_COLLATERAL_CAT_MOJOS);
+        assert_eq!(one_under.shortfall_dig_base_units, PER_COIN);
     }
 
-    /// The wallet that reads as rich because someone used whole $DIG where CAT mojos were meant.
-    /// 20 is the whole-$DIG figure and it must fund NOTHING; the 1,000x confusion is the specific
-    /// mistake `dig-constants` pins two constants to prevent.
+    /// The wallet that reads as rich because someone passed a WHOLE-$DIG figure where base units
+    /// were meant.
+    ///
+    /// A balance of 5 whole $DIG is 5_000 base units and would fund five coins at the starting
+    /// requirement; expressed as the bare number 5 it funds none. The fixture asserts BOTH halves,
+    /// because asserting only the underfunded half is satisfied by an implementation that funds
+    /// nothing at all.
     #[test]
-    fn a_balance_of_twenty_whole_dig_expressed_as_mojos_funds_nothing() {
+    fn a_whole_dig_figure_used_where_base_units_were_meant_funds_nothing() {
         let creates = vec![bond("aa", "11")];
-        let split = split_by_funds(
+        let whole_dig = 5_u64;
+
+        let mistaken = split_by_funds(&creates, whole_dig, PER_COIN);
+        assert!(
+            !mistaken.is_funded(),
+            "5 base units is 0.005 $DIG and collateralises nothing"
+        );
+
+        let correct = split_by_funds(
             &creates,
-            dig_constants::MIRROR_COIN_COLLATERAL_DIG,
-            MIRROR_COIN_COLLATERAL_CAT_MOJOS,
+            whole_dig * dig_constants::CAT_MOJOS_PER_DIG,
+            PER_COIN,
         );
         assert!(
-            !split.is_funded(),
-            "20 CAT mojos is 0.02 $DIG and collateralises nothing"
+            correct.is_funded(),
+            "the same figure in base units funds the bond, so the test is not vacuously red"
         );
+    }
+
+    /// The requirement is a PARAMETER, not a constant: the same balance and the same bonds split
+    /// differently when the epoch's requirement moves.
+    ///
+    /// This is the assertion that would go red against an implementation that ignored `per_coin`
+    /// and used a hard-coded figure — which is precisely the defect `dig-constants` 0.13.0 removed
+    /// a constant to prevent, and which no single-amount fixture can see.
+    #[test]
+    fn a_raised_requirement_funds_fewer_bonds_from_the_same_balance() {
+        let creates = vec![bond("aa", "11"), bond("bb", "22")];
+        let balance = 2 * PER_COIN;
+
+        let at_start = split_by_funds(&creates, balance, PER_COIN);
+        assert_eq!(at_start.affordable.len(), 2, "both bonds fit at 1.000 DIG each");
+
+        let raised = split_by_funds(&creates, balance, PER_COIN_RAISED);
+        assert_eq!(
+            raised.affordable,
+            vec![bond("aa", "11")],
+            "at 2.500 DIG each the same balance funds only the first bond"
+        );
+        assert_eq!(raised.short, vec![bond("bb", "22")]);
+        assert_eq!(raised.shortfall_dig_base_units, PER_COIN_RAISED);
     }
 
     /// Partial funding stops at the first unaffordable create and reports the rest, rather than
@@ -530,13 +583,13 @@ mod tests {
         let creates = vec![bond("aa", "11"), bond("bb", "22"), bond("cc", "33")];
         let split = split_by_funds(
             &creates,
-            2 * MIRROR_COIN_COLLATERAL_CAT_MOJOS,
-            MIRROR_COIN_COLLATERAL_CAT_MOJOS,
+            2 * PER_COIN,
+            PER_COIN,
         );
 
         assert_eq!(split.affordable, vec![bond("aa", "11"), bond("bb", "22")]);
         assert_eq!(split.short, vec![bond("cc", "33")]);
-        assert_eq!(split.shortfall_cat_mojos, MIRROR_COIN_COLLATERAL_CAT_MOJOS);
+        assert_eq!(split.shortfall_dig_base_units, PER_COIN);
     }
 
     /// An empty wallet is short everything and creates nothing — and, crucially, this says nothing
@@ -545,13 +598,13 @@ mod tests {
     #[test]
     fn an_empty_wallet_creates_nothing_and_reports_the_whole_shortfall() {
         let creates = vec![bond("aa", "11"), bond("bb", "22")];
-        let split = split_by_funds(&creates, 0, MIRROR_COIN_COLLATERAL_CAT_MOJOS);
+        let split = split_by_funds(&creates, 0, PER_COIN);
 
         assert!(split.affordable.is_empty());
         assert_eq!(split.short, creates);
         assert_eq!(
-            split.shortfall_cat_mojos,
-            2 * MIRROR_COIN_COLLATERAL_CAT_MOJOS
+            split.shortfall_dig_base_units,
+            2 * PER_COIN
         );
     }
 
@@ -561,7 +614,7 @@ mod tests {
     #[test]
     fn a_wallet_at_zero_still_reclaims_what_it_already_locked() {
         let plan = plan(&[], &[coin("c1", "aa", "11", NOW_EPOCH)], NOW_EPOCH);
-        let split = split_by_funds(&plan.create, 0, MIRROR_COIN_COLLATERAL_CAT_MOJOS);
+        let split = split_by_funds(&plan.create, 0, PER_COIN);
 
         assert_eq!(
             plan.reclaim,
