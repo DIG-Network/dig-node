@@ -64,8 +64,8 @@ use dig_node_control_interface::params::{
     WalletReservationsReserveParams,
 };
 use dig_node_control_interface::results::{
-    AutomatedSpend, SpendAsset, SpendAuthority, SpendChainReference, SpendFailureStage, SpendOutcome,
-    SpendsListResult,
+    AutomatedSpend, SpendAsset, SpendAuthority, SpendChainReference, SpendFailureStage,
+    SpendOutcome, SpendsListResult,
 };
 use dig_node_control_interface::ControlMethod;
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
@@ -3211,7 +3211,8 @@ fn spends_list_wire(ledger: &crate::spend_audit::SpendLedger) -> Value {
         cursor: crate::spend_audit::SpendLog::cursor_of(ledger),
         unreadable_lines: ledger.unreadable_lines.min(u32::MAX as usize) as u32,
     };
-    serde_json::to_value(result).expect("the contract result type is plain data and always serializes")
+    serde_json::to_value(result)
+        .expect("the contract result type is plain data and always serializes")
 }
 
 /// One audit row, as the published contract's own [`AutomatedSpend`].
@@ -5510,4 +5511,3 @@ mod tests {
         }
     }
 }
-
