@@ -748,7 +748,10 @@ mod tests {
 
         impl Write for Captured {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("the capture buffer").extend_from_slice(buf);
+                self.0
+                    .lock()
+                    .expect("the capture buffer")
+                    .extend_from_slice(buf);
                 Ok(buf.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
