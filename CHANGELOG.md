@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.165.0] - 2026-08-29
+
+### Features
+- **wallet:** Stage derived-hash CAT arrivals, promote only lineage-proven coins (#393)- **collateral:** Serve mirror-coin collateral control methods and spends.list (#395)- **collateral:** Per-epoch record, gossip serve, sampled sync (#398)- **logging:** Report file-sink health on control.status (#237)
+
+### Bug Fixes
+- **wallet:** Run CAT attribution in production so a funded wallet can name its $DIG (#391)
+
 ## [0.160.0] - 2026-08-27
 
 ### Features
