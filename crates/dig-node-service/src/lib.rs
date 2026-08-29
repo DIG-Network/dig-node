@@ -36,6 +36,9 @@ pub mod cli;
 /// safety margin, and the funding advice built on them. Every figure comes out of
 /// `dig-mirror-collateral`; no formula is restated.
 pub mod collateral;
+/// The census runner: the chain reads that let a node record an epoch after the first, and the
+/// named reasons it declines to record one. Every stop writes nothing.
+pub mod collateral_census;
 /// Adopting an epoch history from untrusted peers, and serving one to them: the
 /// re-derivation every candidate record must survive, and the sampling plan that bounds
 /// what a sample of peers is allowed to decide.

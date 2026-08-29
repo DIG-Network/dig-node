@@ -35,6 +35,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chia_protocol::SpendBundle;
+// Through `chia-query`'s own re-export rather than a second declaration of
+// `dig-chainsource-interface`: the provider descriptor must be the SAME type `chia-query` compiled
+// against, and a separately declared version could resolve to a different line of the crate and
+// fail to unify (§2.4b's split-family trap).
+use chia_query::provider_registry::interface::{ProviderId, ProviderInfo, ProviderKind};
 
 use super::fallback::{
     ChainFallback, ChainPeerTier, CoinsetFallback, FallbackCoin, FallbackCoinSpend,
@@ -166,6 +171,13 @@ pub trait SignedBundlePusher: Send + Sync {
     async fn push(&self, bundle: &SpendBundle) -> Result<PushOutcome>;
 }
 
+/// The stable identifier this node's chain source registers itself under.
+///
+/// Named once rather than written at the construction site: an identifier a registry orders and
+/// de-duplicates on is a contract with whatever reads it, and two spellings of it are two
+/// providers.
+pub const CHAIN_SOURCE_PROVIDER_ID: &str = "dig-node/chia-query";
+
 /// A shared, lazily-built `chia_query` client serving the wallet's chain reads and its push.
 ///
 /// Also the wallet's [`ChainFallback`] tier, so a balance, a coin read and a push all speak to ONE
@@ -240,6 +252,62 @@ impl ChainTransport {
         self.client().await
     }
 
+    /// This transport's chain reads presented as the canonical
+    /// [`ChainSource`](chia_query::provider_registry::interface::ChainSource) — the trait every DIG consumer of
+    /// chain state depends on.
+    ///
+    /// It is a VIEW of the one shared client, never a second one. `chia-query` already implements
+    /// the trait ([`ChiaQueryProvider`]), so nothing here re-derives a chain read; building a
+    /// separate source for a new consumer is what gave a live node two independent peer pools with
+    /// two notions of the peak (dig_ecosystem#2761), and this method exists so the next consumer
+    /// cannot repeat it.
+    ///
+    /// `handle` MUST belong to a **multi-thread** tokio runtime: the returned provider is
+    /// synchronous and bridges each read with `run_blocking`, which fails closed with a clear
+    /// error on a current-thread runtime rather than deadlocking. An async caller must additionally
+    /// wrap each read in [`tokio::task::spawn_blocking`] so a blocking read never occupies an async
+    /// worker.
+    ///
+    /// # Errors
+    ///
+    /// The lazy client build — i.e. this node could not reach a chain at all. Not cached, so a
+    /// later call tries again.
+    pub async fn chain_source(
+        &self,
+        handle: tokio::runtime::Handle,
+    ) -> Result<chia_query::provider_registry::ChiaQueryProvider> {
+        let client = self.shared_client().await?;
+        Ok(chia_query::provider_registry::ChiaQueryProvider::new(
+            client,
+            handle,
+            ProviderInfo {
+                id: ProviderId(std::borrow::Cow::Borrowed(CHAIN_SOURCE_PROVIDER_ID)),
+                // `Custom` rather than `LocalNode`, because the router behind it is not this
+                // node's peers: with `coinset_fallback_enabled` — the default every production
+                // fabric is built from — it asks `api.coinset.org` FIRST and consults the peers
+                // this node dialled only when that read fails. It is not a race, and the peers do
+                // not corroborate the answer.
+                //
+                // So this provider's ANSWERS are the oracle's whenever the oracle is reachable,
+                // and a peer-tracked value with no agreement step when it is not. It belongs to
+                // the oracle's independence group for exactly that reason
+                // (`super::sources::independence_group_for`, which derives the group from what a
+                // fabric can REACH after registering one as its own group made a 2-of-2
+                // independent-group custody quorum satisfiable by a single HTTPS endpoint —
+                // measured on a client holding no peers at all).
+                //
+                // Nothing registers this provider in a `ProviderRegistry` today. Anything that
+                // does MUST take its group from `ChiaQueryProvider::independence_group()` rather
+                // than from this `kind`, or it repeats that incident.
+                kind: ProviderKind::Custom,
+                priority: 0,
+                // Answers are believed because the tier that produced them was believed, not
+                // because they carry a proof this node checked.
+                trustless: false,
+            },
+        ))
+    }
+
     /// A transport that already HAS its client, so nothing in the test dials.
     ///
     /// Seeding the client is what makes pointer identity assertable: a consumer that quietly built
@@ -284,7 +352,15 @@ impl ChainTransport {
     ///
     /// A transport with no peer reads — a bare one built by a test — still falls through to the
     /// router. That path is the oracle-first one, and it is documented as such rather than
-    /// silently retained: nothing in production takes it.
+    /// silently retained: no WALLET read in production takes it.
+    ///
+    /// The router's peak IS taken in production elsewhere, and by exactly one caller: the
+    /// collateral census reads through [`Self::chain_source`], which hands `ChiaQueryProvider`
+    /// straight to the router (dig-node#400). Its peak is therefore the oracle-first one described
+    /// above — uncorroborated — and it gates that path's reorg-finality check. Extending the
+    /// corroborated reads to cover the census's population read is tracked as a sequencing
+    /// constraint against the mirror-coin mint; until it lands, no surface may describe the
+    /// census's peak as agreed across this node's peers.
     pub async fn peak_height(&self) -> Result<Option<u32>> {
         if let Some(peers) = &self.peer_reads {
             return Ok(peers.peak_height().await);

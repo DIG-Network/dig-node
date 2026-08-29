@@ -7666,6 +7666,71 @@ authoritative** — not by `control.collateral.requirement`, not by `dig.getColl
 into a verification. Every field of such a record parses, so nothing downstream would question its
 figures.
 
+### 24.8a. Producing a record: the census
+
+A record for an epoch after the first MUST be produced by counting the chain, and by nothing else.
+
+The node MUST obtain the three census inputs from `dig_mirror_coin::census`, at the height
+`dig_mirror_coin::census_height` derives for that epoch — the first transaction block at or after
+the epoch's start instant — and MUST derive the record with
+`dig_mirror_collateral::EpochRecord::advance`. It MUST NOT restate either. A census height chosen
+any other way is a fork, because every node must reach the same height without coordinating.
+
+The chain reads MUST be served through a `dig_chainsource_interface::ChainSource`. The node MUST NOT
+open a second connection to the chain for this purpose: it takes a `ChainSource` view of the one
+transport that already serves its wallet reads, so a node holds ONE peer pool.
+
+**One pool is not one notion of the peak, and this node has three.** The wallet's peak is settled by
+NC-12 agreement across the full nodes this node dialled itself, and their failure to agree is
+reported as not knowing. The census's peak is not: it is read through the `ChainSource`, whose router
+asks `api.coinset.org` FIRST and consults this node's peers only when that read fails — so on a
+reachable oracle the census's peak is one HTTPS endpoint's answer, and when the oracle is
+unreachable it is a peer-tracked value carried with NO agreement step. It is that peak the
+`CENSUS_FINALITY_DEPTH_BLOCKS` refusal below is measured against.
+
+A census provider MUST therefore be classified by what it can REACH rather than by its type: a
+fabric that can fall through to the oracle shares the oracle's independence group, however many
+peers it holds. A node MUST NOT count such a provider as an independent chain source, and MUST NOT
+describe the census's peak as corroborated.
+
+**The walk is sequential.** Epoch *n* is derived from epoch *n-1*, so the node computes each
+intervening epoch in order from the newest record it holds. It MUST NOT skip forward to the current
+epoch, and it MUST NOT derive a successor from a record whose `protocol_version` exceeds what the
+build implements — the ceiling of §24.8 applies at this boundary too.
+
+**A census that could not be taken MUST record nothing.** Each refusal is reported with its own
+reason and its own remedy:
+
+| the census stopped because | remedy |
+|---|---|
+| a chain read could not be answered | reach a chain source |
+| the chain has not yet reached the epoch's start | wait for a block |
+| the census height is not yet buried to `CENSUS_FINALITY_DEPTH_BLOCKS` | wait |
+| the candidate population exceeds what can be authenticated | refused whole; never censused as a prefix |
+| the predecessor record is absent, unreadable, or names an unimplemented ruleset | that epoch first |
+| the store already holds a DIFFERENT record for the computed epoch | the held record stands |
+| the controller refused to derive the record from the census | its own reason, reported verbatim: the census is not the successor epoch, no activation row governs that epoch, or the version is unimplemented |
+| the record store could not be read or written | the state directory |
+| the store's own line for the computed epoch cannot be read | repair or remove that line |
+
+The last of these MUST be detected BEFORE the chain is read. An unreadable line is invisible to the
+scan that answers "the newest epoch held", so a node that did not check would recensus that epoch on
+every attempt — the whole population and its spend executions — only to fail at the write, forever.
+
+None of these MUST EVER become a figure — not a zero, not a default, and not the neighbouring
+epoch's answer. The store's own absence then surfaces through §24.2's `unknown` with its reason,
+which is the only answer such a node can defend.
+
+**A census that counted nothing MUST say what it examined.** A `stores` of zero is produced
+identically by an empty network, by a source answering at a puzzle hash other than the one it was
+asked for, and by a source that could not supply the creating spends its candidates needed. Those
+call for opposite responses and only the first is a fact about the network, so for every epoch it
+records a node MUST report the census's examined count and its per-rule exclusion counts alongside
+the recorded figure. Reporting the figure alone renders a broken instrument as an answer.
+
+Re-attempting MUST be cheap in the steady state: a node whose store already holds the target epoch
+performs **no chain read at all**.
+
 ### 24.9. Serving an epoch to a peer
 
 `dig.getCollateralEpoch` is an OPEN node method taking `{ epoch }` and returning `{ record }` or

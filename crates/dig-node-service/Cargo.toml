@@ -101,6 +101,17 @@ dig-node-control-interface = "0.24"
 # comes out of this crate so that a second derivation cannot drift from the consensus one.
 dig-mirror-collateral = "0.3"
 
+# The chain half of the same model: `census` counts the collateralised network at a block height
+# and hands `dig-mirror-collateral` the three integers its controller consumes (dig-node#400).
+# Without it a node could only ever record epoch 1, which is derivable from nothing.
+dig-mirror-coin = "0.7"
+
+# The canonical `ChainSource` trait `dig-mirror-coin`'s census is generic over. Declared, not
+# implemented: `chia-query` already provides the implementation this node uses
+# (`ChiaQueryProvider`), reached through `dig-wallet`'s one shared chain transport. Caret-matched
+# to the line `chia-query` and `dig-mirror-coin` compiled against, so all three unify on one crate.
+dig-chainsource-interface = "0.3"
+
 # The OS CSPRNG for all authorization material — the control token, pairing ids/tokens
 # (§7), and the relay loop-probe id (`control::fill_random`). Wraps `getrandom(2)` /
 # `/dev/urandom` on Unix and `BCryptGenRandom` on Windows, one code path on every
@@ -256,6 +267,11 @@ dig-wallet = { path = "../dig-wallet" }
 # (its series skips 0.32 -> 0.42) and pins the primitives to its own version, so it cannot
 # sit on the chia-wallet-sdk ceiling without re-splitting the family (dig_ecosystem#3161).
 chia-bls = "0.36.1"
+# The census-runner unit tests implement `ChainSource` over a double, whose method signatures are
+# spelled in `chia-protocol` types. The SAME 0.36.1 line `dig-chainsource-interface` and
+# `dig-mirror-coin` compile against -- a second line would make the double's `Bytes32` a different
+# type from the trait's and the impl would not apply.
+chia-protocol = "0.36.1"
 hex = "0.4"
 # The crate's own integration tests need its test-construction seams (the `testkit` feature above).
 # Depending on self with the feature on is what keeps those seams available to `tests/` while staying

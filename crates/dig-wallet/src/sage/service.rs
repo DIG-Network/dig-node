@@ -121,6 +121,15 @@ pub struct WalletService {
     /// within one puzzle-hash poll; when addresses are already subscribed, additional
     /// registrations take effect at the next reconnect (dig_ecosystem#2826).
     pub watchlist: WatchRegistry,
+    /// The node's ONE chain transport, exposed so a consumer outside the wallet can take a
+    /// [`ChainSource`](chia_query::provider_registry::interface::ChainSource) view of it
+    /// ([`ChainTransport::chain_source`]) instead of building a second client.
+    ///
+    /// Exposed rather than duplicated on purpose. The collateral census (dig-node#400) needs chain
+    /// reads, and every other way of giving it some would have added a second peer pool with its
+    /// own notion of the peak — the defect dig_ecosystem#2761 removed. Sharing the transport keeps
+    /// exactly one.
+    pub chain: Arc<ChainTransport>,
 }
 
 impl WalletService {
@@ -322,6 +331,7 @@ impl WalletService {
             cert,
             sync,
             watchlist,
+            chain,
         }
     }
 }
