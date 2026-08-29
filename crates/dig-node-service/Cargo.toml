@@ -272,6 +272,19 @@ chia-bls = "0.36.1"
 # `dig-mirror-coin` compile against -- a second line would make the double's `Bytes32` a different
 # type from the trait's and the impl would not apply.
 chia-protocol = "0.36.1"
+# The degraded-source census probe (dig-node#405) builds its mirror coins with genuine CAT spends,
+# reusing `dig-mirror-coin`'s own published test support verbatim (`tests/support/mod.rs`). A
+# hand-written `CoinRecord` cannot exercise the authentication path the census runs, so the probe
+# would assert its property against a fixture that could not exhibit it.
+#
+# Every version here is the one `dig-mirror-coin` 0.7 itself compiles against, and the whole set
+# moves together: the chia ceiling is not one number, and a crate split across two chia lines
+# compiles only until something crosses a public signature.
+chia-puzzle-types = "0.36.1"
+chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-types = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+clvm-utils = "0.36.1"
+num-bigint = "0.4.6"
 hex = "0.4"
 # The crate's own integration tests need its test-construction seams (the `testkit` feature above).
 # Depending on self with the feature on is what keeps those seams available to `tests/` while staying
