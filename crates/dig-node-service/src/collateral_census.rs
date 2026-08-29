@@ -41,7 +41,9 @@
 use dig_chainsource_interface::ChainSource;
 use dig_mirror_coin::{census, census_height, CensusOutcome, Exclusions, MirrorError};
 
-use crate::collateral::{EpochRecordStore, PutOutcome, StoredEpoch, StoredRecord, GENESIS_EPOCH};
+use crate::collateral::{
+    EpochRecordStore, PutOutcome, RecordProvenance, StoredEpoch, StoredRecord, GENESIS_EPOCH,
+};
 
 /// Why a catch-up stopped before reaching the target epoch.
 ///
@@ -315,7 +317,21 @@ fn refresh<S: ChainSource>(
     store: &EpochRecordStore,
     epoch: u64,
 ) -> Result<Option<CensusObservation>, CensusStop> {
+    // Epoch 1 is derived from NOTHING and was taken at no height, so there is no census to repeat
+    // and no predecessor to derive one from. Without this guard the walk re-entered `record_one`
+    // for it on every pass and stopped at `PriorEpochMissing { epoch: 0 }` — a stop naming an epoch
+    // that cannot exist, reported forever, on the one node state that is always correct.
+    if epoch <= GENESIS_EPOCH {
+        return Ok(None);
+    }
+
     let held_stores = match store.get(epoch) {
+        // A bootstrap record is not a census either, and `put` would refuse to supersede it
+        // (`own_recensus_supersedes` demands `Censused` on BOTH sides). Re-censusing it would spend
+        // a whole population read to reach a refusal.
+        StoredEpoch::Found(held) if !matches!(held.provenance, RecordProvenance::Censused) => {
+            return Ok(None)
+        }
         StoredEpoch::Found(held) => held.record.census.stores,
         // Not a state this function is reached in — `catch_up` only calls it for an epoch
         // `highest_recorded` just reported — and answered honestly rather than assumed away.
@@ -625,6 +641,13 @@ mod tests {
         }
     }
 
+    /// A plausible consensus record for `epoch`, for seeding a store the walk must then re-census.
+    fn record_for(epoch: u64) -> dig_mirror_collateral::EpochRecord {
+        let mut rec = EpochRecord::bootstrap();
+        rec.epoch = epoch;
+        rec
+    }
+
     /// A store in a fresh temp dir, holding only the genesis record the bring-up writes.
     fn seeded_store(name: &str) -> (EpochRecordStore, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -688,10 +711,17 @@ mod tests {
     /// independent ways — the counter, and a stop that could only have come from attempting it.
     #[test]
     fn a_store_already_at_the_target_recensuses_it() {
+        // The target is epoch 2, NOT genesis. Genesis is derived from nothing and is deliberately
+        // never re-censused (see `refresh`), so a fixture aimed at it asserts the guard rather than
+        // the repair and reads as "no chain read" for the wrong reason — which is exactly how this
+        // test first passed against a walk that could not repair anything.
         let (store, dir) = seeded_store("current");
+        store
+            .put(&StoredRecord::censused(record_for(2), 1_002))
+            .expect("seed epoch 2");
         let source = UnreachableSource::new();
 
-        let outcome = catch_up(&source, &store, GENESIS_EPOCH);
+        let outcome = catch_up(&source, &store, 2);
 
         assert_eq!(outcome.recorded, Vec::<CensusObservation>::new());
         assert_eq!(outcome.superseded, None, "nothing was repaired to report");
@@ -701,11 +731,30 @@ mod tests {
         );
         match outcome.stopped {
             Some(CensusStop::ChainUnavailable { epoch, .. }) => assert_eq!(
-                epoch, GENESIS_EPOCH,
+                epoch, 2,
                 "the re-census must be of the TARGET epoch and of no earlier one"
             ),
             other => panic!("expected the refused read to be reported, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **Genesis is never re-censused, and never reports a stop for an epoch that cannot exist.**
+    ///
+    /// Epoch 1 is derived from nothing, so there is no census to repeat and no predecessor to
+    /// derive one from. Before the guard in `refresh`, a node whose target was genesis re-entered
+    /// the census on every pass and stopped at `PriorEpochMissing { epoch: 0 }` — forever, on the
+    /// one node state that is unambiguously correct.
+    #[test]
+    fn the_genesis_epoch_is_never_re_censused() {
+        let (store, dir) = seeded_store("genesis");
+        let source = UnreachableSource::new();
+
+        let outcome = catch_up(&source, &store, GENESIS_EPOCH);
+
+        assert_eq!(outcome.stopped, None, "genesis reported a stop: {outcome:?}");
+        assert_eq!(source.reads(), 0, "genesis was re-censused");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -723,10 +772,8 @@ mod tests {
     fn no_epoch_before_the_target_is_ever_re_censused() {
         let (store, dir) = seeded_store("history-once");
         for epoch in 2..=3u64 {
-            let mut rec = dig_mirror_collateral::EpochRecord::bootstrap();
-            rec.epoch = epoch;
             store
-                .put(&StoredRecord::censused(rec, 1_000 + epoch as u32))
+                .put(&StoredRecord::censused(record_for(epoch), 1_000 + epoch as u32))
                 .expect("seed");
         }
         let source = UnreachableSource::new();

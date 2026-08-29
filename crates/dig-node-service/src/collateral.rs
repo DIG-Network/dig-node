@@ -1057,17 +1057,34 @@ mod tests {
         assert_eq!(store.put(&degraded).expect("put"), PutOutcome::Written);
 
         let healthy = StoredRecord::censused(record(9, 1_000_000, 1_000, 42), 7_000);
-        assert_ne!(
-            healthy.record.required_per_store_dig_base_units,
-            degraded.record.required_per_store_dig_base_units,
-            "the fixture must move the figure the defect is about, not merely the count"
-        );
         assert_eq!(store.put(&healthy).expect("put"), PutOutcome::Written);
 
         match store.get(9) {
             StoredEpoch::Found(rec) => assert_eq!(rec.record, healthy.record),
             other => panic!("the repaired record must be the one served, got {other:?}"),
         }
+
+        // And the repair MATTERS, shown rather than asserted about.
+        //
+        // `required_per_store` is a function of the multiplier and the OWNER count, so an
+        // under-counted `stores` does not move the figure in its own epoch — it moves the
+        // SUCCESSOR's, because `advance` reads the seed's census to derive the next multiplier.
+        // That is precisely why sealing one was permanent rather than merely wrong for a week: the
+        // low count propagates into every epoch derived from it. Advancing both records with the
+        // SAME following census isolates the seed as the only difference.
+        let next = EpochCensus {
+            epoch: 10,
+            stores: 60,
+            owners: 1_100,
+            locked: 0,
+        };
+        let from_undercount = degraded.record.advance(next).expect("advance the undercount");
+        let from_repair = healthy.record.advance(next).expect("advance the repair");
+        assert_ne!(
+            from_undercount.required_per_store_dig_base_units,
+            from_repair.required_per_store_dig_base_units,
+            "a sealed under-count must be shown to change what the next epoch charges, or this              test pins a bookkeeping change with no consequence"
+        );
     }
 
     /// The other side of the ladder, asserted separately rather than as the negation of the test
