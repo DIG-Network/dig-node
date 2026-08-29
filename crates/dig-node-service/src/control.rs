@@ -4428,13 +4428,13 @@ mod tests {
 
         // The chain reference carries its observed/expected flag, so an INTENDED coin id can never
         // be rendered as an on-chain fact.
-        assert_eq!(
+        assert!(
             decoded.spends[0]
                 .chain_reference
                 .as_ref()
                 .expect("a confirmed row has a reference")
                 .confirmed,
-            true
+            "a confirmed row's coin id is an OBSERVED fact and must say so"
         );
         assert!(
             !decoded.spends[2]
