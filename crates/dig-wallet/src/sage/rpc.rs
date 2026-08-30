@@ -7225,7 +7225,7 @@ mod tests {
     /// both, which is what makes `complete` load-bearing here rather than decorative.
     const PAGE_FIXTURE: [&str; 4] = ["aa11", "bb22", "cc33", "dd44"];
 
-    async fn db_with_four_unspent_coins() -> Db {
+    async fn db_with_four_unspent_coins() -> WalletDb {
         let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
         for (i, id) in PAGE_FIXTURE.iter().enumerate() {
             db.upsert_coin(&coin_at_ph(id, &owned_ph(), 10 + i as u64, Some(1), None))
