@@ -859,6 +859,68 @@ mod tests {
         }
     }
 
+    /// A successful broadcast records its submission UNCONDITIONALLY.
+    ///
+    /// Asserted STRUCTURALLY, over this file's own source, for the same reason as the guard above:
+    /// reaching `sign_and_broadcast` at runtime needs an opened `OperatorWallet` and a real signed
+    /// `MirrorSpends`, and the property is about a branch that must not exist rather than a value.
+    /// The behaviour of the recording itself IS asserted at runtime, at the journal seam, by
+    /// `funding::tests::a_spend_with_no_derivable_target_still_withholds_its_funding_coins`.
+    ///
+    /// **Catches** the exact shape this replaced: recording the submission only in the arm where a
+    /// target coin was derivable. A mirror create is precisely the case where it is not, so that
+    /// branch made `committed_funding_coin_ids` permanently empty for creates — the reservation was
+    /// never wrong, it was never FED — and two creates in one confirmation window re-selected the
+    /// same coins. `intended` is now carried into `Submission` as data, so there is nowhere to drop
+    /// it; the guard is what keeps a future edit from reintroducing the branch.
+    #[test]
+    fn a_successful_broadcast_records_its_submission_without_branching_on_the_target() {
+        let source = include_str!("lifecycle.rs");
+        assert!(
+            source.contains(concat!("self.journal.", "submitted(")),
+            "the broadcast path must journal its submission at all"
+        );
+        assert_eq!(
+            source.matches(concat!("self.journal.", "submitted(")).count(),
+            1,
+            "one unconditional recording; a second call site is how one branch starts recording \
+             the consumed coins and another stops"
+        );
+        for conditional in [
+            concat!("match ", "intended"),
+            concat!("Some(", "intended_coin_id) =>"),
+        ] {
+            assert!(
+                !source.contains(conditional),
+                "`{conditional}` branches the recording on whether a target coin is derivable, \
+                 which is what left every create contributing an empty funding-coin list"
+            );
+        }
+    }
+
+    /// The guard above is looking at real text and WOULD fail if the branch returned.
+    ///
+    /// Without this, a needle that matches no possible spelling — or an `include_str!` that stopped
+    /// resolving to the file holding the broadcast path — leaves a guard that passes forever.
+    #[test]
+    fn the_unconditional_recording_guard_can_actually_fail() {
+        let planted = concat!("match ", "intended {\n    Some(", "intended_coin_id) => {}\n}");
+        for conditional in [
+            concat!("match ", "intended"),
+            concat!("Some(", "intended_coin_id) =>"),
+        ] {
+            assert!(
+                planted.contains(conditional),
+                "{conditional} is the spelling the reintroduced branch would write"
+            );
+        }
+        assert!(
+            include_str!("lifecycle.rs").contains("fn sign_and_broadcast"),
+            "the guard must read the file that owns the broadcast path; a wrong include makes it \
+             pass forever"
+        );
+    }
+
     /// `publish` carries the report's own figures across, and does not recompute either.
     ///
     /// The fixture's `locked_dig_base_units` is deliberately INCONSISTENT with its `states` — a
