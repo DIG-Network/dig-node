@@ -57,8 +57,8 @@
 //! **What a create still needs before one can be attempted.** A mirror advertises WHERE its store
 //! can be fetched from, and `dig_mirror_coin::create` refuses an advertisement with no URL. This
 //! node has no configured public name yet, so [`NodeMirrorEffects`] is handed an empty URL set and
-//! `create` refuses by name, ahead of any chain read. That is the one remaining gap, and it is an
-//! advertisement question rather than a funding one.
+//! `create` refuses by name, ahead of any chain read. That is the one remaining gap, it is an
+//! advertisement question rather than a funding one, and it is dig-node#426.
 //!
 //! # Nothing here relaxes the audit shape
 //!

@@ -2788,7 +2788,7 @@ fn spawn_mirror_passes(
                             // fetched from, and this node has no configured public name to
                             // advertise — so `create` refuses by name rather than publishing an
                             // advertisement nobody can act on. That is an advertisement gap, not a
-                            // funding one; the operator-scoped selector behind it is live.
+                            // funding one (dig-node#426); the selector behind it is live.
                             Vec::new(),
                             &source,
                             owner_puzzle_hash,

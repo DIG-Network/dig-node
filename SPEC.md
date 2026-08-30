@@ -7962,7 +7962,7 @@ itself (SYSTEM.md §4.1).
 >   audit record, never funding a smaller coin (dig-node#421). What is still missing is the
 >   advertisement: `dig_mirror_coin::create` requires at least one URL its store can be fetched
 >   from, this node has no configured public name, and `NodeMirrorEffects::create` therefore refuses
->   by name BEFORE any chain read. **RECLAIMS are implemented** and are supported at `fee = 0` with
+>   by name BEFORE any chain read (dig-node#426). **RECLAIMS are implemented** and are supported at `fee = 0` with
 >   no fee coins, which is §25.4.4 — and are never gated on any funding read, including the
 >   committed-coin read.
 > * **§25.6's DHT pointer is not attached.** `ProviderRecord::unverified_mirror_coin_id` lives in
