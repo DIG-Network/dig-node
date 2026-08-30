@@ -203,6 +203,24 @@ impl<E: MirrorEffects> PassRunner<E> {
         }
     }
 
+    /// Adopt an existing presence tracker, so §25.5's debounce survives across runners.
+    ///
+    /// A production scheduler rebuilds its [`MirrorEffects`] every round — the chain source is
+    /// per-round and does not outlive it — so the runner is rebuilt too. Without this, each round
+    /// would begin with a FRESH tracker, and a fresh tracker suppresses every capsule it has ever
+    /// seen exactly once: no bond would ever settle, and the node would never create a coin while
+    /// looking like it was reconciling normally. Carrying the tracker is what makes the debounce a
+    /// window in wall-clock time rather than a window per runner.
+    pub fn with_presence(mut self, presence: super::presence::PresenceTracker) -> Self {
+        self.presence = presence;
+        self
+    }
+
+    /// Hand the presence tracker back, for the next round's runner.
+    pub fn into_presence(self) -> super::presence::PresenceTracker {
+        self.presence
+    }
+
     /// Use a non-default settling window (§25.5).
     pub fn with_settling_window_ms(mut self, window_ms: u64) -> Self {
         self.settling_window_ms = window_ms;

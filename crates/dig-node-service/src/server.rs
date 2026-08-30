@@ -119,6 +119,12 @@ pub struct AppState {
     /// re-implemented — it is already a per-[`RequestorId`] token-bucket registry with the
     /// identity-cycling table bound this needs.
     control_ingress: Arc<dig_node_core::rate_limit::MissRateLimiter>,
+    /// §25.8's bond observation, as the last mirror pass published it (dig-node#412 step 7).
+    ///
+    /// Held on the shared state rather than rebuilt per request precisely so the control surface
+    /// cannot be made to do chain work by asking: the mirror pass observes on its own round timer
+    /// and writes here, and `control.mirror.bondStates` only ever reads.
+    mirror_bonds: crate::mirror::lifecycle::BondSnapshot,
 }
 
 /// Per-source burst for OPEN control reads (dig_ecosystem#3051): how many token-less reads one
@@ -588,6 +594,7 @@ pub async fn build_state(config: &Config) -> AppState {
         wallet: wallet_service.backend,
         wallet_cert: wallet_service.cert,
         wallet_chain: wallet_service.chain,
+        mirror_bonds: crate::mirror::lifecycle::new_snapshot(),
         control_ingress: Arc::new(dig_node_core::rate_limit::MissRateLimiter::new(
             CONTROL_INGRESS_BURST,
             CONTROL_INGRESS_REFILL_PER_SEC,
@@ -669,6 +676,7 @@ fn control_ctx(state: &AppState) -> ControlCtx {
         sync_available: state.sync_available,
         pairings: state.pairings.clone(),
         wallet: state.wallet.clone(),
+        mirror_bonds: state.mirror_bonds.clone(),
     }
 }
 
@@ -2125,6 +2133,13 @@ where
     // precisely so nothing dials.
     if config.enable_chain_sync {
         spawn_collateral_census(state.wallet_chain.clone());
+        spawn_mirror_passes(
+            state.node.clone(),
+            state.wallet.clone(),
+            state.wallet_chain.clone(),
+            state.mirror_bonds.clone(),
+            config.enable_live_broadcast,
+        );
     }
 
     // §14 autonomous sync (#213): bring up the L7 peer network — the connected peer
@@ -2631,6 +2646,181 @@ pub(crate) fn log_census_observation(observed: &crate::collateral_census::Census
 /// chain view cannot stay sealed (dig-node#405).
 const COLLATERAL_CENSUS_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(dig_constants::MIRROR_ROUND_LENGTH_MS as u64);
+
+/// The interval between mirror reconcile passes — §25.4's round.
+///
+/// The SAME constant the collateral census uses, and deliberately so: a pass prices its creates from
+/// the epoch record the census writes, so a mirror round that ran faster than the census would keep
+/// re-deriving an answer from a record that had not moved.
+const MIRROR_PASS_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(dig_constants::MIRROR_ROUND_LENGTH_MS as u64);
+
+/// Run the §25 mirror-coin reconcile pass on the round timer, and publish what each pass observed.
+///
+/// Detached and best-effort, exactly like the collateral census beside it: a node that cannot
+/// observe still serves content, and every outcome is logged rather than swallowed.
+///
+/// # The operator wallet is opened ONCE, here, and never again on a read path
+///
+/// [`crate::mirror::lifecycle::open_signer`] unseals the §16.4 seed under the device key a single
+/// time at bring-up. The public puzzle hash it yields is held for the life of the task and used by
+/// every pass, so no request — and no later edit to a request path — can cause a second unseal. A
+/// `Locked` or `Orphaned` wallet yields no signer, and the lifecycle then OBSERVES without spending
+/// rather than degrading into a node that reports nothing.
+///
+/// # Every pass re-reads everything; nothing is carried between rounds but the presence tracker
+///
+/// The epoch, the requirement and the margin are read per pass for the same reason the census reads
+/// its target per pass: this task outlives an epoch boundary, and a value captured at start-up would
+/// leave the node permanently one epoch behind from the moment the schedule rolled over. The
+/// [`PassRunner`](crate::mirror::runner::PassRunner) is long-lived only because §25.5's presence
+/// debounce is, by definition, memory between rounds — so it is built once, outside the loop.
+fn spawn_mirror_passes(
+    node: Arc<dig_node_core::Node>,
+    wallet: Arc<dig_wallet::sage::rpc::WalletBackend>,
+    chain: Arc<dig_wallet::sage::chain::ChainTransport>,
+    snapshot: crate::mirror::lifecycle::BondSnapshot,
+    live_broadcast: bool,
+) {
+    use crate::collateral::{current_epoch_now, CurrentEpoch, EpochRecordStore};
+    use crate::mirror::lifecycle::{self, NodeMirrorEffects, SpendCapability};
+    use crate::mirror::runner::{PassContext, PassRunner};
+
+    tokio::spawn(async move {
+        let paths = dig_wallet::autoseed::default_paths();
+        let (signer, capability) = lifecycle::open_signer(&paths, live_broadcast);
+
+        // The owner puzzle hash comes from the SIGNER when there is one, so the key a spend is built
+        // for and the address its bonds are observed under cannot be two different values. Without a
+        // signer it is derived on its own — a public value, and the observation half needs it even
+        // when nothing may spend.
+        let Some(owner_puzzle_hash) = signer
+            .as_ref()
+            .map(|s| s.owner_puzzle_hash())
+            .or_else(|| dig_wallet::operator_wallet::operator_puzzle_hash(&paths))
+        else {
+            tracing::warn!(
+                target: "mirror",
+                capability = ?capability,
+                "no operator wallet is available, so this node cannot observe or bond its own \
+                 capsules; SPEC.md §25.8 reports unknown until one exists"
+            );
+            return;
+        };
+
+        match capability {
+            SpendCapability::Available => tracing::info!(
+                target: "mirror",
+                "the mirror lifecycle is live: this node may create and reclaim collateral"
+            ),
+            SpendCapability::BroadcastDisabled => tracing::info!(
+                target: "mirror",
+                "the mirror lifecycle OBSERVES only: DIG_WALLET_ENABLE_LIVE_BROADCAST is off, the \
+                 money-safe default, so no mirror spend is sent"
+            ),
+            SpendCapability::WalletUnavailable => tracing::warn!(
+                target: "mirror",
+                "the mirror lifecycle OBSERVES only: the operator wallet (SPEC.md §16.4) did not open"
+            ),
+        }
+
+        let journal = lifecycle::journal();
+        let mut presence = crate::mirror::presence::PresenceTracker::new();
+
+        loop {
+            let epoch = match current_epoch_now() {
+                CurrentEpoch::Final(epoch) => epoch as i64,
+                // No epoch in force means no requirement and no amount, so a pass could plan
+                // nothing. Waiting is the whole action.
+                _ => {
+                    tokio::time::sleep(MIRROR_PASS_INTERVAL).await;
+                    continue;
+                }
+            };
+            let requirement = crate::collateral::requirement(
+                &EpochRecordStore::in_state_dir(),
+                current_epoch_now(),
+            );
+            let config = crate::collateral::CollateralConfig::load();
+
+            // The two asynchronous readings, taken BEFORE the pass so the pass itself is
+            // synchronous and sees one disk state and one balance throughout.
+            let capsules = lifecycle::observe_disk(&node).await;
+            let dig_balance = lifecycle::observe_dig_balance(&wallet, owner_puzzle_hash).await;
+
+            match chain.chain_source(tokio::runtime::Handle::current()).await {
+                Ok(source) => {
+                    let runtime = tokio::runtime::Handle::current();
+                    let signer_ref = signer.as_ref();
+                    let ctx = PassContext {
+                        now_unix_ms: lifecycle::now_unix_ms(),
+                        current_epoch: epoch,
+                        requirement,
+                        margin_bp: config.margin_bp,
+                        creates_enabled: config.mirror_enabled,
+                    };
+                    // `block_in_place` rather than `spawn_blocking`: the runner borrows the signer,
+                    // the journal and the chain source, none of which is `'static`, and moving them
+                    // into a task would mean opening the wallet per pass — the second unseal route
+                    // this design exists to remove.
+                    let outcome = tokio::task::block_in_place(|| {
+                        let effects = NodeMirrorEffects::new(
+                            capsules,
+                            dig_balance,
+                            &source,
+                            owner_puzzle_hash,
+                            signer_ref,
+                            &journal,
+                            None,
+                            runtime,
+                        );
+                        let mut pass = PassRunner::new(
+                            effects,
+                            crate::spend_audit::SpendLog::in_state_dir(),
+                        )
+                        .with_presence(std::mem::take(&mut presence));
+                        let report = pass.run(&ctx);
+                        (report, pass.into_presence())
+                    });
+                    let (outcome, carried) = outcome;
+                    presence = carried;
+
+                    match outcome {
+                        Ok(report) => {
+                            lifecycle::publish(&snapshot, &report, epoch);
+                            tracing::debug!(
+                                target: "mirror",
+                                epoch,
+                                bonds = report.states.len(),
+                                locked_dig_base_units = report.locked_dig_base_units,
+                                reclaimed = report.reclaimed.len(),
+                                created = report.created.len(),
+                                "mirror pass complete"
+                            );
+                        }
+                        // NOT published. An observation that failed is not a smaller observation:
+                        // publishing an empty one would tell an operator this node holds no bonds
+                        // and locks no money, which is a definite claim it is in no position to
+                        // make. The surface keeps saying `unknown`, and any previous pass's answer
+                        // is left in place rather than replaced by a worse one.
+                        Err(e) => tracing::warn!(
+                            target: "mirror",
+                            error = %e,
+                            "the mirror pass could not observe; SPEC.md §25.8 keeps its previous answer"
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "mirror",
+                    error = %e,
+                    "no chain source for the mirror pass this round"
+                ),
+            }
+
+            tokio::time::sleep(MIRROR_PASS_INTERVAL).await;
+        }
+    });
+}
 
 /// Run the collateral census on a timer, against the node's own chain transport.
 ///

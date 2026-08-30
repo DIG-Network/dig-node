@@ -411,6 +411,8 @@ pub fn publish(snapshot: &BondSnapshot, report: &PassReport, epoch: i64) {
 /// is NOT applied here — [`super::runner::split_by_provenance`] owns it, and applying it early would
 /// put §25.1's exclusion in a second place.
 pub async fn observe_disk(node: &Node) -> Result<Vec<ObservedCapsule>, PassError> {
+    use dig_node_core::CapsuleStore as _;
+
     let cached = node
         .cache_list_cached()
         .await
@@ -438,6 +440,17 @@ pub async fn observe_dig_balance(
         .dig_balance_base_units(owner_puzzle_hash)
         .await
         .ok_or_else(|| PassError::Wallet("the operator wallet's $DIG balance is unreadable".into()))
+}
+
+/// Wall-clock milliseconds, for §25.5's presence window.
+///
+/// Named here rather than inlined so the ONE clock a pass reads is a named step. A pass that read
+/// the clock twice could debounce against one instant and price against another.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// A [`SpendJournal`] over the machine-wide audit log.
