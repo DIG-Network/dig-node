@@ -937,7 +937,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.collateral.requirement" => collateral_requirement(id),
         "control.collateral.margin.get" => collateral_margin_get(id),
         "control.collateral.margin.set" => collateral_margin_set(id, params),
-        "control.collateral.buffer" => collateral_buffer(id),
+        "control.collateral.buffer" => collateral_buffer(mirror_bond_observation(ctx).ok(), id),
         // The mirror-coin bond surface (dig-node#412, SPEC.md §25.8) -- one page of this
         // node's OWN bonds. Shell-owned because the bonds are the SERVICE's money, not the
         // embedded engine's.
@@ -3451,18 +3451,25 @@ fn collateral_requirement(id: Value) -> Value {
 /// (dig-node#387), and the operator's spendable balance is not a fact this node holds — it cannot
 /// know which address holds their $DIG, and a balance read of the wrong address returns a confident
 /// number about the wrong money. A zero would read as "no buffer needed" and have them post nothing.
-fn collateral_buffer(id: Value) -> Value {
+fn collateral_buffer(
+    observation: Option<crate::mirror::states::BondObservation>,
+    id: Value,
+) -> Value {
     let store = crate::collateral::EpochRecordStore::in_state_dir();
     let requirement = crate::collateral::requirement(&store, current_collateral_epoch());
     let margin_bp = crate::collateral::CollateralConfig::load().margin_bp;
 
     let answer = crate::collateral::buffer_advice(
-        // The served set and the spendable balance are both genuinely unknown to the node today, so
-        // each is passed as `None` and reported through its own reason. They are NOT approximated
-        // from the hosted-store list or from an arbitrary address: a set that merely resembles the
-        // served pairs, or a balance for the wrong address, yields a plausible wrong number on a
-        // money surface — which is worse than no number.
-        None,
+        // The served set comes from the SAME published observation `control.mirror.bondStates`
+        // serves (dig-node#412 step 7), so the two surfaces cannot disagree about how many pairs
+        // this node serves. Before that observation existed both answered `unknown`, and this one
+        // still does when the first pass has not completed: `None` here is the absence of an
+        // observation, never a served set of zero.
+        //
+        // It is the count of BOND ROWS, which is the served set — held AND relayed — and it is not
+        // approximated from the hosted-store list: a set that merely resembles the served pairs
+        // yields a plausible wrong number on a money surface, which is worse than no number.
+        observation.map(|o| o.states.len() as u64),
         &requirement,
         margin_bp,
         None,
