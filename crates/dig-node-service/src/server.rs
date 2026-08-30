@@ -2774,11 +2774,9 @@ fn spawn_mirror_passes(
                             None,
                             runtime,
                         );
-                        let mut pass = PassRunner::new(
-                            effects,
-                            crate::spend_audit::SpendLog::in_state_dir(),
-                        )
-                        .with_presence(std::mem::take(&mut presence));
+                        let mut pass =
+                            PassRunner::new(effects, crate::spend_audit::SpendLog::in_state_dir())
+                                .with_presence(std::mem::take(&mut presence));
                         let report = pass.run(&ctx);
                         (report, pass.into_presence())
                     });

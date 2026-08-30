@@ -43,7 +43,7 @@
 //! selector is scoped to its own replica instead, so using it would fund a mirror coin from the
 //! wrong wallet's coins. [`NodeMirrorEffects::create`] therefore returns a named
 //! [`PassError::Wallet`], the pass reports it in `stopped_at`, and §25.8 keeps reporting the bond
-//! as uncovered — which is true. The selector is dig-node#420.
+//! as uncovered — which is true. The selector is dig-node#421.
 //!
 //! # Nothing here relaxes the audit shape
 //!
@@ -102,7 +102,11 @@ pub fn new_snapshot() -> BondSnapshot {
 /// epoch and the requirement, and for the same reason.
 pub struct NodeMirrorEffects<'a, S: ChainSource> {
     /// The capsules on disk, WITH provenance, already read.
-    capsules: Result<Vec<ObservedCapsule>, PassError>,
+    ///
+    /// Not a `Result`: `Node::cache_list_cached` is infallible — it reports the capsules it could
+    /// read and nothing else — so there is no disk failure for this to carry. `MirrorEffects` keeps
+    /// the fallible shape because a different implementation may have one.
+    capsules: Vec<ObservedCapsule>,
     /// Spendable $DIG at the operator address, already read. `Err` defers creates, never reclaims.
     dig_balance: Result<u64, PassError>,
     /// The chain, for the owned-coin scan and for the reclaim spends.
@@ -131,7 +135,7 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
     /// Assemble the effects for one pass from readings the scheduler has already taken.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        capsules: Result<Vec<ObservedCapsule>, PassError>,
+        capsules: Vec<ObservedCapsule>,
         dig_balance: Result<u64, PassError>,
         source: &'a S,
         owner_puzzle_hash: Bytes32,
@@ -229,7 +233,7 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
 
 impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
     fn observe_disk(&self) -> Result<Vec<ObservedCapsule>, PassError> {
-        self.capsules.clone()
+        Ok(self.capsules.clone())
     }
 
     fn observe_chain(&self) -> Result<Vec<HeldMirror>, PassError> {
@@ -296,14 +300,19 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         self.sign_and_broadcast(&spends, Some(reclaimed_coin_id(&coin)))
     }
 
-    fn create(&self, bond: &Bond, _epoch: i64, amount_dig_base_units: u64) -> Result<(), PassError> {
+    fn create(
+        &self,
+        bond: &Bond,
+        _epoch: i64,
+        amount_dig_base_units: u64,
+    ) -> Result<(), PassError> {
         // REFUSED, by name, rather than funded from the wrong wallet. See the module doc: the only
         // $DIG selector this process has is scoped to the node-custodied replica, not to the
         // operator puzzle hash, and a mirror coin funded from the wrong coins is a real spend that
-        // looks successful. dig-node#420 is the operator-scoped selector.
+        // looks successful. dig-node#421 is the operator-scoped selector.
         Err(PassError::Wallet(format!(
             "creating the {} bond needs {} DIG base units selected from the OPERATOR wallet, and \
-             this node has no operator-scoped $DIG coin selector yet (dig-node#420); no spend was \
+             this node has no operator-scoped $DIG coin selector yet (dig-node#421); no spend was \
              attempted",
             bond.store_id, amount_dig_base_units
         )))
@@ -334,11 +343,8 @@ fn reclaimed_coin_id(mirror: &MirrorCoin) -> TargetCoinId {
     let puzzle_hash: Bytes32 =
         CatArgs::curry_tree_hash(dig_mirror_coin::DIG_ASSET_ID, inner).into();
 
-    let created = chia_protocol::Coin::new(
-        mirror.coin().coin_id(),
-        puzzle_hash,
-        mirror.collateral(),
-    );
+    let created =
+        chia_protocol::Coin::new(mirror.coin().coin_id(), puzzle_hash, mirror.collateral());
     TargetCoinId(hex::encode(created.coin_id()))
 }
 
@@ -368,7 +374,10 @@ impl SpendCapability {
 /// [`OperatorWallet::open`] returns `None` for BOTH §16.4 `Locked` and `Orphaned`, which is the
 /// behaviour this wants: neither state has a key it would be correct to substitute, so the honest
 /// outcome is the same in both — no signer, and a lifecycle that observes without spending.
-pub fn open_signer(paths: &WalletPaths, live_broadcast: bool) -> (Option<MirrorSigner>, SpendCapability) {
+pub fn open_signer(
+    paths: &WalletPaths,
+    live_broadcast: bool,
+) -> (Option<MirrorSigner>, SpendCapability) {
     let Some(wallet) = OperatorWallet::open(paths, dig_constants::DIG_MAINNET.genesis_challenge())
     else {
         return (None, SpendCapability::WalletUnavailable);
@@ -410,20 +419,17 @@ pub fn publish(snapshot: &BondSnapshot, report: &PassReport, epoch: i64) {
 /// Asynchronous, so it is taken by the scheduler before the pass begins. The `Held`/`Relayed` split
 /// is NOT applied here — [`super::runner::split_by_provenance`] owns it, and applying it early would
 /// put §25.1's exclusion in a second place.
-pub async fn observe_disk(node: &Node) -> Result<Vec<ObservedCapsule>, PassError> {
+pub async fn observe_disk(node: &Node) -> Vec<ObservedCapsule> {
     use dig_node_core::CapsuleStore as _;
 
-    let cached = node
-        .cache_list_cached()
+    node.cache_list_cached()
         .await
-        .map_err(|e| PassError::Disk(e.to_string()))?;
-    Ok(cached
         .into_iter()
         .map(|capsule| ObservedCapsule {
             bond: Bond::new(capsule.store_id, capsule.root),
             provenance: capsule.provenance,
         })
-        .collect())
+        .collect()
 }
 
 /// Read spendable $DIG at the OPERATOR address.
@@ -483,6 +489,79 @@ mod tests {
         assert!(!capability.may_spend());
     }
 
+    /// The needles the guard below searches for, ASSEMBLED rather than written.
+    ///
+    /// Spelled with `concat!` because a guard that searches its own file for a literal finds that
+    /// literal in itself. The first version of this test failed on its own fixture — which is a
+    /// pleasing proof that the search works, and useless as a standing guard. `concat!` runs at
+    /// compile time, so the source carries only the fragments and the guard sees only real calls.
+    fn forbidden_installations() -> [&'static str; 2] {
+        [
+            concat!(".with_", "signer("),
+            concat!(".with_", "broadcaster("),
+        ]
+    }
+
+    /// The mirror signer NEVER reaches the served wallet backend.
+    ///
+    /// Asserted STRUCTURALLY, over the crate's own source, because the property is about something
+    /// that must not exist rather than about a value: `WalletBackend`'s signer field is private and
+    /// `with_signer` is its only door, so proving the door is never opened proves
+    /// `current_signer()` still answers `None` for every caller of the served backend — which a
+    /// runtime assertion from this crate cannot reach, the accessor being private too.
+    ///
+    /// **Catches** the exact regression bring-up invites: attaching the operator signer to the
+    /// shared backend "so the wallet can spend too". That would enable that backend's whole signing
+    /// surface — including DEFAULT-ON auto-tipping — as a side effect of collateralising capsules,
+    /// an unreviewed behaviour change on a money path that no other mirror test would fail on.
+    ///
+    /// Both spellings are checked because the two halves are separately dangerous: a signer makes
+    /// the backend sign, and a broadcaster makes it send. Requiring the opening parenthesis is what
+    /// keeps prose — `signer.rs`'s module doc NAMES `WalletBackend::with_signer` — from satisfying
+    /// or breaking the guard.
+    #[test]
+    fn no_signer_or_broadcaster_is_ever_installed_on_the_served_wallet_backend() {
+        for (name, source) in [
+            ("lifecycle.rs", include_str!("lifecycle.rs")),
+            ("signer.rs", include_str!("signer.rs")),
+            ("../server.rs", include_str!("../server.rs")),
+        ] {
+            for forbidden in forbidden_installations() {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name} calls {forbidden} — the operator signer must stay inside the mirror                      lifecycle, never installed on the shared WalletBackend"
+                );
+            }
+        }
+    }
+
+    /// The guard is looking at real text and WOULD fail if the call appeared.
+    ///
+    /// Two failure modes it removes, both of which leave a green guard proving nothing: a needle
+    /// that matches no possible call, and an `include_str!` pointing at a file that does not contain
+    /// the code being guarded. The second is asserted by requiring a string every guarded file
+    /// genuinely contains, so a path typo is a failure rather than an empty search.
+    #[test]
+    fn the_installation_guard_can_actually_fail() {
+        for needle in forbidden_installations() {
+            let planted = format!("let _ = backend{needle}s);");
+            assert!(
+                planted.contains(needle),
+                "{needle} is the spelling a real installation would write"
+            );
+        }
+        for (name, source) in [
+            ("lifecycle.rs", include_str!("lifecycle.rs")),
+            ("signer.rs", include_str!("signer.rs")),
+            ("../server.rs", include_str!("../server.rs")),
+        ] {
+            assert!(
+                source.contains("WalletBackend"),
+                "{name} must be the file that could install a signer; an empty or wrong include                  makes the guard pass forever"
+            );
+        }
+    }
+
     /// `publish` carries the report's own figures across, and does not recompute either.
     ///
     /// The fixture's `locked_dig_base_units` is deliberately INCONSISTENT with its `states` — a
@@ -499,14 +578,21 @@ mod tests {
             created: Vec::new(),
             reclaim_failures: Vec::new(),
             stopped_at: None,
-            states: vec![(Bond::new("aa".repeat(32), "11".repeat(32)), BondState::Withheld)],
+            states: vec![(
+                Bond::new("aa".repeat(32), "11".repeat(32)),
+                BondState::Withheld,
+            )],
             per_coin_dig_base_units: None,
             locked_dig_base_units: 4_242,
         };
 
         publish(&snapshot, &report, 9);
 
-        let published = snapshot.read().expect("unpoisoned").clone().expect("published");
+        let published = snapshot
+            .read()
+            .expect("unpoisoned")
+            .clone()
+            .expect("published");
         assert_eq!(
             published.locked_dig_base_units, 4_242,
             "the report's own total, not a sum over the rows"

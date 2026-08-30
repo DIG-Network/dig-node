@@ -3563,7 +3563,8 @@ fn mirror_bond_observation(
         .mirror_bonds
         .read()
         .map_err(|_| MirrorBondStatesUnknownReason::ChainUnreadable)?;
-    slot.clone().ok_or(MirrorBondStatesUnknownReason::ChainUnreadable)
+    slot.clone()
+        .ok_or(MirrorBondStatesUnknownReason::ChainUnreadable)
 }
 
 /// `control.collateral.margin.get` — the node's local safety margin, in basis points.
@@ -3636,7 +3637,9 @@ mod tests {
     #[test]
     fn mirror_bond_states_says_which_fact_it_is_missing_rather_than_returning_an_empty_page() {
         let answer = mirror_bond_states(
-            Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
+            Err(
+                dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable,
+            ),
             json!(1),
             &json!({}),
         );
@@ -3684,7 +3687,10 @@ mod tests {
         let answer = mirror_bond_states(Ok(observation), json!(1), &json!({}));
         let result = &answer["result"];
 
-        assert_eq!(result["state"], "known", "a published observation is KNOWN: {result}");
+        assert_eq!(
+            result["state"], "known",
+            "a published observation is KNOWN: {result}"
+        );
         assert_eq!(
             result["locked_dig_base_units"], 7_777,
             "the observation's own total, carried across unchanged"
@@ -3727,7 +3733,9 @@ mod tests {
         // The control: an in-range limit is not refused, so the assertion above is about the
         // BOUND rather than about the params being rejected wholesale.
         let ok = mirror_bond_states(
-            Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
+            Err(
+                dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable,
+            ),
             json!(1),
             &json!({ "limit": 1000 }),
         );
@@ -3744,7 +3752,9 @@ mod tests {
     fn mirror_bond_states_refuses_a_malformed_cursor_and_tolerates_a_prefixed_one() {
         let hex = "11".repeat(32);
         let malformed = mirror_bond_states(
-            Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
+            Err(
+                dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable,
+            ),
             json!(1),
             &json!({ "after": { "store_id": "not-hex", "root": hex } }),
         );
@@ -3755,7 +3765,9 @@ mod tests {
         );
 
         let prefixed = mirror_bond_states(
-            Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
+            Err(
+                dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable,
+            ),
             json!(1),
             &json!({ "after": { "store_id": format!("0x{hex}"), "root": hex } }),
         );
