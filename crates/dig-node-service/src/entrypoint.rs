@@ -1403,6 +1403,53 @@ fn run_service(config: Config) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// **`dign mirror bond-states --after` sends the cursor to the node.**
+    ///
+    /// Asserted on the WIRE params rather than on the selected method, because a parser that
+    /// selected the right method and dropped the operand is exactly the failure that restarts a
+    /// walk while looking like it resumed — and it is invisible from the method name.
+    #[test]
+    fn the_mirror_bond_states_verb_sends_its_cursor_and_page_size() {
+        let hex = "11".repeat(32);
+        let action = mirror_action(Some(MirrorCommand::BondStates {
+            after: Some(format!("{hex}:{hex}")),
+            limit: Some(25),
+        }))
+        .expect("a well-formed cursor parses");
+
+        assert_eq!(action.method(), "control.mirror.bondStates");
+        let params = action.wire_params();
+        assert_eq!(params["after"]["store_id"], serde_json::json!(hex));
+        assert_eq!(params["after"]["root"], serde_json::json!(hex));
+        assert_eq!(params["limit"], serde_json::json!(25));
+
+        // With no operands NEITHER field is sent, so the CONTRACT's default page size applies
+        // rather than one this CLI invented.
+        let bare = mirror_action(None).expect("no operands is valid").wire_params();
+        assert!(
+            bare.get("after").is_none() && bare.get("limit").is_none(),
+            "an unset operand is omitted, not sent as null: {bare}"
+        );
+    }
+
+    /// **A malformed `--after` is REFUSED, never dropped.**
+    ///
+    /// A dropped cursor restarts the walk at the first bond while the caller believes it resumed,
+    /// and the repeated page carries a whole-set locked total that reads as correct.
+    #[test]
+    fn the_mirror_bond_states_verb_refuses_a_cursor_it_cannot_read() {
+        for bad in ["no-colon", ":root", "store:"] {
+            assert!(
+                mirror_action(Some(MirrorCommand::BondStates {
+                    after: Some(bad.to_string()),
+                    limit: None,
+                }))
+                .is_err(),
+                "{bad:?} must be refused rather than ignored"
+            );
+        }
+    }
+
     /// **`chia-peers add --help` authorises only a node the operator RUNS (#254 item 7).**
     ///
     /// The same NC-12 boundary the wire notice holds, checked on the OTHER surface that states it.

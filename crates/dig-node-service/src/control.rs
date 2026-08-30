@@ -3594,6 +3594,75 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// **Proves:** an unreadable observation answers `unknown` with the reason, and carries NO
+    /// rows at all.
+    ///
+    /// **Catches:** the empty-page fabrication — a node that cannot read its own mirror coins
+    /// returning `{entries: [], complete: true}`, which tells an operator this node holds no bonds
+    /// and locks no money. Both halves are asserted, because a producer that emitted the right
+    /// `state` beside an `entries` key would still hand a lenient client a zero to render.
+    #[test]
+    fn mirror_bond_states_says_which_fact_it_is_missing_rather_than_returning_an_empty_page() {
+        let answer = mirror_bond_states(json!(1), &json!({}));
+        let result = &answer["result"];
+        assert_eq!(result["state"], "unknown");
+        assert_eq!(result["reason"], "chain_unreadable");
+        assert!(
+            result.get("entries").is_none() && result.get("locked_dig_base_units").is_none(),
+            "an unknown answer must carry no rows and no money figure: {result}"
+        );
+    }
+
+    /// **Proves:** an out-of-range page size is REFUSED as `INVALID_PARAMS`, not clamped.
+    ///
+    /// **Catches:** a clamp, which hands back a cursor for a position the caller never asked
+    /// about — the caller's model of the page and the node's then differ silently, on the walk a
+    /// whole-set locked total is read beside.
+    #[test]
+    fn mirror_bond_states_refuses_a_page_size_it_will_not_serve() {
+        for limit in [json!(0), json!(1001)] {
+            let answer = mirror_bond_states(json!(1), &json!({ "limit": limit }));
+            assert_eq!(
+                answer["error"]["code"],
+                json!(ErrorCode::InvalidParams.code()),
+                "limit {limit} must be refused, got {answer}"
+            );
+        }
+        // The control: an in-range limit is not refused, so the assertion above is about the
+        // BOUND rather than about the params being rejected wholesale.
+        let ok = mirror_bond_states(json!(1), &json!({ "limit": 1000 }));
+        assert!(ok.get("error").is_none(), "1000 is in range: {ok}");
+    }
+
+    /// **Proves:** a cursor that is not two canonical 64-hex ids is REFUSED.
+    ///
+    /// **Catches:** a dropped cursor, which restarts the walk while looking like it resumed. The
+    /// fixture is a `0x`-prefixed key, which the contract TOLERATES and normalizes, paired with a
+    /// genuinely malformed one — so this asserts the refusal is about malformedness and not about
+    /// the node ignoring `after` entirely.
+    #[test]
+    fn mirror_bond_states_refuses_a_malformed_cursor_and_tolerates_a_prefixed_one() {
+        let hex = "11".repeat(32);
+        let malformed = mirror_bond_states(
+            json!(1),
+            &json!({ "after": { "store_id": "not-hex", "root": hex } }),
+        );
+        assert_eq!(
+            malformed["error"]["code"],
+            json!(ErrorCode::InvalidParams.code()),
+            "a malformed cursor is refused, not read as start-of-set: {malformed}"
+        );
+
+        let prefixed = mirror_bond_states(
+            json!(1),
+            &json!({ "after": { "store_id": format!("0x{hex}"), "root": hex } }),
+        );
+        assert!(
+            prefixed.get("error").is_none(),
+            "a 0x-prefixed key is tolerated and normalized: {prefixed}"
+        );
+    }
+
     /// **Proves:** `control.capsule.fetch` is dispatched, requires a token, and names its params
     /// as the published contract does.
     ///
