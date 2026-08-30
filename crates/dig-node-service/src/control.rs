@@ -208,6 +208,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.collateral.margin.get",
     "control.collateral.margin.set",
     "control.collateral.buffer",
+    "control.mirror.bondStates",
     "control.profile.putBody",
     "control.profile.getBody",
     "control.updater.status",
@@ -272,6 +273,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.collateral.margin.get",
     "control.collateral.margin.set",
     "control.collateral.buffer",
+    "control.mirror.bondStates",
     "control.profile.putBody",
     "control.profile.getBody",
     "control.updater.status",
@@ -925,6 +927,10 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.collateral.margin.get" => collateral_margin_get(id),
         "control.collateral.margin.set" => collateral_margin_set(id, params),
         "control.collateral.buffer" => collateral_buffer(id),
+        // The mirror-coin bond surface (dig-node#412, SPEC.md §25.8) -- one page of this
+        // node's OWN bonds. Shell-owned because the bonds are the SERVICE's money, not the
+        // embedded engine's.
+        "control.mirror.bondStates" => mirror_bond_states(id, params),
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
@@ -3455,6 +3461,77 @@ fn collateral_buffer(id: Value) -> Value {
         Ok(v) => control_ok(id, v),
         Err(e) => control_error(id, ErrorCode::ControlError, e.to_string()),
     }
+}
+
+/// `control.mirror.bondStates` — §25.8: one page of this node's mirror bonds, and the $DIG they lock.
+///
+/// # The rows are the SERVED set, not the held set
+///
+/// The contract's `withheld` state is *"held on a stranger's behalf and deliberately never
+/// advertised"*, so a producer keyed on the held set alone could never emit it: it would answer "no
+/// such row" exactly where the contract promises "withheld on purpose", and `complete: true` beside
+/// that omission would assert a falsehood about this node's own set. The split is read rather than
+/// inferred — every capsule carries its provenance from the durable sidecar
+/// (`cache_list_cached`) — and [`crate::mirror::pass::decide`] already keys its states on `held`
+/// AND `relayed` for this reason.
+///
+/// # Today this answers `unknown` with a NAMED reason, which is the honest answer and not a stub
+///
+/// Stating a bond's state needs the mirror COINS this wallet owns. That read
+/// (`dig_mirror_coin::list`) needs a `dig_chainsource_interface::ChainSource` and the operator
+/// wallet's own puzzle hash, and neither is reachable from the control plane: the reconcile
+/// runner's bring-up is dig-node#412 step 7. So the node cannot tell a bonded capsule from an
+/// unbonded one, and it says so.
+///
+/// Every alternative is a fabrication on a money surface. An empty page reports a funded node as
+/// holding no bonds; a page of `unfunded` rows raises the out-of-funds alarm about a wallet nobody
+/// read — the dig-app#300 conflation, manufactured by the very surface built to remove it. The
+/// reason is `chain_unreadable` rather than `served_set_unknown` because the served set IS known;
+/// naming the wrong missing fact would send an operator to repair a capsule cache that is working.
+/// [`collateral_buffer`] answers the same way, for the same reason.
+///
+/// The rest of the method is [`crate::mirror::states::page`], already exercised against fixtures, so
+/// step 7 lights this up by handing it an observation rather than by writing a surface.
+fn mirror_bond_states(id: Value, params: &Value) -> Value {
+    use dig_node_control_interface::params::MirrorBondStatesParams;
+    use dig_node_control_interface::results::MirrorBondStatesResult;
+
+    // Deserializing VALIDATES: the contract's own `Deserialize` refuses an out-of-range limit and a
+    // non-canonical cursor rather than clamping or ignoring either. A silently-ignored cursor would
+    // restart the walk while looking like it resumed — and on the page a locked-$DIG total is read
+    // beside, a repeated page is wrong in the reassuring direction and reads as correct.
+    let params: MirrorBondStatesParams = match serde_json::from_value(params.clone()) {
+        Ok(p) => p,
+        Err(e) => return control_error(id, ErrorCode::InvalidParams, e.to_string()),
+    };
+
+    let answer = match mirror_bond_observation() {
+        Ok(observation) => crate::mirror::states::page(
+            &observation,
+            params.after.as_ref(),
+            params.effective_limit(),
+        ),
+        Err(reason) => MirrorBondStatesResult::Unknown { reason },
+    };
+    match serde_json::to_value(answer) {
+        Ok(v) => control_ok(id, v),
+        Err(e) => control_error(id, ErrorCode::ControlError, e.to_string()),
+    }
+}
+
+/// The whole §25.8 answer before paging, or the ONE fact the node is missing.
+///
+/// Separated from [`mirror_bond_states`] so the surface and the observation are different concerns:
+/// paging, ordering and the wire mapping are settled and tested, and this is the single call site
+/// dig-node#412 step 7 replaces when the reconcile runner is brought up. A caller MUST NOT
+/// substitute an empty observation for an `Err` — a page of no rows says "this node holds no
+/// bonds", which is a definite claim about money, and it is not the claim being made here.
+fn mirror_bond_observation(
+) -> Result<
+    crate::mirror::states::BondObservation,
+    dig_node_control_interface::results::MirrorBondStatesUnknownReason,
+> {
+    Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable)
 }
 
 /// `control.collateral.margin.get` — the node's local safety margin, in basis points.

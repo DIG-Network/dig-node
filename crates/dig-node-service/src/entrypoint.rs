@@ -201,6 +201,16 @@ enum Command {
         #[command(subcommand)]
         action: Option<CollateralCommand>,
     },
+    /// Inspect the mirror bonds this node holds, and the $DIG they lock.
+    ///
+    /// A mirror bond is one `(store, root)` this node advertises by locking $DIG for an epoch.
+    /// Each bond reports one state, and only `unfunded` means you are short: `withheld` is a
+    /// capsule held for someone else and never advertised, `disabled` is your own switch, and
+    /// `reclaiming` is money on its way back that is still locked until it lands.
+    Mirror {
+        #[command(subcommand)]
+        action: Option<MirrorCommand>,
+    },
     /// Add, list and remove a TRUSTED Chia full-node peer.
     ///
     /// A different network from `peers`, which manages DIG gossip peers. Trusting a Chia peer
@@ -656,6 +666,24 @@ enum MarginCommand {
     },
 }
 
+/// `dig-node mirror` sub-actions.
+#[derive(Subcommand)]
+enum MirrorCommand {
+    /// Show this node's mirror bonds, one page at a time (the default with no sub-action).
+    ///
+    /// The locked figure covers ALL your bonds, not just the page shown, so it is never a partial
+    /// amount of money. If the node cannot state its bonds it says which fact it is missing --
+    /// it never reports an unreadable set as an empty one.
+    BondStates {
+        /// Resume after this bond, as `<store_id>:<root>` -- the cursor the previous page printed.
+        #[arg(long)]
+        after: Option<String>,
+        /// How many bonds to show. Left unset, the node's own default page size applies.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+}
+
 #[derive(Subcommand)]
 enum ChiaPeersCommand {
     /// List the tracked Chia full-node peers, marking which are trusted.
@@ -724,6 +752,7 @@ impl Command {
             Command::Subscriptions { .. } => "subscriptions",
             Command::Peers { .. } => "peers",
             Command::Collateral { .. } => "collateral",
+            Command::Mirror { .. } => "mirror",
             Command::ChiaPeers { .. } => "chia-peers",
             Command::EnsureHosts => "ensure-hosts",
         }
@@ -902,6 +931,10 @@ pub fn run() -> std::process::ExitCode {
             action: Some(CollateralCommand::History { epoch }),
         } => render(control_cli::collateral_history(epoch), action, json),
         Command::Collateral { action: cmd } => match collateral_action(cmd) {
+            Ok(a) => render(control_cli::run(&config, a), action, json),
+            Err(e) => emit_error(&e, action, json),
+        },
+        Command::Mirror { action: cmd } => match mirror_action(cmd) {
             Ok(a) => render(control_cli::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
         },
@@ -1118,6 +1151,33 @@ fn parse_dig_amount(raw: Option<&str>) -> std::io::Result<Option<u64>> {
 ///
 /// An unrecognised word is REFUSED, never silently treated as a number or as the default: a typo
 /// that fell through to the default would change what this node posts without saying so.
+/// `dig-node mirror [bond-states]` -> the §25.8 control action.
+///
+/// The cursor operand is `<store_id>:<root>`, parsed here and REFUSED when it is not that shape.
+/// A half-understood cursor must never be dropped: the node would restart the walk while the
+/// caller believed it resumed, and a repeated page on a surface carrying a locked-$DIG total is
+/// wrong in the direction that reads as correct.
+fn mirror_action(cmd: Option<MirrorCommand>) -> std::io::Result<ControlAction> {
+    let (after, limit) = match cmd {
+        None | Some(MirrorCommand::BondStates { after: None, limit: None }) => (None, None),
+        Some(MirrorCommand::BondStates { after, limit }) => (after, limit),
+    };
+    let after = match after {
+        None => None,
+        Some(cursor) => match cursor.split_once(':') {
+            Some((store_id, root)) if !store_id.is_empty() && !root.is_empty() => {
+                Some((store_id.to_string(), root.to_string()))
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "--after takes the cursor the previous page printed, as <store_id>:<root>",
+                ))
+            }
+        },
+    };
+    Ok(ControlAction::MirrorBondStates { after, limit })
+}
+
 fn collateral_action(cmd: Option<CollateralCommand>) -> std::io::Result<ControlAction> {
     use dig_mirror_collateral::{
         SAFETY_MARGIN_BP_DEFAULT, SAFETY_MARGIN_BP_GENEROUS, SAFETY_MARGIN_BP_TIGHT,

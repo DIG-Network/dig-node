@@ -7935,9 +7935,15 @@ itself (SYSTEM.md §4.1).
 >   and `::relayed` are separate fields, so no relayed capsule can reach the create path.
 > * §25.8's **vocabulary**, as `mirror::pass::BondState`: `disabled` (the node-wide switch),
 >   `withheld` (`Relayed` provenance) and `reclaiming` are three distinct states, agreeing with
->   `dig-node-control-interface` 0.26.0's tokens. **That crate is NOT adopted at this head and the
->   method is NOT served** — only the vocabulary lines up. `withheld` does have a real producer, the
->   relayed set, rather than being unreachable from a `Held`-keyed derivation.
+>   `dig-node-control-interface` 0.27.0's tokens, which the node now ADOPTS. `withheld` has a real
+>   producer, the relayed set, rather than being unreachable from a `Held`-keyed derivation.
+> * §25.8's **method and verb**: `control.mirror.bondStates` is served (`control.rs`) and
+>   `dign mirror bond-states` is the verb. The wire mapping, the whole-set locked total, the
+>   canonical-key ordering and the paging are `mirror/states.rs`; `BondState::FundsUnknown` maps to
+>   `deferred { balance_unreadable }` per row, never to `unfunded`. **What is not present is an
+>   OBSERVATION**: no pass is constructed, so the node cannot read its own mirror coins and the
+>   method answers `unknown { chain_unreadable }` on every call. The shape is satisfied; the answer
+>   is not.
 >
 > **Everything else in §25 is PENDING**, tracked as
 > <https://github.com/DIG-Network/dig-node/issues/412>. In particular **no pass is CONSTRUCTED and
@@ -7946,7 +7952,8 @@ itself (SYSTEM.md §4.1).
 > triggers in §25.4 — start-up, the round tick, the debounced presence change — do not fire. The
 > runner decides and orders; nothing yet hands it a chain, a wallet or a disk. So a reader MUST NOT
 > infer that any coin is created, reclaimed, broadcast or confirmed at this head, and MUST NOT infer
-> that any state is REPORTED anywhere: §25.8's surface is not served.
+> that any state is REPORTED: §25.8's method is served, and it answers
+> `unknown { chain_unreadable }` because the observation it would describe does not exist.
 >
 > **A clause not named in the list above MUST be read as pending, whatever its grammatical voice**,
 > and the list is to be read NARROWLY: where an entry names a file or a function, it satisfies the
@@ -8235,18 +8242,45 @@ one setting to turn off** (§6.0/#207).
 
 ### 25.8. The per-store state surface
 
-> **PENDING — not yet implemented.** This subsection is normative and is NOT satisfied by
-> code as of this section's introduction. Tracked as dig-node#377 step 6 (the `dig-node-control-interface` 0.26.0
-> method declaration, release-first, then the node serving it and the `dign` verb). Until it lands, a reader MUST NOT
-> rely on the behaviour described here.
+> **PARTIALLY IMPLEMENTED.** The method `control.mirror.bondStates` IS served and `dign mirror
+> bond-states` IS the verb (§8.6 CLI parity). What is NOT yet present is an OBSERVATION for it to
+> describe: nothing constructs a reconcile pass, so the node cannot read the mirror coins it owns
+> and every call answers `unknown { reason: "chain_unreadable" }`. A reader MUST NOT infer that any
+> bond state is REPORTED at this head; it may rely on the shape, the paging, the ordering and the
+> refusals described below. Tracked as dig-node#412 step 7.
 
 The lifecycle exposes, per `(store, root)`, over the control plane and with a `dign` verb (§8.6
 CLI parity): the bond state — `bonded { coin_id, epoch, amount }`, `pending` (in-flight create),
 `unfunded { short_dig_base_units }`, `deferred { requirement reason }` (§25.3), `withheld`
-(`Relayed` provenance — deliberately not advertised), or `reclaiming` — so a client can distinguish
-"out of funds" from "withheld on purpose" without guessing from the store list. Conflating those
-two produces hourly alarms about a healthy node (dig-app#300). The method is declared in
-`dig-node-control-interface` (release-first) before the node serves it.
+(`Relayed` provenance — deliberately not advertised), `disabled` (the node-wide switch, §25.7), or
+`reclaiming { coin_id, epoch, amount }` — so a client can distinguish "out of funds" from "withheld
+on purpose" without guessing from the store list. Conflating those two produces hourly alarms about
+a healthy node (dig-app#300). The method is declared in `dig-node-control-interface` (release-first)
+before the node serves it.
+
+The surface MUST hold four properties, each of which is a money statement:
+
+* **The rows are the SERVED set — held AND relayed.** `withheld` is otherwise unreachable: a
+  relayed capsule is by construction absent from the desired-bond set, so a producer keyed on the
+  held set alone would answer "no such row" where this section promises "withheld on purpose", and
+  would then claim `complete` over a set it had silently narrowed. A node that cannot determine
+  provenance MUST answer `unknown { provenance_unknown }` for the WHOLE call.
+* **Every per-row state is a DEFINITE statement.** A fact the node could not read makes the WHOLE
+  answer `unknown` with the reason, never a degraded row and never an empty list: a truncated list
+  and a complete one read identically. The one exception is not an exception — an unreadable WALLET
+  is `deferred { balance_unreadable }`, which is definite ("this bond cannot be priced, because the
+  balance could not be read") and MUST NOT be reported as `unfunded`, which asserts a shortfall the
+  node has no evidence for.
+* **`locked_dig_base_units` is the WHOLE-SET total, including coins being reclaimed**, and it is
+  computed by the node. A client MUST NOT sum the page: a page sum under-reports locked money by a
+  page boundary, and money reported as free while it is on chain is wrong in the reassuring
+  direction. Reclaiming coins are included because their money is locked until the reclaim confirms.
+* **The order is ascending over the canonical key**, a lowercase unprefixed 64-hex `(store_id,
+  root)`. Keys are normalized BEFORE they are ordered, so a producer and a client cannot disagree
+  about where a cursor points. A page states `complete` positively rather than by its length, a
+  caller resumes from the `cursor` it was HANDED, and a malformed cursor or an out-of-range page
+  size is REFUSED (`-32602`) rather than clamped or ignored — a silently dropped cursor restarts a
+  walk while looking like it resumed.
 
 ### 25.9. Failure directions, stated
 
