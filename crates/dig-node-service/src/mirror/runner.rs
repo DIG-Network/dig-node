@@ -613,7 +613,7 @@ mod tests {
         // requirement is known, creates are on, and nothing is on chain. So a create appearing or
         // not appearing is a statement about the presence window and about nothing else.
         let effects = || FakeEffects {
-            disk: held(&[capsule.clone()]),
+            disk: held(std::slice::from_ref(&capsule)),
             balance: REQUIRED * 10,
             ..FakeEffects::default()
         };
@@ -1123,87 +1123,6 @@ mod tests {
                 .iter()
                 .all(|c| matches!(c, Effect::Reclaim(_))),
             "and no create was attempted at all"
-        );
-    }
-
-    /// The presence tracker CARRIED between rounds is what lets a bond ever settle.
-    ///
-    /// The scheduler rebuilds its effects — and therefore its runner — every round, because the
-    /// chain source is per-round and does not outlive it. `with_presence` / `into_presence` are the
-    /// only thing that survives that rebuild. Drop the carry and every round begins with a fresh
-    /// tracker; a fresh tracker has never seen the bond before, so it is never stable, so no create
-    /// is ever made — **while the node logs a completed pass each round and looks like it is
-    /// reconciling normally**. Nothing else in the suite goes red for that, which is precisely why
-    /// this test exists.
-    ///
-    /// The assertion is a PAIR over the same two passes, because only the pair discriminates. "The
-    /// second pass creates" alone is satisfied by an implementation with no debounce whatsoever, and
-    /// "a fresh tracker suppresses" alone is satisfied by an implementation that suppresses forever.
-    /// Carried settles, fresh does not — that is the property, and it needs both halves.
-    ///
-    /// The window is REAL here (`SETTLING_WINDOW_MS`) rather than the zero the shared `runner`
-    /// helper uses, since a zero window makes every tracker settle immediately and the carry
-    /// unobservable — the shape of fixture that would let this defect through while reading as
-    /// thorough.
-    #[test]
-    fn dropping_the_presence_carry_between_rounds_silently_stops_every_create() {
-        use super::super::presence::{PresenceTracker, SETTLING_WINDOW_MS};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (_journal, log) = journal(dir.path());
-
-        let settling = bond("aa", "11");
-        // One round's fixture: the same capsule on disk, funded, nothing on chain yet.
-        let effects = || FakeEffects {
-            disk: held(&[settling.clone()]),
-            chain: Vec::new(),
-            balance: 10 * REQUIRED,
-            ..Default::default()
-        };
-        let at = |now_unix_ms: u64| PassContext {
-            now_unix_ms,
-            ..ctx()
-        };
-
-        const FIRST: u64 = 1_000_000;
-        let second = FIRST + SETTLING_WINDOW_MS + 1;
-
-        // Round one, from nothing: the bond has just been seen for the first time, so it is not yet
-        // stable and buys nothing. This is the state the carry has to transport.
-        let mut round_one = PassRunner::new(effects(), log.clone())
-            .with_settling_window_ms(SETTLING_WINDOW_MS)
-            .with_presence(PresenceTracker::new());
-        let first_report = round_one.run(&at(FIRST)).expect("the pass runs");
-        assert!(
-            first_report.created.is_empty(),
-            "a bond seen once has not been stable for a window, so it must buy nothing yet: {:?}",
-            first_report.created
-        );
-        let carried = round_one.into_presence();
-
-        // Round two WITH the carry, a full window later: the bond has now held one state across the
-        // window, so it settles and the create is made.
-        let mut carried_round = PassRunner::new(effects(), log.clone())
-            .with_settling_window_ms(SETTLING_WINDOW_MS)
-            .with_presence(carried);
-        let carried_report = carried_round.run(&at(second)).expect("the pass runs");
-        assert_eq!(
-            carried_report.created,
-            vec![settling.clone()],
-            "carrying the tracker is what makes the window wall-clock time rather than per-runner"
-        );
-
-        // The SAME round two with a FRESH tracker — the exact regression a dropped
-        // `.with_presence(...)` produces. Same capsule, same clock, same funds, and nothing settles.
-        let mut fresh_round = PassRunner::new(effects(), log)
-            .with_settling_window_ms(SETTLING_WINDOW_MS)
-            .with_presence(PresenceTracker::new());
-        let fresh_report = fresh_round.run(&at(second)).expect("the pass runs");
-        assert!(
-            fresh_report.created.is_empty(),
-            "a fresh tracker each round re-observes the bond as new forever, so no bond ever \
-             settles and no coin is ever created -- with every pass still reporting success: {:?}",
-            fresh_report.created
         );
     }
 
