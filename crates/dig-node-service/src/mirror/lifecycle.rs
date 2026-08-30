@@ -37,13 +37,12 @@
 //! all — so a node whose XCH is exhausted can still recover $DIG it has locked. That is §25.4.4, and
 //! it is the invariant that matters most, because its failure mode is collateral locked forever.
 //!
-//! The spend is complete; the WIRING is not. This node attaches no production [`Broadcaster`] yet
-//! ([`production_broadcaster`] is `None`, dig-node#424), so a planned reclaim refuses by name before
-//! it signs, exactly as a create refuses for dig-node#421. Both refusals are reported, both name
-//! their missing piece, and neither is a guess dressed as a spend. The reported
-//! [`SpendCapability`] is DERIVED from the same seam, so the node cannot announce a power it does
-//! not have: while the broadcaster is absent the capability is
-//! [`SpendCapability::BroadcasterUnwired`] and never `Available`.
+//! The spend is complete and, since dig-node#424, so is the WIRING: [`production_broadcaster`]
+//! builds a [`Broadcaster`] on this node's ONE shared chain client whenever the operator has
+//! enabled live broadcast. On a default install it builds nothing and dials nothing, so a planned
+//! reclaim still refuses by name before it signs. Every refusal is reported, names its missing
+//! piece, and is never a guess dressed as a spend. The reported [`SpendCapability`] is DERIVED from
+//! the same seam, so the node cannot announce a power it does not have.
 //!
 //! **Creates select their own collateral, from the OPERATOR wallet.** `dig_mirror_coin::create`
 //! takes its `Cat` inputs from its caller, and [`super::funding`] supplies them: it scans the chain
@@ -83,6 +82,7 @@ use dig_mirror_coin::MirrorCoin;
 use dig_node_core::Node;
 use dig_wallet::autoseed::WalletPaths;
 use dig_wallet::operator_wallet::OperatorWallet;
+use dig_wallet::sage::chain::ChainTransport;
 use dig_wallet::sage::rpc::WalletBackend;
 use dig_wallet::sage::spend::Broadcaster;
 
@@ -217,15 +217,21 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
         let signer = self
             .signer
             .ok_or_else(|| PassError::Wallet("no operator wallet is available to sign".into()))?;
-        // Named the way `create` names dig-node#421: at the point this refusal is reachable, the
-        // operator has ALREADY set `DIG_WALLET_ENABLE_LIVE_BROADCAST` — `open_signer` yields no
-        // signer without it, and the signer is checked first — so blaming that flag would tell a
-        // person to set the flag they just set. What is missing is the wiring, and the wiring has a
-        // ticket.
+        // Names the two reasons a broadcaster can be absent NOW that one is wired (dig-node#424).
+        //
+        // The message used to say the build wires no broadcaster at all. That was true when it was
+        // written and became false in the commit that wired one — and worse than merely stale: it
+        // sent an operator to a CLOSED ticket instead of to the switch they can actually reach.
+        //
+        // Only two states reach here, and they are exactly `MirrorBroadcast`'s two non-`Wired`
+        // outcomes: the flag is off, or the shared chain client could not be built. Both are named,
+        // because this refusal cannot see which of the two produced the `None` it was handed.
         let broadcaster = self.broadcaster.ok_or_else(|| {
             PassError::Wallet(
-                "this node has no production broadcaster wired for the mirror lifecycle \
-                 (dig-node#424), so the spend was built and then NOT sent; nothing was signed"
+                "this node has no broadcaster for the mirror lifecycle, so the spend was built and \
+                 then NOT sent; nothing was signed. Either DIG_WALLET_ENABLE_LIVE_BROADCAST is off \
+                 (the money-safe default — set it to 1 to allow automated mirror spends), or it is \
+                 on and this node could not build a chain client to send through"
                     .into(),
             )
         })?;
@@ -248,7 +254,8 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
                     tracing::warn!(
                         target: "mirror",
                         operation = spends.operation().as_str(),
-                        "broadcast a mirror spend whose created coin this node cannot derive; the                          audit entry names no target coin rather than naming a guessed one"
+                        "broadcast a mirror spend whose created coin this node cannot derive; the \
+                         audit entry names no target coin rather than naming a guessed one"
                     );
                 }
                 // Recorded UNCONDITIONALLY, and the two facts are recorded independently. The
@@ -274,6 +281,15 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
                 // Extended only on a broadcast that REACHED the mempool. Reserving on attempt would
                 // strand a coin every time a broadcast failed, and the failure path below already
                 // records that the money stayed put.
+                //
+                // That sentence is load-bearing and was FALSE until the broadcaster stopped reading
+                // `TxStatus::success`, which is true for a PENDING ack — a bundle the full node
+                // explicitly did not admit. `Ok` here therefore meant "reached the mempool OR was
+                // held for an unknown parent", and the held case took this branch: it extended the
+                // reservation, wrote a durable `Submitted` entry below, and every later pass then
+                // excluded those funding coins forever via `committed_funding_coin_ids`. Nothing
+                // reconciles that, so the coins were stranded against a spend nobody was holding.
+                // `dig_wallet::sage::spend::accepted_by_mempool` is what makes the sentence true.
                 //
                 // Reclaims feed it too, and that is deliberate: `funding_coin_ids` is read from the
                 // bundle, so this set holds exactly what the journal holds, and a set that
@@ -523,14 +539,28 @@ pub enum SpendCapability {
     WalletUnavailable,
     /// A wallet opened but `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off, the money-safe default.
     BroadcastDisabled,
-    /// Everything the OPERATOR controls is in place — a wallet opened and live broadcast is on — but
-    /// this build wires no production [`Broadcaster`] (dig-node#424), so a spend can be built and
-    /// signed for and still reach nothing.
+    /// Everything the OPERATOR controls is in place — a wallet opened and live broadcast is on —
+    /// but this node could not BUILD the shared chain client a broadcaster is made from, so a spend
+    /// could be built and signed for and still reach nothing.
     ///
     /// Distinguished from [`Self::BroadcastDisabled`] because the two ask different things of the
-    /// reader: one is a switch they can flip, and this one is not. Reporting a missing wiring as a
-    /// disabled flag sends an operator to set a flag that is already set.
-    BroadcasterUnwired,
+    /// reader: one is a switch they can flip, and this one is not. Reporting a failed client build
+    /// as a disabled flag sends an operator to set a flag that is already set.
+    ///
+    /// # It is named for a CONSTRUCTION failure because that is the only thing it observes
+    ///
+    /// It was called `ChainClientUnavailable`, which promised more than it can deliver. The client build
+    /// is not a reachability test: `ChiaQueryConfig`'s default enables the coinset fallback tier,
+    /// which makes the peer tier `PeerRequirement::Optional`, so the build SUCCEEDS on a node with
+    /// zero peers and no network at all. A name that says "unreachable" would be read as a chain
+    /// probe by everyone who met it, and nothing here probes anything.
+    ///
+    /// So the honest reading of the pair is: [`Self::Available`] means a broadcaster was
+    /// constructed, NOT that a chain answers. A node whose network dies mid-life keeps announcing
+    /// `Available`, and it is the broadcast itself that discovers the truth and refuses by name.
+    /// That is deliberate rather than tolerated — the alternative is a reachability round-trip at
+    /// bring-up, which buys a one-shot answer that is stale by the first pass.
+    ChainClientUnavailable,
 }
 
 impl SpendCapability {
@@ -540,14 +570,101 @@ impl SpendCapability {
     }
 }
 
+/// What this build can do about SENDING a signed mirror spend — the ONE seam.
+///
+/// Read by both the reported capability ([`open_signer`]) and the effects the scheduler builds,
+/// precisely so the two cannot disagree. The alternative — a capability computed from the
+/// environment and a broadcaster passed separately at the construction site — is what let this node
+/// log "this node may create and reclaim collateral" while every reclaim refused: two answers to one
+/// question, and only one of them on the path the money takes.
+pub enum MirrorBroadcast {
+    /// A broadcaster built on this node's one shared chain client.
+    ///
+    /// Means the client was CONSTRUCTED, not that a chain answers — see
+    /// [`SpendCapability::ChainClientUnavailable`] for why the two cannot be told apart here.
+    Wired(Arc<dyn Broadcaster>),
+    /// `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off — the money-safe default. NOTHING was built and
+    /// nothing was dialed.
+    Disabled,
+    /// Live broadcast is on, but the shared chain client could not be built.
+    ChainClientUnavailable,
+}
+
+impl MirrorBroadcast {
+    /// The broadcaster to hand a pass, borrowed for as long as this value lives.
+    ///
+    /// `None` on every non-`Wired` outcome, so a pass refuses by name in `sign_and_broadcast`
+    /// rather than sending into something that is not there.
+    pub fn broadcaster(&self) -> Option<&dyn Broadcaster> {
+        match self {
+            Self::Wired(b) => Some(b.as_ref()),
+            Self::Disabled | Self::ChainClientUnavailable => None,
+        }
+    }
+}
+
+/// Build the mirror lifecycle's [`Broadcaster`], or say why there is none (dig-node#424).
+///
+/// # `live_broadcast` is checked FIRST, and that placement is the property
+///
+/// On a default install nothing is constructed and no chain is dialed — the broadcaster does not
+/// merely go unused, it never exists, so there is nothing for a later edit to attach. Checking the
+/// flag downstream instead would leave a fully-built production broadcaster sitting in scope on
+/// every default install, which is one line away from sending.
+///
+/// # Called per pass rather than built once
+///
+/// [`ChainTransport::broadcaster`](dig_wallet::sage::chain::ChainTransport::broadcaster) does not
+/// cache a failure, so a node that starts offline can broadcast the moment its network returns.
+/// Building this once at bring-up would silently convert that into a node that never broadcasts
+/// again for the rest of its life. The per-pass re-read is that retry, and it is the reason this is
+/// a function of the transport rather than a value computed once.
+///
+/// # What `Wired` actually asserts, and what the error arm actually observes
+///
+/// `Wired` means the shared chain client was CONSTRUCTED. It is not a reachability claim: the
+/// default `ChiaQueryConfig` enables the coinset fallback tier, so the build succeeds on a node
+/// holding no peers and reaching no network. A node that is offline therefore reports `Wired` and
+/// `Available`, and the refusal it deserves arrives at the broadcast, by name, from
+/// [`Broadcaster::broadcast`] — which is also the only place that can honestly know.
+///
+/// So [`MirrorBroadcast::ChainClientUnavailable`] is narrow by construction, and where it is
+/// reachable depends on the caller. From [`open_signer`] at bring-up it is the first thing to need
+/// a client, and a build failure there produces it. From the scheduler it cannot fire at all: that
+/// call site sits inside the `Ok` arm of `ChainTransport::chain_source`, which has already built
+/// the client, and a SUCCESSFUL build is cached. It is kept rather than deleted because it is the
+/// honest error arm of a fallible call with a live producer — not because a branch might one day
+/// want it.
+pub async fn production_broadcaster(
+    chain: &ChainTransport,
+    live_broadcast: bool,
+) -> MirrorBroadcast {
+    if !live_broadcast {
+        return MirrorBroadcast::Disabled;
+    }
+    match chain.broadcaster().await {
+        Ok(b) => MirrorBroadcast::Wired(b),
+        Err(e) => {
+            tracing::warn!(
+                target: "mirror",
+                error = %e,
+                "live broadcast is enabled but this node could not build the shared chain client a \
+                 broadcaster is made from; mirror spends will be refused by name until it can"
+            );
+            MirrorBroadcast::ChainClientUnavailable
+        }
+    }
+}
+
 /// Open the operator wallet, or say why the lifecycle cannot spend.
 ///
 /// [`OperatorWallet::open`] returns `None` for BOTH §16.4 `Locked` and `Orphaned`, which is the
 /// behaviour this wants: neither state has a key it would be correct to substitute, so the honest
 /// outcome is the same in both — no signer, and a lifecycle that observes without spending.
-pub fn open_signer(
+pub async fn open_signer(
     paths: &WalletPaths,
     live_broadcast: bool,
+    chain: &ChainTransport,
 ) -> (Option<MirrorSigner>, SpendCapability) {
     let Some(wallet) = OperatorWallet::open(paths, dig_constants::DIG_MAINNET.genesis_challenge())
     else {
@@ -564,36 +681,21 @@ pub fn open_signer(
     // broadcaster before it signs.
     (
         Some(MirrorSigner::new(wallet)),
-        spend_capability(production_broadcaster().is_some()),
+        spend_capability(&production_broadcaster(chain, live_broadcast).await),
     )
 }
 
-/// What an OPENED wallet with live broadcast on can actually do, given whether a broadcaster exists.
+/// What an OPENED wallet with live broadcast on can actually do, given the seam's own answer.
 ///
-/// Separated from [`open_signer`] so the decision is reachable from a test on both branches: the
-/// wired branch cannot be exercised through `open_signer` on a build where
-/// [`production_broadcaster`] is `None`, and an untestable branch is how the previous version came
-/// to report `Available` on a node that could not send.
-pub fn spend_capability(broadcaster_wired: bool) -> SpendCapability {
-    if broadcaster_wired {
-        SpendCapability::Available
-    } else {
-        SpendCapability::BroadcasterUnwired
+/// Separated from [`open_signer`] so the decision is reachable from a test on every branch. An
+/// untestable branch is how the previous version came to report `Available` on a node that could
+/// not send.
+pub fn spend_capability(broadcast: &MirrorBroadcast) -> SpendCapability {
+    match broadcast {
+        MirrorBroadcast::Wired(_) => SpendCapability::Available,
+        MirrorBroadcast::Disabled => SpendCapability::BroadcastDisabled,
+        MirrorBroadcast::ChainClientUnavailable => SpendCapability::ChainClientUnavailable,
     }
-}
-
-/// The [`Broadcaster`] this build attaches to the mirror lifecycle — `None` until dig-node#424.
-///
-/// ONE seam, read by both the reported capability ([`open_signer`]) and the effects the scheduler
-/// builds, precisely so the two cannot disagree. The alternative — a capability computed from the
-/// environment and a broadcaster passed separately at the construction site — is what let this node
-/// log "this node may create and reclaim collateral" while every reclaim refused: two answers to one
-/// question, and only one of them on the path the money takes.
-///
-/// `&'static` because the honest answer is a property of the build rather than of a request, and
-/// because a static coerces into the shorter lifetime `NodeMirrorEffects` borrows for.
-pub fn production_broadcaster() -> Option<&'static dyn Broadcaster> {
-    None
 }
 
 /// Publish what a pass observed, so `control.mirror.bondStates` can answer from it.
@@ -679,12 +781,13 @@ mod tests {
     /// an operator fixes them differently: an absent wallet needs a seed, a disabled broadcast needs
     /// an environment variable. A test that only checked `signer.is_none()` would pass against an
     /// implementation that reported either reason for both.
-    #[test]
-    fn a_disabled_broadcast_is_reported_differently_from_an_unopenable_wallet() {
+    #[tokio::test]
+    async fn a_disabled_broadcast_is_reported_differently_from_an_unopenable_wallet() {
         let empty = tempfile::tempdir().expect("a temp dir");
         let paths = WalletPaths::resolve(empty.path().join("seed"));
+        let chain = ChainTransport::new();
 
-        let (signer, capability) = open_signer(&paths, true);
+        let (signer, capability) = open_signer(&paths, true, &chain).await;
         assert!(signer.is_none(), "no seed exists, so nothing may sign");
         assert_eq!(
             capability,
@@ -707,82 +810,173 @@ mod tests {
         ]
     }
 
-    /// `Available` and a wired broadcaster are the SAME fact, so the node cannot announce a power a
-    /// spend does not have.
+    /// A DEFAULT INSTALL DOES NOT SPEND, and the seam itself is what guarantees it.
     ///
-    /// This is the assertion the earlier wiring had no room for. `open_signer` reported `Available`
-    /// from the environment while the scheduler built its effects with a hard-coded `None`, so the
-    /// bring-up log said "this node may create and reclaim collateral" and every reclaim refused —
-    /// two answers to one question, with only one of them on the path the money takes. Deriving both
-    /// from [`production_broadcaster`] makes disagreement inexpressible, and this test fails the
-    /// moment someone reintroduces a second source: report `Available` with no broadcaster wired, or
-    /// wire one while still reporting `BroadcasterUnwired`, and the implication below breaks.
+    /// `enable_live_broadcast` defaults false (`config.rs:176`/`:242`). This asserts the property at
+    /// its strongest available point: with live broadcast off the seam does not merely decline to
+    /// USE a broadcaster, it never BUILDS one and never dials — so there is no production
+    /// broadcaster in scope for a later edit to attach, and `NodeMirrorEffects` is handed `None`.
     ///
-    /// Written as an implication over the seam rather than as `assert_eq!(capability, Unwired)`
-    /// because the second spelling becomes a FALSE failure the day dig-node#424 lands — a test that
-    /// has to be deleted to ship the fix is not guarding the property, it is guarding the gap.
-    #[test]
-    fn an_opened_wallet_with_broadcast_enabled_still_may_not_spend_with_no_broadcaster_wired() {
+    /// The fixture is a real [`ChainTransport`], not a double, and it is the honest control: it is
+    /// perfectly capable of building a broadcaster, so a pass here means the FLAG stopped it rather
+    /// than the fixture being unable to produce one. A transport that could never broadcast would
+    /// make this test pass for the wrong reason.
+    ///
+    /// That control is not asserted here, because a claim about the fixture is worth nothing until
+    /// something exercises it: it is
+    /// [`the_same_fixture_does_build_a_broadcaster_when_the_flag_is_on`], which drives this exact
+    /// value through `production_broadcaster(.., true)`. Until that test existed this doc claimed a
+    /// control no test performed — the two other assertions in this file build their broadcaster
+    /// with `MirrorBroadcast::Wired(MockBroadcaster)` directly and never touch a transport.
+    ///
+    /// This is the assertion that protects every existing user, so it is deliberately written to be
+    /// the hardest one here to delete without noticing.
+    #[tokio::test]
+    async fn a_default_install_builds_no_broadcaster_and_cannot_spend() {
         use dig_wallet::autoseed::BootstrapState;
 
+        let chain = ChainTransport::new();
+
+        let seam = production_broadcaster(&chain, false).await;
+        assert!(
+            matches!(seam, MirrorBroadcast::Disabled),
+            "with live broadcast off the seam must report the switched-off flag, never a built \
+             broadcaster and never a chain error"
+        );
+        assert!(
+            seam.broadcaster().is_none(),
+            "a default install must hand the pass NO broadcaster, so sign_and_broadcast refuses \
+             before it signs"
+        );
+        assert_eq!(
+            spend_capability(&seam),
+            SpendCapability::BroadcastDisabled,
+            "and it must SAY so, rather than announcing a power it will not use"
+        );
+        assert!(!spend_capability(&seam).may_spend());
+
+        // And the same through the production entry point, on a real opened wallet — so this holds
+        // for the path a node actually takes at bring-up, not only for the seam in isolation.
         let dir = tempfile::tempdir().expect("a temp dir");
         let paths = WalletPaths::resolve(dir.path().join("seed"));
-
-        // A REAL operator wallet, minted into the temp layout. Without one this test would take the
-        // `WalletUnavailable` path and pass while never reaching the decision under test — which is
-        // exactly how the first version of it went green against the very regression it names.
         let state = crate::wallet_bootstrap::ensure_wallet_seed_at(&paths)
             .expect("the autoseed bootstrap yields a state");
         assert!(
             matches!(state, BootstrapState::Created | BootstrapState::Opened),
-            "the fixture must actually OPEN a wallet, or the assertions below are vacuous: {state:?}"
+            "the fixture must actually OPEN a wallet, or the assertion below is vacuous: {state:?}"
         );
 
-        // Live broadcast ON — the operator has already done everything they can do.
-        let (signer, capability) = open_signer(&paths, true);
+        let (signer, capability) = open_signer(&paths, false, &chain).await;
+        assert!(
+            signer.is_none(),
+            "a default install yields no signer, so nothing can be signed even if a broadcaster \
+             were somehow attached"
+        );
+        assert_eq!(capability, SpendCapability::BroadcastDisabled);
+        assert!(!capability.may_spend());
+    }
+
+    /// The control the default-install test relies on, actually exercised.
+    ///
+    /// It does two jobs, and the second is the one worth having.
+    ///
+    /// First, it makes
+    /// [`a_default_install_builds_no_broadcaster_and_cannot_spend`] non-vacuous: the SAME fixture
+    /// value, with the flag flipped and nothing else changed, DOES produce a broadcaster. So the
+    /// default-install refusal is attributable to the flag rather than to a fixture that could
+    /// never have built one either way. Flipping one input and holding the rest is the whole point;
+    /// a second, differently-built transport would prove nothing about the first.
+    ///
+    /// Second, it pins what `Wired` MEANS. This test runs with no network and no peers, and it
+    /// asserts `Wired` anyway — because the client build is not a reachability probe (the default
+    /// config's coinset fallback tier makes the peer requirement optional). Anyone who later
+    /// "fixes" `production_broadcaster` to report an offline node as
+    /// [`MirrorBroadcast::ChainClientUnavailable`] fails here, and should: that would be a
+    /// reachability claim the build cannot make, and it would trade a truthful `Available` for a
+    /// permanently-stuck refusal on a node whose network recovers.
+    #[tokio::test]
+    async fn the_same_fixture_does_build_a_broadcaster_when_the_flag_is_on() {
+        let chain = ChainTransport::new();
+
+        // The one input that differs from the default-install test is `live_broadcast`.
+        let seam = production_broadcaster(&chain, true).await;
 
         assert!(
-            signer.is_some(),
-            "an opened wallet yields a signer; the observation half needs its puzzle hash"
+            matches!(seam, MirrorBroadcast::Wired(_)),
+            "a real ChainTransport must build a broadcaster once the flag is on, or the \
+             default-install test is passing because the fixture cannot broadcast at all rather \
+             than because the flag stopped it"
+        );
+        assert!(
+            seam.broadcaster().is_some(),
+            "and the built broadcaster must actually be handed over"
         );
         assert_eq!(
-            capability,
-            spend_capability(production_broadcaster().is_some()),
-            "open_signer must REPORT what the pass will actually be handed, never re-decide it"
+            spend_capability(&seam),
+            SpendCapability::Available,
+            "Available means a broadcaster was CONSTRUCTED on the shared chain client — this node \
+             has no network here, and that is deliberately not what the capability reports"
         );
+    }
 
-        if production_broadcaster().is_none() {
+    /// The announced capability and the spend path are ONE derivation, not two that happen to agree.
+    ///
+    /// This is the assertion the earlier wiring had no room for. `open_signer` reported `Available`
+    /// from the environment while the scheduler built its effects with a hard-coded `None`, so the
+    /// bring-up log said "this node may create and reclaim collateral" and every reclaim refused —
+    /// two answers to one question, with only one of them on the path the money takes.
+    ///
+    /// Written as an equivalence over EVERY seam outcome rather than as a pair of literal
+    /// assertions: it says `Available` holds exactly when a broadcaster is handed over, so it fails
+    /// both ways round — announce a power with nothing to send through, or send through something
+    /// while announcing less. A test that only checked today's values would pass against a second
+    /// source that happened to agree at the moment it was written.
+    #[tokio::test]
+    async fn the_announced_capability_holds_exactly_when_a_broadcaster_is_handed_over() {
+        let chain = ChainTransport::new();
+
+        for seam in [
+            production_broadcaster(&chain, false).await,
+            MirrorBroadcast::ChainClientUnavailable,
+            MirrorBroadcast::Wired(std::sync::Arc::new(
+                dig_wallet::sage::spend::MockBroadcaster::default(),
+            )),
+        ] {
             assert_eq!(
-                capability,
-                SpendCapability::BroadcasterUnwired,
-                "with the seam empty the honest answer is the missing wiring, not a switched-off \
-                 flag the operator has already switched on"
-            );
-            assert!(
-                !capability.may_spend(),
-                "and a node that cannot broadcast must not announce that it may create and reclaim"
+                spend_capability(&seam).may_spend(),
+                seam.broadcaster().is_some(),
+                "the capability the node ANNOUNCES and the broadcaster the money path is HANDED \
+                 must be the same fact; two answers to one question is the regression this seam \
+                 exists to make inexpressible"
             );
         }
     }
 
-    /// Both branches of the capability decision, including the one this build cannot reach.
+    /// Every branch of the capability decision, including the ones a given build cannot reach.
     ///
-    /// Separate from the test above because that one can only exercise the branch the current
-    /// [`production_broadcaster`] selects. A branch no fixture can take reads as covered while
-    /// never having run once, so the wired branch is asserted directly.
+    /// A branch no fixture can take reads as covered while never having run once, so each is
+    /// asserted directly.
     #[test]
-    fn the_capability_decision_says_available_only_for_a_wired_broadcaster() {
+    fn the_capability_decision_names_each_seam_outcome() {
         assert_eq!(
-            spend_capability(true),
+            spend_capability(&MirrorBroadcast::Wired(std::sync::Arc::new(
+                dig_wallet::sage::spend::MockBroadcaster::default()
+            ))),
             SpendCapability::Available,
             "a wired broadcaster is what Available means"
         );
         assert_eq!(
-            spend_capability(false),
-            SpendCapability::BroadcasterUnwired,
-            "and its absence is a different answer, not the same one"
+            spend_capability(&MirrorBroadcast::Disabled),
+            SpendCapability::BroadcastDisabled,
+            "a switched-off flag is a switch the operator can flip"
         );
-        assert!(!spend_capability(false).may_spend());
+        assert_eq!(
+            spend_capability(&MirrorBroadcast::ChainClientUnavailable),
+            SpendCapability::ChainClientUnavailable,
+            "and an unreachable chain is NOT that, so it must not be reported as one"
+        );
+        assert!(!spend_capability(&MirrorBroadcast::Disabled).may_spend());
+        assert!(!spend_capability(&MirrorBroadcast::ChainClientUnavailable).may_spend());
     }
 
     /// What a real installation LOOKS like, assembled independently of the needles.
@@ -857,7 +1051,8 @@ mod tests {
             for forbidden in forbidden_installations() {
                 assert!(
                     !source.contains(forbidden),
-                    "{name} calls {forbidden} — the operator signer must stay inside the mirror                      lifecycle, never installed on the shared WalletBackend"
+                    "{name} calls {forbidden} — the operator signer must stay inside the mirror \
+                     lifecycle, never installed on the shared WalletBackend"
                 );
             }
         }
@@ -900,7 +1095,8 @@ mod tests {
         for (name, source) in guarded_sources() {
             assert!(
                 source.contains("WalletBackend"),
-                "{name} must be the file that could install a signer; an empty or wrong include                  makes the guard pass forever"
+                "{name} must be the file that could install a signer; an empty or wrong include \
+                 makes the guard pass forever"
             );
         }
     }

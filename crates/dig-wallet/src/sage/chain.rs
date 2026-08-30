@@ -252,6 +252,28 @@ impl ChainTransport {
         self.client().await
     }
 
+    /// A [`Broadcaster`](super::spend::Broadcaster) that pushes through the ONE shared client.
+    ///
+    /// The narrow counterpart to [`Self::chain_source`], and it exists for the same reason: a
+    /// consumer that needs to SEND a signed bundle needs the ability to push, not the client
+    /// itself. Handing out [`Self::shared_client`] would hand out every other power the client has,
+    /// and building a second client is what gave a live node two independent sets of full-node
+    /// sessions with two notions of the peak (dig_ecosystem#2761).
+    ///
+    /// It is deliberately NOT an `impl Broadcaster for ChainTransport`. An unused one sat in this
+    /// file once and made a one-line `.with_broadcaster(chain.clone())` compile, pass every test,
+    /// and silently enable node-custodied sending on a default install. A caller must ask for a
+    /// broadcaster by name, and asking is a visible line in a diff.
+    ///
+    /// # Errors
+    ///
+    /// The lazy client build — this node could not reach a chain at all. Not cached, so a later
+    /// call tries again; a node that starts offline can broadcast the moment its network returns.
+    pub async fn broadcaster(&self) -> Result<Arc<dyn super::spend::Broadcaster>> {
+        let client = self.shared_client().await?;
+        Ok(Arc::new(super::spend::ChiaQueryBroadcaster::new(client)))
+    }
+
     /// This transport's chain reads presented as the canonical
     /// [`ChainSource`](chia_query::provider_registry::interface::ChainSource) — the trait every DIG consumer of
     /// chain state depends on.
@@ -582,7 +604,11 @@ impl ChainFallback for ChainTransport {
 // `submit_transaction` for the node's custodied key, which is the decision
 // `DIG_WALLET_ENABLE_LIVE_BROADCAST` owns. An unused `impl Broadcaster for ChainTransport` sat here
 // and made a one-line `.with_broadcaster(chain.clone())` compile, pass every test, and silently
-// enable node-custodied sending on a default install. The transport is reachable only as a
+// enable node-custodied sending on a default install.
+//
+// A `Broadcaster` is reachable from the transport, but only by NAME, through
+// [`ChainTransport::broadcaster`] — a visible line in a diff that a caller has to write on purpose.
+// The `impl` is what made it ambient; asking for one is not. Its other route out is as a
 // `SignedBundlePusher`, whose contract is a bundle somebody already signed.
 
 /// Decode a hex-encoded, already-signed spend bundle.

@@ -253,6 +253,47 @@ pub(crate) fn to_query_bundle(bundle: &SpendBundle) -> Result<chia_query::SpendB
     })
 }
 
+/// The ONE reading of a `push_tx` answer, and the reason it is not `status.success`.
+///
+/// A Chia `TransactionAck` carries three outcomes, and `chia_query` collapses two of them:
+/// `ack_to_tx_status` sets `success: true` for status **1 (SUCCESS)** *and* status **2 (PENDING)**.
+/// Those are not the same event. `SUCCESS` means the full node admitted the bundle to its mempool;
+/// `PENDING` means it did **not** — it is holding the bundle for an unknown parent, or refusing it
+/// for a fee below the mempool floor — and a held bundle may never be admitted at all.
+///
+/// [`Broadcaster::broadcast`] promises `Ok` "once the network has accepted it for the mempool", so
+/// only `SUCCESS` may return `Ok` here. Reading `success` instead would report a submission that
+/// never happened: the spend journal would record it, and the intra-pass reservation would strand
+/// the funding coin against a spend the network is not holding.
+///
+/// Kept as a PURE function of the status rather than an inline branch so every ack shape is
+/// exercised directly — the mempool cannot be asked to produce a `PENDING` on demand.
+///
+/// A refused push is FINAL, which is why this reads as a refusal rather than as "try again":
+/// `chia_query`'s router returns the FIRST `Ok` from `push_tx`, so a PENDING ack ends the push —
+/// there is no coinset second opinion and no retry against another peer.
+///
+/// It cannot say WHY, and that is a limitation of the crate rather than a choice here: the
+/// `TransactionAck`'s own error text is discarded by `ack_to_tx_status`, so the ack NAME is the
+/// most specific thing available. An unknown parent and a fee below the mempool floor are
+/// different problems with different operator actions, and both arrive here as `PENDING`.
+///
+/// The comparison is on the status NAME, not the boolean: `chia_query`'s `success` is deliberately
+/// left alone. It is a published crate at a lower level whose other consumers may legitimately be
+/// asking "did the node take it" rather than "is it in the mempool"; widening this fix into that
+/// crate is a release-first cascade, tracked as DIG-Network/chia-query#48 — which also carries the
+/// discarded `ack.error`.
+pub(crate) fn accepted_by_mempool(status: &chia_query::TxStatus) -> Result<()> {
+    if status.status == "SUCCESS" {
+        return Ok(());
+    }
+    Err(Error::api(format!(
+        "the network did not admit the transaction to its mempool (ack: {}); nothing is pending on \
+         chain for this bundle",
+        status.status
+    )))
+}
+
 #[async_trait]
 impl Broadcaster for ChiaQueryBroadcaster {
     async fn broadcast(&self, bundle: &SpendBundle) -> Result<()> {
@@ -262,14 +303,8 @@ impl Broadcaster for ChiaQueryBroadcaster {
             .push_tx(&wire)
             .await
             .map_err(|e| Error::internal(format!("broadcast (push_tx) failed: {e}")))?;
-        // Fail closed: a non-success mempool status is an error, not a silent no-op.
-        if !status.success {
-            return Err(Error::api(format!(
-                "the network rejected the transaction: {}",
-                status.status
-            )));
-        }
-        Ok(())
+        // Fail closed, and on ADMISSION rather than on `success` — see `accepted_by_mempool`.
+        accepted_by_mempool(&status)
     }
 }
 
@@ -969,6 +1004,62 @@ mod tests {
     use super::*;
     use chia_sdk_test::Simulator;
     use chia_wallet_sdk::types::TESTNET11_CONSTANTS;
+
+    /// The exact ack `chia_query` produces for each `TransactionAck` status byte.
+    ///
+    /// Built from `chia_query::peer::translate::ack_to_tx_status`'s own mapping rather than from
+    /// what this module would like it to be, so a change to that mapping shows up here as a
+    /// failure instead of being silently accommodated.
+    fn ack(status: &str, success: bool) -> chia_query::TxStatus {
+        chia_query::TxStatus {
+            status: status.to_string(),
+            success,
+        }
+    }
+
+    /// A PENDING ack is a REFUSAL, and it is the one ack that distinguishes this check from the
+    /// obvious wrong one.
+    ///
+    /// `chia_query` reports status 2 as `TxStatus { status: "PENDING", success: true }` — so a
+    /// broadcaster that reads `success` returns `Ok(())` for a bundle the full node never admitted
+    /// to its mempool. Every other ack shape agrees between the two readings; this fixture is the
+    /// only input that tells them apart, which is why it is written first and named for it.
+    #[test]
+    fn a_pending_ack_is_not_an_accepted_broadcast() {
+        let pending = ack("PENDING", true);
+        assert!(
+            pending.success,
+            "the fixture must carry the conflation it exists to catch: chia_query really does set \
+             success=true on PENDING, and a fixture with success=false would pass against the \
+             defect"
+        );
+
+        let err = accepted_by_mempool(&pending)
+            .expect_err("a bundle the mempool did not admit must not report as broadcast");
+        assert!(
+            err.to_string().contains("PENDING"),
+            "the refusal must NAME the ack it saw, or an operator cannot tell a held bundle from a \
+             rejected one: {err}"
+        );
+    }
+
+    /// SUCCESS, and only SUCCESS, is admission.
+    #[test]
+    fn only_a_success_ack_reports_an_accepted_broadcast() {
+        accepted_by_mempool(&ack("SUCCESS", true)).expect("status 1 is mempool admission");
+
+        for refused in [
+            ack("PENDING", true),
+            ack("FAILED", false),
+            ack("UNKNOWN", false),
+        ] {
+            let name = refused.status.clone();
+            assert!(
+                accepted_by_mempool(&refused).is_err(),
+                "{name} is not mempool admission and must not return Ok"
+            );
+        }
+    }
 
     /// A signer whose single key owns `alice`'s simulator coin, using the testnet11 agg-sig
     /// domain (the domain the simulator validates against).
