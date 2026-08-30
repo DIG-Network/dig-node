@@ -3764,6 +3764,68 @@ mod tests {
         assert_eq!(parsed.len(), 2);
     }
 
+    /// **Proves:** the coin read's page bound is the CONTRACT's, refused rather than clamped, and
+    /// pinned from BOTH sides.
+    ///
+    /// A bound tested only from below can only confirm itself, so the at-maximum value MUST be
+    /// accepted and the one-over MUST be refused. Clamping instead of refusing would hand back a
+    /// cursor for a position the caller never asked about, and the caller would mis-size every
+    /// subsequent request against a boundary it does not share with the node.
+    ///
+    /// The default is asserted against the CONTRACT's constant rather than a literal `100`: a node
+    /// and a client resolving an omitted `limit` to two different numbers page to two different
+    /// boundaries, which is where a coin goes missing.
+    #[test]
+    fn the_coin_page_bound_is_the_contracts_and_is_refused_rather_than_clamped() {
+        use dig_node_control_interface::params::{COINS_DEFAULT_LIMIT, COINS_MAX_LIMIT};
+
+        let ask = |extra: Value| {
+            let mut params = json!({ "address": "xch1abc", "asset": "dig" });
+            if let Value::Object(map) = extra {
+                for (k, v) in map {
+                    params[k] = v;
+                }
+            }
+            wallet_coins_params(&json!(1), &params)
+        };
+
+        assert_eq!(
+            ask(json!({})).expect("an omitted limit is legal").3,
+            COINS_DEFAULT_LIMIT,
+            "an omitted limit must resolve to the CONTRACT's default, not to this node's guess"
+        );
+        assert_eq!(
+            ask(json!({ "limit": COINS_MAX_LIMIT }))
+                .expect("the documented maximum must be ACCEPTED, or it is not the real bound")
+                .3,
+            COINS_MAX_LIMIT
+        );
+
+        for over in [COINS_MAX_LIMIT + 1, 0] {
+            let refused = ask(json!({ "limit": over })).expect_err("must be refused, not clamped");
+            assert_eq!(
+                refused["error"]["code"], -32602,
+                "an out-of-range page size is INVALID_PARAMS: {refused}"
+            );
+        }
+
+        // The cursor is held to the same lowercase-64-hex rule every by-coin read uses, and the
+        // `0x` prefix is normalized away rather than passed through to the query.
+        assert!(ask(json!({ "after_coin_id": "AB".repeat(32) })).is_err());
+        assert_eq!(
+            ask(json!({ "after_coin_id": format!("0x{}", "ab".repeat(32)) }))
+                .expect("an 0x-prefixed cursor is tolerated")
+                .2
+                .as_deref(),
+            Some(&*"ab".repeat(32))
+        );
+
+        // A present-but-wrong-typed page field is refused rather than ignored: serving the default
+        // while reporting success would make the boundary differ from the one the caller believes.
+        assert!(ask(json!({ "limit": "50" })).is_err());
+        assert!(ask(json!({ "after_coin_id": 7 })).is_err());
+    }
+
     /// `coins_wire` emits the contract shape: the requested asset echoed onto every coin, an
     /// explicitly-null `spent_height` (every coin here is unspent), and the tier fields.
     ///
@@ -3794,6 +3856,8 @@ mod tests {
                         spent_height: None,
                     },
                 ],
+                complete: true,
+                cursor: Some("dd".repeat(32)),
                 source: Source::Db,
                 synced: true,
                 peak_height: Some(5_000_000),
@@ -3816,6 +3880,7 @@ mod tests {
                         "created_height": null, "spent_height": null
                     }
                 ],
+                "complete": true, "cursor": "dd".repeat(32),
                 "source": "db", "synced": true, "peak_height": 5_000_000
             })
         );
@@ -3854,6 +3919,8 @@ mod tests {
                     created_height: Some(1),
                     spent_height: None,
                 }],
+                complete: true,
+                cursor: Some("aa".repeat(32)),
                 source: Source::Fallback,
                 synced: false,
                 peak_height: None,
@@ -3914,6 +3981,8 @@ mod tests {
                     created_height: Some(5_000_000),
                     spent_height: Some(5_000_042),
                 }],
+                complete: true,
+                cursor: Some("aa".repeat(32)),
                 source: Source::Fallback,
                 synced: false,
                 peak_height: None,
