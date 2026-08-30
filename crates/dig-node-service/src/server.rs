@@ -2732,6 +2732,12 @@ fn spawn_mirror_passes(
             ),
         }
 
+        // Read ONCE, for the life of the task, beside the wallet above. The value is an operator
+        // configuration rather than an observation, and a coin's URLs are fixed at create for the
+        // whole epoch — so re-reading it per pass would buy nothing and would let the list a
+        // warning was emitted about drift from the list actually published.
+        let advertised_urls = crate::mirror::advertise::configured_urls();
+
         let journal = lifecycle::journal();
         let mut presence = crate::mirror::presence::PresenceTracker::new();
 
@@ -2784,12 +2790,12 @@ fn spawn_mirror_passes(
                             capsules,
                             dig_balance,
                             committed,
-                            // EMPTY, deliberately. A mirror advertises where its store can be
-                            // fetched from, and this node has no configured public name to
-                            // advertise — so `create` refuses by name rather than publishing an
-                            // advertisement nobody can act on. That is an advertisement gap, not a
-                            // funding one (dig-node#426); the selector behind it is live.
-                            Vec::new(),
+                            // The operator's own list (SPEC.md 25.10, dig-node#426), read ONCE
+                            // at bring-up above. Empty when nothing is configured or nothing
+                            // configured is publishable, and `create` then refuses by name before
+                            // any chain read rather than staking collateral on an advertisement
+                            // nobody can act on.
+                            advertised_urls.clone(),
                             &source,
                             owner_puzzle_hash,
                             signer_ref,

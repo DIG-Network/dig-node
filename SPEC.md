@@ -8359,10 +8359,6 @@ The surface MUST hold four properties, each of which is a money statement:
 
 ### 25.10. What the node advertises, and why it is configured
 
-> **PARTIALLY SATISFIED at this head.** The operator surface and its parsing exist
-> (`mirror/advertise.rs`); nothing reads them yet, so no advertisement carries a URL and no coin is
-> created. Tracked as <https://github.com/DIG-Network/dig-node/issues/426>.
-
 A mirror coin publishes, in its memos, the URLs its store can be fetched from. `dig-mirror-coin`
 requires at least one and imposes no other rule on them: they are advisory fetch hints, and the
 crate's reader accepts any UTF-8 entry. This node therefore decides for itself what it is honest to

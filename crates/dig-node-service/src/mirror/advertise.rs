@@ -73,6 +73,51 @@ pub fn advertised_urls_from_env() -> Advertised {
     parse_advertised_urls(&std::env::var(ADVERTISE_URLS_ENV).unwrap_or_default())
 }
 
+/// The URLs this node will publish, with every rejected entry reported to the operator.
+///
+/// This is the whole operator surface as the mirror scheduler consumes it: one call, at bring-up,
+/// yielding the list `create` advertises. An empty answer is the honest default rather than an
+/// error — `NodeMirrorEffects::create` refuses by name on it, before any chain read, so a node with
+/// nothing to advertise stakes nothing.
+///
+/// The warnings are emitted HERE rather than at the call site because this is the only place that
+/// knows WHY an entry was dropped; a caller handed a shortened list could only report that some
+/// entry was missing, which is not something an operator can act on.
+pub fn configured_urls() -> Vec<String> {
+    let advertised = advertised_urls_from_env();
+
+    for (entry, why) in &advertised.rejected {
+        let reason = match why {
+            Rejection::NotAbsolute => {
+                "it is not an absolute URL with a scheme and a host, so it names no way to reach                  anything"
+            }
+            Rejection::ThisMachineOnly => {
+                "its host can only mean this machine, so every reader would resolve it to                  themselves"
+            }
+        };
+        tracing::warn!(
+            target: "mirror",
+            entry = %entry,
+            "{ADVERTISE_URLS_ENV} entry is not advertised: {reason}"
+        );
+    }
+
+    if advertised.can_advertise() {
+        tracing::info!(
+            target: "mirror",
+            urls = ?advertised.accepted,
+            "advertising this node's stores at the operator-configured URLs, in the configured order"
+        );
+    } else {
+        tracing::info!(
+            target: "mirror",
+            "no {ADVERTISE_URLS_ENV} entry is publishable, so this node advertises nothing and              creates no mirror coin (SPEC.md 25.10)"
+        );
+    }
+
+    advertised.accepted
+}
+
 /// Turns one operator-set string into the advertisement's URL list.
 ///
 /// # What is deliberately NOT rejected
