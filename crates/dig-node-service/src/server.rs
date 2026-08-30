@@ -2724,11 +2724,11 @@ fn spawn_mirror_passes(
             ),
             // Deliberately NOT phrased as a flag to set: the operator has already set
             // DIG_WALLET_ENABLE_LIVE_BROADCAST to reach this arm at all.
-            SpendCapability::ChainUnreachable => tracing::warn!(
+            SpendCapability::ChainClientUnavailable => tracing::warn!(
                 target: "mirror",
                 "the mirror lifecycle OBSERVES only: the wallet opened and live broadcast is on, \
-                 but no chain could be reached to broadcast through, so a reclaim is planned \
-                 and reported and no spend is sent"
+                 but this node could not build the shared chain client a broadcaster is made from, \
+                 so a reclaim is planned and reported and no spend is sent"
             ),
         }
 
