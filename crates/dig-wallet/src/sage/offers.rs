@@ -430,33 +430,24 @@ fn select_xch(coins: &[Coin], need: u64) -> Result<Vec<Coin>> {
 }
 
 /// Greedily select CAT coins of `asset_id` (largest first) covering `need`.
+///
+/// The FILTER is this function's own — an offer leg names one asset, and a coin of another asset is
+/// not a candidate however large it is. The ordering and the refusal are
+/// [`super::selection::select_largest_first`]'s, shared with the wallet's row selector and with the
+/// mirror lifecycle's operator-scoped selector.
 fn select_cats(cats: &[Cat], asset_id: Bytes32, need: u64) -> Result<Vec<Cat>> {
-    let mut sorted: Vec<Cat> = cats
+    let candidates: Vec<Cat> = cats
         .iter()
         .filter(|c| c.info.asset_id == asset_id)
         .copied()
         .collect();
-    sorted.sort_by(|a, b| {
-        b.coin
-            .amount
-            .cmp(&a.coin.amount)
-            .then(a.coin.coin_id().cmp(&b.coin.coin_id()))
-    });
-    let mut sum = 0u64;
-    let mut out = Vec::new();
-    for c in sorted {
-        if sum >= need {
-            break;
-        }
-        sum += c.coin.amount;
-        out.push(c);
-    }
-    if sum < need {
-        return Err(Error::api(format!(
-            "insufficient CAT to offer: need {need} have {sum}"
-        )));
-    }
-    Ok(out)
+    super::selection::select_largest_first(candidates, need, |c| (c.coin.amount, c.coin.coin_id()))
+        .map_err(|s| {
+            Error::api(format!(
+                "insufficient CAT to offer: need {} have {}",
+                s.need, s.have
+            ))
+        })
 }
 
 #[cfg(test)]

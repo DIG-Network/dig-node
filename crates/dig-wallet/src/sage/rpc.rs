@@ -4805,29 +4805,22 @@ fn normalize_singleton_id(id: &str) -> String {
 }
 
 /// Greedily select CAT coin rows (largest first) covering `target`. Errors if they cannot.
-fn select_cat_rows(mut rows: Vec<CoinRow>, target: u64) -> Result<Vec<CoinRow>> {
-    rows.sort_by(|a, b| {
-        b.amount
-            .parse::<u64>()
-            .unwrap_or(0)
-            .cmp(&a.amount.parse::<u64>().unwrap_or(0))
-            .then(a.coin_id.cmp(&b.coin_id))
-    });
-    let mut selected = Vec::new();
-    let mut total: u64 = 0;
-    for r in rows {
-        if total >= target {
-            break;
-        }
-        total += r.amount.parse::<u64>().unwrap_or(0);
-        selected.push(r);
-    }
-    if total < target {
-        return Err(Error::api(format!(
-            "insufficient CAT balance: have {total}, need {target}"
-        )));
-    }
-    Ok(selected)
+///
+/// The ordering and the refusal are [`super::selection::select_largest_first`]'s, shared with the
+/// offer builder and with the mirror lifecycle's operator-scoped selector so that one money
+/// algorithm has one implementation. What stays here is the part that is genuinely about this coin
+/// SET: the DB stores an amount as a decimal string, and an unparseable one counts as zero — which
+/// can only make a selection refuse, never over-fund.
+fn select_cat_rows(rows: Vec<CoinRow>, target: u64) -> Result<Vec<CoinRow>> {
+    super::selection::select_largest_first(rows, target, |r| {
+        (r.amount.parse::<u64>().unwrap_or(0), r.coin_id.clone())
+    })
+    .map_err(|s| {
+        Error::api(format!(
+            "insufficient CAT balance: have {}, need {}",
+            s.have, s.need
+        ))
+    })
 }
 
 /// Encode a puzzle-hash hex as a bech32m address with `prefix`.

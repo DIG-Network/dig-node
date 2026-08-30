@@ -45,13 +45,20 @@
 //! not have: while the broadcaster is absent the capability is
 //! [`SpendCapability::BroadcasterUnwired`] and never `Available`.
 //!
-//! **Creates do not, yet, and they refuse rather than guess.** `dig_mirror_coin::create` takes the
-//! `Cat` inputs from its caller, and selecting them requires a $DIG coin selector scoped to the
-//! OPERATOR puzzle hash. The node-custodied [`WalletBackend`](dig_wallet::sage::rpc::WalletBackend)
-//! selector is scoped to its own replica instead, so using it would fund a mirror coin from the
-//! wrong wallet's coins. [`NodeMirrorEffects::create`] therefore returns a named
-//! [`PassError::Wallet`], the pass reports it in `stopped_at`, and §25.8 keeps reporting the bond
-//! as uncovered — which is true. The selector is dig-node#421.
+//! **Creates select their own collateral, from the OPERATOR wallet.** `dig_mirror_coin::create`
+//! takes its `Cat` inputs from its caller, and [`super::funding`] supplies them: it scans the chain
+//! at the CAT wrapping of THIS node's operator puzzle hash, reconstructs each candidate's lineage
+//! from its creating spend, and refuses the whole create on a shortfall rather than funding a
+//! smaller coin (dig-node#421). The node-custodied
+//! [`WalletBackend`](dig_wallet::sage::rpc::WalletBackend) selector is scoped to its own replica and
+//! is deliberately not used here: it would fund a mirror coin from the wrong wallet's coins, which
+//! is a real spend that returns `Ok`.
+//!
+//! **What a create still needs before one can be attempted.** A mirror advertises WHERE its store
+//! can be fetched from, and `dig_mirror_coin::create` refuses an advertisement with no URL. This
+//! node has no configured public name yet, so [`NodeMirrorEffects`] is handed an empty URL set and
+//! `create` refuses by name, ahead of any chain read. That is the one remaining gap, it is an
+//! advertisement question rather than a funding one, and it is dig-node#426.
 //!
 //! # Nothing here relaxes the audit shape
 //!
@@ -83,6 +90,7 @@ use crate::spend_audit::{
     FailureStage, FundingCoinId, SpendJournal, SpendLog, Submission, TargetCoinId,
 };
 
+use super::funding::{self, FundingError};
 use super::observe::held_mirrors;
 use super::plan::{Bond, HeldMirror, ReclaimReason};
 use super::runner::{MirrorEffects, ObservedCapsule, PassError, PassReport};
@@ -117,6 +125,28 @@ pub struct NodeMirrorEffects<'a, S: ChainSource> {
     capsules: Vec<ObservedCapsule>,
     /// Spendable $DIG at the operator address, already read. `Err` defers creates, never reclaims.
     dig_balance: Result<u64, PassError>,
+    /// The coins committed to a bundle in flight: the durable record read once, then EXTENDED by
+    /// every broadcast this pass makes.
+    ///
+    /// The audit log is read once by the scheduler, before the pass — one reading of the record, in
+    /// the same way the pass takes one reading of the disk and one of the balance. That snapshot
+    /// alone is only an ACROSS-pass reservation, and a pass emits N creates
+    /// ([`super::runner`] loops over the affordable prefix). A create's own broadcast does not
+    /// appear in a snapshot taken before it, and the chain still shows its funding coin unspent for
+    /// the whole confirmation window — so the second create in one pass re-selected the first's coin
+    /// and broadcast a bundle that double-spent it.
+    ///
+    /// The `RefCell` is what closes that window: [`Self::sign_and_broadcast`] extends this set from
+    /// the signed bundle on a broadcast that reached the mempool, so the next create in the same
+    /// pass selects against what this pass has already spent. It is exactly the set the durable
+    /// journal receives, which is why the two cannot disagree. `SPEC.md` §25 states the property.
+    ///
+    /// `Err` defers creates and NEVER reclaims, exactly like `dig_balance`: a reclaim needs no coin
+    /// selection at all (§25.4.4), so gating it on a funding read would reintroduce the legacy
+    /// defect where a node that could not fund could not recover either.
+    committed_coin_ids: Result<std::cell::RefCell<std::collections::HashSet<String>>, PassError>,
+    /// Where this node advertises its stores can be fetched from. Empty means it cannot advertise.
+    advertised_urls: Vec<String>,
     /// The chain, for the owned-coin scan and for the reclaim spends.
     source: &'a S,
     /// This node's operator puzzle hash — a public value, derived once at bring-up.
@@ -145,6 +175,8 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
     pub fn new(
         capsules: Vec<ObservedCapsule>,
         dig_balance: Result<u64, PassError>,
+        committed_coin_ids: Result<std::collections::HashSet<String>, PassError>,
+        advertised_urls: Vec<String>,
         source: &'a S,
         owner_puzzle_hash: Bytes32,
         signer: Option<&'a MirrorSigner>,
@@ -155,6 +187,10 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
         Self {
             capsules,
             dig_balance,
+            // Wrapped here rather than at the call site: the scheduler's job is to take ONE reading
+            // of the audit record, and within-pass accumulation is this type's business.
+            committed_coin_ids: committed_coin_ids.map(std::cell::RefCell::new),
+            advertised_urls,
             source,
             owner_puzzle_hash,
             signer,
@@ -200,7 +236,7 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
 
         // The coins CONSUMED are read from the bundle itself rather than stated: every `CoinSpend`
         // in it spends exactly its own coin, so this cannot disagree with what was signed.
-        let funding_coin_ids = spends
+        let funding_coin_ids: Vec<FundingCoinId> = spends
             .coin_spends()
             .iter()
             .map(|cs| FundingCoinId(hex::encode(cs.coin.coin_id())))
@@ -208,30 +244,55 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
 
         match self.runtime.block_on(broadcaster.broadcast(&bundle)) {
             Ok(()) => {
-                match intended {
-                    // Recorded as an EXPECTATION. Only a chain observation may promote it to
-                    // `Confirmed`, which is why `SpendJournal::confirmed` is not called from this
-                    // path at all.
-                    Some(intended_coin_id) => self.journal.submitted(
-                        &recorded,
-                        Submission {
-                            intended_coin_id,
-                            funding_coin_ids,
-                        },
-                    ),
-                    // No coin id this node can DERIVE, so none is stated. Dropping `recorded`
-                    // resolves it `Unresolved`, which this crate defines as "the node signed and
-                    // does not know what became of it" — and after a successful broadcast with an
-                    // underivable target, that is precisely true. Naming a plausible coin instead
-                    // would let §23.5's reconcile confirm this spend against a coin it never
-                    // created, which is the legacy defect `TargetCoinId` exists to make
-                    // inexpressible.
-                    None => tracing::warn!(
+                if intended.is_none() {
+                    tracing::warn!(
                         target: "mirror",
                         operation = spends.operation().as_str(),
-                        "broadcast a mirror spend whose created coin this node cannot derive; the                          audit entry resolves UNRESOLVED rather than naming a guessed coin"
-                    ),
+                        "broadcast a mirror spend whose created coin this node cannot derive; the                          audit entry names no target coin rather than naming a guessed one"
+                    );
                 }
+                // Recorded UNCONDITIONALLY, and the two facts are recorded independently. The
+                // consumed coins came from the bundle and are always known; `intended` is the coin
+                // this node could derive, which for a create is `None`. An earlier shape recorded
+                // the submission ONLY when a target was derivable and dropped `recorded` otherwise
+                // — which resolved the entry `Unresolved` and, far worse, threw away the funding
+                // ids, leaving `committed_funding_coin_ids` permanently empty for creates. Two
+                // creates in one confirmation window then re-selected the same coins.
+                //
+                // `intended` is still an EXPECTATION, never a confirmation: only a chain
+                // observation promotes it, which is why `SpendJournal::confirmed` is not called
+                // from this path at all. A `None` stays `None` — naming a plausible coin would let
+                // §23.5's reconcile confirm this spend against a coin it never created, the legacy
+                // defect `TargetCoinId` exists to make inexpressible.
+                // The IN-MEMORY reservation is extended from the same value, so a later create in
+                // THIS pass cannot re-select a coin this bundle just spent. The durable journal is
+                // an across-pass record only: it is re-read once per pass, before the pass, so
+                // nothing written here reaches the next create through it. The chain cannot supply
+                // the answer either — a broadcast coin stays unspent in the chain's view for the
+                // whole confirmation window, which is shorter than nothing and longer than a round.
+                //
+                // Extended only on a broadcast that REACHED the mempool. Reserving on attempt would
+                // strand a coin every time a broadcast failed, and the failure path below already
+                // records that the money stayed put.
+                //
+                // Reclaims feed it too, and that is deliberate: `funding_coin_ids` is read from the
+                // bundle, so this set holds exactly what the journal holds, and a set that
+                // disagreed with the record it mirrors would be a second answer to "what is in
+                // flight". A poisoned `Err` reading contributes nothing — it already refuses every
+                // create, and reclaims never consult it (§25.4.4).
+                if let Ok(committed) = self.committed_coin_ids.as_ref() {
+                    committed
+                        .borrow_mut()
+                        .extend(funding_coin_ids.iter().map(|c| c.0.clone()));
+                }
+
+                self.journal.submitted(
+                    &recorded,
+                    Submission {
+                        intended_coin_id: intended,
+                        funding_coin_ids,
+                    },
+                );
                 Ok(())
             }
             Err(e) => {
@@ -313,22 +374,111 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         self.sign_and_broadcast(&spends, Some(reclaimed_coin_id(&coin)))
     }
 
-    fn create(
-        &self,
-        bond: &Bond,
-        _epoch: i64,
-        amount_dig_base_units: u64,
-    ) -> Result<(), PassError> {
-        // REFUSED, by name, rather than funded from the wrong wallet. See the module doc: the only
-        // $DIG selector this process has is scoped to the node-custodied replica, not to the
-        // operator puzzle hash, and a mirror coin funded from the wrong coins is a real spend that
-        // looks successful. dig-node#421 is the operator-scoped selector.
-        Err(PassError::Wallet(format!(
-            "creating the {} bond needs {} DIG base units selected from the OPERATOR wallet, and \
-             this node has no operator-scoped $DIG coin selector yet (dig-node#421); no spend was \
-             attempted",
-            bond.store_id, amount_dig_base_units
-        )))
+    fn create(&self, bond: &Bond, epoch: i64, amount_dig_base_units: u64) -> Result<(), PassError> {
+        // The advertisement is checked FIRST, ahead of every chain read. `dig_mirror_coin::create`
+        // refuses an advertisement with no URL, so selecting coins before knowing there is somewhere
+        // to advertise spends a chain scan to reach a refusal that was decidable for free.
+        if self.advertised_urls.is_empty() {
+            return Err(PassError::Wallet(format!(
+                "creating the {} bond needs at least one URL this node's stores can be fetched \
+                 from, and none is configured; a mirror with nowhere to fetch from is not a \
+                 mirror, so no coin was selected and no spend was attempted",
+                bond.store_id
+            )));
+        }
+
+        let store_launcher_id = parse_id(&bond.store_id, "store id")?;
+        let root_hash = parse_id(&bond.root, "root hash")?;
+
+        let committed = self.committed_coin_ids.as_ref().map_err(Clone::clone)?;
+
+        // The amount is the planner's — `apply_safety_margin(required_per_store, margin_bp)`,
+        // §25.3 — carried straight through. Nothing here re-derives it and nothing here has an
+        // opinion about it: a create at the wrong amount locks money and advertises nothing.
+        //
+        // The borrow is scoped to the selection ALONE and released before anything is signed.
+        // `sign_and_broadcast` takes the set mutably to record what this bundle consumed, and a
+        // borrow still live across that call is a runtime panic on the money path rather than a
+        // compile error — so the scope is the guarantee, and it is deliberately narrow.
+        let dig_coins = {
+            let committed = committed.borrow();
+            funding::select_operator_dig_cats(
+                self.source,
+                self.owner_puzzle_hash,
+                amount_dig_base_units,
+                &committed,
+            )
+            .map_err(funding_refusal)?
+        };
+
+        let signer = self
+            .signer
+            .ok_or_else(|| PassError::Wallet("no operator wallet is available to sign".into()))?;
+
+        // `fee = 0` with no fee coins, matching the reclaim path. A create gated on selectable XCH
+        // would leave a node holding $DIG and no XCH unable to bond anything at all, and the next
+        // pass retries a create the mempool declined under fee pressure.
+        let spends = super::spends::build_create(
+            store_launcher_id,
+            root_hash,
+            num_bigint::BigInt::from(epoch),
+            self.advertised_urls.clone(),
+            amount_dig_base_units,
+            dig_coins,
+            signer.synthetic_key(),
+            Vec::new(),
+            0,
+        )
+        .map_err(|e| PassError::Wallet(e.to_string()))?;
+
+        tracing::info!(
+            target: "mirror",
+            store_id = %bond.store_id,
+            root = %bond.root,
+            epoch,
+            amount_dig_base_units,
+            "creating mirror collateral"
+        );
+
+        // No intended coin id is stated. A create's output coin takes its parent from whichever
+        // input the builder draws it from, and this node does not derive that — so naming a
+        // plausible coin would let §23.5's reconcile confirm this spend against a coin it never
+        // created. The record resolves `Unresolved` instead, which is the honest reading, and
+        // §25.4.6's duplicate suppression works from the `(root, epoch)` the record already
+        // carries rather than from a coin id.
+        self.sign_and_broadcast(&spends, None)
+    }
+}
+
+/// A 64-hex id from the planner, as the builder's `Bytes32`.
+///
+/// The planner carries store and root as lowercase hex strings, because that is what the disk scan
+/// and the control surface speak. A malformed one is a REFUSAL rather than a zeroed hash: a create
+/// against `0x00…` would lock real collateral advertising a store that does not exist, and the
+/// money would be just as locked as if the advertisement were good.
+fn parse_id(hex_id: &str, what: &str) -> Result<Bytes32, PassError> {
+    let bytes: [u8; 32] = hex::decode(hex_id)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| {
+            PassError::Wallet(format!(
+                "the {what} {hex_id:?} is not 32 bytes of hex, so no create is attempted for it"
+            ))
+        })?;
+    Ok(Bytes32::new(bytes))
+}
+
+/// A funding refusal, in the pass's own vocabulary.
+///
+/// The chain variant maps to [`PassError::Chain`] and every other to [`PassError::Wallet`], because
+/// the two mean different things to whoever reads `stopped_at`: a chain that could not answer is a
+/// transient condition of the SOURCE, while an empty or fully-committed wallet is a durable
+/// condition of this NODE. Collapsing them would tell an operator to add funds when the truth is
+/// that a read timed out.
+fn funding_refusal(error: FundingError) -> PassError {
+    match &error {
+        FundingError::Chain(_) => PassError::Chain(error.to_string()),
+        _ => PassError::Wallet(error.to_string()),
     }
 }
 
@@ -350,11 +500,10 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
 /// unwrapped hash would produce a coin id that can never appear on chain, so the reclaim would stay
 /// unconfirmed forever while having genuinely succeeded.
 fn reclaimed_coin_id(mirror: &MirrorCoin) -> TargetCoinId {
-    use chia_puzzle_types::cat::CatArgs;
-
-    let inner: clvm_utils::TreeHash = mirror.owner_puzzle_hash().into();
-    let puzzle_hash: Bytes32 =
-        CatArgs::curry_tree_hash(dig_mirror_coin::DIG_ASSET_ID, inner).into();
+    // The SAME derivation the create path scans with, not a second copy of it. Two hand-rolled CAT
+    // curries is how one of them ends up naming a puzzle hash nobody can spend, with nothing in the
+    // tree comparing the two.
+    let puzzle_hash = funding::dig_cat_puzzle_hash(mirror.owner_puzzle_hash());
 
     let created =
         chia_protocol::Coin::new(mirror.coin().coin_id(), puzzle_hash, mirror.collateral());
@@ -754,6 +903,74 @@ mod tests {
                 "{name} must be the file that could install a signer; an empty or wrong include                  makes the guard pass forever"
             );
         }
+    }
+
+    /// A successful broadcast records its submission UNCONDITIONALLY.
+    ///
+    /// Asserted STRUCTURALLY, over this file's own source, for the same reason as the guard above:
+    /// reaching `sign_and_broadcast` at runtime needs an opened `OperatorWallet` and a real signed
+    /// `MirrorSpends`, and the property is about a branch that must not exist rather than a value.
+    /// The behaviour of the recording itself IS asserted at runtime, at the journal seam, by
+    /// `funding::tests::a_spend_with_no_derivable_target_still_withholds_its_funding_coins`.
+    ///
+    /// **Catches** the exact shape this replaced: recording the submission only in the arm where a
+    /// target coin was derivable. A mirror create is precisely the case where it is not, so that
+    /// branch made `committed_funding_coin_ids` permanently empty for creates — the reservation was
+    /// never wrong, it was never FED — and two creates in one confirmation window re-selected the
+    /// same coins. `intended` is now carried into `Submission` as data, so there is nowhere to drop
+    /// it; the guard is what keeps a future edit from reintroducing the branch.
+    #[test]
+    fn a_successful_broadcast_records_its_submission_without_branching_on_the_target() {
+        let source = include_str!("lifecycle.rs");
+        assert!(
+            source.contains(concat!("self.journal.", "submitted(")),
+            "the broadcast path must journal its submission at all"
+        );
+        assert_eq!(
+            source
+                .matches(concat!("self.journal.", "submitted("))
+                .count(),
+            1,
+            "one unconditional recording; a second call site is how one branch starts recording \
+             the consumed coins and another stops"
+        );
+        for conditional in [
+            concat!("match ", "intended"),
+            concat!("Some(", "intended_coin_id) =>"),
+        ] {
+            assert!(
+                !source.contains(conditional),
+                "`{conditional}` branches the recording on whether a target coin is derivable, \
+                 which is what left every create contributing an empty funding-coin list"
+            );
+        }
+    }
+
+    /// The guard above is looking at real text and WOULD fail if the branch returned.
+    ///
+    /// Without this, a needle that matches no possible spelling — or an `include_str!` that stopped
+    /// resolving to the file holding the broadcast path — leaves a guard that passes forever.
+    #[test]
+    fn the_unconditional_recording_guard_can_actually_fail() {
+        let planted = concat!(
+            "match ",
+            "intended {\n    Some(",
+            "intended_coin_id) => {}\n}"
+        );
+        for conditional in [
+            concat!("match ", "intended"),
+            concat!("Some(", "intended_coin_id) =>"),
+        ] {
+            assert!(
+                planted.contains(conditional),
+                "{conditional} is the spelling the reintroduced branch would write"
+            );
+        }
+        assert!(
+            include_str!("lifecycle.rs").contains("fn sign_and_broadcast"),
+            "the guard must read the file that owns the broadcast path; a wrong include makes it \
+             pass forever"
+        );
     }
 
     /// `publish` carries the report's own figures across, and does not recompute either.

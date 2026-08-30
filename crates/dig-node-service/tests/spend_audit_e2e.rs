@@ -65,7 +65,7 @@ fn an_automated_spend_is_written_by_the_node_and_read_back_by_dign() {
     journal.submitted(
         &ok,
         Submission {
-            intended_coin_id: TargetCoinId("a".repeat(64)),
+            intended_coin_id: Some(TargetCoinId("a".repeat(64))),
             funding_coin_ids: vec![],
         },
     );

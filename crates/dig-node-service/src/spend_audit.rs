@@ -723,8 +723,16 @@ impl Drop for RecordedSpend {
 pub struct Submission {
     /// The coin the spend is expected to create — recorded as an EXPECTATION, and only promoted to
     /// a confirmed chain reference by [`SpendJournal::confirmed`].
-    pub intended_coin_id: TargetCoinId,
-    /// The coins consumed.
+    ///
+    /// `None` where the producer cannot DERIVE the created coin — a mirror create takes its output
+    /// coin's parent from whichever input the builder draws it from, and this node does not know
+    /// which. Optional rather than absent because the two facts a submission carries are
+    /// independent: the coins CONSUMED are read from the signed bundle and are always known, while
+    /// the coin CREATED sometimes is not. Coupling them — the shape this replaced — meant a
+    /// producer with no derivable target had no way to record the consumed coins either, so the
+    /// reservation set in [`crate::mirror::funding`] was silently never fed by the create path.
+    pub intended_coin_id: Option<TargetCoinId>,
+    /// The coins consumed. Read from the signed bundle, so this is known on every submission.
     pub funding_coin_ids: Vec<FundingCoinId>,
 }
 
@@ -808,10 +816,18 @@ impl SpendJournal {
     }
 
     /// The signed bundle reached the mempool. Records the coins consumed and the coin EXPECTED.
+    ///
+    /// Called on EVERY successful broadcast, including one whose created coin the producer cannot
+    /// derive. Reaching the mempool is a thing the node observed, so `Submitted` is the truthful
+    /// status for it; not knowing the resulting coin id is a separate, narrower ignorance, and it
+    /// is recorded as `intended_coin_id: None` rather than by withholding the whole entry. The
+    /// difference is load-bearing: the consumed coins are what
+    /// [`crate::mirror::funding::committed_funding_coin_ids`] reserves against, so an unrecorded
+    /// submission lets the next pass re-select the very coins this bundle is spending.
     pub fn submitted(&self, spend: &RecordedSpend, submission: Submission) {
         spend.write(SpendStatus::Submitted, (self.clock)(), |rec| {
             rec.funding_coin_ids = submission.funding_coin_ids;
-            rec.intended_coin_id = Some(submission.intended_coin_id);
+            rec.intended_coin_id = submission.intended_coin_id;
         });
     }
 
@@ -1087,7 +1103,7 @@ mod tests {
         journal.submitted(
             &recorded,
             Submission {
-                intended_coin_id: TargetCoinId("target-coin".to_string()),
+                intended_coin_id: Some(TargetCoinId("target-coin".to_string())),
                 funding_coin_ids: vec![FundingCoinId("funding-coin".to_string())],
             },
         );
@@ -1122,7 +1138,7 @@ mod tests {
         journal.submitted(
             &recorded,
             Submission {
-                intended_coin_id: TargetCoinId("target-coin".to_string()),
+                intended_coin_id: Some(TargetCoinId("target-coin".to_string())),
                 funding_coin_ids: vec![FundingCoinId("funding-coin".to_string())],
             },
         );
@@ -1160,7 +1176,7 @@ mod tests {
             journal.submitted(
                 &recorded,
                 Submission {
-                    intended_coin_id: TargetCoinId("target-coin".to_string()),
+                    intended_coin_id: Some(TargetCoinId("target-coin".to_string())),
                     funding_coin_ids: vec![],
                 },
             );
@@ -1191,7 +1207,7 @@ mod tests {
             journal.submitted(
                 &recorded,
                 Submission {
-                    intended_coin_id: TargetCoinId("target-coin".to_string()),
+                    intended_coin_id: Some(TargetCoinId("target-coin".to_string())),
                     funding_coin_ids: vec![FundingCoinId("funding-coin".to_string())],
                 },
             );
@@ -1246,7 +1262,7 @@ mod tests {
         journal.submitted(
             &recorded,
             Submission {
-                intended_coin_id: TargetCoinId("c".to_string()),
+                intended_coin_id: Some(TargetCoinId("c".to_string())),
                 funding_coin_ids: vec![],
             },
         );

@@ -76,6 +76,7 @@ pub mod quorum;
 pub mod rate_limit;
 pub mod routing;
 pub mod rpc;
+pub mod selection;
 pub mod service;
 pub mod singleton;
 pub mod sources;
