@@ -1624,8 +1624,7 @@ mod tests {
         let Some(Command::Mirror { action: cmd }) = parsed.command else {
             panic!("parsed to something other than `mirror`");
         };
-        let action = mirror_action(cmd)
-            .expect("a well-formed cursor parses");
+        let action = mirror_action(cmd).expect("a well-formed cursor parses");
         assert_eq!(action.method(), "control.mirror.bondStates");
         assert_eq!(
             action.wire_params(),
