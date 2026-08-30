@@ -326,9 +326,17 @@ impl<E: MirrorEffects> PassRunner<E> {
                 match self.effects.create(&bond, current_epoch, per_coin) {
                     Ok(()) => created.push(bond),
                     Err(e) => {
-                        // Stop, cleanly. Not a retry and not a skip-and-continue: a create that
-                        // failed for want of a coin will fail identically for the next bond, and the
-                        // next pass re-derives the whole answer anyway.
+                        // Stop, cleanly. Not a retry and not a skip-and-continue: every bond in
+                        // this loop needs the SAME per-coin amount, and a create that could not be
+                        // funded has left the wallet no richer — its own funding coins are now
+                        // reserved for the pass if it broadcast, and untouched if it did not. So
+                        // the next bond fails identically, and the next pass re-derives the whole
+                        // answer anyway.
+                        //
+                        // The reservation is what makes that reasoning sound rather than merely
+                        // plausible: without it the next bond would re-select the coin this one
+                        // just spent and succeed at SELECTION, failing later at the mempool as a
+                        // double-spend. See `lifecycle::NodeMirrorEffects::committed_coin_ids`.
                         stopped_at = Some((bond, e));
                         break;
                     }

@@ -187,10 +187,7 @@ fn coins_spent_per_bundle(broadcaster: &MockBroadcaster) -> Vec<HashSet<Bytes32>
 
 /// A bond over two distinct 64-hex ids.
 fn bond(store: u8, root: u8) -> Bond {
-    Bond::new(
-        hex::encode([store; 32]),
-        hex::encode([root; 32]),
-    )
+    Bond::new(hex::encode([store; 32]), hex::encode([root; 32]))
 }
 
 /// Two creates in one pass select DISJOINT coins when a second coin is available.

@@ -7965,10 +7965,16 @@ itself (SYSTEM.md §4.1).
 >   `spend_audit::Submission` UNCONDITIONALLY, carrying the coins the signed bundle consumes. The
 >   coin CREATED is a separate, optional field of that submission — a create names none, because its
 >   output coin takes its parent from whichever input the builder drew it from and this node does not
->   derive it — so an underivable target no longer suppresses the record of the coins consumed.
->   Consequently two creates in one confirmation window MUST NOT select the same coin, and
+>   derive it — so an underivable target no longer suppresses the record of the coins consumed, and
 >   `control.mirror.*` and `dign spend-audit` MUST show a create's consumed coins rather than an
->   empty list. What is still missing is the
+>   empty list. **Two creates MUST NOT select the same coin**, whether or not they fall in the same
+>   pass, and the two halves of that are separate mechanisms: ACROSS passes the durable journal
+>   above is re-read before each pass, and WITHIN one pass — where a pass emits a create per bond of
+>   the affordable prefix — `NodeMirrorEffects` extends its own committed set from each bundle that
+>   reaches the mempool, so a later create in the same pass selects against what the pass has
+>   already spent. The journal alone does not cover the second: it is read once, before the pass,
+>   and the chain reports a broadcast coin as unspent for the whole confirmation window. What is
+>   still missing is the
 >   advertisement: `dig_mirror_coin::create` requires at least one URL its store can be fetched
 >   from, this node has no configured public name, and `NodeMirrorEffects::create` therefore refuses
 >   by name BEFORE any chain read (dig-node#426). **RECLAIMS are implemented** and are supported at `fee = 0` with
