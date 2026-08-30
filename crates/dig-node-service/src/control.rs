@@ -3711,11 +3711,19 @@ mod tests {
         // the uncovered one reports `deferred{balance_unreadable}` rather than a fabricated
         // shortfall. A count-only assertion is satisfied by an implementation that emits one state
         // for every row.
+        //
+        // The state is FLATTENED into the row under the `bond_state` tag — one object carrying
+        // `store_id`, `root`, `bond_state` and that state's own payload, never a nested envelope.
+        // Asserted at the flattened spelling because that is the shape dig-app#289 and #300 parse;
+        // an assertion against a nested one would pass on a producer no client can read.
         assert_eq!(entries[0]["store_id"], "aa".repeat(32));
-        assert_eq!(entries[0]["state"]["state"], "withheld");
+        assert_eq!(entries[0]["bond_state"], "withheld");
         assert_eq!(entries[1]["store_id"], "bb".repeat(32));
-        assert_eq!(entries[1]["state"]["state"], "deferred");
-        assert_eq!(entries[1]["state"]["reason"], "balance_unreadable");
+        assert_eq!(entries[1]["bond_state"], "deferred");
+        assert_eq!(
+            entries[1]["reason"], "balance_unreadable",
+            "an unreadable wallet is DEFERRED with its reason, never a fabricated shortfall"
+        );
     }
 
     /// **Proves:** an out-of-range page size is REFUSED as `INVALID_PARAMS`, not clamped.
