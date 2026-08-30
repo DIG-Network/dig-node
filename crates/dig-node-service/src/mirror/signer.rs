@@ -58,7 +58,7 @@
 use chia_protocol::{Bytes32, SpendBundle};
 use dig_wallet::operator_wallet::OperatorWallet;
 
-use crate::spend_audit::{RecordedSpend, SpendJournal};
+use crate::spend_audit::{FailureStage, RecordedSpend, SpendJournal};
 
 use super::spends::MirrorSpends;
 
@@ -173,11 +173,22 @@ impl MirrorSigner {
         let recorded = journal.begin(spends.intent());
 
         let coin_spends = spends.coin_spends().to_vec();
-        let signature = self
-            .wallet
-            .signer()
-            .sign(&coin_spends)
-            .map_err(|e| SignError::Signing(e.to_string()))?;
+        let signature = match self.wallet.signer().sign(&coin_spends) {
+            Ok(signature) => signature,
+            Err(e) => {
+                // Resolve the record BEFORE returning. A bare `?` here drops `recorded` inside this
+                // frame, and `Drop` writes `Unresolved` -- which this crate defines as "the node
+                // signed and does not know what became of it". No signature exists, so that entry
+                // would claim money may have moved when nothing left the wallet, and §23.5's
+                // reconcile would chase a chain reference that can never exist.
+                //
+                // `Failed { stage: Signing }` is the truthful status: `money_may_have_moved()` is
+                // false for it and only for it, which is the whole reason the stage is on the entry.
+                let cause = e.to_string();
+                journal.failed(&recorded, FailureStage::Signing, cause.clone());
+                return Err(SignError::Signing(cause));
+            }
+        };
 
         Ok((SpendBundle::new(coin_spends, signature), recorded))
     }
@@ -340,5 +351,51 @@ abandon abandon abandon art";
         );
         assert_eq!(ledger.records[0].kind.as_str(), kinds::MIRROR_COIN);
         assert_eq!(ledger.records[0].authority.grant, "mirror-collateral");
+    }
+
+    /// A signature that could not be produced is `failed { stage: signing }` — NOT `unresolved`.
+    ///
+    /// The distinction is the entry's whole job. `Unresolved` means "the node signed and does not
+    /// know what became of it", so `money_may_have_moved()` is true for it and §23.5's reconcile
+    /// chases a chain reference. When signing itself failed, no bundle exists and nothing can have
+    /// moved; `Failed { stage: Signing }` is the only status whose `money_may_have_moved()` is false.
+    ///
+    /// This was a real regression: a bare `?` on the signing call dropped the open record inside this
+    /// frame, and `Drop` writes `Unresolved`. It failed in the SAFE direction — over-reporting risk —
+    /// which is exactly why nothing caught it, and why it is fixed before the first production caller
+    /// exists rather than after.
+    ///
+    /// The two assertions are not redundant. The status is asserted because it is the thing that
+    /// changed, and `money_may_have_moved()` because that is the property every consumer actually
+    /// branches on — a future third status with the wrong answer would pass the first and fail the
+    /// second.
+    #[test]
+    fn a_signing_failure_is_recorded_as_failed_at_signing_not_unresolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (journal, log) = journal(dir.path());
+        let signer = signer();
+
+        let unsignable = super::super::spends::unsignable_for_tests(signer.owner_puzzle_hash());
+
+        assert!(
+            matches!(
+                signer.sign(&unsignable, &journal),
+                Err(SignError::Signing(_))
+            ),
+            "the fixture must actually fail to sign, or this test proves nothing"
+        );
+
+        let ledger = log.ledger().expect("ledger readable");
+        assert_eq!(ledger.records.len(), 1, "one attempt, one entry");
+        match &ledger.records[0].status {
+            crate::spend_audit::SpendStatus::Failed { stage, .. } => {
+                assert_eq!(*stage, crate::spend_audit::FailureStage::Signing);
+                assert!(
+                    !stage.money_may_have_moved(),
+                    "no bundle was produced, so nothing can have moved"
+                );
+            }
+            other => panic!("expected failed at signing, got {other:?}"),
+        }
     }
 }

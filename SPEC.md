@@ -7912,8 +7912,9 @@ every spend here is subject to; §24 is where the amount comes from. Spend const
 itself (SYSTEM.md §4.1).
 
 > **IMPLEMENTATION STATUS — read this before relying on any clause in §25.** This section is
-> normative in full and is written in the present indicative throughout. At this head **only the
-> deciding half exists; nothing runs it.** Satisfied by code today, and *only* this:
+> normative in full and is written in the present indicative throughout. At this head **the
+> deciding and the ORDERING halves exist, and nothing RUNS them** — no pass is constructed, so no
+> observation is ever made and no spend is ever attempted. Satisfied by code today, and *only* this:
 >
 > * §25.2's structural bounds on the signing authority — `MirrorSpends` and its two producers
 >   (`mirror/spends.rs`); and in `mirror/signer.rs`, the fee ceiling, the refusal of spends belonging
@@ -7924,32 +7925,53 @@ itself (SYSTEM.md §4.1).
 >   §25.9's decision directions.
 > * §25.5's stability rule, as a **pure tracker** (`mirror/presence.rs`), and §25.7's persisted
 >   `collateral.json` switch.
+> * §25.4's **execution rules** — steps 4, 5 and 6 — as `mirror/runner.rs`: reclaims are performed
+>   before any create and are never gated on funds; the create loop stops cleanly at the end of the
+>   affordable prefix or at the first create that errors; and the in-flight set is re-derived from
+>   the audit record on every pass, which is restart-safe because the record carries the bond
+>   `(store, root, epoch)` structurally (`spend_audit::AuditedBond`).
+> * §25.1's **`Relayed` exclusion**, applied at the point of observation
+>   (`mirror::runner::split_by_provenance`) and expressed in the types thereafter: `PassInputs::held`
+>   and `::relayed` are separate fields, so no relayed capsule can reach the create path.
+> * §25.8's **vocabulary**, as `mirror::pass::BondState`: `disabled` (the node-wide switch),
+>   `withheld` (`Relayed` provenance) and `reclaiming` are three distinct states, agreeing with
+>   `dig-node-control-interface` 0.26.0's tokens. **That crate is NOT adopted at this head and the
+>   method is NOT served** — only the vocabulary lines up. `withheld` does have a real producer, the
+>   relayed set, rather than being unreachable from a `Held`-keyed derivation.
 >
 > **Everything else in §25 is PENDING**, tracked as
-> <https://github.com/DIG-Network/dig-node/issues/412>. That includes every clause under which the
-> node *observes* disk or chain, *scans*, *schedules*, *spends*, *broadcasts*, *records an outcome*,
-> or *reports a state*: no pass is constructed and none is scheduled, and no caller anywhere reaches
-> `MirrorSigner::new`, `build_create`, `build_reclaim` or `dig_mirror_coin::list`.
+> <https://github.com/DIG-Network/dig-node/issues/412>. In particular **no pass is CONSTRUCTED and
+> none is SCHEDULED**: `mirror::runner::MirrorEffects` has no implementation, so nothing reaches
+> `MirrorSigner::new`, `build_create`, `build_reclaim` or `dig_mirror_coin::list`, and the three
+> triggers in §25.4 — start-up, the round tick, the debounced presence change — do not fire. The
+> runner decides and orders; nothing yet hands it a chain, a wallet or a disk. So a reader MUST NOT
+> infer that any coin is created, reclaimed, broadcast or confirmed at this head, and MUST NOT infer
+> that any state is REPORTED anywhere: §25.8's surface is not served.
 >
-> **A clause not named in the list above MUST be read as pending, whatever its grammatical voice.**
-> The default is deliberately pending rather than satisfied: a per-clause list of what is missing has
-> to be complete to be safe, and this one only has to be complete about what is *present*.
+> **A clause not named in the list above MUST be read as pending, whatever its grammatical voice**,
+> and the list is to be read NARROWLY: where an entry names a file or a function, it satisfies the
+> clause only to the extent that named code reaches. The default is deliberately pending rather than
+> satisfied — a per-clause list of what is missing has to be complete to be safe, and this one only
+> has to be complete about what is *present*.
 
 ### 25.1. The invariant
 
 > **PENDING — the invariant is stated, and nothing maintains it at this head.** Neither side is
-> observed: the disk side (`cache_list_cached()` filtered to `Held`) is not read by this module, and
-> the chain side is not read at all — `dig_mirror_coin::list` appears nowhere in this repo. So a
-> reader MUST NOT infer that a coin's existence tracks a `.dig`'s presence today; the biconditional
-> below is the obligation <https://github.com/DIG-Network/dig-node/issues/412> discharges.
+> observed: `mirror::runner::MirrorEffects` DECLARES both observations and nothing implements it, so
+> `cache_list_cached()` is not read by this module and `dig_mirror_coin::list` is not called anywhere
+> in this repo. So a reader MUST NOT infer that a coin's existence tracks a `.dig`'s presence today;
+> the biconditional below is the obligation
+> <https://github.com/DIG-Network/dig-node/issues/412> discharges.
 >
-> **The `Relayed`-is-never-advertised rule is PENDING too, and it is the load-bearing one.** It is
-> prose at this head, not code: the planner takes a bond set it is GIVEN and carries no provenance
-> field, so nothing filters `Relayed` out — the exclusion lives only in a doc comment
-> (`mirror/plan.rs:24`) and in the sentence below. This is the single point at which another party
-> could influence what this node spends its own money on, since a `Relayed` capsule arrives on
-> somebody else's behalf. The observation step #412 builds MUST filter to `Held` provenance at the
-> source, and MUST NOT rely on a caller passing an already-filtered set.
+> **The `Relayed`-is-never-advertised rule IS satisfied by code, and it is the load-bearing one.**
+> `mirror::runner` splits the observation by `CapsuleProvenance` at the point it is made
+> (`split_by_provenance`) and hands the two halves to `PassInputs` as SEPARATE FIELDS, so the create
+> path is structurally unable to see a relayed capsule and no caller can substitute an
+> already-filtered set. This is the single point at which another party could influence what this
+> node spends its own money on, since a `Relayed` capsule arrives on somebody else's behalf — which
+> is why the exclusion is a shape rather than a filter someone remembers to apply. What remains
+> PENDING is the OBSERVATION itself: no implementation of `MirrorEffects` reads `cache_list_cached()`,
+> so the split has no live input yet.
 
 > **A mirror coin owned by this node for the CURRENT epoch exists ⟺ the `.dig` for that
 > `(store, root)` is on disk with `Held` provenance.**
@@ -8032,9 +8054,10 @@ owner key is the first derived key; its standard puzzle hash is the wallet's rec
 address create-change returns to. Deposits, bonds and reclaims therefore all move through ONE
 address the wallet already tracks.
 
-> **PARTIALLY PENDING.** The two structural halves of this subsection ARE satisfied by code: the
-> spend-shape bound (`MirrorSpends`), the fee bound (now read from the artifact, below), and the
-> `&RecordedSpend` precondition. The sentence above — that the signer instance is *constructed at
+> **PARTIALLY PENDING.** THREE structural bounds of this subsection ARE satisfied by code: the
+> spend-shape bound (`MirrorSpends`), the fee bound (read from the artifact, below), and the
+> journal-taking signature, which makes one-record-per-signature and a derived intent properties of
+> the call rather than of the caller. The sentence above — that the signer instance is *constructed at
 > bring-up* from the operator seed — is NOT: `MirrorSigner::new` has no caller at this head, so no
 > signer is constructed anywhere and the `Locked`/`Orphaned` reporting it describes does not exist.
 > Nor is the audit-EXECUTION paragraph below satisfied: no entry is ever written for a mirror spend,
@@ -8076,15 +8099,18 @@ locked, exactly.
 
 ### 25.4. The reconcile pass — two observations, a pure plan, reclaims first
 
-> **PARTIALLY PENDING — step 3 only is implemented.** The pure planner *is* satisfied by code
-> (`mirror/plan.rs`, `mirror/pass.rs`): given the two observations, the epoch, the requirement, the
-> balance and the switch, it produces exactly the table below. **Nothing supplies it and nothing acts
-> on its answer.** The observations (steps 1–2), the execution order (step 4), the funds-limited
-> create loop (step 5), the audit-ledger in-flight suppression (step 6), the confirmation record, and
-> the three triggers above — start-up, the `MIRROR_ROUND_LENGTH_MS` tick, and the debounced presence
-> change — are NOT implemented at this head. Tracked as
-> <https://github.com/DIG-Network/dig-node/issues/412>. Until it lands, a reader MUST NOT rely on any
-> pass running at all.
+> **PARTIALLY PENDING — steps 3 to 6 are implemented; nothing supplies them and nothing schedules
+> them.** The pure planner (`mirror/plan.rs`, `mirror/pass.rs`) and the pass runner
+> (`mirror/runner.rs`) together satisfy step 3's table, step 4's reclaim-before-create order and
+> never-gated-on-funds rule, step 5's clean stop at the affordable prefix, and step 6's in-flight
+> suppression keyed on `(store, root, epoch)` from the audit record.
+>
+> **What is NOT implemented is everything that touches the world.** The two observations (steps 1–2)
+> are a trait, `mirror::runner::MirrorEffects`, with no implementation; the confirmation record is
+> not written; and the three triggers above — start-up, the `MIRROR_ROUND_LENGTH_MS` tick, and the
+> debounced presence change — do not fire, because no pass is constructed. Tracked as
+> <https://github.com/DIG-Network/dig-node/issues/412>. **Until that lands, a reader MUST NOT rely on
+> any pass running at all**, and MUST read every clause below as describing what a pass WOULD do.
 
 A pass runs: at start-up (once the wallet and a chain source are available), on every round tick
 (`dig_constants::MIRROR_ROUND_LENGTH_MS`), and after a debounced presence change (§25.5). Each pass:
@@ -8133,12 +8159,13 @@ coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile acc
 
 ### 25.5. Presence and debounce
 
-> **PARTIALLY PENDING — the debounce rule is implemented; the scanning is not.** The
-> stability-across-a-window rule, in both directions, is satisfied by the pure tracker in
-> `mirror/presence.rs` and its `SETTLING_WINDOW_MS`. **Nothing feeds it**: there is no periodic
-> scan, no start-up scan, no watcher, and no caller of the tracker at this head — so the scanning
-> cadence described below, the un-debounced start-up exemption, and the claim that the periodic pass
-> is the correctness mechanism are all pending, tracked as
+> **PARTIALLY PENDING — the debounce rule is implemented and now has a caller; the scanning is
+> not.** The stability-across-a-window rule, in both directions, is satisfied by the pure tracker in
+> `mirror/presence.rs` and its `SETTLING_WINDOW_MS`, and `mirror::runner::PassRunner` debounces the
+> advertisable half of every observation through it. **Nothing feeds THAT**: there is no periodic
+> scan, no start-up scan and no watcher, because `MirrorEffects::observe_disk` has no implementation
+> — so the scanning cadence described below, the un-debounced start-up exemption, and the claim that
+> the periodic pass is the correctness mechanism are all still pending, tracked as
 > <https://github.com/DIG-Network/dig-node/issues/412>.
 
 Presence changes are detected by SCANNING, with an optional watcher as an accelerator — never the
@@ -8209,7 +8236,7 @@ one setting to turn off** (§6.0/#207).
 ### 25.8. The per-store state surface
 
 > **PENDING — not yet implemented.** This subsection is normative and is NOT satisfied by
-> code as of this section's introduction. Tracked as dig-node#377 step 6 (the `dig-node-control-interface` 0.25.0
+> code as of this section's introduction. Tracked as dig-node#377 step 6 (the `dig-node-control-interface` 0.26.0
 > method declaration, release-first, then the node serving it and the `dign` verb). Until it lands, a reader MUST NOT
 > rely on the behaviour described here.
 

@@ -4317,6 +4317,7 @@ mod tests {
             amount_mojos: amount,
             fee_mojos: 4_200,
             store_id: Some("ee".repeat(32)),
+            bond: None,
             initiated_ms: 1_756_000_000_000,
             updated_ms: 1_756_000_001_000,
             status,
