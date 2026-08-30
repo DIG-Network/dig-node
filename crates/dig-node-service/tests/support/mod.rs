@@ -235,3 +235,59 @@ pub fn xch_spend_paying_the_mirror_hash(
 
     (spend, coins)
 }
+
+/// Ordinary $DIG CAT coins of `owner` — the coins a mirror CREATE draws its collateral from.
+///
+/// Distinct from every fixture above, and the distinction is the whole point of dig-node#421: those
+/// build coins at the MIRROR puzzle hash (`P2ParentCoin`, where collateral already sits), while a
+/// create spends coins at the owner's ORDINARY $DIG address — the canonical CAT wrapping of the
+/// owner's standard puzzle hash. A selector pointed at the wrong one of those two finds nothing and
+/// reports an empty wallet.
+///
+/// The spend is real: the parent CAT runs through to its conditions, so the returned coins resolve
+/// through `Cat::parse_children` exactly as chain-read coins do. `salt` varies the grandparent, so
+/// two calls with the same amounts still produce distinct coins.
+pub fn ordinary_dig_coins(owner: &Wallet, amounts: &[u64], salt: u8) -> (CoinSpend, Vec<Coin>) {
+    let mut ctx = SpendContext::new();
+    let parent_amount: u64 = amounts.iter().sum();
+
+    let cat_puzzle_hash: Bytes32 =
+        CatArgs::curry_tree_hash(DIG_ASSET_ID, TreeHash::from(owner.puzzle_hash)).into();
+    let grandparent_parent = Bytes32::new([salt; 32]);
+    let grandparent = Coin::new(grandparent_parent, cat_puzzle_hash, parent_amount);
+    let parent = Coin::new(grandparent.coin_id(), cat_puzzle_hash, parent_amount);
+
+    let lineage_proof = LineageProof {
+        parent_parent_coin_info: grandparent_parent,
+        parent_inner_puzzle_hash: owner.puzzle_hash,
+        parent_amount,
+    };
+    let cat = Cat::new(
+        parent,
+        Some(lineage_proof),
+        CatInfo::new(DIG_ASSET_ID, None, owner.puzzle_hash),
+    );
+
+    // Paid to the owner's own inner puzzle hash: an ordinary CAT holding, not collateral.
+    let mut conditions = Conditions::new();
+    for amount in amounts {
+        conditions = conditions.create_coin(owner.puzzle_hash, *amount, Memos::None);
+    }
+
+    let inner_spend = StandardLayer::new(owner.public_key)
+        .spend_with_conditions(&mut ctx, conditions)
+        .unwrap();
+    Cat::spend_all(&mut ctx, &[CatSpend::new(cat, inner_spend)]).unwrap();
+
+    let spend = ctx
+        .take()
+        .into_iter()
+        .find(|spend| spend.coin == parent)
+        .expect("the parent CAT spend");
+    let coins = amounts
+        .iter()
+        .map(|amount| Coin::new(parent.coin_id(), cat_puzzle_hash, *amount))
+        .collect();
+
+    (spend, coins)
+}
