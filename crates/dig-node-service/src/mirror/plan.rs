@@ -599,7 +599,10 @@ mod tests {
     #[test]
     fn a_raised_requirement_funds_fewer_bonds_from_the_same_balance() {
         let creates = vec![bond("aa", "11"), bond("bb", "22")];
-        let balance = 2 * PER_COIN;
+        // Chosen so the SAME balance lands on a different side of each requirement: 2.500 DIG buys
+        // two bonds at 1.000 each and exactly one at 2.500. A balance that funded the same count at
+        // both amounts could not distinguish a parameter from a constant.
+        let balance = PER_COIN_RAISED;
 
         let at_start = split_by_funds(&creates, balance, PER_COIN);
         assert_eq!(at_start.affordable.len(), 2, "both bonds fit at 1.000 DIG each");
