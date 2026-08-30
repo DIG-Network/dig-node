@@ -2688,7 +2688,7 @@ fn spawn_mirror_passes(
 
     tokio::spawn(async move {
         let paths = dig_wallet::autoseed::default_paths();
-        let (signer, capability) = lifecycle::open_signer(&paths, live_broadcast);
+        let (signer, capability) = lifecycle::open_signer(&paths, live_broadcast, &chain).await;
 
         // The owner puzzle hash comes from the SIGNER when there is one, so the key a spend is built
         // for and the address its bonds are observed under cannot be two different values. Without a
@@ -2724,11 +2724,11 @@ fn spawn_mirror_passes(
             ),
             // Deliberately NOT phrased as a flag to set: the operator has already set
             // DIG_WALLET_ENABLE_LIVE_BROADCAST to reach this arm at all.
-            SpendCapability::BroadcasterUnwired => tracing::info!(
+            SpendCapability::ChainUnreachable => tracing::warn!(
                 target: "mirror",
                 "the mirror lifecycle OBSERVES only: the wallet opened and live broadcast is on, \
-                 but this build wires no broadcaster (dig-node#424), so a reclaim is planned and \
-                 reported and no spend is sent"
+                 but no chain could be reached to broadcast through, so a reclaim is planned \
+                 and reported and no spend is sent"
             ),
         }
 
@@ -2772,6 +2772,12 @@ fn spawn_mirror_passes(
 
             match chain.chain_source(tokio::runtime::Handle::current()).await {
                 Ok(source) => {
+                    // Re-read per pass, deliberately: `ChainTransport::broadcaster` does not
+                    // cache a failure, so a node that started offline can broadcast the moment
+                    // its network returns. Holding one built at bring-up would silently make
+                    // that node one that never broadcasts again.
+                    let broadcast =
+                        lifecycle::production_broadcaster(&chain, live_broadcast).await;
                     let runtime = tokio::runtime::Handle::current();
                     let signer_ref = signer.as_ref();
                     let ctx = PassContext {
@@ -2803,7 +2809,7 @@ fn spawn_mirror_passes(
                             // The SAME seam `open_signer` derived the reported capability from, so
                             // what this node says it can do and what a spend can actually reach
                             // cannot be two different answers (dig-node#424).
-                            lifecycle::production_broadcaster(),
+                            broadcast.broadcaster(),
                             runtime,
                         );
                         let mut pass =

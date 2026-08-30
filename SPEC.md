@@ -8119,12 +8119,21 @@ address the wallet already tracks.
 > no confirmation is observed, and nothing reconciles an `unresolved` or `failed` one. Both are
 > tracked as <https://github.com/DIG-Network/dig-node/issues/412>.
 >
-> **A mirror spend is BUILT and not SENT.** The node wires no production broadcaster for this
-> lifecycle, so a planned reclaim refuses by name before it signs and no mirror spend reaches the
-> mempool — the create half refuses separately, for the coin selector
-> (<https://github.com/DIG-Network/dig-node/issues/421>). The refusal is reported rather than
-> silent, and the capability the node announces is derived from the same seam, so it cannot claim a
-> power it does not have. Tracked as <https://github.com/DIG-Network/dig-node/issues/424>.
+> **A mirror spend is SENT only when the operator has enabled live broadcast.** The lifecycle
+> builds its own `Broadcaster` on this node's ONE shared chain client, and it is built only when
+> `DIG_WALLET_ENABLE_LIVE_BROADCAST` is on. On a default install — the flag defaults off — no
+> broadcaster is constructed and no chain is dialed for one, so a planned reclaim refuses by name
+> before it signs and no mirror spend reaches the mempool. The refusal is reported rather than
+> silent, and the capability the node announces is derived from the SAME seam the money path is
+> handed, so it cannot claim a power it does not have: `Available` holds exactly when a broadcaster
+> is handed over.
+>
+> The broadcaster is built per pass rather than once at bring-up, because the shared client does not
+> cache a failure — a node that started with no network broadcasts as soon as its network returns,
+> and a node that cannot reach a chain reports that distinctly from a switched-off flag.
+>
+> Nothing is attached to the served `WalletBackend`: the broadcaster is scoped to the mirror
+> lifecycle, signs only from the §16.4 operator wallet, and never acts on a user's behalf (§908).
 
 **Every spend is audited, structurally — exactly ONE entry per signature, and it cannot lie about
 the spend.** The signer takes the `SpendJournal` (§23.3) and opens the record itself, returning the
