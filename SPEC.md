@@ -8374,8 +8374,11 @@ on a claim the node cannot keep, which this section penalises. The operator sets
   listed first, and the node publishes the operator's order verbatim rather than sorting it.
 * An entry MUST be an absolute URL with a scheme and a host. No scheme allowlist is imposed.
 * An entry whose host can only mean this machine — loopback, the unspecified address, link-local,
-  `localhost`, or `dig.local` — MUST NOT be published. A private or LAN address MAY be published:
-  it is a deliberate operator choice and risks only that operator's own stake.
+  `localhost`, or `dig.local` — MUST NOT be published. The rule is on the address the host DENOTES,
+  not on how it is written: it MUST hold under every scheme, including a non-special one whose host
+  is opaque, and an IPv6 address that embeds an IPv4 one MUST be judged by the address it embeds.
+  A private or LAN address MAY be published: it is a deliberate operator choice and risks only that
+  operator's own stake.
 * A rejected entry is dropped with a warning naming the reason; the surviving entries are published.
 * When no entry survives, **the node advertises nothing and creates no mirror coin**. That refusal
   is the correct default: publishing a URL nobody can fetch from is worse than publishing none,

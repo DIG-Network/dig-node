@@ -25,6 +25,8 @@
 //! Nothing here reclaims on a config change — spending money in response to a text edit is not a
 //! behaviour an operator asked for.
 
+use std::net::Ipv4Addr;
+
 /// The operator-set list of URLs this node advertises. Entries are separated by commas or
 /// whitespace, so both `a,b` and a shell-quoted `"a b"` work.
 ///
@@ -163,20 +165,52 @@ fn classify(entry: &str) -> Option<Rejection> {
     };
 
     let this_machine_only = match host {
-        url::Host::Domain(name) => {
-            let name = name.trim_end_matches('.').to_ascii_lowercase();
-            name == "localhost"
-                || name.ends_with(".localhost")
-                || name == crate::config::DIG_LOCAL_HOST
-        }
-        url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_unspecified() || ip.is_link_local(),
-        // `is_unicast_link_local` is unstable, so the `fe80::/10` prefix is tested directly.
+        url::Host::Domain(name) => match name.parse::<Ipv4Addr>() {
+            // A NON-SPECIAL scheme — `dig://`, which this module accepts on purpose — takes the
+            // WHATWG *opaque-host* path, so its host is never IP-parsed and a bare IPv4 literal
+            // arrives here as a domain. Reading it back is what stops `dig://127.0.0.1/` reaching a
+            // coin; without it the entire rule below is unreachable for every non-special scheme.
+            Ok(ip) => is_this_machine_only_v4(ip),
+            Err(_) => {
+                let name = name.trim_end_matches('.').to_ascii_lowercase();
+                name == "localhost"
+                    || name.ends_with(".localhost")
+                    || name == crate::config::DIG_LOCAL_HOST
+            }
+        },
+        url::Host::Ipv4(ip) => is_this_machine_only_v4(ip),
         url::Host::Ipv6(ip) => {
-            ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80
+            // `is_unicast_link_local` is unstable, so the `fe80::/10` prefix is tested directly.
+            //
+            // The v6 predicates are asked FIRST and the embedded-v4 rule only after, which is
+            // load-bearing rather than stylistic: `::1` unwraps to `0.0.0.1`, an ordinary global
+            // v4 address, so asking the v4 rule first would ACCEPT the IPv6 loopback.
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+                // `to_ipv4` rather than `to_ipv4_mapped`: it covers the deprecated IPv4-COMPATIBLE
+                // form (`::127.0.0.1`) as well as the mapped one, and both are written by hand as
+                // readily as the plain literal. A compatible address means exactly its embedded v4,
+                // so there is no case where the wider unwrap answers a question the narrower one
+                // should have declined.
+                || ip.to_ipv4().is_some_and(is_this_machine_only_v4)
         }
     };
 
     this_machine_only.then_some(Rejection::ThisMachineOnly)
+}
+
+/// Whether an IPv4 address can only ever mean the machine reading it.
+///
+/// The single home of the v4 half of §25.10's rule. Three different paths can produce a v4 address —
+/// the `Ipv4` host arm, a non-special scheme's opaque host, and an IPv4-mapped or -compatible IPv6
+/// address — and each of them funnels through here, so no two of them can drift into disagreeing
+/// about what "this machine" means.
+///
+/// Alternate IPv4 spellings (decimal, hex, octal, short form) need no handling: `url` normalises
+/// them before `classify` ever sees the host.
+fn is_this_machine_only_v4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || ip.is_link_local()
 }
 
 #[cfg(test)]
@@ -262,6 +296,70 @@ mod tests {
             parse_advertised_urls(&format!("{v4} {v6}")).accepted,
             vec![v4, v6]
         );
+    }
+
+    /// A bare IPv4 literal under a NON-SPECIAL scheme is still this machine.
+    ///
+    /// `dig://` is a tested, intended input (see `any_scheme_is_accepted`), and a non-special scheme
+    /// takes the WHATWG **opaque-host** path: the value arrives as `Host::Domain("127.0.0.1")`, so
+    /// the `Host::Ipv4` arm holding the loopback rule never runs. The scheme is named in the fixture
+    /// because the defect lives in the scheme, not in the host.
+    #[test]
+    fn a_non_special_scheme_does_not_smuggle_a_this_machine_host_past_the_opaque_host_path() {
+        let got = parse_advertised_urls("dig://127.0.0.1:4161/ dig://0.0.0.0/ dig://node.example/");
+
+        assert_eq!(
+            got.accepted,
+            vec!["dig://node.example/".to_string()],
+            "only the honest control may survive: {got:?}"
+        );
+        assert_eq!(got.rejected.len(), 2, "{:?}", got.rejected);
+        assert!(got
+            .rejected
+            .iter()
+            .all(|(_, why)| *why == Rejection::ThisMachineOnly));
+    }
+
+    /// An IPv6 address that merely WRAPS an IPv4 one means whatever the embedded address means.
+    ///
+    /// `Ipv6Addr::is_loopback` is true only of `::1`, and the meaning of a mapped or compatible form
+    /// lives entirely in its low 32 bits — so a rule that reads only the v6 predicates sees
+    /// `[::ffff:127.0.0.1]` as an ordinary global address. The honest sibling in the same list is
+    /// what separates this from a blanket refusal of every bracketed host.
+    #[test]
+    fn an_ipv4_wrapped_in_ipv6_is_judged_by_the_address_it_embeds() {
+        let got = parse_advertised_urls(
+            "http://[::ffff:127.0.0.1]/, http://[::127.0.0.1]/, http://[::ffff:0.0.0.0]/, \
+             http://[::ffff:169.254.10.4]/, http://[2001:db8::1]/",
+        );
+
+        assert_eq!(
+            got.accepted,
+            vec!["http://[2001:db8::1]/".to_string()],
+            "only the genuinely global entry may survive: {got:?}"
+        );
+        assert_eq!(got.rejected.len(), 4, "{:?}", got.rejected);
+        assert!(got
+            .rejected
+            .iter()
+            .all(|(_, why)| *why == Rejection::ThisMachineOnly));
+    }
+
+    /// The widening does not overshoot. A LAN address stays publishable however it is written, and
+    /// `::1` keeps its own meaning rather than being read through its low 32 bits as `0.0.0.1`.
+    ///
+    /// Both halves are controls the widening could plausibly break: unwrapping an embedded v4
+    /// unconditionally would turn `[::1]` into an accepted host, and applying the v4 rule to a
+    /// mapped LAN address would refuse a choice the operator is allowed to make.
+    #[test]
+    fn the_this_machine_rule_still_permits_a_lan_address_and_still_refuses_bare_ipv6_loopback() {
+        let permitted = parse_advertised_urls("http://192.168.1.10/ http://[::ffff:192.168.1.10]/");
+        assert_eq!(permitted.accepted.len(), 2, "{permitted:?}");
+        assert!(permitted.rejected.is_empty(), "{:?}", permitted.rejected);
+
+        let refused = parse_advertised_urls("http://[::1]/ http://[::]/");
+        assert!(refused.accepted.is_empty(), "{refused:?}");
+        assert_eq!(refused.rejected.len(), 2, "{:?}", refused.rejected);
     }
 
     /// The memo layout carries many URLs, so several entries is the designed case; an exact
