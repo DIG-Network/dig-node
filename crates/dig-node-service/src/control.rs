@@ -3684,6 +3684,56 @@ mod tests {
         );
     }
 
+    /// A `Withheld` row locks nothing, so it is not one of the pairs the buffer advice prices.
+    ///
+    /// **Proves** the one thing `bondable_pairs` exists to do. The count is handed to
+    /// `buffer_advice` as `pairs_served_by_this_node` and reaches `one_epoch_lock`, which turns it
+    /// into an amount of $DIG the operator must have available to LOCK — so a row that will never
+    /// be bonded inflates a money figure.
+    ///
+    /// **Catches** the nearest wrong implementation, which is also the code that shipped:
+    /// `observation.states.len()`. Delete the filter and this test is the only thing in the repo
+    /// that goes red.
+    ///
+    /// The fixture varies the STATE across two rows rather than the row count, because a
+    /// single-row fixture distinguishes nothing here — `len()` and the filtered count agree on
+    /// every set that is entirely bondable or entirely withheld. It deliberately does NOT route
+    /// through `collateral_buffer`: that call returns early on the absent balance, so a test taken
+    /// that way passes without the count ever being read.
+    #[test]
+    fn a_withheld_row_is_not_a_pair_the_buffer_advice_prices() {
+        use crate::mirror::pass::BondState;
+        use crate::mirror::plan::Bond;
+        use crate::mirror::states::BondObservation;
+
+        let observation = BondObservation {
+            states: vec![
+                (
+                    Bond::new("aa".repeat(32), "11".repeat(32)),
+                    BondState::Withheld,
+                ),
+                (
+                    Bond::new("bb".repeat(32), "22".repeat(32)),
+                    BondState::FundsUnknown,
+                ),
+            ],
+            locked_dig_base_units: 7_777,
+            epoch: 4,
+        };
+
+        assert_eq!(
+            bondable_pairs(&observation),
+            1,
+            "two served rows, one of them relayed on a stranger's behalf and never bonded: only \
+             the other locks anything"
+        );
+        assert_ne!(
+            bondable_pairs(&observation),
+            observation.states.len() as u64,
+            "and it must not be the row count -- that is the figure this replaced"
+        );
+    }
+
     /// **Proves:** a PUBLISHED observation reaches the wire as rows — the surface stops answering
     /// `unknown` the moment a pass has run.
     ///
@@ -3748,6 +3798,69 @@ mod tests {
         assert_eq!(
             entries[1]["reason"], "balance_unreadable",
             "an unreadable wallet is DEFERRED with its reason, never a fabricated shortfall"
+        );
+    }
+
+    /// **Proves:** [`bondable_pairs`] counts the pairs this node will BOND, which is every served
+    /// row EXCEPT `Withheld`.
+    ///
+    /// **Catches:** the defect this function was extracted to fix — `states.len()`, which counts a
+    /// relayed capsule that locks nothing and so advises an operator to hold $DIG for money that
+    /// will never be spent. The function's own doc says it was separated "so the distinction is
+    /// testable"; without this test the seam is decoration, and substituting `states.len()` for the
+    /// body leaves the whole suite green.
+    ///
+    /// The fixture varies the state field across FOUR rows because a narrower one cannot see the
+    /// nearest wrong implementations. A single `Withheld` beside a single anything-else is
+    /// satisfied by "count the last row" as readily as by the contract; three bondable rows of
+    /// three DIFFERENT states also rule out "count only `Bonded`" (which would answer 1) and "count
+    /// the first non-withheld row" (also 1). Only the true predicate answers 3.
+    ///
+    /// Asserted on `bondable_pairs` DIRECTLY, never through [`collateral_buffer`]: that caller
+    /// returns early on an unreadable balance, so an assertion routed through it would pass without
+    /// ever reaching this function.
+    #[test]
+    fn bondable_pairs_counts_every_served_row_except_the_relayed_one_that_locks_nothing() {
+        use crate::mirror::pass::BondState;
+        use crate::mirror::plan::Bond;
+        use crate::mirror::states::BondObservation;
+
+        let observation = BondObservation {
+            states: vec![
+                // Relayed on a stranger's behalf: served, never advertised, never bonded.
+                (
+                    Bond::new("aa".repeat(32), "11".repeat(32)),
+                    BondState::Withheld,
+                ),
+                // The three "this node has collateralised it or intends to" shapes.
+                (
+                    Bond::new("bb".repeat(32), "22".repeat(32)),
+                    BondState::FundsUnknown,
+                ),
+                (Bond::new("cc".repeat(32), "33".repeat(32)), BondState::Pending),
+                (
+                    Bond::new("dd".repeat(32), "44".repeat(32)),
+                    BondState::Bonded {
+                        coin_id: "ee".repeat(32),
+                        epoch: 4,
+                        amount_dig_base_units: 1_000,
+                    },
+                ),
+            ],
+            locked_dig_base_units: 1_000,
+            epoch: 4,
+        };
+
+        assert_eq!(
+            observation.states.len(),
+            4,
+            "the fixture must carry a row the answer EXCLUDES, or it cannot tell the contract from \
+             a plain row count"
+        );
+        assert_eq!(
+            bondable_pairs(&observation),
+            3,
+            "a `Withheld` row locks nothing and is not bondable; the other three are"
         );
     }
 
