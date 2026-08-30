@@ -331,7 +331,7 @@ mod tests {
         journal.submitted(
             &ok,
             Submission {
-                intended_coin_id: TargetCoinId("coin-ok".to_string()),
+                intended_coin_id: Some(TargetCoinId("coin-ok".to_string())),
                 funding_coin_ids: vec![],
             },
         );
@@ -410,7 +410,7 @@ mod tests {
         journal.submitted(
             &pending,
             Submission {
-                intended_coin_id: TargetCoinId("coin-expected".to_string()),
+                intended_coin_id: Some(TargetCoinId("coin-expected".to_string())),
                 funding_coin_ids: vec![],
             },
         );

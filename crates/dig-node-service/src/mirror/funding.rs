@@ -372,7 +372,7 @@ mod tests {
         journal.submitted(
             &in_flight,
             Submission {
-                intended_coin_id: TargetCoinId("aa".repeat(32)),
+                intended_coin_id: Some(TargetCoinId("aa".repeat(32))),
                 funding_coin_ids: vec![FundingCoinId("11".repeat(32))],
             },
         );
@@ -381,7 +381,7 @@ mod tests {
         journal.submitted(
             &settled,
             Submission {
-                intended_coin_id: TargetCoinId("bb".repeat(32)),
+                intended_coin_id: Some(TargetCoinId("bb".repeat(32))),
                 funding_coin_ids: vec![FundingCoinId("22".repeat(32))],
             },
         );
@@ -391,7 +391,7 @@ mod tests {
         journal.submitted(
             &refused_before_signing,
             Submission {
-                intended_coin_id: TargetCoinId("cc".repeat(32)),
+                intended_coin_id: Some(TargetCoinId("cc".repeat(32))),
                 funding_coin_ids: vec![FundingCoinId("33".repeat(32))],
             },
         );
@@ -413,6 +413,100 @@ mod tests {
         assert_eq!(committed.len(), 1);
     }
 
+    /// A spend whose CREATED coin is underivable still withholds the coins it CONSUMED.
+    ///
+    /// This is the create path's shape: `sign_and_broadcast` passes `intended: None` because a
+    /// mirror create's output coin takes its parent from whichever input the builder drew it from,
+    /// which this node does not derive. The coins consumed are a different fact, read from the
+    /// signed bundle, and are known.
+    ///
+    /// The fixture varies ONE thing — whether the target coin is derivable — and keeps a truthful
+    /// control beside it: a reclaim-shaped spend that DOES name its target. The nearest wrong
+    /// implementation is the one this replaced, which recorded a submission only when a target was
+    /// derivable; it returns `{11…}` here, and a test carrying only the create would be unable to
+    /// tell that from a completely broken reader returning nothing. Two entries are the minimum
+    /// that distinguishes "creates are omitted" from "everything is omitted".
+    #[test]
+    fn a_spend_with_no_derivable_target_still_withholds_its_funding_coins() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+        let journal = SpendJournal::new(log.clone());
+
+        let reclaim = journal.begin(intent("reclaim, target derivable"));
+        journal.submitted(
+            &reclaim,
+            Submission {
+                intended_coin_id: Some(TargetCoinId("aa".repeat(32))),
+                funding_coin_ids: vec![FundingCoinId("11".repeat(32))],
+            },
+        );
+
+        let create = journal.begin(intent("create, target underivable"));
+        journal.submitted(
+            &create,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("22".repeat(32))],
+            },
+        );
+
+        let committed = committed_funding_coin_ids(&log).expect("readable");
+        assert!(
+            committed.contains(&"22".repeat(32)),
+            "the create consumed this coin; a second create in the same confirmation window must \
+             not re-select it and broadcast a conflicting bundle"
+        );
+        assert!(
+            committed.contains(&"11".repeat(32)),
+            "the control: a derivable target was never what made a coin committed"
+        );
+        assert_eq!(committed.len(), 2);
+    }
+
+    /// An underivable target is recorded as UNKNOWN, never as a guessed coin.
+    ///
+    /// The companion to the test above, and the reason the two facts are recorded independently:
+    /// making the create feed the reservation must not be paid for by inventing a target. A named
+    /// coin here would let §23.5's reconcile confirm this spend against a coin it never created —
+    /// the legacy defect `TargetCoinId` exists to make inexpressible — and would make
+    /// `chain_reference()` offer an operator a coin id to look up that can never appear.
+    #[test]
+    fn recording_a_creates_funding_coins_does_not_invent_a_target_coin() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+        let journal = SpendJournal::new(log.clone());
+
+        let create = journal.begin(intent("create, target underivable"));
+        journal.submitted(
+            &create,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("22".repeat(32))],
+            },
+        );
+
+        let ledger = log.ledger().expect("readable");
+        let rec = ledger
+            .records
+            .iter()
+            .find(|r| r.purpose == "create, target underivable")
+            .expect("the create is on record");
+        assert_eq!(
+            rec.intended_coin_id, None,
+            "this node cannot derive the created coin, so it names none"
+        );
+        assert!(
+            rec.chain_reference().is_none(),
+            "offering an operator a coin id to look up that can never exist is a chain claim the \
+             node has not earned"
+        );
+        assert_eq!(
+            rec.funding_coin_ids,
+            vec![FundingCoinId("22".repeat(32))],
+            "the consumed coins are known independently of the created one"
+        );
+    }
+
     /// A corrupt audit record REFUSES rather than reporting a smaller committed set.
     ///
     /// The discriminating fixture is a file with one GOOD line and one bad one: an implementation
@@ -428,7 +522,7 @@ mod tests {
         journal.submitted(
             &spend,
             Submission {
-                intended_coin_id: TargetCoinId("aa".repeat(32)),
+                intended_coin_id: Some(TargetCoinId("aa".repeat(32))),
                 funding_coin_ids: vec![FundingCoinId("11".repeat(32))],
             },
         );

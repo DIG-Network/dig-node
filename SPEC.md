@@ -7959,7 +7959,16 @@ itself (SYSTEM.md §4.1).
 >   committed to a bundle whose audit record is not terminal, selects largest-first, and
 >   reconstructs each selected candidate's lineage from its creating spend — refusing the WHOLE
 >   selection on a shortfall, an unauthenticatable candidate, an unreadable chain, or an unreadable
->   audit record, never funding a smaller coin (dig-node#421). What is still missing is the
+>   audit record, never funding a smaller coin (dig-node#421). The reservation is FED by every
+>   successful broadcast and not only by one whose created coin is derivable: on a `broadcast` that
+>   reaches the mempool, `mirror::lifecycle::NodeMirrorEffects::sign_and_broadcast` records a
+>   `spend_audit::Submission` UNCONDITIONALLY, carrying the coins the signed bundle consumes. The
+>   coin CREATED is a separate, optional field of that submission — a create names none, because its
+>   output coin takes its parent from whichever input the builder drew it from and this node does not
+>   derive it — so an underivable target no longer suppresses the record of the coins consumed.
+>   Consequently two creates in one confirmation window MUST NOT select the same coin, and
+>   `control.mirror.*` and `dign spend-audit` MUST show a create's consumed coins rather than an
+>   empty list. What is still missing is the
 >   advertisement: `dig_mirror_coin::create` requires at least one URL its store can be fetched
 >   from, this node has no configured public name, and `NodeMirrorEffects::create` therefore refuses
 >   by name BEFORE any chain read (dig-node#426). **RECLAIMS are implemented** and are supported at `fee = 0` with

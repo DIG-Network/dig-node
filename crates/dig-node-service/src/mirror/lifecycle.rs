@@ -228,30 +228,33 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
 
         match self.runtime.block_on(broadcaster.broadcast(&bundle)) {
             Ok(()) => {
-                match intended {
-                    // Recorded as an EXPECTATION. Only a chain observation may promote it to
-                    // `Confirmed`, which is why `SpendJournal::confirmed` is not called from this
-                    // path at all.
-                    Some(intended_coin_id) => self.journal.submitted(
-                        &recorded,
-                        Submission {
-                            intended_coin_id,
-                            funding_coin_ids,
-                        },
-                    ),
-                    // No coin id this node can DERIVE, so none is stated. Dropping `recorded`
-                    // resolves it `Unresolved`, which this crate defines as "the node signed and
-                    // does not know what became of it" — and after a successful broadcast with an
-                    // underivable target, that is precisely true. Naming a plausible coin instead
-                    // would let §23.5's reconcile confirm this spend against a coin it never
-                    // created, which is the legacy defect `TargetCoinId` exists to make
-                    // inexpressible.
-                    None => tracing::warn!(
+                if intended.is_none() {
+                    tracing::warn!(
                         target: "mirror",
                         operation = spends.operation().as_str(),
-                        "broadcast a mirror spend whose created coin this node cannot derive; the                          audit entry resolves UNRESOLVED rather than naming a guessed coin"
-                    ),
+                        "broadcast a mirror spend whose created coin this node cannot derive; the                          audit entry names no target coin rather than naming a guessed one"
+                    );
                 }
+                // Recorded UNCONDITIONALLY, and the two facts are recorded independently. The
+                // consumed coins came from the bundle and are always known; `intended` is the coin
+                // this node could derive, which for a create is `None`. An earlier shape recorded
+                // the submission ONLY when a target was derivable and dropped `recorded` otherwise
+                // — which resolved the entry `Unresolved` and, far worse, threw away the funding
+                // ids, leaving `committed_funding_coin_ids` permanently empty for creates. Two
+                // creates in one confirmation window then re-selected the same coins.
+                //
+                // `intended` is still an EXPECTATION, never a confirmation: only a chain
+                // observation promotes it, which is why `SpendJournal::confirmed` is not called
+                // from this path at all. A `None` stays `None` — naming a plausible coin would let
+                // §23.5's reconcile confirm this spend against a coin it never created, the legacy
+                // defect `TargetCoinId` exists to make inexpressible.
+                self.journal.submitted(
+                    &recorded,
+                    Submission {
+                        intended_coin_id: intended,
+                        funding_coin_ids,
+                    },
+                );
                 Ok(())
             }
             Err(e) => {
