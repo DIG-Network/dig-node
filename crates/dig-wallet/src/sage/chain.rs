@@ -604,7 +604,11 @@ impl ChainFallback for ChainTransport {
 // `submit_transaction` for the node's custodied key, which is the decision
 // `DIG_WALLET_ENABLE_LIVE_BROADCAST` owns. An unused `impl Broadcaster for ChainTransport` sat here
 // and made a one-line `.with_broadcaster(chain.clone())` compile, pass every test, and silently
-// enable node-custodied sending on a default install. The transport is reachable only as a
+// enable node-custodied sending on a default install.
+//
+// A `Broadcaster` is reachable from the transport, but only by NAME, through
+// [`ChainTransport::broadcaster`] — a visible line in a diff that a caller has to write on purpose.
+// The `impl` is what made it ambient; asking for one is not. Its other route out is as a
 // `SignedBundlePusher`, whose contract is a bundle somebody already signed.
 
 /// Decode a hex-encoded, already-signed spend bundle.

@@ -282,6 +282,15 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
                 // strand a coin every time a broadcast failed, and the failure path below already
                 // records that the money stayed put.
                 //
+                // That sentence is load-bearing and was FALSE until the broadcaster stopped reading
+                // `TxStatus::success`, which is true for a PENDING ack — a bundle the full node
+                // explicitly did not admit. `Ok` here therefore meant "reached the mempool OR was
+                // held for an unknown parent", and the held case took this branch: it extended the
+                // reservation, wrote a durable `Submitted` entry below, and every later pass then
+                // excluded those funding coins forever via `committed_funding_coin_ids`. Nothing
+                // reconciles that, so the coins were stranded against a spend nobody was holding.
+                // `dig_wallet::sage::spend::accepted_by_mempool` is what makes the sentence true.
+                //
                 // Reclaims feed it too, and that is deliberate: `funding_coin_ids` is read from the
                 // bundle, so this set holds exactly what the journal holds, and a set that
                 // disagreed with the record it mirrors would be a second answer to "what is in

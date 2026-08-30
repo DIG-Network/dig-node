@@ -269,10 +269,20 @@ pub(crate) fn to_query_bundle(bundle: &SpendBundle) -> Result<chia_query::SpendB
 /// Kept as a PURE function of the status rather than an inline branch so every ack shape is
 /// exercised directly — the mempool cannot be asked to produce a `PENDING` on demand.
 ///
+/// A refused push is FINAL, which is why this reads as a refusal rather than as "try again":
+/// `chia_query`'s router returns the FIRST `Ok` from `push_tx`, so a PENDING ack ends the push —
+/// there is no coinset second opinion and no retry against another peer.
+///
+/// It cannot say WHY, and that is a limitation of the crate rather than a choice here: the
+/// `TransactionAck`'s own error text is discarded by `ack_to_tx_status`, so the ack NAME is the
+/// most specific thing available. An unknown parent and a fee below the mempool floor are
+/// different problems with different operator actions, and both arrive here as `PENDING`.
+///
 /// The comparison is on the status NAME, not the boolean: `chia_query`'s `success` is deliberately
 /// left alone. It is a published crate at a lower level whose other consumers may legitimately be
 /// asking "did the node take it" rather than "is it in the mempool"; widening this fix into that
-/// crate is a release-first cascade, tracked separately.
+/// crate is a release-first cascade, tracked as DIG-Network/chia-query#48 — which also carries the
+/// discarded `ack.error`.
 pub(crate) fn accepted_by_mempool(status: &chia_query::TxStatus) -> Result<()> {
     if status.status == "SUCCESS" {
         return Ok(());
