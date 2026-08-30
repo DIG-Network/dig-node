@@ -1215,8 +1215,8 @@ impl WalletBackend {
 
     /// The spendable **$DIG** at this node's own operator puzzle hash, in DIG CAT base units.
     ///
-    /// `None` when the balance could not be read — an unreachable chain source, an unsynced replica
-    /// that cannot answer for this address, a figure too large for a `u64`. `None` is **not zero**:
+    /// `None` when the balance could not be read — an unreachable chain source, a replica that is
+    /// not authoritative for this address, a figure too large for a `u64`. `None` is **not zero**:
     /// §25's bond surface reports an uncovered bond as `deferred{balance_unreadable}` on `None` and
     /// as `unfunded` on `Some(0)`, and those are opposite claims — the first says the node does not
     /// know, the second raises an out-of-funds alarm. Substituting zero for an unreadable balance is
@@ -1227,6 +1227,15 @@ impl WalletBackend {
     /// this crate, where the one definition of each already lives. A caller that assembled its own
     /// address string could read the right amount of the wrong asset at the wrong network's prefix,
     /// and every one of those returns a confident number.
+    ///
+    /// **Staleness is NOT covered by `None`, and a caller must not read it as freshness.** Being
+    /// authoritative for an address and being current with the chain are independent questions, and
+    /// only the first can fail the read: a replica that is in scope but behind answers `Ok` with
+    /// `synced: false`, so this returns `Some` of a figure that may lag the chain. A caller that
+    /// needs currency must ask for it — `balance_for_address` returns `source`, `synced` and
+    /// `peak_height`, and this narrowing keeps only `balance`. Discriminating on `synced` alone
+    /// would be wrong in the other direction, because the fallback arm hard-codes it false for
+    /// answers that are perfectly good.
     ///
     /// This is a READ. It confers no custody and touches no key: the puzzle hash is a public value.
     pub async fn dig_balance_base_units(&self, owner_puzzle_hash: Bytes32) -> Option<u64> {
