@@ -7912,8 +7912,9 @@ every spend here is subject to; §24 is where the amount comes from. Spend const
 itself (SYSTEM.md §4.1).
 
 > **IMPLEMENTATION STATUS — read this before relying on any clause in §25.** This section is
-> normative in full and is written in the present indicative throughout. At this head **only the
-> deciding half exists; nothing runs it.** Satisfied by code today, and *only* this:
+> normative in full and is written in the present indicative throughout. At this head **the
+> deciding and the ORDERING halves exist, and nothing RUNS them** — no pass is constructed, so no
+> observation is ever made and no spend is ever attempted. Satisfied by code today, and *only* this:
 >
 > * §25.2's structural bounds on the signing authority — `MirrorSpends` and its two producers
 >   (`mirror/spends.rs`); and in `mirror/signer.rs`, the fee ceiling, the refusal of spends belonging
@@ -7933,9 +7934,10 @@ itself (SYSTEM.md §4.1).
 >   (`mirror::runner::split_by_provenance`) and expressed in the types thereafter: `PassInputs::held`
 >   and `::relayed` are separate fields, so no relayed capsule can reach the create path.
 > * §25.8's **vocabulary**, as `mirror::pass::BondState`: `disabled` (the node-wide switch),
->   `withheld` (`Relayed` provenance) and `reclaiming` are three distinct states, matching
->   `dig-node-control-interface` 0.26.0. `withheld` has a real producer — the relayed set — rather
->   than being unreachable from a `Held`-keyed derivation.
+>   `withheld` (`Relayed` provenance) and `reclaiming` are three distinct states, agreeing with
+>   `dig-node-control-interface` 0.26.0's tokens. **That crate is NOT adopted at this head and the
+>   method is NOT served** — only the vocabulary lines up. `withheld` does have a real producer, the
+>   relayed set, rather than being unreachable from a `Held`-keyed derivation.
 >
 > **Everything else in §25 is PENDING**, tracked as
 > <https://github.com/DIG-Network/dig-node/issues/412>. In particular **no pass is CONSTRUCTED and
