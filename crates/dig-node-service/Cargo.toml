@@ -258,6 +258,11 @@ dig-constants = "0.13.0"
 hex = "0.4"
 base64 = "0.22"
 
+# Parsing the operator-set advertised-URL list (dig-node#426). Already resolved in this tree as a
+# transitive dependency, so declaring it directly adds no new line; hand-rolling a scheme/host split
+# would be a second, weaker URL parser in a place that decides what gets published on chain.
+url = "2"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

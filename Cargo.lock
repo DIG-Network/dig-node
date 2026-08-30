@@ -3080,6 +3080,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "windows-service",
  "windows-sys 0.61.2",
 ]
