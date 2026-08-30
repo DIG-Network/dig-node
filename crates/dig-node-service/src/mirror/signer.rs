@@ -146,9 +146,7 @@ impl MirrorSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spend_audit::{
-        kinds, Asset, Authority, SpendIntent, SpendJournal, SpendLog,
-    };
+    use crate::spend_audit::{kinds, Asset, Authority, SpendIntent, SpendJournal, SpendLog};
 
     const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \

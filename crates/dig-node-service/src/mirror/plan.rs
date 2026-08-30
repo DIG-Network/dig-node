@@ -228,11 +228,12 @@ pub fn split_by_funds(create: &[Bond], balance_dig_base_units: u64, per_coin: u6
     // A zero per-coin collateral would make every bond free and the split meaningless. The crate
     // refuses a zero-collateral mirror anyway, so treat it as "nothing is affordable" rather than
     // dividing by it and reporting infinite capacity.
-    let affordable_count = if per_coin == 0 {
-        0
-    } else {
-        ((balance_dig_base_units / per_coin) as usize).min(create.len())
-    };
+    // `checked_div` is `None` at a zero requirement, and zero affordable is the right reading of
+    // it: a zero-collateral mirror would make every bond free, and the crate refuses to create
+    // one anyway. Reporting infinite capacity instead would plan creates that cannot be made.
+    let affordable_count = balance_dig_base_units
+        .checked_div(per_coin)
+        .map_or(0, |n| (n as usize).min(create.len()));
 
     let (affordable, short) = create.split_at(affordable_count);
     FundingSplit {
@@ -330,7 +331,10 @@ mod tests {
 
         assert_eq!(
             plan.reclaim,
-            vec![(coin("c2", "bb", "22", NOW_EPOCH), ReclaimReason::NoLongerHeld)],
+            vec![(
+                coin("c2", "bb", "22", NOW_EPOCH),
+                ReclaimReason::NoLongerHeld
+            )],
             "only the coin whose capsule is gone may be reclaimed"
         );
         assert!(
@@ -356,7 +360,10 @@ mod tests {
 
         assert_eq!(
             plan.reclaim,
-            vec![(coin("old", "aa", "11", NOW_EPOCH - 1), ReclaimReason::EpochEnded)]
+            vec![(
+                coin("old", "aa", "11", NOW_EPOCH - 1),
+                ReclaimReason::EpochEnded
+            )]
         );
         assert_eq!(
             plan.create,
@@ -382,7 +389,10 @@ mod tests {
 
         assert_eq!(
             plan.reclaim,
-            vec![(coin("old", "aa", "11", NOW_EPOCH - 1), ReclaimReason::EpochEnded)]
+            vec![(
+                coin("old", "aa", "11", NOW_EPOCH - 1),
+                ReclaimReason::EpochEnded
+            )]
         );
         assert!(
             plan.create.is_empty(),
@@ -409,7 +419,10 @@ mod tests {
 
         assert_eq!(
             plan.reclaim,
-            vec![(coin("past", "aa", "11", NOW_EPOCH - 1), ReclaimReason::EpochEnded)],
+            vec![(
+                coin("past", "aa", "11", NOW_EPOCH - 1),
+                ReclaimReason::EpochEnded
+            )],
             "a coin from the future must survive a slow local clock"
         );
         assert_eq!(
@@ -455,7 +468,10 @@ mod tests {
 
         assert_eq!(
             plan.reclaim,
-            vec![(coin("c1", "aa", "11", NOW_EPOCH), ReclaimReason::NoLongerHeld)]
+            vec![(
+                coin("c1", "aa", "11", NOW_EPOCH),
+                ReclaimReason::NoLongerHeld
+            )]
         );
         assert_eq!(plan.create, vec![bond("aa", "22")]);
     }
@@ -495,7 +511,12 @@ mod tests {
     /// saw both a legacy and a migrated artifact must not pay 40 $DIG for one advertisement.
     #[test]
     fn a_bond_listed_twice_on_disk_is_created_once() {
-        let plan = plan(&[bond("aa", "11"), bond("aa", "11")], &[], NOW_EPOCH, NOT_IN_FLIGHT);
+        let plan = plan(
+            &[bond("aa", "11"), bond("aa", "11")],
+            &[],
+            NOW_EPOCH,
+            NOT_IN_FLIGHT,
+        );
         assert_eq!(plan.create, vec![bond("aa", "11")]);
     }
 
@@ -522,11 +543,7 @@ mod tests {
     #[test]
     fn a_fully_funded_wallet_creates_everything_and_is_short_nothing() {
         let creates = vec![bond("aa", "11"), bond("bb", "22")];
-        let split = split_by_funds(
-            &creates,
-            2 * PER_COIN,
-            PER_COIN,
-        );
+        let split = split_by_funds(&creates, 2 * PER_COIN, PER_COIN);
 
         assert!(split.is_funded());
         assert_eq!(split.affordable, creates);
@@ -539,21 +556,13 @@ mod tests {
     fn the_collateral_bound_is_exact_in_both_directions() {
         let creates = vec![bond("aa", "11")];
 
-        let at_bound = split_by_funds(
-            &creates,
-            PER_COIN,
-            PER_COIN,
-        );
+        let at_bound = split_by_funds(&creates, PER_COIN, PER_COIN);
         assert!(
             at_bound.is_funded(),
             "exactly one requirement's worth funds exactly one coin"
         );
 
-        let one_under = split_by_funds(
-            &creates,
-            PER_COIN - 1,
-            PER_COIN,
-        );
+        let one_under = split_by_funds(&creates, PER_COIN - 1, PER_COIN);
         assert!(
             !one_under.is_funded(),
             "one mojo short must not collateralise anything"
@@ -605,7 +614,11 @@ mod tests {
         let balance = PER_COIN_RAISED;
 
         let at_start = split_by_funds(&creates, balance, PER_COIN);
-        assert_eq!(at_start.affordable.len(), 2, "both bonds fit at 1.000 DIG each");
+        assert_eq!(
+            at_start.affordable.len(),
+            2,
+            "both bonds fit at 1.000 DIG each"
+        );
 
         let raised = split_by_funds(&creates, balance, PER_COIN_RAISED);
         assert_eq!(
@@ -623,11 +636,7 @@ mod tests {
     #[test]
     fn a_partially_funded_wallet_stops_at_the_first_unaffordable_create() {
         let creates = vec![bond("aa", "11"), bond("bb", "22"), bond("cc", "33")];
-        let split = split_by_funds(
-            &creates,
-            2 * PER_COIN,
-            PER_COIN,
-        );
+        let split = split_by_funds(&creates, 2 * PER_COIN, PER_COIN);
 
         assert_eq!(split.affordable, vec![bond("aa", "11"), bond("bb", "22")]);
         assert_eq!(split.short, vec![bond("cc", "33")]);
@@ -644,10 +653,7 @@ mod tests {
 
         assert!(split.affordable.is_empty());
         assert_eq!(split.short, creates);
-        assert_eq!(
-            split.shortfall_dig_base_units,
-            2 * PER_COIN
-        );
+        assert_eq!(split.shortfall_dig_base_units, 2 * PER_COIN);
     }
 
     /// An empty wallet with coins to reclaim still reclaims them. This is the assertion that makes
@@ -655,12 +661,20 @@ mod tests {
     /// advertise nor recover at zero balance, and that is what stranded the money.
     #[test]
     fn a_wallet_at_zero_still_reclaims_what_it_already_locked() {
-        let plan = plan(&[], &[coin("c1", "aa", "11", NOW_EPOCH)], NOW_EPOCH, NOT_IN_FLIGHT);
+        let plan = plan(
+            &[],
+            &[coin("c1", "aa", "11", NOW_EPOCH)],
+            NOW_EPOCH,
+            NOT_IN_FLIGHT,
+        );
         let split = split_by_funds(&plan.create, 0, PER_COIN);
 
         assert_eq!(
             plan.reclaim,
-            vec![(coin("c1", "aa", "11", NOW_EPOCH), ReclaimReason::NoLongerHeld)],
+            vec![(
+                coin("c1", "aa", "11", NOW_EPOCH),
+                ReclaimReason::NoLongerHeld
+            )],
             "reclaim must not be gated on the balance"
         );
         assert!(split.affordable.is_empty());
@@ -706,7 +720,10 @@ mod tests {
 
         assert_eq!(
             plan.reclaim,
-            vec![(coin("c1", "aa", "11", NOW_EPOCH), ReclaimReason::NoLongerHeld)],
+            vec![(
+                coin("c1", "aa", "11", NOW_EPOCH),
+                ReclaimReason::NoLongerHeld
+            )],
             "a reclaim is never gated on an unrelated create being in flight"
         );
         assert!(plan.create.is_empty());

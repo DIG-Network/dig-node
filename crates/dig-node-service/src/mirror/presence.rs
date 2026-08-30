@@ -206,9 +206,9 @@ mod tests {
         let steady = bond("aa", "11");
         let flapping = bond("bb", "22");
 
-        tracker.observe(&[steady.clone()], T0, WINDOW);
+        tracker.observe(std::slice::from_ref(&steady), T0, WINDOW);
         tracker.observe(&[steady.clone(), flapping.clone()], T0 + 1_000, WINDOW);
-        let settled = tracker.observe(&[steady.clone()], T0 + WINDOW, WINDOW);
+        let settled = tracker.observe(std::slice::from_ref(&steady), T0 + WINDOW, WINDOW);
 
         assert_eq!(
             settled,
@@ -225,19 +225,22 @@ mod tests {
         let mut tracker = PresenceTracker::new();
         let b = bond("aa", "11");
 
-        tracker.observe(&[b.clone()], T0, WINDOW);
-        assert_eq!(tracker.observe(&[b.clone()], T0 + WINDOW, WINDOW), vec![b.clone()]);
+        tracker.observe(std::slice::from_ref(&b), T0, WINDOW);
+        assert_eq!(
+            tracker.observe(std::slice::from_ref(&b), T0 + WINDOW, WINDOW),
+            vec![b.clone()]
+        );
 
         // Gone for one observation, back for the next, both inside a fresh window.
         tracker.observe(&[], T0 + WINDOW + 1_000, WINDOW);
-        let settled = tracker.observe(&[b.clone()], T0 + WINDOW + 2_000, WINDOW);
+        let settled = tracker.observe(std::slice::from_ref(&b), T0 + WINDOW + 2_000, WINDOW);
 
         assert!(
             settled.is_empty(),
             "the capsule restarts its window rather than staying settled through a gap"
         );
         assert_eq!(
-            tracker.observe(&[b.clone()], T0 + 2 * WINDOW + 2_000, WINDOW),
+            tracker.observe(std::slice::from_ref(&b), T0 + 2 * WINDOW + 2_000, WINDOW),
             vec![b],
             "and settles again once it has been stably present for a full window"
         );
@@ -258,7 +261,7 @@ mod tests {
         );
 
         assert_eq!(
-            tracker.observe(&[staying.clone()], T0 + 2 * WINDOW, WINDOW),
+            tracker.observe(std::slice::from_ref(&staying), T0 + 2 * WINDOW, WINDOW),
             vec![staying],
             "the departed capsule is no longer held, which is what drives its reclaim"
         );
@@ -271,7 +274,7 @@ mod tests {
         let mut tracker = PresenceTracker::new();
         let b = bond("aa", "11");
 
-        tracker.observe(&[b.clone()], T0, WINDOW);
+        tracker.observe(std::slice::from_ref(&b), T0, WINDOW);
         tracker.observe(&[], T0 + WINDOW, WINDOW);
         tracker.observe(&[], T0 + 3 * WINDOW, WINDOW);
 

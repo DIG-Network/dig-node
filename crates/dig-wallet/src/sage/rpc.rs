@@ -4909,11 +4909,9 @@ mod tests {
             "baseline: a backend with nothing installed cannot sign"
         );
 
-        let operator = crate::operator_wallet::OperatorWallet::from_phrase(
-            PHRASE,
-            Bytes32::from([7u8; 32]),
-        )
-        .expect("the operator wallet really does open");
+        let operator =
+            crate::operator_wallet::OperatorWallet::from_phrase(PHRASE, Bytes32::from([7u8; 32]))
+                .expect("the operator wallet really does open");
         assert_ne!(
             operator.owner_puzzle_hash(),
             Bytes32::default(),
@@ -4925,12 +4923,9 @@ mod tests {
             "the operator wallet is held by its caller and installed on nothing"
         );
 
-        let installed = backend_with(vec![], true)
-            .await
-            .with_signer(Arc::new(crate::sage::spend::WalletSigner::new(
-                vec![],
-                Bytes32::from([7u8; 32]),
-            )));
+        let installed = backend_with(vec![], true).await.with_signer(Arc::new(
+            crate::sage::spend::WalletSigner::new(vec![], Bytes32::from([7u8; 32])),
+        ));
         assert!(
             installed.current_signer().is_some(),
             "a backend CAN hold a signer, so the `None` above is a measurement and not a tautology"

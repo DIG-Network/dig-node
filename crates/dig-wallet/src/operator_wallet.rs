@@ -121,8 +121,13 @@ abandon abandon abandon art";
     /// nothing — which is the whole property this test exists to hold.
     #[test]
     fn the_operator_address_is_the_standard_chia_hd_address_for_the_phrase() {
-        use chia_bls::{derive_keys::master_to_wallet_unhardened, DerivableKey, SecretKey};
-        use chia_puzzle_types::standard::StandardArgs;
+        // `derive_keys` is a private module in chia-bls 0.36; its contents are re-exported at the
+        // crate root, which is the supported path.
+        // Both re-exported at their crate roots; `derive_keys` and `derive_synthetic` are private
+        // modules. `DeriveSynthetic` is the trait that carries `derive_synthetic`, and it lives in
+        // chia-puzzle-types rather than chia-bls.
+        use chia_bls::{master_to_wallet_unhardened, SecretKey};
+        use chia_puzzle_types::{standard::StandardArgs, DeriveSynthetic};
 
         let wallet = OperatorWallet::from_phrase(PHRASE, agg_sig_data())
             .expect("a valid 24-word phrase derives");
@@ -131,9 +136,8 @@ abandon abandon abandon art";
         let seed = mnemonic.to_seed("");
         let master = SecretKey::from_seed(&seed);
         let expected_sk = master_to_wallet_unhardened(&master, 0).derive_synthetic();
-        let expected_ph = Bytes32::from(
-            StandardArgs::curry_tree_hash(expected_sk.public_key()).to_bytes(),
-        );
+        let expected_ph =
+            Bytes32::from(StandardArgs::curry_tree_hash(expected_sk.public_key()).to_bytes());
 
         assert_eq!(
             wallet.owner_puzzle_hash(),

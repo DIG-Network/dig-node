@@ -155,11 +155,8 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
 
     let (affordable, split) = match per_coin {
         Some(per_coin) => {
-            let split = super::plan::split_by_funds(
-                &create,
-                inputs.dig_balance_base_units,
-                per_coin,
-            );
+            let split =
+                super::plan::split_by_funds(&create, inputs.dig_balance_base_units, per_coin);
             (split.affordable.clone(), Some(split))
         }
         None => (Vec::new(), None),
@@ -190,10 +187,9 @@ fn bond_states(
 
     for bond in inputs.held {
         // The chain first: a coin that exists outranks every reason a coin might not.
-        let coin = inputs
-            .on_chain
-            .iter()
-            .find(|c| c.epoch == inputs.current_epoch && c.store_id == bond.store_id && c.root == bond.root);
+        let coin = inputs.on_chain.iter().find(|c| {
+            c.epoch == inputs.current_epoch && c.store_id == bond.store_id && c.root == bond.root
+        });
 
         let state = if let Some(coin) = coin {
             BondState::Bonded {
@@ -395,7 +391,11 @@ mod tests {
         let d = decide(&i);
 
         assert!(d.create.is_empty());
-        assert_eq!(d.reclaim.len(), 1, "a reclaim is never gated on the balance");
+        assert_eq!(
+            d.reclaim.len(),
+            1,
+            "a reclaim is never gated on the balance"
+        );
         assert_eq!(
             d.states,
             vec![(
