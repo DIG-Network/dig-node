@@ -2776,8 +2776,7 @@ fn spawn_mirror_passes(
                     // cache a failure, so a node that started offline can broadcast the moment
                     // its network returns. Holding one built at bring-up would silently make
                     // that node one that never broadcasts again.
-                    let broadcast =
-                        lifecycle::production_broadcaster(&chain, live_broadcast).await;
+                    let broadcast = lifecycle::production_broadcaster(&chain, live_broadcast).await;
                     let runtime = tokio::runtime::Handle::current();
                     let signer_ref = signer.as_ref();
                     let ctx = PassContext {

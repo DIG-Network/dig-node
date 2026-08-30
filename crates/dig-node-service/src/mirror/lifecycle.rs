@@ -734,12 +734,13 @@ mod tests {
     /// an operator fixes them differently: an absent wallet needs a seed, a disabled broadcast needs
     /// an environment variable. A test that only checked `signer.is_none()` would pass against an
     /// implementation that reported either reason for both.
-    #[test]
-    fn a_disabled_broadcast_is_reported_differently_from_an_unopenable_wallet() {
+    #[tokio::test]
+    async fn a_disabled_broadcast_is_reported_differently_from_an_unopenable_wallet() {
         let empty = tempfile::tempdir().expect("a temp dir");
         let paths = WalletPaths::resolve(empty.path().join("seed"));
+        let chain = ChainTransport::new();
 
-        let (signer, capability) = open_signer(&paths, true);
+        let (signer, capability) = open_signer(&paths, true, &chain).await;
         assert!(signer.is_none(), "no seed exists, so nothing may sign");
         assert_eq!(
             capability,
