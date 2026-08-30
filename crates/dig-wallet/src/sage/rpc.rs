@@ -5398,7 +5398,12 @@ mod tests {
         let be = backend_over(fb).await;
 
         let r = be
-            .coins_for_address(&address, BalanceAsset::Cat(foreign_asset_id()), None, TEST_PAGE)
+            .coins_for_address(
+                &address,
+                BalanceAsset::Cat(foreign_asset_id()),
+                None,
+                TEST_PAGE,
+            )
             .await
             .unwrap();
         let ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
@@ -5424,7 +5429,12 @@ mod tests {
         let be = backend_over(fb).await;
 
         let r = be
-            .coins_for_address(&address, BalanceAsset::Cat(Bytes32::from([0x77u8; 32])), None, TEST_PAGE)
+            .coins_for_address(
+                &address,
+                BalanceAsset::Cat(Bytes32::from([0x77u8; 32])),
+                None,
+                TEST_PAGE,
+            )
             .await
             .unwrap();
         assert!(
@@ -6857,7 +6867,8 @@ mod tests {
         let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
         let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
         assert_eq!(
-            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE).await,
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
+                .await,
             Err(BalanceError::NoChainSource)
         );
 
@@ -6875,7 +6886,8 @@ mod tests {
         db.set_initial_sync_complete(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(ErringFallback), WalletConfig::default());
         assert!(matches!(
-            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE).await,
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
+                .await,
             Err(BalanceError::ReadFailed(_))
         ));
 
@@ -7217,7 +7229,6 @@ mod tests {
         );
     }
 
-
     /// The four unspent coins a paging fixture needs, ASCENDING by coin id.
     ///
     /// FOUR, read TWO at a time, so the truncated page and the final page carry the SAME row count
@@ -7260,9 +7271,17 @@ mod tests {
             .coins_for_address(&owned_address(), BalanceAsset::Xch, None, 2)
             .await
             .unwrap();
-        assert_eq!(first.source, Source::Db, "the fixture must take the DB tier");
         assert_eq!(
-            first.coins.iter().map(|c| c.coin_id.as_str()).collect::<Vec<_>>(),
+            first.source,
+            Source::Db,
+            "the fixture must take the DB tier"
+        );
+        assert_eq!(
+            first
+                .coins
+                .iter()
+                .map(|c| c.coin_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["aa11", "bb22"],
             "the first page must be the first two coins in ascending coin-id order"
         );
@@ -7274,11 +7293,20 @@ mod tests {
             .unwrap();
 
         let second = be
-            .coins_for_address(&owned_address(), BalanceAsset::Xch, first.cursor.as_deref(), 2)
+            .coins_for_address(
+                &owned_address(),
+                BalanceAsset::Xch,
+                first.cursor.as_deref(),
+                2,
+            )
             .await
             .unwrap();
         assert_eq!(
-            second.coins.iter().map(|c| c.coin_id.as_str()).collect::<Vec<_>>(),
+            second
+                .coins
+                .iter()
+                .map(|c| c.coin_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["cc33", "dd44"],
             "a coin was skipped or repeated across the boundary -- an offset-paged read lands on \
              `dd44` alone here, and `cc33` becomes money the caller cannot see"
@@ -7310,7 +7338,12 @@ mod tests {
         );
 
         let second = be
-            .coins_for_address(&owned_address(), BalanceAsset::Xch, first.cursor.as_deref(), 2)
+            .coins_for_address(
+                &owned_address(),
+                BalanceAsset::Xch,
+                first.cursor.as_deref(),
+                2,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -7360,7 +7393,10 @@ mod tests {
         }
         assert_eq!(
             walked,
-            PAGE_FIXTURE.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            PAGE_FIXTURE
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
             "the walk must visit every coin exactly once, in ascending order"
         );
     }
@@ -7499,7 +7535,8 @@ mod tests {
             "the first read spends the only token"
         );
         assert_eq!(
-            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE).await,
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
+                .await,
             Err(BalanceError::RateLimited),
             "a second coin read must be refused, not amplified onto the third party"
         );

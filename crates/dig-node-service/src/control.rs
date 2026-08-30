@@ -1730,8 +1730,15 @@ fn page_fields(
 fn wallet_coins_params(
     id: &Value,
     params: &Value,
-) -> std::result::Result<(String, dig_wallet::sage::rpc::BalanceAsset, Option<String>, u32), Value>
-{
+) -> std::result::Result<
+    (
+        String,
+        dig_wallet::sage::rpc::BalanceAsset,
+        Option<String>,
+        u32,
+    ),
+    Value,
+> {
     const METHOD: &str = "control.wallet.coins";
     let (address, asset) = wallet_address_params(METHOD, id, params)?;
     let (after_coin_id, limit) = page_fields(id, METHOD, params)?;
