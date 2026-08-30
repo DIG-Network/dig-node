@@ -120,7 +120,9 @@ fn classify(entry: &str) -> Option<Rejection> {
     let this_machine_only = match host {
         url::Host::Domain(name) => {
             let name = name.trim_end_matches('.').to_ascii_lowercase();
-            name == "localhost" || name.ends_with(".localhost") || name == crate::config::DIG_LOCAL_HOST
+            name == "localhost"
+                || name.ends_with(".localhost")
+                || name == crate::config::DIG_LOCAL_HOST
         }
         url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_unspecified() || ip.is_link_local(),
         // `is_unicast_link_local` is unstable, so the `fe80::/10` prefix is tested directly.
@@ -159,7 +161,10 @@ mod tests {
              http://[::1]:4161/, http://dig.local/, http://169.254.10.4/",
         );
 
-        assert_eq!(got.accepted, vec!["https://mirror.example.net/".to_string()]);
+        assert_eq!(
+            got.accepted,
+            vec!["https://mirror.example.net/".to_string()]
+        );
         assert_eq!(got.rejected.len(), 5, "{:?}", got.rejected);
         assert!(got
             .rejected
@@ -222,7 +227,10 @@ mod tests {
             parse_advertised_urls("https://a.example/, https://a.example/, https://b.example/");
         assert_eq!(
             got.accepted,
-            vec!["https://a.example/".to_string(), "https://b.example/".to_string()]
+            vec![
+                "https://a.example/".to_string(),
+                "https://b.example/".to_string()
+            ]
         );
     }
 }
