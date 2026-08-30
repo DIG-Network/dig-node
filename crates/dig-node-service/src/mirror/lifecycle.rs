@@ -236,7 +236,7 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
 
         // The coins CONSUMED are read from the bundle itself rather than stated: every `CoinSpend`
         // in it spends exactly its own coin, so this cannot disagree with what was signed.
-        let funding_coin_ids = spends
+        let funding_coin_ids: Vec<FundingCoinId> = spends
             .coin_spends()
             .iter()
             .map(|cs| FundingCoinId(hex::encode(cs.coin.coin_id())))

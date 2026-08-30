@@ -46,7 +46,6 @@ use std::collections::{HashMap, HashSet};
 use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use chia_sha2::Sha256;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
-use dig_node_service::mirror::funding::dig_cat_puzzle_hash;
 use dig_node_service::mirror::lifecycle::NodeMirrorEffects;
 use dig_node_service::mirror::plan::Bond;
 use dig_node_service::mirror::runner::MirrorEffects;
