@@ -67,10 +67,15 @@ fn with_advertise_env<T>(value: &str, body: impl FnOnce() -> T) -> T {
 }
 
 /// A chain holding whatever the test put on it — and nothing else.
+///
+/// It COUNTS its address lookups, because that is the only externally visible trace coin selection
+/// leaves when no spend follows. Without it, the refusal probe below could not tell a guard that
+/// runs before selection from one that runs after: both broadcast nothing.
 #[derive(Default)]
 struct Chain {
     by_puzzle_hash: std::collections::HashMap<Bytes32, Vec<CoinRecord>>,
     spends: std::collections::HashMap<Bytes32, CoinSpend>,
+    address_lookups: std::sync::atomic::AtomicUsize,
 }
 
 impl Chain {
@@ -104,6 +109,8 @@ impl ChainSource for Chain {
         puzzle_hash: Bytes32,
         _include_spent: bool,
     ) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.address_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self
             .by_puzzle_hash
             .get(&puzzle_hash)
@@ -300,6 +307,18 @@ fn an_all_rejected_value_refuses_and_spends_nothing() {
     );
     assert!(
         broadcast_bytes(&broadcaster).is_empty(),
-        "the refusal must precede coin selection: no spend may be attempted"
+        "no spend may be attempted for an advertisement no stranger could act on"
+    );
+    // The PLACEMENT, which the two assertions above cannot see. `dig-mirror-coin` also refuses an
+    // empty URL list, so a guard moved to after coin selection would broadcast nothing and return
+    // an error exactly as this one does — while having reserved a funding coin for a create that
+    // can never happen, starving the next bond in the same pass. A create that never reads an
+    // address is the only observation that separates the two.
+    assert_eq!(
+        chain
+            .address_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refusal must be reached before any chain read, so no coin is selected or reserved"
     );
 }
