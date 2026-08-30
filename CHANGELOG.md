@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.169.0] - 2026-08-30
+
+### Features
+- **collateral:** Census the current epoch against a real chain source (#401)- **mirror-coin:** Lifecycle driven by .dig presence, created and reclaimed per epoch (#379)
+
+### Bug Fixes
+- **collateral:** A degraded source can no longer seal a low requirement (#406)- **spends:** Control.spends.list emits its own contract's shape (#409)
+
 ## [0.165.0] - 2026-08-29
 
 ### Features
