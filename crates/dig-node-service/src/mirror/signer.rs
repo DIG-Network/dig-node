@@ -33,6 +33,14 @@
 //! The crate's builders take XCH fee coins separately from the $DIG being locked, so a fee is never
 //! taken out of the amount advertised. [`MIRROR_SPEND_FEE_CEILING_MOJOS`] bounds the fee itself, and
 //! [`MirrorSigner::sign`] refuses above it rather than trusting every future caller to check.
+//!
+//! The ceiling is checked against [`MirrorSpends::fee_mojos`] — the fee the bundle actually pays,
+//! recorded by the builder that baked it in — and NOT against a fee the caller passes alongside.
+//! Those are not the same bound. A separate argument would make this the one bound of the four that
+//! is a promise about a parameter rather than a property of the artifact: a caller holding a reclaim
+//! built at 0.9 XCH could offer it with a `0` and be signed, with no edit to this file and nothing
+//! for a reviewer of this file to see. Since the fee now travels ON the thing being signed, and
+//! `MirrorSpends` has no public constructor, there is no number a caller can substitute.
 
 use chia_protocol::{Bytes32, SpendBundle};
 use dig_wallet::operator_wallet::OperatorWallet;
@@ -57,9 +65,9 @@ pub const MIRROR_SPEND_FEE_CEILING_MOJOS: u64 = 1_000_000_000;
 /// of the likeliest things to end up in a log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignError {
-    /// The requested fee exceeds [`MIRROR_SPEND_FEE_CEILING_MOJOS`].
+    /// The fee these spends pay exceeds [`MIRROR_SPEND_FEE_CEILING_MOJOS`].
     FeeAboveCeiling {
-        /// What was asked for, in XCH mojos.
+        /// What the spends actually pay, in XCH mojos.
         requested_mojos: u64,
         /// The ceiling it exceeded, in XCH mojos.
         ceiling_mojos: u64,
@@ -118,13 +126,14 @@ impl MirrorSigner {
     /// remove the audit guarantee while changing no observable behaviour — which is exactly why it is
     /// spelled out here rather than left to a reviewer to notice.
     ///
-    /// Refuses a fee above [`MIRROR_SPEND_FEE_CEILING_MOJOS`] before signing anything.
+    /// Refuses a fee above [`MIRROR_SPEND_FEE_CEILING_MOJOS`] before signing anything. The fee read
+    /// is `spends`' own — see the module doc for why it is deliberately not a parameter here.
     pub fn sign(
         &self,
         spends: &MirrorSpends,
         _recorded: &RecordedSpend,
-        fee_mojos: u64,
     ) -> Result<SpendBundle, SignError> {
+        let fee_mojos = spends.fee_mojos();
         if fee_mojos > MIRROR_SPEND_FEE_CEILING_MOJOS {
             return Err(SignError::FeeAboveCeiling {
                 requested_mojos: fee_mojos,
@@ -204,10 +213,12 @@ abandon abandon abandon art";
         let dir = tempfile::tempdir().expect("tempdir");
         let journal = journal(dir.path());
         let recorded = journal.begin(intent());
-        let spends = super::super::spends::empty_for_tests();
         let signer = signer();
 
-        let over = signer.sign(&spends, &recorded, MIRROR_SPEND_FEE_CEILING_MOJOS + 1);
+        let over = signer.sign(
+            &super::super::spends::empty_for_tests(MIRROR_SPEND_FEE_CEILING_MOJOS + 1),
+            &recorded,
+        );
         assert_eq!(
             over,
             Err(SignError::FeeAboveCeiling {
@@ -219,7 +230,10 @@ abandon abandon abandon art";
 
         assert!(
             signer
-                .sign(&spends, &recorded, MIRROR_SPEND_FEE_CEILING_MOJOS)
+                .sign(
+                    &super::super::spends::empty_for_tests(MIRROR_SPEND_FEE_CEILING_MOJOS),
+                    &recorded
+                )
                 .is_ok(),
             "exactly at the ceiling is permitted, so the refusal above is not unconditional"
         );
@@ -247,7 +261,7 @@ abandon abandon abandon art";
         assert_eq!(ledger.records[0].status.token(), "pending");
 
         signer()
-            .sign(&super::super::spends::empty_for_tests(), &recorded, 0)
+            .sign(&super::super::spends::empty_for_tests(0), &recorded)
             .expect("an empty spend set signs to an empty aggregate");
     }
 }

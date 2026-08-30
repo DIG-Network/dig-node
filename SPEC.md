@@ -7911,7 +7911,38 @@ every spend here is subject to; §24 is where the amount comes from. Spend const
 `dig-mirror-coin` — nothing in this repo assembles a mirror spend, a CAT wrapper, or a memo layout
 itself (SYSTEM.md §4.1).
 
+> **IMPLEMENTATION STATUS — read this before relying on any clause in §25.** This section is
+> normative in full and is written in the present indicative throughout. At this head **only the
+> deciding half exists; nothing runs it.** Satisfied by code today, and *only* this:
+>
+> * §25.2's structural bounds on the signing authority — `MirrorSpends` and its two producers
+>   (`mirror/spends.rs`), `MirrorSigner::sign` and the fee ceiling (`mirror/signer.rs`), and the
+>   `&RecordedSpend` precondition that makes a journal entry the shape of the call.
+> * §25.3's pricing rule and §25.4's step-3 planner, as **pure functions** over supplied
+>   observations (`mirror/plan.rs`, `mirror/pass.rs`), including §25.7's switch semantics and
+>   §25.9's decision directions.
+> * §25.5's stability rule, as a **pure tracker** (`mirror/presence.rs`), and §25.7's persisted
+>   `collateral.json` switch.
+>
+> **Everything else in §25 is PENDING**, tracked as
+> <https://github.com/DIG-Network/dig-node/issues/412>. That includes every clause under which the
+> node *observes* disk or chain, *scans*, *schedules*, *spends*, *broadcasts*, *records an outcome*,
+> or *reports a state*: no pass is constructed and none is scheduled, and no caller anywhere reaches
+> `MirrorSigner::new`, `build_create`, `build_reclaim` or `dig_mirror_coin::list`.
+>
+> **A clause not named in the list above MUST be read as pending, whatever its grammatical voice.**
+> The default is deliberately pending rather than satisfied: a per-clause list of what is missing has
+> to be complete to be safe, and this one only has to be complete about what is *present*.
+
 ### 25.1. The invariant
+
+> **PENDING — the invariant is stated, and nothing maintains it at this head.** Neither side is
+> observed: the disk side (`cache_list_cached()` filtered to `Held`) is not read by this module, and
+> the chain side is not read at all — `dig_mirror_coin::list` appears nowhere in this repo. So a
+> reader MUST NOT infer that a coin's existence tracks a `.dig`'s presence today; the biconditional
+> below is the obligation <https://github.com/DIG-Network/dig-node/issues/412> discharges. The
+> `Relayed`-is-never-advertised rule is the exception: it holds structurally, because the plan's
+> desired set is built from `Held` bonds only.
 
 > **A mirror coin owned by this node for the CURRENT epoch exists ⟺ the `.dig` for that
 > `(store, root)` is on disk with `Held` provenance.**
@@ -7966,7 +7997,12 @@ The authority is bounded four ways, and every bound is stated so a reader can ch
 4. **By fee source and size.** Fees are paid from XCH coins only — the crate's builders take
    separate fee inputs, so a fee can never shave collateral. `fee_mojos` per spend MUST come from a
    named constant, MUST be recorded in the audit entry, and MUST NOT exceed
-   `MIRROR_SPEND_FEE_CEILING_MOJOS` = 1_000_000_000 (0.001 XCH). The shipped default fee is 0; a
+   `MIRROR_SPEND_FEE_CEILING_MOJOS` = 1_000_000_000 (0.001 XCH). The ceiling MUST be enforced
+   against the fee the spends THEMSELVES pay — `MirrorSpends::fee_mojos()`, recorded by the builder
+   that baked it into the bundle — and MUST NOT be a separate argument to `sign`. A fee passed
+   alongside the artifact bounds a caller's claim about the bundle rather than the bundle, which
+   would make this the one of these four bounds that any caller could step around by passing a
+   different number. The shipped default fee is 0; a
    zero-fee reclaim is explicitly supported by `dig_mirror_coin::reclaim`.
 
 **The signer instance is module-private.** It is constructed at bring-up from the operator seed —
@@ -7985,6 +8021,15 @@ owner key is the first derived key; its standard puzzle hash is the wallet's rec
 `owner_puzzle_hash` term of every hint this node creates, the address reclaims return to, and the
 address create-change returns to. Deposits, bonds and reclaims therefore all move through ONE
 address the wallet already tracks.
+
+> **PARTIALLY PENDING.** The two structural halves of this subsection ARE satisfied by code: the
+> spend-shape bound (`MirrorSpends`), the fee bound (now read from the artifact, below), and the
+> `&RecordedSpend` precondition. The sentence above — that the signer instance is *constructed at
+> bring-up* from the operator seed — is NOT: `MirrorSigner::new` has no caller at this head, so no
+> signer is constructed anywhere and the `Locked`/`Orphaned` reporting it describes does not exist.
+> Nor is the audit-EXECUTION paragraph below satisfied: no entry is ever written for a mirror spend,
+> no confirmation is observed, and nothing reconciles an `unresolved` or `failed` one. Both are
+> tracked as <https://github.com/DIG-Network/dig-node/issues/412>.
 
 **Every spend is audited, structurally.** The signer takes `&RecordedSpend`, whose only source is
 `SpendJournal::begin` (§23.3) — recording is the shape of the call. Entries carry
@@ -8013,6 +8058,16 @@ locked under a previous epoch's amount is reclaimed at that amount — reclaim r
 locked, exactly.
 
 ### 25.4. The reconcile pass — two observations, a pure plan, reclaims first
+
+> **PARTIALLY PENDING — step 3 only is implemented.** The pure planner *is* satisfied by code
+> (`mirror/plan.rs`, `mirror/pass.rs`): given the two observations, the epoch, the requirement, the
+> balance and the switch, it produces exactly the table below. **Nothing supplies it and nothing acts
+> on its answer.** The observations (steps 1–2), the execution order (step 4), the funds-limited
+> create loop (step 5), the audit-ledger in-flight suppression (step 6), the confirmation record, and
+> the three triggers above — start-up, the `MIRROR_ROUND_LENGTH_MS` tick, and the debounced presence
+> change — are NOT implemented at this head. Tracked as
+> <https://github.com/DIG-Network/dig-node/issues/412>. Until it lands, a reader MUST NOT rely on any
+> pass running at all.
 
 A pass runs: at start-up (once the wallet and a chain source are available), on every round tick
 (`dig_constants::MIRROR_ROUND_LENGTH_MS`), and after a debounced presence change (§25.5). Each pass:
@@ -8061,6 +8116,14 @@ coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile acc
 
 ### 25.5. Presence and debounce
 
+> **PARTIALLY PENDING — the debounce rule is implemented; the scanning is not.** The
+> stability-across-a-window rule, in both directions, is satisfied by the pure tracker in
+> `mirror/presence.rs` and its `SETTLING_WINDOW_MS`. **Nothing feeds it**: there is no periodic
+> scan, no start-up scan, no watcher, and no caller of the tracker at this head — so the scanning
+> cadence described below, the un-debounced start-up exemption, and the claim that the periodic pass
+> is the correctness mechanism are all pending, tracked as
+> <https://github.com/DIG-Network/dig-node/issues/412>.
+
 Presence changes are detected by SCANNING, with an optional watcher as an accelerator — never the
 reverse. A watcher event is exactly what a crash, an unmounted volume, or an uncovered path loses;
 the periodic pass (§25.4) is the correctness mechanism.
@@ -8101,6 +8164,13 @@ declared tuple plus a recomputed hint, which is what defeats the constructible a
 collision (the epoch term is freely chosen, so hint equality alone proves nothing).
 
 ### 25.7. Consent, the switch, and revocation
+
+> **PARTIALLY PENDING.** The switch itself is real — it persists in `collateral.json`, defaults on,
+> and the planner honours it by forcing the desired bond set empty so every live coin falls into the
+> reclaim set. What does NOT exist at this head is the pass that acts on that plan, so **turning
+> collateralisation off today reclaims nothing, because nothing is ever created either.** The
+> revocation bullet below describes the behaviour once
+> <https://github.com/DIG-Network/dig-node/issues/412> lands; it is decided, not performed.
 
 There is deliberately no per-spend approval; the standing authority is the consent model, and it is
 honest the same way auto-tipping (§18.23) is: **disclosed, default-on, bounded, fully audited, and

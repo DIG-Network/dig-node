@@ -59,6 +59,7 @@ impl MirrorOperation {
 pub struct MirrorSpends {
     operation: MirrorOperation,
     spends: Vec<CoinSpend>,
+    fee_mojos: u64,
 }
 
 impl MirrorSpends {
@@ -71,6 +72,19 @@ impl MirrorSpends {
     /// them, so a borrowed `MirrorSpends` cannot become a vehicle for an unrelated spend.
     pub fn coin_spends(&self) -> &[CoinSpend] {
         &self.spends
+    }
+
+    /// The XCH fee, in mojos, that these spends actually pay.
+    ///
+    /// Recorded at build time from the same `fee` handed to the `dig_mirror_coin` builder, so it
+    /// describes the artifact rather than a caller's account of it. That distinction is the whole
+    /// value of the field: `MirrorSigner::sign` bounds THIS against
+    /// [`MIRROR_SPEND_FEE_CEILING_MOJOS`](super::signer::MIRROR_SPEND_FEE_CEILING_MOJOS), and a fee
+    /// supplied to the signer separately would have been a number about the bundle instead of the
+    /// bundle's own — bypassable by any caller that passed a different one, with no edit to the
+    /// signer. It is also the figure §25.2 requires in the audit entry.
+    pub fn fee_mojos(&self) -> u64 {
+        self.fee_mojos
     }
 }
 
@@ -115,6 +129,7 @@ pub fn build_create(
     Ok(MirrorSpends {
         operation: MirrorOperation::Create,
         spends,
+        fee_mojos: fee,
     })
 }
 
@@ -139,6 +154,7 @@ pub fn build_reclaim(
     Ok(MirrorSpends {
         operation: MirrorOperation::Reclaim,
         spends,
+        fee_mojos: fee,
     })
 }
 
@@ -148,10 +164,15 @@ pub fn build_reclaim(
 /// is the whole authority bound, and a test seam that widened it would quietly remove the thing this
 /// module exists to guarantee. It carries [`MirrorOperation::Create`] because a `MirrorSpends` always
 /// names an operation; the operation is irrelevant to an empty spend set.
+///
+/// `fee_mojos` is a parameter rather than zero so a signer test can exercise the ceiling without a
+/// chain. The fee is the one thing about these spends the signer reads, so a fixture that could not
+/// vary it could not test the bound at all.
 #[cfg(test)]
-pub(crate) fn empty_for_tests() -> MirrorSpends {
+pub(crate) fn empty_for_tests(fee_mojos: u64) -> MirrorSpends {
     MirrorSpends {
         operation: MirrorOperation::Create,
         spends: Vec::new(),
+        fee_mojos,
     }
 }
