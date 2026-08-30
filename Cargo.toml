@@ -88,9 +88,3 @@ overflow-checks = true
 # So "0.21 is chia-blocked" is FALSE and "dig-node cannot reach 0.21" is still TRUE. The remaining
 # unblock is a dig-gossip release against `dig-nat ^0.21`, upstream, never an edit in this file. Do
 # not bridge two lines with a shim -- that is the §4.1 byte-drift class.
-
-# TEMPORARY, REMOVED BEFORE THIS PR IS MARKED READY (dig-node#381): the paged
-# control.wallet.coins shape is declared in dig-node-control-interface 0.25.0, which is
-# release-first and not yet published. Release order is contract -> publish -> this bump.
-[patch.crates-io]
-dig-node-control-interface = { path = "C:/tmp/worktrees/dnci-381" }
