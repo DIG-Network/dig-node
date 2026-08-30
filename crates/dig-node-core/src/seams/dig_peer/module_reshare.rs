@@ -1336,7 +1336,9 @@ mod tests {
                 provider_peer_id: "dd".repeat(32),
                 addresses: vec![],
                 expires_at: u64::MAX,
-            }])
+                // No mirror-coin pointer: absence is the normal state for a provider (#422).
+                unverified_mirror_coin_id: None,
+                }])
         }
     }
 

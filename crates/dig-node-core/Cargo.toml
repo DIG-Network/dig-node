@@ -399,7 +399,7 @@ dig-social-profile = { version = "0.7", default-features = false }
 # `ProviderRecord::unverified_mirror_coin_id` lives (dig-dht#23), so the §25 mirror-coin pointer is
 # unreachable here until dig-download AND dig-peer-selector release against `dig-dht ^0.15` —
 # upstream, never a version edit here. Bridging two lines with a shim is the §4.1 byte-drift class.
-dig-dht = "0.13"
+dig-dht = "0.15"
 # -- L7 Peer Exchange (PEX, #166) --------------------------------------------------------------------
 # The node<->node peer-sharing protocol: over each established mTLS peer connection, a dedicated PEX
 # logical stream exchanges delta-based first-hand known-peer sets (handshake -> snapshot -> deltas),
@@ -445,7 +445,7 @@ dig-pex = "0.1.1"
 # checkpoint store (`download.rs::capturing_state_store_checkpoints_a_real_module_download_key`),
 # because dig-download's own suite missed it: every `module.rs` test used `InMemoryStateStore` (no
 # filename at all) and the one `FileStateStore` test used a 3-character key.
-dig-download = "0.21"
+dig-download = "0.22"
 # -- The shared peer client (#1283/#1576) -------------------------------------------------------------
 # `DigPeer` — the ONE DIG Network peer client: peer_id-pinned mTLS over the full NAT ladder plus typed
 # RPC. Depended on DIRECTLY (not only transitively through dig-download) because dig-node supplies the
@@ -483,7 +483,7 @@ dig-peer = "0.13"
 # 0.10 IS takeable as of dig-gossip v0.32.0, which declares `dig-nat = "0.21"` — the release the old
 # note here was waiting on. It carries `dig-dht ^0.13`, which is what holds dig-dht at 0.13; see the
 # dig-dht entry above.
-dig-peer-selector = "0.10"
+dig-peer-selector = "0.11"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
 # the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the
@@ -567,7 +567,7 @@ rcgen = "0.13"
 #
 # Pinned by the `the_fail_open_anchor_verifier_is_not_reachable_from_a_production_build` test, which
 # fails if `testkit` ever appears on the production entry.
-dig-download = { version = "0.21", features = ["testkit"] }
+dig-download = { version = "0.22", features = ["testkit"] }
 # Captures the peer-facing serve's real emitted tracing records into an in-memory buffer, so the
 # serve-observability tests (#1595) assert what an operator would actually see in the node log —
 # and that no payload byte or proof ever reaches it.
