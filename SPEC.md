@@ -1612,7 +1612,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.wallet.coinsByParent` | `parent_coin_id` (64 lowercase-hex, `0x` TOLERATED), optional `after_coin_id` (same rule), optional `limit` (1..=1000, default 100) | `coins` (array of the `control.wallet.coinById` record shape), `complete`, `cursor`, `source`, `synced`, `peak_height`. ONE PAGE of the DIRECT children created by spending the named parent. ONE HOP, never a walk: the node MUST NOT recurse -- a transitive walk over caller-supplied input is unbounded work the caller cannot bound, and a partial walk returned as complete is a lineage with a silent hole in it. A caller composes hops itself, pairing this with `control.wallet.coinSpend`. Children MUST be returned in ASCENDING `coin_id` order and that order MUST be stable across the pages of one walk, because `after_coin_id` means *strictly after this id in that order* and without a fixed order a cursor names no position (a walk would repeat some children and skip others). `complete` states whether the page is the WHOLE child set and MUST be derived from whether further children EXIST -- never from whether the page filled: the two differ exactly when the child count is an integer multiple of `limit`, where the second declares a truncated page whole and ends a lineage walk one hop early while looking finished. `cursor` is the LAST child in the page (the id the caller was handed), or `null` for an empty page; a node MUST NOT emit `complete: false` with `cursor: null`, which leaves a caller with no way to make progress. An out-of-range `limit` is REFUSED as `INVALID_PARAMS`, never clamped: the page boundary is what the caller resumes from, so a silently shrunk page hands back a cursor for a position the caller never asked about. Every record MUST report `asset: null` (naming a coin by its parent classifies nothing). Every child MUST name the requested parent; a source that returns one that does not fails the WHOLE read (`WALLET_READ_FAILED`, §10) rather than having the row filtered out. `coins: []` MUST mean a chain ANSWERED and the parent created no children it knows of -- typically it is unspent; every way of failing to consult a chain is a DISTINCT error, never an empty page, because an empty page reads as *that spend created nothing*. OPEN read (no token), same global fallback rate bound. `INVALID_PARAMS` on a missing/malformed id or an illegal `limit`, refused BEFORE any network call; the rules are `dig-node-control-interface`'s own `WalletCoinsByParentParams::validated()`. |
 | `control.wallet.arrivals` | `after_seq` (integer ≥ 0, default `0`), `limit` (integer, default `50`, CLAMPED to `1..=500`) | `arrivals` (`[{seq, coin_id, puzzle_hash, amount, asset_id, confirmed_height}]`, oldest first), `cursor` (the RESUME position: the last `seq` actually returned, or the caller's own `after_seq` on an empty page), `latest` (the newest position the ledger holds). A client MUST resume from `cursor` and MUST NOT resume from `latest`: `latest` is read after the page, so an arrival recorded in between sits above the page and below `latest`, and resuming from `latest` would step over it. `latest` exists for the first-run case only — a client with no stored cursor reads it and passes it back as `after_seq` to start from NOW rather than replaying the ledger as a burst of notifications. INCOMING FUNDS the node determined ARRIVED, since a cursor (dig_ecosystem#2548) — the question neither `.balance` (a total the user's own change also moves) nor `.coins` (no notion of "new") can answer. A row is written ONLY for a coin that is (a) CONFIRMED — `confirmed_height` is `NOT NULL` in the store, so a mempool sighting is unwritable, not merely unwritten; (b) confirmed STRICTLY ABOVE the wallet's arrival baseline, which is armed ONLY by the statement that records a COMPLETED address-history catch-up — the one caller that has demonstrably replayed everything — so a first catch-up announces nothing, and a point read against the fallback oracle, which replays nothing, cannot arm a baseline at all; (c) not already recorded, enforced by a `UNIQUE` coin id on disk, so a restart, a reconnect or a rebuilt replica re-announces nothing; and (d) NOT created by spending a coin this wallet holds, so the user's own change is never reported as a receipt. `amount` is a decimal STRING (the full `u64` range; a JSON number would round it). `asset_id` is `null` for native XCH and the CAT's hex TAIL otherwise — NEVER a ticker, because naming an asset the node did not attribute would assert a classification it cannot support; a coin whose asset is not yet determinable is HELD and re-examined, never announced as XCH. A reorg DELETES the arrivals above the fork with the coins they describe, and walks the baseline back; `seq` is `AUTOINCREMENT`, so a deleted row's position is never reused and a stored cursor cannot come to mean a different arrival. `arrivals: []` means the node consulted its OWN replica and nothing arrived since the cursor — it is NOT a claim that the replica is current (ask `control.wallet.syncStatus`), and a node that has never completed a catch-up has no baseline and reports empty forever. OPEN read (no token) and the NARROWEST of the open reads: it touches only the local replica, has no oracle path, and so discloses nothing off-node and cannot amplify a poll into outbound requests. `INVALID_PARAMS` on a negative `after_seq`; `WALLET_READ_FAILED` if the local ledger cannot be read. |
 | `control.wallet.peak` | — | `peak_height` (`u32` or `null`), `synced` (bool). The node's current chain peak, independent of any address. Its OWN method rather than a field on a balance because a balance reports `peak_height: null` on every `"fallback"`-tier answer by design (§18.7b), so a caller bounding a claimed confirmation could not obtain one from the node that most needs to answer. Prefers the node's own replica and falls back to the chain tier. The chain tier is the node's OWN dialled Chia peers, asked CONCURRENTLY and settled on their AGREEMENT (NC-12): the height is the settled height every credible peer in the sample has passed, and a sample that collapses to one voice, or splits, MUST report `peak_height: null` rather than a repaired number. A node MUST NOT satisfy this read from a single public oracle, and MUST NOT fall through to one when its peers fail to agree — falling through would let one endpoint overrule the peers at exactly the moment corroboration failed, which is the single-source dependency NC-12 exists to remove. `peak_height: null` means UNKNOWN and MUST NOT be read as height zero, which every block is trivially above. `synced` carries EXACTLY its `control.wallet.balance` meaning (§18.7b) and MUST be MEASURED by the same predicate: a replica-served peak reports `synced: true` only while the replica is FOLLOWING the chain, so a behind-but-once-synced replica answers `synced: false` WITH its real `peak_height`, and a tier with no observable peer height, or a replica with no peak of its own, also answers `synced: false` — neither an unmeasured peer tier nor an unknown replica height can establish currency. A node MUST NOT derive this flag from `initial_sync_complete`, which latches on the first completed catch-up and is cleared only by a backwards chain move: a replica hundreds of blocks behind still satisfies it, so `control.wallet.peak` would report `synced: true` about the same replica `control.wallet.syncStatus` is simultaneously reporting as `syncing`. This is the endpoint a caller uses to bound a claimed confirmation, so the overstatement lands on the read that decides whether money has settled. A chain-tier answer reports `synced: false`, because a height the replica did not produce says nothing about the replica. OPEN read. |
-| `control.wallet.broadcast` | `signed_bundle_hex` (lowercase hex, optionally `0x`-prefixed, of a chia `Streamable` `SpendBundle`) | `accepted` (bool), `transaction_id` (lowercase 64-hex or `null`), `rejection` (string or `null`). Pushes an ALREADY-SIGNED bundle. **§908: the node signs nothing and is never given anything it could sign with** — there is no key, seed, phrase or unsigned-plan parameter here and none may be added; the node's role on the money path is to read chain state and relay what somebody else signed. A mempool that examined the bundle and refused it is a SUCCESSFUL call reporting `{accepted:false, rejection}`; failing to REACH a mempool is `WALLET_READ_FAILED`, and a node with no chain source is `WALLET_NO_CHAIN_SOURCE`. These MUST NOT be collapsed: the first says build a different bundle, the second says retry this one. `accepted:true` reports mempool admission ONLY and is NOT evidence anything reached a block — a caller MUST NOT record an outcome from it; only a buried confirmation of the created coin is evidence. `INVALID_PARAMS` on hex that is not a streamable `SpendBundle`, refused BEFORE any network call. A bundle requiring a signature from any key the NODE custodies — whatever puzzle wraps the coin — while `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off is `WALLET_NODE_SPEND_DISABLED`, also refused before any network call — the node relays what somebody ELSE signed, and it signs on request, so whether the node could have signed it is CHECKED rather than assumed. TOKEN-GATED (not an open read). |
+| `control.wallet.broadcast` | `signed_bundle_hex` (lowercase hex, optionally `0x`-prefixed, of a chia `Streamable` `SpendBundle`) | `accepted` (bool), `transaction_id` (lowercase 64-hex or `null`), `rejection` (string or `null`). Pushes an ALREADY-SIGNED bundle. **§908: this method signs nothing and is never given anything it could sign with** — there is no key, seed, phrase or unsigned-plan parameter here and none may be added; on this surface the node's role is to read chain state and relay what somebody else signed. The node's OWN automated spends (§23, §25) never transit this method and are not reachable from it. A mempool that examined the bundle and refused it is a SUCCESSFUL call reporting `{accepted:false, rejection}`; failing to REACH a mempool is `WALLET_READ_FAILED`, and a node with no chain source is `WALLET_NO_CHAIN_SOURCE`. These MUST NOT be collapsed: the first says build a different bundle, the second says retry this one. `accepted:true` reports mempool admission ONLY and is NOT evidence anything reached a block — a caller MUST NOT record an outcome from it; only a buried confirmation of the created coin is evidence. `INVALID_PARAMS` on hex that is not a streamable `SpendBundle`, refused BEFORE any network call. A bundle requiring a signature from any key the NODE custodies — whatever puzzle wraps the coin — while `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off is `WALLET_NODE_SPEND_DISABLED`, also refused before any network call — the node relays what somebody ELSE signed, and it signs on request, so whether the node could have signed it is CHECKED rather than assumed. TOKEN-GATED (not an open read). |
 | `control.chiaPeers.add` | `ip` (a bare IPv4/IPv6 literal — no brackets, no port, no hostname; the standard full-node port is assumed) | `{added: true, ip, port, corroboration_bypassed, notice}`. TRUSTS a Chia full node: it writes the `user_managed` peer row that is the ONLY way to reach `PeerTrust::Operator`, the trust level whose answers may drive catch-up, rollback and the `initial_sync_complete` flag WITHOUT a quorum. Every other peer is `Discovered` and must be corroborated by independently chosen peers first (§18.16). `ip` is CANONICALISED on the way in (`IpAddr` display form — RFC 5952 lowercase compressed for v6) and echoed back in that form, so one host is one entry however it was spelled; `INVALID_PARAMS` on anything that is not a bare literal, refused before any write. `corroboration_bypassed` is the RESULTING trust state, NOT a restatement of the request: a node MUST report `false` where the entry did not end up trusted — adding a peer that was BANNED un-bans it and confers no bypass. `notice` carries the cost as a sentence and MUST be non-empty, name the corroboration bypass, and be rendered VERBATIM; a client MUST NOT paraphrase, truncate or suppress it. The wording MUST authorise only **a node the operator runs themselves** — never vouching or recommending, which widen the case past what justifies the entry's unbounded authority. Idempotent — re-adding a known peer succeeds and un-bans it. A node MUST serve this from the SAME peer store its wallet replica consults. **MASTER-TOKEN TIER** (`ControlMethod::requires_master_token`): a paired token MUST be refused, because the entry outlives the token that wrote it and `pairing.revoke` removes no peer row. |
 | `control.chiaPeers.list` | — | `{peers: [{ip, port, peak_height, user_managed, banned}]}` — every tracked Chia peer: TRUSTED, DISCOVERED **AND BANNED** alike. `user_managed` tells the trusted set from the discovered one and MUST be reported rather than filtered on: a list showing only the trusted set would let a person conclude the node talks to nobody else. `banned` MUST likewise be reported and its rows MUST NOT be omitted — this is the ONLY enumeration of the ban set, and a blocklist a person cannot read is a blocklist they cannot correct. This enumeration is DISTINCT from the dialling read, which excludes banned peers; a node MUST NOT serve both from one relaxed query. `peak_height` is `null` where the node holds no telemetry for that peer yet — `null` means UNOBSERVABLE and MUST NEVER be reported as `0`, which would render an unpolled peer as one stalled at genesis. A reported height is that peer's CLAIM, never a verified fact, and MUST NOT be aggregated into a chain position (NC-12). TOKEN-GATED at the ORDINARY tier — a read grants nothing that outlives the token, and a paired client must stay able to show the operator the trust state it is subject to. |
 | `control.chiaPeers.remove` | `ip` (canonicalised as for `add`), optional `ban` (bool, default `false`) | `{outcome, ip, banned}` where `outcome` is `"removed"` or `"no_such_peer"`. Stops trusting a peer, RESTORING corroboration for it. There is deliberately NO `removed: true` companion field: this is the only way to un-trust a peer holding unbounded authority over the wallet replica, so a consumer MUST match on `outcome` and MUST surface `"no_such_peer"` as a failure to act — an operator told "removed" when nothing matched believes they revoked custody-grade trust and did not. Matching is by the canonical form, so an address spelled differently from the stored entry still names the same peer. `ban: true` keeps the peer excluded so discovery cannot re-add it; the banned set is bounded at `MAX_BANNED_CHIA_PEERS` (256) and on overflow a node MUST evict its OLDEST ban rather than refuse the newest. `ban: false` merely forgets the row and is the un-ban path — clearing a ban that way grants NO trust. `INVALID_PARAMS` on a missing or non-literal `ip`. **MASTER-TOKEN TIER** — a paired token MUST be refused, so it cannot strip the peers an operator deliberately trusts. |
@@ -3709,7 +3709,7 @@ ONLY automatic release trigger, a quiet repo can silently stop releasing. Detect
 | 13 | Subscription persistence | `<cache>/subscriptions.json` schema-versioned, atomic, cross-process-locked | §14.1; `subscription.rs` |
 | 14 | Autonomous sync fail-closed | chain-watch + gap-fill + read-path pin never serve/pull against an unconfirmable root | §14.2–14.4; `chainwatch.rs`, `lib.rs` |
 | 15 | FFI C-ABI | `dig_runtime_start`/`dig_runtime_start_wallet` (wallet-only vs full) + `dig_rpc`/`dig_wallet_rpc`/`dig_free` + read-crypto `dig_read_verify_decrypt`/`dig_bytes_free` (`DIG_READ_*` codes) signatures + ownership/threading | §15, §15.1; `dig-runtime/src/lib.rs` |
-| 16 | Wallet signs nothing locally | every key/sign method is forwarded to the user's Sage wallet; no local signer, no session, no broadcast gate to withhold | §16.2, §18.20; `dig-wallet/src/lib.rs` |
+| 16 | No user key is ever held or signed with | every dapp key/sign method is forwarded to the user's Sage wallet; the node's OWN operating wallet (§16.4) signs only under the §23 audit contract (tips §18.23, mirror coins §25), through module-scoped signers no RPC surface can reach | §16.2, §18.20, §23, §25 |
 
 ---
 
@@ -4581,7 +4581,7 @@ does not custody. `control.wallet.watch` registers G1 public keys, `control.wall
 them, and `control.wallet.watched` lists what is currently registered. All three are MUTATIONS and
 therefore require authorization; none is an open read.
 
-This exists because the correct install has no seed on the node at all: under §908 the user's account
+This exists because the correct install has no USER seed on the node at all (the node's own operator seed, §16.4, is machine custody, not the user's account): under §908 the user's account
 lives in dig-app, so custody contributes zero puzzle hashes, §18.6a refuses a catch-up over the empty set,
 and the replica's peak never advances. Registration is the only way such a node can watch its user's
 coins.
@@ -7556,7 +7556,7 @@ legal choice and any conversion to whole percent would erase it.
 ### 24.5. The funding advice — how much to hold, and the states
 
 **Collateral is RECLAIMED, not spent.** Each pass creates the coins for `(store, root, epoch n)` and
-reclaims epoch `n-1`; reclaims run FIRST and are never gated on funds, so returned collateral funds
+reclaims epoch `n-1`; reclaims run FIRST and are never gated on funds (§25.4), so returned collateral funds
 the creates behind it. **The steady state is roughly ONE epoch's lock, not one per epoch.** A
 recommendation of "requirement x epochs of runway" overstates by the epoch count and tells an
 operator to hold many times what they need.
@@ -7898,3 +7898,339 @@ at once.
 default rather than as "keep nothing", which would discard the epoch currently in force. **Epoch 1
 MUST NOT be pruned under any policy**: it is the base case every verification walk terminates at, so
 a node that discarded it could no longer check anything a peer offered it.
+
+---
+
+## 25. Mirror-coin lifecycle — presence on disk made true on chain, signed by the node (dig-node#377)
+
+The node advertises each `(store, root)` it serves by locking $DIG in a mirror coin, one coin per
+`(store, root, epoch)`, and it signs those spends ITSELF, without per-spend approval. This section is
+the contract for that lifecycle: the invariant it maintains, the exact boundary of the signing
+authority, the reconcile pass, and how the authority is revoked. §23 is the accountability contract
+every spend here is subject to; §24 is where the amount comes from. Spend construction is owned by
+`dig-mirror-coin` — nothing in this repo assembles a mirror spend, a CAT wrapper, or a memo layout
+itself (SYSTEM.md §4.1).
+
+> **IMPLEMENTATION STATUS — read this before relying on any clause in §25.** This section is
+> normative in full and is written in the present indicative throughout. At this head **only the
+> deciding half exists; nothing runs it.** Satisfied by code today, and *only* this:
+>
+> * §25.2's structural bounds on the signing authority — `MirrorSpends` and its two producers
+>   (`mirror/spends.rs`); and in `mirror/signer.rs`, the fee ceiling, the refusal of spends belonging
+>   to another wallet, and the one-record-per-signature audit entry whose intent is derived from the
+>   spends. All four read the artifact rather than a value passed beside it.
+> * §25.3's pricing rule and §25.4's step-3 planner, as **pure functions** over supplied
+>   observations (`mirror/plan.rs`, `mirror/pass.rs`), including §25.7's switch semantics and
+>   §25.9's decision directions.
+> * §25.5's stability rule, as a **pure tracker** (`mirror/presence.rs`), and §25.7's persisted
+>   `collateral.json` switch.
+>
+> **Everything else in §25 is PENDING**, tracked as
+> <https://github.com/DIG-Network/dig-node/issues/412>. That includes every clause under which the
+> node *observes* disk or chain, *scans*, *schedules*, *spends*, *broadcasts*, *records an outcome*,
+> or *reports a state*: no pass is constructed and none is scheduled, and no caller anywhere reaches
+> `MirrorSigner::new`, `build_create`, `build_reclaim` or `dig_mirror_coin::list`.
+>
+> **A clause not named in the list above MUST be read as pending, whatever its grammatical voice.**
+> The default is deliberately pending rather than satisfied: a per-clause list of what is missing has
+> to be complete to be safe, and this one only has to be complete about what is *present*.
+
+### 25.1. The invariant
+
+> **PENDING — the invariant is stated, and nothing maintains it at this head.** Neither side is
+> observed: the disk side (`cache_list_cached()` filtered to `Held`) is not read by this module, and
+> the chain side is not read at all — `dig_mirror_coin::list` appears nowhere in this repo. So a
+> reader MUST NOT infer that a coin's existence tracks a `.dig`'s presence today; the biconditional
+> below is the obligation <https://github.com/DIG-Network/dig-node/issues/412> discharges.
+>
+> **The `Relayed`-is-never-advertised rule is PENDING too, and it is the load-bearing one.** It is
+> prose at this head, not code: the planner takes a bond set it is GIVEN and carries no provenance
+> field, so nothing filters `Relayed` out — the exclusion lives only in a doc comment
+> (`mirror/plan.rs:24`) and in the sentence below. This is the single point at which another party
+> could influence what this node spends its own money on, since a `Relayed` capsule arrives on
+> somebody else's behalf. The observation step #412 builds MUST filter to `Held` provenance at the
+> source, and MUST NOT rely on a caller passing an already-filtered set.
+
+> **A mirror coin owned by this node for the CURRENT epoch exists ⟺ the `.dig` for that
+> `(store, root)` is on disk with `Held` provenance.**
+
+Both directions are normative, and they fail in different directions:
+
+* **`.dig` held → coin MUST exist.** Without it the node serves content it is undiscoverable and
+  unrewarded for. A missed create costs opportunity only — money stays in the wallet.
+* **`.dig` gone → coin MUST be reclaimed.** A live coin advertising content this node cannot serve is
+  the PENALISED state, so reclaim is loss avoidance, not cleanup, and the reclaim path is held to a
+  higher standard of reliability than the create path.
+
+The disk side of the invariant is `Node::cache_list_cached()` filtered to
+`CapsuleProvenance::Held`. `Relayed` capsules are servable but NEVER advertised (dig-node#276);
+collateralising one would stake $DIG on a claim the node deliberately does not make. A capsule that
+has not landed and verified is not in the inventory at all, so "never advertise a store you cannot
+serve" holds structurally rather than by a sync-state check.
+
+The chain side is `dig_mirror_coin::list`, keyed on the owner puzzle hash, with ownership read from
+each coin's lineage proof. **No local bookkeeping is ever a source of truth for what is bonded** —
+the legacy's authoritative local `.json` stranded collateral when it was lost, and this design makes
+that unrepresentable: the reconcile's only inputs are the disk and the chain.
+
+### 25.2. The signing authority — what §908 still forbids, and what this section permits
+
+**Unchanged, and this section does not weaken any of it:** the node holds no user seed and no user
+spend key (§16.3, §18.20, §18.24); no dapp/RPC/control surface can obtain a signature over
+caller-supplied spends from the node's keys; `control.wallet.broadcast` remains a relay for bundles
+somebody else signed and carries no signing parameter (§4-method table).
+
+**What this section permits:** the node signs mirror-coin CREATE and RECLAIM spends, automatically,
+with the keys of its OWN operating wallet — the §16.4 autoseed identity, which is machine custody,
+not user custody. The user funds that wallet (the dig-app deposit flow); money deposited there is
+money placed under this section's standing authority.
+
+The authority is bounded four ways, and every bound is stated so a reader can check it:
+
+1. **By reachable spend shape.** `MirrorSpends` is a newtype with no public constructor, no
+   `Default`, and no conversion from `Vec<CoinSpend>`. Its only producers are `build_create` and
+   `build_reclaim`, thin wrappers over `dig_mirror_coin::create` / `::reclaim` that add no
+   conditions, alter no amount and change no destination. The signer's ONLY public entry point is
+   `sign(&MirrorSpends, &SpendJournal) -> Result<(SpendBundle, RecordedSpend), SignError>`, and it
+   MUST refuse spends whose owner puzzle hash is not its own wallet's — the builders take a
+   `synthetic_key` while the signer signs with its own, and nothing else relates the two.
+   There is no method on this path that accepts an arbitrary
+   `CoinSpend`, so widening the authority requires adding a producer — a visible, reviewable edit to
+   the one file whose purpose is to say what may be signed.
+2. **By destination, structurally.** A create's collateral lands at the $DIG CAT construction around
+   `dig_mirror_coin::mirror_coin_puzzle_hash()`, with change returned to the node's own puzzle hash;
+   a reclaim recreates the FULL locked amount at the owner's own puzzle hash and is refused
+   (`NotOwner`) for any coin the node does not own. Both properties are enforced inside
+   `dig-mirror-coin`, not re-checked here. There is no supply-reducing path.
+3. **By amount** (§25.3): per coin, exactly the margined per-epoch requirement; per pass, at most
+   that amount times the number of held `(store, root)` pairs, plus fees.
+4. **By fee source and size.** Fees are paid from XCH coins only — the crate's builders take
+   separate fee inputs, so a fee can never shave collateral. `fee_mojos` per spend MUST come from a
+   named constant, MUST be recorded in the audit entry, and MUST NOT exceed
+   `MIRROR_SPEND_FEE_CEILING_MOJOS` = 1_000_000_000 (0.001 XCH). The ceiling MUST be enforced
+   against the fee the spends THEMSELVES pay — `MirrorSpends::fee_mojos()`, recorded by the builder
+   that baked it into the bundle — and MUST NOT be a separate argument to `sign`. A fee passed
+   alongside the artifact bounds a caller's claim about the bundle rather than the bundle, which
+   would make this the one of these four bounds that any caller could step around by passing a
+   different number. The shipped default fee is 0; a
+   zero-fee reclaim is explicitly supported by `dig_mirror_coin::reclaim`.
+
+**The signer instance is module-private.** It is constructed at bring-up from the operator seed —
+only when the seed opens under the device key (§16.4 `BootstrapState::Opened`/`Created`); a `Locked`
+or `Orphaned` wallet yields no signer and the lifecycle reports itself unavailable rather than
+degrading. The instance is NEVER installed on the general `WalletBackend`, is not reachable from any
+RPC, control, or dapp method, and does not change `current_signer()`'s answer for any other surface.
+Mirror spends do not transit `control.wallet.broadcast`, and `DIG_WALLET_ENABLE_LIVE_BROADCAST`
+does not govern them: that flag gates the GENERAL node-custodied wallet surface, while this
+lifecycle is governed by §25.7's switch and §23's audit contract.
+
+**Key derivation MUST be the standard Chia HD derivation** from the operator mnemonic, so the phrase
+exported by `dign wallet export-seed` (§16.3) recovers the collateral wallet — including anything
+locked in unreclaimed mirror coins, via any standard wallet — with no dig-node code involved. The
+owner key is the first derived key; its standard puzzle hash is the wallet's receive address, the
+`owner_puzzle_hash` term of every hint this node creates, the address reclaims return to, and the
+address create-change returns to. Deposits, bonds and reclaims therefore all move through ONE
+address the wallet already tracks.
+
+> **PARTIALLY PENDING.** The two structural halves of this subsection ARE satisfied by code: the
+> spend-shape bound (`MirrorSpends`), the fee bound (now read from the artifact, below), and the
+> `&RecordedSpend` precondition. The sentence above — that the signer instance is *constructed at
+> bring-up* from the operator seed — is NOT: `MirrorSigner::new` has no caller at this head, so no
+> signer is constructed anywhere and the `Locked`/`Orphaned` reporting it describes does not exist.
+> Nor is the audit-EXECUTION paragraph below satisfied: no entry is ever written for a mirror spend,
+> no confirmation is observed, and nothing reconciles an `unresolved` or `failed` one. Both are
+> tracked as <https://github.com/DIG-Network/dig-node/issues/412>.
+
+**Every spend is audited, structurally — exactly ONE entry per signature, and it cannot lie about
+the spend.** The signer takes the `SpendJournal` (§23.3) and opens the record itself, returning the
+`RecordedSpend` for the caller to resolve: recording is the shape of the call. Two properties MUST
+hold and are held here by construction rather than by convention. **One record MUST NOT be able to
+back more than one signature** — an already-opened record passed by shared borrow can be reused in a
+loop, accounting for N unattended spends as one. And **the intent MUST be DERIVED from the spends**,
+never supplied alongside them: an intent a caller states can name a different amount, store or fee
+than the bundle moves, and a record that is confidently wrong is worse than no record, because
+§908's carve-out is bought precisely with the account being true. Entries carry
+`kind: "mirror-coin"` (`spend_audit::kinds::MIRROR_COIN`),
+`authority: { principal: "node", grant: "mirror-collateral" }`, the asset (`dig` for creates and
+reclaims), the amount in DIG base units, the fee in XCH mojos, and `store_id`; `purpose` SHOULD name
+the root and epoch. Confirmation is by observing the CREATED coin, never the funding coin (§23.2).
+A pass that ends without an outcome leaves `unresolved`, and a `failed` entry at `broadcast` or
+`confirmation` stage is reconciled against the chain, never treated as "the money stayed put" —
+a mirror spend that landed unrecorded is collateral locked with the node believing it is not.
+
+### 25.3. The amount is DERIVED per epoch, never a constant
+
+The collateral per coin is `apply_safety_margin(required_per_store, margin_bp)` for the CURRENT
+epoch, obtained through §24's requirement machinery (the censused epoch record) and the §24.4
+margin. It MUST NOT be a compile-time constant, MUST NOT restate the model's arithmetic
+(`required_per_store` is the whole answer; the formula as usually written omits the floor clamp),
+and MUST NOT be read from a stale epoch. All lifecycle amounts are **DIG base units**
+(`1 DIG = 1_000`); field and parameter names MUST say so — a mirror amount is never "mojos".
+
+When the requirement is not `Known` (§24.2 — `not_censused`, `behind_finality_depth`,
+`record_unreadable`, `no_chain_source`), **creates are DEFERRED** for that pass and reported with
+the requirement's own reason. **Reclaims are unaffected**: a reclaim's amount is read from the coin
+being reclaimed (`MirrorCoin::collateral()`), so recovering money never waits on a census. A coin
+locked under a previous epoch's amount is reclaimed at that amount — reclaim returns what was
+locked, exactly.
+
+### 25.4. The reconcile pass — two observations, a pure plan, reclaims first
+
+> **PARTIALLY PENDING — step 3 only is implemented.** The pure planner *is* satisfied by code
+> (`mirror/plan.rs`, `mirror/pass.rs`): given the two observations, the epoch, the requirement, the
+> balance and the switch, it produces exactly the table below. **Nothing supplies it and nothing acts
+> on its answer.** The observations (steps 1–2), the execution order (step 4), the funds-limited
+> create loop (step 5), the audit-ledger in-flight suppression (step 6), the confirmation record, and
+> the three triggers above — start-up, the `MIRROR_ROUND_LENGTH_MS` tick, and the debounced presence
+> change — are NOT implemented at this head. Tracked as
+> <https://github.com/DIG-Network/dig-node/issues/412>. Until it lands, a reader MUST NOT rely on any
+> pass running at all.
+
+A pass runs: at start-up (once the wallet and a chain source are available), on every round tick
+(`dig_constants::MIRROR_ROUND_LENGTH_MS`), and after a debounced presence change (§25.5). Each pass:
+
+1. **Observes disk**: the `Held` capsule set (§25.1) — the desired bonds for the current epoch.
+2. **Observes chain**: `dig_mirror_coin::list(source, owner_puzzle_hash)` — the coins actually owned.
+3. **Plans**, purely (no I/O, no clock — the epoch is a parameter):
+
+   | owned coin | its `.dig` held | action |
+   |---|---|---|
+   | `epoch == current` | yes | keep |
+   | `epoch == current` | no | **reclaim** (`NoLongerHeld` — the penalised state; the priority) |
+   | `epoch <  current` | either | **reclaim** (`EpochEnded` — the automatic form of the operation the legacy left to an operator; dig-node has no operator) |
+   | `epoch >  current` | either | **keep** |
+
+   The last row is a decision, not a gap: the epoch clock is wall-clock with no chain input
+   (§24.3), so a slow local clock reads a legitimately-created next-epoch coin as "future", and
+   reclaiming on that reading would destroy a valid bond on the strength of this machine's clock.
+   Keeping is the recoverable direction; the coin becomes ordinary at the next tick. Duplicate
+   coins for one `(store, root, epoch)` are ALL kept while the bond is held — choosing which valid
+   bond to destroy is information the planner does not have — and both are reclaimed as
+   `EpochEnded` after rollover.
+
+4. **Executes reclaims FIRST, then creates.** Reclaims are NEVER gated on funds: they return
+   collateral, which may fund the creates behind them, and a reclaim withheld for lack of funds is
+   the legacy defect where a wallet at zero could neither advertise nor recover what it had locked.
+   When no XCH is selectable, reclaims are attempted with `fee = 0`; zero-fee mempool admission is
+   not guaranteed under fee pressure, so an unadmitted zero-fee reclaim is retried on subsequent
+   passes rather than escalated. This is why epoch rollover is a re-create, not a top-up: pass
+   order makes epoch n−1's returned collateral available to epoch n's creates.
+5. **Creates in deterministic order** (sorted by `(store_id, root)`), stopping CLEANLY at the first
+   unaffordable one: no partial spend, no retry loop, no half-written audit entry. The shortfall —
+   which `(store, root)` pairs are uncollateralised and how many DIG base units short — is exposed
+   on §25.8's surface. $DIG and XCH shortfalls are distinguished: $DIG missing blocks creates; XCH
+   missing blocks fees, which degrades reclaims to `fee = 0` and blocks creates only if a non-zero
+   create fee is configured. An underfunded pass MUST NOT stall, retry-loop, or block any other
+   node work — the next pass re-derives everything, so added funds are picked up without restarting
+   any epoch's work.
+6. **Suppresses in-flight duplicates.** At most one in-flight create per `(store, root, epoch)`:
+   a bond whose current-epoch create has a `pending` or `submitted` audit entry is excluded from
+   the plan's create set until that entry resolves. The audit record is the in-flight ledger; the
+   disk and the chain remain the only steady-state truths.
+
+A confirmed create is `Confirmed { height, coin_id }` in the audit record, observed on the created
+coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile accounts for it.
+
+### 25.5. Presence and debounce
+
+> **PARTIALLY PENDING — the debounce rule is implemented; the scanning is not.** The
+> stability-across-a-window rule, in both directions, is satisfied by the pure tracker in
+> `mirror/presence.rs` and its `SETTLING_WINDOW_MS`. **Nothing feeds it**: there is no periodic
+> scan, no start-up scan, no watcher, and no caller of the tracker at this head — so the scanning
+> cadence described below, the un-debounced start-up exemption, and the claim that the periodic pass
+> is the correctness mechanism are all pending, tracked as
+> <https://github.com/DIG-Network/dig-node/issues/412>.
+
+Presence changes are detected by SCANNING, with an optional watcher as an accelerator — never the
+reverse. A watcher event is exactly what a crash, an unmounted volume, or an uncovered path loses;
+the periodic pass (§25.4) is the correctness mechanism.
+
+The debounce is **presence-stable-for-a-window**, not a timer after an event: a bond must be
+observed in the SAME state across `SETTLING_WINDOW_MS` (default 30_000) before that state is acted
+on, in BOTH directions. An event-reset timer never settles under repeated rewrites and cannot see
+changes that produced no event. A capsule that appears and vanishes inside the window was never
+stable and triggers neither a create nor a reclaim — this is the churn control that prevents a
+flapping file from costing two fees per flap, and it is why an atomic replace (delete-then-create
+to a watcher) does not produce a spurious round trip.
+
+Two exemptions: the START-UP scan is un-debounced — a scan at start-up IS the settled state; and
+the node's own capsule writes are structurally invisible mid-write, because a capsule stages under
+the downloads directory and is renamed into the inventory only after verification, so the scan
+cannot observe a half-written file the node produced itself.
+
+### 25.6. The DHT pointer, and epoch rollover
+
+> **PENDING — not yet implemented.** This subsection is normative and is NOT satisfied by
+> code as of this section's introduction. Tracked as dig-node#377 step 7 (the dig-dht 0.12.1 → 0.15 bump and the
+> announce-seam attach). Until it lands, a reader MUST NOT
+> rely on the behaviour described here.
+
+After a create confirms, the node attaches the coin id to its DHT provider record
+(`dig_dht::ProviderRecord::unverified_mirror_coin_id`) for that content, and it MUST re-announce on
+epoch rollover once the new epoch's coin confirms — dig-dht has no clock and republish re-attaches
+whatever was recorded at announce time, so an un-refreshed pointer goes stale one epoch after
+publication and a correctly-collateralised node reads as uncollateralised.
+
+The pointer is an UNTRUSTED convenience (NC-12): it tells a verifier where to look, never what the
+coin is. Its absence MUST NOT degrade discovery or be treated as a fault. A verifier — this node
+when it checks others, and others when they check this node — accepts a coin as bonding
+`(store, root, epoch)` only on the coin's own evidence: it sits at the mirror-coin puzzle hash, is
+genuinely $DIG with the asset id re-derived from the creating spend, carries the declared
+collateral, and `MirrorCoin::advertises(store, root, epoch)` passes — an exact equality on the
+declared tuple plus a recomputed hint, which is what defeats the constructible additive-morph
+collision (the epoch term is freely chosen, so hint equality alone proves nothing).
+
+### 25.7. Consent, the switch, and revocation
+
+> **PARTIALLY PENDING.** The switch itself is real — it persists in `collateral.json`, defaults on,
+> and the planner honours it by forcing the desired bond set empty so every live coin falls into the
+> reclaim set. What does NOT exist at this head is the pass that acts on that plan, so **turning
+> collateralisation off today reclaims nothing, because nothing is ever created either.** The
+> revocation bullet below describes the behaviour once
+> <https://github.com/DIG-Network/dig-node/issues/412> lands; it is decided, not performed.
+
+There is deliberately no per-spend approval; the standing authority is the consent model, and it is
+honest the same way auto-tipping (§18.23) is: **disclosed, default-on, bounded, fully audited, and
+one setting to turn off** (§6.0/#207).
+
+* **What the user accepts, and when:** running dig-node with collateralisation enabled (the
+  default) and funding its operating wallet. The grant is named — every audit entry carries
+  `grant: "mirror-collateral"` — and the account of every exercise of it is `dign spends` and the
+  dig-app Activity tab.
+* **The switch** is a persisted node setting (`collateral.json`, beside §24.4's margin; the node is
+  the authoritative home §24.4). It gates CREATES ONLY. **Reclaims run regardless of the switch** —
+  a disable that stopped reclaims would strand locked funds, which inverts the point of revoking.
+* **Revocation reclaims what is locked, with no new machinery:** OFF forces the desired bond set
+  empty, so the next pass reclaims every live coin this wallet owns (current epoch as
+  `NoLongerHeld`, prior epochs as `EpochEnded`) and the collateral returns to the wallet balance.
+  Per-store revocation is deleting/unpinning the `.dig`; the invariant does the rest.
+* Disabling collateralisation does not touch the wallet, the audit record, or any other surface.
+
+### 25.8. The per-store state surface
+
+> **PENDING — not yet implemented.** This subsection is normative and is NOT satisfied by
+> code as of this section's introduction. Tracked as dig-node#377 step 6 (the `dig-node-control-interface` 0.25.0
+> method declaration, release-first, then the node serving it and the `dign` verb). Until it lands, a reader MUST NOT
+> rely on the behaviour described here.
+
+The lifecycle exposes, per `(store, root)`, over the control plane and with a `dign` verb (§8.6
+CLI parity): the bond state — `bonded { coin_id, epoch, amount }`, `pending` (in-flight create),
+`unfunded { short_dig_base_units }`, `deferred { requirement reason }` (§25.3), `withheld`
+(`Relayed` provenance — deliberately not advertised), or `reclaiming` — so a client can distinguish
+"out of funds" from "withheld on purpose" without guessing from the store list. Conflating those
+two produces hourly alarms about a healthy node (dig-app#300). The method is declared in
+`dig-node-control-interface` (release-first) before the node serves it.
+
+### 25.9. Failure directions, stated
+
+* A missed CREATE fails safe: money stays in the wallet, the node is undiscoverable for that root,
+  and §25.8 says so.
+* A missed RECLAIM fails expensive (the penalty) — which is why reclaims run first, why the
+  start-up scan is the reliable path, and why `.dig`-gone is the highest-priority row of the plan.
+* A slow clock KEEPS foreign-epoch coins (never destroys a valid bond); a fast clock creates the
+  next epoch's coin early and reclaims the old one on the same pass — the same funds movement as
+  an ordinary rollover.
+* An unknown requirement defers creates and never defers reclaims.
+* A crash at any point loses at most watcher events; the next pass re-derives the plan from disk
+  and chain, and §23.5's reconcile plus in-flight suppression prevent both double-creates and
+  silent losses.

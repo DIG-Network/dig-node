@@ -73,6 +73,11 @@ pub mod logging;
 /// `127.0.0.1` from the rest of the machine. See [`loopback`].
 pub mod loopback;
 pub mod meta;
+/// The mirror-coin lifecycle (dig-node#377, `SPEC.md` §25): presence of a `.dig` on disk drives
+/// creation of an on-chain mirror coin locking the epoch's required $DIG for that
+/// `(store, root, epoch)`, and its disappearance drives reclaim of the collateral. The node signs
+/// those spends itself with its own operator wallet, scoped by construction. See [`mirror`].
+pub mod mirror;
 /// `dig-node open <chia://… | urn:dig:chia:…>` (#389): the OS scheme-handler target the
 /// installer registers for `chia://` + `urn:dig:chia:`. Strictly validates the untrusted
 /// handler argument, then opens the user's default browser at the resolving URL. See [`open`].

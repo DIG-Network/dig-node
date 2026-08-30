@@ -74,10 +74,29 @@ pub struct CollateralConfig {
     /// inventing a decision the operator never made.
     #[serde(default)]
     pub retention_epochs: Option<u64>,
+
+    /// Whether the mirror-coin lifecycle may CREATE bonds (`SPEC.md` §25.7).
+    ///
+    /// **It gates creates only. Reclaims run regardless**, which is why turning this off releases
+    /// locked collateral instead of freezing it: OFF forces the desired bond set empty, and the
+    /// ordinary pass then reclaims every live coin. A switch that stopped reclaims would strand the
+    /// user's $DIG behind their own decision to stop, which inverts the meaning of revoking.
+    ///
+    /// Default-on, and `default` rather than required, for the same reason the two fields above
+    /// are: a config written before this field existed expressed no preference, and a node that
+    /// silently stopped collateralising on upgrade would go undiscoverable without saying so. The
+    /// consent model that makes default-on honest is §25.7's — disclosed, bounded, fully audited,
+    /// one setting to turn off.
+    #[serde(default = "default_mirror_enabled")]
+    pub mirror_enabled: bool,
 }
 
 fn default_margin_bp() -> u64 {
     SAFETY_MARGIN_BP_DEFAULT
+}
+
+fn default_mirror_enabled() -> bool {
+    true
 }
 
 impl Default for CollateralConfig {
@@ -87,6 +106,7 @@ impl Default for CollateralConfig {
             // Keep everything. See the field's own documentation for why this is not a tuning
             // choice.
             retention_epochs: None,
+            mirror_enabled: default_mirror_enabled(),
         }
     }
 }
@@ -1575,6 +1595,36 @@ mod tests {
         }
     }
 
+    /// A config written before `mirror_enabled` existed still collateralises.
+    ///
+    /// The fixture is an EMPTY object rather than one naming the field, because that is what an
+    /// upgraded node actually has on disk, and it is the only input that can tell `#[serde(default)]`
+    /// (which would read `false`) from `default = "default_mirror_enabled"` (which reads `true`).
+    /// The false reading is silent: the node stops advertising every store it serves and reports no
+    /// error, because declining to collateralise is a legitimate state.
+    ///
+    /// The second half is the control — an explicit `false` must still be honoured, or the field is
+    /// not a switch at all.
+    #[test]
+    fn a_config_predating_the_switch_still_collateralises_and_an_explicit_off_is_honoured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(COLLATERAL_CONFIG_FILE), b"{}").expect("write");
+        assert!(
+            CollateralConfig::load_from(dir.path()).mirror_enabled,
+            "an upgraded node must not silently stop advertising what it serves"
+        );
+
+        std::fs::write(
+            dir.path().join(COLLATERAL_CONFIG_FILE),
+            br#"{"mirror_enabled":false}"#,
+        )
+        .expect("write");
+        assert!(
+            !CollateralConfig::load_from(dir.path()).mirror_enabled,
+            "and an operator who turned it off stays turned off across a restart"
+        );
+    }
+
     #[test]
     fn a_config_that_expresses_no_retention_keeps_everything() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1587,8 +1637,9 @@ mod tests {
         // Zero is not a retention of nothing. Honouring it would delete the epoch in force.
         assert_eq!(
             CollateralConfig {
+                retention_epochs: Some(0),
                 margin_bp: 0,
-                retention_epochs: Some(0)
+                ..CollateralConfig::default()
             }
             .retention(),
             RetentionPolicy::KeepEverything
@@ -1720,7 +1771,7 @@ mod tests {
         // pass if the fixture used the default.
         CollateralConfig {
             margin_bp: 250,
-            retention_epochs: None,
+            ..CollateralConfig::default()
         }
         .save_to(dir.path())
         .expect("save");

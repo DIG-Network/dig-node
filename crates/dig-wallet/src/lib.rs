@@ -72,6 +72,11 @@ pub mod seed_export;
 // under a machine-held device key. Every failure arm is fail-closed and writes nothing.
 pub mod autoseed;
 
+/// Bring-up for the node's OWN operating wallet (`SPEC.md` §16.4) — the one wallet this process may
+/// sign with, derived on the standard Chia HD path so the exported phrase recovers it anywhere. It is
+/// never installed on the general [`sage`] backend. See [`operator_wallet`].
+pub mod operator_wallet;
+
 /// One wallet request awaiting Sage. `wc_dispatch` cannot reach the relay itself (the
 /// live WalletConnect requester SignClient lives
 /// in the wallet UI page, the one tab that stays open), so it parks the call here and
