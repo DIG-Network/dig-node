@@ -122,8 +122,7 @@ pub trait MirrorEffects {
     /// The amount is a parameter because it is derived ONCE per pass from the epoch's requirement
     /// (§25.3) and must be identical for every create in that pass. An implementation that re-derived
     /// it per call could price two coins of one pass differently.
-    fn create(&self, bond: &Bond, epoch: i64, amount_dig_base_units: u64)
-        -> Result<(), PassError>;
+    fn create(&self, bond: &Bond, epoch: i64, amount_dig_base_units: u64) -> Result<(), PassError>;
 }
 
 /// What a pass consults that this module does not observe for itself.
@@ -475,7 +474,9 @@ mod tests {
         }
 
         fn reclaim(&self, mirror: &HeldMirror, _reason: ReclaimReason) -> Result<(), PassError> {
-            self.calls.borrow_mut().push(Effect::Reclaim(mirror.clone()));
+            self.calls
+                .borrow_mut()
+                .push(Effect::Reclaim(mirror.clone()));
             if self.reclaim_fails.contains(&mirror.coin_id) {
                 return Err(PassError::Wallet("no fee coin".to_string()));
             }
@@ -488,9 +489,11 @@ mod tests {
             epoch: i64,
             amount_dig_base_units: u64,
         ) -> Result<(), PassError> {
-            self.calls
-                .borrow_mut()
-                .push(Effect::Create(bond.clone(), epoch, amount_dig_base_units));
+            self.calls.borrow_mut().push(Effect::Create(
+                bond.clone(),
+                epoch,
+                amount_dig_base_units,
+            ));
             if self.create_fails.contains(bond) {
                 return Err(PassError::Wallet("no selectable coin".to_string()));
             }

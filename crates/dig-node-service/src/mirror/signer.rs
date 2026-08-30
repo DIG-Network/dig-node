@@ -375,11 +375,13 @@ abandon abandon abandon art";
         let (journal, log) = journal(dir.path());
         let signer = signer();
 
-        let unsignable =
-            super::super::spends::unsignable_for_tests(signer.owner_puzzle_hash());
+        let unsignable = super::super::spends::unsignable_for_tests(signer.owner_puzzle_hash());
 
         assert!(
-            matches!(signer.sign(&unsignable, &journal), Err(SignError::Signing(_))),
+            matches!(
+                signer.sign(&unsignable, &journal),
+                Err(SignError::Signing(_))
+            ),
             "the fixture must actually fail to sign, or this test proves nothing"
         );
 
