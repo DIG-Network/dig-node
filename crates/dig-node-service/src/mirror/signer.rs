@@ -58,7 +58,7 @@
 use chia_protocol::{Bytes32, SpendBundle};
 use dig_wallet::operator_wallet::OperatorWallet;
 
-use crate::spend_audit::{RecordedSpend, SpendJournal};
+use crate::spend_audit::{FailureStage, RecordedSpend, SpendJournal};
 
 use super::spends::MirrorSpends;
 
@@ -173,11 +173,22 @@ impl MirrorSigner {
         let recorded = journal.begin(spends.intent());
 
         let coin_spends = spends.coin_spends().to_vec();
-        let signature = self
-            .wallet
-            .signer()
-            .sign(&coin_spends)
-            .map_err(|e| SignError::Signing(e.to_string()))?;
+        let signature = match self.wallet.signer().sign(&coin_spends) {
+            Ok(signature) => signature,
+            Err(e) => {
+                // Resolve the record BEFORE returning. A bare `?` here drops `recorded` inside this
+                // frame, and `Drop` writes `Unresolved` -- which this crate defines as "the node
+                // signed and does not know what became of it". No signature exists, so that entry
+                // would claim money may have moved when nothing left the wallet, and §23.5's
+                // reconcile would chase a chain reference that can never exist.
+                //
+                // `Failed { stage: Signing }` is the truthful status: `money_may_have_moved()` is
+                // false for it and only for it, which is the whole reason the stage is on the entry.
+                let cause = e.to_string();
+                journal.failed(&recorded, FailureStage::Signing, cause.clone());
+                return Err(SignError::Signing(cause));
+            }
+        };
 
         Ok((SpendBundle::new(coin_spends, signature), recorded))
     }

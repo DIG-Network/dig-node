@@ -86,23 +86,46 @@ pub enum BondState {
         /// cannot invent a reason of its own.
         reason: CollateralUnknownReason,
     },
-    /// Collateralisation is switched off. The node holds the capsule and is deliberately not
-    /// advertising it; any coin it already had is being reclaimed.
+    /// Collateralisation is switched off NODE-WIDE (§25.7). The node holds the capsule and is
+    /// deliberately not advertising it; any coin it already had is being reclaimed.
     ///
-    /// NOTE for step 6, which serves `SPEC.md` §25.8 over the control plane: that subsection is
-    /// still marked PENDING and its vocabulary does not yet line up with this enum. §25.8 gives
-    /// `withheld` a NARROWER meaning (`Relayed` provenance — a capsule this node holds but does not
-    /// claim to serve) and lists a `reclaiming` state this enum has no variant for. Serving these
-    /// variants under those names without reconciling them would publish a contract whose words mean
-    /// something else. Reconcile at the interface, not by quietly renaming here.
+    /// Distinct from [`Self::Withheld`] in SCOPE — one switch for the whole node, not one capsule's
+    /// provenance — and decisively in REMEDY: an operator told "withheld" about a disabled node goes
+    /// looking at content when they should be looking for a switch.
+    Disabled,
+    /// This capsule is `Relayed` (§25.1): held on a stranger's behalf, served, and never advertised.
+    ///
+    /// Not a failure and not a shortfall. There is no remedy because nothing is wrong — which is
+    /// exactly why it must not be reported as `Unfunded`, the conflation dig-app#300 exists to fix.
+    ///
+    /// Reachable only from a producer that enumerates the SERVED set. A `Held`-keyed derivation
+    /// cannot emit it, because a `Relayed` capsule is by construction absent from the desired-bond
+    /// set — see [`bond_states`], which takes the served set for this reason.
     Withheld,
+    /// A reclaim for this bond is in flight. The money is STILL LOCKED until it confirms.
+    ///
+    /// Kept apart from [`Self::Disabled`] and [`Self::Withheld`] because those two describe a node
+    /// that is not spending, while this one describes money in motion — and from `Bonded`, which
+    /// would tell a person their collateral is advertising something when it is on its way back.
+    Reclaiming,
 }
 
 /// Everything a pass consults, gathered once so the decision can be taken without further I/O.
 #[derive(Debug, Clone)]
 pub struct PassInputs<'a> {
     /// The SETTLED `Held` bonds on disk (§25.5) — what this node is willing to advertise.
+    ///
+    /// `Held` provenance ONLY. §25.1's exclusion of `Relayed` capsules is enforced by the SPLIT
+    /// itself: a relayed capsule arrives in [`Self::relayed`] instead, so nothing on the create path
+    /// can reach one. That matters beyond tidiness — what this node bonds is what it spends its own
+    /// money on, and a stranger chooses what it relays.
     pub held: &'a [Bond],
+    /// The SETTLED `Relayed` bonds on disk (§25.1) — served, never advertised, never bonded.
+    ///
+    /// Present so the §25.8 surface can say `withheld` about them. Omitting them would leave the
+    /// surface answering "no such row" exactly where the contract promises "withheld on purpose",
+    /// which reads to a person as a missing capsule rather than a deliberate policy.
+    pub relayed: &'a [Bond],
     /// The mirror coins this wallet owns, from `dig_mirror_coin::list`.
     pub on_chain: &'a [HeldMirror],
     /// Bonds whose current-epoch create is submitted and unconfirmed (§25.4.6).
@@ -162,7 +185,7 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
         None => (Vec::new(), None),
     };
 
-    let states = bond_states(inputs, &affordable, split.as_ref(), per_coin);
+    let states = bond_states(inputs, &affordable, split.as_ref(), per_coin, &reclaim);
 
     PassDecision {
         reclaim,
@@ -182,23 +205,40 @@ fn bond_states(
     affordable: &[Bond],
     split: Option<&FundingSplit>,
     per_coin: Option<u64>,
+    reclaim: &[(HeldMirror, ReclaimReason)],
 ) -> Vec<(Bond, BondState)> {
     let mut states: Vec<(Bond, BondState)> = Vec::new();
 
+    // The served-but-never-advertised half first, so `Withheld` has a producer at all. Keyed on the
+    // RELAYED set rather than derived from the held one: a relayed capsule is absent from `held` by
+    // construction, so a held-keyed loop could never emit this variant however it was written.
+    for bond in inputs.relayed {
+        states.push((bond.clone(), BondState::Withheld));
+    }
+
     for bond in inputs.held {
-        // The chain first: a coin that exists outranks every reason a coin might not.
+        // A reclaim in flight outranks the coin it is reclaiming. Checked BEFORE the chain, because
+        // the coin is still there — that is what a reclaim is for — and reporting `Bonded` would
+        // tell a person their collateral is advertising this capsule while it is on its way back.
+        let reclaiming = reclaim
+            .iter()
+            .any(|(c, _)| c.store_id == bond.store_id && c.root == bond.root);
+
+        // Then the chain: a coin that exists outranks every reason a coin might not.
         let coin = inputs.on_chain.iter().find(|c| {
             c.epoch == inputs.current_epoch && c.store_id == bond.store_id && c.root == bond.root
         });
 
-        let state = if let Some(coin) = coin {
+        let state = if reclaiming {
+            BondState::Reclaiming
+        } else if let Some(coin) = coin {
             BondState::Bonded {
                 coin_id: coin.coin_id.clone(),
                 epoch: coin.epoch,
                 amount_dig_base_units: coin.collateral_dig_base_units,
             }
         } else if !inputs.creates_enabled {
-            BondState::Withheld
+            BondState::Disabled
         } else if inputs.in_flight.contains(bond) {
             BondState::Pending
         } else {
@@ -308,6 +348,7 @@ mod tests {
     ) -> PassInputs<'a> {
         PassInputs {
             held,
+            relayed: &[],
             on_chain,
             in_flight: &[],
             current_epoch: NOW_EPOCH,
@@ -455,18 +496,14 @@ mod tests {
 
         assert_eq!(
             state("aa", "11"),
-            BondState::Bonded {
-                coin_id: id("c1"),
-                epoch: NOW_EPOCH,
-                amount_dig_base_units: REQUIRED,
-            },
-            "a coin that is still on chain is still locking money, switch or no switch"
+            BondState::Reclaiming,
+            "the coin is still on chain and still locking money, switch or no switch -- and the              reclaim carrying it home is the more precise thing to say than `Bonded`"
         );
-        assert!(matches!(state("bb", "22"), BondState::Bonded { .. }));
+        assert_eq!(state("bb", "22"), BondState::Reclaiming);
         assert_eq!(
             state("cc", "33"),
-            BondState::Withheld,
-            "the bond with no coin is the one the switch actually withholds"
+            BondState::Disabled,
+            "the bond with no coin is the one the switch actually disables"
         );
     }
 
@@ -557,6 +594,62 @@ mod tests {
                 short_dig_base_units: REQUIRED
             }),
             "the third bond is the one that did not fit"
+        );
+    }
+    /// A `Relayed` capsule is never bonded, and is reported as `withheld` rather than omitted.
+    ///
+    /// Two things at once, and both matter. The create list must not contain it — this node does not
+    /// spend its own money advertising content a stranger chose, which is the one place in this
+    /// lifecycle an attacker has any influence over what the node buys. And the surface must still
+    /// SAY something about it: a capsule a person can see on disk, absent from the bond list, reads
+    /// as a bug or a missing capsule rather than as the deliberate policy it is.
+    ///
+    /// The fixture carries a held bond ALONGSIDE the relayed one, so an implementation that simply
+    /// dropped every relayed capsule on the floor is red here: it creates one coin (correct) and
+    /// reports one state (wrong).
+    #[test]
+    fn a_relayed_capsule_is_never_created_and_is_reported_withheld() {
+        let held = [bond("aa", "11")];
+        let relayed = [bond("zz", "99")];
+        let req = known();
+        let mut i = inputs(&held, &[], &req);
+        i.relayed = &relayed;
+
+        let d = decide(&i);
+
+        assert_eq!(
+            d.create,
+            vec![bond("aa", "11")],
+            "the relayed capsule buys no coin"
+        );
+        assert!(
+            d.states.contains(&(bond("zz", "99"), BondState::Withheld)),
+            "and it is still accounted for, as withheld on purpose: {:?}",
+            d.states
+        );
+        assert_eq!(d.states.len(), 2, "both capsules are reported");
+    }
+
+    /// A bond whose coin is being reclaimed reports `Reclaiming`, not `Bonded`.
+    ///
+    /// The coin is still on chain — that is what a reclaim is for — so a chain-first implementation
+    /// reports `Bonded` and tells a person their collateral is advertising a capsule whose money is
+    /// on its way back. The fixture is a PRIOR-epoch coin for a bond that is still held, which is the
+    /// ordinary rollover case rather than a contrived one.
+    #[test]
+    fn a_bond_whose_coin_is_being_reclaimed_reports_reclaiming() {
+        let held = [bond("aa", "11")];
+        let req = known();
+        let on_chain = [coin("old", "aa", "11", NOW_EPOCH - 1, REQUIRED)];
+        let i = inputs(&held, &on_chain, &req);
+
+        let d = decide(&i);
+
+        assert_eq!(d.reclaim.len(), 1, "last epoch's coin comes home");
+        assert_eq!(
+            d.states,
+            vec![(bond("aa", "11"), BondState::Reclaiming)],
+            "not `Bonded`: the money is locked but it is no longer advertising anything"
         );
     }
 }

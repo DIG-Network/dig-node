@@ -30,7 +30,7 @@ use clvm_utils::ToTreeHash;
 use dig_mirror_coin::{MirrorAdvertisement, MirrorCoin, MirrorError};
 use num_bigint::BigInt;
 
-use crate::spend_audit::{kinds, Asset, Authority, SpendIntent, SpendKind};
+use crate::spend_audit::{kinds, Asset, AuditedBond, Authority, SpendIntent, SpendKind};
 
 /// What a mirror spend is FOR. Carried alongside the spends so the audit entry and any log can name
 /// the operation without re-deriving it from the CLVM.
@@ -133,7 +133,30 @@ impl MirrorSpends {
             amount_mojos: self.collateral_dig_base_units,
             fee_mojos: self.fee_mojos,
             store_id: Some(hex::encode(self.store_launcher_id)),
+            // The other two thirds of the bond key, recorded structurally rather than left to be
+            // read back out of `purpose`. This is what lets a pass that has just restarted tell
+            // which `(store, root, epoch)` create is already in flight (SPEC.md 25.4.6) without
+            // remembering anything itself.
+            // The mirror epoch is a `BigInt` on the wire because the hint morph is arithmetic over
+            // 32-byte values. As a NUMBER it is a wall-clock round index and fits an i64 for the
+            // next few hundred million years. One that does not fit yields `None` rather than a
+            // truncated epoch: `None` suppresses nothing, whereas a wrong epoch would suppress the
+            // WRONG create, and a bond left uncollateralised is worse than one attempted twice.
+            bond: i64::try_from(self.epoch.clone())
+                .ok()
+                .map(|epoch| AuditedBond {
+                    root: hex::encode(self.root_hash),
+                    epoch,
+                }),
         }
+    }
+
+    /// The bond these spends are for, as the planner spells it.
+    pub(crate) fn bond(&self) -> super::plan::Bond {
+        super::plan::Bond::new(
+            hex::encode(self.store_launcher_id),
+            hex::encode(self.root_hash),
+        )
     }
 }
 
