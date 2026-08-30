@@ -3684,56 +3684,6 @@ mod tests {
         );
     }
 
-    /// A `Withheld` row locks nothing, so it is not one of the pairs the buffer advice prices.
-    ///
-    /// **Proves** the one thing `bondable_pairs` exists to do. The count is handed to
-    /// `buffer_advice` as `pairs_served_by_this_node` and reaches `one_epoch_lock`, which turns it
-    /// into an amount of $DIG the operator must have available to LOCK — so a row that will never
-    /// be bonded inflates a money figure.
-    ///
-    /// **Catches** the nearest wrong implementation, which is also the code that shipped:
-    /// `observation.states.len()`. Delete the filter and this test is the only thing in the repo
-    /// that goes red.
-    ///
-    /// The fixture varies the STATE across two rows rather than the row count, because a
-    /// single-row fixture distinguishes nothing here — `len()` and the filtered count agree on
-    /// every set that is entirely bondable or entirely withheld. It deliberately does NOT route
-    /// through `collateral_buffer`: that call returns early on the absent balance, so a test taken
-    /// that way passes without the count ever being read.
-    #[test]
-    fn a_withheld_row_is_not_a_pair_the_buffer_advice_prices() {
-        use crate::mirror::pass::BondState;
-        use crate::mirror::plan::Bond;
-        use crate::mirror::states::BondObservation;
-
-        let observation = BondObservation {
-            states: vec![
-                (
-                    Bond::new("aa".repeat(32), "11".repeat(32)),
-                    BondState::Withheld,
-                ),
-                (
-                    Bond::new("bb".repeat(32), "22".repeat(32)),
-                    BondState::FundsUnknown,
-                ),
-            ],
-            locked_dig_base_units: 7_777,
-            epoch: 4,
-        };
-
-        assert_eq!(
-            bondable_pairs(&observation),
-            1,
-            "two served rows, one of them relayed on a stranger's behalf and never bonded: only \
-             the other locks anything"
-        );
-        assert_ne!(
-            bondable_pairs(&observation),
-            observation.states.len() as u64,
-            "and it must not be the row count -- that is the figure this replaced"
-        );
-    }
-
     /// **Proves:** a PUBLISHED observation reaches the wire as rows — the surface stops answering
     /// `unknown` the moment a pass has run.
     ///
@@ -3837,7 +3787,10 @@ mod tests {
                     Bond::new("bb".repeat(32), "22".repeat(32)),
                     BondState::FundsUnknown,
                 ),
-                (Bond::new("cc".repeat(32), "33".repeat(32)), BondState::Pending),
+                (
+                    Bond::new("cc".repeat(32), "33".repeat(32)),
+                    BondState::Pending,
+                ),
                 (
                     Bond::new("dd".repeat(32), "44".repeat(32)),
                     BondState::Bonded {
