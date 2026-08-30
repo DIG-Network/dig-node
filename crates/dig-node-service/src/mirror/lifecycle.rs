@@ -881,7 +881,9 @@ mod tests {
             "the broadcast path must journal its submission at all"
         );
         assert_eq!(
-            source.matches(concat!("self.journal.", "submitted(")).count(),
+            source
+                .matches(concat!("self.journal.", "submitted("))
+                .count(),
             1,
             "one unconditional recording; a second call site is how one branch starts recording \
              the consumed coins and another stops"
@@ -904,7 +906,11 @@ mod tests {
     /// resolving to the file holding the broadcast path — leaves a guard that passes forever.
     #[test]
     fn the_unconditional_recording_guard_can_actually_fail() {
-        let planted = concat!("match ", "intended {\n    Some(", "intended_coin_id) => {}\n}");
+        let planted = concat!(
+            "match ",
+            "intended {\n    Some(",
+            "intended_coin_id) => {}\n}"
+        );
         for conditional in [
             concat!("match ", "intended"),
             concat!("Some(", "intended_coin_id) =>"),
