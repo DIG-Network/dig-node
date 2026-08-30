@@ -336,7 +336,7 @@ impl<E: MirrorEffects> PassRunner<E> {
 /// than a step inside a [`MirrorEffects`] implementation, so that there is exactly one of it: a
 /// second implementation of this rule is a second answer to "what may this node spend its own money
 /// advertising", and the two would not stay equal.
-fn split_by_provenance(observed: &[ObservedCapsule]) -> (Vec<Bond>, Vec<Bond>) {
+pub(super) fn split_by_provenance(observed: &[ObservedCapsule]) -> (Vec<Bond>, Vec<Bond>) {
     let mut held = Vec::new();
     let mut relayed = Vec::new();
     for capsule in observed {

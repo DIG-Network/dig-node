@@ -101,6 +101,37 @@ impl OperatorWallet {
     }
 }
 
+/// This node's operator PUZZLE HASH, derived without ever producing a signer.
+///
+/// `None` for exactly the cases [`OperatorWallet::open`] returns `None` for: no seed, no device key,
+/// a seal that will not open, or a phrase that does not derive. A caller MUST report the capability
+/// as unavailable rather than substitute any other address — a balance or a coin list read for the
+/// wrong puzzle hash is a confident number about somebody else's money.
+///
+/// # Why this exists beside [`OperatorWallet::open`] rather than being a call to it
+///
+/// The puzzle hash is a **public** value: this node's receive address, the address the dig-app
+/// deposit flow funds, and the address reclaims return to. A [`WalletSigner`] is not. §25.8's bond
+/// surface (dig-node#412) is a token-gated READ that needs the first and has no business
+/// materialising the second, so this function's return type is a [`Bytes32`] and there is no signer
+/// value anywhere on its path.
+///
+/// That distinction is held by the **type**, not by a convention: a control-plane read built on this
+/// cannot reach a signing capability, because no such capability is ever constructed for it to
+/// reach. `OperatorWallet::open` remains the only way to obtain one, and the mirror lifecycle
+/// remains its only caller.
+///
+/// The secret key derived along the way is dropped at the end of this function and never leaves it;
+/// the phrase lives in a zeroizing wrapper for the length of the derivation, exactly as in
+/// [`OperatorWallet::open`], and nothing here is logged.
+///
+/// §908 is untouched. This is the §16.4 machine-custody wallet — the node's own money — and no user
+/// seed reaches this process.
+pub fn operator_puzzle_hash(paths: &WalletPaths) -> Option<Bytes32> {
+    let phrase = autoseed::open_operator_phrase(paths)?;
+    Some(digstore_chain::keys::derive_wallet_keys(&phrase).ok()?.owner_puzzle_hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
