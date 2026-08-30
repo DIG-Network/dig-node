@@ -167,6 +167,21 @@ pub struct PassReport {
     pub states: Vec<(Bond, BondState)>,
     /// The margined per-epoch amount each create locked, when one was known.
     pub per_coin_dig_base_units: Option<u64>,
+    /// Every DIG base unit this wallet has locked in mirror coins, over the WHOLE owned set.
+    ///
+    /// Computed here, from the one place that has seen the entire chain observation, precisely so
+    /// that §25.8's surface cannot compute it by summing a page. A page sum under-reports locked
+    /// money on every node with more bonds than fit in one page, and under-reporting locked money
+    /// shows unspendable funds as available — wrong in the reassuring direction, which is the one
+    /// direction a money figure must never be wrong in. dig-app#289 renders this figure.
+    ///
+    /// **Coins being reclaimed are INCLUDED.** A reclaim that has been broadcast has not confirmed,
+    /// and the collateral is locked until it does. Excluding them would report money as free while
+    /// it is still on chain, which is the same lie one round earlier.
+    ///
+    /// Read from each coin's own `collateral_dig_base_units` rather than from this epoch's
+    /// requirement: a coin created under a previous requirement locks the previous amount.
+    pub locked_dig_base_units: u64,
 }
 
 /// Runs reconcile passes. Long-lived: it owns the presence tracker, which is the only state a pass
@@ -216,6 +231,13 @@ impl<E: MirrorEffects> PassRunner<E> {
         let in_flight = in_flight_creates(&self.log, ctx.current_epoch);
         let dig_balance_base_units = self.effects.dig_balance_base_units()?;
 
+        // Over the WHOLE observation, before the plan splits it into keeps and reclaims. Summed
+        // here rather than from the plan, because the plan does not carry the coins it leaves alone.
+        let locked_dig_base_units = on_chain
+            .iter()
+            .map(|c| c.collateral_dig_base_units)
+            .fold(0u64, u64::saturating_add);
+
         let decision = pass::decide(&PassInputs {
             held: &held,
             relayed: &relayed,
@@ -228,11 +250,16 @@ impl<E: MirrorEffects> PassRunner<E> {
             creates_enabled: ctx.creates_enabled,
         });
 
-        Ok(self.execute(decision, ctx.current_epoch))
+        Ok(self.execute(decision, ctx.current_epoch, locked_dig_base_units))
     }
 
     /// Step 4 and step 5: reclaims first, then creates, stopping cleanly.
-    fn execute(&self, decision: PassDecision, current_epoch: i64) -> PassReport {
+    fn execute(
+        &self,
+        decision: PassDecision,
+        current_epoch: i64,
+        locked_dig_base_units: u64,
+    ) -> PassReport {
         let PassDecision {
             reclaim,
             create,
@@ -284,6 +311,7 @@ impl<E: MirrorEffects> PassRunner<E> {
             stopped_at,
             states,
             per_coin_dig_base_units,
+            locked_dig_base_units,
         }
     }
 }
@@ -298,12 +326,39 @@ fn split_by_provenance(observed: &[ObservedCapsule]) -> (Vec<Bond>, Vec<Bond>) {
     let mut held = Vec::new();
     let mut relayed = Vec::new();
     for capsule in observed {
+        let bond = canonical(&capsule.bond);
         match capsule.provenance {
-            CapsuleProvenance::Held => held.push(capsule.bond.clone()),
-            CapsuleProvenance::Relayed => relayed.push(capsule.bond.clone()),
+            CapsuleProvenance::Held => held.push(bond),
+            CapsuleProvenance::Relayed => relayed.push(bond),
         }
     }
     (held, relayed)
+}
+
+/// A bond in the ONE form every ordering downstream assumes: lowercase, unprefixed, 64 hex.
+///
+/// `Bond`'s `Ord` is derived over the raw `String`s, and `dig-node-control-interface`'s
+/// `MirrorBondKey` orders the same way — so the canonical form is what makes the two derives agree.
+/// Two nodes that sorted differently would page §25.8's surface differently, and a paging walk that
+/// disagrees with its server does not error: it SKIPS or REPEATS rows. On the surface feeding
+/// dig-app#289's locked total, a skipped row is wrong in the reassuring direction, which is the one
+/// direction a money figure must never be wrong in.
+///
+/// Normalising HERE rather than trusting the observer is the point. `CachedCapsule` documents its
+/// ids as lowercase 64-hex and today they are, but that is a property of one producer, and this is
+/// the boundary where a second one would arrive. Normalising costs an allocation per capsule per
+/// pass and removes a whole class of disagreement that shows up as a wrong number rather than as an
+/// error.
+fn canonical(bond: &Bond) -> Bond {
+    fn hex(value: &str) -> String {
+        value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value)
+            .to_ascii_lowercase()
+    }
+
+    Bond::new(hex(&bond.store_id), hex(&bond.root))
 }
 
 /// The bonds whose CURRENT-epoch create is open and unresolved (§25.4.6).
@@ -978,6 +1033,79 @@ mod tests {
             runner.run(&ctx()).err(),
             Some(PassError::Chain("no source".to_string())),
             "an unknown chain is not an empty chain"
+        );
+    }
+    /// The observation is normalised BEFORE it is sorted, so a producer that spells an id
+    /// differently cannot change the order of the surface.
+    ///
+    /// The fixture varies the two axes independently — one bond upper-case, one `0x`-prefixed — so a
+    /// normaliser that handled only case or only the prefix is red rather than green. It also puts
+    /// them in an order that the raw strings would sort DIFFERENTLY from the canonical ones: `0x…`
+    /// sorts before every hex digit and `AA…` sorts before `aa…`, so an implementation that sorted
+    /// first and normalised afterwards produces a different sequence here.
+    #[test]
+    fn bond_ids_are_canonicalised_before_anything_orders_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_journal, log) = journal(dir.path());
+
+        let effects = FakeEffects {
+            disk: vec![
+                ObservedCapsule {
+                    bond: Bond::new(id("bb").to_ascii_uppercase(), id("22").to_ascii_uppercase()),
+                    provenance: CapsuleProvenance::Held,
+                },
+                ObservedCapsule {
+                    bond: Bond::new(format!("0x{}", id("aa")), format!("0x{}", id("11"))),
+                    provenance: CapsuleProvenance::Held,
+                },
+            ],
+            chain: Vec::new(),
+            balance: 10 * REQUIRED,
+            ..Default::default()
+        };
+        let mut runner = runner(effects, log);
+
+        assert_eq!(
+            runner.run(&ctx()).expect("the pass runs").created,
+            vec![bond("aa", "11"), bond("bb", "22")],
+            "both spellings reduce to the canonical form, and the order is the canonical one"
+        );
+    }
+    /// The locked total spans the WHOLE owned set, including coins being reclaimed.
+    ///
+    /// Three coins: one kept, one reclaimed because its `.dig` is gone, one reclaimed because its
+    /// epoch ended — and each locks a DIFFERENT amount, so no pair sums to the same figure as
+    /// another and a partial sum cannot coincide with the right answer. That last part is what makes
+    /// the assertion load-bearing: with three coins of 1_000 each, "kept only" and "all three" are
+    /// distinguishable, but "kept plus one reclaim" and any other pair are not.
+    ///
+    /// Excluding the reclaiming coins would report 300 base units as free while 2_400 of them are
+    /// still on chain — unspendable money shown as available, which is the shape of the lie
+    /// dig-app#289 renders this figure to avoid.
+    #[test]
+    fn the_locked_total_includes_coins_that_are_being_reclaimed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_journal, log) = journal(dir.path());
+
+        let effects = FakeEffects {
+            disk: held(&[bond("aa", "11")]),
+            chain: vec![
+                coin("kept", "aa", "11", NOW_EPOCH, 300),
+                coin("gone", "zz", "99", NOW_EPOCH, 900),
+                coin("old", "yy", "88", NOW_EPOCH - 1, 1_500),
+            ],
+            balance: 10 * REQUIRED,
+            ..Default::default()
+        };
+        let mut runner = runner(effects, log);
+
+        let report = runner.run(&ctx()).expect("the pass runs");
+
+        assert_eq!(report.reclaimed.len(), 2, "two coins are on their way home");
+        assert_eq!(
+            report.locked_dig_base_units,
+            300 + 900 + 1_500,
+            "a broadcast reclaim has not confirmed, so its collateral is still locked"
         );
     }
 }

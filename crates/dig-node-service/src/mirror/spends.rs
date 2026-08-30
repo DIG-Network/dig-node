@@ -150,14 +150,6 @@ impl MirrorSpends {
                 }),
         }
     }
-
-    /// The bond these spends are for, as the planner spells it.
-    pub(crate) fn bond(&self) -> super::plan::Bond {
-        super::plan::Bond::new(
-            hex::encode(self.store_launcher_id),
-            hex::encode(self.root_hash),
-        )
-    }
 }
 
 /// Build the spends that lock `collateral_dig_base_units` of $DIG as a mirror for one `(store, root,
@@ -266,6 +258,35 @@ pub(crate) fn empty_for_tests(fee_mojos: u64, owner_puzzle_hash: Bytes32) -> Mir
         operation: MirrorOperation::Create,
         spends: Vec::new(),
         fee_mojos,
+        owner_puzzle_hash,
+        store_launcher_id: Bytes32::default(),
+        root_hash: Bytes32::default(),
+        epoch: BigInt::from(0),
+        collateral_dig_base_units: 0,
+    }
+}
+
+/// A [`MirrorSpends`] whose single spend CANNOT be signed, for testing the signer's failure path.
+///
+/// The puzzle reveal is a truncated CLVM cons, so computing the required signatures fails before any
+/// key is consulted. That is the only way to reach `WalletSigner::sign`'s error arm without a chain:
+/// an empty spend set always succeeds, and a well-formed one signs.
+///
+/// `#[cfg(test)]` for the same reason [`empty_for_tests`] is — the no-public-constructor property is
+/// the whole authority bound. Owned by this signer's wallet, so the test that uses it is exercising
+/// the SIGNING failure and not the ownership refusal in front of it.
+#[cfg(test)]
+pub(crate) fn unsignable_for_tests(owner_puzzle_hash: Bytes32) -> MirrorSpends {
+    use chia_protocol::Program;
+
+    MirrorSpends {
+        operation: MirrorOperation::Create,
+        spends: vec![CoinSpend::new(
+            Coin::new(Bytes32::default(), Bytes32::default(), 1),
+            Program::from(vec![0xff_u8]),
+            Program::from(vec![0x80_u8]),
+        )],
+        fee_mojos: 0,
         owner_puzzle_hash,
         store_launcher_id: Bytes32::default(),
         root_hash: Bytes32::default(),

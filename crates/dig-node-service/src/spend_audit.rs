@@ -1029,6 +1029,7 @@ mod tests {
             amount_mojos: 1_000,
             fee_mojos: 10,
             store_id: Some("store-a".to_string()),
+            bond: None,
         }
     }
 
@@ -1319,6 +1320,7 @@ mod tests {
             amount_mojos: 1,
             fee_mojos: 0,
             store_id: store.map(str::to_string),
+            bond: None,
             initiated_ms,
             updated_ms: initiated_ms,
             status: SpendStatus::Pending,
