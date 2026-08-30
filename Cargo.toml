@@ -71,16 +71,21 @@ overflow-checks = true
 # cargo printed success. **dig-gossip v0.32.0 (`main`, rev 1a339166) declares `dig-nat = "0.21"`,
 # which cleared it.**
 #
-# The resolved stack is dig-nat 0.21, dig-dht 0.13, dig-download 0.21, dig-peer 0.13,
-# dig-peer-selector 0.10 -- and dig-nat, dig-dht, dig-tls, chia-bls and chia-protocol each resolve to
+# The resolved stack is dig-nat 0.21, dig-dht 0.15, dig-download 0.22, dig-peer 0.13,
+# dig-peer-selector 0.11 -- and dig-nat, dig-dht, dig-tls, chia-bls and chia-protocol each resolve to
 # exactly the line count they had before the move.
 #
-# THE ONE THING A FUTURE LANE WILL GET WRONG: **dig-dht 0.15 is NOT takeable, and the blocker has
-# moved down a level.** dig-download 0.21.0 and dig-peer-selector 0.10.0 -- the LATEST published of
-# each -- both require `dig-dht ^0.13`, measured from the crates.io index and not from a caret.
-# Declaring `dig-dht = "0.15"` resolves TWO dig-dht lines while cargo prints success, and dig-dht
-# values cross from this crate into both of them. dig-dht 0.15 carries
-# `ProviderRecord::unverified_mirror_coin_id` (dig-dht#23), so that field is unreachable here until a
-# dig-download AND a dig-peer-selector release against `dig-dht ^0.15` exist -- upstream, never an
-# edit in this file. One line per family beats the highest version numbers (CLAUDE.md §2.4b), and
-# bridging two lines with a shim is the §4.1 byte-drift class.
+# THE dig-dht 0.15 TIER IS TAKEN (dig-node#422), and it was blocked one level DOWN until it was:
+# dig-download 0.21.0 and dig-peer-selector 0.10.0 both required `dig-dht ^0.13`, which is
+# semver-incompatible with 0.15 on a 0.x line, so declaring "0.15" would have resolved TWO dig-dht
+# lines while cargo printed success -- with dig-dht values crossing from this crate into both
+# consumers. dig-download 0.22.0 and dig-peer-selector 0.11.0 released against `dig-dht ^0.15` and
+# cleared it, which is what makes `ProviderRecord::unverified_mirror_coin_id` (dig-dht#23) reachable
+# here.
+#
+# THE THING A FUTURE LANE WILL GET WRONG: taking the next dig-dht line is STILL an upstream job, not
+# an edit in this file. Check dig-download's and dig-peer-selector's LATEST published requirement
+# from the crates.io index before moving it, name every crate explicitly on `cargo update -p`
+# (a caret-compatible transitive is invisible to `cargo fetch`), and count the entries in the
+# resolved `Cargo.lock` rather than reading the caret. One line per family beats the highest version
+# numbers (CLAUDE.md §2.4b), and bridging two lines with a shim is the §4.1 byte-drift class.
