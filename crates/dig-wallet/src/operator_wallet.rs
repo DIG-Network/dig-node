@@ -129,7 +129,11 @@ impl OperatorWallet {
 /// seed reaches this process.
 pub fn operator_puzzle_hash(paths: &WalletPaths) -> Option<Bytes32> {
     let phrase = autoseed::open_operator_phrase(paths)?;
-    Some(digstore_chain::keys::derive_wallet_keys(&phrase).ok()?.owner_puzzle_hash)
+    Some(
+        digstore_chain::keys::derive_wallet_keys(&phrase)
+            .ok()?
+            .owner_puzzle_hash,
+    )
 }
 
 #[cfg(test)]

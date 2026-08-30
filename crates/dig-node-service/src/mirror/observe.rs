@@ -174,9 +174,14 @@ mod tests {
         }
     }
 
+    /// A coin whose id is DISTINCT per `(store, root)`.
+    ///
+    /// One shared id across every fixture coin would make `coin_id` useless as a discriminator:
+    /// an assertion about "the coin bonding aa/11" would hold just as well against the coin bonding
+    /// bb/22, so a `Bonded` row that named the wrong coin would still pass.
     fn coin(store: &str, root: &str, epoch: i64, collateral: u64) -> HeldMirror {
         HeldMirror {
-            coin_id: "cc".repeat(32),
+            coin_id: format!("{store}{root}").repeat(16),
             store_id: store.repeat(32),
             root: root.repeat(32),
             epoch,
@@ -191,10 +196,12 @@ mod tests {
             current_epoch: 7,
             requirement: CollateralRequirementResult::Known {
                 epoch: 7,
+                protocol_version: 1,
                 required_per_store_dig_base_units: REQUIRED,
                 stores: 10,
                 owners: 3,
-                census_height: 100,
+                multiplier_micros: 1_000_000,
+                handicap_dig_base_units: 0,
             },
             margin_bp: 0,
             creates_enabled: true,
@@ -219,12 +226,25 @@ mod tests {
             observation.locked_dig_base_units, 1_000,
             "both owned coins are locked; the reclaimed one has not confirmed"
         );
+        // Asserted on the PAYLOAD, not merely on the variant. `Bonded` carries the coin a person
+        // looks up and the amount that coin locks, and a row naming the other coin — or this
+        // epoch's requirement instead of the coin's own 600 — is exactly the plausible wrong answer
+        // a bare variant check cannot see.
         assert!(
             observation
                 .states
                 .iter()
-                .any(|(b, s)| *b == bond("aa", "11") && *s == BondState::Bonded),
-            "the covered capsule is bonded"
+                .any(|(b, s)| *b == bond("aa", "11")
+                    && matches!(
+                        s,
+                        BondState::Bonded { coin_id, epoch, amount_dig_base_units }
+                            if *coin_id == format!("{}{}", "aa", "11").repeat(16)
+                                && *epoch == 7
+                                && *amount_dig_base_units == 600
+                    )),
+            "the covered capsule is bonded by its OWN coin, for the amount that coin locks: \
+             {:?}",
+            observation.states
         );
     }
 
@@ -280,10 +300,11 @@ mod tests {
                 .find(|(k, _)| *k == b)
                 .map(|(_, s)| s.clone())
         };
-        assert_eq!(
-            state_of(bond("aa", "11")),
-            Some(BondState::Bonded),
-            "a covered bond does not depend on the balance"
+        assert!(
+            matches!(state_of(bond("aa", "11")), Some(BondState::Bonded { .. })),
+            "a covered bond does not depend on the balance, so an unreadable wallet must not \
+             disturb it: {:?}",
+            state_of(bond("aa", "11"))
         );
         assert_eq!(
             state_of(bond("bb", "22")),
