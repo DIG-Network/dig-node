@@ -8960,3 +8960,7 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "dig-node-control-interface"
+version = "0.25.0"
