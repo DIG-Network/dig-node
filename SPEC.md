@@ -5849,8 +5849,11 @@ one live backend.
 
 - **No runtime signer load.** `current_signer` resolves ONLY the bring-up-injected signer
   (`with_signer`), which no shipped build attaches — it exists for the simulator/test path. A shipped node
-  therefore has no signer at all, and every method that needs one reports the wallet locked
-  (dig_ecosystem#1701, §908).
+  therefore has no signer at all, and every method that needs one refuses (dig_ecosystem#1701, §908).
+  A refusal MUST name the state the node is actually in and MUST NOT report the wallet locked merely
+  because no signer resolved: the two are independent here, so an UNLOCKED wallet would be told to
+  unlock, and node-managed unlock was removed (§18.24) so no unlock would help. The tip path
+  (§18.23) states the three observable cases separately.
 - **No custody dispatch.** `wallet.*` and `auth.*` reach no handler; the wallet gate refuses the prefixes
   outright (§7.12) and neither appears in discovery. The attached `WalletCustody` is a read (§18.20) that
   contributes PUBLIC addresses to the subscription set and to the push guard.
@@ -5899,8 +5902,20 @@ payment does (`Cat::spend_all` CAT-wraps it).
   (the only money-moving step). A crash at any point leaves ≤1 reserved entry for that key; on restart the
   engine (re-loaded from the ledger file) treats the key as already tipped and SKIPS — erring toward
   under-tipping, never a double-spend. A definitively PRE-broadcast failure (`TipSpendOutcome::NotExecutable`
-  — locked wallet / not-yet-synced / insufficient $DIG) rolls the reservation back (retryable); an
+  — no signing key / not-yet-synced / insufficient $DIG) rolls the reservation back (retryable); an
   AMBIGUOUS broadcast error keeps it as `Failed` (never retried that day).
+- **A signer-absence refusal names its own state (#410).** When no signing key resolves, the
+  `NotExecutable` reason MUST be exactly one of the three published `crate::sage::tipping::refusal`
+  constants, chosen by what the backend can OBSERVE: no custody view attached at all
+  (`NO_SIGNER_CONFIGURED`), a custody view holding an enrolled wallet whose sealed seed this node
+  cannot open (`WALLET_ENROLLED_BUT_UNOPENABLE`), or a custody view holding no wallet
+  (`NO_WALLET_ENROLLED`). The three MUST be distinct strings and none MUST assert that the wallet is
+  locked, because the signer is absent on the shipped node whether or not any wallet is locked, and
+  §18.24 removed the unlock such a message would send the reader after. `Orphaned`
+  (`crate::autoseed::BootstrapState::Orphaned`) is deliberately NOT among them: it is decided at
+  bootstrap from paths the backend does not hold, so reporting it here would be a guess of the same
+  kind this clause forbids. The refusal is PRE-broadcast in every case — no bundle is built, signed
+  or sent.
 - **Fail-closed on unreadable persisted state.** Load distinguishes an ABSENT file (a genuine first run:
   config → DEFAULT-ON, ledger → empty) from a file that is PRESENT but unreadable/unparseable
   (locked / corrupt / truncated / forward-incompatible). A present-but-unreadable **ledger** POISONS the

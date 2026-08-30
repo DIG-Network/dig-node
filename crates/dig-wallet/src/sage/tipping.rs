@@ -282,12 +282,47 @@ pub enum TipSpendOutcome {
         /// asynchronous, and the reservation blocks a same-day retry either way).
         confirmed: bool,
     },
-    /// The wallet cannot currently build/broadcast the tip (locked / not-yet-synced / no lineage /
-    /// insufficient $DIG). Definitively PRE-broadcast — no money moved; the caller may retry later.
+    /// The wallet cannot currently build/broadcast the tip (no signing key / not-yet-synced / no
+    /// lineage / insufficient $DIG). Definitively PRE-broadcast — no money moved; the caller may
+    /// retry later.
     NotExecutable {
-        /// A human-readable reason.
+        /// A human-readable reason. When the refusal is signer-absence, it is exactly one of
+        /// [`NO_SIGNER_CONFIGURED`], [`WALLET_ENROLLED_BUT_UNOPENABLE`] or [`NO_WALLET_ENROLLED`].
         reason: String,
     },
+}
+
+/// Why a tip refusal happened when no signing key could be resolved (#410).
+///
+/// These are the exact `TipSpendOutcome::NotExecutable::reason` strings for the three signer-absence
+/// states a [`super::rpc::WalletBackend`] can actually OBSERVE, published as constants so a caller
+/// (and a test) can match a refusal by equality rather than by reading prose.
+///
+/// They exist because the single reason they replace — `"wallet is locked"` — was false in the state
+/// a shipped node is always in. Nothing attaches a signer to the served backend (`with_signer` has no
+/// non-test caller), so a user with a perfectly unlocked wallet was told to unlock it, would try, and
+/// would get nowhere. Each string below therefore describes a state the user can check, and none of
+/// them asks for an unlock that would not help.
+///
+/// A fourth state, `Orphaned` (a sealed seed whose device key is gone,
+/// [`crate::autoseed::BootstrapState::Orphaned`]), is deliberately NOT represented: it is decided at
+/// bootstrap from paths the backend does not hold, and [`super::custody::CustodyState`] has no
+/// variant for it. Minting a reason the backend cannot distinguish would reintroduce exactly the
+/// defect this fixes.
+pub mod refusal {
+    /// No signing key and no custody view at all — this backend was built without either, so it
+    /// could never spend. There is no wallet state for the user to change.
+    pub const NO_SIGNER_CONFIGURED: &str =
+        "no signing key is configured on this node, so it cannot sign a tip";
+
+    /// A wallet IS enrolled on this device, and the node cannot open its sealed seed. Node-managed
+    /// unlock was removed (SPEC §18.24), so this is not a lock the user can open from here.
+    pub const WALLET_ENROLLED_BUT_UNOPENABLE: &str =
+        "a wallet is enrolled on this device but this node cannot open its sealed seed, so it cannot sign a tip";
+
+    /// Custody is attached and holds no wallet — nothing is enrolled to sign with.
+    pub const NO_WALLET_ENROLLED: &str =
+        "no wallet is enrolled on this device, so it cannot sign a tip";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
