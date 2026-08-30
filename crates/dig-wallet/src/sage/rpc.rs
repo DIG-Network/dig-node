@@ -2902,6 +2902,26 @@ impl WalletBackend {
         None
     }
 
+    /// Why [`Self::current_signer`] returned `None`, as one of the three published
+    /// [`super::tipping::refusal`] strings (#410).
+    ///
+    /// The states are distinguished by what this backend can actually SEE — whether a custody view
+    /// is attached at all, and whether that view holds any enrolled wallet — never by guessing. The
+    /// single reason these replace, `"wallet is locked"`, was false in the state a shipped node is
+    /// permanently in: `with_signer` has no non-test caller, so the signer is absent on an unlocked
+    /// wallet just as surely as on a locked one, and telling the user to unlock sent them after a
+    /// remedy that does not exist.
+    ///
+    /// Only meaningful when the signer is genuinely absent; callers reach it from the `else` arm.
+    fn signer_absence_reason(&self) -> &'static str {
+        use super::tipping::refusal;
+        match self.custody.as_ref() {
+            None => refusal::NO_SIGNER_CONFIGURED,
+            Some(custody) if custody.any_wallet() => refusal::WALLET_ENROLLED_BUT_UNOPENABLE,
+            Some(_) => refusal::NO_WALLET_ENROLLED,
+        }
+    }
+
     /// Record `signer`'s public keys so the push guard still recognises the node's own coins after
     /// the signer is gone (see [`Self::custodied_public_keys`]).
     ///
@@ -3064,7 +3084,7 @@ impl WalletBackend {
     /// tips never enables live broadcast for the whole wallet surface.
     ///
     /// Fail-closed contract (see [`super::tipping::TipSpender`]): definitively PRE-broadcast
-    /// conditions (locked wallet / no lineage / insufficient $DIG / build or validation failure)
+    /// conditions (no signing key / no lineage / insufficient $DIG / build or validation failure)
     /// return [`TipSpendOutcome::NotExecutable`] (retryable — no money moved); the ONLY money-moving
     /// step is `broadcaster.broadcast`, whose error propagates as `Err` (ambiguous — the engine keeps
     /// the reservation and does not retry that day).
@@ -3077,10 +3097,11 @@ impl WalletBackend {
         confirmer: Option<&dyn super::spend::Confirmer>,
     ) -> Result<super::tipping::TipSpendOutcome> {
         use super::tipping::TipSpendOutcome;
-        // Signer (node custody). A locked wallet is retryable, not a spend failure.
+        // Signer (node custody). Absence is retryable, not a spend failure — but WHY it is absent
+        // is three different situations, and saying the wrong one sends the user somewhere useless.
         let Some(signer) = self.current_signer() else {
             return Ok(TipSpendOutcome::NotExecutable {
-                reason: "wallet is locked".into(),
+                reason: self.signer_absence_reason().into(),
             });
         };
         // CAT-send needs a lineage source to resolve input coins; absent ⇒ not-yet-synced.
@@ -5000,6 +5021,149 @@ mod tests {
             installed.current_signer().is_some(),
             "a backend CAN hold a signer, so the `None` above is a measurement and not a tautology"
         );
+    }
+
+    // ---- #410: the tip refusal names the state it is actually in ---------------------------
+
+    /// A scratch config dir unique to this process AND thread, so parallel tests never share a
+    /// custody manifest.
+    fn refusal_scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dig-wallet-tip-refusal-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Ask `be` for a tip and return the `NotExecutable` reason, asserting on the way that the
+    /// broadcaster was never reached — the refusal must be definitively PRE-broadcast.
+    async fn tip_refusal_reason(be: &WalletBackend) -> String {
+        let bc = crate::sage::spend::MockBroadcaster::default();
+        let outcome = be
+            .build_and_broadcast_dig_tip(Bytes32::from([9u8; 32]), 1_000, 0, &bc, None)
+            .await
+            .expect("a signer-absence refusal is an Ok(NotExecutable), never an Err");
+        assert!(
+            bc.sent.lock().unwrap().is_empty(),
+            "the refusal must happen before anything is broadcast"
+        );
+        match outcome {
+            super::super::tipping::TipSpendOutcome::NotExecutable { reason } => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The three signer-absence reasons must be DISTINCT strings, or the split is decorative:
+    /// collapsing them back to one shared sentence would leave every equality assertion below
+    /// still passing.
+    #[test]
+    fn the_three_signer_absence_reasons_are_pairwise_distinct() {
+        use super::super::tipping::refusal;
+        let all = [
+            refusal::NO_SIGNER_CONFIGURED,
+            refusal::WALLET_ENROLLED_BUT_UNOPENABLE,
+            refusal::NO_WALLET_ENROLLED,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "each signer-absence state needs its own sentence");
+            }
+        }
+    }
+
+    /// The defect this ticket exists for: a backend with no custody view refused with
+    /// `"wallet is locked"`, which is false — nothing is locked, nothing was ever configured.
+    ///
+    /// The negative assertion is on the SUBSTRING `"lock"`, not on the whole sentence, because the
+    /// harm was never the exact wording: any sentence containing `lock`/`unlock` sends the reader
+    /// after a remedy that does not exist on this node (SPEC §18.24 removed node-managed unlock).
+    #[tokio::test]
+    async fn with_no_custody_the_tip_refusal_says_unconfigured_and_never_mentions_a_lock() {
+        let be = backend_with(vec![], true).await;
+        assert!(
+            be.current_signer().is_none(),
+            "the fixture must genuinely have no signer, or this asserts nothing"
+        );
+
+        let reason = tip_refusal_reason(&be).await;
+        assert_eq!(reason, super::super::tipping::refusal::NO_SIGNER_CONFIGURED);
+        assert!(
+            !reason.to_ascii_lowercase().contains("lock"),
+            "an unlocked wallet must never be told it is locked; got {reason:?}"
+        );
+    }
+
+    /// A wallet IS enrolled and its seed cannot be opened. This is the one state the old sentence
+    /// was nearly right about — and it still must not claim a lock the user can open, so it names
+    /// the sealed seed instead.
+    #[tokio::test]
+    async fn an_enrolled_wallet_refuses_the_tip_as_an_unopenable_seed() {
+        let dir = refusal_scratch_dir("enrolled");
+        WalletCustody::enroll_for_tests(&dir, "tip-refusal-fixture", &[BlsPair::new(410).pk]);
+        let custody = WalletCustody::open(dir.clone());
+        assert!(
+            custody.any_wallet(),
+            "the fixture must really enrol a wallet, or it is the empty-custody case in disguise"
+        );
+
+        let be = backend_with(vec![], true).await.with_custody(custody);
+        let reason = tip_refusal_reason(&be).await;
+        assert_eq!(
+            reason,
+            super::super::tipping::refusal::WALLET_ENROLLED_BUT_UNOPENABLE
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Custody attached, nothing enrolled — a different situation from both of the above, and the
+    /// only one of the three a user fixes by creating a wallet.
+    #[tokio::test]
+    async fn custody_holding_no_wallet_refuses_the_tip_as_nothing_enrolled() {
+        let dir = refusal_scratch_dir("empty");
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let custody = WalletCustody::open(dir.clone());
+        assert!(
+            !custody.any_wallet(),
+            "the fixture must really be empty, or it is the enrolled case in disguise"
+        );
+
+        let be = backend_with(vec![], true).await.with_custody(custody);
+        assert_eq!(
+            tip_refusal_reason(&be).await,
+            super::super::tipping::refusal::NO_WALLET_ENROLLED
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control that keeps the three assertions above from being true of everything: a backend
+    /// that CAN sign gets past the signer guard entirely, and refuses for a different reason.
+    /// Without this, a `signer_absence_reason` wired in unconditionally would pass every test here.
+    #[tokio::test]
+    async fn a_backend_that_can_sign_never_refuses_for_signer_absence() {
+        use super::super::tipping::refusal;
+        let be = backend_with(vec![], true).await.with_signer(Arc::new(
+            crate::sage::spend::WalletSigner::new(vec![], Bytes32::from([7u8; 32])),
+        ));
+        assert!(
+            be.current_signer().is_some(),
+            "the control needs a backend that really can sign"
+        );
+
+        let reason = tip_refusal_reason(&be).await;
+        for absent in [
+            refusal::NO_SIGNER_CONFIGURED,
+            refusal::WALLET_ENROLLED_BUT_UNOPENABLE,
+            refusal::NO_WALLET_ENROLLED,
+        ] {
+            assert_ne!(
+                reason, absent,
+                "a signing backend reached the signer-absence branch"
+            );
+        }
     }
 
     async fn backend_with(coins: Vec<CoinRow>, synced: bool) -> WalletBackend {
