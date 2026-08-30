@@ -301,13 +301,24 @@ enum WalletCommand {
         #[arg(long, default_value = "xch")]
         asset: String,
     },
-    /// List the unspent coins at a public address (READ-ONLY; needs no seed or pairing).
+    /// List ONE PAGE of the unspent coins at a public address (READ-ONLY; needs no seed or
+    /// pairing).
+    ///
+    /// A funded address accumulates coins without limit, so the answer is PAGED. Pass the `cursor`
+    /// from one page as `--after-coin-id` to get the next; `complete` says whether there is one.
     Coins {
         /// The bech32m address to read (`xch1…`).
         address: String,
         /// The asset to list: `xch` (default) or `dig`.
         #[arg(long, default_value = "xch")]
         asset: String,
+        /// Resume STRICTLY AFTER this coin — pass the `cursor` from the previous page. Omit to
+        /// start at the first coin.
+        #[arg(long)]
+        after_coin_id: Option<String>,
+        /// The page size (1..=1000). Omit to let the node use the contract's default of 100.
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// Look up ONE coin by its coin id, spent or unspent (READ-ONLY; needs no seed or pairing).
     ///
@@ -982,7 +993,17 @@ fn wallet_action(cmd: WalletCommand) -> Option<ControlAction> {
         WalletCommand::Balance { address, asset } => {
             ControlAction::WalletBalance { address, asset }
         }
-        WalletCommand::Coins { address, asset } => ControlAction::WalletCoins { address, asset },
+        WalletCommand::Coins {
+            address,
+            asset,
+            after_coin_id,
+            limit,
+        } => ControlAction::WalletCoins {
+            address,
+            asset,
+            after_coin_id,
+            limit,
+        },
         WalletCommand::CoinById { coin_id } => ControlAction::WalletCoinById { coin_id },
         WalletCommand::CoinSpend { coin_id } => ControlAction::WalletCoinSpend { coin_id },
         WalletCommand::CoinsByParent {

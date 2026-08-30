@@ -61,8 +61,14 @@ pub enum ControlAction {
     SyncTrigger { store: String },
     /// `control.wallet.balance` — the READ-ONLY balance of a public address (XCH or $DIG).
     WalletBalance { address: String, asset: String },
-    /// `control.wallet.coins` — the READ-ONLY unspent coins of a public address (XCH or $DIG).
-    WalletCoins { address: String, asset: String },
+    /// `control.wallet.coins` — ONE PAGE of the READ-ONLY unspent coins of a public address (XCH
+    /// or $DIG). `after_coin_id` resumes from the `cursor` of a previous page.
+    WalletCoins {
+        address: String,
+        asset: String,
+        after_coin_id: Option<String>,
+        limit: Option<u32>,
+    },
     /// `control.wallet.coinById` — the READ-ONLY lookup of ONE coin by coin id (spent or not).
     WalletCoinById { coin_id: String },
     /// `control.wallet.coinSpend` — the READ-ONLY spend that spent one coin (reveal + solution).
@@ -277,9 +283,27 @@ impl ControlAction {
             // generation; folding it into the `store` arm above would send one joined field the
             // node refuses as a missing `root`.
             ControlAction::CapsuleFetch { store, root } => json!({ "store": store, "root": root }),
-            ControlAction::WalletBalance { address, asset }
-            | ControlAction::WalletCoins { address, asset } => {
+            ControlAction::WalletBalance { address, asset } => {
                 json!({ "address": address, "asset": asset_to_wire(asset) })
+            }
+            // Split from the balance arm because this read is PAGED. The two page fields are
+            // OMITTED when unset rather than sent as null, so the node applies the CONTRACT's
+            // default page size -- sending a number this CLI invented would make `dign wallet
+            // coins` page differently from every other client for no reason a user asked for.
+            ControlAction::WalletCoins {
+                address,
+                asset,
+                after_coin_id,
+                limit,
+            } => {
+                let mut params = json!({ "address": address, "asset": asset_to_wire(asset) });
+                if let Some(after) = after_coin_id {
+                    params["after_coin_id"] = json!(after);
+                }
+                if let Some(limit) = limit {
+                    params["limit"] = json!(limit);
+                }
+                params
             }
             ControlAction::WalletCoinById { coin_id }
             | ControlAction::WalletCoinSpend { coin_id } => json!({ "coin_id": coin_id }),
@@ -399,6 +423,8 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         ControlAction::WalletCoins {
             address: String::new(),
             asset: String::new(),
+            after_coin_id: None,
+            limit: None,
         }
         .method(),
         ControlAction::WalletCoinById {
@@ -704,14 +730,19 @@ fn summarize(method: &str, result: &Value) -> String {
         // Says explicitly whether the page is the whole child set, and how to get the rest. A
         // summary that printed only a count would let a truncated page read as a finished hop --
         // the exact misreading `complete` exists to prevent.
+        // Says explicitly whether the page is the whole unspent set, and how to get the rest. A
+        // summary that printed only a count would let a truncated page read as an address's whole
+        // holdings -- which is a person deciding they cannot afford something they can.
+        "control.wallet.coins" => {
+            let coins = result["coins"].as_array().map(Vec::len).unwrap_or(0);
+            format!("{coins} unspent coin(s){}", page_suffix(result))
+        }
         "control.wallet.coinsByParent" => {
             let coins = result["coins"].as_array().map(Vec::len).unwrap_or(0);
-            let more = match (result["complete"].as_bool(), result["cursor"].as_str()) {
-                (Some(true), _) => " · complete".to_string(),
-                (_, Some(cursor)) => format!(" · MORE remain — resume after {cursor}"),
-                _ => " · completeness unknown (a node too old to say)".to_string(),
-            };
-            format!("{coins} direct child coin(s) — one hop, not a lineage{more}")
+            format!(
+                "{coins} direct child coin(s) — one hop, not a lineage{}",
+                page_suffix(result)
+            )
         }
         "control.collateral.requirement" => summarize_collateral_requirement(result),
         "control.collateral.buffer" => summarize_collateral_buffer(result),
@@ -722,6 +753,23 @@ fn summarize(method: &str, result: &Value) -> String {
         }
         "control.updater.status" => summarize_updater_status(result),
         _ => compact(result),
+    }
+}
+
+/// Whether a paged answer is the whole set, and how to resume when it is not.
+///
+/// Shared by both paged coin reads. The dangerous rendering is the one this exists to prevent: a
+/// summary that prints only a count lets a TRUNCATED page read as the whole answer, and the two
+/// pages are indistinguishable by length whenever the total is a multiple of the page size.
+///
+/// The third arm is not dead. `complete: null` is the contract's "a node too old to page", and
+/// saying so is better than printing nothing — a caller shown a bare count from such a node cannot
+/// tell it apart from a node that measured and found the set complete.
+fn page_suffix(result: &Value) -> String {
+    match (result["complete"].as_bool(), result["cursor"].as_str()) {
+        (Some(true), _) => " · complete".to_string(),
+        (_, Some(cursor)) => format!(" · MORE remain — resume after {cursor}"),
+        _ => " · completeness unknown (a node too old to say)".to_string(),
     }
 }
 

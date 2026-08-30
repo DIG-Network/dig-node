@@ -2820,6 +2820,68 @@ impl WalletDb {
         Ok(row.is_some())
     }
 
+    /// ONE PAGE of the UNSPENT coins for `asset_id` scoped to `puzzle_hashes`, ASCENDING by
+    /// `coin_id` (dig-node#381).
+    ///
+    /// # Every filter is applied HERE, in SQL, and that is the point
+    ///
+    /// The scope, the asset, the unspent predicate and the page bound are one query. Paginating a
+    /// broader query and filtering the rows afterwards would cut the page BEFORE the filter, so a
+    /// page of `limit` rows could shrink to any smaller number on the way out — short pages, and a
+    /// `complete` computed from a row count that no longer describes what remains. On a coin read
+    /// the caller spends what it is handed, so a page that lost rows is funds it cannot see.
+    ///
+    /// # It returns up to `limit + 1` rows on purpose
+    ///
+    /// The caller drops the last one and reads its EXISTENCE as "more remain". Deriving
+    /// completeness from whether the page filled instead agrees on every input except a coin count
+    /// that is an exact multiple of the page size — where it declares a truncated page whole.
+    ///
+    /// Mempool coins (`created_height IS NULL`) are INCLUDED, matching
+    /// [`Self::coins_scoped`] and the contract: the caller decides whether an unconfirmed coin is
+    /// spendable for its purpose, and the node never decides that by hiding one.
+    pub async fn unspent_coins_page(
+        &self,
+        asset_id: Option<&str>,
+        puzzle_hashes: &[String],
+        after_coin_id: Option<&str>,
+        limit: u32,
+    ) -> sqlx::Result<Vec<CoinRow>> {
+        if puzzle_hashes.is_empty() {
+            return Ok(vec![]);
+        }
+        let ph = Self::placeholders(puzzle_hashes.len());
+        // The SAME scope/asset pairing `coins_scoped` uses: a CAT coin sits at an unrelated puzzle
+        // hash and is HINTED to the address, so an asset-scoped read matches on the hint.
+        let (scope_col, asset_clause) = match asset_id {
+            Some(_) => ("hint", "AND asset_id = ?"),
+            None => ("puzzle_hash", "AND asset_id IS NULL"),
+        };
+        let cursor_clause = if after_coin_id.is_some() {
+            "AND coin_id > ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT * FROM coins WHERE {scope_col} IN ({ph}) {asset_clause} \
+             AND spent_height IS NULL {cursor_clause} ORDER BY coin_id ASC LIMIT ?"
+        );
+        let mut q = sqlx::query(&sql);
+        for p in puzzle_hashes {
+            q = q.bind(p.to_ascii_lowercase());
+        }
+        if let Some(a) = asset_id {
+            q = q.bind(a.to_ascii_lowercase());
+        }
+        if let Some(cursor) = after_coin_id {
+            q = q.bind(cursor.to_ascii_lowercase());
+        }
+        // One row beyond the page, for the caller to read as "more remain" and then drop.
+        q = q.bind(i64::from(limit) + 1);
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(Self::coin_from_row).collect())
+    }
+
     /// All coins (any spent state) for `asset_id` scoped to `puzzle_hashes`. Used by
     /// `get_coins`, which applies its own spent/filter modes over the returned set.
     pub async fn coins_scoped(

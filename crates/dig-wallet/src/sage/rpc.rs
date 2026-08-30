@@ -269,8 +269,18 @@ pub struct WalletCoin {
 /// [`WalletBackend::coins_for_address`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletCoinsResult {
-    /// The unspent coins, newest-first is NOT guaranteed; order is the source's.
+    /// ONE PAGE of the unspent coins, ASCENDING by `coin_id` — a total, stable order, because a
+    /// cursor names no position without one.
     pub coins: Vec<WalletCoin>,
+    /// Whether [`Self::coins`] is the WHOLE unspent set at this address for this asset.
+    ///
+    /// Derived from whether rows remain BEYOND the page, never from whether the page filled. The
+    /// two differ exactly when the coin count is a multiple of the page size, and getting it wrong
+    /// there hands a spend builder a partial coin set that looks complete — it then refuses with a
+    /// shortfall that is not true, while the funds sit in the coins that were withheld.
+    pub complete: bool,
+    /// The last coin in this page — what a caller resumes from — or `None` for an empty page.
+    pub cursor: Option<String>,
     /// Which tier produced these coins.
     pub source: Source,
     /// Whether THIS answer is CURRENT — see [`WalletBalanceResult::synced`], of which this is the
@@ -1471,6 +1481,8 @@ impl WalletBackend {
         &self,
         address: &str,
         asset: BalanceAsset,
+        after_coin_id: Option<&str>,
+        limit: u32,
     ) -> std::result::Result<WalletCoinsResult, BalanceError> {
         let puzzle_hash =
             normalize_ph(&decode_address(address).ok_or(BalanceError::InvalidAddress)?);
@@ -1505,9 +1517,13 @@ impl WalletBackend {
         match source {
             Source::Db => {
                 let scope = [puzzle_hash];
+                // Scope, asset, unspent and the page bound are ONE query. Paging a broader read
+                // and filtering afterwards would cut the page before the filter, so a page would
+                // arrive short and `complete` would be computed from a count that no longer
+                // describes what remains.
                 let rows = self
                     .db
-                    .coins_scoped(asset_id.as_deref(), &scope)
+                    .unspent_coins_page(asset_id.as_deref(), &scope, after_coin_id, limit)
                     .await
                     .map_err(|e| read_err(e.into()))?;
                 let peak_height = self
@@ -1516,13 +1532,19 @@ impl WalletBackend {
                     .await
                     .map_err(|e| read_err(e.into()))?
                     .peak_height;
+                let page_size = limit as usize;
+                // The query returned up to one row PAST the page; its existence is what says more
+                // remain, and it is dropped rather than served.
+                let complete = rows.len() <= page_size;
                 let coins = rows
                     .iter()
-                    .filter(|r| r.spent_height.is_none())
+                    .take(page_size)
                     .map(coin_from_row)
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(read_err)?;
                 Ok(WalletCoinsResult {
+                    cursor: coins.last().map(|c| c.coin_id.clone()),
+                    complete,
                     coins,
                     source,
                     // The same measurement as the balance read's: this is that answer unreduced,
@@ -1546,16 +1568,35 @@ impl WalletBackend {
                     return Err(BalanceError::RateLimited);
                 }
                 let phs = [puzzle_hash];
-                let coins = self
+                let mut unspent: Vec<WalletCoin> = self
                     .asset_scoped_fallback_coins(asset, &phs)
                     .await
-                    .map_err(read_err)?;
-                Ok(WalletCoinsResult {
-                    coins: coins
-                        .iter()
-                        .filter(|c| c.spent_height.is_none())
-                        .map(coin_from_fallback)
+                    .map_err(read_err)?
+                    .iter()
+                    .filter(|c| c.spent_height.is_none())
+                    .map(coin_from_fallback)
+                    .collect();
+                // Sorted HERE rather than trusted from the source, for the reason
+                // `coins_by_parent` records: the tier underneath merges peer and coinset answers
+                // and promises no order at all, and an order that varies between pages loses rows.
+                unspent.sort_by(|a, b| a.coin_id.cmp(&b.coin_id));
+                let remaining: Vec<WalletCoin> = match after_coin_id {
+                    Some(cursor) => unspent
+                        .into_iter()
+                        .filter(|c| c.coin_id.as_str() > cursor)
                         .collect(),
+                    None => unspent,
+                };
+                let page_size = limit as usize;
+                // This tier answers with the whole set in one call and has no cursor to push the
+                // page down into, so the bound is on the RESPONSE. The upstream call count is one
+                // per request either way.
+                let complete = remaining.len() <= page_size;
+                let coins: Vec<WalletCoin> = remaining.into_iter().take(page_size).collect();
+                Ok(WalletCoinsResult {
+                    cursor: coins.last().map(|c| c.coin_id.clone()),
+                    complete,
+                    coins,
                     source,
                     // The replica neither produced these coins nor bounds their freshness (#2233).
                     synced: false,
@@ -5032,6 +5073,13 @@ mod tests {
         db
     }
 
+    /// The page size every coin-read test that is NOT about paging asks for.
+    ///
+    /// Large enough that those tests see the whole fixture, so the paging change cannot silently
+    /// truncate what they assert about — and named rather than a bare literal, so a reader can tell
+    /// "this test does not care about the page" from "this test chose 100 for a reason".
+    const TEST_PAGE: u32 = 100;
+
     fn coin_at_ph(
         id: &str,
         ph: &str,
@@ -5312,7 +5360,7 @@ mod tests {
         let be = backend_over(fb).await;
 
         let r = be
-            .coins_for_address(&address, BalanceAsset::DIG)
+            .coins_for_address(&address, BalanceAsset::DIG, None, TEST_PAGE)
             .await
             .unwrap();
         let mut ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
@@ -5350,7 +5398,12 @@ mod tests {
         let be = backend_over(fb).await;
 
         let r = be
-            .coins_for_address(&address, BalanceAsset::Cat(foreign_asset_id()))
+            .coins_for_address(
+                &address,
+                BalanceAsset::Cat(foreign_asset_id()),
+                None,
+                TEST_PAGE,
+            )
             .await
             .unwrap();
         let ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
@@ -5376,7 +5429,12 @@ mod tests {
         let be = backend_over(fb).await;
 
         let r = be
-            .coins_for_address(&address, BalanceAsset::Cat(Bytes32::from([0x77u8; 32])))
+            .coins_for_address(
+                &address,
+                BalanceAsset::Cat(Bytes32::from([0x77u8; 32])),
+                None,
+                TEST_PAGE,
+            )
             .await
             .unwrap();
         assert!(
@@ -6746,7 +6804,7 @@ mod tests {
             .with_chain_peer_tier_for_tests(peers_level_at(500));
 
         let r = be
-            .coins_for_address(&owned_address(), BalanceAsset::Xch)
+            .coins_for_address(&owned_address(), BalanceAsset::Xch, None, TEST_PAGE)
             .await
             .unwrap();
 
@@ -6778,7 +6836,7 @@ mod tests {
         let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
 
         let r = be
-            .coins_for_address(&arbitrary, BalanceAsset::Xch)
+            .coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
             .await
             .unwrap();
 
@@ -6809,7 +6867,8 @@ mod tests {
         let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
         let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
         assert_eq!(
-            be.coins_for_address(&arbitrary, BalanceAsset::Xch).await,
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
+                .await,
             Err(BalanceError::NoChainSource)
         );
 
@@ -6817,7 +6876,7 @@ mod tests {
         let db = db_with_owned_derivation(false, None).await;
         let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
         assert_eq!(
-            be.coins_for_address(&owned_address(), BalanceAsset::Xch)
+            be.coins_for_address(&owned_address(), BalanceAsset::Xch, None, TEST_PAGE)
                 .await,
             Err(BalanceError::NotSynced)
         );
@@ -6827,7 +6886,8 @@ mod tests {
         db.set_initial_sync_complete(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(ErringFallback), WalletConfig::default());
         assert!(matches!(
-            be.coins_for_address(&arbitrary, BalanceAsset::Xch).await,
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
+                .await,
             Err(BalanceError::ReadFailed(_))
         ));
 
@@ -6835,7 +6895,7 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
         let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
         assert_eq!(
-            be.coins_for_address("not-an-address", BalanceAsset::Xch)
+            be.coins_for_address("not-an-address", BalanceAsset::Xch, None, TEST_PAGE)
                 .await,
             Err(BalanceError::InvalidAddress)
         );
@@ -7115,7 +7175,7 @@ mod tests {
             .await
             .unwrap();
         let coins = be
-            .coins_for_address(&owned_address(), BalanceAsset::Xch)
+            .coins_for_address(&owned_address(), BalanceAsset::Xch, None, TEST_PAGE)
             .await
             .unwrap();
         let peak = be.chain_peak().await.unwrap();
@@ -7157,7 +7217,7 @@ mod tests {
             .with_chain_peer_tier_for_tests(peers_ahead_of_the_replica());
 
         let coins = be
-            .coins_for_address(&owned_address(), BalanceAsset::Xch)
+            .coins_for_address(&owned_address(), BalanceAsset::Xch, None, TEST_PAGE)
             .await
             .unwrap();
         assert_eq!(coins.source, Source::Db);
@@ -7166,6 +7226,178 @@ mod tests {
         assert!(
             !coins.synced,
             "the spend path was told a stale coin set was current"
+        );
+    }
+
+    /// The four unspent coins a paging fixture needs, ASCENDING by coin id.
+    ///
+    /// FOUR, read TWO at a time, so the truncated page and the final page carry the SAME row count
+    /// and only one of them is the last. Every length-based inference gives the same answer for
+    /// both, which is what makes `complete` load-bearing here rather than decorative.
+    const PAGE_FIXTURE: [&str; 4] = ["aa11", "bb22", "cc33", "dd44"];
+
+    async fn db_with_four_unspent_coins() -> WalletDb {
+        let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+        for (i, id) in PAGE_FIXTURE.iter().enumerate() {
+            db.upsert_coin(&coin_at_ph(id, &owned_ph(), 10 + i as u64, Some(1), None))
+                .await
+                .unwrap();
+        }
+        db
+    }
+
+    /// **Proves:** the page boundary survives a coin being SPENT between two pages — no coin is
+    /// skipped and none is repeated.
+    ///
+    /// This is the fixture an OFFSET implementation cannot pass, and the reason the read pages by
+    /// cursor. Coin `aa11` is spent after page one is served, so the unspent set shrinks from four
+    /// rows to three. An offset of 2 into the shrunken set lands on `dd44` and SKIPS `cc33`
+    /// entirely; the cursor `bb22` still names a position, so page two is `cc33` then `dd44`.
+    ///
+    /// The skipped coin is the whole cost: a caller building a spend never sees it, and refuses
+    /// with a shortfall that is not true while the money sits in the coin it could not see. The
+    /// assertion is therefore on the coin IDENTITIES and not on the row count — a count-only
+    /// assertion would pass against an implementation that returned the wrong two coins.
+    ///
+    /// Exactly ONE actor varies (the first coin is spent); the other three stay honest, so the
+    /// test can still see what a correct implementation returns.
+    #[tokio::test]
+    async fn a_coin_spent_between_pages_shifts_no_boundary_and_loses_no_coin() {
+        let db = db_with_four_unspent_coins().await;
+        let be = WalletBackend::new(db.clone(), Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(REPLICA_PEAK));
+
+        let first = be
+            .coins_for_address(&owned_address(), BalanceAsset::Xch, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.source,
+            Source::Db,
+            "the fixture must take the DB tier"
+        );
+        assert_eq!(
+            first
+                .coins
+                .iter()
+                .map(|c| c.coin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aa11", "bb22"],
+            "the first page must be the first two coins in ascending coin-id order"
+        );
+        assert_eq!(first.cursor.as_deref(), Some("bb22"));
+
+        // The event the cursor exists for: a coin BEFORE the boundary leaves the unspent set.
+        db.upsert_coin(&coin_at_ph("aa11", &owned_ph(), 10, Some(1), Some(2)))
+            .await
+            .unwrap();
+
+        let second = be
+            .coins_for_address(
+                &owned_address(),
+                BalanceAsset::Xch,
+                first.cursor.as_deref(),
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .coins
+                .iter()
+                .map(|c| c.coin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cc33", "dd44"],
+            "a coin was skipped or repeated across the boundary -- an offset-paged read lands on \
+             `dd44` alone here, and `cc33` becomes money the caller cannot see"
+        );
+    }
+
+    /// **Proves:** an exactly-full FINAL page reports `complete: true`, and the truncated page
+    /// before it reports `false` while carrying the same number of rows.
+    ///
+    /// Four coins at a page size of two: both pages hold exactly two. `complete = coins.len() <
+    /// limit` calls BOTH of them incomplete, and "a full page means more" calls both truncated, so
+    /// this fixture is the one that separates a completeness derived from what REMAINS from one
+    /// inferred from length. A spurious `complete: false` on the last page costs one wasted
+    /// request; a spurious `true` on the first costs a spend built on half an address's coins.
+    #[tokio::test]
+    async fn an_exactly_full_final_page_is_complete_and_the_one_before_it_is_not() {
+        let db = db_with_four_unspent_coins().await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(REPLICA_PEAK));
+
+        let first = be
+            .coins_for_address(&owned_address(), BalanceAsset::Xch, None, 2)
+            .await
+            .unwrap();
+        assert!(
+            !first.complete,
+            "two of four coins were withheld -- a `true` here presents half an address's holdings \
+             as all of them"
+        );
+
+        let second = be
+            .coins_for_address(
+                &owned_address(),
+                BalanceAsset::Xch,
+                first.cursor.as_deref(),
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.coins.len(),
+            first.coins.len(),
+            "both pages carry the same row count -- which is exactly why length cannot decide it"
+        );
+        assert!(
+            second.complete,
+            "the last two coins fit exactly, so this page IS the end of the set"
+        );
+        assert_eq!(
+            second.cursor.as_deref(),
+            Some("dd44"),
+            "the cursor is the last coin HANDED over, even on a complete page"
+        );
+    }
+
+    /// **Proves:** walking the pages end to end yields every coin exactly once, in order.
+    ///
+    /// The composition test the two above cannot replace: each of them looks at one boundary, and
+    /// a duplicate or a gap can hide in the seam between three of them. The page size of ONE makes
+    /// every coin its own boundary, so every seam is exercised — and it also pins the loop's
+    /// termination, since a read that never sets `complete` would spin here rather than pass.
+    #[tokio::test]
+    async fn a_cursor_walk_visits_every_coin_exactly_once() {
+        let db = db_with_four_unspent_coins().await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(REPLICA_PEAK));
+
+        let mut walked: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..PAGE_FIXTURE.len() + 2 {
+            let page = be
+                .coins_for_address(&owned_address(), BalanceAsset::Xch, cursor.as_deref(), 1)
+                .await
+                .unwrap();
+            walked.extend(page.coins.iter().map(|c| c.coin_id.clone()));
+            if page.complete {
+                break;
+            }
+            cursor = page.cursor.clone();
+            assert!(
+                cursor.is_some(),
+                "an incomplete page with no cursor is a walk that cannot continue"
+            );
+        }
+        assert_eq!(
+            walked,
+            PAGE_FIXTURE
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "the walk must visit every coin exactly once, in ascending order"
         );
     }
 
@@ -7297,13 +7529,14 @@ mod tests {
         )
         .with_fallback_rate_limit(1.0, 0.0);
         assert!(
-            be.coins_for_address(&arbitrary, BalanceAsset::Xch)
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
                 .await
                 .is_ok(),
             "the first read spends the only token"
         );
         assert_eq!(
-            be.coins_for_address(&arbitrary, BalanceAsset::Xch).await,
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
+                .await,
             Err(BalanceError::RateLimited),
             "a second coin read must be refused, not amplified onto the third party"
         );

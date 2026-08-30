@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dig_node_control_interface::params::{
-    WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
+    WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams, WalletCoinsParams,
     WalletReservationsReserveParams,
 };
 use dig_node_control_interface::results::{
@@ -1670,6 +1670,100 @@ fn wallet_coin_spend_param(id: &Value, params: &Value) -> std::result::Result<St
 ///
 /// The three fields are read separately from the untyped `params` and then validated TOGETHER, so a
 /// request that is wrong in two ways is still refused, and refused before anything is dialed.
+/// Read the two PAGING fields — `after_coin_id` and `limit` — off untyped JSON-RPC `params`.
+///
+/// Shared by every paged coin read rather than copied into each. The two reads page the same record
+/// over the same frame under the same contract rules, so two copies of this extraction could only
+/// ever differ by drifting apart — and a drift in a page boundary is a drift in what a caller
+/// resumes from.
+///
+/// A present-but-wrong-typed field is REFUSED rather than silently ignored: a caller that sent
+/// `limit: "50"` asked for a page size, and serving it the default while reporting success would
+/// make the page boundary — the thing it resumes from — different from the one it believes in.
+///
+/// The VALUES are not checked here. Range and hex well-formedness belong to the contract's own
+/// `validated()`, which each caller applies; this function contributes only what a typed contract
+/// cannot — pulling named fields out of a `Value`, and the error prose.
+fn page_fields(
+    id: &Value,
+    method: &str,
+    params: &Value,
+) -> std::result::Result<(Option<String>, Option<u32>), Value> {
+    let invalid = |detail: String| {
+        control_error(
+            id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{method}: {detail}"),
+        )
+    };
+    let after_coin_id = match params.get("after_coin_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(other) => {
+            return Err(invalid(format!(
+                "params.after_coin_id must be a coin id string or omitted, got {other}"
+            )))
+        }
+    };
+    let limit = match params.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(n) => Some(n),
+            None => {
+                return Err(invalid(format!(
+                    "params.limit must be a positive whole number or omitted, got {v}"
+                )))
+            }
+        },
+    };
+    Ok((after_coin_id, limit))
+}
+
+/// Parse + validate the whole `control.wallet.coins` request: the address, the asset, and the
+/// optional page cursor + size (dig-node#381).
+///
+/// The paging rules are the CONTRACT's `WalletCoinsParams::validated`, consumed rather than
+/// restated — an out-of-range `limit` is refused rather than clamped, and a cursor is held to the
+/// same lowercase-64-hex rule every by-coin read uses. A second copy of a published rule agrees
+/// until it does not, and here the divergence would surface as a page boundary this node and its
+/// caller disagree about, which is a coin the caller never sees.
+fn wallet_coins_params(
+    id: &Value,
+    params: &Value,
+) -> std::result::Result<
+    (
+        String,
+        dig_wallet::sage::rpc::BalanceAsset,
+        Option<String>,
+        u32,
+    ),
+    Value,
+> {
+    const METHOD: &str = "control.wallet.coins";
+    let (address, asset) = wallet_address_params(METHOD, id, params)?;
+    let (after_coin_id, limit) = page_fields(id, METHOD, params)?;
+    let validated = WalletCoinsParams {
+        // The contract does not validate the address (only a bech32m reader can), and this node
+        // decodes it downstream; passing it through keeps the type honest rather than empty.
+        address: address.clone(),
+        // The asset has already been parsed into this node's own enum, and re-encoding it into the
+        // contract's `Asset` only to discard it would be a conversion with no reader.
+        asset: ControlAsset::from(asset),
+        after_coin_id,
+        limit,
+    }
+    .validated()
+    .map_err(|e| {
+        control_error(
+            id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{METHOD}: {}", e.message),
+        )
+    })?;
+    let limit = validated.effective_limit();
+    Ok((address, asset, validated.after_coin_id, limit))
+}
+
 fn wallet_coins_by_parent_params(
     id: &Value,
     params: &Value,
@@ -1687,29 +1781,7 @@ fn wallet_coins_by_parent_params(
             "params.parent_coin_id must be a 64-character lowercase-hex coin id string".to_string(),
         );
     };
-    // A present-but-wrong-typed field is refused rather than silently ignored: a caller that sent
-    // `limit: "50"` asked for a page size, and serving it the default while reporting success would
-    // make the page boundary — the thing it resumes from — different from the one it believes in.
-    let after_coin_id = match params.get("after_coin_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(other) => {
-            return invalid(format!(
-                "params.after_coin_id must be a coin id string or omitted, got {other}"
-            ))
-        }
-    };
-    let limit = match params.get("limit") {
-        None | Some(Value::Null) => None,
-        Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()) {
-            Some(n) => Some(n),
-            None => {
-                return invalid(format!(
-                    "params.limit must be a positive whole number or omitted, got {v}"
-                ))
-            }
-        },
-    };
+    let (after_coin_id, limit) = page_fields(id, METHOD, params)?;
     WalletCoinsByParentParams {
         parent_coin_id: parent_coin_id.to_string(),
         after_coin_id,
@@ -1795,11 +1867,15 @@ fn wallet_read_error(method: &str, id: Value, address: &str, e: BalanceError) ->
 /// holder of funds that they hold none, and a spend built on that refuses with an untrue shortfall.
 async fn wallet_coins(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     const METHOD: &str = "control.wallet.coins";
-    let (address, asset) = match wallet_address_params(METHOD, &id, params) {
+    let (address, asset, after_coin_id, limit) = match wallet_coins_params(&id, params) {
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
-    match ctx.wallet.coins_for_address(&address, asset).await {
+    match ctx
+        .wallet
+        .coins_for_address(&address, asset, after_coin_id.as_deref(), limit)
+        .await
+    {
         Ok(r) => control_ok(id, coins_wire(&r, asset)),
         Err(e) => wallet_read_error(METHOD, id, &address, e),
     }
@@ -2829,6 +2905,10 @@ fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset)
             // read's filtering ever changes.
             "spent_height": c.spent_height,
         })).collect::<Vec<_>>(),
+        // Always a concrete boolean. The contract's `null` means "a node too old to page", and
+        // emitting it from a node that DOES page would tell a caller its cursor is meaningless.
+        "complete": r.complete,
+        "cursor": r.cursor,
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
@@ -3691,6 +3771,68 @@ mod tests {
         assert_eq!(parsed.len(), 2);
     }
 
+    /// **Proves:** the coin read's page bound is the CONTRACT's, refused rather than clamped, and
+    /// pinned from BOTH sides.
+    ///
+    /// A bound tested only from below can only confirm itself, so the at-maximum value MUST be
+    /// accepted and the one-over MUST be refused. Clamping instead of refusing would hand back a
+    /// cursor for a position the caller never asked about, and the caller would mis-size every
+    /// subsequent request against a boundary it does not share with the node.
+    ///
+    /// The default is asserted against the CONTRACT's constant rather than a literal `100`: a node
+    /// and a client resolving an omitted `limit` to two different numbers page to two different
+    /// boundaries, which is where a coin goes missing.
+    #[test]
+    fn the_coin_page_bound_is_the_contracts_and_is_refused_rather_than_clamped() {
+        use dig_node_control_interface::params::{COINS_DEFAULT_LIMIT, COINS_MAX_LIMIT};
+
+        let ask = |extra: Value| {
+            let mut params = json!({ "address": "xch1abc", "asset": "dig" });
+            if let Value::Object(map) = extra {
+                for (k, v) in map {
+                    params[k] = v;
+                }
+            }
+            wallet_coins_params(&json!(1), &params)
+        };
+
+        assert_eq!(
+            ask(json!({})).expect("an omitted limit is legal").3,
+            COINS_DEFAULT_LIMIT,
+            "an omitted limit must resolve to the CONTRACT's default, not to this node's guess"
+        );
+        assert_eq!(
+            ask(json!({ "limit": COINS_MAX_LIMIT }))
+                .expect("the documented maximum must be ACCEPTED, or it is not the real bound")
+                .3,
+            COINS_MAX_LIMIT
+        );
+
+        for over in [COINS_MAX_LIMIT + 1, 0] {
+            let refused = ask(json!({ "limit": over })).expect_err("must be refused, not clamped");
+            assert_eq!(
+                refused["error"]["code"], -32602,
+                "an out-of-range page size is INVALID_PARAMS: {refused}"
+            );
+        }
+
+        // The cursor is held to the same lowercase-64-hex rule every by-coin read uses, and the
+        // `0x` prefix is normalized away rather than passed through to the query.
+        assert!(ask(json!({ "after_coin_id": "AB".repeat(32) })).is_err());
+        assert_eq!(
+            ask(json!({ "after_coin_id": format!("0x{}", "ab".repeat(32)) }))
+                .expect("an 0x-prefixed cursor is tolerated")
+                .2
+                .as_deref(),
+            Some(&*"ab".repeat(32))
+        );
+
+        // A present-but-wrong-typed page field is refused rather than ignored: serving the default
+        // while reporting success would make the boundary differ from the one the caller believes.
+        assert!(ask(json!({ "limit": "50" })).is_err());
+        assert!(ask(json!({ "after_coin_id": 7 })).is_err());
+    }
+
     /// `coins_wire` emits the contract shape: the requested asset echoed onto every coin, an
     /// explicitly-null `spent_height` (every coin here is unspent), and the tier fields.
     ///
@@ -3721,6 +3863,8 @@ mod tests {
                         spent_height: None,
                     },
                 ],
+                complete: true,
+                cursor: Some("dd".repeat(32)),
                 source: Source::Db,
                 synced: true,
                 peak_height: Some(5_000_000),
@@ -3743,6 +3887,7 @@ mod tests {
                         "created_height": null, "spent_height": null
                     }
                 ],
+                "complete": true, "cursor": "dd".repeat(32),
                 "source": "db", "synced": true, "peak_height": 5_000_000
             })
         );
@@ -3781,6 +3926,8 @@ mod tests {
                     created_height: Some(1),
                     spent_height: None,
                 }],
+                complete: true,
+                cursor: Some("aa".repeat(32)),
                 source: Source::Fallback,
                 synced: false,
                 peak_height: None,
@@ -3841,6 +3988,8 @@ mod tests {
                     created_height: Some(5_000_000),
                     spent_height: Some(5_000_042),
                 }],
+                complete: true,
+                cursor: Some("aa".repeat(32)),
                 source: Source::Fallback,
                 synced: false,
                 peak_height: None,
