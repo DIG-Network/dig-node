@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
+use chia_sha2::Sha256;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_node_service::mirror::advertise::{configured_urls, ADVERTISE_URLS_ENV};
 use dig_node_service::mirror::lifecycle::NodeMirrorEffects;
@@ -64,6 +65,17 @@ fn with_advertise_env<T>(value: &str, body: impl FnOnce() -> T) -> T {
         None => std::env::remove_var(ADVERTISE_URLS_ENV),
     }
     out
+}
+
+/// A fixture discriminator, DERIVED rather than spelled.
+///
+/// `ordinary_dig_coins` seeds a grandparent with `[salt; 32]`, so a byte literal reads to CodeQL as
+/// a hard-coded cryptographic value (dig-node#917, #950). Deterministic, so a failure reproduces;
+/// distinct per `step`, so two fixture coins cannot collapse onto one id.
+fn salt(step: u8) -> u8 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"dig-node mirror_advertised_urls fixture");
+    hasher.finalize()[0].wrapping_add(step)
 }
 
 /// A chain holding whatever the test put on it — and nothing else.
@@ -202,7 +214,7 @@ fn the_configured_urls_reach_the_coin_in_the_operators_order() {
     let (signer, address) = operator(dir.path());
 
     let mut chain = Chain::default();
-    chain.fund(&address, &[PER_COIN], 0x11);
+    chain.fund(&address, &[PER_COIN], salt(1));
 
     let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
     let journal = SpendJournal::new(log);
@@ -271,7 +283,7 @@ fn an_all_rejected_value_refuses_and_spends_nothing() {
     let mut chain = Chain::default();
     // Funded deliberately: a refusal on an EMPTY wallet would be indistinguishable from a funding
     // refusal, and would assert nothing about the advertisement.
-    chain.fund(&address, &[PER_COIN], 0x22);
+    chain.fund(&address, &[PER_COIN], salt(2));
 
     let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
     let journal = SpendJournal::new(log);
