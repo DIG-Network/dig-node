@@ -71,7 +71,9 @@ use dig_wallet::operator_wallet::OperatorWallet;
 use dig_wallet::sage::rpc::WalletBackend;
 use dig_wallet::sage::spend::Broadcaster;
 
-use crate::spend_audit::{FailureStage, SpendJournal, SpendLog, Submission, TargetCoinId};
+use crate::spend_audit::{
+    FailureStage, FundingCoinId, SpendJournal, SpendLog, Submission, TargetCoinId,
+};
 
 use super::observe::held_mirrors;
 use super::plan::{Bond, HeldMirror, ReclaimReason};
@@ -159,7 +161,11 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
     /// `Failed { stage: Broadcast }` rather than being dropped — dropping it writes `Unresolved`,
     /// which claims the node signed and does not know what became of it. That claim is true only
     /// when the broadcast's own outcome is genuinely unknown, and a returned error is not that.
-    fn sign_and_broadcast(&self, spends: &super::spends::MirrorSpends) -> Result<(), PassError> {
+    fn sign_and_broadcast(
+        &self,
+        spends: &super::spends::MirrorSpends,
+        intended: Option<TargetCoinId>,
+    ) -> Result<(), PassError> {
         let signer = self
             .signer
             .ok_or_else(|| PassError::Wallet("no operator wallet is available to sign".into()))?;
@@ -175,17 +181,40 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
             .sign(spends, self.journal)
             .map_err(|e| PassError::Wallet(e.to_string()))?;
 
-        // The intended coin is the one the spends declare they create. Recorded as an EXPECTATION
-        // here; only a chain observation may promote it to `Confirmed`, which is why
-        // `SpendJournal::confirmed` is not called from this path at all.
-        let submission = Submission {
-            intended_coin_id: TargetCoinId::new(hex::encode(spends.intended_coin_id())),
-            funding_coin_ids: spends.funding_coin_ids(),
-        };
+        // The coins CONSUMED are read from the bundle itself rather than stated: every `CoinSpend`
+        // in it spends exactly its own coin, so this cannot disagree with what was signed.
+        let funding_coin_ids = spends
+            .coin_spends()
+            .iter()
+            .map(|cs| FundingCoinId(hex::encode(cs.coin.coin_id())))
+            .collect();
 
         match self.runtime.block_on(broadcaster.broadcast(&bundle)) {
             Ok(()) => {
-                self.journal.submitted(&recorded, submission);
+                match intended {
+                    // Recorded as an EXPECTATION. Only a chain observation may promote it to
+                    // `Confirmed`, which is why `SpendJournal::confirmed` is not called from this
+                    // path at all.
+                    Some(intended_coin_id) => self.journal.submitted(
+                        &recorded,
+                        Submission {
+                            intended_coin_id,
+                            funding_coin_ids,
+                        },
+                    ),
+                    // No coin id this node can DERIVE, so none is stated. Dropping `recorded`
+                    // resolves it `Unresolved`, which this crate defines as "the node signed and
+                    // does not know what became of it" — and after a successful broadcast with an
+                    // underivable target, that is precisely true. Naming a plausible coin instead
+                    // would let §23.5's reconcile confirm this spend against a coin it never
+                    // created, which is the legacy defect `TargetCoinId` exists to make
+                    // inexpressible.
+                    None => tracing::warn!(
+                        target: "mirror",
+                        operation = spends.operation().as_str(),
+                        "broadcast a mirror spend whose created coin this node cannot derive; the                          audit entry resolves UNRESOLVED rather than naming a guessed coin"
+                    ),
+                }
                 Ok(())
             }
             Err(e) => {
@@ -264,7 +293,7 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
             reason = ?reason,
             "reclaiming mirror collateral"
         );
-        self.sign_and_broadcast(&spends)
+        self.sign_and_broadcast(&spends, Some(reclaimed_coin_id(&coin)))
     }
 
     fn create(&self, bond: &Bond, _epoch: i64, amount_dig_base_units: u64) -> Result<(), PassError> {
@@ -279,6 +308,38 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
             bond.store_id, amount_dig_base_units
         )))
     }
+}
+
+/// The coin a reclaim of `mirror` CREATES, derived rather than guessed.
+///
+/// `dig_mirror_coin::reclaim` recreates the entire locked amount at the owner's own puzzle hash, as
+/// a $DIG CAT — so the created coin is fully determined by three things the coin itself carries: its
+/// own id becomes the parent, the amount is the collateral it locked, and the puzzle hash is the CAT
+/// wrapping of the owner's standard puzzle hash under [`dig_mirror_coin::DIG_ASSET_ID`].
+///
+/// Derived here rather than read back from the bundle because the audit record must name the coin
+/// whose EXISTENCE confirms this spend, and a spend that has only been broadcast has created
+/// nothing yet. Getting it wrong is the legacy defect [`TargetCoinId`] exists to prevent: confirming
+/// against a coin the spend did not create — or against the funding coin, which a competing spend
+/// removes identically — proves nothing at all.
+///
+/// The CAT wrapping is NOT optional and is not a detail: a mirror coin's collateral is $DIG, so the
+/// returned coin sits at the CAT puzzle hash and never at the bare owner puzzle hash. Naming the
+/// unwrapped hash would produce a coin id that can never appear on chain, so the reclaim would stay
+/// unconfirmed forever while having genuinely succeeded.
+fn reclaimed_coin_id(mirror: &MirrorCoin) -> TargetCoinId {
+    use chia_puzzle_types::cat::CatArgs;
+
+    let inner: clvm_utils::TreeHash = mirror.owner_puzzle_hash().into();
+    let puzzle_hash: Bytes32 =
+        CatArgs::curry_tree_hash(dig_mirror_coin::DIG_ASSET_ID, inner).into();
+
+    let created = chia_protocol::Coin::new(
+        mirror.coin().coin_id(),
+        puzzle_hash,
+        mirror.collateral(),
+    );
+    TargetCoinId(hex::encode(created.coin_id()))
 }
 
 /// What bring-up found, and therefore what this node's lifecycle can do.

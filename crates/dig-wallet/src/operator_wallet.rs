@@ -52,6 +52,7 @@ use crate::sage::spend::WalletSigner;
 pub struct OperatorWallet {
     signer: WalletSigner,
     owner_puzzle_hash: Bytes32,
+    synthetic_key: chia_bls::PublicKey,
 }
 
 impl OperatorWallet {
@@ -82,8 +83,20 @@ impl OperatorWallet {
         let keys = digstore_chain::keys::derive_wallet_keys(phrase).ok()?;
         Some(Self {
             owner_puzzle_hash: keys.owner_puzzle_hash,
+            synthetic_key: keys.synthetic_sk.public_key(),
             signer: WalletSigner::new(vec![keys.synthetic_sk], agg_sig_data),
         })
+    }
+
+    /// The PUBLIC synthetic key the spend builders curry into a standard layer.
+    ///
+    /// Public, and deliberately typed as such: `dig_mirror_coin::create` and `::reclaim` both take a
+    /// [`chia_bls::PublicKey`] to derive the owner they build for, and handing them the secret key
+    /// would be neither necessary nor expressible. Derived once at construction from the same
+    /// secret the signer holds, so the key a spend is BUILT for and the key it is SIGNED with cannot
+    /// be two different keys.
+    pub fn synthetic_key(&self) -> chia_bls::PublicKey {
+        self.synthetic_key.clone()
     }
 
     /// The signer for this wallet's keys.

@@ -842,6 +842,17 @@ pub struct ControlCtx {
     /// The node-custodied wallet backend (#368), for the READ-ONLY `control.wallet.balance`
     /// chain read (#1851). A public-address balance read only — never a spend/custody path.
     pub wallet: Arc<dig_wallet::sage::rpc::WalletBackend>,
+    /// §25.8's observation, as the last mirror pass published it (dig-node#412 step 7).
+    ///
+    /// A published SNAPSHOT rather than a per-request observation, and that is a security property
+    /// rather than a cache: observing here would turn one ~200-byte token-gated call into a seed
+    /// unseal, a PBKDF2, up to `dig_mirror_coin::MAX_CANDIDATES` chain lookups and an oracle read.
+    /// Reading a value the round timer already produced cannot be amplified by asking more often.
+    ///
+    /// `None` inside means the first pass has not completed, which the surface reports as `unknown`
+    /// with a named reason. It is deliberately not an empty observation — see
+    /// [`crate::mirror::lifecycle::BondSnapshot`].
+    pub mirror_bonds: crate::mirror::lifecycle::BondSnapshot,
 }
 
 /// Dispatch a single authorized CONTROL method. The caller has ALREADY enforced the
@@ -930,7 +941,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         // The mirror-coin bond surface (dig-node#412, SPEC.md §25.8) -- one page of this
         // node's OWN bonds. Shell-owned because the bonds are the SERVICE's money, not the
         // embedded engine's.
-        "control.mirror.bondStates" => mirror_bond_states(id, params),
+        "control.mirror.bondStates" => mirror_bond_states(mirror_bond_observation(ctx), id, params),
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
@@ -3475,13 +3486,17 @@ fn collateral_buffer(id: Value) -> Value {
 /// (`cache_list_cached`) — and [`crate::mirror::pass::decide`] already keys its states on `held`
 /// AND `relayed` for this reason.
 ///
-/// # Today this answers `unknown` with a NAMED reason, which is the honest answer and not a stub
+/// # The answer comes from the last PASS, not from a read this call performs
 ///
-/// Stating a bond's state needs the mirror COINS this wallet owns. That read
-/// (`dig_mirror_coin::list`) needs a `dig_chainsource_interface::ChainSource` and the operator
-/// wallet's own puzzle hash, and neither is reachable from the control plane: the reconcile
-/// runner's bring-up is dig-node#412 step 7. So the node cannot tell a bonded capsule from an
-/// unbonded one, and it says so.
+/// Stating a bond's state needs the mirror coins this wallet owns, and that read
+/// (`dig_mirror_coin::list`) is a scan of a puzzle hash anyone may add to. Performing it per request
+/// would turn one ~200-byte token-gated call into a seed unseal, a PBKDF2, up to
+/// `dig_mirror_coin::MAX_CANDIDATES` chain lookups and an oracle read — a genuine amplification
+/// surface, since a paired token is a much weaker predicate than "trusted". So the mirror lifecycle
+/// observes on its own round timer and PUBLISHES what it saw
+/// ([`crate::mirror::lifecycle::BondSnapshot`]), and this method reads that.
+///
+/// # `unknown` remains the honest answer before the first pass, and is not an empty page
 ///
 /// Every alternative is a fabrication on a money surface. An empty page reports a funded node as
 /// holding no bonds; a page of `unfunded` rows raises the out-of-funds alarm about a wallet nobody
@@ -3490,9 +3505,17 @@ fn collateral_buffer(id: Value) -> Value {
 /// naming the wrong missing fact would send an operator to repair a capsule cache that is working.
 /// [`collateral_buffer`] answers the same way, for the same reason.
 ///
-/// The rest of the method is [`crate::mirror::states::page`], already exercised against fixtures, so
-/// step 7 lights this up by handing it an observation rather than by writing a surface.
-fn mirror_bond_states(id: Value, params: &Value) -> Value {
+/// The observation is a PARAMETER rather than something this function fetches, so the paging,
+/// ordering and wire mapping stay exercisable against fixtures with no wallet, no chain and no
+/// `ControlCtx` anywhere near them.
+fn mirror_bond_states(
+    observation: Result<
+        crate::mirror::states::BondObservation,
+        dig_node_control_interface::results::MirrorBondStatesUnknownReason,
+    >,
+    id: Value,
+    params: &Value,
+) -> Value {
     use dig_node_control_interface::params::MirrorBondStatesParams;
     use dig_node_control_interface::results::MirrorBondStatesResult;
 
@@ -3505,7 +3528,7 @@ fn mirror_bond_states(id: Value, params: &Value) -> Value {
         Err(e) => return control_error(id, ErrorCode::InvalidParams, e.to_string()),
     };
 
-    let answer = match mirror_bond_observation() {
+    let answer = match observation {
         Ok(observation) => crate::mirror::states::page(
             &observation,
             params.after.as_ref(),
@@ -3522,15 +3545,25 @@ fn mirror_bond_states(id: Value, params: &Value) -> Value {
 /// The whole §25.8 answer before paging, or the ONE fact the node is missing.
 ///
 /// Separated from [`mirror_bond_states`] so the surface and the observation are different concerns:
-/// paging, ordering and the wire mapping are settled and tested, and this is the single call site
-/// dig-node#412 step 7 replaces when the reconcile runner is brought up. A caller MUST NOT
-/// substitute an empty observation for an `Err` — a page of no rows says "this node holds no
-/// bonds", which is a definite claim about money, and it is not the claim being made here.
-fn mirror_bond_observation() -> Result<
+/// paging, ordering and the wire mapping are settled and tested against fixtures, and this is the
+/// one place that touches live state. A caller MUST NOT substitute an empty observation for an
+/// `Err` — a page of no rows says "this node holds no bonds", which is a definite claim about
+/// money, and it is not the claim being made here.
+fn mirror_bond_observation(
+    ctx: &ControlCtx,
+) -> Result<
     crate::mirror::states::BondObservation,
     dig_node_control_interface::results::MirrorBondStatesUnknownReason,
 > {
-    Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable)
+    use dig_node_control_interface::results::MirrorBondStatesUnknownReason;
+
+    // A poisoned lock is UNKNOWN, not empty: a writer panicked on a money path and this node cannot
+    // vouch for what it last published.
+    let slot = ctx
+        .mirror_bonds
+        .read()
+        .map_err(|_| MirrorBondStatesUnknownReason::ChainUnreadable)?;
+    slot.clone().ok_or(MirrorBondStatesUnknownReason::ChainUnreadable)
 }
 
 /// `control.collateral.margin.get` — the node's local safety margin, in basis points.
@@ -3602,7 +3635,11 @@ mod tests {
     /// `state` beside an `entries` key would still hand a lenient client a zero to render.
     #[test]
     fn mirror_bond_states_says_which_fact_it_is_missing_rather_than_returning_an_empty_page() {
-        let answer = mirror_bond_states(json!(1), &json!({}));
+        let answer = mirror_bond_states(
+            Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
+            json!(1),
+            &json!({}),
+        );
         let result = &answer["result"];
         assert_eq!(result["state"], "unknown");
         assert_eq!(result["reason"], "chain_unreadable");
@@ -3610,6 +3647,62 @@ mod tests {
             result.get("entries").is_none() && result.get("locked_dig_base_units").is_none(),
             "an unknown answer must carry no rows and no money figure: {result}"
         );
+    }
+
+    /// **Proves:** a PUBLISHED observation reaches the wire as rows — the surface stops answering
+    /// `unknown` the moment a pass has run.
+    ///
+    /// **Catches:** the whole reason this step exists. Before step 7 the observation seam returned
+    /// `Err` unconditionally, so every green test above passed against a method that could not
+    /// answer anything, and `chain_unreadable` was indistinguishable from a stub.
+    ///
+    /// The fixture carries TWO bonds with DIFFERENT states, and a `locked_dig_base_units` that is
+    /// not derivable from either — an implementation that paged only the first row, that reported
+    /// one state for every row, or that recomputed the total from the page would each be visible.
+    /// A single-row fixture could distinguish none of them.
+    #[test]
+    fn a_published_observation_is_served_as_rows_rather_than_as_unknown() {
+        use crate::mirror::pass::BondState;
+        use crate::mirror::plan::Bond;
+        use crate::mirror::states::BondObservation;
+
+        let observation = BondObservation {
+            states: vec![
+                (
+                    Bond::new("aa".repeat(32), "11".repeat(32)),
+                    BondState::Withheld,
+                ),
+                (
+                    Bond::new("bb".repeat(32), "22".repeat(32)),
+                    BondState::FundsUnknown,
+                ),
+            ],
+            locked_dig_base_units: 7_777,
+            epoch: 4,
+        };
+
+        let answer = mirror_bond_states(Ok(observation), json!(1), &json!({}));
+        let result = &answer["result"];
+
+        assert_eq!(result["state"], "known", "a published observation is KNOWN: {result}");
+        assert_eq!(
+            result["locked_dig_base_units"], 7_777,
+            "the observation's own total, carried across unchanged"
+        );
+        assert_eq!(result["epoch"], 4);
+
+        let entries = result["entries"].as_array().expect("rows");
+        assert_eq!(entries.len(), 2, "both bonds are rows: {result}");
+        // Asserted on the PAYLOAD, and on the two rows SEPARATELY. A `withheld` capsule stays
+        // `withheld` — it is held on a stranger's behalf and deliberately never advertised — while
+        // the uncovered one reports `deferred{balance_unreadable}` rather than a fabricated
+        // shortfall. A count-only assertion is satisfied by an implementation that emits one state
+        // for every row.
+        assert_eq!(entries[0]["store_id"], "aa".repeat(32));
+        assert_eq!(entries[0]["state"]["state"], "withheld");
+        assert_eq!(entries[1]["store_id"], "bb".repeat(32));
+        assert_eq!(entries[1]["state"]["state"], "deferred");
+        assert_eq!(entries[1]["state"]["reason"], "balance_unreadable");
     }
 
     /// **Proves:** an out-of-range page size is REFUSED as `INVALID_PARAMS`, not clamped.
@@ -3620,7 +3713,11 @@ mod tests {
     #[test]
     fn mirror_bond_states_refuses_a_page_size_it_will_not_serve() {
         for limit in [json!(0), json!(1001)] {
-            let answer = mirror_bond_states(json!(1), &json!({ "limit": limit }));
+            let answer = mirror_bond_states(
+                Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
+                json!(1),
+                &json!({ "limit": limit }),
+            );
             assert_eq!(
                 answer["error"]["code"],
                 json!(ErrorCode::InvalidParams.code()),
@@ -3629,7 +3726,11 @@ mod tests {
         }
         // The control: an in-range limit is not refused, so the assertion above is about the
         // BOUND rather than about the params being rejected wholesale.
-        let ok = mirror_bond_states(json!(1), &json!({ "limit": 1000 }));
+        let ok = mirror_bond_states(
+            Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
+            json!(1),
+            &json!({ "limit": 1000 }),
+        );
         assert!(ok.get("error").is_none(), "1000 is in range: {ok}");
     }
 
@@ -3643,6 +3744,7 @@ mod tests {
     fn mirror_bond_states_refuses_a_malformed_cursor_and_tolerates_a_prefixed_one() {
         let hex = "11".repeat(32);
         let malformed = mirror_bond_states(
+            Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
             json!(1),
             &json!({ "after": { "store_id": "not-hex", "root": hex } }),
         );
@@ -3653,6 +3755,7 @@ mod tests {
         );
 
         let prefixed = mirror_bond_states(
+            Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
             json!(1),
             &json!({ "after": { "store_id": format!("0x{hex}"), "root": hex } }),
         );
