@@ -30,7 +30,7 @@ name = "dig-node-core"
 # dig-node#276/#296). Changing a public return type is BREAKING for an out-of-workspace implementor;
 # this crate is consumed in-workspace only and is pre-1.0, so it is a MINOR bump under SemVer's 0.x
 # rule -- recorded here rather than letting the number imply the locator surface held still.
-version = "0.62.0"
+version = "0.63.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -392,14 +392,16 @@ dig-social-profile = { version = "0.7", default-features = false }
 # from crates.io too, so cargo unifies to ONE dig-dht instance — its `PeerId` / `Contact` /
 # `DhtTransport` are then the exact types `dig_nat::connect` returns, rather than look-alikes.
 #
-# NOT bumped to 0.15, and this is the tier's REMAINING blocker rather than an oversight: dig-download
-# 0.21.0 and dig-peer-selector 0.10.0 — the LATEST published of each — both require `dig-dht ^0.13`,
-# read from the crates.io index. Declaring "0.15" resolves TWO dig-dht lines while cargo prints
-# success, and dig-dht values cross from this crate into both consumers. dig-dht 0.15 is where
-# `ProviderRecord::unverified_mirror_coin_id` lives (dig-dht#23), so the §25 mirror-coin pointer is
-# unreachable here until dig-download AND dig-peer-selector release against `dig-dht ^0.15` —
-# upstream, never a version edit here. Bridging two lines with a shim is the §4.1 byte-drift class.
-dig-dht = "0.13"
+# 0.15 (dig-node#422): the line that carries `ProviderRecord::unverified_mirror_coin_id` (dig-dht#23)
+# and `announce_provider_with_collateral`, which is what `dht.rs` publishes the untrusted mirror-coin
+# pointer through. Taking it was blocked UPSTREAM, not here: dig-download 0.21.0 and
+# dig-peer-selector 0.10.0 both required `dig-dht ^0.13`, semver-incompatible with 0.15 on a 0.x
+# line, so declaring "0.15" would have resolved TWO dig-dht lines while cargo printed success — with
+# dig-dht values crossing from this crate into both consumers. dig-download 0.22.0 and
+# dig-peer-selector 0.11.0 released against `^0.15` and cleared it. The next line moves the same way:
+# upstream first, verified by counting entries in the resolved `Cargo.lock`, never by reading a
+# caret. Bridging two lines with a shim is the §4.1 byte-drift class.
+dig-dht = "0.15"
 # -- L7 Peer Exchange (PEX, #166) --------------------------------------------------------------------
 # The node<->node peer-sharing protocol: over each established mTLS peer connection, a dedicated PEX
 # logical stream exchanges delta-based first-hand known-peer sets (handshake -> snapshot -> deltas),
@@ -439,13 +441,13 @@ dig-pex = "0.1.1"
 # capsule-checkpoint filename fix (dig-download#38): `FileStateStore` hex-encoded the download key into
 # the filename, so a module key `module:<64hex>:<64hex>` (136 bytes) became a 277-character name and
 # EVERY capsule checkpoint write on Linux failed with `File name too long (os error 36)`. The same fix
-# also shipped as 0.20.1, but 0.20 requires dig-dht ^0.12 / dig-nat ^0.20 / dig-peer ^0.12 /
-# dig-tls ^0.4 — the whole dig_ecosystem#3152 cascade — which this crate cannot take yet, so the
-# backport keeps the 0.19-line pins intact. Regression-tested here through the node's OWN production
+# also shipped as 0.20.1. 0.22 is the release that carries `dig-dht ^0.15`, which is what unblocked
+# the dig-dht tier above (dig-node#422); the dig_ecosystem#3152 cascade it once waited on is done.
+# The 0.19-line regression is still covered: regression-tested here through the node's OWN production
 # checkpoint store (`download.rs::capturing_state_store_checkpoints_a_real_module_download_key`),
 # because dig-download's own suite missed it: every `module.rs` test used `InMemoryStateStore` (no
 # filename at all) and the one `FileStateStore` test used a 3-character key.
-dig-download = "0.21"
+dig-download = "0.22"
 # -- The shared peer client (#1283/#1576) -------------------------------------------------------------
 # `DigPeer` — the ONE DIG Network peer client: peer_id-pinned mTLS over the full NAT ladder plus typed
 # RPC. Depended on DIRECTLY (not only transitively through dig-download) because dig-node supplies the
@@ -480,10 +482,11 @@ dig-peer = "0.13"
 # halves of that split are gone — dig-nat 0.20 and the dig-gossip rev both take `dig-tls ^0.4`, and
 # the lock now resolves dig-tls ONCE at 0.4.0.
 #
-# 0.10 IS takeable as of dig-gossip v0.32.0, which declares `dig-nat = "0.21"` — the release the old
-# note here was waiting on. It carries `dig-dht ^0.13`, which is what holds dig-dht at 0.13; see the
-# dig-dht entry above.
-dig-peer-selector = "0.10"
+# 0.11 carries `dig-dht ^0.15` — one of the two consumer releases that unblocked the dig-dht tier
+# above (dig-node#422). Its predecessor 0.10.0 required `^0.13`, and because this crate passes
+# dig-dht values into the selector, that requirement is what held dig-dht at 0.13; see the dig-dht
+# entry above.
+dig-peer-selector = "0.11"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
 # the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the
@@ -567,7 +570,7 @@ rcgen = "0.13"
 #
 # Pinned by the `the_fail_open_anchor_verifier_is_not_reachable_from_a_production_build` test, which
 # fails if `testkit` ever appears on the production entry.
-dig-download = { version = "0.21", features = ["testkit"] }
+dig-download = { version = "0.22", features = ["testkit"] }
 # Captures the peer-facing serve's real emitted tracing records into an in-memory buffer, so the
 # serve-observability tests (#1595) assert what an operator would actually see in the node log —
 # and that no payload byte or proof ever reaches it.

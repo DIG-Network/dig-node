@@ -425,6 +425,50 @@ pub async fn announce_inventory_ids(
     ids: &[dig_dht::ContentId],
     concurrency: usize,
 ) -> usize {
+    announce_inventory_ids_with_pointers(dht, ids, concurrency, None).await
+}
+
+/// This node's CLAIMED mirror-coin id per content id, together with the collateral epoch those
+/// claims were drawn for (#422).
+///
+/// The claim is **UNTRUSTED** (NC-12). Publishing it tells a verifier WHERE TO LOOK — one coin to
+/// fetch instead of a scan of the mirror puzzle hash — and never WHAT THE COIN IS. A verifier
+/// accepts a coin only on the coin's own evidence: found at the mirror puzzle hash, genuinely $DIG
+/// with the asset id re-derived from the creating spend, carrying the declared collateral, and
+/// `MirrorCoin::advertises(store, root, epoch)` passing. Nothing published here enters that
+/// judgement, so a lying peer buys itself a wasted lookup and nothing else.
+///
+/// **Absence is a normal, fully supported state.** A node with no coin for a capsule — or no
+/// pointer source at all — announces exactly as before; the verifier's fallback is the hint scan.
+/// An implementation MUST NOT treat `None` as a fault, and MUST NOT let it suppress the announce.
+///
+/// [`epoch`](Self::epoch) exists because a mirror coin bonds a `(store, root, owner, epoch)` tuple
+/// while **dig-dht has no clock**: `republish` re-attaches whatever pointer was recorded at announce
+/// time, so a pointer that is never refreshed is wrong one epoch after publication and a
+/// correctly-collateralised node reads as uncollateralised. `epoch()` is what
+/// [`DhtHandle::reannounce_on_epoch_rollover`] compares to detect the rollover.
+pub trait MirrorCoinPointers: Send + Sync {
+    /// The collateral epoch [`coin_id_for`](Self::coin_id_for) currently answers for. A change in
+    /// this value is what triggers the re-announce.
+    fn epoch(&self) -> u64;
+
+    /// The mirror-coin id this node CLAIMS bonds `content` in the current epoch, if it has one.
+    /// `None` is normal and must not degrade discovery.
+    fn coin_id_for(&self, content: &dig_dht::ContentId) -> Option<[u8; 32]>;
+}
+
+/// As [`announce_inventory_ids`], but attaching the untrusted mirror-coin pointer (#422) that
+/// `pointers` supplies for each content id.
+///
+/// The lookup is PER CONTENT ID, because a mirror coin bonds one `(store, root, owner, epoch)`
+/// tuple — one node's inventory can be partly bonded, and the ids without a coin announce
+/// unchanged rather than being held back.
+pub async fn announce_inventory_ids_with_pointers(
+    dht: &DhtService,
+    ids: &[dig_dht::ContentId],
+    concurrency: usize,
+    pointers: Option<&dyn MirrorCoinPointers>,
+) -> usize {
     use futures::stream::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -446,7 +490,8 @@ pub async fn announce_inventory_ids(
         .for_each_concurrent(concurrency.max(1), |id| {
             let done = &done;
             async move {
-                let _ = dht.announce_provider(id).await;
+                let coin_id = pointers.and_then(|p| p.coin_id_for(id));
+                let _ = dht.announce_provider_with_collateral(id, coin_id).await;
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_multiple_of(stride) && n != total {
                     println!(
@@ -486,8 +531,7 @@ pub async fn announce_inventory_ids(
 pub fn spawn_initial_inventory_announce(handle: Arc<DhtHandle>) {
     tokio::spawn(async move {
         let _ = crate::shared::catch_iteration("initial_inventory_announce", async move {
-            let ids = handle.announced_ids().await;
-            announce_inventory_ids(handle.service(), &ids, INITIAL_ANNOUNCE_CONCURRENCY).await;
+            handle.announce_all().await;
         })
         .await;
     });
@@ -555,10 +599,23 @@ pub async fn sync_inventory(
     previous: &[dig_dht::ContentId],
     cached: &[CachedCapsule],
 ) -> InventoryDelta {
+    sync_inventory_with_pointers(dht, previous, cached, None).await
+}
+
+/// As [`sync_inventory`], but attaching the untrusted mirror-coin pointer (#422) to each newly
+/// announced id, so a capsule gained between epochs publishes its pointer at once rather than
+/// waiting for the next rollover.
+pub async fn sync_inventory_with_pointers(
+    dht: &DhtService,
+    previous: &[dig_dht::ContentId],
+    cached: &[CachedCapsule],
+    pointers: Option<&dyn MirrorCoinPointers>,
+) -> InventoryDelta {
     let current = inventory_content_ids(cached);
     let (to_announce, to_withdraw) = inventory_diff(previous, &current);
     for id in &to_announce {
-        let _ = dht.announce_provider(id).await;
+        let coin_id = pointers.and_then(|p| p.coin_id_for(id));
+        let _ = dht.announce_provider_with_collateral(id, coin_id).await;
     }
     for id in &to_withdraw {
         dht.retract_own_provider(id).await;
@@ -610,15 +667,84 @@ pub struct DhtHandle {
     /// The content ids currently announced, guarded so [`Self::refresh_inventory`] can diff + update
     /// atomically against concurrent maintenance.
     announced: tokio::sync::Mutex<Vec<dig_dht::ContentId>>,
+    /// The untrusted mirror-coin pointer source (#422), or `None` on a node that publishes no
+    /// pointers — which is an ordinary, fully supported configuration, not a degraded one.
+    pointers: Option<Arc<dyn MirrorCoinPointers>>,
+    /// The collateral epoch the currently-published pointers were drawn for, so
+    /// [`Self::reannounce_on_epoch_rollover`] can tell a rollover from a quiet tick. `None` until
+    /// the first pointer-bearing announce.
+    announced_epoch: tokio::sync::Mutex<Option<u64>>,
 }
 
 impl DhtHandle {
     /// Wrap a bootstrapped [`DhtService`], recording the initial announced content-id set.
+    ///
+    /// Publishes no mirror-coin pointer; see [`with_mirror_pointers`](Self::with_mirror_pointers).
     pub fn new(service: Arc<DhtService>, initial: Vec<dig_dht::ContentId>) -> Arc<Self> {
+        Self::with_mirror_pointers(service, initial, None)
+    }
+
+    /// As [`new`](Self::new), but attaching this node's untrusted mirror-coin pointers (#422) to
+    /// every announce it makes, and re-attaching them on each epoch rollover.
+    pub fn with_mirror_pointers(
+        service: Arc<DhtService>,
+        initial: Vec<dig_dht::ContentId>,
+        pointers: Option<Arc<dyn MirrorCoinPointers>>,
+    ) -> Arc<Self> {
         Arc::new(DhtHandle {
             service,
             announced: tokio::sync::Mutex::new(initial),
+            pointers,
+            announced_epoch: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Announce this node's whole current content-id set, attaching the mirror-coin pointer each id
+    /// has one for, and remembering the epoch those pointers were drawn for.
+    pub async fn announce_all(&self) -> usize {
+        let ids = self.announced_ids().await;
+        if let Some(p) = self.pointers.as_ref() {
+            *self.announced_epoch.lock().await = Some(p.epoch());
+        }
+        announce_inventory_ids_with_pointers(
+            &self.service,
+            &ids,
+            INITIAL_ANNOUNCE_CONCURRENCY,
+            self.pointers.as_deref(),
+        )
+        .await
+    }
+
+    /// Re-announce every content id with FRESHLY READ pointers when the collateral epoch has rolled
+    /// over since the last announce. Returns how many ids were re-announced (`0` on a quiet tick,
+    /// and always `0` on a node with no pointer source).
+    ///
+    /// This exists because **dig-dht has no clock**. `republish` faithfully re-attaches whatever
+    /// pointer was recorded at announce time, so without this the published pointer names last
+    /// epoch's coin forever: a verifier fetches a coin that no longer advertises the current epoch,
+    /// and a node that IS correctly collateralised reads as uncollateralised. Nothing about that
+    /// failure is visible on the day the pointer is first published, which is why it is asserted
+    /// directly rather than left to the republish path.
+    pub async fn reannounce_on_epoch_rollover(&self) -> usize {
+        let Some(pointers) = self.pointers.as_ref() else {
+            return 0;
+        };
+        let epoch = pointers.epoch();
+        {
+            let mut announced_epoch = self.announced_epoch.lock().await;
+            if *announced_epoch == Some(epoch) {
+                return 0; // same epoch: the published pointers are still the right ones
+            }
+            *announced_epoch = Some(epoch);
+        }
+        let ids = self.announced_ids().await;
+        announce_inventory_ids_with_pointers(
+            &self.service,
+            &ids,
+            INITIAL_ANNOUNCE_CONCURRENCY,
+            Some(pointers.as_ref()),
+        )
+        .await
     }
 
     /// The underlying service (for the inbound-RPC serving path + diagnostics).
@@ -646,7 +772,13 @@ impl DhtHandle {
     /// it, which is what keeps the DHT records and the flood in agreement.
     pub async fn reconcile_inventory(&self, cached: &[CachedCapsule]) -> InventoryDelta {
         let mut announced = self.announced.lock().await;
-        let delta = sync_inventory(&self.service, &announced, cached).await;
+        let delta = sync_inventory_with_pointers(
+            &self.service,
+            &announced,
+            cached,
+            self.pointers.as_deref(),
+        )
+        .await;
         *announced = inventory_content_ids(cached);
         delta
     }
@@ -724,10 +856,15 @@ pub async fn run_maintenance(handle: Arc<DhtHandle>, interval: Duration) {
         // asserting its unwind-safety is sound; the next tick resumes the schedule.
         let _ = crate::shared::catch_iteration("dht_maintenance", async {
             let dht = &handle.service;
+            // BEFORE the republish, not after: republish re-attaches the pointer recorded at
+            // announce time, so a rollover detected only afterwards would leave last epoch's coin
+            // id published for a further whole interval (#422).
+            let repointed = handle.reannounce_on_epoch_rollover().await;
             let republished = dht.republish().await;
             let refreshed = dht.refresh_buckets().await;
             let collected = dht.gc().await;
             tracing::debug!(
+                repointed,
                 republished,
                 refreshed,
                 collected,
@@ -1562,6 +1699,208 @@ mod tests {
         assert!(
             whole.contains(ordinary),
             "an ordinary cause is not truncated: {whole:?}"
+        );
+    }
+
+    // -- The untrusted mirror-coin pointer (#422) -----------------------------------------------
+
+    const COIN_THIS_EPOCH: [u8; 32] = [0xA1; 32];
+    const COIN_NEXT_EPOCH: [u8; 32] = [0xB2; 32];
+
+    /// A pointer source whose epoch AND its coin ids move together, as a real rollover moves them:
+    /// a mirror coin bonds `(store, root, owner, epoch)`, so the coin that bonds a capsule in epoch
+    /// N+1 is a DIFFERENT coin from the one that bonded it in epoch N.
+    ///
+    /// The two must vary together or the rollover test is blind: a fake that keeps the same coin id
+    /// across the rollover cannot tell a re-announce that re-reads the pointers from one that
+    /// replays the pointer recorded at the first announce.
+    struct EpochPointers {
+        state: std::sync::Mutex<(u64, std::collections::HashMap<ContentId, [u8; 32]>)>,
+    }
+
+    impl EpochPointers {
+        fn new(epoch: u64, bonded: &[(ContentId, [u8; 32])]) -> Arc<Self> {
+            Arc::new(EpochPointers {
+                state: std::sync::Mutex::new((epoch, bonded.iter().copied().collect())),
+            })
+        }
+
+        /// The chain moved on: a new epoch, bonded by new coins.
+        fn roll_to(&self, epoch: u64, bonded: &[(ContentId, [u8; 32])]) {
+            *self.state.lock().expect("pointers") = (epoch, bonded.iter().copied().collect());
+        }
+    }
+
+    impl MirrorCoinPointers for EpochPointers {
+        fn epoch(&self) -> u64 {
+            self.state.lock().expect("pointers").0
+        }
+
+        fn coin_id_for(&self, content: &ContentId) -> Option<[u8; 32]> {
+            self.state.lock().expect("pointers").1.get(content).copied()
+        }
+    }
+
+    /// A `DhtService` with an EMPTY routing table, so `announce_provider` stores locally without a
+    /// network round trip and `find_providers` answers from that same local store — which is what
+    /// lets these tests read back exactly what this node published about itself.
+    fn local_only_service(label: &str) -> Arc<DhtService> {
+        Arc::new(DhtService::new(
+            PeerId::from_bytes([0x42; 32]),
+            vec![CandidateAddr::direct("::1", 9444)],
+            dig_dht::DhtConfig::default(),
+            Arc::new(test_transport(label)),
+        ))
+    }
+
+    /// The mirror-coin pointer this node currently publishes for `id`, read back off its own
+    /// provider record.
+    async fn published_pointer(service: &DhtService, id: &ContentId) -> Option<[u8; 32]> {
+        let records = service.find_providers(id).await.expect("local providers");
+        let record = records
+            .first()
+            .expect("this node provides the id it announced");
+        record.unverified_mirror_coin_id_bytes()
+    }
+
+    /// Two ids: one this node holds a mirror coin for, one it does not.
+    fn bonded_and_unbonded() -> (ContentId, ContentId) {
+        (
+            ContentId::capsule([0x01; 32], [0x02; 32]),
+            ContentId::capsule([0x03; 32], [0x04; 32]),
+        )
+    }
+
+    /// **Proves:** the pointer is attached PER CONTENT ID — the id with a coin publishes it, and the
+    /// id without one is announced exactly as before.
+    ///
+    /// **Catches:** attaching one node-wide pointer to every id (a mirror coin bonds one
+    /// `(store, root, owner, epoch)` tuple, so a shared pointer would send verifiers to a coin that
+    /// does not advertise the capsule they asked about), and any implementation that treats a
+    /// missing coin as a fault by skipping or failing that announce. The unbonded id is the
+    /// truthful control: it is what makes "absence does not degrade discovery" observable rather
+    /// than assumed.
+    #[tokio::test]
+    async fn the_pointer_is_attached_per_id_and_its_absence_does_not_suppress_the_announce() {
+        let (bonded, unbonded) = bonded_and_unbonded();
+        let service = local_only_service("pointer-per-id-422");
+        let pointers = EpochPointers::new(7, &[(bonded, COIN_THIS_EPOCH)]);
+        let handle = DhtHandle::with_mirror_pointers(
+            service.clone(),
+            vec![bonded, unbonded],
+            Some(pointers),
+        );
+
+        assert_eq!(
+            handle.announce_all().await,
+            2,
+            "both ids are announced; a missing coin is not a reason to withhold one"
+        );
+
+        assert_eq!(
+            published_pointer(&service, &bonded).await,
+            Some(COIN_THIS_EPOCH),
+            "the bonded id publishes this node's claimed coin"
+        );
+        assert_eq!(
+            published_pointer(&service, &unbonded).await,
+            None,
+            "the unbonded id publishes no pointer -- and is still a normal provider record"
+        );
+    }
+
+    /// **Proves:** when the collateral epoch rolls over, every announced id is re-announced with
+    /// FRESHLY READ pointers, and a tick within the same epoch re-announces nothing.
+    ///
+    /// **Catches:** the failure this half of #422 exists for, which is invisible on the day the
+    /// pointer ships. dig-dht has NO CLOCK: `republish` re-attaches whatever pointer was recorded at
+    /// announce time, so an implementation that publishes the pointer once and leaves refreshing to
+    /// republish keeps naming LAST epoch's coin forever -- a verifier fetches a coin that no longer
+    /// advertises the current epoch, and a correctly-collateralised node reads as uncollateralised.
+    /// The republish assertion in the middle is what pins that: it shows the record surviving a
+    /// republish UNCHANGED, so the later change can only have come from the rollover re-announce.
+    ///
+    /// It also catches a re-announce that replays the cached pointer (the id would still name
+    /// `COIN_THIS_EPOCH`), and one that fires on every tick regardless of epoch (the two
+    /// same-epoch calls must return 0).
+    #[tokio::test]
+    async fn the_pointer_is_refreshed_when_the_collateral_epoch_rolls_over() {
+        let (bonded, unbonded) = bonded_and_unbonded();
+        let service = local_only_service("pointer-rollover-422");
+        let pointers = EpochPointers::new(7, &[(bonded, COIN_THIS_EPOCH)]);
+        let handle = DhtHandle::with_mirror_pointers(
+            service.clone(),
+            vec![bonded, unbonded],
+            Some(pointers.clone()),
+        );
+
+        handle.announce_all().await;
+        assert_eq!(
+            published_pointer(&service, &bonded).await,
+            Some(COIN_THIS_EPOCH)
+        );
+
+        // A maintenance tick inside the same epoch: nothing to refresh.
+        assert_eq!(
+            handle.reannounce_on_epoch_rollover().await,
+            0,
+            "the published pointers are still the right ones; re-announcing every tick would put \
+             the whole inventory back on the wire for nothing"
+        );
+
+        // And republish alone cannot refresh it -- it faithfully replays what was recorded.
+        service.republish().await;
+        assert_eq!(
+            published_pointer(&service, &bonded).await,
+            Some(COIN_THIS_EPOCH),
+            "republish re-attaches the recorded pointer; it is not a refresh mechanism"
+        );
+
+        // The chain rolls over: a new epoch, bonded by a new coin.
+        pointers.roll_to(8, &[(bonded, COIN_NEXT_EPOCH)]);
+
+        assert_eq!(
+            handle.reannounce_on_epoch_rollover().await,
+            2,
+            "every announced id is re-announced on a rollover"
+        );
+        assert_eq!(
+            published_pointer(&service, &bonded).await,
+            Some(COIN_NEXT_EPOCH),
+            "the refreshed announce names THIS epoch's coin, read fresh rather than replayed"
+        );
+        assert_eq!(
+            published_pointer(&service, &unbonded).await,
+            None,
+            "an id with no coin in the new epoch still publishes none"
+        );
+
+        assert_eq!(
+            handle.reannounce_on_epoch_rollover().await,
+            0,
+            "the new epoch is now the announced one; a second tick is quiet again"
+        );
+    }
+
+    /// **Proves:** a node with no pointer source at all behaves exactly as it did before #422 --
+    /// every id announced, no pointer published, and the rollover check a no-op.
+    ///
+    /// **Catches:** making the pointer source load-bearing for discovery. A node that has never
+    /// minted a mirror coin is an ordinary DIG node, not a broken one, and it must not be held back
+    /// from announcing or spun through re-announces it has nothing to refresh.
+    #[tokio::test]
+    async fn a_node_with_no_pointer_source_announces_exactly_as_before() {
+        let (bonded, unbonded) = bonded_and_unbonded();
+        let service = local_only_service("pointer-absent-422");
+        let handle = DhtHandle::new(service.clone(), vec![bonded, unbonded]);
+
+        assert_eq!(handle.announce_all().await, 2);
+        assert_eq!(published_pointer(&service, &bonded).await, None);
+        assert_eq!(published_pointer(&service, &unbonded).await, None);
+        assert_eq!(
+            handle.reannounce_on_epoch_rollover().await,
+            0,
+            "there is nothing to refresh, and no epoch to compare against"
         );
     }
 }
