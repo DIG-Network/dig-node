@@ -125,12 +125,26 @@ pub struct NodeMirrorEffects<'a, S: ChainSource> {
     capsules: Vec<ObservedCapsule>,
     /// Spendable $DIG at the operator address, already read. `Err` defers creates, never reclaims.
     dig_balance: Result<u64, PassError>,
-    /// The coins already committed to a bundle in flight, read ONCE per pass.
+    /// The coins committed to a bundle in flight: the durable record read once, then EXTENDED by
+    /// every broadcast this pass makes.
+    ///
+    /// The audit log is read once by the scheduler, before the pass — one reading of the record, in
+    /// the same way the pass takes one reading of the disk and one of the balance. That snapshot
+    /// alone is only an ACROSS-pass reservation, and a pass emits N creates
+    /// ([`super::runner`] loops over the affordable prefix). A create's own broadcast does not
+    /// appear in a snapshot taken before it, and the chain still shows its funding coin unspent for
+    /// the whole confirmation window — so the second create in one pass re-selected the first's coin
+    /// and broadcast a bundle that double-spent it.
+    ///
+    /// The `RefCell` is what closes that window: [`Self::sign_and_broadcast`] extends this set from
+    /// the signed bundle on a broadcast that reached the mempool, so the next create in the same
+    /// pass selects against what this pass has already spent. It is exactly the set the durable
+    /// journal receives, which is why the two cannot disagree. `SPEC.md` §25 states the property.
     ///
     /// `Err` defers creates and NEVER reclaims, exactly like `dig_balance`: a reclaim needs no coin
     /// selection at all (§25.4.4), so gating it on a funding read would reintroduce the legacy
     /// defect where a node that could not fund could not recover either.
-    committed_coin_ids: Result<std::collections::HashSet<String>, PassError>,
+    committed_coin_ids: Result<std::cell::RefCell<std::collections::HashSet<String>>, PassError>,
     /// Where this node advertises its stores can be fetched from. Empty means it cannot advertise.
     advertised_urls: Vec<String>,
     /// The chain, for the owned-coin scan and for the reclaim spends.
@@ -173,7 +187,9 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
         Self {
             capsules,
             dig_balance,
-            committed_coin_ids,
+            // Wrapped here rather than at the call site: the scheduler's job is to take ONE reading
+            // of the audit record, and within-pass accumulation is this type's business.
+            committed_coin_ids: committed_coin_ids.map(std::cell::RefCell::new),
             advertised_urls,
             source,
             owner_puzzle_hash,
@@ -248,6 +264,28 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
                 // from this path at all. A `None` stays `None` — naming a plausible coin would let
                 // §23.5's reconcile confirm this spend against a coin it never created, the legacy
                 // defect `TargetCoinId` exists to make inexpressible.
+                // The IN-MEMORY reservation is extended from the same value, so a later create in
+                // THIS pass cannot re-select a coin this bundle just spent. The durable journal is
+                // an across-pass record only: it is re-read once per pass, before the pass, so
+                // nothing written here reaches the next create through it. The chain cannot supply
+                // the answer either — a broadcast coin stays unspent in the chain's view for the
+                // whole confirmation window, which is shorter than nothing and longer than a round.
+                //
+                // Extended only on a broadcast that REACHED the mempool. Reserving on attempt would
+                // strand a coin every time a broadcast failed, and the failure path below already
+                // records that the money stayed put.
+                //
+                // Reclaims feed it too, and that is deliberate: `funding_coin_ids` is read from the
+                // bundle, so this set holds exactly what the journal holds, and a set that
+                // disagreed with the record it mirrors would be a second answer to "what is in
+                // flight". A poisoned `Err` reading contributes nothing — it already refuses every
+                // create, and reclaims never consult it (§25.4.4).
+                if let Ok(committed) = self.committed_coin_ids.as_ref() {
+                    committed
+                        .borrow_mut()
+                        .extend(funding_coin_ids.iter().map(|c| c.0.clone()));
+                }
+
                 self.journal.submitted(
                     &recorded,
                     Submission {
@@ -357,13 +395,21 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         // The amount is the planner's — `apply_safety_margin(required_per_store, margin_bp)`,
         // §25.3 — carried straight through. Nothing here re-derives it and nothing here has an
         // opinion about it: a create at the wrong amount locks money and advertises nothing.
-        let dig_coins = funding::select_operator_dig_cats(
-            self.source,
-            self.owner_puzzle_hash,
-            amount_dig_base_units,
-            committed,
-        )
-        .map_err(funding_refusal)?;
+        //
+        // The borrow is scoped to the selection ALONE and released before anything is signed.
+        // `sign_and_broadcast` takes the set mutably to record what this bundle consumed, and a
+        // borrow still live across that call is a runtime panic on the money path rather than a
+        // compile error — so the scope is the guarantee, and it is deliberately narrow.
+        let dig_coins = {
+            let committed = committed.borrow();
+            funding::select_operator_dig_cats(
+                self.source,
+                self.owner_puzzle_hash,
+                amount_dig_base_units,
+                &committed,
+            )
+            .map_err(funding_refusal)?
+        };
 
         let signer = self
             .signer
