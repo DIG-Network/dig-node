@@ -3451,6 +3451,24 @@ fn collateral_requirement(id: Value) -> Value {
 /// (dig-node#387), and the operator's spendable balance is not a fact this node holds — it cannot
 /// know which address holds their $DIG, and a balance read of the wrong address returns a confident
 /// number about the wrong money. A zero would read as "no buffer needed" and have them post nothing.
+/// How many of an observation's served pairs this node will actually BOND.
+///
+/// Every state except `Withheld` is a pair this node either has collateralised or intends to —
+/// `Bonded`, `Pending`, `Unfunded` and `FundsUnknown` all describe a coin that exists or is owed.
+/// `Withheld` is the one row that describes a capsule relayed on a stranger's behalf, deliberately
+/// never advertised and therefore never bonded, so it locks nothing.
+///
+/// Named and separated from [`collateral_buffer`] so the distinction is testable without a state
+/// directory: the caller feeds this into an amount of money, and a count that quietly includes rows
+/// locking nothing is a wrong figure on a money surface rather than a wrong figure about rows.
+fn bondable_pairs(observation: &crate::mirror::states::BondObservation) -> u64 {
+    observation
+        .states
+        .iter()
+        .filter(|(_, state)| !matches!(state, crate::mirror::pass::BondState::Withheld))
+        .count() as u64
+}
+
 fn collateral_buffer(
     observation: Option<crate::mirror::states::BondObservation>,
     id: Value,
@@ -3466,10 +3484,17 @@ fn collateral_buffer(
         // still does when the first pass has not completed: `None` here is the absence of an
         // observation, never a served set of zero.
         //
-        // It is the count of BOND ROWS, which is the served set — held AND relayed — and it is not
-        // approximated from the hosted-store list: a set that merely resembles the served pairs
-        // yields a plausible wrong number on a money surface, which is worse than no number.
-        observation.map(|o| o.states.len() as u64),
+        // It counts the BONDABLE rows, not every row. `states` is the SERVED set — held and relayed
+        // both, so `withheld` has a producer — but a `Withheld` row is relayed on a stranger's
+        // behalf, is never bonded, and therefore locks nothing. `buffer_advice` feeds this straight
+        // into `one_epoch_lock`, which is an amount of $DIG the operator must have available to
+        // LOCK, so counting rows that lock nothing advises a buffer for money that will never be
+        // spent. The parameter is `pairs_served_by_this_node`; the arithmetic is about the pairs
+        // this node will BOND, and where those two readings diverge the arithmetic wins.
+        //
+        // It is not approximated from the hosted-store list: a set that merely resembles the served
+        // pairs yields a plausible wrong number on a money surface, which is worse than no number.
+        observation.as_ref().map(bondable_pairs),
         &requirement,
         margin_bp,
         None,

@@ -32,10 +32,18 @@
 //!
 //! # What this node can and cannot do with money today
 //!
-//! **Reclaims work.** `dig_mirror_coin::reclaim` recreates the full locked amount at the owner's own
-//! puzzle hash and is supported at `fee = 0`, which needs no fee coins at all — so a node whose XCH
-//! is exhausted can still recover $DIG it has locked. That is §25.4.4, and it is the invariant that
-//! matters most, because its failure mode is collateral locked forever.
+//! **Reclaims are BUILT but not yet SENT.** `dig_mirror_coin::reclaim` recreates the full locked
+//! amount at the owner's own puzzle hash and is supported at `fee = 0`, which needs no fee coins at
+//! all — so a node whose XCH is exhausted can still recover $DIG it has locked. That is §25.4.4, and
+//! it is the invariant that matters most, because its failure mode is collateral locked forever.
+//!
+//! The spend is complete; the WIRING is not. This node attaches no production [`Broadcaster`] yet
+//! ([`production_broadcaster`] is `None`, dig-node#424), so a planned reclaim refuses by name before
+//! it signs, exactly as a create refuses for dig-node#421. Both refusals are reported, both name
+//! their missing piece, and neither is a guess dressed as a spend. The reported
+//! [`SpendCapability`] is DERIVED from the same seam, so the node cannot announce a power it does
+//! not have: while the broadcaster is absent the capability is
+//! [`SpendCapability::BroadcasterUnwired`] and never `Available`.
 //!
 //! **Creates do not, yet, and they refuse rather than guess.** `dig_mirror_coin::create` takes the
 //! `Cat` inputs from its caller, and selecting them requires a $DIG coin selector scoped to the
@@ -173,10 +181,15 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
         let signer = self
             .signer
             .ok_or_else(|| PassError::Wallet("no operator wallet is available to sign".into()))?;
+        // Named the way `create` names dig-node#421: at the point this refusal is reachable, the
+        // operator has ALREADY set `DIG_WALLET_ENABLE_LIVE_BROADCAST` — `open_signer` yields no
+        // signer without it, and the signer is checked first — so blaming that flag would tell a
+        // person to set the flag they just set. What is missing is the wiring, and the wiring has a
+        // ticket.
         let broadcaster = self.broadcaster.ok_or_else(|| {
             PassError::Wallet(
-                "live broadcast is disabled (DIG_WALLET_ENABLE_LIVE_BROADCAST), so no mirror spend \
-                 is sent"
+                "this node has no production broadcaster wired for the mirror lifecycle \
+                 (dig-node#424), so the spend was built and then NOT sent; nothing was signed"
                     .into(),
             )
         })?;
@@ -354,12 +367,21 @@ fn reclaimed_coin_id(mirror: &MirrorCoin) -> TargetCoinId {
 /// wallet available at all" is answered once, at the place that can say why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendCapability {
-    /// An operator wallet opened and live broadcast is enabled: this node may create and reclaim.
+    /// An operator wallet opened, live broadcast is enabled, AND a broadcaster is wired: this node
+    /// may create and reclaim.
     Available,
     /// The §16.4 wallet did not open — absent, `Locked`, or `Orphaned`. Observation continues.
     WalletUnavailable,
     /// A wallet opened but `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off, the money-safe default.
     BroadcastDisabled,
+    /// Everything the OPERATOR controls is in place — a wallet opened and live broadcast is on — but
+    /// this build wires no production [`Broadcaster`] (dig-node#424), so a spend can be built and
+    /// signed for and still reach nothing.
+    ///
+    /// Distinguished from [`Self::BroadcastDisabled`] because the two ask different things of the
+    /// reader: one is a switch they can flip, and this one is not. Reporting a missing wiring as a
+    /// disabled flag sends an operator to set a flag that is already set.
+    BroadcasterUnwired,
 }
 
 impl SpendCapability {
@@ -388,7 +410,41 @@ pub fn open_signer(
         // which are different things for an operator to fix.
         return (None, SpendCapability::BroadcastDisabled);
     }
-    (Some(MirrorSigner::new(wallet)), SpendCapability::Available)
+    // The signer is yielded either way: the owner puzzle hash the OBSERVATION half needs comes from
+    // it, and no spend can escape on the back of it, because `sign_and_broadcast` checks the
+    // broadcaster before it signs.
+    (
+        Some(MirrorSigner::new(wallet)),
+        spend_capability(production_broadcaster().is_some()),
+    )
+}
+
+/// What an OPENED wallet with live broadcast on can actually do, given whether a broadcaster exists.
+///
+/// Separated from [`open_signer`] so the decision is reachable from a test on both branches: the
+/// wired branch cannot be exercised through `open_signer` on a build where
+/// [`production_broadcaster`] is `None`, and an untestable branch is how the previous version came
+/// to report `Available` on a node that could not send.
+pub fn spend_capability(broadcaster_wired: bool) -> SpendCapability {
+    if broadcaster_wired {
+        SpendCapability::Available
+    } else {
+        SpendCapability::BroadcasterUnwired
+    }
+}
+
+/// The [`Broadcaster`] this build attaches to the mirror lifecycle — `None` until dig-node#424.
+///
+/// ONE seam, read by both the reported capability ([`open_signer`]) and the effects the scheduler
+/// builds, precisely so the two cannot disagree. The alternative — a capability computed from the
+/// environment and a broadcaster passed separately at the construction site — is what let this node
+/// log "this node may create and reclaim collateral" while every reclaim refused: two answers to one
+/// question, and only one of them on the path the money takes.
+///
+/// `&'static` because the honest answer is a property of the build rather than of a request, and
+/// because a static coerces into the shorter lifetime `NodeMirrorEffects` borrows for.
+pub fn production_broadcaster() -> Option<&'static dyn Broadcaster> {
+    None
 }
 
 /// Publish what a pass observed, so `control.mirror.bondStates` can answer from it.
@@ -502,6 +558,101 @@ mod tests {
         ]
     }
 
+    /// `Available` and a wired broadcaster are the SAME fact, so the node cannot announce a power a
+    /// spend does not have.
+    ///
+    /// This is the assertion the earlier wiring had no room for. `open_signer` reported `Available`
+    /// from the environment while the scheduler built its effects with a hard-coded `None`, so the
+    /// bring-up log said "this node may create and reclaim collateral" and every reclaim refused —
+    /// two answers to one question, with only one of them on the path the money takes. Deriving both
+    /// from [`production_broadcaster`] makes disagreement inexpressible, and this test fails the
+    /// moment someone reintroduces a second source: report `Available` with no broadcaster wired, or
+    /// wire one while still reporting `BroadcasterUnwired`, and the implication below breaks.
+    ///
+    /// Written as an implication over the seam rather than as `assert_eq!(capability, Unwired)`
+    /// because the second spelling becomes a FALSE failure the day dig-node#424 lands — a test that
+    /// has to be deleted to ship the fix is not guarding the property, it is guarding the gap.
+    #[test]
+    fn the_reported_capability_cannot_disagree_with_what_can_actually_broadcast() {
+        // BOTH branches, which is why the decision is a named function: the wired branch is
+        // unreachable through `open_signer` on this build, and a branch no fixture can take reads as
+        // covered while never having run once.
+        assert_eq!(
+            spend_capability(true),
+            SpendCapability::Available,
+            "a wired broadcaster is what Available means"
+        );
+        assert_eq!(
+            spend_capability(false),
+            SpendCapability::BroadcasterUnwired,
+            "with no broadcaster the node must say so, not report a switched-off flag the operator \
+             has already switched on"
+        );
+        assert!(
+            !spend_capability(false).may_spend(),
+            "a node with no broadcaster may not spend, whatever the operator has enabled"
+        );
+
+        // The load-bearing half: on THIS build the seam is empty, so no path may report Available.
+        // Hard-code `Available` back into `open_signer` and this fails; wire dig-node#424 and it
+        // keeps passing, because the assertion is an implication over the seam rather than a
+        // snapshot of the gap.
+        assert_eq!(
+            spend_capability(production_broadcaster().is_some()) == SpendCapability::Available,
+            production_broadcaster().is_some(),
+            "Available and a wired broadcaster must be the same fact"
+        );
+    }
+
+    /// What a real installation LOOKS like, assembled independently of the needles.
+    ///
+    /// Independently is the whole point: the discriminating test below asks whether each needle
+    /// matches a line somebody might actually write. Building the sample by interpolating the needle
+    /// into it answers a different question — whether a string contains itself — which is true for
+    /// every needle including a wrong one, and is the tautology this pair replaces.
+    ///
+    /// `concat!` for the same reason the needles use it — and this comment is fragmented for the
+    /// same reason again: an installation spelled out in full anywhere in this file, prose included,
+    /// sits in the file's own source and trips the guard on itself.
+    fn sample_installations() -> [&'static str; 2] {
+        [
+            concat!(
+                "        let backend = backend.with_",
+                "signer(signer.clone());"
+            ),
+            concat!(
+                "        let backend = backend.with_",
+                "broadcaster(pusher);"
+            ),
+        ]
+    }
+
+    /// Every file that HOLDS or BUILDS the served backend, and could therefore install on it.
+    ///
+    /// `service.rs` is the file that CONSTRUCTS it (`WalletService::build_with`), reaching
+    /// `AppState.wallet` from `server.rs`; `wallet_mtls.rs` and `control.rs` hold the same `Arc`.
+    /// The earlier list named only the three mirror-adjacent files, so a regression introduced at
+    /// the construction site — the likeliest place for one — would not have tripped the guard.
+    ///
+    /// `rpc.rs` is deliberately ABSENT: it DEFINES `with_signer`/`with_broadcaster` and its own
+    /// tests call them, so scanning it would fail on the definition and force the guard to be
+    /// weakened into uselessness.
+    ///
+    /// **Known residue, stated rather than implied.** `dig-wallet`'s own `sage/service.rs` — where
+    /// `WalletService::build_with` constructs the backend this crate is handed — is NOT scanned: an
+    /// `include_str!` reaching outside this package would leave the crate unpackageable, which is a
+    /// worse defect than the one it guards. The property holds there today (neither spelling appears
+    /// anywhere outside `rpc.rs`), and the guard that would cover it belongs in `dig-wallet`.
+    fn guarded_sources() -> [(&'static str, &'static str); 5] {
+        [
+            ("lifecycle.rs", include_str!("lifecycle.rs")),
+            ("signer.rs", include_str!("signer.rs")),
+            ("../server.rs", include_str!("../server.rs")),
+            ("../control.rs", include_str!("../control.rs")),
+            ("../wallet_mtls.rs", include_str!("../wallet_mtls.rs")),
+        ]
+    }
+
     /// The mirror signer NEVER reaches the served wallet backend.
     ///
     /// Asserted STRUCTURALLY, over the crate's own source, because the property is about something
@@ -521,11 +672,7 @@ mod tests {
     /// or breaking the guard.
     #[test]
     fn no_signer_or_broadcaster_is_ever_installed_on_the_served_wallet_backend() {
-        for (name, source) in [
-            ("lifecycle.rs", include_str!("lifecycle.rs")),
-            ("signer.rs", include_str!("signer.rs")),
-            ("../server.rs", include_str!("../server.rs")),
-        ] {
+        for (name, source) in guarded_sources() {
             for forbidden in forbidden_installations() {
                 assert!(
                     !source.contains(forbidden),
@@ -537,24 +684,39 @@ mod tests {
 
     /// The guard is looking at real text and WOULD fail if the call appeared.
     ///
-    /// Two failure modes it removes, both of which leave a green guard proving nothing: a needle
-    /// that matches no possible call, and an `include_str!` pointing at a file that does not contain
-    /// the code being guarded. The second is asserted by requiring a string every guarded file
-    /// genuinely contains, so a path typo is a failure rather than an empty search.
+    /// Three failure modes it removes, each of which leaves a green guard proving nothing: a needle
+    /// that matches no possible call, a needle so loose it matches anything, and an `include_str!`
+    /// pointing at a file that does not contain the code being guarded. The last is asserted by
+    /// requiring a string every guarded file genuinely contains, so a path typo is a failure rather
+    /// than an empty search.
+    ///
+    /// The first two are what the earlier version could not see: it interpolated the needle into its
+    /// own fixture and then asserted the fixture contained it, which holds for EVERY needle — a
+    /// misspelling such as `.with_signer (` included. Matching against a sample written on its own
+    /// terms is what makes the assertion capable of failing.
     #[test]
     fn the_installation_guard_can_actually_fail() {
-        for needle in forbidden_installations() {
-            let planted = format!("let _ = backend{needle}s);");
+        for (needle, sample) in forbidden_installations()
+            .into_iter()
+            .zip(sample_installations())
+        {
             assert!(
-                planted.contains(needle),
-                "{needle} is the spelling a real installation would write"
+                sample.contains(needle),
+                "{needle} must match the line a real installation would write: {sample}"
             );
         }
-        for (name, source) in [
-            ("lifecycle.rs", include_str!("lifecycle.rs")),
-            ("signer.rs", include_str!("signer.rs")),
-            ("../server.rs", include_str!("../server.rs")),
-        ] {
+
+        // A needle that is subtly wrong matches NOTHING, and the guard built on it would be green
+        // forever. Spelled with a space before the parenthesis — the plausible near-miss.
+        let near_miss = concat!(".with_", "signer (");
+        for sample in sample_installations() {
+            assert!(
+                !sample.contains(near_miss),
+                "a needle that matches no real call must be visible as a failure, not a pass"
+            );
+        }
+
+        for (name, source) in guarded_sources() {
             assert!(
                 source.contains("WalletBackend"),
                 "{name} must be the file that could install a signer; an empty or wrong include                  makes the guard pass forever"

@@ -2722,6 +2722,14 @@ fn spawn_mirror_passes(
                 target: "mirror",
                 "the mirror lifecycle OBSERVES only: the operator wallet (SPEC.md §16.4) did not open"
             ),
+            // Deliberately NOT phrased as a flag to set: the operator has already set
+            // DIG_WALLET_ENABLE_LIVE_BROADCAST to reach this arm at all.
+            SpendCapability::BroadcasterUnwired => tracing::info!(
+                target: "mirror",
+                "the mirror lifecycle OBSERVES only: the wallet opened and live broadcast is on, \
+                 but this build wires no broadcaster (dig-node#424), so a reclaim is planned and \
+                 reported and no spend is sent"
+            ),
         }
 
         let journal = lifecycle::journal();
@@ -2771,7 +2779,10 @@ fn spawn_mirror_passes(
                             owner_puzzle_hash,
                             signer_ref,
                             &journal,
-                            None,
+                            // The SAME seam `open_signer` derived the reported capability from, so
+                            // what this node says it can do and what a spend can actually reach
+                            // cannot be two different answers (dig-node#424).
+                            lifecycle::production_broadcaster(),
                             runtime,
                         );
                         let mut pass =
