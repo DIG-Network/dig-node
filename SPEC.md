@@ -8356,3 +8356,34 @@ The surface MUST hold four properties, each of which is a money statement:
 * A crash at any point loses at most watcher events; the next pass re-derives the plan from disk
   and chain, and §23.5's reconcile plus in-flight suppression prevent both double-creates and
   silent losses.
+
+### 25.10. What the node advertises, and why it is configured
+
+A mirror coin publishes, in its memos, the URLs its store can be fetched from. `dig-mirror-coin`
+requires at least one and imposes no other rule on them: they are advisory fetch hints, and the
+crate's reader accepts any UTF-8 entry. This node therefore decides for itself what it is honest to
+publish about itself.
+
+The advertised URLs are **operator-configured and MUST NOT be derived**. A coin's URLs are fixed at
+create for the whole epoch, so an address the node inferred about itself — a STUN reflexive address,
+a resolver answer — may be unreachable from outside or may simply change, leaving collateral staked
+on a claim the node cannot keep, which this section penalises. The operator sets them in
+`DIG_MIRROR_ADVERTISE_URLS`, separated by commas or whitespace.
+
+* The list MAY carry several entries; the memo layout is built for that. IPv6 entries SHOULD be
+  listed first, and the node publishes the operator's order verbatim rather than sorting it.
+* An entry MUST be an absolute URL with a scheme and a host. No scheme allowlist is imposed.
+* An entry whose host can only mean this machine — loopback, the unspecified address, link-local,
+  `localhost`, or `dig.local` — MUST NOT be published. The rule is on the address the host DENOTES,
+  not on how it is written: it MUST hold under every scheme, including a non-special one whose host
+  is opaque, and an IPv6 address that embeds an IPv4 one MUST be judged by the address it embeds.
+  A private or LAN address MAY be published: it is a deliberate operator choice and risks only that
+  operator's own stake.
+* A rejected entry is dropped with a warning naming the reason; the surviving entries are published.
+* When no entry survives, **the node advertises nothing and creates no mirror coin**. That refusal
+  is the correct default: publishing a URL nobody can fetch from is worse than publishing none,
+  because it locks collateral against a claim that will be penalised.
+
+Changing the value affects only coins created after the change. Bringing an existing coin into line
+means reclaiming and re-creating it — a round trip and a fee — and the node MUST NOT reclaim in
+response to a configuration edit.

@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.176.0"
+version = "0.177.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3080,6 +3080,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "windows-service",
  "windows-sys 0.61.2",
 ]
