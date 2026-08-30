@@ -573,10 +573,56 @@ mod tests {
     /// because the second spelling becomes a FALSE failure the day dig-node#424 lands — a test that
     /// has to be deleted to ship the fix is not guarding the property, it is guarding the gap.
     #[test]
-    fn the_reported_capability_cannot_disagree_with_what_can_actually_broadcast() {
-        // BOTH branches, which is why the decision is a named function: the wired branch is
-        // unreachable through `open_signer` on this build, and a branch no fixture can take reads as
-        // covered while never having run once.
+    fn an_opened_wallet_with_broadcast_enabled_still_may_not_spend_with_no_broadcaster_wired() {
+        use dig_wallet::autoseed::BootstrapState;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let paths = WalletPaths::resolve(dir.path().join("seed"));
+
+        // A REAL operator wallet, minted into the temp layout. Without one this test would take the
+        // `WalletUnavailable` path and pass while never reaching the decision under test — which is
+        // exactly how the first version of it went green against the very regression it names.
+        let state = crate::wallet_bootstrap::ensure_wallet_seed_at(&paths)
+            .expect("the autoseed bootstrap yields a state");
+        assert!(
+            matches!(state, BootstrapState::Created | BootstrapState::Opened),
+            "the fixture must actually OPEN a wallet, or the assertions below are vacuous: {state:?}"
+        );
+
+        // Live broadcast ON — the operator has already done everything they can do.
+        let (signer, capability) = open_signer(&paths, true);
+
+        assert!(
+            signer.is_some(),
+            "an opened wallet yields a signer; the observation half needs its puzzle hash"
+        );
+        assert_eq!(
+            capability,
+            spend_capability(production_broadcaster().is_some()),
+            "open_signer must REPORT what the pass will actually be handed, never re-decide it"
+        );
+
+        if production_broadcaster().is_none() {
+            assert_eq!(
+                capability,
+                SpendCapability::BroadcasterUnwired,
+                "with the seam empty the honest answer is the missing wiring, not a switched-off \
+                 flag the operator has already switched on"
+            );
+            assert!(
+                !capability.may_spend(),
+                "and a node that cannot broadcast must not announce that it may create and reclaim"
+            );
+        }
+    }
+
+    /// Both branches of the capability decision, including the one this build cannot reach.
+    ///
+    /// Separate from the test above because that one can only exercise the branch the current
+    /// [`production_broadcaster`] selects. A branch no fixture can take reads as covered while
+    /// never having run once, so the wired branch is asserted directly.
+    #[test]
+    fn the_capability_decision_says_available_only_for_a_wired_broadcaster() {
         assert_eq!(
             spend_capability(true),
             SpendCapability::Available,
@@ -585,23 +631,9 @@ mod tests {
         assert_eq!(
             spend_capability(false),
             SpendCapability::BroadcasterUnwired,
-            "with no broadcaster the node must say so, not report a switched-off flag the operator \
-             has already switched on"
+            "and its absence is a different answer, not the same one"
         );
-        assert!(
-            !spend_capability(false).may_spend(),
-            "a node with no broadcaster may not spend, whatever the operator has enabled"
-        );
-
-        // The load-bearing half: on THIS build the seam is empty, so no path may report Available.
-        // Hard-code `Available` back into `open_signer` and this fails; wire dig-node#424 and it
-        // keeps passing, because the assertion is an implication over the seam rather than a
-        // snapshot of the gap.
-        assert_eq!(
-            spend_capability(production_broadcaster().is_some()) == SpendCapability::Available,
-            production_broadcaster().is_some(),
-            "Available and a wired broadcaster must be the same fact"
-        );
+        assert!(!spend_capability(false).may_spend());
     }
 
     /// What a real installation LOOKS like, assembled independently of the needles.
