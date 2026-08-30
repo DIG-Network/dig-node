@@ -31,7 +31,10 @@
 
 use dig_mirror_collateral::margin::apply_safety_margin;
 
-use crate::collateral::{CollateralRequirementResult, CollateralUnknownReason};
+// From the control interface's published contract rather than re-exported through
+// `crate::collateral`: these are the same types the §25.8 surface serves, and naming their
+// owner keeps one definition rather than a local alias that could drift from it.
+use dig_node_control_interface::results::{CollateralRequirementResult, CollateralUnknownReason};
 
 use super::plan::{plan, Bond, FundingSplit, HeldMirror, MirrorPlan, ReclaimReason};
 
@@ -85,6 +88,13 @@ pub enum BondState {
     },
     /// Collateralisation is switched off. The node holds the capsule and is deliberately not
     /// advertising it; any coin it already had is being reclaimed.
+    ///
+    /// NOTE for step 6, which serves `SPEC.md` §25.8 over the control plane: that subsection is
+    /// still marked PENDING and its vocabulary does not yet line up with this enum. §25.8 gives
+    /// `withheld` a NARROWER meaning (`Relayed` provenance — a capsule this node holds but does not
+    /// claim to serve) and lists a `reclaiming` state this enum has no variant for. Serving these
+    /// variants under those names without reconciling them would publish a contract whose words mean
+    /// something else. Reconcile at the interface, not by quietly renaming here.
     Withheld,
 }
 
@@ -270,10 +280,18 @@ mod tests {
     const REQUIRED: u64 = 1_000;
 
     fn known() -> CollateralRequirementResult {
+        known_at(REQUIRED)
+    }
+
+    /// A `Known` requirement at an arbitrary per-store figure.
+    ///
+    /// Spelled as a function rather than `..known()` because `Known` is an enum VARIANT, and
+    /// functional-update syntax does not apply to one.
+    fn known_at(required_per_store_dig_base_units: u64) -> CollateralRequirementResult {
         CollateralRequirementResult::Known {
             epoch: NOW_EPOCH as u64,
             protocol_version: 1,
-            required_per_store_dig_base_units: REQUIRED,
+            required_per_store_dig_base_units,
             stores: 1,
             owners: 1,
             multiplier_micros: 1_000_000,
@@ -389,14 +407,23 @@ mod tests {
         );
     }
 
-    /// Rule 2: the switch OFF releases what is locked rather than freezing it.
+    /// Rule 2: the switch OFF releases what is locked rather than freezing it — and says so
+    /// truthfully while the release is still in flight.
     ///
-    /// Two live coins go back and nothing is created. The `Withheld` state is asserted too, because
-    /// a node that reported `Unfunded` while switched off would send a person hunting for money they
-    /// do not need.
+    /// The fixture carries THREE bonds under OFF: two with a live coin, one without. That third
+    /// bond is what makes the assertion about placement rather than about outcome. A `Bonded` coin
+    /// is a fact of the chain and it outranks the switch, because the money is still locked and
+    /// still penalisable until the reclaim confirms; a person told `Withheld` about a coin that
+    /// exists cannot see either. But a bond with NO coin under OFF is genuinely withheld, and
+    /// reporting it as `Unfunded` or `Deferred` would send that person hunting for money they do
+    /// not need.
+    ///
+    /// A switch-first implementation — one that checked `creates_enabled` before the chain — reports
+    /// all three as `Withheld` and hides two live locked coins. This fixture is red against it;
+    /// a two-bond fixture with coins on both is not.
     #[test]
     fn switching_creates_off_reclaims_every_live_coin_and_creates_none() {
-        let held = [bond("aa", "11"), bond("bb", "22")];
+        let held = [bond("aa", "11"), bond("bb", "22"), bond("cc", "33")];
         let req = known();
         let on_chain = [
             coin("c1", "aa", "11", NOW_EPOCH, REQUIRED),
@@ -417,10 +444,30 @@ mod tests {
             .reclaim
             .iter()
             .all(|(_, why)| *why == ReclaimReason::NoLongerHeld));
-        assert!(d
-            .states
-            .iter()
-            .all(|(_, s)| *s == BondState::Withheld));
+
+        let state = |store: &str, root: &str| {
+            d.states
+                .iter()
+                .find(|(b, _)| *b == bond(store, root))
+                .map(|(_, s)| s.clone())
+                .expect("every held bond is reported")
+        };
+
+        assert_eq!(
+            state("aa", "11"),
+            BondState::Bonded {
+                coin_id: id("c1"),
+                epoch: NOW_EPOCH,
+                amount_dig_base_units: REQUIRED,
+            },
+            "a coin that is still on chain is still locking money, switch or no switch"
+        );
+        assert!(matches!(state("bb", "22"), BondState::Bonded { .. }));
+        assert_eq!(
+            state("cc", "33"),
+            BondState::Withheld,
+            "the bond with no coin is the one the switch actually withholds"
+        );
     }
 
     /// The switch OFF must still reclaim a PRIOR epoch's coin, which is a different plan row.
@@ -455,10 +502,7 @@ mod tests {
     #[test]
     fn a_bonded_coin_reports_what_it_locks_rather_than_todays_requirement() {
         let held = [bond("aa", "11")];
-        let req = CollateralRequirementResult::Known {
-            required_per_store_dig_base_units: 2_500,
-            ..known()
-        };
+        let req = known_at(2_500);
         let on_chain = [coin("c1", "aa", "11", NOW_EPOCH, 1_000)];
         let i = inputs(&held, &on_chain, &req);
 
