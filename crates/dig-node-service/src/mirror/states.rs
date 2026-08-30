@@ -27,7 +27,8 @@
 //! unreadable.
 
 use dig_node_control_interface::results::{
-    CollateralUnknownReason, MirrorBondEntry, MirrorBondKey, MirrorBondState, MirrorBondStatesResult,
+    CollateralUnknownReason, MirrorBondEntry, MirrorBondKey, MirrorBondState,
+    MirrorBondStatesResult,
 };
 
 use super::pass::BondState;
@@ -396,7 +397,10 @@ mod tests {
             100,
         ));
         assert_eq!(
-            entries.iter().map(|e| e.store_id.as_str()).collect::<Vec<_>>(),
+            entries
+                .iter()
+                .map(|e| e.store_id.as_str())
+                .collect::<Vec<_>>(),
             vec![hex(0x11), hex(0xff)]
         );
         assert_eq!(cursor.expect("a cursor").store_id, hex(0xff));

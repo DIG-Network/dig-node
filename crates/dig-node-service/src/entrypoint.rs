@@ -1159,7 +1159,11 @@ fn parse_dig_amount(raw: Option<&str>) -> std::io::Result<Option<u64>> {
 /// wrong in the direction that reads as correct.
 fn mirror_action(cmd: Option<MirrorCommand>) -> std::io::Result<ControlAction> {
     let (after, limit) = match cmd {
-        None | Some(MirrorCommand::BondStates { after: None, limit: None }) => (None, None),
+        None
+        | Some(MirrorCommand::BondStates {
+            after: None,
+            limit: None,
+        }) => (None, None),
         Some(MirrorCommand::BondStates { after, limit }) => (after, limit),
     };
     let after = match after {
@@ -1425,7 +1429,9 @@ mod tests {
 
         // With no operands NEITHER field is sent, so the CONTRACT's default page size applies
         // rather than one this CLI invented.
-        let bare = mirror_action(None).expect("no operands is valid").wire_params();
+        let bare = mirror_action(None)
+            .expect("no operands is valid")
+            .wire_params();
         assert!(
             bare.get("after").is_none() && bare.get("limit").is_none(),
             "an unset operand is omitted, not sent as null: {bare}"

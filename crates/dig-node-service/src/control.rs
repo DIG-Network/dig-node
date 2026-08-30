@@ -3526,8 +3526,7 @@ fn mirror_bond_states(id: Value, params: &Value) -> Value {
 /// dig-node#412 step 7 replaces when the reconcile runner is brought up. A caller MUST NOT
 /// substitute an empty observation for an `Err` — a page of no rows says "this node holds no
 /// bonds", which is a definite claim about money, and it is not the claim being made here.
-fn mirror_bond_observation(
-) -> Result<
+fn mirror_bond_observation() -> Result<
     crate::mirror::states::BondObservation,
     dig_node_control_interface::results::MirrorBondStatesUnknownReason,
 > {
