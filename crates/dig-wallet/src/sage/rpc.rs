@@ -1213,6 +1213,42 @@ impl WalletBackend {
         Self::SUPPORTED_METHODS.contains(&method)
     }
 
+    /// The spendable **$DIG** at this node's own operator puzzle hash, in DIG CAT base units.
+    ///
+    /// `None` when the balance could not be read — an unreachable chain source, a replica that is
+    /// not authoritative for this address, a figure too large for a `u64`. `None` is **not zero**:
+    /// §25's bond surface reports an uncovered bond as `deferred{balance_unreadable}` on `None` and
+    /// as `unfunded` on `Some(0)`, and those are opposite claims — the first says the node does not
+    /// know, the second raises an out-of-funds alarm. Substituting zero for an unreadable balance is
+    /// the dig-app#300 conflation.
+    ///
+    /// Takes the puzzle hash rather than an address so no caller has to spell an address, pick a
+    /// prefix, or name the asset: the encoding and the canonical `$DIG` asset id both stay inside
+    /// this crate, where the one definition of each already lives. A caller that assembled its own
+    /// address string could read the right amount of the wrong asset at the wrong network's prefix,
+    /// and every one of those returns a confident number.
+    ///
+    /// **Staleness is NOT covered by `None`, and a caller must not read it as freshness.** Being
+    /// authoritative for an address and being current with the chain are independent questions, and
+    /// only the first can fail the read: a replica that is in scope but behind answers `Ok` with
+    /// `synced: false`, so this returns `Some` of a figure that may lag the chain. A caller that
+    /// needs currency must ask for it — `balance_for_address` returns `source`, `synced` and
+    /// `peak_height`, and this narrowing keeps only `balance`. Discriminating on `synced` alone
+    /// would be wrong in the other direction, because the fallback arm hard-codes it false for
+    /// answers that are perfectly good.
+    ///
+    /// This is a READ. It confers no custody and touches no key: the puzzle hash is a public value.
+    pub async fn dig_balance_base_units(&self, owner_puzzle_hash: Bytes32) -> Option<u64> {
+        let address = self.address_of(&hex::encode(owner_puzzle_hash));
+        let read = self
+            .balance_for_address(&address, BalanceAsset::DIG)
+            .await
+            .ok()?;
+        // Narrowed rather than saturated. A saturating cast would report a balance above `u64::MAX`
+        // as exactly `u64::MAX` — the largest possible confident wrong number on a funding decision.
+        u64::try_from(read.balance).ok()
+    }
+
     // ---- address helpers --------------------------------------------------
 
     fn address_of(&self, puzzle_hash_hex: &str) -> String {

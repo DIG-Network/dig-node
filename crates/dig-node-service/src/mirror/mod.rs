@@ -77,6 +77,8 @@
 //! that confusion is exactly how a money bug ships. Fees, which genuinely are XCH mojos, are named
 //! `*_mojos` and come from separate coins so a fee can never shave collateral.
 
+pub mod lifecycle;
+pub mod observe;
 pub mod pass;
 pub mod plan;
 pub mod presence;

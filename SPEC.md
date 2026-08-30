@@ -7940,20 +7940,32 @@ itself (SYSTEM.md §4.1).
 > * §25.8's **method and verb**: `control.mirror.bondStates` is served (`control.rs`) and
 >   `dign mirror bond-states` is the verb. The wire mapping, the whole-set locked total, the
 >   canonical-key ordering and the paging are `mirror/states.rs`; `BondState::FundsUnknown` maps to
->   `deferred { balance_unreadable }` per row, never to `unfunded`. **What is not present is an
->   OBSERVATION**: no pass is constructed, so the node cannot read its own mirror coins and the
->   method answers `unknown { chain_unreadable }` on every call. The shape is satisfied; the answer
->   is not.
+>   `deferred { balance_unreadable }` per row, never to `unfunded`. The method now ANSWERS: it
+>   serves the observation the last pass published (`mirror/lifecycle.rs`), and `unknown
+>   { chain_unreadable }` remains only for a node whose first pass has not completed.
+> * A **production `MirrorEffects`** (`mirror::lifecycle::NodeMirrorEffects`) and a SCHEDULED pass
+>   (`server::spawn_mirror_passes`, on `dig_constants::MIRROR_ROUND_LENGTH_MS`). The operator wallet
+>   is opened ONCE at bring-up under the device key; a §16.4 `Locked` or `Orphaned` wallet yields no
+>   signer, and the lifecycle then OBSERVES without spending rather than degrading. `dig_mirror_coin::list`
+>   is called, and an INCOMPLETE inventory (`MAX_CANDIDATES` truncation, unresolved candidates)
+>   aborts the pass rather than under-reporting locked money.
 >
-> **Everything else in §25 is PENDING**, tracked as
-> <https://github.com/DIG-Network/dig-node/issues/412>. In particular **no pass is CONSTRUCTED and
-> none is SCHEDULED**: `mirror::runner::MirrorEffects` has no implementation, so nothing reaches
-> `MirrorSigner::new`, `build_create`, `build_reclaim` or `dig_mirror_coin::list`, and the three
-> triggers in §25.4 — start-up, the round tick, the debounced presence change — do not fire. The
-> runner decides and orders; nothing yet hands it a chain, a wallet or a disk. So a reader MUST NOT
-> infer that any coin is created, reclaimed, broadcast or confirmed at this head, and MUST NOT infer
-> that any state is REPORTED: §25.8's method is served, and it answers
-> `unknown { chain_unreadable }` because the observation it would describe does not exist.
+> **Two things in §25 remain PENDING**, tracked as
+> <https://github.com/DIG-Network/dig-node/issues/412>:
+>
+> * **CREATES are refused, by name.** `dig_mirror_coin::create` takes its `Vec<Cat>` from the
+>   caller, and this node has no $DIG coin selector scoped to the OPERATOR puzzle hash — the
+>   node-custodied selector reads a different wallet's coins. `NodeMirrorEffects::create` therefore
+>   returns a named error, the pass reports it, and §25.8 keeps reporting the bond as uncovered,
+>   which is true. Tracked as <https://github.com/DIG-Network/dig-node/issues/421>. **RECLAIMS are
+>   implemented** and are supported at `fee = 0` with no fee coins, which is §25.4.4.
+> * **§25.6's DHT pointer is not attached.** `ProviderRecord::unverified_mirror_coin_id` lives in
+>   dig-dht 0.15, and `dig-download` 0.21.0 and `dig-peer-selector` 0.10.0 both require
+>   `dig-dht ^0.13` — semver-incompatible on a `0.x` line, so taking 0.15 here would resolve two
+>   dig-dht lines. Tracked as <https://github.com/DIG-Network/dig-node/issues/422>.
+>
+> So a reader MUST NOT infer that any coin is CREATED at this head, and MUST NOT infer that a mirror
+> coin id reaches the DHT.
 >
 > **A clause not named in the list above MUST be read as pending, whatever its grammatical voice**,
 > and the list is to be read NARROWLY: where an entry names a file or a function, it satisfies the
@@ -8070,6 +8082,13 @@ address the wallet already tracks.
 > Nor is the audit-EXECUTION paragraph below satisfied: no entry is ever written for a mirror spend,
 > no confirmation is observed, and nothing reconciles an `unresolved` or `failed` one. Both are
 > tracked as <https://github.com/DIG-Network/dig-node/issues/412>.
+>
+> **A mirror spend is BUILT and not SENT.** The node wires no production broadcaster for this
+> lifecycle, so a planned reclaim refuses by name before it signs and no mirror spend reaches the
+> mempool — the create half refuses separately, for the coin selector
+> (<https://github.com/DIG-Network/dig-node/issues/421>). The refusal is reported rather than
+> silent, and the capability the node announces is derived from the same seam, so it cannot claim a
+> power it does not have. Tracked as <https://github.com/DIG-Network/dig-node/issues/424>.
 
 **Every spend is audited, structurally — exactly ONE entry per signature, and it cannot lie about
 the spend.** The signer takes the `SpendJournal` (§23.3) and opens the record itself, returning the
@@ -8242,12 +8261,18 @@ one setting to turn off** (§6.0/#207).
 
 ### 25.8. The per-store state surface
 
-> **PARTIALLY IMPLEMENTED.** The method `control.mirror.bondStates` IS served and `dign mirror
-> bond-states` IS the verb (§8.6 CLI parity). What is NOT yet present is an OBSERVATION for it to
-> describe: nothing constructs a reconcile pass, so the node cannot read the mirror coins it owns
-> and every call answers `unknown { reason: "chain_unreadable" }`. A reader MUST NOT infer that any
-> bond state is REPORTED at this head; it may rely on the shape, the paging, the ordering and the
-> refusals described below. Tracked as dig-node#412 step 7.
+> **IMPLEMENTED.** The method `control.mirror.bondStates` is served, `dign mirror bond-states` is
+> the verb (§8.6 CLI parity), and it now ANSWERS: the mirror pass observes on its own round timer
+> and publishes what it saw, and this method serves that observation.
+>
+> The answer is a published SNAPSHOT rather than a read this call performs, and that is a security
+> property rather than a cache. Observing per request would turn one token-gated call into an
+> operator-seed unseal, a PBKDF2, up to `dig_mirror_coin::MAX_CANDIDATES` chain lookups and an
+> oracle read — a real amplification surface, since a paired token is a much weaker predicate than
+> "trusted". A node whose first pass has not yet completed answers
+> `unknown { reason: "chain_unreadable" }`, which remains the honest answer and is never an empty
+> page. A bond whose create is refused for want of an operator-scoped $DIG selector
+> (dig-node#421) reports as uncovered, which is what it is.
 
 The lifecycle exposes, per `(store, root)`, over the control plane and with a `dign` verb (§8.6
 CLI parity): the bond state — `bonded { coin_id, epoch, amount }`, `pending` (in-flight create),

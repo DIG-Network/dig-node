@@ -32,7 +32,7 @@ edition = "2021"
 # the ROOT manifest (`[workspace.package].version`), so it MUST be set here for a
 # release to fire (§3.6). The library crates (dig-node-core/dig-runtime/dig-wallet)
 # keep their own independent versions — only the released binary tracks the workspace version.
-version = "0.172.0"
+version = "0.173.0"
 
 # Release hardening, matching digstore: keep integer-overflow checks ON in release.
 # The node parses untrusted serialized input and does offset/length arithmetic over
@@ -56,35 +56,31 @@ overflow-checks = true
 # dig-nat from crates.io, so cargo resolves ONE dig-nat instance without any git redirect.
 # dig-constants is likewise a plain crates.io dep everywhere now.
 #
-# The RESOLVED line today is dig-nat **0.18.0** (see `crates/dig-node-core/Cargo.toml`, which owns the
-# declaration and the reasoning). Do not read a version out of this comment: an earlier revision of it
-# asserted "dig-nat 0.7 ... resolves ONE dig-nat 0.7 instance", which was true of the #1280 cascade and
-# was eleven minors stale by the time anyone read it. `tests/dependency_tree.rs` asserts the
-# single-instance invariant against the resolved LOCK, which is the only claim that cannot go stale.
+# Do NOT read a version out of this comment. `tests/dependency_tree.rs` asserts the single-instance
+# invariant against the resolved LOCK, which is the only claim about a version that cannot go stale.
+# An earlier revision of this block asserted "dig-nat 0.7 ... resolves ONE dig-nat 0.7 instance",
+# which was eleven minors stale by the time anyone read it.
 #
-# THE PEER STACK IS NOW ON THE 0.36.1 LINE (dig_ecosystem#3161, 2026-08-26).
+# THE PEER STACK IS ON THE ^0.21 TIER (dig-node#412 step 7, 2026-08-30).
 #
-# The wall this comment used to describe was chia-bls: every published stack member required
-# `dig-nat ^0.20` -> `dig-tls ^0.4`, which is the chia-bls 0.36.1 uplift, while dig-gossip was pinned
-# at a rev reaching chia-protocol 0.26 through `dig-peer-protocol 0.6.0`. Adopting any of them split
-# chia-bls across two lines inside one crate.
+# Two walls have now been cleared here in sequence, and both cleared UPSTREAM rather than by an edit
+# in this file. The first was chia-bls: the stack required `dig-nat ^0.20` -> `dig-tls ^0.4` (the
+# chia-bls 0.36.1 uplift) while dig-gossip was pinned at a rev reaching chia-protocol 0.26 through
+# `dig-peer-protocol 0.6.0`. dig-gossip v0.30.0 cleared it. The second was dig-nat itself: that same
+# dig-gossip release declared `dig-nat ^0.20`, so the ^0.21 tier resolved TWO dig-nat lines while
+# cargo printed success. **dig-gossip v0.32.0 (`main`, rev 1a339166) declares `dig-nat = "0.21"`,
+# which cleared it.**
 #
-# The predicted unblock is exactly what happened, and it happened UPSTREAM: dig-gossip `main`
-# (v0.30.0) moved to `dig-peer-protocol 0.7` and chia 0.36.1. Repointing the git rev in
-# `crates/dig-node-core/Cargo.toml` is what let the stack move; nothing was shimmed, and nothing in
-# this file needed to change to allow it.
+# The resolved stack is dig-nat 0.21, dig-dht 0.13, dig-download 0.21, dig-peer 0.13,
+# dig-peer-selector 0.10 -- and dig-nat, dig-dht, dig-tls, chia-bls and chia-protocol each resolve to
+# exactly the line count they had before the move.
 #
-# The resolved stack is dig-nat 0.20, dig-dht 0.12.1, dig-download 0.20.4, dig-peer 0.12.0,
-# dig-peer-selector 0.9.2 -- the ^0.20 TIER, deliberately not the newest.
-#
-# WHY THE OLDER TIER IS THE CORRECT CHOICE, and the distinction a future lane will get wrong: the
-# step from dig-nat 0.20 to 0.21 carries ZERO chia delta (both take `dig-tls ^0.4`). It is still not
-# takeable, for a reason one level up -- dig-gossip v0.30.0 declares `dig-nat ^0.20`, while
-# dig-dht 0.13 / dig-peer 0.13 / dig-download 0.21 / dig-peer-selector 0.10 all require `^0.21`.
-# Taking the newer tier resolves TWO dig-nat lines while cargo prints success, MEASURED here, and
-# dig-nat values cross from this crate into dig-download/dig-gossip/dig-peer-selector. One line per
-# family beats the highest version numbers (CLAUDE.md §2.4b).
-#
-# So "0.21 is chia-blocked" is FALSE and "dig-node cannot reach 0.21" is still TRUE. The remaining
-# unblock is a dig-gossip release against `dig-nat ^0.21`, upstream, never an edit in this file. Do
-# not bridge two lines with a shim -- that is the §4.1 byte-drift class.
+# THE ONE THING A FUTURE LANE WILL GET WRONG: **dig-dht 0.15 is NOT takeable, and the blocker has
+# moved down a level.** dig-download 0.21.0 and dig-peer-selector 0.10.0 -- the LATEST published of
+# each -- both require `dig-dht ^0.13`, measured from the crates.io index and not from a caret.
+# Declaring `dig-dht = "0.15"` resolves TWO dig-dht lines while cargo prints success, and dig-dht
+# values cross from this crate into both of them. dig-dht 0.15 carries
+# `ProviderRecord::unverified_mirror_coin_id` (dig-dht#23), so that field is unreachable here until a
+# dig-download AND a dig-peer-selector release against `dig-dht ^0.15` exist -- upstream, never an
+# edit in this file. One line per family beats the highest version numbers (CLAUDE.md §2.4b), and
+# bridging two lines with a shim is the §4.1 byte-drift class.

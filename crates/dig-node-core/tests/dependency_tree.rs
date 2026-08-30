@@ -16,18 +16,36 @@
 //! So both are asserted where they are actually decided: the manifest and the lock.
 
 /// This crate's manifest, read at compile time so the assertion cannot drift from the build.
-const MANIFEST: &str = include_str!("../Cargo.toml");
+const MANIFEST_RAW: &str = include_str!("../Cargo.toml");
+
+/// The manifest with its line endings normalised to `\n`.
+///
+/// An editor on Windows rewrites a manifest with CRLF without changing a single declaration.
+/// Searching those bytes for `"\n[section]\n"` then finds nothing — which is a fact about the file's
+/// line endings, not about its dependencies. dig-node#412 hit exactly that: a dependency-tier commit
+/// saved this file as CRLF, and the section lookup below went on to report `dig-download` as absent
+/// from a production tree it had never left. Normalising first keeps every assertion in this file
+/// about DECLARATIONS, which is the only thing any of them means to be about.
+fn manifest() -> &'static str {
+    static NORMALISED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NORMALISED.get_or_init(|| MANIFEST_RAW.replace("\r\n", "\n"))
+}
 
 /// The workspace lock (two levels up from this crate).
 const LOCK: &str = include_str!("../../../Cargo.lock");
 
 /// The body of `section` in the manifest (up to the next `[` at column 0).
 fn manifest_section(section: &str) -> &'static str {
-    let start = MANIFEST
+    let manifest = manifest();
+    // Panics rather than falling back to offset 0. A lookup that FAILED is not evidence about any
+    // dependency, and offset 0 silently searches `[package]`, where nothing is declared — so every
+    // "X is a production dependency" assertion below would then report absence with total
+    // confidence. Failing here names the section that could not be read instead.
+    let start = manifest
         .find(&format!("\n[{section}]\n"))
         .map(|i| i + section.len() + 4)
-        .unwrap_or(0);
-    let rest = &MANIFEST[start..];
+        .unwrap_or_else(|| panic!("this manifest has no `[{section}]` section to read"));
+    let rest = &manifest[start..];
     let end = rest.find("\n[").unwrap_or(rest.len());
     &rest[..end]
 }

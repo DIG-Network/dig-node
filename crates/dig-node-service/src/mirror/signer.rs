@@ -140,6 +140,16 @@ impl MirrorSigner {
         self.wallet.owner_puzzle_hash()
     }
 
+    /// The PUBLIC synthetic key the mirror spend builders curry.
+    ///
+    /// Exposed so the lifecycle can BUILD a spend for the same wallet that will sign it, without
+    /// holding the wallet. Handing out a public key is not a capability: `sign` still refuses any
+    /// bundle whose owner is not this wallet, so a caller cannot use this key to have something
+    /// else signed.
+    pub fn synthetic_key(&self) -> chia_bls::PublicKey {
+        self.wallet.synthetic_key()
+    }
+
     /// Open an audit record for `spends` and sign them, returning both.
     ///
     /// The record is opened HERE, from the spends, and exactly one is opened per signature. Its

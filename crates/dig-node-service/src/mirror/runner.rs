@@ -203,6 +203,24 @@ impl<E: MirrorEffects> PassRunner<E> {
         }
     }
 
+    /// Adopt an existing presence tracker, so §25.5's debounce survives across runners.
+    ///
+    /// A production scheduler rebuilds its [`MirrorEffects`] every round — the chain source is
+    /// per-round and does not outlive it — so the runner is rebuilt too. Without this, each round
+    /// would begin with a FRESH tracker, and a fresh tracker suppresses every capsule it has ever
+    /// seen exactly once: no bond would ever settle, and the node would never create a coin while
+    /// looking like it was reconciling normally. Carrying the tracker is what makes the debounce a
+    /// window in wall-clock time rather than a window per runner.
+    pub fn with_presence(mut self, presence: super::presence::PresenceTracker) -> Self {
+        self.presence = presence;
+        self
+    }
+
+    /// Hand the presence tracker back, for the next round's runner.
+    pub fn into_presence(self) -> super::presence::PresenceTracker {
+        self.presence
+    }
+
     /// Use a non-default settling window (§25.5).
     pub fn with_settling_window_ms(mut self, window_ms: u64) -> Self {
         self.settling_window_ms = window_ms;
@@ -336,7 +354,7 @@ impl<E: MirrorEffects> PassRunner<E> {
 /// than a step inside a [`MirrorEffects`] implementation, so that there is exactly one of it: a
 /// second implementation of this rule is a second answer to "what may this node spend its own money
 /// advertising", and the two would not stay equal.
-fn split_by_provenance(observed: &[ObservedCapsule]) -> (Vec<Bond>, Vec<Bond>) {
+pub(super) fn split_by_provenance(observed: &[ObservedCapsule]) -> (Vec<Bond>, Vec<Bond>) {
     let mut held = Vec::new();
     let mut relayed = Vec::new();
     for capsule in observed {
@@ -566,6 +584,91 @@ mod tests {
     /// twice and this one not at all.
     fn runner(effects: FakeEffects, log: SpendLog) -> PassRunner<FakeEffects> {
         PassRunner::new(effects, log).with_settling_window_ms(0)
+    }
+
+    /// The presence tracker CARRIES between runners, and a fresh one on the second pass suppresses.
+    ///
+    /// **Proves** the reason [`PassRunner::with_presence`] exists. The production scheduler rebuilds
+    /// its [`MirrorEffects`] every round — the chain source is per-round and does not outlive it —
+    /// so the runner is rebuilt too. §25.5's window is wall-clock, not per-runner, and a fresh
+    /// tracker restarts every bond's window at the moment it is built.
+    ///
+    /// **Catches** the regression that drops the carry from the scheduler. It compiles, it passes
+    /// every other test, and it produces a node that never settles a bond and never creates a coin
+    /// **while looking like it is reconciling normally** — the runner's own doc says the failure is
+    /// invisible on every other signal, which is exactly why it needs a test naming it.
+    ///
+    /// The two halves are asserted as a PAIR, and only the pair discriminates. The carried run
+    /// alone is satisfied by an implementation with no debounce at all — one that settles
+    /// everything immediately would pass it — so the fresh-tracker half is what proves the window
+    /// is real and that the first half's success came from the CARRY rather than from its absence.
+    #[test]
+    fn the_presence_tracker_carries_between_runners_and_a_fresh_one_suppresses() {
+        use super::super::presence::SETTLING_WINDOW_MS;
+
+        const FIRST_SEEN_MS: u64 = 1_000_000;
+        let capsule = bond("aa", "11");
+
+        // A pass whose ONLY reason not to create is the debounce: the wallet is funded, the
+        // requirement is known, creates are on, and nothing is on chain. So a create appearing or
+        // not appearing is a statement about the presence window and about nothing else.
+        let effects = || FakeEffects {
+            disk: held(std::slice::from_ref(&capsule)),
+            balance: REQUIRED * 10,
+            ..FakeEffects::default()
+        };
+        let at = |now_unix_ms| PassContext {
+            now_unix_ms,
+            ..ctx()
+        };
+        let created = |report: &PassReport| report.created.clone();
+
+        // A real, EMPTY audit log per runner. Empty matters: an in-flight create recorded for this
+        // (store, root, epoch) would suppress the create through §25.4.6 instead, and the test
+        // would then pass for a reason that has nothing to do with the presence window.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let log = |tag: &str| SpendLog::at(dir.path().join(format!("{tag}.jsonl")));
+
+        // Pass 1 — the capsule has just appeared. Nothing settles, so nothing is created. This is
+        // the control: it shows the window is doing something before the carry is tested at all.
+        let mut first = PassRunner::new(effects(), log("first"));
+        let opening = first
+            .run(&at(FIRST_SEEN_MS))
+            .expect("the observation succeeds");
+        assert!(
+            created(&opening).is_empty(),
+            "a capsule seen for the first time has not settled, so no coin is created: {:?}",
+            created(&opening)
+        );
+
+        // Pass 2, CARRYING the tracker, one full window later. The bond's window began at
+        // FIRST_SEEN_MS and has now elapsed, so it settles and the create happens.
+        let mut carried =
+            PassRunner::new(effects(), log("carried")).with_presence(first.into_presence());
+        let settled = carried
+            .run(&at(FIRST_SEEN_MS + SETTLING_WINDOW_MS))
+            .expect("the observation succeeds");
+        assert_eq!(
+            created(&settled),
+            vec![capsule.clone()],
+            "the carried tracker remembers when the capsule appeared, so one window later it \
+             settles and is bonded: {:?}",
+            created(&settled)
+        );
+
+        // The SAME second pass, at the SAME instant, with a FRESH tracker. The bond's window
+        // restarts now, so it cannot have elapsed, and nothing is created. This is the regression
+        // itself, reproduced.
+        let mut restarted = PassRunner::new(effects(), log("restarted"));
+        let stalled = restarted
+            .run(&at(FIRST_SEEN_MS + SETTLING_WINDOW_MS))
+            .expect("the observation succeeds");
+        assert!(
+            created(&stalled).is_empty(),
+            "a fresh tracker restarts the window, so the identical pass creates nothing — this is \
+             the silent stall the carry exists to prevent: {:?}",
+            created(&stalled)
+        );
     }
 
     /// An audit intent for a mirror create of `(store, root, epoch)`.
