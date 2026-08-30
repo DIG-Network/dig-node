@@ -182,6 +182,18 @@ pub enum ControlAction {
         /// The margin in BASIS POINTS (`100` is +1%), already resolved from any preset name.
         margin_bp: u64,
     },
+    /// `control.mirror.bondStates` — one page of this node's mirror bonds (SPEC.md §25.8).
+    ///
+    /// Paged rather than whole because the node's answer is paged: a headless operator walking the
+    /// set from the command line resumes from the cursor the node HANDED them, exactly as any other
+    /// client does. The locked-$DIG total the node reports spans the WHOLE set, so a person reading
+    /// one page is never reading a partial money figure.
+    MirrorBondStates {
+        /// Resume strictly after this `(store_id, root)`, as the node handed it back.
+        after: Option<(String, String)>,
+        /// The page size, or `None` for the contract's default.
+        limit: Option<u32>,
+    },
     /// `control.chiaPeers.remove` — stop trusting a Chia full node (`ban` keeps it excluded so
     /// discovery cannot re-add it).
     ChiaPeersRemove { ip: String, ban: bool },
@@ -240,6 +252,7 @@ impl ControlAction {
             ControlAction::CollateralMarginGet => "control.collateral.margin.get",
             ControlAction::CollateralBuffer => "control.collateral.buffer",
             ControlAction::CollateralMarginSet { .. } => "control.collateral.margin.set",
+            ControlAction::MirrorBondStates { .. } => "control.mirror.bondStates",
             ControlAction::ChiaPeersRemove { .. } => "control.chiaPeers.remove",
         }
     }
@@ -273,6 +286,18 @@ impl ControlAction {
             // Basis points, never a percentage and never a float. A 1 bp margin (0.01%) is a legal
             // choice and any conversion to whole percent would erase it.
             ControlAction::CollateralMarginSet { margin_bp } => json!({ "margin_bp": margin_bp }),
+            // Both page fields are OMITTED when unset rather than sent as null, so the node
+            // applies the CONTRACT's default page size rather than one this CLI invented.
+            ControlAction::MirrorBondStates { after, limit } => {
+                let mut params = json!({});
+                if let Some((store_id, root)) = after {
+                    params["after"] = json!({ "store_id": store_id, "root": root });
+                }
+                if let Some(limit) = limit {
+                    params["limit"] = json!(limit);
+                }
+                params
+            }
             ControlAction::CacheSetCap { bytes } => json!({ "cap_bytes": bytes }),
             ControlAction::StoresPin { store }
             | ControlAction::StoresUnpin { store }
@@ -509,6 +534,12 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         ControlAction::CollateralMarginGet.method(),
         ControlAction::CollateralBuffer.method(),
         ControlAction::CollateralMarginSet { margin_bp: 0 }.method(),
+        // `dign mirror bond-states` drives the §25.8 bond surface (dig-node#412).
+        ControlAction::MirrorBondStates {
+            after: None,
+            limit: None,
+        }
+        .method(),
         ControlAction::ChiaPeersRemove {
             ip: String::new(),
             ban: false,
@@ -746,6 +777,7 @@ fn summarize(method: &str, result: &Value) -> String {
         }
         "control.collateral.requirement" => summarize_collateral_requirement(result),
         "control.collateral.buffer" => summarize_collateral_buffer(result),
+        "control.mirror.bondStates" => summarize_mirror_bond_states(result),
         // Shown with its real cost, not as a bare setting: a margin is a number of basis points
         // until someone says what it costs to hold.
         "control.collateral.margin.get" | "control.collateral.margin.set" => {
@@ -770,6 +802,92 @@ fn page_suffix(result: &Value) -> String {
         (Some(true), _) => " · complete".to_string(),
         (_, Some(cursor)) => format!(" · MORE remain — resume after {cursor}"),
         _ => " · completeness unknown (a node too old to say)".to_string(),
+    }
+}
+
+/// `dign mirror bond-states` — one page of this node's mirror bonds, and what they lock.
+///
+/// Decoded through the contract's own type rather than by reading JSON keys, on the same terms as
+/// [`summarize_collateral_requirement`]: a payload this build cannot decode is reported as
+/// undecodable, never rendered as a figure.
+///
+/// An `unknown` answer prints as UNKNOWN with its reason and NO count. "0 bonds" is a definite
+/// claim about this node's money, and it is not the claim a node that could not read its chain
+/// made — a person shown a zero stops looking, which is the failure the whole call-level unknown
+/// exists to prevent.
+fn summarize_mirror_bond_states(result: &Value) -> String {
+    use dig_node_control_interface::results::{
+        MirrorBondState, MirrorBondStatesResult, MirrorBondStatesUnknownReason,
+    };
+
+    use crate::collateral::format_dig;
+
+    let answer = match serde_json::from_value::<MirrorBondStatesResult>(result.clone()) {
+        Ok(answer) => answer,
+        Err(e) => return format!("mirror bonds: unreadable answer from the node ({e})"),
+    };
+
+    let (entries, complete, cursor, locked_dig_base_units, epoch) = match answer {
+        MirrorBondStatesResult::Unknown { reason } => {
+            let (missing, remedy) = match reason {
+                MirrorBondStatesUnknownReason::ServedSetUnknown => (
+                    "this node cannot enumerate what it serves",
+                    "check the capsule cache",
+                ),
+                MirrorBondStatesUnknownReason::ChainUnreadable => (
+                    "this node cannot read the chain",
+                    "configure a chain source",
+                ),
+                MirrorBondStatesUnknownReason::InFlightUnknown => (
+                    "this node cannot see its own in-flight creates",
+                    "check the automated-spend record",
+                ),
+                MirrorBondStatesUnknownReason::ProvenanceUnknown => (
+                    "this node cannot tell held capsules from relayed ones",
+                    "check the capsule cache",
+                ),
+            };
+            return format!("mirror bonds UNKNOWN — {missing} · {remedy}");
+        }
+        MirrorBondStatesResult::Known {
+            entries,
+            complete,
+            cursor,
+            locked_dig_base_units,
+            epoch,
+        } => (entries, complete, cursor, locked_dig_base_units, epoch),
+    };
+
+    // Counted by state, because the counts are what an operator acts on: only `unfunded` is a
+    // shortfall, and the other six mean "no coin yet" for reasons that need entirely different
+    // responses. A bare row count would flatten them back together.
+    let mut bonded = 0usize;
+    let mut unfunded = 0usize;
+    let mut other = 0usize;
+    for entry in &entries {
+        match entry.state {
+            MirrorBondState::Bonded { .. } => bonded += 1,
+            MirrorBondState::Unfunded { .. } => unfunded += 1,
+            _ => other += 1,
+        }
+    }
+
+    // The locked figure is the node's WHOLE-SET total and is labelled as such, so a page is never
+    // read as the whole of this operator's locked money.
+    let page = format!(
+        "epoch {epoch}: {} bond(s) on this page — {bonded} bonded, {unfunded} unfunded, {other} other · {} locked across ALL bonds",
+        entries.len(),
+        format_dig(locked_dig_base_units),
+    );
+    match (complete, cursor) {
+        (true, _) => format!("{page} · complete"),
+        (false, Some(cursor)) => format!(
+            "{page} · MORE remain — resume after {}:{}",
+            cursor.store_id, cursor.root
+        ),
+        // A truncated page with no cursor is a node contradicting itself; say so rather than
+        // print a resume instruction nobody can follow.
+        (false, None) => format!("{page} · MORE remain, but the node handed back no cursor"),
     }
 }
 
@@ -1036,6 +1154,12 @@ fn summarize_collateral_requirement(result: &Value) -> String {
                 CollateralUnknownReason::NoChainSource => {
                     ("this node cannot see the chain", "configure a chain source")
                 }
+                // The WALLET, not the census. An operator told their census is broken would go
+                // looking at the chain, and the chain is fine.
+                CollateralUnknownReason::BalanceUnreadable => (
+                    "this node cannot read its own $DIG balance",
+                    "check the node's operator wallet",
+                ),
             };
             // Emphatically NOT "0 DIG". An absent requirement rendered as a zero cost is the money
             // lie this surface exists to prevent.

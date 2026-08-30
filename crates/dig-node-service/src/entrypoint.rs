@@ -201,6 +201,16 @@ enum Command {
         #[command(subcommand)]
         action: Option<CollateralCommand>,
     },
+    /// Inspect the mirror bonds this node holds, and the $DIG they lock.
+    ///
+    /// A mirror bond is one `(store, root)` this node advertises by locking $DIG for an epoch.
+    /// Each bond reports one state, and only `unfunded` means you are short: `withheld` is a
+    /// capsule held for someone else and never advertised, `disabled` is your own switch, and
+    /// `reclaiming` is money on its way back that is still locked until it lands.
+    Mirror {
+        #[command(subcommand)]
+        action: Option<MirrorCommand>,
+    },
     /// Add, list and remove a TRUSTED Chia full-node peer.
     ///
     /// A different network from `peers`, which manages DIG gossip peers. Trusting a Chia peer
@@ -656,6 +666,24 @@ enum MarginCommand {
     },
 }
 
+/// `dig-node mirror` sub-actions.
+#[derive(Subcommand)]
+enum MirrorCommand {
+    /// Show this node's mirror bonds, one page at a time (the default with no sub-action).
+    ///
+    /// The locked figure covers ALL your bonds, not just the page shown, so it is never a partial
+    /// amount of money. If the node cannot state its bonds it says which fact it is missing --
+    /// it never reports an unreadable set as an empty one.
+    BondStates {
+        /// Resume after this bond, as `<store_id>:<root>` -- the cursor the previous page printed.
+        #[arg(long)]
+        after: Option<String>,
+        /// How many bonds to show. Left unset, the node's own default page size applies.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+}
+
 #[derive(Subcommand)]
 enum ChiaPeersCommand {
     /// List the tracked Chia full-node peers, marking which are trusted.
@@ -724,6 +752,7 @@ impl Command {
             Command::Subscriptions { .. } => "subscriptions",
             Command::Peers { .. } => "peers",
             Command::Collateral { .. } => "collateral",
+            Command::Mirror { .. } => "mirror",
             Command::ChiaPeers { .. } => "chia-peers",
             Command::EnsureHosts => "ensure-hosts",
         }
@@ -902,6 +931,10 @@ pub fn run() -> std::process::ExitCode {
             action: Some(CollateralCommand::History { epoch }),
         } => render(control_cli::collateral_history(epoch), action, json),
         Command::Collateral { action: cmd } => match collateral_action(cmd) {
+            Ok(a) => render(control_cli::run(&config, a), action, json),
+            Err(e) => emit_error(&e, action, json),
+        },
+        Command::Mirror { action: cmd } => match mirror_action(cmd) {
             Ok(a) => render(control_cli::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
         },
@@ -1108,6 +1141,37 @@ fn parse_dig_amount(raw: Option<&str>) -> std::io::Result<Option<u64>> {
         .and_then(|w| w.checked_add(millis))
         .map(Some)
         .ok_or_else(refuse)
+}
+
+/// Map `MirrorCommand::BondStates` to a [`ControlAction`], parsing and validating the cursor.
+///
+/// The cursor operand is `<store_id>:<root>`, parsed here and REFUSED when it is not that shape.
+/// A half-understood cursor must never be dropped: the node would restart the walk while the
+/// caller believed it resumed, and a repeated page on a surface carrying a locked-$DIG total is
+/// wrong in the direction that reads as correct.
+fn mirror_action(cmd: Option<MirrorCommand>) -> std::io::Result<ControlAction> {
+    let (after, limit) = match cmd {
+        None
+        | Some(MirrorCommand::BondStates {
+            after: None,
+            limit: None,
+        }) => (None, None),
+        Some(MirrorCommand::BondStates { after, limit }) => (after, limit),
+    };
+    let after = match after {
+        None => None,
+        Some(cursor) => match cursor.split_once(':') {
+            Some((store_id, root)) if !store_id.is_empty() && !root.is_empty() => {
+                Some((store_id.to_string(), root.to_string()))
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "--after takes the cursor the previous page printed, as <store_id>:<root>",
+                ))
+            }
+        },
+    };
+    Ok(ControlAction::MirrorBondStates { after, limit })
 }
 
 /// Map the `collateral` subcommand to its [`ControlAction`], resolving a margin preset name.
@@ -1343,6 +1407,55 @@ fn run_service(config: Config) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// **`dign mirror bond-states --after` sends the cursor to the node.**
+    ///
+    /// Asserted on the WIRE params rather than on the selected method, because a parser that
+    /// selected the right method and dropped the operand is exactly the failure that restarts a
+    /// walk while looking like it resumed — and it is invisible from the method name.
+    #[test]
+    fn the_mirror_bond_states_verb_sends_its_cursor_and_page_size() {
+        let hex = "11".repeat(32);
+        let action = mirror_action(Some(MirrorCommand::BondStates {
+            after: Some(format!("{hex}:{hex}")),
+            limit: Some(25),
+        }))
+        .expect("a well-formed cursor parses");
+
+        assert_eq!(action.method(), "control.mirror.bondStates");
+        let params = action.wire_params();
+        assert_eq!(params["after"]["store_id"], serde_json::json!(hex));
+        assert_eq!(params["after"]["root"], serde_json::json!(hex));
+        assert_eq!(params["limit"], serde_json::json!(25));
+
+        // With no operands NEITHER field is sent, so the CONTRACT's default page size applies
+        // rather than one this CLI invented.
+        let bare = mirror_action(None)
+            .expect("no operands is valid")
+            .wire_params();
+        assert!(
+            bare.get("after").is_none() && bare.get("limit").is_none(),
+            "an unset operand is omitted, not sent as null: {bare}"
+        );
+    }
+
+    /// **A malformed `--after` is REFUSED, never dropped.**
+    ///
+    /// A dropped cursor restarts the walk at the first bond while the caller believes it resumed,
+    /// and the repeated page carries a whole-set locked total that reads as correct.
+    #[test]
+    fn the_mirror_bond_states_verb_refuses_a_cursor_it_cannot_read() {
+        for bad in ["no-colon", ":root", "store:"] {
+            assert!(
+                mirror_action(Some(MirrorCommand::BondStates {
+                    after: Some(bad.to_string()),
+                    limit: None,
+                }))
+                .is_err(),
+                "{bad:?} must be refused rather than ignored"
+            );
+        }
+    }
+
     /// **`chia-peers add --help` authorises only a node the operator RUNS (#254 item 7).**
     ///
     /// The same NC-12 boundary the wire notice holds, checked on the OTHER surface that states it.
@@ -1484,6 +1597,57 @@ mod tests {
             Command::Wallet { action } => Some(wallet_action(action)?.method()),
             _ => None,
         }
+    }
+
+    /// **The `mirror bond-states` verb parses from a real command line and carries its operands.**
+    ///
+    /// The parity coverage test only checks `control.wallet.*`, so a new verb that emits a
+    /// different control method is invisible to it — exactly what happened when `control.wallet.coinById`
+    /// shipped without a clap subcommand (dig_ecosystem#2376). This drives the actual parser and
+    /// asserts the parsed operands reach `wire_params`: a verb that parsed but dropped its cursor
+    /// would post a different position to the wire, and a method-name-only assertion could not see that.
+    #[test]
+    fn the_mirror_bond_states_verb_parses_and_carries_its_cursor() {
+        const STORE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const ROOT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+        let parsed = Cli::try_parse_from([
+            "dig-node",
+            "mirror",
+            "bond-states",
+            "--after",
+            &format!("{STORE}:{ROOT}"),
+            "--limit",
+            "50",
+        ])
+        .expect("`mirror bond-states --after --limit` parses");
+        let Some(Command::Mirror { action: cmd }) = parsed.command else {
+            panic!("parsed to something other than `mirror`");
+        };
+        let action = mirror_action(cmd).expect("a well-formed cursor parses");
+        assert_eq!(action.method(), "control.mirror.bondStates");
+        assert_eq!(
+            action.wire_params(),
+            serde_json::json!({
+                "after": { "store_id": STORE, "root": ROOT },
+                "limit": 50
+            }),
+            "the cursor and limit the user typed must reach the wire"
+        );
+
+        // With no operands, neither field is sent.
+        let bare = Cli::try_parse_from(["dig-node", "mirror", "bond-states"])
+            .expect("`mirror bond-states` with no operands parses");
+        let Some(Command::Mirror { action: cmd }) = bare.command else {
+            panic!("parsed to something other than `mirror`");
+        };
+        let bare_action = mirror_action(cmd)
+            .expect("no operands is valid")
+            .wire_params();
+        assert!(
+            bare_action.get("after").is_none() && bare_action.get("limit").is_none(),
+            "unset operands are omitted, not sent as null: {bare_action}"
+        );
     }
 
     /// **Both `profile` verbs parse from a real command line AND carry their operands.**
