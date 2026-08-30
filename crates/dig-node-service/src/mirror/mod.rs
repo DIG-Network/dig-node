@@ -45,10 +45,17 @@
 //! # Accountability is what pays for it
 //!
 //! Because the user cannot approve each spend, they are owed a complete account of every spend made
-//! without asking. The signer takes a
-//! [`RecordedSpend`](crate::spend_audit::RecordedSpend) (dig-node#376), whose only source is
-//! [`SpendJournal::begin`](crate::spend_audit::SpendJournal::begin) — so recording is the SHAPE of
-//! the call rather than a convention a later producer can forget.
+//! without asking. So the signer takes the
+//! [`SpendJournal`](crate::spend_audit::SpendJournal) (dig-node#376) and opens the record ITSELF,
+//! returning the [`RecordedSpend`](crate::spend_audit::RecordedSpend) for the caller to resolve —
+//! recording is the SHAPE of the call rather than a convention a later producer can forget.
+//!
+//! Opening it there, rather than accepting one already opened, is what makes the account TRUE
+//! rather than merely present. Exactly one entry exists per signature, so N unattended spends can
+//! never be accounted for as one; and the entry's amount, store and fee are derived from the spends
+//! by [`spends::MirrorSpends::intent`], so no caller is in a position to state a figure the bundle
+//! does not move. A record that is confidently wrong would be worse than none at all, because it is
+//! the record that buys the permission to spend without asking.
 //!
 //! # Nothing here re-derives the epoch, the hint, or the amount
 //!

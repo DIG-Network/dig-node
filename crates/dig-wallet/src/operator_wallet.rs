@@ -31,7 +31,10 @@
 //!
 //! [`OperatorWallet`] is a value a caller holds; it is not registered anywhere. In particular it is
 //! never passed to `WalletBackend::with_signer`, so `WalletBackend::current_signer()` answers exactly
-//! what it answered before — see the guard test at the bottom of this file. That matters beyond
+//! what it answered before — see the guard test
+//! `sage::rpc::tests::opening_the_operator_wallet_installs_no_signer_on_the_general_surface`, in
+//! `sage/rpc.rs`, which is where a `WalletBackend` can be built and so where the mistake would be
+//! made. That matters beyond
 //! tidiness: installing a signer on the general backend would silently activate every other
 //! node-custodied spend path, including default-on auto-tipping, as a side effect of enabling
 //! collateralisation.

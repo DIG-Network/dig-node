@@ -124,6 +124,10 @@ dig-chainsource-interface = "0.3"
 chia-bls = "0.36.1"
 chia-protocol = "0.36.1"
 chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+# `ToTreeHash`, to re-derive an owner puzzle hash from the key a mirror create is built for, so the
+# signer can refuse spends that are not its own wallet's rather than trusting the call site to have
+# passed the right key. Part of the same chia set above -- `chia-sdk-driver` already resolves it.
+clvm-utils = "0.36.1"
 # The epoch term of a mirror hint is a `BigInt`, not a `u64`: the morph is arithmetic over
 # 32-byte values and the crate's API says so. Same line as `dig-mirror-coin`'s own.
 num-bigint = "0.4.6"

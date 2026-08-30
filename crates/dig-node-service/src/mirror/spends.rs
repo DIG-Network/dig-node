@@ -12,7 +12,7 @@
 //! So the constraint is the argument type. [`MirrorSpends`] has no public constructor, no
 //! `Default`, and no way to be built from arbitrary spends. The only two producers are in this
 //! module, and each is a thin wrapper over the corresponding `dig_mirror_coin` builder. The signer
-//! ([`super::key::MirrorOperatingKey::sign`]) takes one and nothing else will type-check.
+//! ([`super::signer::MirrorSigner::sign`]) takes one and nothing else will type-check.
 //!
 //! That is a compile-time property of the API surface rather than a claim about its behaviour: to
 //! widen the authority you would have to add a producer here, which is a visible, reviewable edit to
@@ -25,9 +25,12 @@
 
 use chia_bls::PublicKey;
 use chia_protocol::{Bytes32, Coin, CoinSpend};
-use chia_sdk_driver::Cat;
+use chia_sdk_driver::{Cat, StandardLayer};
+use clvm_utils::ToTreeHash;
 use dig_mirror_coin::{MirrorAdvertisement, MirrorCoin, MirrorError};
 use num_bigint::BigInt;
+
+use crate::spend_audit::{kinds, Asset, Authority, SpendIntent, SpendKind};
 
 /// What a mirror spend is FOR. Carried alongside the spends so the audit entry and any log can name
 /// the operation without re-deriving it from the CLVM.
@@ -60,6 +63,11 @@ pub struct MirrorSpends {
     operation: MirrorOperation,
     spends: Vec<CoinSpend>,
     fee_mojos: u64,
+    owner_puzzle_hash: Bytes32,
+    store_launcher_id: Bytes32,
+    root_hash: Bytes32,
+    epoch: BigInt,
+    collateral_dig_base_units: u64,
 }
 
 impl MirrorSpends {
@@ -85,6 +93,47 @@ impl MirrorSpends {
     /// signer. It is also the figure §25.2 requires in the audit entry.
     pub fn fee_mojos(&self) -> u64 {
         self.fee_mojos
+    }
+
+    /// The puzzle hash these spends belong to — the key a create was built for, or the on-chain
+    /// owner of the coin a reclaim releases.
+    ///
+    /// `MirrorSigner::sign` refuses any bundle whose owner is not its own wallet's. Without it,
+    /// §25.2's destination bound would rest on every call site having passed the right key: the
+    /// builders take a `synthetic_key` while the signer signs with `self.wallet`, and nothing
+    /// related the two. The failure direction was safe — the network rejects the mismatch — but
+    /// "the network catches it" is not the same guarantee as "it cannot be built", and this module's
+    /// thesis is the second one.
+    pub fn owner_puzzle_hash(&self) -> Bytes32 {
+        self.owner_puzzle_hash
+    }
+
+    /// The audit intent these spends imply, derived wholly from the spends themselves.
+    ///
+    /// This is deliberately not something a caller supplies. An intent passed ALONGSIDE the spends
+    /// is a claim about them: it can name a different amount, a different store, or a different fee
+    /// than the bundle actually moves, and the resulting record is confidently wrong — which is
+    /// worse than no record, because §908's carve-out is bought precisely with the record being
+    /// true. Deriving it here makes the two unable to disagree.
+    pub(crate) fn intent(&self) -> SpendIntent {
+        SpendIntent {
+            kind: SpendKind::new(kinds::MIRROR_COIN),
+            purpose: format!(
+                "{} a mirror coin for store {} at root {} in epoch {}",
+                self.operation.as_str(),
+                hex::encode(self.store_launcher_id),
+                hex::encode(self.root_hash),
+                self.epoch,
+            ),
+            authority: Authority {
+                principal: "node".to_string(),
+                grant: "mirror-collateral".to_string(),
+            },
+            asset: Asset::Dig,
+            amount_mojos: self.collateral_dig_base_units,
+            fee_mojos: self.fee_mojos,
+            store_id: Some(hex::encode(self.store_launcher_id)),
+        }
     }
 }
 
@@ -116,7 +165,7 @@ pub fn build_create(
         MirrorAdvertisement {
             store_launcher_id,
             root_hash,
-            epoch,
+            epoch: epoch.clone(),
             urls,
             collateral: collateral_dig_base_units,
         },
@@ -130,6 +179,14 @@ pub fn build_create(
         operation: MirrorOperation::Create,
         spends,
         fee_mojos: fee,
+        // Re-derived from the key the spends were built for, by the same standard derivation
+        // `dig_mirror_coin::reclaim` uses to decide ownership — so the recorded owner is a property
+        // of the bundle rather than a second thing a caller could state.
+        owner_puzzle_hash: StandardLayer::new(synthetic_key).tree_hash().into(),
+        store_launcher_id,
+        root_hash,
+        epoch,
+        collateral_dig_base_units,
     })
 }
 
@@ -155,6 +212,17 @@ pub fn build_reclaim(
         operation: MirrorOperation::Reclaim,
         spends,
         fee_mojos: fee,
+        // The coin's own owner, read from its lineage proof rather than from the caller. `reclaim`
+        // has already refused (`NotOwner`) any coin this key does not own, so by the time there are
+        // spends at all these two agree.
+        owner_puzzle_hash: mirror.owner_puzzle_hash(),
+        store_launcher_id: mirror.store_launcher_id(),
+        root_hash: mirror.root_hash(),
+        epoch: mirror.epoch().clone(),
+        // What the coin actually locked, which is exactly what a reclaim returns -- not the current
+        // epoch's requirement. A coin bonded under a previous epoch's amount is reclaimed at that
+        // amount (SPEC.md 25.3).
+        collateral_dig_base_units: mirror.collateral(),
     })
 }
 
@@ -165,14 +233,20 @@ pub fn build_reclaim(
 /// module exists to guarantee. It carries [`MirrorOperation::Create`] because a `MirrorSpends` always
 /// names an operation; the operation is irrelevant to an empty spend set.
 ///
-/// `fee_mojos` is a parameter rather than zero so a signer test can exercise the ceiling without a
-/// chain. The fee is the one thing about these spends the signer reads, so a fixture that could not
-/// vary it could not test the bound at all.
+/// `fee_mojos` and `owner_puzzle_hash` are parameters rather than fixed values so a signer test can
+/// exercise the ceiling and the wallet binding without a chain. They are the two things about these
+/// spends the signer reads, and a fixture that could not vary them could not test either bound: a
+/// double that can only hold one value cannot express the disagreement being guarded against.
 #[cfg(test)]
-pub(crate) fn empty_for_tests(fee_mojos: u64) -> MirrorSpends {
+pub(crate) fn empty_for_tests(fee_mojos: u64, owner_puzzle_hash: Bytes32) -> MirrorSpends {
     MirrorSpends {
         operation: MirrorOperation::Create,
         spends: Vec::new(),
         fee_mojos,
+        owner_puzzle_hash,
+        store_launcher_id: Bytes32::default(),
+        root_hash: Bytes32::default(),
+        epoch: BigInt::from(0),
+        collateral_dig_base_units: 0,
     }
 }

@@ -7916,8 +7916,9 @@ itself (SYSTEM.md §4.1).
 > deciding half exists; nothing runs it.** Satisfied by code today, and *only* this:
 >
 > * §25.2's structural bounds on the signing authority — `MirrorSpends` and its two producers
->   (`mirror/spends.rs`), `MirrorSigner::sign` and the fee ceiling (`mirror/signer.rs`), and the
->   `&RecordedSpend` precondition that makes a journal entry the shape of the call.
+>   (`mirror/spends.rs`); and in `mirror/signer.rs`, the fee ceiling, the refusal of spends belonging
+>   to another wallet, and the one-record-per-signature audit entry whose intent is derived from the
+>   spends. All four read the artifact rather than a value passed beside it.
 > * §25.3's pricing rule and §25.4's step-3 planner, as **pure functions** over supplied
 >   observations (`mirror/plan.rs`, `mirror/pass.rs`), including §25.7's switch semantics and
 >   §25.9's decision directions.
@@ -7940,9 +7941,15 @@ itself (SYSTEM.md §4.1).
 > observed: the disk side (`cache_list_cached()` filtered to `Held`) is not read by this module, and
 > the chain side is not read at all — `dig_mirror_coin::list` appears nowhere in this repo. So a
 > reader MUST NOT infer that a coin's existence tracks a `.dig`'s presence today; the biconditional
-> below is the obligation <https://github.com/DIG-Network/dig-node/issues/412> discharges. The
-> `Relayed`-is-never-advertised rule is the exception: it holds structurally, because the plan's
-> desired set is built from `Held` bonds only.
+> below is the obligation <https://github.com/DIG-Network/dig-node/issues/412> discharges.
+>
+> **The `Relayed`-is-never-advertised rule is PENDING too, and it is the load-bearing one.** It is
+> prose at this head, not code: the planner takes a bond set it is GIVEN and carries no provenance
+> field, so nothing filters `Relayed` out — the exclusion lives only in a doc comment
+> (`mirror/plan.rs:24`) and in the sentence below. This is the single point at which another party
+> could influence what this node spends its own money on, since a `Relayed` capsule arrives on
+> somebody else's behalf. The observation step #412 builds MUST filter to `Held` provenance at the
+> source, and MUST NOT rely on a caller passing an already-filtered set.
 
 > **A mirror coin owned by this node for the CURRENT epoch exists ⟺ the `.dig` for that
 > `(store, root)` is on disk with `Held` provenance.**
@@ -7984,7 +7991,10 @@ The authority is bounded four ways, and every bound is stated so a reader can ch
    `Default`, and no conversion from `Vec<CoinSpend>`. Its only producers are `build_create` and
    `build_reclaim`, thin wrappers over `dig_mirror_coin::create` / `::reclaim` that add no
    conditions, alter no amount and change no destination. The signer's ONLY public entry point is
-   `sign(&MirrorSpends, &RecordedSpend)`. There is no method on this path that accepts an arbitrary
+   `sign(&MirrorSpends, &SpendJournal) -> Result<(SpendBundle, RecordedSpend), SignError>`, and it
+   MUST refuse spends whose owner puzzle hash is not its own wallet's — the builders take a
+   `synthetic_key` while the signer signs with its own, and nothing else relates the two.
+   There is no method on this path that accepts an arbitrary
    `CoinSpend`, so widening the authority requires adding a producer — a visible, reviewable edit to
    the one file whose purpose is to say what may be signed.
 2. **By destination, structurally.** A create's collateral lands at the $DIG CAT construction around
@@ -8031,8 +8041,15 @@ address the wallet already tracks.
 > no confirmation is observed, and nothing reconciles an `unresolved` or `failed` one. Both are
 > tracked as <https://github.com/DIG-Network/dig-node/issues/412>.
 
-**Every spend is audited, structurally.** The signer takes `&RecordedSpend`, whose only source is
-`SpendJournal::begin` (§23.3) — recording is the shape of the call. Entries carry
+**Every spend is audited, structurally — exactly ONE entry per signature, and it cannot lie about
+the spend.** The signer takes the `SpendJournal` (§23.3) and opens the record itself, returning the
+`RecordedSpend` for the caller to resolve: recording is the shape of the call. Two properties MUST
+hold and are held here by construction rather than by convention. **One record MUST NOT be able to
+back more than one signature** — an already-opened record passed by shared borrow can be reused in a
+loop, accounting for N unattended spends as one. And **the intent MUST be DERIVED from the spends**,
+never supplied alongside them: an intent a caller states can name a different amount, store or fee
+than the bundle moves, and a record that is confidently wrong is worse than no record, because
+§908's carve-out is bought precisely with the account being true. Entries carry
 `kind: "mirror-coin"` (`spend_audit::kinds::MIRROR_COIN`),
 `authority: { principal: "node", grant: "mirror-collateral" }`, the asset (`dig` for creates and
 reclaims), the amount in DIG base units, the fee in XCH mojos, and `store_id`; `purpose` SHOULD name
