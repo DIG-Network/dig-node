@@ -1143,15 +1143,7 @@ fn parse_dig_amount(raw: Option<&str>) -> std::io::Result<Option<u64>> {
         .ok_or_else(refuse)
 }
 
-/// Map the `collateral` subcommand to its [`ControlAction`], resolving a margin preset name.
-///
-/// A preset resolves to the SAME basis-point constant `dig-mirror-collateral` publishes, rather
-/// than to a number spelled out here. A second spelling of "generous" is how one surface comes to
-/// post a different amount than another for a setting the operator believes is one choice.
-///
-/// An unrecognised word is REFUSED, never silently treated as a number or as the default: a typo
-/// that fell through to the default would change what this node posts without saying so.
-/// `dig-node mirror [bond-states]` -> the §25.8 control action.
+/// Map `MirrorCommand::BondStates` to a [`ControlAction`], parsing and validating the cursor.
 ///
 /// The cursor operand is `<store_id>:<root>`, parsed here and REFUSED when it is not that shape.
 /// A half-understood cursor must never be dropped: the node would restart the walk while the
@@ -1182,6 +1174,14 @@ fn mirror_action(cmd: Option<MirrorCommand>) -> std::io::Result<ControlAction> {
     Ok(ControlAction::MirrorBondStates { after, limit })
 }
 
+/// Map the `collateral` subcommand to its [`ControlAction`], resolving a margin preset name.
+///
+/// A preset resolves to the SAME basis-point constant `dig-mirror-collateral` publishes, rather
+/// than to a number spelled out here. A second spelling of "generous" is how one surface comes to
+/// post a different amount than another for a setting the operator believes is one choice.
+///
+/// An unrecognised word is REFUSED, never silently treated as a number or as the default: a typo
+/// that fell through to the default would change what this node posts without saying so.
 fn collateral_action(cmd: Option<CollateralCommand>) -> std::io::Result<ControlAction> {
     use dig_mirror_collateral::{
         SAFETY_MARGIN_BP_DEFAULT, SAFETY_MARGIN_BP_GENEROUS, SAFETY_MARGIN_BP_TIGHT,
@@ -1597,6 +1597,58 @@ mod tests {
             Command::Wallet { action } => Some(wallet_action(action)?.method()),
             _ => None,
         }
+    }
+
+    /// **The `mirror bond-states` verb parses from a real command line and carries its operands.**
+    ///
+    /// The parity coverage test only checks `control.wallet.*`, so a new verb that emits a
+    /// different control method is invisible to it — exactly what happened when `control.wallet.coinById`
+    /// shipped without a clap subcommand (dig_ecosystem#2376). This drives the actual parser and
+    /// asserts the parsed operands reach `wire_params`: a verb that parsed but dropped its cursor
+    /// would post a different position to the wire, and a method-name-only assertion could not see that.
+    #[test]
+    fn the_mirror_bond_states_verb_parses_and_carries_its_cursor() {
+        const STORE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const ROOT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+        let parsed = Cli::try_parse_from([
+            "dig-node",
+            "mirror",
+            "bond-states",
+            "--after",
+            &format!("{STORE}:{ROOT}"),
+            "--limit",
+            "50",
+        ])
+        .expect("`mirror bond-states --after --limit` parses");
+        let Some(Command::Mirror { action: cmd }) = parsed.command else {
+            panic!("parsed to something other than `mirror`");
+        };
+        let action = mirror_action(cmd)
+            .expect("a well-formed cursor parses");
+        assert_eq!(action.method(), "control.mirror.bondStates");
+        assert_eq!(
+            action.wire_params(),
+            serde_json::json!({
+                "after": { "store_id": STORE, "root": ROOT },
+                "limit": 50
+            }),
+            "the cursor and limit the user typed must reach the wire"
+        );
+
+        // With no operands, neither field is sent.
+        let bare = Cli::try_parse_from(["dig-node", "mirror", "bond-states"])
+            .expect("`mirror bond-states` with no operands parses");
+        let Some(Command::Mirror { action: cmd }) = bare.command else {
+            panic!("parsed to something other than `mirror`");
+        };
+        let bare_action = mirror_action(cmd)
+            .expect("no operands is valid")
+            .wire_params();
+        assert!(
+            bare_action.get("after").is_none() && bare_action.get("limit").is_none(),
+            "unset operands are omitted, not sent as null: {bare_action}"
+        );
     }
 
     /// **Both `profile` verbs parse from a real command line AND carry their operands.**
