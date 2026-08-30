@@ -96,7 +96,7 @@ impl OperatorWallet {
     /// secret the signer holds, so the key a spend is BUILT for and the key it is SIGNED with cannot
     /// be two different keys.
     pub fn synthetic_key(&self) -> chia_bls::PublicKey {
-        self.synthetic_key.clone()
+        self.synthetic_key
     }
 
     /// The signer for this wallet's keys.
