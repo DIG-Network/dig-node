@@ -3042,6 +3042,7 @@ dependencies = [
  "chia-puzzle-types 0.36.1",
  "chia-sdk-driver 0.36.0",
  "chia-sdk-types 0.36.0",
+ "chia-sha2 0.36.1",
  "clap",
  "clvm-utils 0.36.1",
  "dig-cert",
