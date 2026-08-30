@@ -228,7 +228,22 @@ impl<E: MirrorEffects> PassRunner<E> {
 
         let on_chain = self.effects.observe_chain()?;
         let in_flight = in_flight_creates(&self.log, ctx.current_epoch);
-        let dig_balance_base_units = self.effects.dig_balance_base_units()?;
+        // NOT `?`. The balance prices creates and nothing else, so a wallet that cannot report its
+        // $DIG must degrade the create half rather than abort the pass — aborting here would leave a
+        // node unable to advertise AND unable to recover what it has already locked, which is rule 1
+        // (`pass.rs`) defeated through the funds READ instead of through the funds gate. §25.4.4's
+        // zero-fee reclaim exists for exactly this degraded state.
+        let dig_balance_base_units = match self.effects.dig_balance_base_units() {
+            Ok(balance) => Some(balance),
+            Err(e) => {
+                tracing::warn!(
+                    target: "mirror",
+                    error = %e,
+                    "the wallet could not report its $DIG; creates are deferred this pass and reclaims proceed"
+                );
+                None
+            }
+        };
 
         // Over the WHOLE observation, before the plan splits it into keeps and reclaims. Summed
         // here rather than from the plan, because the plan does not carry the coins it leaves alone.
@@ -458,6 +473,10 @@ mod tests {
         create_fails: Vec<Bond>,
         /// Coins whose reclaim must fail, so a failing reclaim can be shown not to stop the next.
         reclaim_fails: Vec<String>,
+        /// Make the BALANCE READ itself fail. Without this the `PassError::Wallet` arm of the
+        /// balance observation is unreachable from any fixture, and an error path no double can
+        /// take reads as covered while never having been run once.
+        balance_fails: bool,
     }
 
     impl MirrorEffects for FakeEffects {
@@ -470,6 +489,9 @@ mod tests {
         }
 
         fn dig_balance_base_units(&self) -> Result<u64, PassError> {
+            if self.balance_fails {
+                return Err(PassError::Wallet("the wallet is locked".to_string()));
+            }
             Ok(self.balance)
         }
 
@@ -564,6 +586,49 @@ mod tests {
                 epoch,
             }),
         }
+    }
+
+    /// Rule 1 again, reached through the funds READ rather than the funds gate.
+    ///
+    /// A wallet that can be talked to but cannot report its $DIG used to abort the pass, so a node
+    /// in that state could neither advertise nor recover what it had already locked -- the legacy
+    /// defect exactly, entered by a different door. The balance prices creates and nothing else.
+    ///
+    /// The fixture needs the widened double: every other `FakeEffects` returns `Ok` for the balance,
+    /// so `PassError::Wallet` on that call was unreachable from any fixture and the arm read as
+    /// covered while having never run. It also carries a bond WANTING a create, because the second
+    /// half of the assertion is about what the node SAYS -- `FundsUnknown`, not `Unfunded`, which
+    /// would send a person hunting for $DIG when what is broken is the wallet the node asks.
+    #[test]
+    fn an_unreadable_balance_defers_creates_and_still_reclaims() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_journal, log) = journal(dir.path());
+        let effects = FakeEffects {
+            disk: held(&[bond("aa", "11")]),
+            chain: vec![coin("old", "aa", "11", NOW_EPOCH - 1, REQUIRED)],
+            balance_fails: true,
+            ..Default::default()
+        };
+        let mut runner = runner(effects, log);
+
+        let report = runner
+            .run(&ctx())
+            .expect("an unreadable balance is not a reason to abandon locked money");
+
+        assert_eq!(
+            report.reclaimed.len(),
+            1,
+            "last epoch's coin still comes home: {report:?}"
+        );
+        assert!(
+            report.created.is_empty(),
+            "and nothing is bought at an unknown price: {report:?}"
+        );
+        assert_eq!(
+            report.states,
+            vec![(bond("aa", "11"), BondState::FundsUnknown)],
+            "not `Unfunded` -- this pass has no evidence the wallet is short, only that it could              not be read"
+        );
     }
 
     /// Rule 1, and the whole reason step 4 states an order: reclaims are never gated on funds.

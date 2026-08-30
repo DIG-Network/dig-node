@@ -80,6 +80,15 @@ pub enum BondState {
         /// How many more DIG base units this bond alone needs.
         short_dig_base_units: u64,
     },
+    /// The WALLET could not be read, so whether this create is affordable is unknown.
+    ///
+    /// Third of the three "no coin yet" answers, and distinct from both its neighbours: `Unfunded`
+    /// asserts the wallet is short, which this pass has no evidence for, and `Deferred` blames the
+    /// requirement, which may be perfectly well known. The remedy differs too — a person told they
+    /// are short goes looking for $DIG, when what is broken is the wallet the node asks.
+    ///
+    /// Reclaims are unaffected while this is reported: a coin coming home needs no balance.
+    FundsUnknown,
     /// The epoch's requirement is not known, so no create may be priced. NOT an out-of-funds state.
     Deferred {
         /// Why the requirement is unknown, verbatim from the requirement machinery so this surface
@@ -107,7 +116,19 @@ pub enum BondState {
     /// Kept apart from [`Self::Disabled`] and [`Self::Withheld`] because those two describe a node
     /// that is not spending, while this one describes money in motion — and from `Bonded`, which
     /// would tell a person their collateral is advertising something when it is on its way back.
-    Reclaiming,
+    ///
+    /// Carries the coin it is ABOUT, for the same reason `Bonded` does: a person told their money is
+    /// moving needs to know which coin and how much, and a payload-free variant leaves the §25.8
+    /// surface unable to say. It also makes the identity of the coin part of the state, so a
+    /// predicate that matched the wrong one could not report a plausible-looking answer.
+    Reclaiming {
+        /// The coin being spent home — the one a person can look up.
+        coin_id: String,
+        /// The epoch it bonded.
+        epoch: i64,
+        /// What it still locks until the reclaim confirms.
+        amount_dig_base_units: u64,
+    },
 }
 
 /// Everything a pass consults, gathered once so the decision can be taken without further I/O.
@@ -136,8 +157,15 @@ pub struct PassInputs<'a> {
     pub requirement: &'a CollateralRequirementResult,
     /// The local safety margin, in basis points (`collateral.json`).
     pub margin_bp: u64,
-    /// Spendable $DIG, in base units.
-    pub dig_balance_base_units: u64,
+    /// Spendable $DIG in base units, or `None` when the wallet could not report it.
+    ///
+    /// `None` is NOT zero. A wallet that cannot be read is UNKNOWN, and reading it as zero would
+    /// report every uncovered bond as `Unfunded` — an out-of-funds alarm about a wallet that may be
+    /// perfectly funded, which is the conflation dig-app#300 exists to prevent. It reaches the
+    /// pricing of creates and NOTHING else: rule 1 says a reclaim is never withheld for want of
+    /// funds, and a reclaim withheld because the BALANCE READ failed is the same defect reached
+    /// through the observation instead of through the gate.
+    pub dig_balance_base_units: Option<u64>,
     /// Whether creates are enabled (§25.7). Reclaims ignore this.
     pub creates_enabled: bool,
 }
@@ -176,13 +204,15 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
         CollateralRequirementResult::Unknown { .. } => None,
     };
 
-    let (affordable, split) = match per_coin {
-        Some(per_coin) => {
-            let split =
-                super::plan::split_by_funds(&create, inputs.dig_balance_base_units, per_coin);
+    // Rule 1, continued: the balance is read AFTER the plan too, and an unknown balance prices no
+    // create rather than aborting anything. `reclaim` above is already decided and is untouched by
+    // either arm below.
+    let (affordable, split) = match (per_coin, inputs.dig_balance_base_units) {
+        (Some(per_coin), Some(balance)) => {
+            let split = super::plan::split_by_funds(&create, balance, per_coin);
             (split.affordable.clone(), Some(split))
         }
-        None => (Vec::new(), None),
+        _ => (Vec::new(), None),
     };
 
     let states = bond_states(inputs, &affordable, split.as_ref(), per_coin, &reclaim);
@@ -230,11 +260,11 @@ fn bond_states(
         // collateral is advertising this capsule while the money is leaving; reporting `Reclaiming`
         // because some OTHER coin is leaving tells them the inverse lie about a coin that is posted
         // and working. Both are false money statements, so the precedence is kept and narrowed.
-        let mut reclaiming = false;
+        let mut reclaiming: Option<&HeldMirror> = None;
         let mut coin = None;
         for candidate in current_epoch_coins {
             if reclaim.iter().any(|(c, _)| c.coin_id == candidate.coin_id) {
-                reclaiming = true;
+                reclaiming = reclaiming.or(Some(candidate));
             } else {
                 coin = Some(candidate);
                 break;
@@ -247,11 +277,15 @@ fn bond_states(
                 epoch: coin.epoch,
                 amount_dig_base_units: coin.collateral_dig_base_units,
             }
-        } else if reclaiming {
+        } else if let Some(going) = reclaiming {
             // Every current-epoch coin for this bond is on its way home — the switch-off and
             // `NoLongerHeld` cases. The money is still locked until the reclaim confirms, so this
             // outranks both the switch and the plan's intentions, exactly as before.
-            BondState::Reclaiming
+            BondState::Reclaiming {
+                coin_id: going.coin_id.clone(),
+                epoch: going.epoch,
+                amount_dig_base_units: going.collateral_dig_base_units,
+            }
         } else if !inputs.creates_enabled {
             BondState::Disabled
         } else if inputs.in_flight.contains(bond) {
@@ -273,6 +307,10 @@ fn bond_states(
                         BondState::Pending
                     }
                 }
+                // Order matters between the two unknowns: an unreadable wallet is reported as
+                // itself even when the requirement is also unknown, because it is the one that
+                // needs a person to look at this node rather than at the chain.
+                _ if inputs.dig_balance_base_units.is_none() => BondState::FundsUnknown,
                 _ => BondState::Deferred {
                     reason: unknown_reason(inputs.requirement),
                 },
@@ -369,7 +407,7 @@ mod tests {
             current_epoch: NOW_EPOCH,
             requirement,
             margin_bp: 0,
-            dig_balance_base_units: 1_000_000,
+            dig_balance_base_units: Some(1_000_000),
             creates_enabled: true,
         }
     }
@@ -442,7 +480,7 @@ mod tests {
         let req = known();
         let on_chain = [coin("gone", "bb", "22", NOW_EPOCH, REQUIRED)];
         let mut i = inputs(&held, &on_chain, &req);
-        i.dig_balance_base_units = 0;
+        i.dig_balance_base_units = Some(0);
 
         let d = decide(&i);
 
@@ -511,10 +549,21 @@ mod tests {
 
         assert_eq!(
             state("aa", "11"),
-            BondState::Reclaiming,
+            BondState::Reclaiming {
+                coin_id: id("c1"),
+                epoch: NOW_EPOCH,
+                amount_dig_base_units: REQUIRED,
+            },
             "the coin is still on chain and still locking money, switch or no switch -- and the              reclaim carrying it home is the more precise thing to say than `Bonded`"
         );
-        assert_eq!(state("bb", "22"), BondState::Reclaiming);
+        assert_eq!(
+            state("bb", "22"),
+            BondState::Reclaiming {
+                coin_id: id("c2"),
+                epoch: NOW_EPOCH,
+                amount_dig_base_units: REQUIRED,
+            }
+        );
         assert_eq!(
             state("cc", "33"),
             BondState::Disabled,
@@ -642,7 +691,7 @@ mod tests {
         let in_flight = [bond("aa", "11")];
         let mut i = inputs(&held, &[], &req);
         i.in_flight = &in_flight;
-        i.dig_balance_base_units = 0;
+        i.dig_balance_base_units = Some(0);
 
         let d = decide(&i);
 
@@ -657,7 +706,7 @@ mod tests {
         let held = [bond("aa", "11"), bond("bb", "22"), bond("cc", "33")];
         let req = known();
         let mut i = inputs(&held, &[], &req);
-        i.dig_balance_base_units = 2 * REQUIRED;
+        i.dig_balance_base_units = Some(2 * REQUIRED);
 
         let d = decide(&i);
 
