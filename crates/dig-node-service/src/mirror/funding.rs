@@ -263,7 +263,9 @@ fn authenticate<S: ChainSource>(
         return Err(refuse("the resolved CAT is not $DIG"));
     }
     if cat.info.p2_puzzle_hash != owner_puzzle_hash {
-        return Err(refuse("the resolved CAT is owned by a different puzzle hash"));
+        return Err(refuse(
+            "the resolved CAT is owned by a different puzzle hash",
+        ));
     }
     Ok(cat)
 }
