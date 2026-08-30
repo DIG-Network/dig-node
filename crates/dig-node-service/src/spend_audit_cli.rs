@@ -318,6 +318,7 @@ mod tests {
             amount_mojos: 1_000,
             fee_mojos: 10,
             store_id: store.map(str::to_string),
+            bond: None,
         }
     }
 

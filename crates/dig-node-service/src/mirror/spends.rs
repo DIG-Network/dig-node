@@ -30,7 +30,7 @@ use clvm_utils::ToTreeHash;
 use dig_mirror_coin::{MirrorAdvertisement, MirrorCoin, MirrorError};
 use num_bigint::BigInt;
 
-use crate::spend_audit::{kinds, Asset, Authority, SpendIntent, SpendKind};
+use crate::spend_audit::{kinds, Asset, AuditedBond, Authority, SpendIntent, SpendKind};
 
 /// What a mirror spend is FOR. Carried alongside the spends so the audit entry and any log can name
 /// the operation without re-deriving it from the CLVM.
@@ -133,6 +133,21 @@ impl MirrorSpends {
             amount_mojos: self.collateral_dig_base_units,
             fee_mojos: self.fee_mojos,
             store_id: Some(hex::encode(self.store_launcher_id)),
+            // The other two thirds of the bond key, recorded structurally rather than left to be
+            // read back out of `purpose`. This is what lets a pass that has just restarted tell
+            // which `(store, root, epoch)` create is already in flight (SPEC.md 25.4.6) without
+            // remembering anything itself.
+            // The mirror epoch is a `BigInt` on the wire because the hint morph is arithmetic over
+            // 32-byte values. As a NUMBER it is a wall-clock round index and fits an i64 for the
+            // next few hundred million years. One that does not fit yields `None` rather than a
+            // truncated epoch: `None` suppresses nothing, whereas a wrong epoch would suppress the
+            // WRONG create, and a bond left uncollateralised is worse than one attempted twice.
+            bond: i64::try_from(self.epoch.clone())
+                .ok()
+                .map(|epoch| AuditedBond {
+                    root: hex::encode(self.root_hash),
+                    epoch,
+                }),
         }
     }
 }
@@ -243,6 +258,35 @@ pub(crate) fn empty_for_tests(fee_mojos: u64, owner_puzzle_hash: Bytes32) -> Mir
         operation: MirrorOperation::Create,
         spends: Vec::new(),
         fee_mojos,
+        owner_puzzle_hash,
+        store_launcher_id: Bytes32::default(),
+        root_hash: Bytes32::default(),
+        epoch: BigInt::from(0),
+        collateral_dig_base_units: 0,
+    }
+}
+
+/// A [`MirrorSpends`] whose single spend CANNOT be signed, for testing the signer's failure path.
+///
+/// The puzzle reveal is a truncated CLVM cons, so computing the required signatures fails before any
+/// key is consulted. That is the only way to reach `WalletSigner::sign`'s error arm without a chain:
+/// an empty spend set always succeeds, and a well-formed one signs.
+///
+/// `#[cfg(test)]` for the same reason [`empty_for_tests`] is — the no-public-constructor property is
+/// the whole authority bound. Owned by this signer's wallet, so the test that uses it is exercising
+/// the SIGNING failure and not the ownership refusal in front of it.
+#[cfg(test)]
+pub(crate) fn unsignable_for_tests(owner_puzzle_hash: Bytes32) -> MirrorSpends {
+    use chia_protocol::Program;
+
+    MirrorSpends {
+        operation: MirrorOperation::Create,
+        spends: vec![CoinSpend::new(
+            Coin::new(Bytes32::default(), Bytes32::default(), 1),
+            Program::from(vec![0xff_u8]),
+            Program::from(vec![0x80_u8]),
+        )],
+        fee_mojos: 0,
         owner_puzzle_hash,
         store_launcher_id: Bytes32::default(),
         root_hash: Bytes32::default(),

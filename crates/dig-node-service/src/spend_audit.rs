@@ -321,6 +321,23 @@ pub struct ChainReference {
     pub confirmed: bool,
 }
 
+/// The exact bond a mirror-coin spend is FOR: `(store, root, epoch)`.
+///
+/// Recorded structurally, beside `store_id`, so the in-flight ledger can be re-derived from the
+/// record ALONE after a restart. `purpose` names the same three things in a sentence, and parsing
+/// that sentence would make the suppression rule depend on prose nobody promised to keep stable.
+///
+/// `store_id` alone is not enough and the difference is not academic: suppressing per store would
+/// withhold a legitimate create for a DIFFERENT root of the same store while an unrelated one is in
+/// flight, which is a bond the node holds and does not advertise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditedBond {
+    /// Generation root hash (lowercase 64-hex).
+    pub root: String,
+    /// The mirror epoch this spend bonds.
+    pub epoch: i64,
+}
+
 /// Everything a producer must state BEFORE it is allowed to sign.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendIntent {
@@ -338,6 +355,9 @@ pub struct SpendIntent {
     pub fee_mojos: u64,
     /// The store this spend serves, when it serves one. Filterable.
     pub store_id: Option<String>,
+    /// The `(root, epoch)` half of a bond, for spends that bond one. `None` for every other kind.
+    #[serde(default)]
+    pub bond: Option<AuditedBond>,
 }
 
 /// One entry in the audit record: a full snapshot of one spend at one revision.
@@ -361,6 +381,15 @@ pub struct SpendRecord {
     pub fee_mojos: u64,
     /// The store served, when any.
     pub store_id: Option<String>,
+    /// The `(root, epoch)` this spend bonds, when it bonds one.
+    ///
+    /// Carried through from the intent so a pass reading the record back — after a restart, with no
+    /// memory of what it submitted — can tell which `(store, root, epoch)` create is already in
+    /// flight (`SPEC.md` §25.4.6). `#[serde(default)]` so records written before this field existed
+    /// still parse: an older entry answers `None`, which suppresses nothing, and the pass then makes
+    /// a duplicate-free decision from the chain instead.
+    #[serde(default)]
+    pub bond: Option<AuditedBond>,
     /// When the node decided to spend (unix ms).
     pub initiated_ms: u64,
     /// When this revision was written (unix ms).
@@ -755,6 +784,7 @@ impl SpendJournal {
             amount_mojos: intent.amount_mojos,
             fee_mojos: intent.fee_mojos,
             store_id: intent.store_id,
+            bond: intent.bond,
             initiated_ms: now,
             updated_ms: now,
             status: SpendStatus::Pending,
@@ -999,6 +1029,7 @@ mod tests {
             amount_mojos: 1_000,
             fee_mojos: 10,
             store_id: Some("store-a".to_string()),
+            bond: None,
         }
     }
 
@@ -1289,6 +1320,7 @@ mod tests {
             amount_mojos: 1,
             fee_mojos: 0,
             store_id: store.map(str::to_string),
+            bond: None,
             initiated_ms,
             updated_ms: initiated_ms,
             status: SpendStatus::Pending,

@@ -44,6 +44,7 @@ fn intent(store: &str) -> SpendIntent {
         amount_mojos: 1_000,
         fee_mojos: 10,
         store_id: Some(store.to_string()),
+        bond: None,
     }
 }
 
