@@ -347,7 +347,7 @@ mod tests {
             expires_at: u64::MAX,
             // No mirror-coin pointer: absence is the normal state for a provider (#422).
             unverified_mirror_coin_id: None,
-            };
+        };
         let pool_hint = ProviderRecord {
             content_key: cid.to_key().to_hex(),
             provider_peer_id: mock_peer_hex(1),
@@ -355,7 +355,7 @@ mod tests {
             expires_at: u64::MAX,
             // No mirror-coin pointer: absence is the normal state for a provider (#422).
             unverified_mirror_coin_id: None,
-            };
+        };
         let dht = Arc::new(MockProviderLocator::fixed(vec![dht_hint]));
         let pool = Arc::new(MockProviderLocator::fixed(vec![pool_hint]));
         let union = UnionLocator::new(vec![dht, pool]);
@@ -407,7 +407,7 @@ mod tests {
             expires_at: u64::MAX,
             // No mirror-coin pointer: absence is the normal state for a provider (#422).
             unverified_mirror_coin_id: None,
-            };
+        };
         let src = Arc::new(MockProviderLocator::fixed(vec![bloated]));
         let union = UnionLocator::new(vec![src]);
 
@@ -452,7 +452,7 @@ mod tests {
             expires_at: u64::MAX,
             // No mirror-coin pointer: absence is the normal state for a provider (#422).
             unverified_mirror_coin_id: None,
-            };
+        };
         // A LATER source names the SAME peer at one ADDITIONAL, reachable address.
         let later = ProviderRecord {
             content_key: cid.to_key().to_hex(),
@@ -461,7 +461,7 @@ mod tests {
             expires_at: u64::MAX,
             // No mirror-coin pointer: absence is the normal state for a provider (#422).
             unverified_mirror_coin_id: None,
-            };
+        };
         let src_a = Arc::new(MockProviderLocator::fixed(vec![earlier]));
         let src_b = Arc::new(MockProviderLocator::fixed(vec![later]));
         let union = UnionLocator::new(vec![src_a, src_b]);

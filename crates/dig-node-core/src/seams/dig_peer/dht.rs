@@ -1757,7 +1757,9 @@ mod tests {
     /// provider record.
     async fn published_pointer(service: &DhtService, id: &ContentId) -> Option<[u8; 32]> {
         let records = service.find_providers(id).await.expect("local providers");
-        let record = records.first().expect("this node provides the id it announced");
+        let record = records
+            .first()
+            .expect("this node provides the id it announced");
         record.unverified_mirror_coin_id_bytes()
     }
 

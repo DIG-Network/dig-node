@@ -1338,7 +1338,7 @@ mod tests {
                 expires_at: u64::MAX,
                 // No mirror-coin pointer: absence is the normal state for a provider (#422).
                 unverified_mirror_coin_id: None,
-                }])
+            }])
         }
     }
 
