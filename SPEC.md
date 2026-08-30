@@ -7953,12 +7953,18 @@ itself (SYSTEM.md §4.1).
 > **Two things in §25 remain PENDING**, tracked as
 > <https://github.com/DIG-Network/dig-node/issues/412>:
 >
-> * **CREATES are refused, by name.** `dig_mirror_coin::create` takes its `Vec<Cat>` from the
->   caller, and this node has no $DIG coin selector scoped to the OPERATOR puzzle hash — the
->   node-custodied selector reads a different wallet's coins. `NodeMirrorEffects::create` therefore
->   returns a named error, the pass reports it, and §25.8 keeps reporting the bond as uncovered,
->   which is true. Tracked as <https://github.com/DIG-Network/dig-node/issues/421>. **RECLAIMS are
->   implemented** and are supported at `fee = 0` with no fee coins, which is §25.4.4.
+> * **CREATES select their collateral from the OPERATOR wallet, and are refused for want of an
+>   ADVERTISED URL.** `mirror::funding::select_operator_dig_cats` scans the chain at the CAT wrapping
+>   of this node's operator puzzle hash under `dig_mirror_coin::DIG_ASSET_ID`, withholds coins
+>   committed to a bundle whose audit record is not terminal, selects largest-first, and
+>   reconstructs each selected candidate's lineage from its creating spend — refusing the WHOLE
+>   selection on a shortfall, an unauthenticatable candidate, an unreadable chain, or an unreadable
+>   audit record, never funding a smaller coin (dig-node#421). What is still missing is the
+>   advertisement: `dig_mirror_coin::create` requires at least one URL its store can be fetched
+>   from, this node has no configured public name, and `NodeMirrorEffects::create` therefore refuses
+>   by name BEFORE any chain read. **RECLAIMS are implemented** and are supported at `fee = 0` with
+>   no fee coins, which is §25.4.4 — and are never gated on any funding read, including the
+>   committed-coin read.
 > * **§25.6's DHT pointer is not attached.** `ProviderRecord::unverified_mirror_coin_id` lives in
 >   dig-dht 0.15, and `dig-download` 0.21.0 and `dig-peer-selector` 0.10.0 both require
 >   `dig-dht ^0.13` — semver-incompatible on a `0.x` line, so taking 0.15 here would resolve two
@@ -8271,8 +8277,8 @@ one setting to turn off** (§6.0/#207).
 > oracle read — a real amplification surface, since a paired token is a much weaker predicate than
 > "trusted". A node whose first pass has not yet completed answers
 > `unknown { reason: "chain_unreadable" }`, which remains the honest answer and is never an empty
-> page. A bond whose create is refused for want of an operator-scoped $DIG selector
-> (dig-node#421) reports as uncovered, which is what it is.
+> page. A bond whose create is refused — for want of an advertised URL, for want of uncommitted
+> operator $DIG, or because the chain could not be read — reports as uncovered, which is what it is.
 
 The lifecycle exposes, per `(store, root)`, over the control plane and with a `dign` verb (§8.6
 CLI parity): the bond state — `bonded { coin_id, epoch, amount }`, `pending` (in-flight create),

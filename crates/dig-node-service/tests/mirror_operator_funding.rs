@@ -52,8 +52,17 @@ impl Chain {
     fn fund(&mut self, owner: &Wallet, amounts: &[u64], salt: u8) -> Vec<Bytes32> {
         let (spend, coins) = ordinary_dig_coins(owner, amounts, salt);
         self.spends.insert(spend.coin.coin_id(), spend);
-        let mut ids = Vec::new();
+        let mut ids: Vec<Bytes32> = Vec::new();
         for coin in coins {
+            // A coin id is `(parent, puzzle_hash, amount)`. Two children of ONE spend paying the
+            // SAME amount to the SAME address are therefore literally the same coin, and a fixture
+            // that thinks it published two has published one. That collapse silently defeats every
+            // per-coin assertion below -- committing "one of the two" commits both -- so it is a
+            // fixture failure rather than something a test is left to notice.
+            assert!(
+                !ids.contains(&coin.coin_id()),
+                "two fixture coins collapsed to one id; vary the AMOUNTS, not just the count"
+            );
             ids.push(coin.coin_id());
             self.by_puzzle_hash
                 .entry(coin.puzzle_hash)
@@ -252,7 +261,10 @@ fn an_operator_with_no_coins_refuses_even_when_the_replica_is_rich() {
 fn a_committed_coin_is_withheld_and_the_uncommitted_one_is_taken() {
     let operator = operator();
     let mut chain = Chain::default();
-    let ids = chain.fund(&operator, &[REQUIRED, REQUIRED], 0x01);
+    // Distinct amounts, so the two coins are two coins. The COMMITTED one is the larger, so
+    // largest-first reaches it first and a selector that ignored the commitment would visibly take
+    // it -- a fixture committing the smaller would be satisfied by one that simply never looked.
+    let ids = chain.fund(&operator, &[REQUIRED * 2, REQUIRED], 0x01);
     let (committed_id, free_id) = (ids[0], ids[1]);
 
     let committed: HashSet<String> = [hex::encode(committed_id)].into_iter().collect();
@@ -277,18 +289,21 @@ fn a_committed_coin_is_withheld_and_the_uncommitted_one_is_taken() {
 fn a_reservation_that_makes_the_balance_short_refuses_rather_than_double_spending() {
     let operator = operator();
     let mut chain = Chain::default();
-    let ids = chain.fund(&operator, &[REQUIRED / 2, REQUIRED / 2], 0x01);
+    // The raw balance COVERS the requirement (0.75 + 0.5 = 1.25x) and the uncommitted part does
+    // not. That is the discriminating shape: an unfiltered selector succeeds here and a correct one
+    // refuses, whereas a fixture whose raw balance were already short would refuse either way.
+    let ids = chain.fund(&operator, &[REQUIRED * 3 / 4, REQUIRED / 2], 0x01);
 
     let committed: HashSet<String> = [hex::encode(ids[0])].into_iter().collect();
     let err = select_operator_dig_cats(&chain, operator.puzzle_hash, REQUIRED, &committed)
-        .expect_err("half the balance is already committed");
+        .expect_err("three quarters of the balance is already committed");
     assert_eq!(
         err,
         FundingError::Insufficient {
             have_dig_base_units: REQUIRED / 2,
             need_dig_base_units: REQUIRED,
         },
-        "the committed half is not available, so the wallet is short and no spend is attempted"
+        "only the uncommitted half is available, so the wallet is short and no spend is attempted"
     );
 }
 
@@ -337,16 +352,30 @@ fn exactly_the_requirement_is_funded() {
 fn the_number_of_coins_drawn_follows_the_requirement_it_was_given() {
     let operator = operator();
     let mut chain = Chain::default();
-    chain.fund(&operator, &[REQUIRED, REQUIRED, REQUIRED], 0x01);
+    // Distinct amounts for the reason `Chain::fund` asserts, and each below the requirement so the
+    // count genuinely has to grow: 0.6 + 0.5 + 0.4 = 1.5x, and no two of them cover 1x either.
+    chain.fund(
+        &operator,
+        &[REQUIRED * 3 / 5, REQUIRED / 2, REQUIRED * 2 / 5],
+        0x01,
+    );
 
-    let small = select_operator_dig_cats(&chain, operator.puzzle_hash, REQUIRED, &HashSet::new())
-        .expect("covered");
-    let large =
-        select_operator_dig_cats(&chain, operator.puzzle_hash, REQUIRED * 3, &HashSet::new())
+    let small =
+        select_operator_dig_cats(&chain, operator.puzzle_hash, REQUIRED / 2, &HashSet::new())
             .expect("covered");
+    let large = select_operator_dig_cats(&chain, operator.puzzle_hash, REQUIRED, &HashSet::new())
+        .expect("covered");
 
-    assert_eq!(small.len(), 1, "one coin covers one requirement");
-    assert_eq!(large.len(), 3, "three are needed to cover three");
+    assert_eq!(
+        small.len(),
+        1,
+        "the largest coin alone covers half the requirement"
+    );
+    assert_eq!(
+        large.len(),
+        2,
+        "no single coin covers the whole requirement, so a second is drawn"
+    );
 }
 
 /// **A candidate that cannot be authenticated refuses the WHOLE selection.**
