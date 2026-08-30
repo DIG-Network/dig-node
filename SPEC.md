@@ -8236,7 +8236,7 @@ one setting to turn off** (§6.0/#207).
 ### 25.8. The per-store state surface
 
 > **PENDING — not yet implemented.** This subsection is normative and is NOT satisfied by
-> code as of this section's introduction. Tracked as dig-node#377 step 6 (the `dig-node-control-interface` 0.25.0
+> code as of this section's introduction. Tracked as dig-node#377 step 6 (the `dig-node-control-interface` 0.26.0
 > method declaration, release-first, then the node serving it and the `dign` verb). Until it lands, a reader MUST NOT
 > rely on the behaviour described here.
 

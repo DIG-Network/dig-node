@@ -217,26 +217,41 @@ fn bond_states(
     }
 
     for bond in inputs.held {
-        // A reclaim in flight outranks the coin it is reclaiming. Checked BEFORE the chain, because
-        // the coin is still there — that is what a reclaim is for — and reporting `Bonded` would
-        // tell a person their collateral is advertising this capsule while it is on its way back.
-        let reclaiming = reclaim
-            .iter()
-            .any(|(c, _)| c.store_id == bond.store_id && c.root == bond.root);
-
-        // Then the chain: a coin that exists outranks every reason a coin might not.
-        let coin = inputs.on_chain.iter().find(|c| {
+        // The chain first, scoped to the CURRENT epoch: those are the only coins that can be
+        // collateralising this bond right now. A prior-epoch coin for the same `(store, root)` is
+        // always being reclaimed at a rollover (`plan`'s `EpochEnded` row) and says nothing about
+        // whether this bond is covered.
+        let current_epoch_coins = inputs.on_chain.iter().filter(|c| {
             c.epoch == inputs.current_epoch && c.store_id == bond.store_id && c.root == bond.root
         });
 
-        let state = if reclaiming {
-            BondState::Reclaiming
-        } else if let Some(coin) = coin {
+        // A reclaim in flight outranks the coin IT is reclaiming — matched by `coin_id`, never by
+        // `(store, root)`. Reporting `Bonded` for a coin on its way home would tell a person their
+        // collateral is advertising this capsule while the money is leaving; reporting `Reclaiming`
+        // because some OTHER coin is leaving tells them the inverse lie about a coin that is posted
+        // and working. Both are false money statements, so the precedence is kept and narrowed.
+        let mut reclaiming = false;
+        let mut coin = None;
+        for candidate in current_epoch_coins {
+            if reclaim.iter().any(|(c, _)| c.coin_id == candidate.coin_id) {
+                reclaiming = true;
+            } else {
+                coin = Some(candidate);
+                break;
+            }
+        }
+
+        let state = if let Some(coin) = coin {
             BondState::Bonded {
                 coin_id: coin.coin_id.clone(),
                 epoch: coin.epoch,
                 amount_dig_base_units: coin.collateral_dig_base_units,
             }
+        } else if reclaiming {
+            // Every current-epoch coin for this bond is on its way home — the switch-off and
+            // `NoLongerHeld` cases. The money is still locked until the reclaim confirms, so this
+            // outranks both the switch and the plan's intentions, exactly as before.
+            BondState::Reclaiming
         } else if !inputs.creates_enabled {
             BondState::Disabled
         } else if inputs.in_flight.contains(bond) {
@@ -530,6 +545,65 @@ mod tests {
         );
     }
 
+    /// At a rollover a bond holds coins for TWO epochs at once, and only the OLD one is leaving.
+    ///
+    /// The window is the ordinary case, not a contrived one: the new epoch's coin confirms before
+    /// the old one's reclaim does, so every pass in between sees both. The fixture varies the EPOCH
+    /// term — the one term no other fixture here varies — because a `(store, root)`-keyed reclaim
+    /// predicate is satisfied by the departing coin and reports a posted, advertising capsule as
+    /// `Reclaiming`: the inverse of the false money statement `Reclaiming` was added to prevent.
+    ///
+    /// `bb` is the control, and it is what makes this about the epoch rather than about the count:
+    /// it holds ONLY a prior-epoch coin, so it must NOT read as `Bonded` — a predicate that dropped
+    /// the epoch term from the chain lookup instead would pass on `aa` alone.
+    #[test]
+    fn a_current_epoch_coin_is_bonded_while_its_prior_epoch_sibling_reclaims() {
+        let held = [bond("aa", "11"), bond("bb", "22")];
+        let req = known();
+        let on_chain = [
+            coin("aa-old", "aa", "11", NOW_EPOCH - 1, REQUIRED),
+            coin("aa-now", "aa", "11", NOW_EPOCH, REQUIRED),
+            coin("bb-old", "bb", "22", NOW_EPOCH - 1, REQUIRED),
+        ];
+        let i = inputs(&held, &on_chain, &req);
+
+        let d = decide(&i);
+
+        let state = |store: &str, root: &str| {
+            d.states
+                .iter()
+                .find(|(b, _)| *b == bond(store, root))
+                .map(|(_, s)| s.clone())
+                .expect("every held bond is reported")
+        };
+
+        assert_eq!(
+            state("aa", "11"),
+            BondState::Bonded {
+                coin_id: id("aa-now"),
+                epoch: NOW_EPOCH,
+                amount_dig_base_units: REQUIRED,
+            },
+            "this capsule's collateral is posted and advertising; only last epoch's coin is leaving"
+        );
+        assert_eq!(
+            state("bb", "22"),
+            BondState::Pending,
+            "a prior-epoch coin collateralises nothing, so this bond still needs its create"
+        );
+
+        let reclaimed: Vec<String> = d.reclaim.iter().map(|(c, _)| c.coin_id.clone()).collect();
+        assert_eq!(
+            reclaimed,
+            vec![id("aa-old"), id("bb-old")],
+            "the prior-epoch coins are what reclaim, and the current-epoch one is untouched"
+        );
+        assert!(d
+            .reclaim
+            .iter()
+            .all(|(_, why)| *why == ReclaimReason::EpochEnded));
+    }
+
     /// A bond already on chain reports the amount ITS OWN COIN locks, not this epoch's requirement.
     ///
     /// The fixture deliberately makes the two differ: a coin created when the requirement was 1.000
@@ -630,14 +704,64 @@ mod tests {
         assert_eq!(d.states.len(), 2, "both capsules are reported");
     }
 
-    /// A bond whose coin is being reclaimed reports `Reclaiming`, not `Bonded`.
+    /// A rollover where BOTH epochs' coins are on chain reports `Bonded` — the defect this fixture
+    /// exists for.
     ///
-    /// The coin is still on chain — that is what a reclaim is for — so a chain-first implementation
-    /// reports `Bonded` and tells a person their collateral is advertising a capsule whose money is
-    /// on its way back. The fixture is a PRIOR-epoch coin for a bond that is still held, which is the
-    /// ordinary rollover case rather than a contrived one.
+    /// `plan` reclaims every `epoch < current` coin unconditionally, so on any pass after the new
+    /// coin has confirmed and before the old reclaim has, the live coin and the outgoing one coexist.
+    /// A `Reclaiming` predicate scoped to `(store, root)` rather than to the coin it is actually
+    /// reclaiming reports this correctly-collateralised capsule as money on its way home — the same
+    /// class of false money statement the variant exists to prevent, pointing the other way, and it
+    /// hides a real `Bonded` row from the surface dig-app#289 renders.
+    ///
+    /// **Neither other fixture can see this**, which is why it is its own test: the switch-off case
+    /// holds only current-epoch coins and the case below holds only a prior-epoch one, so the epoch
+    /// term is never varied against a fixture holding both. The two coins carry DIFFERENT amounts so
+    /// the assertion also proves which of them was read.
     #[test]
-    fn a_bond_whose_coin_is_being_reclaimed_reports_reclaiming() {
+    fn a_bond_with_both_epochs_on_chain_is_bonded_not_reclaiming() {
+        let held = [bond("aa", "11")];
+        let req = known();
+        let on_chain = [
+            coin("new", "aa", "11", NOW_EPOCH, 700),
+            coin("old", "aa", "11", NOW_EPOCH - 1, 1_500),
+        ];
+        let i = inputs(&held, &on_chain, &req);
+
+        let d = decide(&i);
+
+        assert_eq!(
+            d.reclaim,
+            vec![(
+                coin("old", "aa", "11", NOW_EPOCH - 1, 1_500),
+                ReclaimReason::EpochEnded
+            )],
+            "last epoch's coin is still going home -- that is what makes the two coexist"
+        );
+        assert_eq!(
+            d.states,
+            vec![(
+                bond("aa", "11"),
+                BondState::Bonded {
+                    coin_id: id("new"),
+                    epoch: NOW_EPOCH,
+                    amount_dig_base_units: 700,
+                }
+            )],
+            "the capsule IS collateralised and advertising; the outgoing coin is a different coin"
+        );
+    }
+
+    /// With only a PRIOR epoch's coin on chain, the bond is not collateralised for this epoch, and
+    /// the honest answer is about the create being made rather than about the coin leaving.
+    ///
+    /// `Reclaiming` is deliberately NOT the answer here. It is reserved for the case where the coin
+    /// that would otherwise read `Bonded` is itself on its way home — the switch-off and
+    /// `NoLongerHeld` paths, pinned by `switching_creates_off_reclaims_every_live_coin_and_creates_none`.
+    /// Saying `Reclaiming` about a bond whose current-epoch create is in progress describes last
+    /// epoch's money while a person is asking about this epoch's capsule.
+    #[test]
+    fn a_bond_with_only_last_epochs_coin_reports_the_create_not_the_reclaim() {
         let held = [bond("aa", "11")];
         let req = known();
         let on_chain = [coin("old", "aa", "11", NOW_EPOCH - 1, REQUIRED)];
@@ -647,9 +771,14 @@ mod tests {
 
         assert_eq!(d.reclaim.len(), 1, "last epoch's coin comes home");
         assert_eq!(
+            d.create,
+            vec![bond("aa", "11")],
+            "and this epoch's coin is being made in the same pass"
+        );
+        assert_eq!(
             d.states,
-            vec![(bond("aa", "11"), BondState::Reclaiming)],
-            "not `Bonded`: the money is locked but it is no longer advertising anything"
+            vec![(bond("aa", "11"), BondState::Pending)],
+            "not `Bonded` -- nothing is advertising it yet -- and not `Reclaiming`, which would              describe last epoch's money while the question is about this epoch's capsule"
         );
     }
 }
