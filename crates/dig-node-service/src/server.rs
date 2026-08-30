@@ -2755,6 +2755,14 @@ fn spawn_mirror_passes(
             // synchronous and sees one disk state and one balance throughout.
             let capsules = lifecycle::observe_disk(&node).await;
             let dig_balance = lifecycle::observe_dig_balance(&wallet, owner_puzzle_hash).await;
+            // ONE reading of what is already committed, for the whole pass — the analogue of the
+            // wallet selector's reservation prune (dig_ecosystem#2763), which the chain cannot
+            // offer: a broadcast coin stays unspent in the chain's view for the entire confirmation
+            // window, and this loop runs inside it. An `Err` defers creates and never reclaims.
+            let committed = crate::mirror::funding::committed_funding_coin_ids(
+                &crate::spend_audit::SpendLog::in_state_dir(),
+            )
+            .map_err(|e| crate::mirror::runner::PassError::Wallet(e.to_string()));
 
             match chain.chain_source(tokio::runtime::Handle::current()).await {
                 Ok(source) => {
@@ -2775,6 +2783,13 @@ fn spawn_mirror_passes(
                         let effects = NodeMirrorEffects::new(
                             capsules,
                             dig_balance,
+                            committed,
+                            // EMPTY, deliberately. A mirror advertises where its store can be
+                            // fetched from, and this node has no configured public name to
+                            // advertise — so `create` refuses by name rather than publishing an
+                            // advertisement nobody can act on. That is an advertisement gap, not a
+                            // funding one; the operator-scoped selector behind it is live.
+                            Vec::new(),
                             &source,
                             owner_puzzle_hash,
                             signer_ref,

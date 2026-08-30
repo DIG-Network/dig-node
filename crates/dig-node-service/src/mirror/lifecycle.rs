@@ -45,13 +45,20 @@
 //! not have: while the broadcaster is absent the capability is
 //! [`SpendCapability::BroadcasterUnwired`] and never `Available`.
 //!
-//! **Creates do not, yet, and they refuse rather than guess.** `dig_mirror_coin::create` takes the
-//! `Cat` inputs from its caller, and selecting them requires a $DIG coin selector scoped to the
-//! OPERATOR puzzle hash. The node-custodied [`WalletBackend`](dig_wallet::sage::rpc::WalletBackend)
-//! selector is scoped to its own replica instead, so using it would fund a mirror coin from the
-//! wrong wallet's coins. [`NodeMirrorEffects::create`] therefore returns a named
-//! [`PassError::Wallet`], the pass reports it in `stopped_at`, and §25.8 keeps reporting the bond
-//! as uncovered — which is true. The selector is dig-node#421.
+//! **Creates select their own collateral, from the OPERATOR wallet.** `dig_mirror_coin::create`
+//! takes its `Cat` inputs from its caller, and [`super::funding`] supplies them: it scans the chain
+//! at the CAT wrapping of THIS node's operator puzzle hash, reconstructs each candidate's lineage
+//! from its creating spend, and refuses the whole create on a shortfall rather than funding a
+//! smaller coin (dig-node#421). The node-custodied
+//! [`WalletBackend`](dig_wallet::sage::rpc::WalletBackend) selector is scoped to its own replica and
+//! is deliberately not used here: it would fund a mirror coin from the wrong wallet's coins, which
+//! is a real spend that returns `Ok`.
+//!
+//! **What a create still needs before one can be attempted.** A mirror advertises WHERE its store
+//! can be fetched from, and `dig_mirror_coin::create` refuses an advertisement with no URL. This
+//! node has no configured public name yet, so [`NodeMirrorEffects`] is handed an empty URL set and
+//! `create` refuses by name, ahead of any chain read. That is the one remaining gap, and it is an
+//! advertisement question rather than a funding one.
 //!
 //! # Nothing here relaxes the audit shape
 //!
@@ -83,6 +90,7 @@ use crate::spend_audit::{
     FailureStage, FundingCoinId, SpendJournal, SpendLog, Submission, TargetCoinId,
 };
 
+use super::funding::{self, FundingError};
 use super::observe::held_mirrors;
 use super::plan::{Bond, HeldMirror, ReclaimReason};
 use super::runner::{MirrorEffects, ObservedCapsule, PassError, PassReport};
@@ -117,6 +125,14 @@ pub struct NodeMirrorEffects<'a, S: ChainSource> {
     capsules: Vec<ObservedCapsule>,
     /// Spendable $DIG at the operator address, already read. `Err` defers creates, never reclaims.
     dig_balance: Result<u64, PassError>,
+    /// The coins already committed to a bundle in flight, read ONCE per pass.
+    ///
+    /// `Err` defers creates and NEVER reclaims, exactly like `dig_balance`: a reclaim needs no coin
+    /// selection at all (§25.4.4), so gating it on a funding read would reintroduce the legacy
+    /// defect where a node that could not fund could not recover either.
+    committed_coin_ids: Result<std::collections::HashSet<String>, PassError>,
+    /// Where this node advertises its stores can be fetched from. Empty means it cannot advertise.
+    advertised_urls: Vec<String>,
     /// The chain, for the owned-coin scan and for the reclaim spends.
     source: &'a S,
     /// This node's operator puzzle hash — a public value, derived once at bring-up.
@@ -145,6 +161,8 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
     pub fn new(
         capsules: Vec<ObservedCapsule>,
         dig_balance: Result<u64, PassError>,
+        committed_coin_ids: Result<std::collections::HashSet<String>, PassError>,
+        advertised_urls: Vec<String>,
         source: &'a S,
         owner_puzzle_hash: Bytes32,
         signer: Option<&'a MirrorSigner>,
@@ -155,6 +173,8 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
         Self {
             capsules,
             dig_balance,
+            committed_coin_ids,
+            advertised_urls,
             source,
             owner_puzzle_hash,
             signer,
@@ -313,22 +333,103 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         self.sign_and_broadcast(&spends, Some(reclaimed_coin_id(&coin)))
     }
 
-    fn create(
-        &self,
-        bond: &Bond,
-        _epoch: i64,
-        amount_dig_base_units: u64,
-    ) -> Result<(), PassError> {
-        // REFUSED, by name, rather than funded from the wrong wallet. See the module doc: the only
-        // $DIG selector this process has is scoped to the node-custodied replica, not to the
-        // operator puzzle hash, and a mirror coin funded from the wrong coins is a real spend that
-        // looks successful. dig-node#421 is the operator-scoped selector.
-        Err(PassError::Wallet(format!(
-            "creating the {} bond needs {} DIG base units selected from the OPERATOR wallet, and \
-             this node has no operator-scoped $DIG coin selector yet (dig-node#421); no spend was \
-             attempted",
-            bond.store_id, amount_dig_base_units
-        )))
+    fn create(&self, bond: &Bond, epoch: i64, amount_dig_base_units: u64) -> Result<(), PassError> {
+        // The advertisement is checked FIRST, ahead of every chain read. `dig_mirror_coin::create`
+        // refuses an advertisement with no URL, so selecting coins before knowing there is somewhere
+        // to advertise spends a chain scan to reach a refusal that was decidable for free.
+        if self.advertised_urls.is_empty() {
+            return Err(PassError::Wallet(format!(
+                "creating the {} bond needs at least one URL this node's stores can be fetched \
+                 from, and none is configured; a mirror with nowhere to fetch from is not a \
+                 mirror, so no coin was selected and no spend was attempted",
+                bond.store_id
+            )));
+        }
+
+        let store_launcher_id = parse_id(&bond.store_id, "store id")?;
+        let root_hash = parse_id(&bond.root, "root hash")?;
+
+        let committed = self.committed_coin_ids.as_ref().map_err(Clone::clone)?;
+
+        // The amount is the planner's — `apply_safety_margin(required_per_store, margin_bp)`,
+        // §25.3 — carried straight through. Nothing here re-derives it and nothing here has an
+        // opinion about it: a create at the wrong amount locks money and advertises nothing.
+        let dig_coins = funding::select_operator_dig_cats(
+            self.source,
+            self.owner_puzzle_hash,
+            amount_dig_base_units,
+            committed,
+        )
+        .map_err(funding_refusal)?;
+
+        let signer = self
+            .signer
+            .ok_or_else(|| PassError::Wallet("no operator wallet is available to sign".into()))?;
+
+        // `fee = 0` with no fee coins, matching the reclaim path. A create gated on selectable XCH
+        // would leave a node holding $DIG and no XCH unable to bond anything at all, and the next
+        // pass retries a create the mempool declined under fee pressure.
+        let spends = super::spends::build_create(
+            store_launcher_id,
+            root_hash,
+            num_bigint::BigInt::from(epoch),
+            self.advertised_urls.clone(),
+            amount_dig_base_units,
+            dig_coins,
+            signer.synthetic_key(),
+            Vec::new(),
+            0,
+        )
+        .map_err(|e| PassError::Wallet(e.to_string()))?;
+
+        tracing::info!(
+            target: "mirror",
+            store_id = %bond.store_id,
+            root = %bond.root,
+            epoch,
+            amount_dig_base_units,
+            "creating mirror collateral"
+        );
+
+        // No intended coin id is stated. A create's output coin takes its parent from whichever
+        // input the builder draws it from, and this node does not derive that — so naming a
+        // plausible coin would let §23.5's reconcile confirm this spend against a coin it never
+        // created. The record resolves `Unresolved` instead, which is the honest reading, and
+        // §25.4.6's duplicate suppression works from the `(root, epoch)` the record already
+        // carries rather than from a coin id.
+        self.sign_and_broadcast(&spends, None)
+    }
+}
+
+/// A 64-hex id from the planner, as the builder's `Bytes32`.
+///
+/// The planner carries store and root as lowercase hex strings, because that is what the disk scan
+/// and the control surface speak. A malformed one is a REFUSAL rather than a zeroed hash: a create
+/// against `0x00…` would lock real collateral advertising a store that does not exist, and the
+/// money would be just as locked as if the advertisement were good.
+fn parse_id(hex_id: &str, what: &str) -> Result<Bytes32, PassError> {
+    let bytes: [u8; 32] = hex::decode(hex_id)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| {
+            PassError::Wallet(format!(
+                "the {what} {hex_id:?} is not 32 bytes of hex, so no create is attempted for it"
+            ))
+        })?;
+    Ok(Bytes32::new(bytes))
+}
+
+/// A funding refusal, in the pass's own vocabulary.
+///
+/// The chain variant maps to [`PassError::Chain`] and every other to [`PassError::Wallet`], because
+/// the two mean different things to whoever reads `stopped_at`: a chain that could not answer is a
+/// transient condition of the SOURCE, while an empty or fully-committed wallet is a durable
+/// condition of this NODE. Collapsing them would tell an operator to add funds when the truth is
+/// that a read timed out.
+fn funding_refusal(error: FundingError) -> PassError {
+    match &error {
+        FundingError::Chain(_) => PassError::Chain(error.to_string()),
+        _ => PassError::Wallet(error.to_string()),
     }
 }
 
@@ -350,11 +451,10 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
 /// unwrapped hash would produce a coin id that can never appear on chain, so the reclaim would stay
 /// unconfirmed forever while having genuinely succeeded.
 fn reclaimed_coin_id(mirror: &MirrorCoin) -> TargetCoinId {
-    use chia_puzzle_types::cat::CatArgs;
-
-    let inner: clvm_utils::TreeHash = mirror.owner_puzzle_hash().into();
-    let puzzle_hash: Bytes32 =
-        CatArgs::curry_tree_hash(dig_mirror_coin::DIG_ASSET_ID, inner).into();
+    // The SAME derivation the create path scans with, not a second copy of it. Two hand-rolled CAT
+    // curries is how one of them ends up naming a puzzle hash nobody can spend, with nothing in the
+    // tree comparing the two.
+    let puzzle_hash = funding::dig_cat_puzzle_hash(mirror.owner_puzzle_hash());
 
     let created =
         chia_protocol::Coin::new(mirror.coin().coin_id(), puzzle_hash, mirror.collateral());
