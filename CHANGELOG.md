@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.172.0] - 2026-08-30
+
+### Features
+- **mirror:** The pass runner -- disk and chain observed, reclaims before creates (#414)- **wallet:** Paginate the unspent-coin read (#413)- **mirror:** Serve control.mirror.bondStates and its dign verb (#417)
+
+### Documentation
+- **mirror:** The step-8 proof runbook and operator-wallet measurement for #377 (#415)
+
 ## [0.169.0] - 2026-08-30
 
 ### Features
