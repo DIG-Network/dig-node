@@ -320,6 +320,17 @@ fn two_open_spends_claiming_one_coin_resolve_neither() {
 /// a mempool, so a coin for that bond was created by some OTHER spend — a previous pass, or another
 /// node at the same puzzle hash — and attributing it here would credit this attempt with a coin it
 /// did not make and release the funding coins it still holds reserved.
+///
+/// # Two guards enforce this, and only ONE of them is load-bearing
+///
+/// [`super::resolve::resolve_landed_spends`] skips a `Pending` record when choosing what to look
+/// up, and [`SpendJournal::resolve_landed`] refuses one when asked to write. The second masks the
+/// first: relaxing the sweep's filter alone changes nothing observable, because the write still
+/// refuses. So this test asserts the WRITER directly as well as through the sweep — an assertion
+/// only through the sweep would pin a coincidence and stay green when the real guard was removed.
+///
+/// The sweep's filter is kept anyway, and deliberately: it is what stops a `Pending` record costing
+/// a chain read per pass to reach a refusal that was decidable for free.
 #[test]
 fn a_spend_that_never_reached_the_network_is_not_confirmed_by_a_coin_that_matches_its_bond() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -340,6 +351,21 @@ fn a_spend_that_never_reached_the_network_is_not_confirmed_by_a_coin_that_matche
         status_of(&log, &audit_id),
         SpendStatus::Pending,
         "a spend that never left this node cannot have created a coin"
+    );
+
+    // The authoritative guard, asked directly. The sweep above cannot exercise it, because the
+    // sweep's own filter reaches the same answer first.
+    assert_eq!(
+        journal
+            .resolve_landed(&audit_id, TargetCoinId(id("c7")), LANDED_HEIGHT)
+            .expect("the record is readable"),
+        crate::spend_audit::Resolution::NotOpen,
+        "the writer must refuse a record that never reached the network, whatever asks it"
+    );
+    assert_eq!(
+        status_of(&log, &audit_id),
+        SpendStatus::Pending,
+        "and refusing must write nothing at all"
     );
     drop(recorded);
 }
