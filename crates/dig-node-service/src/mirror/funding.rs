@@ -636,7 +636,9 @@ mod tests {
         assert!(gate.observe(&short(60_000)).is_some(), "the transition in");
         assert!(gate.observe(&short(60_000)).is_none(), "still short");
 
-        let recovered = gate.observe(&FundingObservation::Healthy).expect("recovery");
+        let recovered = gate
+            .observe(&FundingObservation::Healthy)
+            .expect("recovery");
         assert_eq!(recovered.remedy, None, "a recovery asks for no action");
         assert!(
             gate.observe(&FundingObservation::Healthy).is_none(),
