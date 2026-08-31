@@ -42,8 +42,34 @@ pub struct BootstrapTarget {
 
 /// The bootstrap targets for this process: the `DIG_BOOTSTRAP_PEERS` override when set, else the
 /// canonical compiled-in set.
+///
+/// Announces WHICH branch it took, at `info`, because the three branches are indistinguishable from
+/// the outside and one of them reaches the public network (#352). A node that could not tell "the
+/// operator asked for no peers" from "the operator said nothing" guessed silently on a
+/// network-reaching decision, and an isolated fleet that had in fact dialled the production gateway
+/// looked exactly like one that had not. This line is what makes that self-diagnosing.
 pub fn bootstrap_targets_from_env() -> Vec<BootstrapTarget> {
-    resolve_bootstrap_targets(std::env::var(BOOTSTRAP_ENV).ok().as_deref())
+    let configured = std::env::var(BOOTSTRAP_ENV).ok();
+    let targets = resolve_bootstrap_targets(configured.as_deref());
+    match configured.as_deref() {
+        None => tracing::info!(
+            env = BOOTSTRAP_ENV,
+            anchors = targets.len(),
+            "bootstrap: UNSET — dialling the compiled-in public anchors"
+        ),
+        Some(v) if targets.is_empty() => tracing::info!(
+            env = BOOTSTRAP_ENV,
+            value = %v,
+            "bootstrap: DISABLED by configuration — no anchors will be dialled"
+        ),
+        Some(v) => tracing::info!(
+            env = BOOTSTRAP_ENV,
+            value = %v,
+            anchors = targets.len(),
+            "bootstrap: using the configured anchors — the compiled-in set is NOT dialled"
+        ),
+    }
+    targets
 }
 
 /// Pure: resolve the bootstrap targets from an optional `DIG_BOOTSTRAP_PEERS` value.
@@ -101,9 +127,14 @@ fn compiled_in_targets() -> Vec<BootstrapTarget> {
         .collect()
 }
 
-/// Whether the value explicitly disables bootstrapping (mirrors `DIG_RELAY_URL`'s opt-out).
+/// Whether the value explicitly disables bootstrapping.
+///
+/// Now the SHARED [`crate::peer::is_off_token`] rather than a third private copy of the same
+/// predicate (#282): the ecosystem's three isolation knobs read one vocabulary, so an operator
+/// cannot find that the same word works on one of them and not another. `is_off_token` already
+/// treats an empty value as "none", which is the behaviour dig-node#312 added here.
 fn is_disabled(value: &str) -> bool {
-    value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("disabled")
+    crate::peer::is_off_token(value)
 }
 
 /// Pure: parse one `peer_id@host:port` entry, or `None` if it is malformed.
