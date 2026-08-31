@@ -2556,7 +2556,21 @@ impl Node {
         }
         crate::seams::dig_peer::persist_holder_claim(&path, claim)
             .map_err(|_| "could not record the capsule's provenance".to_string())?;
-        write_atomic(&path, &bytes).map_err(|e| format!("could not write the capsule: {e}"))?;
+        write_atomic(&path, &bytes).map_err(|e| {
+            // The land failed, so the marker must not outlive it and mis-describe a later capsule
+            // arriving at the same path by a different route. Mirrors `capsule_store.rs`'s land
+            // path, which already rolls back this way.
+            //
+            // `Announce` is the REMOVING claim, and removal is only safe because `write_atomic` is
+            // temp-in-the-same-directory then rename: on failure it unlinks the temp and leaves NO
+            // file at the capsule path, so there is no unmarked capsule for this to expose. If that
+            // ever stops being true, this rollback becomes a hole rather than a cleanup.
+            let _ = crate::seams::dig_peer::persist_holder_claim(
+                &path,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            );
+            format!("could not write the capsule: {e}")
+        })?;
         // #1991 telemetry: this is the choke-point every ON-DEMAND landing path funnels through —
         // `cache.fetchAndCache`, chain gap-fill, and fetch-side backfill all call down to here — so
         // counting here (rather than at any one caller) captures all three without double-counting.
