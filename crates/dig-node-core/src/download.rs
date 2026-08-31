@@ -4439,7 +4439,7 @@ pub(crate) mod tests {
 
         let pc = NodeContent::new(
             Arc::new(MockProviderLocator::fixed(vec![
-                claimed(7, None),              // claims nothing      -> Unverified
+                claimed(7, None),             // claims nothing      -> Unverified
                 claimed(8, Some([0x02; 32])), // claims a coin bonding something else
                 claimed(9, Some([0x01; 32])), // claims a coin that really bonds this
             ])),

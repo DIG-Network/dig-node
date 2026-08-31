@@ -246,10 +246,8 @@ mod tests {
             holder(0xBB, Some([0x02; 32])), // claims a coin bonding something else
             holder(0xCC, Some([0x01; 32])), // claims a coin that really bonds this
         ]);
-        let verifier = ByCoinByte::new(&[
-            (0x01, BondVerdict::Bonded),
-            (0x02, BondVerdict::Unbonded),
-        ]);
+        let verifier =
+            ByCoinByte::new(&[(0x01, BondVerdict::Bonded), (0x02, BondVerdict::Unbonded)]);
         let locator = BondRankingLocator::new(Arc::new(slate), installed(verifier));
 
         let got = locator.find_providers(&capsule()).await.expect("located");
@@ -275,10 +273,8 @@ mod tests {
             holder(0xCC, Some([0x02; 32])),
             holder(0xDD, Some([0x01; 32])),
         ]);
-        let verifier = ByCoinByte::new(&[
-            (0x01, BondVerdict::Bonded),
-            (0x02, BondVerdict::Unbonded),
-        ]);
+        let verifier =
+            ByCoinByte::new(&[(0x01, BondVerdict::Bonded), (0x02, BondVerdict::Unbonded)]);
         let locator = BondRankingLocator::new(Arc::new(slate), installed(verifier));
 
         let got = locator.find_providers(&capsule()).await.expect("located");
@@ -353,10 +349,8 @@ mod tests {
             "an outage demotes nobody -- the slate is returned exactly as located, liar included"
         );
 
-        let reachable = ByCoinByte::new(&[
-            (0x01, BondVerdict::Bonded),
-            (0x02, BondVerdict::Unbonded),
-        ]);
+        let reachable =
+            ByCoinByte::new(&[(0x01, BondVerdict::Bonded), (0x02, BondVerdict::Unbonded)]);
         let got = BondRankingLocator::new(Arc::new(slate()), installed(reachable))
             .find_providers(&capsule())
             .await

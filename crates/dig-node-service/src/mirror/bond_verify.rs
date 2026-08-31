@@ -190,8 +190,7 @@ impl ChainBondVerifier {
 fn bondable_tuple(content: &ContentId) -> Option<(Bytes32, Bytes32)> {
     match content {
         ContentId::Store { .. } => None,
-        ContentId::Root { store_id, root }
-        | ContentId::Resource { store_id, root, .. } => {
+        ContentId::Root { store_id, root } | ContentId::Resource { store_id, root, .. } => {
             Some((Bytes32::new(*store_id), Bytes32::new(*root)))
         }
     }

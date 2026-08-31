@@ -159,7 +159,12 @@ fn two_honest_bonds() -> (Chain, Bytes32, Bytes32) {
     (chain, coin_1.coin_id(), coin_2.coin_id())
 }
 
-fn verdict(chain: &impl ChainSource, root: Bytes32, coin: Bytes32, required: Option<u64>) -> BondVerdict {
+fn verdict(
+    chain: &impl ChainSource,
+    root: Bytes32,
+    coin: Bytes32,
+    required: Option<u64>,
+) -> BondVerdict {
     verdict_for(chain, store_a(), root, &epoch(), required, coin)
 }
 
