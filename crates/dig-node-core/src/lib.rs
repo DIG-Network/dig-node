@@ -5602,7 +5602,12 @@ mod tests {
             test_node_with_resolver(Some([5u8; 32]), MockResolver::one(&store_hex, root));
         let root_hex = root.to_hex();
         let served = node
-            .sync_module_from(&base, &store_hex, &root_hex, crate::seams::dig_peer::HolderClaim::Announce)
+            .sync_module_from(
+                &base,
+                &store_hex,
+                &root_hex,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("authed sync succeeds");
         assert_eq!(served.to_hex(), root_hex, "served root == requested root");
@@ -6176,8 +6181,12 @@ mod tests {
             node.upstream = base;
             // The read-path land: no tier-0 loop, no `cache.fetchAndCache` — only this sync runs.
             assert!(
-                node.sync_module_and_bound(&store_a.to_hex(), &root.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
-                    .await,
+                node.sync_module_and_bound(
+                    &store_a.to_hex(),
+                    &root.to_hex(),
+                    crate::seams::dig_peer::HolderClaim::Announce
+                )
+                .await,
                 "the read-path sync landed the chain-anchored capsule and may serve locally"
             );
         });
@@ -6246,7 +6255,11 @@ mod tests {
             // whole capsule DID land under the served root, so the sweep must still fire.
             assert!(
                 !node
-                    .sync_module_and_bound(&store.to_hex(), &requested.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
+                    .sync_module_and_bound(
+                        &store.to_hex(),
+                        &requested.to_hex(),
+                        crate::seams::dig_peer::HolderClaim::Announce
+                    )
                     .await,
                 "served (AA..) != requested (BB..), so the caller may NOT serve locally"
             );
@@ -6838,7 +6851,12 @@ mod tests {
         // the node holding a §21 identity key.
         let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
         let served = node
-            .sync_module_from(&base, &store.to_hex(), &root.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
+            .sync_module_from(
+                &base,
+                &store.to_hex(),
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("the chunked dig.getCapsule path syncs the capsule");
 
@@ -7001,7 +7019,12 @@ mod tests {
         let (node, _td) =
             test_node_with_resolver(Some(seed), MockResolver::one(&store.to_hex(), root));
         let served = node
-            .sync_module_from(&url, &store.to_hex(), &root.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
+            .sync_module_from(
+                &url,
+                &store.to_hex(),
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("authed sync succeeds");
         assert_eq!(served, root, "served root == requested root");
@@ -7056,7 +7079,12 @@ mod tests {
         let (node, _td) =
             test_node_with_resolver(Some(seed), MockResolver::one(&store.to_hex(), served));
         let served = node
-            .sync_module_from(&url, &store.to_hex(), &requested.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
+            .sync_module_from(
+                &url,
+                &store.to_hex(),
+                &requested.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("the sync itself succeeds — it just landed a different generation");
         assert_ne!(served, requested, "served (AA..) != requested (BB..)");
@@ -7748,7 +7776,12 @@ mod tests {
         // No identity → must short-circuit to false WITHOUT touching the network
         // (the URL is intentionally unroutable; the call returns immediately).
         let failure = node
-            .sync_module_from("http://127.0.0.1:1", &store.to_hex(), &root.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
+            .sync_module_from(
+                "http://127.0.0.1:1",
+                &store.to_hex(),
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect_err("no identity and an unroutable upstream cannot sync");
         assert!(
@@ -8371,7 +8404,12 @@ mod tests {
         let store = "33".repeat(32);
         let root = "44".repeat(32);
         let result = node
-            .sync_module_from("http://unreachable.invalid", &store, &root, crate::seams::dig_peer::HolderClaim::Announce)
+            .sync_module_from(
+                "http://unreachable.invalid",
+                &store,
+                &root,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await;
         assert!(result.is_err(), "no upstream reachable → the sync fails");
         assert!(
