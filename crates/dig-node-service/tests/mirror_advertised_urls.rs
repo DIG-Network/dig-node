@@ -28,7 +28,7 @@ use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use chia_sha2::Sha256;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_node_service::mirror::advertise::{configured_urls, ADVERTISE_URLS_ENV};
-use dig_node_service::mirror::lifecycle::NodeMirrorEffects;
+use dig_node_service::mirror::lifecycle::{mirror_agg_sig_data, NodeMirrorEffects};
 use dig_node_service::mirror::plan::Bond;
 use dig_node_service::mirror::runner::MirrorEffects;
 use dig_node_service::mirror::signer::MirrorSigner;
@@ -162,7 +162,14 @@ fn operator(dir: &std::path::Path) -> (MirrorSigner, Wallet) {
     let paths = WalletPaths::resolve(dir.join("seed"));
     dig_node_service::wallet_bootstrap::ensure_wallet_seed_at(&paths)
         .expect("the autoseed bootstrap yields a state");
-    let wallet = OperatorWallet::open(&paths, dig_constants::DIG_MAINNET.genesis_challenge())
+    // The SAME domain production signs mirror spends under, taken from the one function that
+    // decides it -- never a constant restated here. A mirror spend is a Chia L1 CAT spend, so its
+    // AGG_SIG_ME domain is the Chia mainnet genesis; this fixture previously passed the DIG **L2**
+    // genesis, which is the #447 regression that stranded 1010 $DIG on chain. A signer asked for
+    // the message it already believes in always agrees with itself, so a fixture under the wrong
+    // domain cannot fail -- and the next signature-validity assertion added here would have been
+    // written against it (#449).
+    let wallet = OperatorWallet::open(&paths, mirror_agg_sig_data())
         .expect("a wallet was just created, so it opens");
     let signer = MirrorSigner::new(wallet);
     let address = Wallet {

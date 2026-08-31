@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.189.0] - 2026-08-31
+
+### Features
+- **wallet:** Surface the full node's own refusal reason on a rejected push (chia-query#48)
+
+### Bug Fixes
+- **capsule:** Require a holder claim to land a capsule, so an inbound-demand backfill cannot land a stranger's content bondable (#446)
+- **test:** Point the two mirror wallet fixtures at the Chia L1 signing domain (#449)
+
+### Miscellaneous
+- **deps:** chia-query 0.19.0 -> 0.20.0; read mempool ADMISSION rather than the conflated `success` flag
+
 ## [0.183.0] - 2026-08-31
 
 ### Bug Fixes

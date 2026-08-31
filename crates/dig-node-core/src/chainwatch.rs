@@ -271,7 +271,15 @@ impl NodeGapFiller {
 #[async_trait::async_trait]
 impl GapFiller for NodeGapFiller {
     async fn gap_fill(&self, store_id: [u8; 32], root: Bytes32) -> Result<(), String> {
-        self.node.gap_fill_generation(store_id, root).await
+        // The chain-watch loop fills gaps only for stores this OPERATOR subscribed to, so its
+        // lands are the operator's own content and stay bondable (dig-node#446).
+        self.node
+            .gap_fill_generation(
+                store_id,
+                root,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
+            .await
     }
 }
 
