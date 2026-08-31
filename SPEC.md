@@ -8112,6 +8112,17 @@ Mirror spends do not transit `control.wallet.broadcast`, and `DIG_WALLET_ENABLE_
 does not govern them: that flag gates the GENERAL node-custodied wallet surface, while this
 lifecycle is governed by §25.7's switch and §23's audit contract.
 
+**Mirror spends MUST be signed under CHIA MAINNET's `AGG_SIG_ME` domain.** A mirror coin is an
+ordinary Chia L1 CAT, so the consensus that validates its spend appends Chia mainnet's genesis
+challenge (`ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb`) to every `AGG_SIG_ME`
+message. The `agg_sig_data` the operator wallet is opened with MUST therefore be
+`MAINNET_CONSTANTS.genesis_challenge`, and MUST NOT be any `dig-constants` value: `dig-constants`
+describes the **DIG L2** chain, and its genesis is the DIG PEER network id, not an L1 CAT's signing
+domain. Signing under any other domain produces a valid signature over a message the network does
+not check, so the bundle builds, signs and broadcasts and is then refused as
+`BAD_AGGREGATE_SIGNATURE` by every peer, on every retry — with the collateral left locked and no
+local error to see (dig-node#447).
+
 **Key derivation MUST be the standard Chia HD derivation** from the operator mnemonic, so the phrase
 exported by `dign wallet export-seed` (§16.3) recovers the collateral wallet — including anything
 locked in unreclaimed mirror coins, via any standard wallet — with no dig-node code involved. The
