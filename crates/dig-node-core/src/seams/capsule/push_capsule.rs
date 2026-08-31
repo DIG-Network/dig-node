@@ -419,10 +419,15 @@ impl Node {
         // already answered that — it answers "should THIS operator stake THEIR money on it". A third
         // party who owns the store's key is entitled to push; they are not thereby entitled to spend
         // the node operator's $DIG. Only a LOCAL push is the operator speaking for themselves.
-        let claim = match origin {
-            ReadOrigin::Local => crate::seams::dig_peer::HolderClaim::Announce,
-            _ => crate::seams::dig_peer::HolderClaim::Suppress,
-        };
+        //
+        // BOTH axes, via the shared `holder_claim_for_landing` — the same fold line 272 above
+        // already applies to the AUTHORITY check in this very function. Reading `origin` alone here
+        // while folding it there was a real hole: a cross-site page POSTing `cache.pushCapsule` to
+        // the loopback port arrives `origin = Local` (true, and un-spoofable) with
+        // `provenance = CrossSite`, so the authority check correctly demanded an authorized-writer
+        // signature while the provenance check handed the capsule `Announce`. Creating a store is
+        // permissionless, so "owns a store key" is not a trust boundary.
+        let claim = crate::seams::dig_rpc::holder_claim_for_landing(origin, provenance);
         match self.land_capsule_bytes(&key, &bytes, claim).await {
             Ok((size, _fresh)) => json!({"jsonrpc":"2.0","id":id.clone(),"result":{
                 "offset": total_length,
@@ -627,6 +632,11 @@ mod tests {
     }
     fn peer() -> (ReadOrigin, RequestProvenance) {
         (ReadOrigin::Peer, RequestProvenance::FirstParty)
+    }
+    /// A request over a genuinely LOCAL socket, made on a stranger's behalf: a cross-site page in
+    /// the operator's browser POSTing to the loopback port, which CORS admits.
+    fn cross_site_over_local_socket() -> (ReadOrigin, RequestProvenance) {
+        (ReadOrigin::Local, RequestProvenance::CrossSite)
     }
 
     /// Push a whole capsule single-shot (one window) as the local operator and return the response.
@@ -1413,6 +1423,51 @@ mod tests {
                 Some(crate::CapsuleProvenance::Relayed),
                 "a capsule pushed by a REMOTE writer is held on that writer's behalf, never this \
                  operator's own content to bond against"
+            );
+        });
+    }
+    /// **Proves (dig-node#436, the confused deputy on the PUSH path):** a push arriving over a
+    /// genuinely local socket but made on a STRANGER's behalf lands `Relayed`.
+    ///
+    /// This site read the raw `origin` while line 272 of the SAME function already folded both axes
+    /// for its authority check — so the authority half correctly demanded an authorized-writer
+    /// signature for a cross-site push, and the provenance half handed that same push `Announce`.
+    /// Creating a store is permissionless, so holding a store key is not a trust boundary: a third
+    /// party entitled to push is not thereby entitled to spend this operator's $DIG.
+    ///
+    /// **Catches:** either landing decision in this file reverting to a single axis.
+    #[test]
+    fn a_cross_site_push_over_a_local_socket_lands_relayed() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (sk, pk, store) = store_keypair(0x63);
+            let (module, root) = push_module(store, &pk, 0x64, 0);
+            let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+            let sig = digstore_crypto::sign_push(&sk, &Bytes32(root), &Bytes32(store));
+            let (node, _td) = crate::test_support::test_node_for_peer_surface();
+            let node = node.as_ref();
+
+            let resp = push_one_shot(
+                node,
+                &store_hex,
+                &root_hex,
+                &module,
+                Some(&sig.to_hex()),
+                cross_site_over_local_socket(),
+            )
+            .await;
+            assert_eq!(resp["result"]["complete"], json!(true), "resp={resp}");
+
+            assert_eq!(
+                listed_provenance(node, &store_hex, &root_hex).await,
+                Some(crate::CapsuleProvenance::Relayed),
+                "a local socket driven by a stranger's page is a confused deputy, not the operator"
             );
         });
     }

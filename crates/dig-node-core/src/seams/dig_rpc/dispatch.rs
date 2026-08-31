@@ -903,7 +903,7 @@ impl RpcDispatch for Node {
             //     against, because it is not this operator's content. A `Local` read keeps `Announce`,
             //     which is the reshare flywheel: the operator's own read leaves content more
             //     available than it found it.
-            let claim = holder_claim_for_read(origin, provenance);
+            let claim = holder_claim_for_landing(origin, provenance);
             if node
                 .sync_module_and_bound(store_hex, &root_hex, claim)
                 .await
@@ -1036,7 +1036,12 @@ impl RpcDispatch for Node {
     }
 }
 
-/// Which holder claim a `dig.getContent` miss-backfill lands under, decided from the read's origin.
+/// Which holder claim an on-demand landing records, decided from BOTH axes of the request.
+///
+/// Shared by the read path (`dig.getContent`'s miss-backfill) and the push path
+/// (`cache.pushCapsule`), because the rule is the same one and two copies of it would be a rival
+/// implementation that can drift apart — which is exactly how the push site kept the single-axis
+/// bug after the read site was fixed.
 ///
 /// This is the eleventh cache-write path (dig-node#436). `dig.getContent` for a capsule this node
 /// does not hold funnels through [`Node::sync_module_and_bound`] to `write_atomic`, reaching the
@@ -1057,7 +1062,7 @@ impl RpcDispatch for Node {
 /// Extracted as a named function rather than left inline so the decision is testable on its own —
 /// an end-to-end assertion on the landed marker passes for many reasons, only one of which is this
 /// mapping being right.
-fn holder_claim_for_read(
+pub(crate) fn holder_claim_for_landing(
     origin: crate::download::ReadOrigin,
     provenance: crate::download::RequestProvenance,
 ) -> crate::seams::dig_peer::HolderClaim {
@@ -1084,7 +1089,7 @@ fn holder_claim_for_read(
 
 #[cfg(test)]
 mod holder_claim_tests {
-    use super::holder_claim_for_read;
+    use super::holder_claim_for_landing;
     use crate::download::{ReadOrigin, RequestProvenance};
     use crate::seams::dig_peer::HolderClaim;
 
@@ -1098,7 +1103,7 @@ mod holder_claim_tests {
     #[test]
     fn a_peer_read_backfills_suppressed() {
         assert_eq!(
-            holder_claim_for_read(ReadOrigin::Peer, RequestProvenance::FirstParty),
+            holder_claim_for_landing(ReadOrigin::Peer, RequestProvenance::FirstParty),
             HolderClaim::Suppress,
             "a capsule pulled because a STRANGER asked for it is not this operator's content"
         );
@@ -1111,7 +1116,7 @@ mod holder_claim_tests {
     #[test]
     fn a_local_read_backfills_announced() {
         assert_eq!(
-            holder_claim_for_read(ReadOrigin::Local, RequestProvenance::FirstParty),
+            holder_claim_for_landing(ReadOrigin::Local, RequestProvenance::FirstParty),
             HolderClaim::Announce,
             "the operator's own read leaves content more available than it found it"
         );
@@ -1134,7 +1139,7 @@ mod holder_claim_tests {
     #[test]
     fn a_cross_site_read_over_a_local_socket_backfills_suppressed() {
         assert_eq!(
-            holder_claim_for_read(ReadOrigin::Local, RequestProvenance::CrossSite),
+            holder_claim_for_landing(ReadOrigin::Local, RequestProvenance::CrossSite),
             HolderClaim::Suppress,
             "a local socket driven by a stranger's page is a confused deputy, not the operator"
         );
@@ -1146,7 +1151,7 @@ mod holder_claim_tests {
     #[test]
     fn a_cross_site_peer_read_stays_suppressed() {
         assert_eq!(
-            holder_claim_for_read(ReadOrigin::Peer, RequestProvenance::CrossSite),
+            holder_claim_for_landing(ReadOrigin::Peer, RequestProvenance::CrossSite),
             HolderClaim::Suppress,
             "folding both axes is only ever restrictive"
         );
