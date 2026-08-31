@@ -1418,6 +1418,41 @@ fn run_service(config: Config) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// **The bare `pair` verb LISTS; only `pair approve <id>` approves.**
+    ///
+    /// This exists because a remedy string in `control.rs` told an operator that `sudo dign pair`
+    /// "approves the client's pending request". It does not, and nothing could see the mistake:
+    /// the remedy's own test asserted `contains("dign pair")`, which the wrong sentence satisfies
+    /// as its own substring. Pinning the mapping HERE means the claim is measured against the
+    /// parser rather than against a phrase, so the two cannot drift apart silently.
+    #[test]
+    fn the_bare_pair_verb_lists_and_only_approve_approves() {
+        let pair_action = |argv: &[&str]| match Cli::try_parse_from(argv)
+            .expect("the verb parses")
+            .command
+            .expect("a subcommand was given")
+        {
+            Command::Pair { action } => match action {
+                None | Some(PairCommand::List) => PairAction::List,
+                Some(PairCommand::Approve { pairing_id }) => PairAction::Approve { pairing_id },
+                Some(PairCommand::Revoke { token_id }) => PairAction::Revoke { token_id },
+            },
+            _ => panic!("expected a pair command from {argv:?}"),
+        };
+
+        assert!(
+            matches!(pair_action(&["dig-node", "pair"]), PairAction::List),
+            "a bare `pair` must remain a LIST -- the remedy text depends on it"
+        );
+        assert!(
+            matches!(
+                pair_action(&["dig-node", "pair", "approve", "abc123"]),
+                PairAction::Approve { ref pairing_id } if pairing_id == "abc123"
+            ),
+            "`pair approve <id>` must approve, and must carry the id through"
+        );
+    }
+
     /// **`dign mirror bond-states --after` sends the cursor to the node.**
     ///
     /// Asserted on the WIRE params rather than on the selected method, because a parser that

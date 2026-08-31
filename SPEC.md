@@ -2401,11 +2401,28 @@ flood of never-attached `begin`s cannot grow engine state without bound.
 `install` · `uninstall` · `start` · `stop` (each accepting `--scope <auto|system|user>`, §9.1) ·
 `status` · `pair` (§7.11) · `open` (§8.5) ·
 the **control-parity** subcommands `info` · `config` · `cache` · `stores` · `sync` · `updater` ·
-`subscriptions` (§8.6) · `peers` (§8.7) · `logs` (§11).
+`subscriptions` (§8.6) · `peers` (§8.7) · `network-info` (§8.8) · `logs` (§11).
 
 The `dign` alias binary (§2.1a) exposes this SAME subcommand set with the SAME semantics — `dign
 <subcommand>` is equivalent to `dig-node <subcommand>` in every respect except the reported program
 name.
+
+### 8.8. `network-info` — this node's own network posture (#303)
+
+`network-info` prints this node's `peer_id`, network id, effective L2 genesis, listen address,
+reachability, and its advertised candidate addresses in the node's own advertisement order, which
+is IPv6-first (§5.2). The order MUST be passed through untouched: re-sorting would hide a node
+whose IPv6 advertisement is missing, which is the fault an operator runs the command to find. An
+absent field MUST render as `unknown` and MUST NOT be filled with a plausible default — a
+fabricated `direct` or an invented `0.0.0.0` reads exactly like a measurement.
+
+**It reads the OPEN surface and is NOT token-gated, deliberately.** It is the one documented
+exception to §8.6's rule that a CLI subcommand presents the master control token: it calls
+`dig.getNetworkInfo`, whose body this node already hands any peer that dials it, so a loopback
+caller learns nothing a stranger does not. Gating it would buy no confidentiality while costing
+real availability — on a `.deb` install the control token is `0600 root:root` (§7.11/#501), so an
+ordinary user asking "what is my node's address" would be told to elevate for a read the network
+performs for free. This is a property to PRESERVE, not an oversight to tighten later.
 
 ### 8.6. Control-parity subcommands (#426)
 
@@ -2415,7 +2432,9 @@ extension drives it from a browser. Each subcommand is a THIN dispatch — it ca
 `control.*` method over the node's loopback endpoint, presenting the MASTER control token
 (`X-Dig-Control-Token`, read WITHOUT minting — §7.11/#501); no CLI logic is forked from the control
 plane. A mutating CLI control is therefore gated by the identical capability as the WS surface (the
-on-disk master token = local-machine control), never an unauthenticated backdoor.
+on-disk master token = local-machine control), never an unauthenticated backdoor. The one
+documented exception is `network-info` (§8.8), which reads an OPEN, already-public surface and is
+token-free by design; it is not a control-parity subcommand and this rule does not reach it.
 
 - `info` → `control.status` — the rich node status (version, uptime, cache, hosted-store +
   cached-capsule counts, §21 sync availability). DISTINCT from `status` (§8.3), which is an
@@ -2620,10 +2639,42 @@ exit `1` (`NOT_SERVING`) so scripts can gate on liveness; the JSON result carrie
 | 4 | `SERVICE_FAILED` | A service-manager operation failed. |
 | 5 | `BIND_FAILED` | `run`: could not bind the loopback address. |
 | 6 | `IO_ERROR` | Other I/O error. |
-| 7 | `NODE_UNREACHABLE` | The node did not answer; the operation was not measured. |
+| 12 | `NODE_UNREACHABLE` | The node did not answer; the operation was not measured. |
 
-I/O-error mapping: `PermissionDenied` → 3; `AddrInUse`/`AddrNotAvailable` → 5; anything else → 6.
+I/O-error mapping, in the order `ExitCode::from_io_error` matches — every arm, because a partial
+list reads as complete and the omitted arms are exactly the ones a caller gets wrong:
+`PermissionDenied` → 3; `AddrInUse`/`AddrNotAvailable` → 5; `InvalidInput` → 2 (a bad argument
+surfaced as an I/O error is still a usage error); `ConnectionRefused` → 12; anything else → 6.
+
 Numeric values and symbolic names are a stable contract and MUST NOT be renumbered.
+
+**The occupied numbers span the whole DIG command line, not this CLI alone (MUST).** `dign` and
+dig-app's `diga` deliberately share one numbering so a caller sees one surface across both
+(`dig-app-core/src/gateway/outcome.rs`), so a code is available only if it is unoccupied
+ECOSYSTEM-WIDE. Absence from the table above does NOT make a number free — this repo has already
+paid for that reasoning once in the JSON-RPC error space, where `-32015` was taken as "the next
+free code" from the owning crate's own list and collided with a released `METADATA_TOO_LARGE`,
+forcing a yank. The full occupied set, measured, is:
+
+| Code | `dign` (this CLI) | `diga` (dig-app gateway) |
+|---|---|---|
+| 0 | `OK` | `OK` |
+| 1 | `NOT_SERVING` | — |
+| 2 | `USAGE` | `USAGE` |
+| 3 | `PERMISSION_DENIED` | — |
+| 4 | `SERVICE_FAILED` | — |
+| 5 | `BIND_FAILED` | — |
+| 6 | `IO_ERROR` | `IO_ERROR` |
+| 7 | — | `NOT_CONNECTED` |
+| 8 | — | `ENGINE_ERROR` |
+| 9 | — | `LOCKED` |
+| 10 | — | `NOT_FOUND` |
+| 11 | — | `DENIED` |
+| 12 | `NODE_UNREACHABLE` | — |
+
+0–11 were therefore taken before this CLI added a code, and 12 is the first free number. A new
+code MUST be drawn from 13 upward and MUST re-check BOTH tables first; 126, 127 and 128+n are
+reserved by the shell and MUST NOT be used.
 
 ---
 

@@ -483,7 +483,7 @@ fn remedy_for_unreadable_token(path: &Path, dir: &str, unix: bool) -> String {
     );
     if unix {
         format!(
-            "{elevated}. For a program that must keep running as an ordinary user (the dig-app Agent on a server), do NOT widen the mode on this file — it is the master capability. Pair a scoped, revocable token for that client instead: `sudo dign pair` approves the client's pending request, and the token it receives cannot mint or revoke pairings and cannot grant chain authority. Revoke it any time with `sudo dign pair revoke <id>`."
+            "{elevated}. For a program that must keep running as an ordinary user (the dig-app Agent on a server), do NOT widen the mode on this file — it is the master capability. Pair a scoped, revocable token for that client instead: `sudo dign pair` LISTS the pending requests and `sudo dign pair approve <pairing_id>` approves one -- the bare verb only lists, it approves nothing -- and the token the client receives cannot mint or revoke pairings and cannot grant chain authority. Revoke it any time with `sudo dign pair revoke <token_id>`."
         )
     } else {
         format!(
@@ -5779,9 +5779,21 @@ mod tests {
         let windows = remedy_for_unreadable_token(path, "/var/lib/dig-node", false);
 
         assert!(unix.contains("elevated"), "{unix}");
+        // The APPROVING verb, in full. `contains("dign pair")` is satisfied by every WRONG
+        // string as its own substring -- including the one this row was rewritten to catch,
+        // which claimed a bare `sudo dign pair` "approves the client's pending request" while
+        // `entrypoint.rs` maps a bare `pair` to `PairAction::List`. A remedy that names a verb
+        // which does not approve is the same dead end the reinstall clause was.
         assert!(
-            unix.contains("dign pair"),
-            "the scoped-credential route must be named: {unix}"
+            unix.contains("`sudo dign pair approve <pairing_id>`"),
+            "the remedy must name the verb that actually approves: {unix}"
+        );
+        // Fails if the verb reverts. The row above passes on any string containing the correct
+        // command, including one that ALSO reasserts the false claim beside it; this one is
+        // one-sided against the specific wrong attribution, so the two cannot both be vacuous.
+        assert!(
+            !unix.contains("`sudo dign pair` approves"),
+            "the bare verb only lists; attributing approval to it is the dead end: {unix}"
         );
         assert!(
             unix.contains("revoke"),

@@ -183,6 +183,45 @@ else
   ok "the upgrade restart is conditional on the unit already running (#305)"
 fi
 
+# The #317 marker must survive EVERY future upgrade, not just the install that created it. The
+# postinst comment reasons that `try-restart` gives this for free -- it cycles a unit only if it
+# is already running, so a node held back by the marker stays stopped -- but reasoning is not a
+# test, and the marker+upgrade combination was never exercised by either section above: section 2
+# runs the marker on a FIRST install, and the upgrade run above carries no marker.
+#
+# What is asserted is what the stub can see: the argv the postinst emits. `try-restart`'s runtime
+# conditionality belongs to systemd and cannot be observed here, so the load-bearing claim is that
+# an upgrade under the marker emits NO unconditional starter -- a `start`, a `restart`, or an
+# `enable --now` would each start a node the operator deliberately stopped, and each is a change
+# a later simplification could plausibly make.
+MARKED_UPGRADE_ROOT="$TMP/marked-upgrade"; mkdir -p "$MARKED_UPGRADE_ROOT/etc/dig-node"
+touch "$MARKED_UPGRADE_ROOT/etc/dig-node/no-autostart"
+MARKED_UPGRADE_LOG="$(run_postinst "$MARKED_UPGRADE_ROOT" "0.1.0")"
+if grep -qE 'systemctl (start|restart|reload-or-restart|enable) ' <<<"$MARKED_UPGRADE_LOG"; then
+  fail "an upgrade under the no-autostart marker starts the node the operator stopped (#317/#305)"
+else
+  ok "an upgrade under the no-autostart marker starts nothing (#317 survives upgrades)"
+fi
+
+# ...and it still CYCLES a running unit. The #305 fix must not be lost under the marker: an
+# operator who removed the marker and started the node by hand is running a node like any other,
+# and the next upgrade must replace its binary. This row and the one above are one-sided in
+# opposite directions, so neither can be satisfied by the postinst simply doing nothing.
+if grep -qE 'systemctl try-restart net\.dignetwork\.dig-node\.service' <<<"$MARKED_UPGRADE_LOG"; then
+  ok "the marked upgrade still cycles an already-running unit (#305 preserved under #317)"
+else
+  fail "the marker suppressed try-restart -- an upgrade would leave the old binary serving (#305)"
+fi
+
+# The truthful control for the row above. Its assertion is a NEGATIVE, which an empty log would
+# satisfy for the wrong reason -- a postinst that did nothing at all under the marker would look
+# identical. `daemon-reload` proves the configure branch really ran.
+if grep -q 'daemon-reload' <<<"$MARKED_UPGRADE_LOG"; then
+  ok "the marked upgrade really ran its configure branch (so the check above measured something)"
+else
+  fail "the marked upgrade emitted no daemon-reload -- the no-start check above proves nothing"
+fi
+
 # The control. A FIRST install already starts the node via `enable --now`, so a restart there
 # would be redundant; its ABSENCE is what proves the assertion above measured the upgrade
 # argument rather than a restart bolted onto every configure.

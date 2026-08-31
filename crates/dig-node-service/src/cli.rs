@@ -19,7 +19,7 @@
 //! | 4    | SERVICE_FAILED      | A service operation failed (register/start/stop).|
 //! | 5    | BIND_FAILED         | `run`: could not bind the loopback address.      |
 //! | 6    | IO_ERROR            | Other I/O error.                                 |
-//! | 7    | NODE_UNREACHABLE    | The node did not answer; nothing was measured.    |
+//! | 12   | NODE_UNREACHABLE    | The node did not answer; nothing was measured.    |
 
 use serde_json::{json, Value};
 
@@ -44,7 +44,7 @@ pub enum ExitCode {
     BindFailed,
     /// 6 — any other I/O error.
     IoError,
-    /// 7 — the node did not answer, so the operation was never measured (dig-node#407).
+    /// 12 — the node did not answer, so the operation was never measured (dig-node#407).
     ///
     /// Deliberately NOT `IO_ERROR`: that code says an I/O operation was attempted and failed,
     /// which is a claim about the requested operation. An unreachable node is a failure to
@@ -65,7 +65,7 @@ impl ExitCode {
             ExitCode::ServiceFailed => 4,
             ExitCode::BindFailed => 5,
             ExitCode::IoError => 6,
-            ExitCode::NodeUnreachable => 7,
+            ExitCode::NodeUnreachable => 12,
         }
     }
 
@@ -220,12 +220,53 @@ mod tests {
         );
     }
 
+    /// **No `dign` code may collide with a `diga` code that means something else.**
+    ///
+    /// The two command lines deliberately share ONE numbering so a caller sees one surface
+    /// (`dig-app-core/src/gateway/outcome.rs` says so in its own doc comment), which means a
+    /// number is free only if it is unoccupied ECOSYSTEM-WIDE. `NODE_UNREACHABLE` was first
+    /// assigned 7 by reading this file's own table, where 7 genuinely was the next number --
+    /// and 7 is `NOT_CONNECTED` on the other side. The identical reasoning already cost a yank
+    /// in the JSON-RPC error space (`-32015` vs a released `METADATA_TOO_LARGE`), so the guard
+    /// is a test rather than a note.
+    ///
+    /// The `diga` map is transcribed rather than imported: dig-node MUST NOT take a dependency
+    /// on dig-app (it is the engine, not a consumer of its own client). That makes this fixture
+    /// the drift risk, so it names the file it was read from and the SPEC carries the same table.
+    #[test]
+    fn no_exit_code_collides_with_the_dig_app_gateway_numbering() {
+        // Read from modules/apps/dig-app/crates/dig-app-core/src/gateway/outcome.rs.
+        const DIGA: &[(u8, &str)] = &[
+            (0, "OK"),
+            (2, "USAGE"),
+            (6, "IO_ERROR"),
+            (7, "NOT_CONNECTED"),
+            (8, "ENGINE_ERROR"),
+            (9, "LOCKED"),
+            (10, "NOT_FOUND"),
+            (11, "DENIED"),
+        ];
+
+        for code in ExitCode::all() {
+            if let Some((_, diga_name)) = DIGA.iter().find(|(n, _)| *n == code.code()) {
+                assert_eq!(
+                    code.name(),
+                    *diga_name,
+                    "exit {} is `{}` here and `{}` in the dig-app gateway -- a shared number                      must carry the SAME meaning on both command lines, or a caller branching                      on it is reading two different failures as one",
+                    code.code(),
+                    code.name(),
+                    diga_name
+                );
+            }
+        }
+    }
+
     /// The catalogue is the machine-readable contract (§6.2), and a code missing from it is
     /// invisible to every consumer that enumerates rather than guesses.
     #[test]
     fn the_new_code_is_in_the_catalogue_with_a_stable_name_and_number() {
         assert!(ExitCode::all().contains(&ExitCode::NodeUnreachable));
-        assert_eq!(ExitCode::NodeUnreachable.code(), 7);
+        assert_eq!(ExitCode::NodeUnreachable.code(), 12);
         assert_eq!(ExitCode::NodeUnreachable.name(), "NODE_UNREACHABLE");
         // Every code's number is distinct -- an added arm that reused 6 would read as success
         // against the two assertions above if either were relaxed.

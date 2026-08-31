@@ -301,6 +301,15 @@ CORS reflects `chrome-extension://` and the local page origins `http://localhost
 / `http://127.0.0.1` / `http://127.0.0.2` / `http://[::1]` (with or without a `:port`), so the
 extension and any page served from a canonical local name can call it.
 
+### `dign network-info` — this node's own posture, from the terminal
+
+`dign network-info` prints the node's peer id, network id, effective L2 genesis, listen address,
+reachability, and the addresses it advertises, in the node's own IPv6-first order. It reads the
+open `dig.getNetworkInfo` surface, so it needs **no control token and no elevation** — on a `.deb`
+install the control token is `0600 root:root`, and asking "what is my node's address" should not
+require `sudo` for a read the node already performs for any peer that dials it. A field the node
+did not report prints as `unknown` rather than as a plausible default.
+
 ## Machine-readable contracts (agent-friendly)
 
 ### CLI `--json`
@@ -332,7 +341,7 @@ typed `ExitCode` enum in `src/cli.rs`:
 | 4 | `SERVICE_FAILED` | A service operation failed (register/start/stop/uninstall). |
 | 5 | `BIND_FAILED` | `run`: could not bind the loopback address. |
 | 6 | `IO_ERROR` | Other I/O error. |
-| 7 | `NODE_UNREACHABLE` | The node did not answer; the operation was not measured. |
+| 12 | `NODE_UNREACHABLE` | The node did not answer; the operation was not measured. |
 
 ### JSON-RPC error-code catalogue
 
