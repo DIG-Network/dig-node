@@ -318,7 +318,18 @@ pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
 /// tests stayed green because a method absent from the contract is absent from both sides of every
 /// comparison they make. Granting the ordinary tier is now a reviewable one-line edit to this list
 /// instead of a side effect of editing an unrelated one.
-pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] = &["control.peers.ping"];
+/// `control.wallet.resetCoinDb` (dig-node#384) is listed because the contract has not published it
+/// yet, and BOTH consequences of listing it were weighed rather than inherited: the conformance
+/// gate tolerates the publish drift, and the method keeps the PAIRED tier. The second is the one
+/// that matters, and it is the intended answer — the DIG App drives this reset and holds a paired
+/// token, so master-tiering it would make the feature unreachable by its only consumer. It is
+/// destructive, and what bounds it is loopback-only + a token + `confirm: true` on the wire + a
+/// refusal while a spend is in flight, not tier alone.
+///
+/// **Remove this entry the moment `dig-node-control-interface` publishes the method** — the
+/// `the_unpublished_list_still_describes_real_drift` test fails until it is.
+pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] =
+    &["control.peers.ping", "control.wallet.resetCoinDb"];
 
 /// Does this control method require the MASTER control token, never a paired one? PURE.
 ///
@@ -2333,13 +2344,22 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 /// never appears in an asset-scoped balance, for the life of the file. Until this method the only
 /// recovery was deleting the database by hand.
 ///
-/// # It is NOT an open read, deliberately
+/// # Not an open read; PAIRED tier, and that is a deliberate choice
 ///
-/// Absent from [`is_open_control_read`], so it takes the control-plane token like every other
-/// privileged method, and the node binds loopback-only. A caller on another machine cannot reach
-/// it. **The one exception is an operator who sets `DIG_NODE_ALLOW_REMOTE=1`**, which widens every
-/// privileged method at once; that is a deliberate, documented choice and not specific to this
-/// one, but it is stated here because this method destroys state.
+/// Absent from [`is_open_control_read`], so it takes a control-plane token, and the node binds
+/// loopback-only — a caller on another machine cannot reach it. **The one exception is an operator
+/// who sets `DIG_NODE_ALLOW_REMOTE=1`**, which widens every privileged method at once; not specific
+/// to this one, but stated here because this method destroys state.
+///
+/// It sits on the PAIRED tier rather than the master tier, via
+/// [`KNOWN_UNPUBLISHED_CONTROL_METHODS`]. The master tier is tempting for a destructive method and
+/// is the WRONG answer here: dig-node#384 exists to put a reset button in the DIG App, and the App
+/// holds a paired token. Master-tiering it would make the feature unreachable by the only consumer
+/// it was built for — a guard so tight it removes the capability is not a guard, it is a deletion.
+///
+/// What actually bounds the damage is the combination this method does enforce: loopback-only, a
+/// token, an explicit `confirm: true` on the wire, a refusal while any spend is in flight, and a
+/// blast radius that contains no key material and nothing a re-sync cannot rebuild.
 ///
 /// # `confirm: true` is required
 ///
@@ -2357,7 +2377,7 @@ async fn wallet_reset_coin_db(ctx: &ControlCtx, id: Value, params: &Value) -> Va
         return control_error(
             id,
             ErrorCode::InvalidParams,
-            "control.wallet.resetCoinDb is DESTRUCTIVE: it discards this node's cached coin              database and re-syncs from chain. Pass params.confirm = true to proceed. No key              material is affected.",
+            "control.wallet.resetCoinDb is DESTRUCTIVE: it discards this node's cached coin database \n             and re-syncs from chain. Pass params.confirm = true to proceed. No key \n             material is affected.",
         );
     }
 
@@ -5456,21 +5476,6 @@ mod tests {
             "control.pairing.revoke",
             "control.chiaPeers.add",
             "control.chiaPeers.remove",
-            // dig-node#384. Master-tier because the CONTRACT has not published it yet and this
-            // gate fails CLOSED for an unrecognised name — and that is the tier it should have
-            // regardless: it discards the node's cached coin database.
-            //
-            // Deliberately NOT added to `KNOWN_UNPUBLISHED_CONTROL_METHODS`. That list exempts a
-            // method from the strict tier to avoid breaking paired clients that already call it;
-            // nothing calls this one yet, and exempting a destructive method to spare a client
-            // that does not exist would trade the guard for nothing.
-            //
-            // This entry is therefore load-bearing in BOTH directions. When
-            // `dig-node-control-interface` publishes the method it must publish it as
-            // master-tier: publishing it as paired-reachable silently DOWNGRADES it here (the
-            // `from_name` arm starts matching and answers `false`), and this assertion is what
-            // catches that.
-            "control.wallet.resetCoinDb",
         ]
         .into_iter()
         .collect();
@@ -5481,43 +5486,15 @@ mod tests {
 
         // And it tracks the CONTRACT, so a method the contract promotes later cannot stay
         // paired-reachable here just because nobody edited the list above.
-        //
-        // # Containment, not equality — and the direction is the whole point
-        //
-        // This was `assert_eq!` until dig-node#384 added a served-but-unpublished method. Equality
-        // makes the two sets identical in BOTH directions, so it forbids the node from being
-        // STRICTER than the published contract — and "stricter" is the fail-closed answer
-        // `requires_master_token` deliberately gives an unrecognised name. Under equality the only
-        // way to green this suite before the contract publishes is to add the method to
-        // `KNOWN_UNPUBLISHED_CONTROL_METHODS`, which DOWNGRADES a destructive method to the paired
-        // tier. A lockstep test that can only be satisfied by weakening a guard is worse than no
-        // test.
-        //
-        // Containment keeps every escalation the equality caught: a method the contract promotes
-        // and this node leaves paired-reachable is missing from `actual` and still fails here.
-        // What it now permits is the node reserving MORE than the contract requires, which cannot
-        // grant anyone authority they did not have.
         let contract: BTreeSet<&str> = ControlMethod::ALL
             .iter()
             .filter(|m| m.requires_master_token())
             .map(|m| m.name())
             .filter(|n| CONTROL_METHODS.contains(n))
             .collect();
-        let missing: Vec<&&str> = contract.difference(&actual).collect();
-        assert!(
-            missing.is_empty(),
-            "these methods are master-tier in dig-node-control-interface and are NOT reserved by              this node — a paired token could reach them: {missing:?}"
-        );
-
-        // The residue, stated so it is a known quantity rather than a silent gap: exactly the
-        // methods this node reserves that the contract has not published. An entry appearing here
-        // that is NOT a deliberate unpublished addition means someone reserved a method by
-        // accident, which breaks paired clients that legitimately call it.
-        let unpublished: Vec<&&str> = actual.difference(&contract).collect();
         assert_eq!(
-            unpublished,
-            vec![&"control.wallet.resetCoinDb"],
-            "the set of master-tier-but-unpublished methods changed; publish it in              dig-node-control-interface (as master-tier) and remove it from this expectation"
+            actual, contract,
+            "this node's master tier disagrees with dig-node-control-interface"
         );
     }
 
