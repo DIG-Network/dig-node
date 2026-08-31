@@ -1395,12 +1395,45 @@ impl WalletDb {
     /// only the terminal answer of a full address-history catch-up produces. A caller that has not
     /// replayed history has nothing to build one out of, which is what makes the unsafe arming hard
     /// to write rather than merely discouraged.
-    pub async fn set_initial_sync_complete(&self, complete: bool) -> sqlx::Result<()> {
+    ///
+    /// # The `true` direction is UNREPRESENTABLE here, by type (dig-node#462)
+    ///
+    /// This takes no argument, so it can only DISARM. That is the whole fix: dig-node#454 made
+    /// every real ARMING writer take a `reset_epoch` guard, because an unguarded arm is that PR's
+    /// money-lie defect — a catch-up completing after a cache reset set `initial_sync_complete = 1`
+    /// over an EMPTIED table, giving `balance 0, synced true` on a funded wallet. A `bool` setter
+    /// beside those guards is a third path to that state which bypasses them, and the next author
+    /// who needs to set the flag will find a function whose name says it does exactly that.
+    ///
+    /// Removing the parameter discharges it STRUCTURALLY rather than by convention: there is no
+    /// `true` to pass. Arming remains reachable only through [`Self::complete_catch_up`] and
+    /// [`Self::record_coverage`], which is what the compiler now enforces.
+    ///
+    /// **Disarming stays public and unguarded, deliberately.** `sync.rs`'s reorg handler calls it
+    /// when the replica moves backwards, so wallet reads fall back until a fresh catch-up. That is
+    /// the conservative direction — it can only make the node claim LESS than it knows — and it is
+    /// the direction a guard would be protecting nothing by blocking.
+    pub async fn clear_initial_sync_complete(&self) -> sqlx::Result<()> {
+        self.write_initial_sync_complete(false).await
+    }
+
+    /// The raw write, private so that the only ways to reach the `true` direction are the two
+    /// guarded arming paths and the test-only forcing hatch below.
+    async fn write_initial_sync_complete(&self, complete: bool) -> sqlx::Result<()> {
         sqlx::query("UPDATE sync_state SET initial_sync_complete = ? WHERE id = 0")
             .bind(i64::from(complete))
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Force the flag from a test, in either direction.
+    ///
+    /// A test-only escape hatch is fine; an AMBIGUOUS one is what dig-node#462 is about, so the
+    /// name carries its own danger and `#[cfg(test)]` keeps it out of every production build.
+    #[cfg(test)]
+    pub async fn force_initial_sync_complete_for_test(&self, complete: bool) -> sqlx::Result<()> {
+        self.write_initial_sync_complete(complete).await
     }
 
     /// Record the puzzle-hash set a NON-catch-up sync path covered — the oracle-tier refresh
@@ -4882,7 +4915,7 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
 
         // What `refresh_tracked_coins` does on a fresh install with nothing in the DB yet.
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         assert_eq!(
             db.arrival_baseline().await.unwrap(),
             None,
@@ -5292,7 +5325,7 @@ mod tests {
         db.upsert_coin(&coin("c1", 12_345, Some(10), None))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         assert!(db.is_synced().await.unwrap(), "pre-state: authoritative");
 
         let report = db.reset_chain_cache(0).await.unwrap().expect("not refused");
@@ -5321,7 +5354,7 @@ mod tests {
         db.upsert_coin(&coin("c1", 12_345, Some(10), None))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         db.reserve_client_coins(&["c1".to_string()], Some(60_000), 0)
             .await
             .expect("reserve");

@@ -5251,7 +5251,9 @@ mod tests {
     async fn backend_with(coins: Vec<CoinRow>, synced: bool) -> WalletBackend {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coins(&coins).await.unwrap();
-        db.set_initial_sync_complete(synced).await.unwrap();
+        db.force_initial_sync_complete_for_test(synced)
+            .await
+            .unwrap();
         let fb = Arc::new(MockFallback::default());
         // Scope reads (#407) to the test coins' puzzle hash so identity-scoped reads see
         // them — mirrors a client `login` declaring its public puzzle hash.
@@ -5341,7 +5343,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        db.set_initial_sync_complete(synced).await.unwrap();
+        db.force_initial_sync_complete_for_test(synced)
+            .await
+            .unwrap();
         if let Some(h) = peak {
             db.set_peak(h, &"cc".repeat(32)).await.unwrap();
         }
@@ -5892,7 +5896,7 @@ mod tests {
     /// reports NOTHING about the local replica — even when that replica is fully caught up.
     ///
     /// The fixture is chosen to distinguish the fix from the nearest wrong implementation:
-    /// the DB here is `set_initial_sync_complete(true)` with peak `9_000_000`, while the
+    /// the DB here is `force_initial_sync_complete_for_test(true)` with peak `9_000_000`, while the
     /// queried address is unscoped, so routing still picks `Fallback`. The pre-fix code read
     /// `synced` / `peak_height` OUTSIDE the tier decision and would answer
     /// `synced: true, peak_height: Some(9_000_000)` on this input — a third-party oracle read
@@ -5904,7 +5908,7 @@ mod tests {
         let arb_ph = "22".repeat(32);
         let arbitrary = encode_address(&arb_ph, "xch").unwrap();
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         db.set_peak(9_000_000, &"cc".repeat(32)).await.unwrap();
         let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
             "c1",
@@ -6343,7 +6347,7 @@ mod tests {
         let (registry, _dir) = registry_with_key(&enrolled_key());
 
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         db.set_peak(500, &"cc".repeat(32)).await.unwrap();
 
         let be = WalletBackend::new(
@@ -6412,7 +6416,7 @@ mod tests {
 
         // No chain source: arbitrary address, DB synced, EmptyFallback (not live).
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
         let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
         assert_eq!(
@@ -6431,7 +6435,7 @@ mod tests {
 
         // Read failed: arbitrary address routes to a LIVE fallback that errors.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(ErringFallback), WalletConfig::default());
         assert!(matches!(
             be.balance_for_address(&arbitrary, BalanceAsset::Xch).await,
@@ -7243,7 +7247,7 @@ mod tests {
     #[tokio::test]
     async fn an_arbitrary_address_reads_its_coins_from_the_chain_tier() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let fb = Arc::new(MockFallback::with_coins(vec![
             fallback_coin("live", &"33".repeat(32), 1_750, Some(9), None),
             fallback_coin("already-spent", &"33".repeat(32), 5, Some(9), Some(11)),
@@ -7279,7 +7283,7 @@ mod tests {
     async fn a_chain_it_could_not_reach_is_an_error_never_an_empty_coin_list() {
         // No chain source: an arbitrary address, synced replica, a tier that is not live.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
         let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
         assert_eq!(
@@ -7299,7 +7303,7 @@ mod tests {
 
         // A live tier that errors: the answer is unknown, not empty.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(ErringFallback), WalletConfig::default());
         assert!(matches!(
             be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
@@ -7556,7 +7560,7 @@ mod tests {
     /// and only the money reads, still paired `synced: true` with `peak_height: null`.
     ///
     /// The state is production-reachable rather than hypothetical: `refresh_tracked_coins` latches
-    /// the replica authoritative (`record_coverage` + `set_initial_sync_complete(true)`) WITHOUT
+    /// the replica authoritative (`record_coverage` + `force_initial_sync_complete_for_test(true)`) WITHOUT
     /// ever writing a peak, which is exactly what `db_with_owned_derivation(true, None)` builds.
     ///
     /// FIXTURE DESIGN. The peer tier is deliberately HONEST and OBSERVABLE — level with the
@@ -7937,7 +7941,7 @@ mod tests {
 
         // A single token in the bucket, no refill: the first outbound read spends it.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -7959,7 +7963,7 @@ mod tests {
 
         // The peak read reaches the tier only when the replica has no height of its own.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -8152,7 +8156,7 @@ mod tests {
             TESTNET11_CONSTANTS.agg_sig_me_additional_data,
         ));
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let cfg = WalletConfig {
             network_id: "testnet11".into(),
             address_prefix: "txch".into(),
@@ -8364,7 +8368,9 @@ mod tests {
         // loaded signers is empty.
         let restarted = WalletCustody::open(dir.clone());
         let db2 = WalletDb::open_in_memory().await.unwrap();
-        db2.set_initial_sync_complete(true).await.unwrap();
+        db2.force_initial_sync_complete_for_test(true)
+            .await
+            .unwrap();
         let after = WalletBackend::new(db2, Arc::new(MockFallback::default()), cfg)
             .with_custody(restarted)
             .with_pusher(pusher.clone());
@@ -8529,7 +8535,7 @@ mod tests {
     async fn wallet_balance_fallback_is_rate_limited_after_a_burst() {
         const POOL: usize = 4;
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -8557,7 +8563,7 @@ mod tests {
     async fn a_single_legitimate_balance_read_is_unaffected() {
         let arb_ph = "44".repeat(32);
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
             "c1",
             &arb_ph,
@@ -8900,7 +8906,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([test_ph()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         // Reads scope to the wallet's identity (#407); the test coins sit at `test_ph()`.
         let cfg = WalletConfig {
             puzzle_hashes: vec![test_ph()],
@@ -8935,7 +8941,9 @@ mod tests {
             spent_timestamp: None,
         }]));
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(false).await.unwrap(); // still syncing
+        db.force_initial_sync_complete_for_test(false)
+            .await
+            .unwrap(); // still syncing
         let cfg = WalletConfig {
             puzzle_hashes: vec![ph],
             ..Default::default()
@@ -8969,7 +8977,7 @@ mod tests {
         db.upsert_coins(&[xch_coin("inwallet", 1, Some(1), None)])
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
 
         let (status, body) = be
@@ -9057,7 +9065,7 @@ mod tests {
         })
         .await
         .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let bc = Arc::new(MockBroadcaster::default());
         let cfg = WalletConfig {
             puzzle_hashes: vec![hex::encode(ph)],
@@ -9148,7 +9156,10 @@ mod tests {
         );
 
         // The control: the ONLY thing that changes is the authority flag.
-        be.db.set_initial_sync_complete(true).await.unwrap();
+        be.db
+            .force_initial_sync_complete_for_test(true)
+            .await
+            .unwrap();
         let coins = be
             .spendable_coins(None)
             .await
@@ -9240,7 +9251,10 @@ mod tests {
         // The control: the ONLY thing that changes is the authority flag. Both calls now get
         // PAST the tier gate and fail on the missing lineage source underneath, which is a
         // different failure — so the refusals above were the gate, not the empty backend.
-        be.db.set_initial_sync_complete(true).await.unwrap();
+        be.db
+            .force_initial_sync_complete_for_test(true)
+            .await
+            .unwrap();
         for e in [
             be.select_cats(&asset, 1_000, 0).await.unwrap_err(),
             be.singleton_parent_child("c0").await.unwrap_err(),
@@ -9649,7 +9663,7 @@ mod tests {
     #[tokio::test]
     async fn get_nfts_and_get_dids_return_reconstructed_rows() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let nft = NftRecord {
             launcher_id: "aa".repeat(32),
             collection_id: None,
@@ -9740,7 +9754,7 @@ mod tests {
             .await
             .unwrap();
         }
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let cfg = WalletConfig {
             puzzle_hashes: vec![hex::encode(ph)],
             address_prefix: "txch".into(),
@@ -9883,7 +9897,7 @@ mod tests {
 
         let shared = std::sync::Arc::new(super::super::events::EventBus::with_capacity(4));
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be2 = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -9942,7 +9956,9 @@ mod tests {
         // Even with the DB marked caught up, a wallet the node is NOT tracking (no login,
         // no config) still reads NOT synced — never a silent synced-0.
         let db2 = WalletDb::open_in_memory().await.unwrap();
-        db2.set_initial_sync_complete(true).await.unwrap();
+        db2.force_initial_sync_complete_for_test(true)
+            .await
+            .unwrap();
         let be2 = WalletBackend::new(
             db2,
             Arc::new(MockFallback::default()),
@@ -9980,7 +9996,7 @@ mod tests {
         ]))
         .await
         .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         // Identity comes ONLY from the client's login — the node has no own wallet config.
         let be = WalletBackend::new(
             db,
@@ -10033,7 +10049,7 @@ mod tests {
         let addr = encode_address(&ph, "xch").unwrap();
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coins(&[coin_at("c1", &ph, 4_200)]).await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -10123,7 +10139,7 @@ mod tests {
         );
         row.parent_coin_info = hex::encode(child_cat.coin.parent_coin_info);
         db.upsert_coin(&row).await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
 
         // Attribute CATs by uncurrying the parent spend (the sync attribution step).
         let parent = ParentSpend {
@@ -10163,7 +10179,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([owner_ph.as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -10423,7 +10439,9 @@ mod tests {
     #[tokio::test]
     async fn sync_status_reports_tristate_from_db() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(false).await.unwrap();
+        db.force_initial_sync_complete_for_test(false)
+            .await
+            .unwrap();
         let be = WalletBackend::new(
             db.clone(),
             Arc::new(MockFallback::default()),
@@ -10433,7 +10451,7 @@ mod tests {
         assert_eq!(s.state, SyncLifecycle::Syncing);
 
         db.set_peak(123, "aa").await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let s = be.sync_status().await.unwrap();
         assert_eq!(s.state, SyncLifecycle::Synced);
         assert_eq!(s.peak_height, Some(123));
@@ -10469,7 +10487,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([covered_ph.as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         db.set_peak(REPLICA_PEAK, &"cc".repeat(32)).await.unwrap();
         assert!(
             db.is_synced().await.unwrap(),
@@ -10551,7 +10569,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([client_ph.as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -10663,7 +10681,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex(["bb".repeat(32).as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default().offline()),
@@ -10704,7 +10722,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([client_ph.as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
