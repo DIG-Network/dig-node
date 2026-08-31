@@ -326,6 +326,215 @@ pub fn select_operator_dig_cats_detailed<S: ChainSource>(
     }
 }
 
+/// What an operator must actually DO about a funding shortfall.
+///
+/// Two remedies, because they are different actions and telling an operator the wrong one wastes
+/// their money or their afternoon: a wallet holding too little $DIG needs topping up, and a wallet
+/// holding enough $DIG in too many pieces needs consolidating. A message that said only "funding
+/// failed" would leave both operators guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FundingRemedy {
+    /// The wallet does not hold enough $DIG. Add funds.
+    TopUp,
+    /// The wallet holds enough, in too many coins to spend in one bundle. Consolidate them.
+    Consolidate,
+}
+
+/// A message for a person, raised when the funding state of the mirror pass CHANGES.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FundingAlert {
+    /// A one-line headline.
+    pub title: String,
+    /// The body: what happened, in what amounts, and what to do about it.
+    pub body: String,
+    /// The action this alert is asking for, or `None` when it reports a recovery.
+    pub remedy: Option<FundingRemedy>,
+}
+
+/// What one mirror pass observed about funding — the input the alert gate decides on.
+///
+/// Deliberately only three shapes. A pass that could not READ the balance is not a pass that found
+/// it short, and is not represented here at all: reporting a shortfall on no evidence is precisely
+/// the money lie this crate refuses elsewhere, so the caller maps an unreadable balance to
+/// [`FundingObservation::Unknown`], which never alerts and never clears the state either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FundingObservation {
+    /// A create was funded, or none was needed. The operator wallet is not blocking anything.
+    Healthy,
+    /// A create was refused for want of funds.
+    Short {
+        /// What the operator can spend, in $DIG base units.
+        have_dig_base_units: u64,
+        /// What the create needed, in the same units.
+        need_dig_base_units: u64,
+        /// The action that would clear it.
+        remedy: FundingRemedy,
+    },
+    /// The funding state could not be established this pass.
+    Unknown,
+}
+
+impl FundingObservation {
+    /// Read a pass's funding outcome off the error the selection refused with.
+    ///
+    /// The match is exhaustive on purpose. A new [`FundingError`] variant — the bounded-input
+    /// refusal in flight is one — will not compile until someone decides whether it is a shortfall
+    /// an operator can act on, and if so which remedy it names. A wildcard arm here would silently
+    /// classify every future refusal as unknown, which is the shape that ships a surface reporting
+    /// nothing about a condition it was built to report.
+    pub fn from_error(error: &FundingError) -> Self {
+        match error {
+            FundingError::Insufficient {
+                have_dig_base_units,
+                need_dig_base_units,
+            } => FundingObservation::Short {
+                have_dig_base_units: *have_dig_base_units,
+                need_dig_base_units: *need_dig_base_units,
+                remedy: FundingRemedy::TopUp,
+            },
+            // Not shortfalls. An unreadable chain or audit record says nothing about the balance,
+            // and a create asked for at zero collateral is a caller defect, not an empty wallet.
+            FundingError::Chain(_) | FundingError::CommitmentsUnreadable(_) => {
+                FundingObservation::Unknown
+            }
+            FundingError::Unauthenticated { .. } | FundingError::ZeroCollateral => {
+                FundingObservation::Unknown
+            }
+        }
+    }
+}
+
+/// Decides WHEN the operator is told their node has stopped bonding content (dig-node#463).
+///
+/// # The policy, stated here because "how often does this fire" is the whole design
+///
+/// The mirror pass runs unattended every ten minutes. A notification per pass is 144 a day, which
+/// trains an operator to dismiss them and loses the one that mattered inside the noise. So:
+///
+/// * **On the TRANSITION into a funding-short state — once.** Consecutive short passes after that
+///   raise nothing.
+/// * **While short, again only on a MATERIAL change**: the remedy changes (topping up and
+///   consolidating are different actions, so an operator following the old one is being misled), or
+///   the deficit grows by at least [`MATERIAL_DEFICIT_GROWTH_PERCENT`] over the deficit last
+///   alerted on. Growth by a fixed proportion is self-limiting — each further alert needs a deficit
+///   half again as large as the last — so a steadily worsening shortfall cannot become a stream.
+/// * **Once on RECOVERY**, so an operator who acted learns it worked without having to watch for it.
+/// * **Never on [`FundingObservation::Unknown`]**, which also does not CLEAR the state: an
+///   unreadable pass is not evidence of recovery, and treating it as one would re-alert on the next
+///   short pass for a shortfall that never went away.
+///
+/// The gate holds one pass of state and no clock. It is deliberately not the delivery mechanism:
+/// it answers whether to speak, and the caller decides how.
+#[derive(Debug, Default)]
+pub struct FundingAlertGate {
+    /// The shortfall the last alert was raised for, or `None` while not in the short state.
+    alerted: Option<(FundingRemedy, u64)>,
+}
+
+/// How much a deficit must grow, in percent of the last alerted deficit, to speak again.
+///
+/// 50% rather than a few percent: this fires while an operator has already been told, and the
+/// question it answers is "has this become a materially different problem", not "has the number
+/// moved". A small threshold turns a slowly worsening shortfall back into the per-pass stream this
+/// gate exists to prevent.
+pub const MATERIAL_DEFICIT_GROWTH_PERCENT: u64 = 50;
+
+impl FundingAlertGate {
+    /// Feed one pass's observation, and get back the alert to raise — or nothing.
+    pub fn observe(&mut self, observation: &FundingObservation) -> Option<FundingAlert> {
+        match observation {
+            FundingObservation::Unknown => None,
+            FundingObservation::Healthy => self.alerted.take().map(|_| FundingAlert {
+                title: "DIG mirror collateral resumed".into(),
+                body: concat!(
+                    "The operator wallet can fund mirror collateral again. Your content is being ",
+                    "bonded on the next pass."
+                )
+                .into(),
+                remedy: None,
+            }),
+            FundingObservation::Short {
+                have_dig_base_units,
+                need_dig_base_units,
+                remedy,
+            } => {
+                let deficit = need_dig_base_units.saturating_sub(*have_dig_base_units);
+                let speak = match self.alerted {
+                    None => true,
+                    Some((last_remedy, last_deficit)) => {
+                        last_remedy != *remedy || grew_materially(last_deficit, deficit)
+                    }
+                };
+                if !speak {
+                    return None;
+                }
+                self.alerted = Some((*remedy, deficit));
+                Some(shortfall_alert(
+                    *have_dig_base_units,
+                    *need_dig_base_units,
+                    *remedy,
+                ))
+            }
+        }
+    }
+}
+
+/// Whether `deficit` is materially worse than the one already reported.
+///
+/// A first shortfall of zero — reachable only if `have` already met `need`, which is not a
+/// shortfall — would make every later deficit infinitely larger, so growth from zero is treated as
+/// material outright rather than divided by it.
+fn grew_materially(last_deficit: u64, deficit: u64) -> bool {
+    let threshold = last_deficit
+        .saturating_add(last_deficit.saturating_mul(MATERIAL_DEFICIT_GROWTH_PERCENT) / 100);
+    deficit > threshold
+}
+
+/// The operator-facing text for a shortfall.
+///
+/// $DIG is rendered in whole DIG (1 DIG = 1_000 base units) because that is the unit an operator
+/// buys and holds; base units would be a true figure nobody can act on. No coin id and no address
+/// appears — a desktop notification is read over a shoulder and shown on a lock screen, and neither
+/// figure helps the operator do the thing this message is asking for.
+fn shortfall_alert(
+    have_dig_base_units: u64,
+    need_dig_base_units: u64,
+    remedy: FundingRemedy,
+) -> FundingAlert {
+    let short = need_dig_base_units.saturating_sub(have_dig_base_units);
+    let body = match remedy {
+        FundingRemedy::TopUp => format!(
+            concat!(
+                "Your node cannot bond content: it needs {} DIG of collateral for this epoch and ",
+                "the operator wallet holds {} DIG that it can spend, so it is {} DIG short. Add ",
+                "$DIG to the operator wallet. Until then no new content is collateralised and it ",
+                "earns nothing."
+            ),
+            whole_dig(need_dig_base_units),
+            whole_dig(have_dig_base_units),
+            whole_dig(short)
+        ),
+        FundingRemedy::Consolidate => format!(
+            concat!(
+                "Your node cannot bond content: the operator wallet holds enough $DIG for the {} ",
+                "DIG this epoch requires, but in too many separate coins to spend at once. ",
+                "Consolidate the wallet's $DIG into fewer coins — adding more will not help."
+            ),
+            whole_dig(need_dig_base_units)
+        ),
+    };
+    FundingAlert {
+        title: "DIG node cannot bond content".into(),
+        body,
+        remedy: Some(remedy),
+    }
+}
+
+/// Render $DIG base units as whole DIG with three decimal places (1 DIG = 1_000 base units).
+fn whole_dig(base_units: u64) -> String {
+    format!("{}.{:03}", base_units / 1_000, base_units % 1_000)
+}
+
 /// Turn one candidate record into a spendable [`Cat`], or refuse.
 ///
 /// The lineage proof is reconstructed from the spend that CREATED the coin — which is the spend that
@@ -380,6 +589,176 @@ fn authenticate<S: ChainSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A short pass, repeated. The operator hears about it ONCE.
+    fn short(have: u64) -> FundingObservation {
+        FundingObservation::Short {
+            have_dig_base_units: have,
+            need_dig_base_units: 100_000,
+            remedy: FundingRemedy::TopUp,
+        }
+    }
+
+    /// **Ten consecutive short passes raise exactly one alert.**
+    ///
+    /// The pass runs every ten minutes, so the failure this asserts against is not a wrong message
+    /// but 144 correct ones a day, which is how the one that matters gets dismissed with the rest.
+    /// The count is asserted rather than "the first one alerts", because an implementation that
+    /// alerted on passes one and seven satisfies the weaker claim.
+    #[test]
+    fn consecutive_short_passes_alert_once_rather_than_once_per_pass() {
+        let mut gate = FundingAlertGate::default();
+        let raised: Vec<FundingAlert> = (0..10)
+            .filter_map(|_| gate.observe(&short(60_000)))
+            .collect();
+        assert_eq!(
+            raised.len(),
+            1,
+            "one transition into the short state is one alert: {raised:?}"
+        );
+        assert_eq!(raised[0].remedy, Some(FundingRemedy::TopUp));
+        assert!(
+            raised[0].body.contains("40.000"),
+            "the operator is told how much they are short: {}",
+            raised[0].body
+        );
+    }
+
+    /// **Recovering and falling short again alerts again.**
+    ///
+    /// The pairing matters: a gate that simply latched forever would pass the test above and leave
+    /// an operator who fixed the problem, and then hit it again, permanently unwarned. Three
+    /// distinct outcomes are asserted from one sequence — the recovery speaks, and the second
+    /// shortfall speaks again.
+    #[test]
+    fn a_recovery_then_a_second_shortfall_alerts_again() {
+        let mut gate = FundingAlertGate::default();
+        assert!(gate.observe(&short(60_000)).is_some(), "the transition in");
+        assert!(gate.observe(&short(60_000)).is_none(), "still short");
+
+        let recovered = gate.observe(&FundingObservation::Healthy).expect("recovery");
+        assert_eq!(recovered.remedy, None, "a recovery asks for no action");
+        assert!(
+            gate.observe(&FundingObservation::Healthy).is_none(),
+            "a healthy pass after a healthy pass is not news"
+        );
+
+        assert!(
+            gate.observe(&short(60_000)).is_some(),
+            "falling short again is a new transition and must be reported"
+        );
+    }
+
+    /// **An unreadable pass neither alerts nor clears the state.**
+    ///
+    /// Two properties in one sequence, and the second is the one an implementation is likely to
+    /// miss: treating "unknown" as recovery would re-alert on the very next short pass for a
+    /// shortfall that never went away, turning an unstable chain read into a notification stream.
+    #[test]
+    fn an_unknown_funding_state_is_silent_and_does_not_count_as_a_recovery() {
+        let mut gate = FundingAlertGate::default();
+        assert!(gate.observe(&short(60_000)).is_some());
+        assert!(
+            gate.observe(&FundingObservation::Unknown).is_none(),
+            "a pass that could not read the balance has nothing to report"
+        );
+        assert!(
+            gate.observe(&short(60_000)).is_none(),
+            "the shortfall never went away, so it must not be announced a second time"
+        );
+    }
+
+    /// **A materially worse shortfall speaks; a slightly worse one does not.**
+    ///
+    /// Both sides of the bound, from one starting point, because a threshold tested only from below
+    /// confirms nothing but its own existence. At a 40_000 deficit the bound is 60_000: 59_000 is
+    /// silent and 61_000 speaks.
+    #[test]
+    fn the_deficit_must_grow_materially_before_it_is_reported_again() {
+        let mut gate = FundingAlertGate::default();
+        assert!(gate.observe(&short(60_000)).is_some(), "deficit 40_000");
+        assert!(
+            gate.observe(&short(41_000)).is_none(),
+            "a deficit of 59_000 is under the 50% bound and is not a new problem"
+        );
+        assert!(
+            gate.observe(&short(39_000)).is_some(),
+            "a deficit of 61_000 is over the bound and is worth interrupting for"
+        );
+    }
+
+    /// **A changed remedy speaks even when the deficit has not moved.**
+    ///
+    /// Top up and consolidate are opposite instructions. An operator acting on a stale one adds
+    /// money to a wallet that already had enough, so the remedy is reported on its own account
+    /// rather than only when an amount crosses a threshold.
+    #[test]
+    fn a_changed_remedy_is_reported_even_at_an_unchanged_deficit() {
+        let mut gate = FundingAlertGate::default();
+        assert!(gate.observe(&short(60_000)).is_some());
+        let switched = gate
+            .observe(&FundingObservation::Short {
+                have_dig_base_units: 60_000,
+                need_dig_base_units: 100_000,
+                remedy: FundingRemedy::Consolidate,
+            })
+            .expect("the remedy changed, so the previous instruction is now wrong");
+        assert!(
+            switched.body.contains("Consolidate"),
+            "the message must name the action that now applies: {}",
+            switched.body
+        );
+    }
+
+    /// **An unreadable balance is never classified as a shortfall.**
+    ///
+    /// `BalanceUnreadable` exists because "we could not read it" and "you do not have enough" are
+    /// one `Ok` apart and mean opposite things. This asserts the classification at the boundary the
+    /// alert gate reads from, so a chain blip can never produce a message telling an operator to
+    /// spend money.
+    #[test]
+    fn an_unreadable_source_is_not_reported_to_the_operator_as_a_shortfall() {
+        assert_eq!(
+            FundingObservation::from_error(&FundingError::Chain("timeout".into())),
+            FundingObservation::Unknown
+        );
+        assert_eq!(
+            FundingObservation::from_error(&FundingError::CommitmentsUnreadable("torn".into())),
+            FundingObservation::Unknown
+        );
+        assert_eq!(
+            FundingObservation::from_error(&FundingError::Insufficient {
+                have_dig_base_units: 1,
+                need_dig_base_units: 2,
+            }),
+            FundingObservation::Short {
+                have_dig_base_units: 1,
+                need_dig_base_units: 2,
+                remedy: FundingRemedy::TopUp,
+            },
+            "a genuine shortfall must still reach the operator"
+        );
+    }
+
+    /// **No coin id and no address reaches a desktop notification.**
+    ///
+    /// The test looks for an identifier's SHAPE — a long unbroken run of hex — rather than for a
+    /// particular string, so it still fires if someone later interpolates a coin id that no fixture
+    /// here happens to name. Prose is full of hex letters, which is why the run length is what
+    /// discriminates.
+    #[test]
+    fn an_alert_never_carries_a_coin_id_or_an_address() {
+        let mut gate = FundingAlertGate::default();
+        let alert = gate.observe(&short(60_000)).expect("the transition in");
+        let text = format!("{} {}", alert.title, alert.body);
+        for token in text.split_whitespace() {
+            let hexish = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            assert!(
+                hexish.len() < 16 || !hexish.chars().all(|c| c.is_ascii_hexdigit()),
+                "an alert is shown on a lock screen and must carry no identifier: {text}"
+            );
+        }
+    }
     use crate::spend_audit::{
         kinds, Asset, Authority, FailureStage, FundingCoinId, SpendIntent, SpendJournal, SpendKind,
         Submission, TargetCoinId,
