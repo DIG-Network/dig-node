@@ -1328,6 +1328,19 @@ impl NodeResponder {
 
     /// The live pool's peers as L7 `PeerRecord`s (peer_id + candidate addresses), or an empty list
     /// when no pool is wired. `network_id` is echoed onto each record.
+    ///
+    /// # The ADDRESS is withheld, never the PEER (#349)
+    ///
+    /// A pool entry whose address is not a destination — a relay-reached peer carries the wildcard
+    /// `[::]:0` — keeps its row with an EMPTY `addresses` array. It is still a real peer and still
+    /// reachable via the relay, so dropping the row would be a worse regression than the wildcard it
+    /// fixes: the asking node would not learn the peer exists at all.
+    ///
+    /// An empty array rather than an omitted field or an explicit null, because `dig.getPeers` is a
+    /// peer-facing wire surface and an empty array is a shape its consumers ALREADY handle:
+    /// `parse_forwarded_providers` drops an addressless provider by design (tested), and
+    /// `dig.announce` requires only that `addresses` BE an array. Omitting the field would break the
+    /// first of those and fail the second.
     fn pool_peers(&self, network_id: &str, limit: Option<usize>) -> Vec<Value> {
         let Some(handle) = &self.handle else {
             return Vec::new();
@@ -1335,24 +1348,38 @@ impl NodeResponder {
         let mut peers: Vec<Value> = handle
             .connected_pool_peers()
             .into_iter()
-            .map(|(peer_id, addr, _outbound)| {
-                json!({
-                    "peer_id": hex::encode(peer_id),
-                    "addresses": [{
-                        "host": addr.ip().to_string(),
-                        "port": addr.port(),
-                        "kind": "direct",
-                    }],
-                    "network_id": network_id,
-                    "via": "direct",
-                })
-            })
+            .map(|(peer_id, addr, _outbound)| pool_peer_row(peer_id, addr, network_id))
             .collect();
         if let Some(n) = limit {
             peers.truncate(n);
         }
         peers
     }
+}
+
+/// One `dig.getPeers` peer row: the peer's identity, its network, and the addresses a remote node
+/// may DIAL — which is where the `ContactAddr` check applies (#349).
+///
+/// Pure, and separate from [`NodeResponder::pool_peers`], so the decision "does this address go on
+/// the wire?" is testable without a live `GossipHandle`. The plumbing beneath it (reading the pool,
+/// truncating to `limit`) is not the property under test; which addresses survive is.
+fn pool_peer_row(
+    peer_id: impl AsRef<[u8]>,
+    addr: std::net::SocketAddr,
+    network_id: &str,
+) -> Value {
+    // The type boundary: an address reaches the wire only through `ContactAddr`, whose construction
+    // IS the "is this a destination?" question. A wildcard yields no entry, so the row keeps the
+    // peer and withholds the address.
+    let addresses: Vec<Value> = crate::net::ContactAddr::new(addr)
+        .map(|c| vec![c.address_json()])
+        .unwrap_or_default();
+    json!({
+        "peer_id": hex::encode(peer_id),
+        "addresses": addresses,
+        "network_id": network_id,
+        "via": "direct",
+    })
 }
 
 #[async_trait::async_trait]
@@ -4361,6 +4388,84 @@ pub(crate) mod tests {
             effective_network_label(None, override_b),
             "distinct geneses must land on distinct discovery namespaces"
         );
+    }
+
+    /// **Proves:** `dig.getPeers` never serves a non-destination to a remote peer as a dial
+    /// candidate, and withholds only the ADDRESS — the peer's row survives (#349).
+    ///
+    /// **Catches:** the shipped defect, in which a relay-reached peer was served to other nodes as
+    /// `{"host":"::","port":0}`. It also catches the two over-corrections: dropping the row entirely
+    /// (the asking node would never learn the peer exists) and blanking every row.
+    ///
+    /// The fixture is what makes this load-bearing. It carries a TRUTHFUL control peer at a real
+    /// destination alongside each non-destination, so "emit everything" and "emit nothing" both
+    /// fail. A fixture of wildcards alone — the one that reads as the harshest case — would pass
+    /// against an implementation that returned an empty list for every peer.
+    #[test]
+    fn get_peers_withholds_a_non_destination_address_but_keeps_the_peer() {
+        let good_id = [7u8; 32];
+        let bad_id = [9u8; 32];
+        let real: std::net::SocketAddr = "203.0.113.7:9444".parse().unwrap();
+
+        // The truthful control renders its address in full, every time.
+        let control = pool_peer_row(good_id, real, "DIG_MAINNET");
+        assert_eq!(control["addresses"][0]["host"], json!("203.0.113.7"));
+        assert_eq!(control["addresses"][0]["port"], json!(9444));
+        assert_eq!(control["addresses"][0]["kind"], json!("direct"));
+
+        // Every shape of non-destination: the two wildcards, and port 0 on a real IP.
+        for junk in ["[::]:0", "0.0.0.0:0", "[::]:9444", "203.0.113.7:0"] {
+            let addr: std::net::SocketAddr = junk.parse().unwrap();
+            let row = pool_peer_row(bad_id, addr, "DIG_MAINNET");
+
+            // The PEER survives — it is still reachable via the relay, and dropping it would deny
+            // the asking node the knowledge that it exists.
+            assert_eq!(
+                row["peer_id"],
+                json!(hex::encode(bad_id)),
+                "{junk}: the peer row must survive"
+            );
+            assert_eq!(row["network_id"], json!("DIG_MAINNET"));
+
+            // The ADDRESS does not — as an empty array, the shape consumers already handle.
+            assert_eq!(
+                row["addresses"],
+                json!([]),
+                "{junk} is not a destination and must never be served as a dial candidate"
+            );
+            assert!(
+                row["addresses"].is_array(),
+                "{junk}: addresses must stay an ARRAY — dig.announce validates `is_array`, and \
+                 omitting the field or emitting null would fail that check"
+            );
+        }
+    }
+
+    /// **Proves:** the wire-address renderer is reachable ONLY through the destination check — the
+    /// type boundary #349 asked for, rather than a fifth call-site `if`.
+    ///
+    /// **Catches:** a sixth emitter re-deriving `{host, port}` from a raw `SocketAddr`. It cannot
+    /// mint a `ContactAddr` for a non-destination, so there is no renderer to reach.
+    #[test]
+    fn a_wire_address_can_only_be_rendered_from_a_checked_contact() {
+        use crate::net::ContactAddr;
+        let real: std::net::SocketAddr = "203.0.113.7:9444".parse().unwrap();
+        let loopback: std::net::SocketAddr = "127.0.0.1:9444".parse().unwrap();
+
+        // Loopback is deliberately a destination — single-host multi-node runs depend on it — so
+        // this control also pins the guard against being tightened into "public addresses only".
+        for good in [real, loopback] {
+            let contact = ContactAddr::new(good).expect("a real destination must be constructible");
+            assert_eq!(contact.addr(), good);
+            assert_eq!(contact.address_json()["host"], json!(good.ip().to_string()));
+            assert_eq!(contact.address_json()["port"], json!(good.port()));
+        }
+        for bad in ["[::]:0", "0.0.0.0:9444", "203.0.113.7:0"] {
+            assert!(
+                ContactAddr::new(bad.parse().unwrap()).is_none(),
+                "{bad} must not be constructible as a contact, so it has no renderer"
+            );
+        }
     }
 
     /// **Proves:** the three network-reaching isolation knobs read ONE off-vocabulary — an operator

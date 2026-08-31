@@ -2095,28 +2095,61 @@ impl WalletBackend {
             return Err(PushError::NodeCustodiedSpend);
         }
         let pusher = self.pusher.as_ref().ok_or(PushError::NoChainSource)?;
-        let outcome = pusher
-            .push(&bundle)
-            .await
-            .map_err(|e| PushError::Unreachable(e.to_string()))?;
+        let pushed = pusher.push(&bundle).await;
 
-        // Reserve the bundle's inputs ONLY once the mempool has accepted it
-        // (dig_ecosystem#2763). A refusal reserves nothing: those coins were never committed, and
-        // holding them would strand the user's money over a spend that will never happen.
+        // Reserve unless the bundle was DEFINITIVELY rejected — see [`Self::is_definitive_rejection`].
         //
-        // A reservation failure does not fail the push. The bundle is already in a public mempool
-        // by this point, and reporting a push that did happen as an error would be a worse lie
-        // than the double-selection this guards against.
-        if outcome.accepted {
+        // A reservation failure does not fail the push. The bundle may already be in a public
+        // mempool by this point, and reporting a push that did happen as an error would be a worse
+        // lie than the double-selection this guards against.
+        if !matches!(&pushed, Ok(o) if Self::is_definitive_rejection(o)) {
             if let Err(e) = self.reserve_pushed_bundle(&bundle).await {
                 tracing::warn!(
                     error = %e,
-                    "pushed bundle accepted but its coins could not be reserved; a second send \
-                     inside the confirmation window may reselect them"
+                    "pushed bundle may be in flight but its coins could not be reserved; a second \
+                     send inside the confirmation window may reselect them"
                 );
             }
         }
-        Ok(outcome)
+        pushed.map_err(|e| PushError::Unreachable(e.to_string()))
+    }
+
+    /// Whether `outcome` is the network DEFINITIVELY refusing this bundle — the only case in which
+    /// its inputs stay selectable (#348).
+    ///
+    /// # The asymmetry this exists to correct
+    ///
+    /// Reservation used to be gated on `outcome.accepted` alone, so the two directions failed
+    /// OPPOSITE ways and **the cheap-to-lie direction was the unsafe one**:
+    ///
+    /// - **Under-claim** — a source denying it relayed what it did relay, or a transport that failed
+    ///   AFTER transmitting — reserved nothing, so the coins returned to the selectable set while a
+    ///   bundle carrying them was in flight. A second send inside the confirmation window could
+    ///   reselect the same inputs: exactly the double-select window this family exists to close.
+    /// - **Over-claim** reserved for the bounded `RESERVATION_TTL_MS`, which self-heals.
+    ///
+    /// A source that wants a coin reselected only has to say "not accepted". Under NC-12 every
+    /// dialled peer is untrusted, so that is not an exotic failure — it is the assumed case. So an
+    /// unconfirmed relay is now treated as POSSIBLY IN FLIGHT and held to the TTL, which is the
+    /// discipline dig-account settled on for the in-process race.
+    ///
+    /// # What counts as definitive, and what this does NOT claim
+    ///
+    /// A refusal is definitive only when the mempool STATED its reason (`accepted == false` with a
+    /// `rejection`). A bare `accepted: false` with no reason is an unexplained denial and is held.
+    ///
+    /// This does not make the flag trustworthy — a hostile source can fabricate a rejection string,
+    /// and nothing here can verify one without an independent chain read. What it does is make the
+    /// CHEAPEST lie, and the accidental case, land on the safe side: a silent denial and a
+    /// post-transmit transport failure now hold the coins instead of freeing them.
+    ///
+    /// The TTL is deliberately NOT shortened to compensate for the wider hold. That would trade a
+    /// double-select for a lockout, and a lockout is the worse failure — measured on dig-account as
+    /// `available=4000000 selectable=0`, renewable indefinitely. Requiring a STATED reason is what
+    /// keeps a genuine mempool rejection (a bad signature, say) from locking the user's coins for
+    /// the full TTL.
+    fn is_definitive_rejection(outcome: &PushOutcome) -> bool {
+        !outcome.accepted && outcome.rejection.is_some()
     }
 
     /// Record an accepted bundle as in-flight and hold its inputs out of further selection.
@@ -10672,11 +10705,125 @@ mod tests {
         );
     }
 
-    /// **The control:** a mempool REFUSAL reserves nothing.
+    /// **Proves:** a bundle denied WITHOUT a stated reason is held to the TTL, not returned to the
+    /// selectable set (#348).
     ///
-    /// Without it, reserving unconditionally — dropping the `outcome.accepted` guard rather than
-    /// the call — satisfies the test above while stranding a user's coins over a spend that will
-    /// never happen. It pins the guard, not just the wiring.
+    /// **Catches:** the shipped fail-open. Reservation was gated on `outcome.accepted` alone, so a
+    /// source that denied relaying what it actually relayed left the coins reselectable while a
+    /// bundle carrying them was in flight — a second send inside the confirmation window could
+    /// reselect the same inputs. Under NC-12 every dialled peer is untrusted, so a false denial is
+    /// the assumed case rather than an exotic one, and it was the CHEAP direction to lie in.
+    ///
+    /// FIXTURE DESIGN. This differs from `a_refused_bundle_reserves_nothing` in EXACTLY one field —
+    /// `rejection` is `None` rather than `Some(...)` — and the two tests demand OPPOSITE outcomes.
+    /// That pairing is the whole property: it is what distinguishes "held because the denial was
+    /// unexplained" from "holds on every refusal", which would be the lockout regression. Two
+    /// coins, one spent by the bundle, so a mis-scoped reservation that empties selection cannot
+    /// pass for a correct one.
+    #[tokio::test]
+    async fn a_bundle_denied_without_a_reason_is_held_rather_than_freed() {
+        let mut spent_by_the_bundle = spendable_row(0xa1, 100);
+        let (bundle_hex, transaction_id) = a_bundle_spending(&mut spent_by_the_bundle);
+        let untouched = spendable_row(0xb2, 500);
+        // A bare denial: the source says "no" and does not say why. Indistinguishable, from here,
+        // from a source denying a relay it performed.
+        let silently_denying = FakePusher::answering(Ok(PushOutcome {
+            accepted: false,
+            transaction_id: None,
+            rejection: None,
+        }));
+        let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
+            .await
+            .with_pusher(silently_denying);
+
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            2,
+            "the fixture must start with BOTH coins selectable, or the assertion below is vacuous"
+        );
+
+        let outcome = be.push_signed_bundle(&bundle_hex).await.unwrap();
+        assert!(
+            !outcome.accepted,
+            "the outcome is reported honestly — the fix changes what is RESERVED, not what is said"
+        );
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending.len(),
+            1,
+            "an unexplained denial left the bundle unrecorded; its inputs are reselectable while it \
+             may be in flight"
+        );
+        assert_eq!(pending[0].transaction_id, transaction_id);
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(
+            selectable.len(),
+            1,
+            "the possibly-in-flight bundle's input is still offered to a second spend"
+        );
+        assert_eq!(
+            selectable[0].amount, 500,
+            "the wrong coin was held: the untouched control left selection"
+        );
+    }
+
+    /// **Proves:** a transport failure is treated as POSSIBLY IN FLIGHT — the inputs are held —
+    /// while the caller still receives the honest error (#348).
+    ///
+    /// **Catches:** the other half of the fail-open. `push()` returning `Err` propagated with `?`
+    /// BEFORE any reservation, so a transport that failed after transmitting freed the coins. The
+    /// node cannot tell "never sent" from "sent, and the acknowledgement was lost", and only one of
+    /// those is safe to free.
+    ///
+    /// The error assertion is load-bearing in the other direction: a fix that swallowed the failure
+    /// to reach the reserve call would report a push that never happened as a success, which is the
+    /// money-lie this contract refuses. Both must hold at once.
+    #[tokio::test]
+    async fn a_transport_failure_holds_the_inputs_and_still_reports_the_failure() {
+        let mut spent_by_the_bundle = spendable_row(0xa1, 100);
+        let (bundle_hex, transaction_id) = a_bundle_spending(&mut spent_by_the_bundle);
+        let untouched = spendable_row(0xb2, 500);
+        let unreachable = FakePusher::answering(Err("connection reset".into()));
+        let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
+            .await
+            .with_pusher(unreachable);
+
+        assert_eq!(be.spendable_coins(None).await.unwrap().len(), 2);
+
+        let err = be
+            .push_signed_bundle(&bundle_hex)
+            .await
+            .expect_err("a transport failure must still be reported as a failure");
+        assert!(
+            matches!(err, PushError::Unreachable(_)),
+            "the caller must learn the network was not reached, got {err:?}"
+        );
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending.len(),
+            1,
+            "a post-transmit transport failure freed the inputs of a bundle that may be in flight"
+        );
+        assert_eq!(pending[0].transaction_id, transaction_id);
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(selectable.len(), 1);
+        assert_eq!(selectable[0].amount, 500, "the wrong coin was held");
+    }
+
+    /// **The control:** a mempool refusal that STATES ITS REASON reserves nothing.
+    ///
+    /// Without it, reserving unconditionally satisfies the tests above while stranding a user's
+    /// coins over a spend that will never happen — the lockout that is the worse of the two
+    /// failures. It pins the guard, not just the wiring.
+    ///
+    /// Since #348 this is the ONLY path that frees the inputs, and it is the sibling of
+    /// `a_bundle_denied_without_a_reason_is_held_rather_than_freed`: the two fixtures differ in the
+    /// `rejection` field alone and demand opposite outcomes, so together they pin the bound from
+    /// both sides. Neither is meaningful without the other.
     #[tokio::test]
     async fn a_refused_bundle_reserves_nothing() {
         let mut refused = spendable_row(0xa1, 100);

@@ -105,6 +105,52 @@ pub fn is_usable_contact(addr: &SocketAddr) -> bool {
     !addr.ip().is_unspecified() && addr.port() != 0
 }
 
+/// A peer address that HAS been checked against [`is_usable_contact`] — a real destination, not a
+/// bind wildcard or a port-0 sentinel.
+///
+/// # Why a type rather than a fifth `if` (#349)
+///
+/// [`is_usable_contact`] was adopted call site by call site, and each adoption fixed the site
+/// somebody happened to be looking at. Four sites were guarded; the fifth — `pool_peers`, answering
+/// `dig.getPeers` — was not, so this node served `{"host":"::","port":0}` to REMOTE PEERS as a dial
+/// candidate. That is worse than the display falsehood the earlier fixes addressed: a peer that
+/// dials it wastes one of its few dial slots, and a peer that caches it caches a hole.
+///
+/// A guard adopted one call site at a time will keep missing one, and the count reached five before
+/// anyone looked at the site that faced other nodes. So the question moves into the type: a
+/// `ContactAddr` cannot be constructed without answering "is this a destination?", and
+/// [`ContactAddr::address_json`] is the only way to render the shipped `{host, port, kind}` entry.
+/// A new emitter reaches for the renderer, and the renderer is only reachable through the check.
+///
+/// This does not make the raw `SocketAddr` unreachable — that would require changing what
+/// `dig_gossip::GossipHandle::connected_pool_peers` returns, in another crate. It makes the
+/// *rendering* path go through the check, which is where the five leaks occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContactAddr(SocketAddr);
+
+impl ContactAddr {
+    /// The ONLY constructor: `Some` when `addr` is a real destination, `None` when it is not.
+    pub fn new(addr: SocketAddr) -> Option<Self> {
+        is_usable_contact(&addr).then_some(Self(addr))
+    }
+
+    /// The checked address.
+    pub fn addr(&self) -> SocketAddr {
+        self.0
+    }
+
+    /// This contact as the shipped `{host, port, kind}` peer-address entry — the one shape
+    /// `dig.getPeers`, the DHT answer and the forwarded-ask provider list all speak, so no second
+    /// address encoding enters the ecosystem.
+    pub fn address_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "host": self.0.ip().to_string(),
+            "port": self.0.port(),
+            "kind": "direct",
+        })
+    }
+}
+
 /// Discover a routable local IPv6 address, if the host has one. Uses the connect-a-UDP-socket trick:
 /// "connecting" a UDP socket to an off-host address forces the OS to select the local address it
 /// would route from, WITHOUT sending any packet. Returns the local IPv6 address only when it is
