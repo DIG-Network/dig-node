@@ -173,15 +173,17 @@ fn format_counts(result: &Value) -> String {
 /// Render `control.peerStatus` as an operator-friendly summary. Shows the running flag, the
 /// connected count, and the relay reservation; when a newer node fills the optional per-peer
 /// list it prints each peer with its addresses ordered IPv6-first (§5.2).
+///
+/// An EMPTY per-peer list is reported by cause rather than by symptom (#304): zero connected
+/// peers is stated as such, and the version-gap note is kept for the only state that actually
+/// implies one — peers this node counts but cannot enumerate.
 fn format_status(result: &Value) -> String {
     let running = result["running"].as_bool().unwrap_or(false);
     if !running {
         return "dig-node: peer network is not running (no connected peers).".to_string();
     }
-    let mut out = format!(
-        "dig-node peer network: running · {} connected peer(s)",
-        result["connected_peers"].as_u64().unwrap_or(0),
-    );
+    let connected = result["connected_peers"].as_u64().unwrap_or(0);
+    let mut out = format!("dig-node peer network: running · {connected} connected peer(s)");
     if let Some(url) = result["relay"]["url"].as_str() {
         let reserved = result["relay"]["reserved"].as_bool().unwrap_or(false);
         out.push_str(&format!(
@@ -191,10 +193,23 @@ fn format_status(result: &Value) -> String {
     }
     let mut peers = result["peers"].as_array().cloned().unwrap_or_default();
     if peers.is_empty() {
-        // Honest degradation: no per-peer list (no peer network running, or an older node build).
-        out.push_str(
-            "\n  (this node build reports a count only — a per-peer list needs a newer node)",
-        );
+        // An empty list has TWO causes and they need different words (#304). Conflating them
+        // told a first-run user on the newest node that exists to go and upgrade -- advice that
+        // is false, and false in the direction that sends them looking for a release that does
+        // not exist. The connected count distinguishes the two: a node reporting zero connected
+        // peers has an empty list because it HAS no peers, while a node reporting peers it
+        // cannot enumerate is the genuine version gap the note was written for.
+        if connected == 0 {
+            out.push_str(
+                "\n  no peers connected yet — a node finds peers within a minute or two of \
+                 starting. If it stays at zero, check outbound connectivity on the peer port \
+                 and try `dign peers connect <address>` with a known peer.",
+            );
+        } else {
+            out.push_str(
+                "\n  (this node build reports a count only — a per-peer list needs a newer node)",
+            );
+        }
     } else {
         // Render peers with IPv6-addressed ones first (§5.2 display policy).
         peers.sort_by_key(|p| is_ipv4(p["address"].as_str().unwrap_or("")));
@@ -251,6 +266,42 @@ mod tests {
         assert!(s.contains("reservation held"));
         // No per-peer list today → the honest degradation note appears.
         assert!(s.contains("newer node"));
+    }
+
+    /// #304 -- a node with zero peers must not be told to upgrade. Measured on 0.138.0, the
+    /// newest build that existed, where zero peers was the correct state: the CLI printed "a
+    /// per-peer list needs a newer node", sending a first-run user after a release that does not
+    /// exist. The fixture varies ONLY the connected count against the test above, which keeps a
+    /// truthful control: 4 connected peers with no list IS a version gap and still says so, so a
+    /// fix that merely reworded the string unconditionally fails there rather than here.
+    #[test]
+    fn zero_peers_says_so_instead_of_blaming_the_node_version() {
+        let s = format_status(&json!({
+            "running": true,
+            "connected_peers": 0,
+            "relay": { "url": "wss://relay.dig.net:443", "reserved": false },
+        }));
+        assert!(
+            !s.contains("newer node"),
+            "zero peers is not a version gap: {s}"
+        );
+        assert!(s.contains("no peers connected"), "{s}");
+        // Actionable, not merely honest: the message must name something to try.
+        assert!(s.contains("peers connect"), "{s}");
+    }
+
+    /// The same state reported by a node that DOES fill the list -- an explicitly empty array
+    /// rather than an absent key. It is still zero peers, and must read identically; the two
+    /// spellings of "no peers" must not diverge into two different messages.
+    #[test]
+    fn an_explicitly_empty_peer_array_reads_the_same_as_an_absent_one() {
+        let s = format_status(&json!({
+            "running": true,
+            "connected_peers": 0,
+            "peers": [],
+        }));
+        assert!(!s.contains("newer node"), "{s}");
+        assert!(s.contains("no peers connected"), "{s}");
     }
 
     #[test]

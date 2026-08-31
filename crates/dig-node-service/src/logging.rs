@@ -60,6 +60,36 @@ pub fn run_context() -> RunContext {
     }
 }
 
+/// The sentence printed when the rolling log FILE could not be opened and this run is
+/// console-only.
+///
+/// A named constant rather than an inline literal for two reasons. It is the only part of the
+/// degrade path a test can hold onto -- `init` installs a global subscriber, so the emission
+/// itself is not assertable in-process. And it was shipped carrying two runs of ~22 literal
+/// spaces from a lost string continuation, which no test could see and which renders in an
+/// operator's log as a line that looks corrupted at the exact moment they are trying to work out
+/// whether logging is broken.
+///
+/// `concat!` rather than a `\`-continued literal, and that is not a style preference: the first
+/// repair here DID use continuations, and `cargo fmt` rejoined them and materialised the leading
+/// indentation back into the string -- reintroducing the very defect, silently, between writing
+/// the fix and running it. `the_announcement_text_has_no_lost_string_continuation` caught it.
+/// `concat!` has no whitespace a formatter can reinterpret.
+pub const FILE_LOGGING_DEGRADED: &str = concat!(
+    "the rolling log FILE could not be opened; this run logs to the console ONLY. ",
+    "Nothing is being written to that directory -- an empty log directory here means ",
+    "logging was denied, not that the node was quiet."
+);
+
+/// Whether a run must ANNOUNCE that file logging degraded, given the sink's error (if any).
+///
+/// Pure, and separated from [`init`] for the same reason `remedy_for_unreadable_token` takes its
+/// platform as an argument: the branch that matters runs on the half of the fleet where the log
+/// directory is denied, which is not the machine the tests run on.
+pub fn degrade_announcement(file_error: Option<&str>) -> Option<&str> {
+    file_error
+}
+
 /// Install the shared logging stack for a SERVE run (SPEC §1) and hold the guard for the
 /// process lifetime. Idempotent + best-effort: a second call (e.g. a test that serves twice
 /// in one process) is a silent no-op.
@@ -82,6 +112,19 @@ pub fn init(run_context: RunContext) {
     }
     match dig_logging::init(service(run_context)) {
         Ok(guard) => {
+            // ANNOUNCE a degrade, do not merely record it (dig-node#392). `control.status` has
+            // carried `file_error` since the 0.2.0 uplift, but nothing was said at the moment it
+            // happened -- so on a non-admin run denied `C:\ProgramData\DigNetwork\logs` the node
+            // came up console-only in silence, and an operator later found an empty log directory
+            // with no way to tell "nothing went wrong" from "logging never started". The console
+            // layer IS installed on this path, which is precisely why the warning reaches someone.
+            if let Some(reason) = degrade_announcement(guard.file_error()) {
+                tracing::warn!(
+                    dir = %guard.log_dir().display(),
+                    reason = %reason,
+                    "{FILE_LOGGING_DEGRADED}"
+                );
+            }
             // A `set` race (two serve paths initialising at once) is benign: the first guard
             // wins and stays live; a losing guard is dropped, which only detaches a writer
             // that was never wired into the global subscriber.
@@ -182,6 +225,58 @@ mod tests {
         // change reports the actionable reason rather than panicking. (This also documents that
         // `control.log.setLevel` on a non-serving process fails cleanly.)
         assert!(set_level("debug").is_err());
+    }
+
+    /// **A live file sink announces NOTHING.** The control, and the row that makes the next one
+    /// load-bearing: an implementation that warned unconditionally would satisfy the announce
+    /// assertion below while shouting on every healthy start.
+    #[test]
+    fn a_live_file_sink_announces_no_degrade() {
+        assert_eq!(degrade_announcement(None), None);
+    }
+
+    /// **A failed file sink announces, and carries the sink's own reason through.**
+    ///
+    /// The reason is asserted by VALUE, not merely by presence: a warning that says logging
+    /// degraded without saying why sends an operator to guess between a denied directory, a full
+    /// disk and a bad path -- three different remedies.
+    #[test]
+    fn a_failed_file_sink_announces_and_names_the_reason() {
+        assert_eq!(
+            degrade_announcement(Some("Access is denied. (os error 5)")),
+            Some("Access is denied. (os error 5)")
+        );
+    }
+
+    /// **The announcement text carries no run of collapsed whitespace.**
+    ///
+    /// This is not style. The message shipped with two runs of ~22 literal spaces, left behind
+    /// when a Rust string continuation lost its trailing backslash -- the compiler is perfectly
+    /// happy, every other test stays green, and the only witness is an operator reading a line
+    /// that looks corrupted at the moment they are trying to establish whether logging works.
+    #[test]
+    fn the_announcement_text_has_no_lost_string_continuation() {
+        assert!(
+            !FILE_LOGGING_DEGRADED.contains("  "),
+            "a run of consecutive spaces means a continuation lost its backslash:              {FILE_LOGGING_DEGRADED:?}"
+        );
+    }
+
+    /// **The announcement distinguishes "denied" from "quiet".**
+    ///
+    /// The whole point of #392: an empty log directory is ambiguous, and the warning exists to
+    /// resolve the ambiguity rather than to record that something happened. A message that said
+    /// only "file logging failed" would pass a presence check and leave the ambiguity intact.
+    #[test]
+    fn the_announcement_says_an_empty_directory_means_denied_not_quiet() {
+        assert!(
+            FILE_LOGGING_DEGRADED.contains("console ONLY"),
+            "{FILE_LOGGING_DEGRADED}"
+        );
+        assert!(
+            FILE_LOGGING_DEGRADED.contains("logging was denied, not that the node was quiet"),
+            "the message must resolve the empty-directory ambiguity: {FILE_LOGGING_DEGRADED}"
+        );
     }
 
     #[test]
