@@ -195,6 +195,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
     "control.wallet.unwatch",
@@ -260,6 +261,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
     "control.wallet.unwatch",
@@ -316,7 +318,18 @@ pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
 /// tests stayed green because a method absent from the contract is absent from both sides of every
 /// comparison they make. Granting the ordinary tier is now a reviewable one-line edit to this list
 /// instead of a side effect of editing an unrelated one.
-pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] = &["control.peers.ping"];
+/// `control.wallet.resetCoinDb` (dig-node#384) is listed because the contract has not published it
+/// yet, and BOTH consequences of listing it were weighed rather than inherited: the conformance
+/// gate tolerates the publish drift, and the method keeps the PAIRED tier. The second is the one
+/// that matters, and it is the intended answer — the DIG App drives this reset and holds a paired
+/// token, so master-tiering it would make the feature unreachable by its only consumer. It is
+/// destructive, and what bounds it is loopback-only + a token + `confirm: true` on the wire + a
+/// refusal while a spend is in flight, not tier alone.
+///
+/// **Remove this entry the moment `dig-node-control-interface` publishes the method** — the
+/// `the_unpublished_list_still_describes_real_drift` test fails until it is.
+pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] =
+    &["control.peers.ping", "control.wallet.resetCoinDb"];
 
 /// Does this control method require the MASTER control token, never a paired one? PURE.
 ///
@@ -1019,6 +1032,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.coinsByParent" => wallet_coins_by_parent(ctx, id, params).await,
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
+        "control.wallet.resetCoinDb" => wallet_reset_coin_db(ctx, id, params).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
         "control.wallet.watch" => wallet_watch(ctx, id, params).await,
         "control.wallet.unwatch" => wallet_unwatch(ctx, id, params),
@@ -1608,14 +1622,43 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 /// `pending` as JSON **numbers** fitting `u64` (a single address's balance can never exceed
 /// `u64::MAX` mojos, ~18.4M XCH), never JSON strings. Saturates rather than panicking on an
 /// implausible overflow, since a clamped-but-alive response beats a crashed RPC call.
-fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
+fn balance_wire(
+    r: &dig_wallet::sage::rpc::WalletBalanceResult,
+    network_peak: Option<u32>,
+) -> Value {
     json!({
         "balance": u64::try_from(r.balance).unwrap_or(u64::MAX),
         "pending": u64::try_from(r.pending).unwrap_or(u64::MAX),
         "source": r.source,
         "synced": r.synced,
         "peak_height": r.peak_height,
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
+}
+
+/// How many blocks behind the network THIS balance figure is, or `None` when that is UNKNOWN
+/// (dig-node#416).
+///
+/// # `None` is "cannot say", and it is NOT zero
+///
+/// A zero here is a positive claim — *this figure is as current as the network this node can
+/// see*. Absence is the opposite claim and a caller must render it differently, because the
+/// reading that motivated this field was `balance 0, synced false, peak_height null`: a figure
+/// with no freshness bound at all, which is indistinguishable from an empty wallet and was in
+/// fact produced by a replica ~8,380 blocks behind its own peers.
+///
+/// So both inputs must be present for a number to be produced. A missing answer height means
+/// nothing bounds the figure; a missing network peak means no held Chia peer has announced one,
+/// so the node has nothing to measure itself against.
+///
+/// # Saturating, because a replica AHEAD of its peers is not "very stale"
+///
+/// A replica momentarily past the peak its peers last announced would otherwise underflow into a
+/// huge gap and report a healthy node as catastrophically behind. Saturating to `0` says the
+/// truthful thing: nothing known puts this figure behind the network.
+fn stale_by(answer_height: Option<u32>, network_peak: Option<u32>) -> Option<u32> {
+    Some(network_peak?.saturating_sub(answer_height?))
 }
 
 /// `control.wallet.balance` (#1851) — the READ-ONLY balance of a PUBLIC address, for XCH or
@@ -1655,8 +1698,18 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         Err(e) => return e,
     };
 
+    // The peers' announced peak is read SEPARATELY and is allowed to fail: it makes the answer's
+    // staleness legible, and losing it must degrade the answer to "cannot say how stale" rather
+    // than failing a balance read that otherwise succeeded.
+    let network_peak = ctx
+        .wallet
+        .wallet_sync_status()
+        .await
+        .ok()
+        .and_then(|s| s.chia_peer_peak_height);
+
     match ctx.wallet.balance_for_address(address, asset).await {
-        Ok(r) => control_ok(id, balance_wire(&r)),
+        Ok(r) => control_ok(id, balance_wire(&r, network_peak)),
         Err(BalanceError::InvalidAddress) => control_error(
             id,
             ErrorCode::InvalidParams,
@@ -2343,6 +2396,89 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 /// rather than one field — the #2609 regression. A new phase is published in that crate FIRST and
 /// emitted here second; `every_phase_the_node_can_emit_is_declared_by_the_published_contract`
 /// enforces the ordering.
+/// `control.wallet.resetCoinDb` (dig-node#384) — **DESTRUCTIVE.** Drop the cached coin database
+/// and force a re-sync from chain.
+///
+/// # Why it exists, given that attribution self-repairs
+///
+/// `reconstruct_all` walks every coin and repairs unattributed ones on the next tick, so a merely
+/// STALE database needs no reset. The case that does is narrower and permanent: a coin whose
+/// parent spend could not be fetched — an unreachable source, a transient failure, a pruned
+/// response — is skipped silently and **never re-queued**. Its asset never resolves and its value
+/// never appears in an asset-scoped balance, for the life of the file. Until this method the only
+/// recovery was deleting the database by hand.
+///
+/// # Not an open read; PAIRED tier, and that is a deliberate choice
+///
+/// Absent from [`is_open_control_read`], so it takes a control-plane token, and the node binds
+/// loopback-only — a caller on another machine cannot reach it. **The one exception is an operator
+/// who sets `DIG_NODE_ALLOW_REMOTE=1`**, which widens every privileged method at once; not specific
+/// to this one, but stated here because this method destroys state.
+///
+/// It sits on the PAIRED tier rather than the master tier, via
+/// [`KNOWN_UNPUBLISHED_CONTROL_METHODS`]. The master tier is tempting for a destructive method and
+/// is the WRONG answer here: dig-node#384 exists to put a reset button in the DIG App, and the App
+/// holds a paired token. Master-tiering it would make the feature unreachable by the only consumer
+/// it was built for — a guard so tight it removes the capability is not a guard, it is a deletion.
+///
+/// What actually bounds the damage is the combination this method does enforce: loopback-only, a
+/// token, an explicit `confirm: true` on the wire, a refusal while any spend is in flight, and a
+/// blast radius that contains no key material and nothing a re-sync cannot rebuild.
+///
+/// # `confirm: true` is required
+///
+/// A destructive method that runs on an empty parameter object is one keystroke from a wiped
+/// cache. The flag travels on the WIRE rather than being asserted in the CLI, so every client
+/// faces the gate — a guard only the CLI applies is not a guard.
+///
+/// # What it never touches
+///
+/// Key material. Every table it clears is chain-derived and reproduced by syncing; a seed is not.
+/// See [`dig_wallet::sage::db::WalletDb::reset_chain_cache`] for the table list, for why the
+/// authoritative flag is cleared in the SAME transaction, and for the in-flight-spend refusal.
+async fn wallet_reset_coin_db(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    if params.get("confirm").and_then(Value::as_bool) != Some(true) {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            concat!(
+                "control.wallet.resetCoinDb is DESTRUCTIVE: it discards this node's cached ",
+                "coin database and re-syncs from chain. Pass params.confirm = true to ",
+                "proceed. No key material is affected."
+            ),
+        );
+    }
+
+    // The node's own clock. A caller-supplied instant would be a lapse oracle: a far-future value
+    // makes every live spend reservation read as expired, which is exactly the guard being asked
+    // to stand down.
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX);
+
+    match ctx.wallet.reset_coin_db(now_ms).await {
+        Ok(Ok(report)) => control_ok(
+            id,
+            json!({
+                "coins_dropped": report.coins_dropped,
+                "staged_dropped": report.staged_dropped,
+            }),
+        ),
+        // A refusal is an ERROR, not a success with a flag. A caller that ignored a
+        // `refused: true` field would read "your cache was reset" and act on it.
+        Ok(Err(refusal)) => control_error(id, ErrorCode::InvalidParams, refusal.to_string()),
+        Err(e) => control_error(
+            id,
+            ErrorCode::WalletReadFailed,
+            format!("control.wallet.resetCoinDb: the reset could not be applied: {e}"),
+        ),
+    }
+}
+
 async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
     match ctx.wallet.wallet_sync_status().await {
         Ok(s) => control_ok(
@@ -2836,7 +2972,13 @@ const _: () = assert!(
 fn reserve_batch_refusal(len: usize) -> Option<String> {
     (len > MAX_RESERVE_COIN_IDS).then(|| {
         format!(
-            "params.coin_ids holds {len} ids, above the {MAX_RESERVE_COIN_IDS} this node will reserve in one call. Split the request; a bundle that legitimately needs more inputs than this could not fit in a block anyway"
+            concat!(
+                "params.coin_ids holds {len} ids, above the {MAX_RESERVE_COIN_IDS} this ",
+                "node will reserve in one call. Split the request; a bundle that ",
+                "legitimately needs more inputs than this could not fit in a block anyway"
+            ),
+            len = len,
+            MAX_RESERVE_COIN_IDS = MAX_RESERVE_COIN_IDS
         )
     })
 }
@@ -4206,7 +4348,10 @@ mod tests {
         );
         assert!(
             !is_open_control_read("control.wallet.arrivals"),
-            "the arrival cursor names this node's own watched puzzle hashes to a caller that supplied nothing, so it must stay behind the control token"
+            concat!(
+                "the arrival cursor names this node's own watched puzzle hashes to a caller ",
+                "that supplied nothing, so it must stay behind the control token"
+            )
         );
     }
 
@@ -6393,13 +6538,14 @@ mod tests {
             synced: true,
             peak_height: Some(42),
         };
-        let emitted = balance_wire(&r);
+        let emitted = balance_wire(&r, None);
 
         // Golden shape: numeric, not string.
         assert_eq!(
             emitted,
             json!({
                 "balance": 12345u64, "pending": 6u64,
+                "network_peak_height": Value::Null, "stale_by": Value::Null,
                 "source": "db", "synced": true, "peak_height": 42
             }),
         );
@@ -6435,7 +6581,7 @@ mod tests {
             synced: false,
             peak_height: None,
         };
-        let emitted = balance_wire(&r);
+        let emitted = balance_wire(&r, None);
         assert_eq!(emitted["balance"], json!(u64::MAX));
     }
 
@@ -6457,19 +6603,106 @@ mod tests {
         }
 
         for (source, wire) in [(Source::Db, "db"), (Source::Fallback, "fallback")] {
-            let emitted = balance_wire(&WalletBalanceResult {
-                balance: 1,
-                pending: 0,
-                source,
-                synced: source == Source::Db,
-                peak_height: None,
-            });
+            let emitted = balance_wire(
+                &WalletBalanceResult {
+                    balance: 1,
+                    pending: 0,
+                    source,
+                    synced: source == Source::Db,
+                    peak_height: None,
+                },
+                None,
+            );
             assert_eq!(emitted["source"], json!(wire));
 
             let old: OldConsumer = serde_json::from_value(emitted)
                 .expect("a consumer unaware of `source` must still parse");
             assert_eq!(old.balance, 1);
             assert_eq!(old.synced, source == Source::Db);
+        }
+    }
+
+    /// dig-node#416: an UNKNOWN staleness and a staleness of ZERO must not emit the same wire
+    /// value, because they are opposite claims — "nothing bounds this figure" versus "this
+    /// figure is level with the network".
+    ///
+    /// The fixture is built from the measured reading that motivated the ticket (a replica
+    /// 8,380 blocks behind its peers) plus two CONTROLS in the same test: a level replica, and
+    /// a replica whose peers have announced nothing. A test asserting only the stale case would
+    /// pass against an implementation that reported every answer as stale.
+    #[test]
+    fn stale_by_distinguishes_an_unknown_gap_from_a_zero_gap() {
+        // Measured case: the replica named a height, the peers named a higher one.
+        assert_eq!(stale_by(Some(9_211_798), Some(9_220_177)), Some(8_379));
+        // Control 1 — level: a real claim of currency, spelled as a number.
+        assert_eq!(stale_by(Some(9_220_177), Some(9_220_177)), Some(0));
+        // Control 2 — no peer has announced a peak: the node cannot measure itself.
+        assert_eq!(stale_by(Some(9_211_798), None), None);
+        // Control 3 — the answer carries no height (the `peak_height: null` fallback answer
+        // from the ticket): nothing bounds the figure, whatever the network peak is.
+        assert_eq!(stale_by(None, Some(9_220_177)), None);
+        // A replica momentarily ahead reports "not behind", never an underflowed huge gap.
+        assert_eq!(stale_by(Some(9_220_178), Some(9_220_177)), Some(0));
+    }
+
+    /// dig-node#416: the wire carries the gap and the network peak, and both are ADDITIVE —
+    /// the exact reading from the ticket (`balance 0, synced false, peak_height null`) now
+    /// leaves a consumer able to tell "the wallet is empty" from "this node cannot see".
+    #[test]
+    fn balance_wire_carries_the_staleness_gap_additively() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::WalletBalanceResult;
+
+        #[derive(serde::Deserialize)]
+        struct OldConsumer {
+            balance: u64,
+        }
+
+        // The ticket's reading: a zero that is NOT an answer.
+        let unknown = balance_wire(
+            &WalletBalanceResult {
+                balance: 0,
+                pending: 0,
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            Some(9_220_177),
+        );
+        assert_eq!(unknown["stale_by"], json!(null));
+        assert_eq!(unknown["network_peak_height"], json!(9_220_177));
+
+        // A stale-but-bounded DB answer: a real figure as of a named height, 8,380 behind.
+        let stale = balance_wire(
+            &WalletBalanceResult {
+                balance: 0,
+                pending: 0,
+                source: Source::Db,
+                synced: false,
+                peak_height: Some(9_211_798),
+            },
+            Some(9_220_177),
+        );
+        assert_eq!(stale["stale_by"], json!(8_379));
+
+        // Control: a level, synced answer emits a zero gap — distinguishable from the null above.
+        let level = balance_wire(
+            &WalletBalanceResult {
+                balance: 0,
+                pending: 0,
+                source: Source::Db,
+                synced: true,
+                peak_height: Some(9_220_177),
+            },
+            Some(9_220_177),
+        );
+        assert_eq!(level["stale_by"], json!(0));
+        assert_ne!(level["stale_by"], unknown["stale_by"]);
+
+        for v in [&unknown, &stale, &level] {
+            let old: OldConsumer = serde_json::from_value(v.clone())
+                .expect("a consumer unaware of the new fields must still parse");
+            assert_eq!(old.balance, 0);
         }
     }
 }

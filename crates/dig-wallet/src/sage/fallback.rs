@@ -888,7 +888,11 @@ mod chain_failure_tests {
 
         assert!(
             matches!(spend, LineageAnswer::Absent),
-            "a chain that ANSWERED 'no such coin' is an absence, not an outage: an absence may be              remembered and written off, an outage may not. Got {spend:?}"
+            concat!(
+                "a chain that ANSWERED 'no such coin' is an absence, not an outage: an ",
+                "absence may be remembered and written off, an outage may not. Got {spend:?}"
+            ),
+            spend = spend
         );
     }
 
@@ -982,7 +986,13 @@ mod chain_failure_tests {
 
         assert!(
             matches!(spend, Ok(LineageAnswer::Unavailable)),
-            "a failed repair read must refuse the coin, not the session — and must say UNAVAILABLE              rather than ABSENT, because nothing was learned about the chain. Reporting it as an              absence would let one failed read write a real coin off for the cache's whole TTL.              Got {spend:?}"
+            concat!(
+                "a failed repair read must refuse the coin, not the session — and must say ",
+                "UNAVAILABLE rather than ABSENT, because nothing was learned about the ",
+                "chain. Reporting it as an absence would let one failed read write a real ",
+                "coin off for the cache's whole TTL. Got {spend:?}"
+            ),
+            spend = spend
         );
     }
 
