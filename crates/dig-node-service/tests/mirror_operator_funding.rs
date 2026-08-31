@@ -28,7 +28,7 @@ use chia_protocol::{Bytes32, CoinSpend};
 use chia_sha2::Sha256;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_node_service::mirror::funding::{
-    dig_cat_puzzle_hash, select_operator_dig_cats, FundingError,
+    dig_cat_puzzle_hash, select_operator_dig_cats, select_operator_dig_cats_detailed, FundingError,
 };
 use support::{ordinary_dig_coins, wallet, Wallet};
 
@@ -400,27 +400,77 @@ fn the_number_of_coins_drawn_follows_the_requirement_it_was_given() {
     );
 }
 
-/// **A candidate that cannot be authenticated refuses the WHOLE selection.**
+/// **An unauthenticatable candidate is SKIPPED, and the create still funds from the honest coin.**
 ///
-/// Anyone may pay a coin to any puzzle hash. A coin whose creating spend is not on chain cannot have
-/// its lineage proof reconstructed, so it is not spendable — and dropping it and proceeding with the
-/// rest would fund the create from a short set, which is the failure this crate refuses by design.
+/// The address a create funds from is `dig_cat_puzzle_hash(owner)`, which anyone can derive from
+/// the operator's public owner puzzle hash, and selection is largest-first. So a coin nobody can
+/// authenticate, carrying a larger declared amount than any honest coin, is examined FIRST on every
+/// pass. Aborting the selection there let one dust coin block every mirror create a node would ever
+/// make, for as long as it sat unspent (dig-node#461).
 ///
-/// The fixture keeps a genuine, sufficient coin beside the unauthenticated one, so the refusal is
-/// visibly caused by the bad candidate rather than by an empty wallet.
+/// The fixture places exactly that coin ahead of a genuine, sufficient one — the ordering is what is
+/// under test, so a fixture whose bad coin is smaller would pass against the aborting version too.
 #[test]
-fn an_unauthenticatable_candidate_refuses_the_selection_rather_than_being_skipped() {
+fn an_unauthenticatable_candidate_is_skipped_and_the_honest_coin_still_funds_the_create() {
     let operator = operator();
     let mut chain = Chain::default();
-    chain.fund(&operator, &[REQUIRED], salt(1));
-    // Larger, so largest-first reaches it FIRST and a skip would be observable as a success.
+    let honest = chain.fund(&operator, &[REQUIRED], salt(1));
+    // Larger, so largest-first reaches it FIRST: this is the coin the attack relies on.
     chain.fund_without_lineage(&operator, &[REQUIRED * 2], salt(3));
 
-    let err = select_operator_dig_cats(&chain, operator.puzzle_hash, REQUIRED, &HashSet::new())
-        .expect_err("a candidate could not be proven spendable");
-    assert!(
-        matches!(err, FundingError::Unauthenticated { .. }),
-        "expected an authentication refusal, got {err:?}"
+    let selection =
+        select_operator_dig_cats_detailed(&chain, operator.puzzle_hash, REQUIRED, &HashSet::new())
+            .expect("the operator's own coin covers the requirement");
+
+    let funded: Vec<Bytes32> = selection.cats.iter().map(|c| c.coin.coin_id()).collect();
+    assert_eq!(
+        funded, honest,
+        "the create must fund from the operator's genuine coin, not refuse because of a stranger's"
+    );
+    assert_eq!(
+        selection.skipped.len(),
+        1,
+        "the skip is COUNTED, so a genuine lineage bug cannot hide as silence: {:?}",
+        selection.skipped
+    );
+}
+
+/// **Dust cannot exhaust the selection by volume either.**
+///
+/// Skipping one bad coin is not enough if a skip costs an input slot: an attacker who can place one
+/// coin can place many, and a skip that consumed selection budget would reinstate the same denial in
+/// a slower form. The property asserted is that the SELECTED set contains only honest coins — its
+/// size is a function of the honest coins alone, however many strangers' coins precede them.
+#[test]
+fn many_unauthenticatable_candidates_do_not_consume_the_selections_input_budget() {
+    let operator = operator();
+    let mut chain = Chain::default();
+    // Two honest coins, neither sufficient alone, so the selection genuinely walks more than one.
+    let honest = chain.fund(&operator, &[REQUIRED * 2 / 3, REQUIRED / 2], salt(1));
+    // Ten strangers' coins, every one larger than either honest coin, so all ten are walked first.
+    let dust: Vec<u64> = (1..=10).map(|n| REQUIRED * 10 + n).collect();
+    chain.fund_without_lineage(&operator, &dust, salt(4));
+
+    let selection =
+        select_operator_dig_cats_detailed(&chain, operator.puzzle_hash, REQUIRED, &HashSet::new())
+            .expect("the operator's two coins cover the requirement between them");
+
+    let funded: Vec<Bytes32> = selection.cats.iter().map(|c| c.coin.coin_id()).collect();
+    assert_eq!(
+        funded.len(),
+        2,
+        "both honest coins are needed and both must be selected"
+    );
+    for id in &funded {
+        assert!(
+            honest.contains(id),
+            "a selected input is not one of the operator's own coins"
+        );
+    }
+    assert_eq!(
+        selection.skipped.len(),
+        10,
+        "every stranger's coin is skipped and counted, and none is selected"
     );
 }
 

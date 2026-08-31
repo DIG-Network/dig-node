@@ -166,7 +166,44 @@ pub fn committed_funding_coin_ids(log: &SpendLog) -> Result<HashSet<String>, Fun
         .collect())
 }
 
+/// A candidate that was passed over, and why — the counted, reportable half of a selection.
+///
+/// Carried out of the selection rather than only logged, so that a caller (and a test) can assert
+/// how many candidates were passed over. A skip that is invisible to its caller is the silence this
+/// type exists to break: the same code path that passes over a stranger's coin also passes over a
+/// coin this node genuinely owns when lineage handling has a bug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedCandidate {
+    /// The candidate's coin id, hex-encoded, so an operator can look it up on chain.
+    pub coin_id: String,
+    /// What could not be established about it.
+    pub reason: String,
+}
+
+/// The outcome of a funding selection: the coins to spend, and the candidates passed over.
+#[derive(Debug, Clone)]
+pub struct FundingSelection {
+    /// The authenticated, spendable $DIG coins covering the requirement.
+    pub cats: Vec<Cat>,
+    /// Candidates at the operator's address that could not be authenticated, in the order walked.
+    pub skipped: Vec<SkippedCandidate>,
+}
+
 /// Select spendable $DIG `Cat`s of the OPERATOR wallet covering `need_dig_base_units`.
+///
+/// The `Vec<Cat>` half of [`select_operator_dig_cats_detailed`], for callers that fund a spend and
+/// have nothing to say about the candidates that were passed over.
+pub fn select_operator_dig_cats<S: ChainSource>(
+    source: &S,
+    owner_puzzle_hash: Bytes32,
+    need_dig_base_units: u64,
+    committed: &HashSet<String>,
+) -> Result<Vec<Cat>, FundingError> {
+    select_operator_dig_cats_detailed(source, owner_puzzle_hash, need_dig_base_units, committed)
+        .map(|selection| selection.cats)
+}
+
+/// Select spendable $DIG `Cat`s of the OPERATOR wallet, reporting what was passed over.
 ///
 /// `need_dig_base_units` is $DIG in base units (1 DIG = 1_000, never mojos) and is the epoch's
 /// derived requirement — `apply_safety_margin(required_per_store, margin_bp)`, `SPEC.md` §25.3 —
@@ -176,12 +213,38 @@ pub fn committed_funding_coin_ids(log: &SpendLog) -> Result<HashSet<String>, Fun
 /// `committed` is the output of [`committed_funding_coin_ids`], passed in rather than read here so
 /// that one pass takes one reading of the audit record, in the same way it takes one reading of the
 /// disk and one of the balance.
-pub fn select_operator_dig_cats<S: ChainSource>(
+///
+/// # An unauthenticatable candidate is SKIPPED, not fatal (dig-node#461)
+///
+/// The scan address is `dig_cat_puzzle_hash(owner)`, derivable by anyone from the operator's public
+/// owner puzzle hash, and anyone may pay a coin to any puzzle hash. Noise at a public address is the
+/// normal condition of a public address, so a candidate that cannot be authenticated is not this
+/// operator's coin and costs one authentication attempt and nothing else.
+///
+/// Refusing the whole selection on the first such candidate — which this function used to do —
+/// composed with two other facts into a denial of service that cost the attacker dust: selection is
+/// largest-first, so a coin with a large declared amount is walked FIRST, and one unspent coin of
+/// that shape at the public address meant no honest coin was ever reached, on any pass, forever.
+///
+/// Two properties keep the skip from becoming a different failure:
+///
+/// * **A skip is counted and reported**, never swallowed. The same path covers a genuine defect in
+///   lineage handling, and a selection that quietly discarded the operator's own coins while
+///   reporting a shortfall would be indistinguishable from an empty wallet.
+/// * **A skip costs no selection budget.** Candidates are authenticated against the POOL, and a
+///   failed one is removed from the pool before the requirement is covered again — so the coins
+///   handed back are honest coins only, and their number is a function of the honest set alone. An
+///   attacker who could spend an input slot per dust coin would reinstate the same denial in a
+///   slower form.
+///
+/// A chain that cannot ANSWER is still fatal, and deliberately so: an unreadable source is not a
+/// verdict about a coin, and treating it as one would silently shrink the wallet.
+pub fn select_operator_dig_cats_detailed<S: ChainSource>(
     source: &S,
     owner_puzzle_hash: Bytes32,
     need_dig_base_units: u64,
     committed: &HashSet<String>,
-) -> Result<Vec<Cat>, FundingError> {
+) -> Result<FundingSelection, FundingError> {
     if need_dig_base_units == 0 {
         return Err(FundingError::ZeroCollateral);
     }
@@ -194,29 +257,73 @@ pub fn select_operator_dig_cats<S: ChainSource>(
     // honours the flag and one that ignores it are indistinguishable from the returned rows, and
     // selecting a spent coin produces a bundle the mempool rejects for reasons that look nothing
     // like this.
-    let candidates: Vec<_> = records
+    let mut pool: Vec<_> = records
         .into_iter()
         .filter(|r| !r.is_spent())
         .filter(|r| !committed.contains(&hex::encode(r.coin.coin_id())))
         .collect();
 
-    let available = candidates
-        .iter()
-        .fold(0u64, |sum, r| sum.saturating_add(r.coin.amount));
+    // Authenticating a candidate costs a chain read, so each is authenticated at most once however
+    // many times the requirement is covered again.
+    let mut authenticated: Vec<(String, Cat)> = Vec::new();
+    let mut skipped: Vec<SkippedCandidate> = Vec::new();
 
-    let selected = select_largest_first(candidates, need_dig_base_units, |r| {
-        (r.coin.amount, r.coin.coin_id())
-    })
-    .map_err(|_| FundingError::Insufficient {
-        have_dig_base_units: available,
-        need_dig_base_units,
-    })?;
+    loop {
+        let available = pool
+            .iter()
+            .fold(0u64, |sum, r| sum.saturating_add(r.coin.amount));
 
-    let mut cats = Vec::with_capacity(selected.len());
-    for record in &selected {
-        cats.push(authenticate(source, record, owner_puzzle_hash)?);
+        let selected = select_largest_first(pool.clone(), need_dig_base_units, |r| {
+            (r.coin.amount, r.coin.coin_id())
+        })
+        .map_err(|_| FundingError::Insufficient {
+            // The honest total: every candidate proven unauthenticatable has already left the pool,
+            // so this is what the operator can actually spend rather than what the address happens
+            // to hold. Reporting the latter would tell an operator their wallet holds money that is
+            // not theirs.
+            have_dig_base_units: available,
+            need_dig_base_units,
+        })?;
+
+        let mut rejected: Option<Bytes32> = None;
+        let mut cats = Vec::with_capacity(selected.len());
+        for record in &selected {
+            let candidate_id = hex::encode(record.coin.coin_id());
+            if let Some((_, cat)) = authenticated.iter().find(|(id, _)| id == &candidate_id) {
+                cats.push(*cat);
+                continue;
+            }
+            match authenticate(source, record, owner_puzzle_hash) {
+                Ok(cat) => {
+                    authenticated.push((candidate_id, cat));
+                    cats.push(cat);
+                }
+                Err(FundingError::Unauthenticated { coin_id, reason }) => {
+                    tracing::warn!(
+                        coin_id = %coin_id,
+                        reason = %reason,
+                        concat!(
+                            "a coin at the operator's $DIG address could not be proven spendable ",
+                            "and was passed over; if it is one of this node's own coins, its ",
+                            "lineage is not readable from the chain"
+                        )
+                    );
+                    skipped.push(SkippedCandidate { coin_id, reason });
+                    rejected = Some(record.coin.coin_id());
+                    break;
+                }
+                // A source that cannot answer is not a verdict about the coin.
+                Err(fatal) => return Err(fatal),
+            }
+        }
+
+        match rejected {
+            // The rejected candidate leaves the POOL, so it can neither be walked again nor occupy
+            // an input slot, and the requirement is covered again from what remains.
+            Some(coin_id) => pool.retain(|r| r.coin.coin_id() != coin_id),
+            None => return Ok(FundingSelection { cats, skipped }),
+        }
     }
-    Ok(cats)
 }
 
 /// Turn one candidate record into a spendable [`Cat`], or refuse.
