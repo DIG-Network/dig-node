@@ -448,14 +448,15 @@ pub fn relay_enabled() -> bool {
 }
 
 /// Pure: is the relay enabled given an optional `DIG_RELAY_URL` value?
+///
+/// Reads the off-token through the shared [`is_off_token`], so `DIG_RELAY_URL=` (explicitly empty)
+/// now means NO RELAY rather than the compiled-in public relay (#352). An operator who set the
+/// variable to nothing said "none"; resolving that to the default endpoint made a node believed to
+/// be isolated dial production infrastructure, which is the same defect `DIG_BOOTSTRAP_PEERS`
+/// already fixed in dig-node#312. An UNSET variable still takes [`DEFAULT_RELAY_URL`] — #923's
+/// no-configuration anchor is untouched.
 fn is_relay_enabled(env: Option<&str>) -> bool {
-    match env {
-        Some(v) => {
-            let v = v.trim();
-            !(v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disabled"))
-        }
-        None => true,
-    }
+    !env.is_some_and(is_off_token)
 }
 
 /// Whether the peer network (pool + peer-RPC server) is enabled. Disabled with `DIG_PEER_NETWORK=off`
@@ -466,8 +467,42 @@ pub fn peer_network_enabled() -> bool {
 }
 
 /// Pure: is the peer network enabled given an optional `DIG_PEER_NETWORK` value?
+///
+/// Delegates to [`is_off_token`] so this knob reads `off` the same way `DIG_RELAY_URL` and
+/// `DIG_BOOTSTRAP_PEERS` do. It previously matched three exact byte strings, so `OFF` and `off `
+/// left the peer network RUNNING on a node whose operator had asked for it to stop (#282/#352).
 fn is_peer_network_enabled(env: Option<&str>) -> bool {
-    !matches!(env, Some("off") | Some("0") | Some("false"))
+    !env.is_some_and(is_off_token)
+}
+
+/// The ONE reading of "the operator turned this off", shared by every network-reaching `DIG_*` knob.
+///
+/// `off`, `disabled`, `0`, `false`, `no`, or an explicitly EMPTY value — trimmed and
+/// case-insensitive. An empty value counts because a variable that is *set* to nothing is an
+/// operator saying "none", which is exactly what `DIG_BOOTSTRAP_PEERS=` has meant since dig-node#312.
+///
+/// # Why this is one function rather than three (#282)
+///
+/// The three isolation knobs each carried their own off-token predicate and each read a different
+/// vocabulary: relay accepted `off`/`disabled` trimmed and case-insensitively, bootstrap accepted
+/// `off`/`disabled` plus empty, and the peer network matched the exact bytes `off`/`0`/`false` with
+/// no trim and no case folding. So `DIG_PEER_NETWORK=OFF` left the peer network **running** while
+/// the identically-spelled `DIG_RELAY_URL=OFF` correctly disabled the relay — two switches in one
+/// subsystem disagreeing about what the same string means, which is the divergence #282 exists to
+/// close. Every widening here moves a knob toward refusing to reach the network, never away.
+///
+/// **This is deliberately NOT the general boolean parser.** It answers only "did the operator
+/// explicitly disable this?", so an UNRECOGNISED value is not an "off" — for `DIG_RELAY_URL` an
+/// unrecognised value is a relay URL, and mistaking one for a disable would silently unplug a
+/// configured relay.
+pub(crate) fn is_off_token(value: &str) -> bool {
+    let v = value.trim();
+    v.is_empty()
+        || v.eq_ignore_ascii_case("off")
+        || v.eq_ignore_ascii_case("disabled")
+        || v.eq_ignore_ascii_case("0")
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("no")
 }
 
 /// The EFFECTIVE network label a node registers + discovers under — the string namespace shared by
@@ -4187,6 +4222,15 @@ pub(crate) mod tests {
             "case-insensitive opt-out"
         );
         assert!(is_relay_enabled(Some("wss://my-relay:9450")));
+
+        // A BLANK value still resolves to the default URL string, but the relay is DISABLED, so
+        // that string is never dialled (#352). The two assertions are kept adjacent on purpose:
+        // `resolve_relay_url` alone reads as "blank reaches the public relay", and that reading was
+        // true before this fix. Enablement, not the URL, is what isolates the node.
+        assert!(
+            !is_relay_enabled(Some("")),
+            "DIG_RELAY_URL= (explicitly empty) means NO relay, not the compiled-in public one"
+        );
     }
 
     #[test]
@@ -4319,19 +4363,58 @@ pub(crate) mod tests {
         );
     }
 
+    /// **Proves:** the three network-reaching isolation knobs read ONE off-vocabulary — an operator
+    /// who disables one with a given spelling disables all three with it (#282/#352).
+    ///
+    /// **Catches:** the divergence as it actually shipped. `is_peer_network_enabled` matched the
+    /// exact bytes `off`/`0`/`false`, so `DIG_PEER_NETWORK=OFF` left the peer network RUNNING while
+    /// the identically-spelled `DIG_RELAY_URL=OFF` disabled the relay.
+    ///
+    /// The table is what makes this load-bearing. Every token is asserted against BOTH knobs, and
+    /// the case-and-whitespace variants (`OFF`, ` off `, `No`) are the only rows the old and new
+    /// predicates disagree about — a test listing only lowercase `off`/`0`/`false`, which is what
+    /// this replaced, passes under both implementations and could never have caught the defect.
     #[test]
-    fn peer_network_enabled_default_on_off_only_for_opt_out() {
-        assert!(is_peer_network_enabled(None), "unset → enabled");
-        for off in ["off", "0", "false"] {
+    fn the_three_isolation_knobs_share_one_off_vocabulary() {
+        // Unset is NOT a disable on either knob — #923's no-configuration anchor depends on it.
+        assert!(is_relay_enabled(None), "unset relay → enabled");
+        assert!(is_peer_network_enabled(None), "unset peer network → enabled");
+
+        for off in [
+            "off", "OFF", " off ", "Off", "disabled", "DISABLED", "0", "false", "False", "no", "No",
+            "", "   ",
+        ] {
+            assert!(
+                is_off_token(off),
+                "{off:?} must be read as an explicit disable"
+            );
+            assert!(
+                !is_relay_enabled(Some(off)),
+                "DIG_RELAY_URL={off:?} must disable the relay"
+            );
             assert!(
                 !is_peer_network_enabled(Some(off)),
-                "DIG_PEER_NETWORK={off} disables"
+                "DIG_PEER_NETWORK={off:?} must disable the peer network"
             );
         }
-        assert!(
-            is_peer_network_enabled(Some("on")),
-            "any other value → enabled"
-        );
+
+        // An UNRECOGNISED value is not a disable. For the relay it is a URL, so reading it as an
+        // off-token would silently unplug a configured relay — the opposite failure to #282's.
+        for on in ["on", "1", "true", "yes", "wss://my-relay:9450", "offline", "no-thanks"] {
+            assert!(
+                !is_off_token(on),
+                "{on:?} must NOT be read as an explicit disable"
+            );
+            assert!(is_relay_enabled(Some(on)), "DIG_RELAY_URL={on:?} → enabled");
+            assert!(
+                is_peer_network_enabled(Some(on)),
+                "DIG_PEER_NETWORK={on:?} → enabled"
+            );
+        }
+
+        // `offline` and `no-thanks` above are the discriminating negatives: a predicate written with
+        // `starts_with` rather than equality would disable the relay on both, so they pin the
+        // boundary from the other side.
     }
 
     #[test]

@@ -223,8 +223,27 @@ does not own them (except `DIG_NODE_UPSTREAM`, which the shell SETS — see belo
 | `DIG_WALLET_WC_PROJECT_ID` | initial/default WalletConnect projectId for the wallet host (§16) | *(unset ⇒ none)* | A persisted `wc_project_id` in `config.json` wins over this; a blank persisted value falls through to this env. Blank ⇒ treated as unset. |
 | `DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC` | outgoing-bandwidth throttle cap, in bytes/second (§17) | `0` (UNLIMITED — opt-in) | Parsed as `u64`; `0`, unparsable, or unset ⇒ unlimited (the throttle is a no-op until an operator configures a cap). Resolved ONCE at node construction. |
 
-The peer-network layer additionally honors `DIG_PEER_NETWORK` (set to a falsy value to disable the L7
-peer network) and `DIG_RELAY_URL` (override or disable the relay), which gate the P2P bring-up, and
+### The shared off-token
+
+`DIG_PEER_NETWORK`, `DIG_RELAY_URL` and `DIG_BOOTSTRAP_PEERS` are the three knobs that decide whether
+this node reaches the network at all. All three read ONE off-vocabulary: **`off`, `disabled`, `0`,
+`false`, `no`, or an explicitly empty value** — trimmed and case-insensitive. Any of those disables
+the knob; anything else does not.
+
+A node MUST NOT accept a disable token on one of these knobs and ignore the same token on another.
+An operator who writes `OFF` and gets an isolated relay but a live peer network has been told the
+switch worked when it did not.
+
+An explicitly EMPTY value counts as a disable on all three, for the reason given under
+`DIG_BOOTSTRAP_PEERS` below: a variable set to nothing is an operator saying "none", and resolving
+it to the compiled-in default makes a node believed to be isolated dial production infrastructure.
+An UNSET variable is a different thing and keeps its documented default.
+
+An unrecognised value is NOT a disable. For `DIG_RELAY_URL` an unrecognised value is a relay URL, so
+reading one as a disable would silently unplug a configured relay.
+
+The peer-network layer honors `DIG_PEER_NETWORK` (disable the L7 peer network) and `DIG_RELAY_URL`
+(override or disable the relay), which gate the P2P bring-up, and
 **`DIG_PEER_PORT`** — the mTLS peer-RPC server listen port (dig-node-to-dig-node RPC traffic, §5.2).
 Parsed as `u16`; unparsable/unset ⇒ the default **`9444`** (`peer::DEFAULT_P2P_PORT`).
 Bound dual-stack IPv6-first with an IPv4 fallback, per §5.2.
