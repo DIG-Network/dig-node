@@ -47,24 +47,43 @@ pub fn call_control(config: &Config, method: &str, params: Value) -> std::io::Re
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(call_async(addr, &token, method, params))
+    rt.block_on(call_async(addr, Some(&token), method, params))
 }
 
-/// POST one JSON-RPC control method with the master token; return its `result` (or `{}` when
-/// the node omits one). A transport failure = the node isn't running; a JSON-RPC `error` =
-/// the node rejected the call (e.g. a method it does not implement → METHOD_NOT_FOUND).
+/// Call one OPEN (non-`control.*`) node method and return its `result` object -- same transport,
+/// same direct-to-loopback pinning, NO control token.
+///
+/// The loopback server gates the `control.*` plane fail-closed and leaves the ordinary `dig.*`
+/// read surface open, so presenting a token here would not change what the node answers. It would
+/// change who can ASK: on a `.deb` install the master token is `0600 root:root` (#501), so
+/// routing an open read through [`call_control`] makes it fail with an elevation remedy for a
+/// question the node answers to any peer that dials it. Use this for reads the node already
+/// publishes, and [`call_control`] for everything that is genuinely privileged.
+pub fn call_open(config: &Config, method: &str, params: Value) -> std::io::Result<Value> {
+    let addr = config.bind_addr();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(call_async(addr, None, method, params))
+}
+
+/// POST one JSON-RPC method, with the master token when one is supplied; return its `result`
+/// (or `{}` when the node omits one). A transport failure = the node isn't running; a JSON-RPC
+/// `error` = the node rejected the call (e.g. a method it does not implement → METHOD_NOT_FOUND).
 async fn call_async(
     addr: std::net::SocketAddr,
-    token: &str,
+    token: Option<&str>,
     method: &str,
     params: Value,
 ) -> std::io::Result<Value> {
     let client = build_control_client().map_err(std::io::Error::other)?;
     let url = format!("http://{addr}/");
     let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    let resp = client
-        .post(&url)
-        .header(control::CONTROL_TOKEN_HEADER, token)
+    let mut req = client.post(&url);
+    if let Some(token) = token {
+        req = req.header(control::CONTROL_TOKEN_HEADER, token);
+    }
+    let resp = req
         .json(&body)
         .send()
         .await

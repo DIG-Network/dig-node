@@ -13,6 +13,7 @@
 //!   start      Start the installed service.
 //!   stop       Stop the running service.
 //!   status     Report whether the node is serving (probes /health).
+//!   network-info  This node's own network posture (peer id, addresses, reachability).
 //!
 //! With no subcommand, the binary runs in the foreground (equivalent to `run`), so a
 //! bare invocation just serves — the least-surprise default for a localhost endpoint.
@@ -37,6 +38,7 @@ use crate::config::Config;
 use crate::control_cli::{self, ControlAction};
 use crate::open;
 use crate::pair::{self, PairAction};
+use crate::network_info;
 use crate::peers::{self, BanState, PeersAction};
 use crate::service::ScopeChoice;
 use crate::{serve, service, VERSION};
@@ -185,6 +187,13 @@ enum Command {
         #[command(subcommand)]
         action: Option<SubscriptionsCommand>,
     },
+    /// This node's own network posture: peer id, network + genesis, advertised addresses
+    /// (IPv6-first, §5.2), reachability and relay reservation.
+    ///
+    /// Answers the question `peers` cannot: `peers` describes who this node is TALKING to, this
+    /// describes how this node is REACHABLE. Reads the node's open `dig.getNetworkInfo` surface,
+    /// so it needs no control token — every field here is already published to any peer.
+    NetworkInfo,
     /// View + manage the node's peer connections — parity with the extension's peer surface.
     /// With no sub-action, lists the live peer status (running flag, connected count, relay, and —
     /// on a newer node — the per-peer list with addresses shown IPv6-first per §5.2).
@@ -750,6 +759,7 @@ impl Command {
             Command::Spends { .. } => "spends",
             Command::Updater { .. } => "updater",
             Command::Subscriptions { .. } => "subscriptions",
+            Command::NetworkInfo => "network-info",
             Command::Peers { .. } => "peers",
             Command::Collateral { .. } => "collateral",
             Command::Mirror { .. } => "mirror",
@@ -904,6 +914,7 @@ pub fn run() -> std::process::ExitCode {
             action,
             json,
         ),
+        Command::NetworkInfo => render(network_info::run(&config), action, json),
         Command::Peers { action: cmd } => match peers_action(cmd) {
             Ok(a) => render(peers::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
