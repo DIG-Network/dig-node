@@ -5207,15 +5207,6 @@ mod tests {
 
     // ---- coin-database reset (dig-node#384) --------------------------------
 
-    /// **The money hazard, asserted directly: a reset must never leave an EMPTY replica claiming
-    /// to be AUTHORITATIVE (dig-node#384).**
-    ///
-    /// `is_synced` is what licenses `routing::route` to serve wallet-scoped reads from the local
-    /// replica. An emptied-but-still-synced database therefore answers `balance 0, synced true`
-    /// for a funded wallet — a confident zero about somebody's money.
-    ///
-    /// The pre-state is asserted first, so this cannot pass against a database that was never
-    /// synced to begin with.
     /// **Proves (dig-node#454, the guard at the persistence seam):** a completion carrying the
     /// epoch observed BEFORE a reset must not land, and one carrying the epoch AFTER it must.
     ///
@@ -5286,6 +5277,15 @@ mod tests {
         );
     }
 
+    /// **The money hazard, asserted directly: a reset must never leave an EMPTY replica claiming
+    /// to be AUTHORITATIVE (dig-node#384).**
+    ///
+    /// `is_synced` is what licenses `routing::route` to serve wallet-scoped reads from the local
+    /// replica. An emptied-but-still-synced database therefore answers `balance 0, synced true`
+    /// for a funded wallet — a confident zero about somebody's money.
+    ///
+    /// The pre-state is asserted first, so this cannot pass against a database that was never
+    /// synced to begin with.
     #[tokio::test]
     async fn a_reset_clears_the_authoritative_flag_along_with_the_coins() {
         let db = WalletDb::open_in_memory().await.unwrap();
