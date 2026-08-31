@@ -99,13 +99,18 @@ echo "systemctl $*" >> "$SYSTEMCTL_LOG"
 STUB
 chmod 0755 "$TMP/stub/systemctl"
 
-# run_postinst <root> -> echoes the recorded systemctl invocations
+# run_postinst <root> [old-version] -> echoes the recorded systemctl invocations
+#
+# dpkg passes the PREVIOUSLY-CONFIGURED version as $2 on an upgrade and nothing at all on a
+# first install. That argument is the only thing distinguishing the two runs, so it is a
+# parameter here rather than being fixed to the install case.
 run_postinst() {
   local root="$1"
+  local old_version="${2:-}"
   export SYSTEMCTL_LOG="$root/systemctl.log"
   : > "$SYSTEMCTL_LOG"
   mkdir -p "$root/etc" "$root/var/lib" "$root/usr/share/applications"
-  PATH="$TMP/stub:$PATH" DIG_NODE_PKG_ROOT="$root" sh "$TMP/ctl/postinst" configure \
+  PATH="$TMP/stub:$PATH" DIG_NODE_PKG_ROOT="$root" sh "$TMP/ctl/postinst" configure $old_version \
     >"$root/postinst.out" 2>&1
   cat "$SYSTEMCTL_LOG"
 }
@@ -149,6 +154,42 @@ if grep -q 'daemon-reload' <<<"$MARKED_LOG"; then
   ok "the unit is still registered with systemd under the marker"
 else
   fail "the marker suppressed daemon-reload — the unit is not registered and cannot be started later"
+fi
+
+# --- 3. dig-node#305: an UPGRADE must cycle the running service ----------------------------
+# `systemctl enable --now` is a no-op on a unit that is already enabled and running, so the
+# upgrade path replaced the binary on disk and left the OLD process serving. Both checks a
+# person would naturally run reported success: `dig-node --version` reads the ON-DISK binary,
+# and `systemctl is-active` reports the genuinely-healthy OLD process. Only MainPID showed it.
+#
+# The fixture is an UPGRADE (`configure <old-version>`) with a truthful control beside it (the
+# first-install run above, `configure` with no old version). One argument separates them, and
+# it is the only argument dpkg varies -- so a "fix" that restarts unconditionally passes the
+# upgrade assertion and is caught by the control at the end of this section.
+UPGRADE_ROOT="$TMP/upgrade"; mkdir -p "$UPGRADE_ROOT"
+UPGRADE_LOG="$(run_postinst "$UPGRADE_ROOT" "0.1.0")"
+if grep -qE 'systemctl (try-restart|try-reload-or-restart) net\.dignetwork\.dig-node\.service' <<<"$UPGRADE_LOG"; then
+  ok "an upgrade cycles the service, so the new binary is the one running (#305)"
+else
+  fail "an upgrade does not restart the service -- the old binary keeps running silently (#305)"
+fi
+
+# `try-restart` is load-bearing, not a spelling preference: a plain `restart` would START a node
+# the operator had deliberately stopped, and would defeat the #317 no-autostart marker on every
+# subsequent upgrade. Asserting the SEMANTICS means a later simplification to `restart` fails.
+if grep -qE 'systemctl (restart|start|reload-or-restart) net\.dignetwork\.dig-node\.service' <<<"$UPGRADE_LOG"; then
+  fail "the upgrade uses an unconditional restart -- it would start a node the operator stopped (#305)"
+else
+  ok "the upgrade restart is conditional on the unit already running (#305)"
+fi
+
+# The control. A FIRST install already starts the node via `enable --now`, so a restart there
+# would be redundant; its ABSENCE is what proves the assertion above measured the upgrade
+# argument rather than a restart bolted onto every configure.
+if grep -qE 'systemctl [a-z-]*restart' <<<"$CONTROL_LOG"; then
+  fail "a first install restarts the service -- the upgrade check above proves nothing"
+else
+  ok "a first install does not restart (so the upgrade check is measuring the upgrade)"
 fi
 
 # The redirect seam must default to the real root. A postinst that defaulted DIG_NODE_PKG_ROOT to
