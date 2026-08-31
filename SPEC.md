@@ -5635,6 +5635,17 @@ unit wires the LIVE path, gated so it is OFF by default (money-safe) and ON only
   anything the node holds. Tying them together is what made a stock install answer
   `WALLET_NO_CHAIN_SOURCE` to every wallet read and unable to push at all.
 
+- **The flag's SCOPE is one question; its EFFECT reaches two surfaces, and the node MUST say so
+  (dig-node#437).** Enabling it also permits the mirror-coin collateral lifecycle to CREATE bonds,
+  because that lifecycle's own switch — §25.7's `mirror_enabled`, held in `collateral.json` in the
+  node's state directory — defaults to `true`, and the lifecycle's broadcaster is built only when
+  this flag is on. So on an install that has never touched `collateral.json`, setting this flag is
+  the last remaining step before the node commits operator `$DIG` as collateral automatically. Both
+  effects MUST therefore be disclosed together at the point the flag is READ (`Config::from_env`),
+  naming `mirror_enabled` and `collateral.json` as the way to disable the collateral half
+  independently. Setting `mirror_enabled` to `false` stops CREATES only; reclaims continue, so the
+  already-locked collateral is released rather than stranded.
+
   The push is served on every install but NOT unconditionally, because "somebody else signed it" is
   a claim about the bundle, not a property of the method: the node's own custodied wallet signs on
   request (`sign_coin_spends`), so a token holder could obtain a bundle signed by the node's key and
