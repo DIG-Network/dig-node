@@ -2161,9 +2161,8 @@ mod tests {
         // One millisecond before the window closes, BOTH are held. This is the half most fixes get
         // wrong: without it, a fix that releases every coin unconditionally passes the release
         // assertion below and nothing notices.
-        let at_bound =
-            committed_funding_coin_ids(&log, NOW + FUNDING_RESERVATION_WINDOW_MS - 1)
-                .expect("readable");
+        let at_bound = committed_funding_coin_ids(&log, NOW + FUNDING_RESERVATION_WINDOW_MS - 1)
+            .expect("readable");
         assert!(
             at_bound.contains(&"11".repeat(32)) && at_bound.contains(&"22".repeat(32)),
             "a coin committed to a spend still inside the confirmation window must NOT be \

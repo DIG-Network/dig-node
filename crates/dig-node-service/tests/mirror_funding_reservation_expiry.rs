@@ -251,7 +251,10 @@ fn a_coin_committed_to_a_spend_that_never_lands_is_selectable_two_passes_later()
     let (chain, operator, log) = wedged_wallet();
 
     let n_passes = FUNDING_RESERVATION_WINDOW_MS / dig_constants::MIRROR_ROUND_LENGTH_MS as u64;
-    assert_eq!(n_passes, 2, "N is two mirror passes; state it, do not imply it");
+    assert_eq!(
+        n_passes, 2,
+        "N is two mirror passes; state it, do not imply it"
+    );
 
     let committed = committed_funding_coin_ids(
         &log,
