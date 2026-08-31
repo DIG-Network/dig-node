@@ -77,6 +77,17 @@ pub enum PassError {
     Chain(String),
     /// The wallet could not be read, or a spend could not be made.
     Wallet(String),
+    /// A create could not be FUNDED, carried structurally rather than as a message (dig-node#463).
+    ///
+    /// The refusal reaches this type already classified — shortfall, too-fragmented, unreadable —
+    /// and flattening it to a string here would mean the only surface that can tell an operator
+    /// what to DO about it would have to recover the classification by matching on prose. That is
+    /// the shape that reports a chain outage as an empty wallet, so the variant is kept whole and
+    /// [`FundingObservation::from_error`] reads it directly.
+    ///
+    /// `Display` delegates, so every existing consumer that only renders a `PassError` is
+    /// unaffected: the message an operator sees is the `FundingError`'s own.
+    Funding(super::funding::FundingError),
 }
 
 impl std::fmt::Display for PassError {
@@ -85,6 +96,7 @@ impl std::fmt::Display for PassError {
             PassError::Disk(cause) => write!(f, "the capsule cache could not be scanned: {cause}"),
             PassError::Chain(cause) => write!(f, "the chain source could not be read: {cause}"),
             PassError::Wallet(cause) => write!(f, "the operator wallet could not act: {cause}"),
+            PassError::Funding(cause) => write!(f, "{cause}"),
         }
     }
 }
@@ -197,10 +209,20 @@ pub struct PassReport {
     /// Read from each coin's own `collateral_dig_base_units` rather than from this epoch's
     /// requirement: a coin created under a previous requirement locks the previous amount.
     pub locked_dig_base_units: u64,
+    /// The message to put in front of a person, when THIS pass changed the funding story
+    /// (dig-node#463).
+    ///
+    /// `None` on the overwhelming majority of passes, and that is the feature: the pass runs every
+    /// ten minutes, so a field that were `Some` whenever funding is short would be 144 notifications
+    /// a day and would train an operator to ignore the one that mattered. The gate deciding this is
+    /// [`FundingAlertGate`], and it is carried ACROSS runners for the same reason the presence
+    /// tracker is -- a gate rebuilt each round has no memory of having spoken, and would speak every
+    /// round.
+    pub funding_alert: Option<super::funding::FundingAlert>,
 }
 
-/// Runs reconcile passes. Long-lived: it owns the presence tracker, which is the only state a pass
-/// carries between runs.
+/// Runs reconcile passes. Long-lived: it owns the presence tracker and the funding alert gate, the
+/// only state a pass carries between runs.
 pub struct PassRunner<E> {
     effects: E,
     presence: super::presence::PresenceTracker,
@@ -212,6 +234,8 @@ pub struct PassRunner<E> {
     /// what stops a future change to the suppression rule from acquiring a write path by accident.
     journal: crate::spend_audit::SpendJournal,
     settling_window_ms: u64,
+    /// Decides when a funding shortfall is worth telling a person about (dig-node#463).
+    funding_alerts: super::funding::FundingAlertGate,
 }
 
 impl<E: MirrorEffects> PassRunner<E> {
@@ -223,7 +247,29 @@ impl<E: MirrorEffects> PassRunner<E> {
             journal: crate::spend_audit::SpendJournal::new(log.clone()),
             log,
             settling_window_ms: super::presence::SETTLING_WINDOW_MS,
+            funding_alerts: super::funding::FundingAlertGate::default(),
         }
+    }
+
+    /// Adopt an existing funding alert gate, so dig-node#463's once-per-transition rule survives
+    /// across runners.
+    ///
+    /// Exactly the reason [`Self::with_presence`] exists, and exactly the same failure without it:
+    /// the scheduler rebuilds the runner every round, and a gate that starts empty every round has
+    /// never spoken, so it speaks. The dedup would then be a no-op that every unit test still
+    /// passes, because a unit test drives ONE gate over many observations.
+    pub fn with_funding_gate(mut self, gate: super::funding::FundingAlertGate) -> Self {
+        self.funding_alerts = gate;
+        self
+    }
+
+    /// Hand the funding alert gate back, for the next round's runner.
+    ///
+    /// Takes `&mut self` rather than `self`, unlike [`Self::into_presence`], because the scheduler
+    /// needs BOTH pieces of carried state out of the same runner and two by-value takers cannot
+    /// both be called. This one goes first and the by-value one last.
+    pub fn take_funding_gate(&mut self) -> super::funding::FundingAlertGate {
+        std::mem::take(&mut self.funding_alerts)
     }
 
     /// Adopt an existing presence tracker, so §25.5's debounce survives across runners.
@@ -326,7 +372,7 @@ impl<E: MirrorEffects> PassRunner<E> {
 
     /// Step 4 and step 5: reclaims first, then creates, stopping cleanly.
     fn execute(
-        &self,
+        &mut self,
         decision: PassDecision,
         current_epoch: i64,
         locked_dig_base_units: u64,
@@ -383,6 +429,45 @@ impl<E: MirrorEffects> PassRunner<E> {
             }
         }
 
+        // What THIS pass learned about the operator wallet, in the three shapes the gate decides
+        // on. Read off the structured refusal rather than off a message, which is why
+        // `PassError::Funding` carries the `FundingError` whole.
+        let observation = match &stopped_at {
+            Some((_, PassError::Funding(cause))) => {
+                super::funding::FundingObservation::from_error(cause)
+            }
+            // A create stopped for a reason that is not about funding -- no advertised URL, an
+            // unparseable id, a builder or broadcast failure. It is a real failure and it is
+            // reported in `stopped_at`, but it is not evidence about the wallet, and letting it
+            // CLEAR a live shortfall would tell an operator their funding recovered on the strength
+            // of an unrelated error.
+            Some(_) => super::funding::FundingObservation::Unknown,
+            // Nothing stopped. `per_coin` is `Some` exactly when the requirement was known, so this
+            // is a pass that funded every create it planned -- including a pass that planned none,
+            // which is the healthy state a node with nothing new to bond sits in.
+            None if per_coin_dig_base_units.is_some() => {
+                super::funding::FundingObservation::Healthy
+            }
+            // The requirement itself was unknown, so no create was priced and none was refused.
+            // Silent, and it does not clear a shortfall either.
+            None => super::funding::FundingObservation::Unknown,
+        };
+        let funding_alert = self.funding_alerts.observe(&observation);
+
+        // Logged HERE as well as returned, because the return value reaches a surface only if
+        // something renders it, and this line reaches an operator's stderr on a node whose state
+        // dir it cannot even write (dig-node#440). No coin id and no address: the same rule that
+        // shapes the alert body, for the same reason.
+        if let Some(alert) = &funding_alert {
+            tracing::warn!(
+                target: "mirror",
+                title = %alert.title,
+                remedy = ?alert.remedy,
+                "{}",
+                alert.body
+            );
+        }
+
         PassReport {
             reclaimed,
             created,
@@ -391,6 +476,7 @@ impl<E: MirrorEffects> PassRunner<E> {
             states,
             per_coin_dig_base_units,
             locked_dig_base_units,
+            funding_alert,
         }
     }
 }
@@ -546,6 +632,13 @@ mod tests {
         confirmations: std::collections::HashMap<String, u32>,
         /// Coin ids the chain cannot be ASKED about, kept apart from ones it reports absent.
         confirmation_fails: Vec<String>,
+        /// The refusal a failing create returns, so a fixture can distinguish a create that failed
+        /// for want of FUNDS from one that failed for any other reason.
+        ///
+        /// `None` keeps the ordinary non-funding failure the other fixtures rely on. Without this
+        /// the `PassError::Funding` arm of the alert wiring is unreachable from any double, and an
+        /// operator-facing path no test can take reads as covered while never having run.
+        create_funding_failure: Option<super::super::funding::FundingError>,
     }
 
     impl MirrorEffects for FakeEffects {
@@ -593,7 +686,10 @@ mod tests {
                 amount_dig_base_units,
             ));
             if self.create_fails.contains(bond) {
-                return Err(PassError::Wallet("no selectable coin".to_string()));
+                return Err(match &self.create_funding_failure {
+                    Some(cause) => PassError::Funding(cause.clone()),
+                    None => PassError::Wallet("no selectable coin".to_string()),
+                });
             }
             Ok(())
         }
@@ -642,6 +738,143 @@ mod tests {
     /// twice and this one not at all.
     fn runner(effects: FakeEffects, log: SpendLog) -> PassRunner<FakeEffects> {
         PassRunner::new(effects, log).with_settling_window_ms(0)
+    }
+
+    /// **The funding alert reaches the pass report, once, and CARRIES between runners.**
+    ///
+    /// **Proves** the wiring dig-node#463 is actually about. [`FundingAlertGate`] is a pure decision
+    /// with unit tests of its own, and every one of them drives ONE gate over many observations — so
+    /// all nine stay green against a node that constructs a fresh gate per pass and notifies 144
+    /// times a day. The gate being correct and the gate being USED are different claims, and only
+    /// this test makes the second one.
+    ///
+    /// **Catches** two regressions that are invisible on every other signal:
+    ///
+    /// * dropping [`PassRunner::with_funding_gate`] from the scheduler, exactly as
+    ///   `the_presence_tracker_carries_between_runners_and_a_fresh_one_suppresses` catches the same
+    ///   omission for the presence tracker;
+    /// * flattening the refusal to a string on the way out of `MirrorEffects::create`. The
+    ///   observation is read from `PassError::Funding`'s payload, so a `PassError::Wallet` carrying
+    ///   the same prose produces no alert at all — asserted below as the third pass.
+    ///
+    /// The three passes are asserted as a SEQUENCE, and only the sequence discriminates. Pass one
+    /// alone is satisfied by a gate that speaks every time; pass two alone by a gate that never
+    /// speaks after the first ever call, whatever it is fed.
+    #[test]
+    fn a_funding_shortfall_alerts_once_across_rebuilt_runners_and_never_from_a_stringly_refusal() {
+        use super::super::funding::{FundingAlertGate, FundingError, FundingRemedy};
+
+        let capsule = bond("aa", "11");
+        // Short by exactly one base unit, so the refusal is unambiguously a shortfall rather than
+        // an artefact of a wallet with nothing in it.
+        let shortfall = FundingError::Insufficient {
+            have_dig_base_units: REQUIRED - 1,
+            need_dig_base_units: REQUIRED,
+        };
+        // A funded wallet, so the PLAN reaches a create and the only refusal is the one the fixture
+        // injects. A pass that never planned a create could not alert, and would pass vacuously.
+        let effects = |funding: Option<FundingError>| FakeEffects {
+            disk: held(std::slice::from_ref(&capsule)),
+            balance: REQUIRED * 10,
+            create_fails: vec![capsule.clone()],
+            create_funding_failure: funding,
+            ..FakeEffects::default()
+        };
+
+        // One EMPTY audit log, shared: the fake effects never journal, so no pass suppresses the
+        // next through the in-flight set, and every pass reaches the same create for the same reason.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+        let run = |gate, funding| {
+            let mut pass = runner(effects(funding), log.clone()).with_funding_gate(gate);
+            let report = pass.run(&ctx()).expect("the pass observes");
+            (report.funding_alert, pass.take_funding_gate())
+        };
+
+        // Pass 1: the transition into short. The operator has not been told, so they are told.
+        let (first, gate) = run(FundingAlertGate::default(), Some(shortfall.clone()));
+        let first = first.expect("the transition into a funding shortfall must reach the operator");
+        assert_eq!(
+            first.remedy,
+            Some(FundingRemedy::TopUp),
+            "a wallet that is genuinely short is told to add $DIG, not to consolidate"
+        );
+
+        // Pass 2: the SAME shortfall, a REBUILT runner. Silent only because the gate was carried.
+        let (second, _gate) = run(gate, Some(shortfall.clone()));
+        assert_eq!(
+            second, None,
+            concat!(
+                "the second consecutive short pass alerted again, so the gate did not survive the ",
+                "runner being rebuilt; on the ten-minute pass timer that is 144 notifications a day"
+            )
+        );
+
+        // Pass 3: the same wallet condition, refused WITHOUT structure. Nothing is alerted, because
+        // nothing can be classified -- which is why `funding_refusal` keeps the error whole.
+        let (third, _) = run(FundingAlertGate::default(), None);
+        assert_eq!(
+            third, None,
+            concat!(
+                "a refusal carrying only prose was classified as a shortfall; the observation must ",
+                "be read from the structured error, never recovered by matching on a message"
+            )
+        );
+    }
+
+    /// **A create that failed for a NON-funding reason does not clear a live shortfall.**
+    ///
+    /// **Proves** the `Some(_) => Unknown` arm of the wiring. A pass that stopped because no URL is
+    /// advertised, or because the builder refused, is a real failure and is reported in
+    /// `stopped_at` — but it is not evidence about the wallet.
+    ///
+    /// **Catches** the plausible simplification that treats "did not stop for funding" as healthy.
+    /// That version reports a RECOVERY off the back of an unrelated error, telling an operator their
+    /// funding is fixed when it is not, and then alerts afresh on the next short pass. The recovery
+    /// message is the one an operator acts on by stopping work, so a false one is worse than silence.
+    #[test]
+    fn a_non_funding_create_failure_neither_alerts_nor_clears_a_live_shortfall() {
+        use super::super::funding::{FundingAlertGate, FundingError};
+
+        let capsule = bond("aa", "11");
+        let shortfall = FundingError::Insufficient {
+            have_dig_base_units: REQUIRED - 1,
+            need_dig_base_units: REQUIRED,
+        };
+        let effects = |funding: Option<FundingError>| FakeEffects {
+            disk: held(std::slice::from_ref(&capsule)),
+            balance: REQUIRED * 10,
+            create_fails: vec![capsule.clone()],
+            create_funding_failure: funding,
+            ..FakeEffects::default()
+        };
+
+        // One EMPTY audit log, shared: the fake effects never journal, so no pass suppresses the
+        // next through the in-flight set, and every pass reaches the same create for the same reason.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+        let run = |gate, funding| {
+            let mut pass = runner(effects(funding), log.clone()).with_funding_gate(gate);
+            let report = pass.run(&ctx()).expect("the pass observes");
+            (report.funding_alert, pass.take_funding_gate())
+        };
+
+        let (_, gate) = run(FundingAlertGate::default(), Some(shortfall.clone()));
+        // A create that fails without a funding cause: `PassError::Wallet`, the fixture default.
+        let (during, gate) = run(gate, None);
+        assert_eq!(
+            during, None,
+            "an unrelated create failure is not a recovery and must not be announced as one"
+        );
+        // The shortfall then persists. If the pass above had CLEARED the state this alerts again.
+        let (after, _) = run(gate, Some(shortfall));
+        assert_eq!(
+            after, None,
+            concat!(
+                "the shortfall was re-announced, so the unrelated failure cleared the gate's ",
+                "memory; the operator is told about a shortfall that never went away"
+            )
+        );
     }
 
     /// The presence tracker CARRIES between runners, and a fresh one on the second pass suppresses.

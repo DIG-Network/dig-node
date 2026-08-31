@@ -2761,6 +2761,11 @@ fn spawn_mirror_passes(
 
         let journal = lifecycle::journal();
         let mut presence = crate::mirror::presence::PresenceTracker::new();
+        // Carried across passes for the same reason the presence tracker is: the runner is rebuilt
+        // every round, and dig-node#463's "alert once on the transition" rule is memory. A gate
+        // constructed per pass has never spoken, so it speaks every pass -- 144 notifications a day,
+        // which is precisely the behaviour the gate exists to prevent.
+        let mut funding_gate = crate::mirror::funding::FundingAlertGate::default();
 
         loop {
             let epoch = match current_epoch_now() {
@@ -2860,12 +2865,19 @@ fn spawn_mirror_passes(
                         );
                         let mut pass =
                             PassRunner::new(effects, crate::spend_audit::SpendLog::in_state_dir())
-                                .with_presence(std::mem::take(&mut presence));
+                                .with_presence(std::mem::take(&mut presence))
+                                .with_funding_gate(std::mem::take(&mut funding_gate));
                         let report = pass.run(&ctx);
-                        (report, pass.into_presence())
+                        // The gate comes out FIRST: it is taken by `&mut`, and `into_presence`
+                        // consumes the runner. Both must come back even when the pass returned an
+                        // observation error, or a node whose chain source flaps re-alerts on every
+                        // recovery for a shortfall that never went away.
+                        let gate = pass.take_funding_gate();
+                        (report, pass.into_presence(), gate)
                     });
-                    let (outcome, carried) = outcome;
+                    let (outcome, carried, carried_gate) = outcome;
                     presence = carried;
+                    funding_gate = carried_gate;
 
                     match outcome {
                         Ok(report) => {
@@ -3535,6 +3547,7 @@ mod tests {
             states: Vec::new(),
             per_coin_dig_base_units: None,
             locked_dig_base_units: 0,
+            funding_alert: None,
         }
     }
 
