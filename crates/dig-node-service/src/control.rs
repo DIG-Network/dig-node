@@ -2574,9 +2574,15 @@ async fn dig_peer_status(ctx: &ControlCtx) -> Option<Value> {
 ///
 /// # A refusal is a RESULT
 ///
-/// A mempool that examined the bundle and refused it answers `{accepted:false, rejection}` with a
-/// `200`. Failing to REACH a mempool is an error. Collapsing the two turns "your wifi dropped" into
-/// "your mint failed", and the remedies are opposite.
+/// A mempool that examined the bundle and refused it answers `{accepted:false, verdict}` with a
+/// `200`, and `rejection` too WHEN IT STATED A REASON. Failing to REACH a mempool is an error.
+/// Collapsing the two turns "your wifi dropped" into "your mint failed", and the remedies are
+/// opposite.
+///
+/// `rejection` is deliberately absent for a bare verdict, because it is what dig-node#348's hold
+/// keys on: a refusal the mempool did not explain may still be in flight, so its inputs stay held.
+/// `verdict` carries the node's label (`PENDING`, `FAILED`) regardless, so an operator debugging a
+/// stuck broadcast is never left with three nulls and no label.
 async fn wallet_broadcast(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     use dig_wallet::sage::rpc::PushError;
 
@@ -2594,6 +2600,7 @@ async fn wallet_broadcast(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
             json!({
                 "accepted": outcome.accepted,
                 "transaction_id": outcome.transaction_id,
+                "verdict": outcome.verdict,
                 "rejection": outcome.rejection,
             }),
         ),

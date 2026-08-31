@@ -154,8 +154,18 @@ pub struct PushOutcome {
     /// The bundle's transaction id (its name), lowercase 64-hex. Reported only on acceptance —
     /// a refused bundle has no transaction to point at.
     pub transaction_id: Option<String>,
-    /// The mempool's own words for the refusal, when it refused.
+    /// The mempool's own words for the refusal, when it refused AND stated a reason.
+    ///
+    /// `None` for a bare verdict, and that absence is load-bearing: dig-node#348's reservation
+    /// hold keys on it, because a refusal the mempool did not explain may still be in flight.
     pub rejection: Option<String>,
+    /// The source's label for the answer (`SUCCESS`, `PENDING`, `FAILED`, `UNKNOWN`) — always
+    /// present, whether or not a reason came with it.
+    ///
+    /// Separate from `rejection` because the two answer different questions and only one of them
+    /// may drive the hold. Narrowing `rejection` to a STATED reason would otherwise have left an
+    /// operator debugging a bare `PENDING` with three nulls and no label at all.
+    pub verdict: String,
 }
 
 /// Pushes an ALREADY-SIGNED bundle to the network.
@@ -537,6 +547,7 @@ impl ChainTransport {
                 accepted: true,
                 transaction_id: Some(hex::encode(bundle.name())),
                 rejection: None,
+                verdict: status.status.clone(),
             }
         } else {
             PushOutcome {
@@ -557,6 +568,7 @@ impl ChainTransport {
                 // A verdict is not a reason. `PENDING` says the node did not admit it; it does not
                 // say why, and it does not say the bundle is gone.
                 rejection: Self::stated_rejection(&status),
+                verdict: status.status.clone(),
             }
         })
     }
@@ -707,6 +719,32 @@ mod tests {
             inclusion: chia_query::MempoolInclusion::NotAdmitted,
             error: error.map(str::to_string),
         }
+    }
+
+    /// **The label survives even when the reason does not.**
+    ///
+    /// Narrowing `rejection` to a STATED reason is what lets dig-node#348's hold fire — but taken
+    /// alone it left an operator debugging a bare `PENDING` with `accepted:false`,
+    /// `transaction_id:null`, `rejection:null` and **no label at all**. The response did not lie;
+    /// it just said strictly less than before, which is its own kind of regression on a money path.
+    ///
+    /// `verdict` and `rejection` answer different questions and only one of them may drive the
+    /// hold, which is why they are separate fields rather than one string.
+    ///
+    /// **Catches:** folding the label back into `rejection` (which re-breaks the hold), or dropping
+    /// it again (which re-blinds the operator).
+    #[test]
+    fn the_verdict_label_survives_a_refusal_that_states_no_reason() {
+        let bare = status("PENDING", None);
+        assert_eq!(
+            super::ChainTransport::stated_rejection(&bare),
+            None,
+            "a bare verdict must not read as a stated reason, or the #348 hold cannot fire"
+        );
+        assert_eq!(
+            bare.status, "PENDING",
+            "and the label itself must still be available to carry into the response"
+        );
     }
 
     /// **Proves (dig-node#348):** a bare verdict is NOT a stated reason.

@@ -6975,6 +6975,7 @@ mod tests {
                 accepted: true,
                 transaction_id: Some("tx".repeat(32)),
                 rejection: None,
+                verdict: "SUCCESS".into(),
             }))
         }
     }
@@ -8277,6 +8278,7 @@ mod tests {
                 accepted: false,
                 transaction_id: None,
                 rejection: Some("DOUBLE_SPEND".into()),
+                verdict: "FAILED".into(),
             })));
         let outcome = refused
             .push_signed_bundle(&a_signed_bundle_hex())
@@ -10730,7 +10732,9 @@ mod tests {
         let silently_denying = FakePusher::answering(Ok(PushOutcome {
             accepted: false,
             transaction_id: None,
+            // A refusal that states NO reason -- the shape the #348 hold keys on.
             rejection: None,
+            verdict: "PENDING".into(),
         }));
         let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
             .await
@@ -10832,6 +10836,7 @@ mod tests {
             accepted: false,
             transaction_id: None,
             rejection: Some("mempool said no".into()),
+            verdict: "FAILED".into(),
         }));
         let be = backend_with(vec![refused.clone()], true)
             .await
