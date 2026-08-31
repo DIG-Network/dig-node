@@ -55,6 +55,7 @@ pub mod chainwatch;
 pub mod chat;
 pub mod dht_sampling;
 pub mod download;
+pub mod mirror_bond;
 pub mod inbound_demand;
 mod module_tier_tag;
 pub mod peer;

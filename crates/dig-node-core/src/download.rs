@@ -746,6 +746,9 @@ pub struct NodeContent {
     /// [`SelfExcludingLocator`] (#1584), so discovery is already self-filtered — this node's own
     /// `peer_id` never appears as a holder — but is otherwise unranked.
     locator: Arc<dyn ProviderLocator>,
+    /// The mirror-coin bond verifier the discovery chain ranks by (dig-node#466), installed once by
+    /// the host binary through [`Self::set_bond_verifier`] when its chain source exists.
+    bond_verifier: crate::mirror_bond::BondVerifierSlot,
     /// The self-optimizing peer selector (#178) — the decision + learning brain between discovery and
     /// download. It ranks the download sources (bridged into dig-download's [`SourceSelector`] seam by
     /// [`SelectorAdapter`], #1442) and learns from every range outcome dig-download reports back
@@ -1250,6 +1253,13 @@ impl NodeContent {
         self_peer_id: Option<String>,
         cache_dir: &Path,
     ) -> Arc<Self> {
+        // The mirror-coin bond layer (dig-node#466) sits OUTSIDE every other locator, so both the
+        // raw discovery leg kept on the engine and the download union built from it below inherit
+        // one ranking. Its verifier arrives later (the host binary owns the chain source), and until
+        // it does the layer is a pass-through.
+        let bond_verifier = crate::mirror_bond::bond_verifier_slot();
+        let locator: Arc<dyn ProviderLocator> =
+            crate::mirror_bond::BondRankingLocator::new(locator, bond_verifier.clone());
         let downloads_dir = cache_dir.join("downloads");
         let _ = std::fs::create_dir_all(&downloads_dir);
         let state_store = Arc::new(CapturingStateStore::new(FileStateStore::new(
@@ -1334,6 +1344,7 @@ impl NodeContent {
         let ask_routing = AskRoutingState::new(self_peer_id.as_deref());
         Arc::new(NodeContent {
             locator,
+            bond_verifier,
             selector,
             downloader,
             state_store,
@@ -1534,6 +1545,20 @@ impl NodeContent {
         // today's shipped behaviour.
         let _ = &dht;
         content
+    }
+
+    /// Install the mirror-coin bond verifier the discovery chain ranks holders by (dig-node#466).
+    ///
+    /// Idempotent and one-way: the first call wins and later ones are ignored, so a node's
+    /// verification posture cannot change under a running download. Before it is called the layer is
+    /// a pass-through, which is the shipped behaviour of every embedder that has no chain source.
+    ///
+    /// Returns whether this call was the one that installed it.
+    pub fn set_bond_verifier(
+        &self,
+        verifier: Arc<dyn crate::mirror_bond::MirrorBondVerifier>,
+    ) -> bool {
+        self.bond_verifier.set(verifier).is_ok()
     }
 
     /// The configured miss behavior (redirect by default; fetch-through when opted in).
