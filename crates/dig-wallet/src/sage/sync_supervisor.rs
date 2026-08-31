@@ -1668,9 +1668,8 @@ impl Supervisor {
         let writer_answer = match session.header_hash_at(round.height).await {
             Ok(answer) => answer,
             Err(e) => {
-                tracing::debug!(error = %e, height = round.height, concat!(
-                    "wallet sync: the writer could not answer the corroboration question"
-                ));
+                tracing::debug!(error = %e, height = round.height, "wallet sync: the writer could not answer the corroboration question"
+                );
                 None
             }
         };
