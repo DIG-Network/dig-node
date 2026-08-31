@@ -1008,10 +1008,15 @@ mod tests {
     /// The exact ack `chia_query` produces for a `TransactionAck` status byte.
     ///
     /// This CALLS `chia_query::peer::translate::ack_to_tx_status` rather than restating its
-    /// mapping, so the coupling is real: rename a label there, or flip a `success` flag, and these
-    /// tests fail instead of silently accommodating it. A hand-built `TxStatus` would leave
-    /// [`accepted_by_mempool`]'s `"SUCCESS"` literal free to drift out of agreement with the crate,
-    /// and the node would refuse every push with both tests still green.
+    /// mapping, so the coupling is real: rename a label there and these tests fail instead of
+    /// silently accommodating it. A hand-built `TxStatus` would leave [`accepted_by_mempool`]'s
+    /// `"SUCCESS"` literal free to drift out of agreement with the crate, and the node would refuse
+    /// every push with both tests still green.
+    ///
+    /// Boundary: this does NOT guard the `success` flag. [`accepted_by_mempool`] reads only
+    /// `status`, deliberately, because `success` conflates ACCEPTED with PENDING
+    /// (DIG-Network/chia-query#48) — so a change to that flag is invisible here by design, not by
+    /// omission.
     fn ack(status: u8) -> chia_query::TxStatus {
         chia_query::peer::translate::ack_to_tx_status(status)
     }
