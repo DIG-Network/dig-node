@@ -1544,14 +1544,43 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 /// `pending` as JSON **numbers** fitting `u64` (a single address's balance can never exceed
 /// `u64::MAX` mojos, ~18.4M XCH), never JSON strings. Saturates rather than panicking on an
 /// implausible overflow, since a clamped-but-alive response beats a crashed RPC call.
-fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
+fn balance_wire(
+    r: &dig_wallet::sage::rpc::WalletBalanceResult,
+    network_peak: Option<u32>,
+) -> Value {
     json!({
         "balance": u64::try_from(r.balance).unwrap_or(u64::MAX),
         "pending": u64::try_from(r.pending).unwrap_or(u64::MAX),
         "source": r.source,
         "synced": r.synced,
         "peak_height": r.peak_height,
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
+}
+
+/// How many blocks behind the network THIS balance figure is, or `None` when that is UNKNOWN
+/// (dig-node#416).
+///
+/// # `None` is "cannot say", and it is NOT zero
+///
+/// A zero here is a positive claim — *this figure is as current as the network this node can
+/// see*. Absence is the opposite claim and a caller must render it differently, because the
+/// reading that motivated this field was `balance 0, synced false, peak_height null`: a figure
+/// with no freshness bound at all, which is indistinguishable from an empty wallet and was in
+/// fact produced by a replica ~8,380 blocks behind its own peers.
+///
+/// So both inputs must be present for a number to be produced. A missing answer height means
+/// nothing bounds the figure; a missing network peak means no held Chia peer has announced one,
+/// so the node has nothing to measure itself against.
+///
+/// # Saturating, because a replica AHEAD of its peers is not "very stale"
+///
+/// A replica momentarily past the peak its peers last announced would otherwise underflow into a
+/// huge gap and report a healthy node as catastrophically behind. Saturating to `0` says the
+/// truthful thing: nothing known puts this figure behind the network.
+fn stale_by(answer_height: Option<u32>, network_peak: Option<u32>) -> Option<u32> {
+    Some(network_peak?.saturating_sub(answer_height?))
 }
 
 /// `control.wallet.balance` (#1851) — the READ-ONLY balance of a PUBLIC address, for XCH or
@@ -1591,8 +1620,18 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         Err(e) => return e,
     };
 
+    // The peers' announced peak is read SEPARATELY and is allowed to fail: it makes the answer's
+    // staleness legible, and losing it must degrade the answer to "cannot say how stale" rather
+    // than failing a balance read that otherwise succeeded.
+    let network_peak = ctx
+        .wallet
+        .wallet_sync_status()
+        .await
+        .ok()
+        .and_then(|s| s.chia_peer_peak_height);
+
     match ctx.wallet.balance_for_address(address, asset).await {
-        Ok(r) => control_ok(id, balance_wire(&r)),
+        Ok(r) => control_ok(id, balance_wire(&r, network_peak)),
         Err(BalanceError::InvalidAddress) => control_error(
             id,
             ErrorCode::InvalidParams,
@@ -6064,13 +6103,14 @@ mod tests {
             synced: true,
             peak_height: Some(42),
         };
-        let emitted = balance_wire(&r);
+        let emitted = balance_wire(&r, None);
 
         // Golden shape: numeric, not string.
         assert_eq!(
             emitted,
             json!({
                 "balance": 12345u64, "pending": 6u64,
+                "network_peak_height": Value::Null, "stale_by": Value::Null,
                 "source": "db", "synced": true, "peak_height": 42
             }),
         );
@@ -6106,7 +6146,7 @@ mod tests {
             synced: false,
             peak_height: None,
         };
-        let emitted = balance_wire(&r);
+        let emitted = balance_wire(&r, None);
         assert_eq!(emitted["balance"], json!(u64::MAX));
     }
 
@@ -6128,19 +6168,106 @@ mod tests {
         }
 
         for (source, wire) in [(Source::Db, "db"), (Source::Fallback, "fallback")] {
-            let emitted = balance_wire(&WalletBalanceResult {
-                balance: 1,
-                pending: 0,
-                source,
-                synced: source == Source::Db,
-                peak_height: None,
-            });
+            let emitted = balance_wire(
+                &WalletBalanceResult {
+                    balance: 1,
+                    pending: 0,
+                    source,
+                    synced: source == Source::Db,
+                    peak_height: None,
+                },
+                None,
+            );
             assert_eq!(emitted["source"], json!(wire));
 
             let old: OldConsumer = serde_json::from_value(emitted)
                 .expect("a consumer unaware of `source` must still parse");
             assert_eq!(old.balance, 1);
             assert_eq!(old.synced, source == Source::Db);
+        }
+    }
+
+    /// dig-node#416: an UNKNOWN staleness and a staleness of ZERO must not emit the same wire
+    /// value, because they are opposite claims — "nothing bounds this figure" versus "this
+    /// figure is level with the network".
+    ///
+    /// The fixture is built from the measured reading that motivated the ticket (a replica
+    /// 8,380 blocks behind its peers) plus two CONTROLS in the same test: a level replica, and
+    /// a replica whose peers have announced nothing. A test asserting only the stale case would
+    /// pass against an implementation that reported every answer as stale.
+    #[test]
+    fn stale_by_distinguishes_an_unknown_gap_from_a_zero_gap() {
+        // Measured case: the replica named a height, the peers named a higher one.
+        assert_eq!(stale_by(Some(9_211_798), Some(9_220_177)), Some(8_379));
+        // Control 1 — level: a real claim of currency, spelled as a number.
+        assert_eq!(stale_by(Some(9_220_177), Some(9_220_177)), Some(0));
+        // Control 2 — no peer has announced a peak: the node cannot measure itself.
+        assert_eq!(stale_by(Some(9_211_798), None), None);
+        // Control 3 — the answer carries no height (the `peak_height: null` fallback answer
+        // from the ticket): nothing bounds the figure, whatever the network peak is.
+        assert_eq!(stale_by(None, Some(9_220_177)), None);
+        // A replica momentarily ahead reports "not behind", never an underflowed huge gap.
+        assert_eq!(stale_by(Some(9_220_178), Some(9_220_177)), Some(0));
+    }
+
+    /// dig-node#416: the wire carries the gap and the network peak, and both are ADDITIVE —
+    /// the exact reading from the ticket (`balance 0, synced false, peak_height null`) now
+    /// leaves a consumer able to tell "the wallet is empty" from "this node cannot see".
+    #[test]
+    fn balance_wire_carries_the_staleness_gap_additively() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::WalletBalanceResult;
+
+        #[derive(serde::Deserialize)]
+        struct OldConsumer {
+            balance: u64,
+        }
+
+        // The ticket's reading: a zero that is NOT an answer.
+        let unknown = balance_wire(
+            &WalletBalanceResult {
+                balance: 0,
+                pending: 0,
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            Some(9_220_177),
+        );
+        assert_eq!(unknown["stale_by"], json!(null));
+        assert_eq!(unknown["network_peak_height"], json!(9_220_177));
+
+        // A stale-but-bounded DB answer: a real figure as of a named height, 8,380 behind.
+        let stale = balance_wire(
+            &WalletBalanceResult {
+                balance: 0,
+                pending: 0,
+                source: Source::Db,
+                synced: false,
+                peak_height: Some(9_211_798),
+            },
+            Some(9_220_177),
+        );
+        assert_eq!(stale["stale_by"], json!(8_379));
+
+        // Control: a level, synced answer emits a zero gap — distinguishable from the null above.
+        let level = balance_wire(
+            &WalletBalanceResult {
+                balance: 0,
+                pending: 0,
+                source: Source::Db,
+                synced: true,
+                peak_height: Some(9_220_177),
+            },
+            Some(9_220_177),
+        );
+        assert_eq!(level["stale_by"], json!(0));
+        assert_ne!(level["stale_by"], unknown["stale_by"]);
+
+        for v in [&unknown, &stale, &level] {
+            let old: OldConsumer = serde_json::from_value(v.clone())
+                .expect("a consumer unaware of the new fields must still parse");
+            assert_eq!(old.balance, 0);
         }
     }
 }

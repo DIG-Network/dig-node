@@ -2761,6 +2761,32 @@ fn spawn_mirror_passes(
             // synchronous and sees one disk state and one balance throughout.
             let capsules = lifecycle::observe_disk(&node).await;
             let dig_balance = lifecycle::observe_dig_balance(&wallet, owner_puzzle_hash).await;
+
+            // dig-node#286: the ONLY caller of the funded latch. `latch_ever_funded` was written,
+            // persisted and tested, and nothing invoked it — so in the shipped build a funded
+            // auto-created wallet was still described as disposable, for ever.
+            //
+            // This pass is the observation point because it already reads the operator wallet's
+            // own balance on a timer, so the latch costs no extra chain read and cannot drift from
+            // the figure the node acts on. `synced` gates ONLY the zero case (see
+            // `FundingObservation::should_latch`), so a stale or fallback answer showing money
+            // still latches immediately.
+            {
+                use crate::wallet_funded::FundingObservation;
+                let synced = wallet
+                    .wallet_sync_status()
+                    .await
+                    .is_ok_and(|s| s.phase == dig_wallet::sage::sync_supervisor::SyncPhase::Synced);
+                let observation = match &dig_balance {
+                    Ok(base_units) => {
+                        FundingObservation::classify(u128::from(*base_units), 0, synced)
+                    }
+                    // An unreadable balance is not a zero balance. It says nothing, and the latch
+                    // is monotonic, so the next pass that CAN read decides.
+                    Err(_) => FundingObservation::CannotSay,
+                };
+                crate::wallet_funded::observe(&paths, observation);
+            }
             // ONE reading of what is already committed, for the whole pass — the analogue of the
             // wallet selector's reservation prune (dig_ecosystem#2763), which the chain cannot
             // offer: a broadcast coin stays unspent in the chain's view for the entire confirmation

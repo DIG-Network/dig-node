@@ -735,13 +735,9 @@ fn summarize(method: &str, result: &Value) -> String {
         ),
         "control.wallet.balance" => format!(
             "balance {} · pending {} · {}",
-            result["balance"].as_u64().unwrap_or(0),
-            result["pending"].as_u64().unwrap_or(0),
-            if result["synced"].as_bool().unwrap_or(false) {
-                "synced"
-            } else {
-                "syncing"
-            },
+            amount(&result["balance"]),
+            amount(&result["pending"]),
+            balance_freshness(result),
         ),
         // `result["coin"]` yields `Null` for a missing key, but indexing the INNER map would
         // panic on one — so every field is read with `get`, and a coin record short of a field
@@ -1385,6 +1381,65 @@ fn avail(v: &Value) -> &'static str {
         "available"
     } else {
         "unavailable"
+    }
+}
+
+/// A balance figure for a human line: the number, or `unknown` when the field is missing or is
+/// not a number.
+///
+/// NEVER `0` on a miss (dig-node#416). A zero balance is a real claim about money — *you hold
+/// none* — so printing one for a field the CLI could not read asserts a fact it does not have,
+/// and does it in the direction a reader acts on. This is the same rule [`mojos`] states, applied
+/// to the field a person actually looks at when asking what they own.
+fn amount(v: &Value) -> String {
+    match v.as_u64() {
+        Some(a) => a.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+/// How much a rendered balance can be trusted (dig-node#416).
+///
+/// # The defect this exists to remove
+///
+/// A stale replica answered `balance 0, synced false, source "fallback", peak_height null` for a
+/// wallet, and the human line rendered that as `balance 0 · pending 0 · syncing`. A funded wallet
+/// on a node ~8,380 blocks behind its peers produces exactly that line, and `syncing` reads as
+/// reassuring progress rather than as *this number may be wrong*. The distinguishing fields were
+/// on the wire the whole time and nothing a person reads used them.
+///
+/// # The four cases, which are four different claims
+///
+/// - **current** — the replica produced the figure and is following the chain. The number is an
+///   answer.
+/// - **as of height H, N blocks behind** — a real figure with a freshness bound. Usable, and the
+///   reader can decide whether N matters to them.
+/// - **as of height H, distance from the network unknown** — a bounded figure, but no held Chia
+///   peer has announced a peak, so the node cannot say how far behind it is.
+/// - **NOT CURRENT — this node cannot say what height this reflects** — the ticket's reading.
+///   Nothing bounds the figure at all, so it is not evidence of anything, least of all emptiness.
+///
+/// Every non-current case is prefixed `NOT CURRENT` so the qualifier cannot be missed beside the
+/// digit, and the last one says outright that the figure may not reflect the wallet — because
+/// that is the case in which a reader is most likely to conclude they own nothing.
+fn balance_freshness(result: &Value) -> String {
+    if result["synced"].as_bool().unwrap_or(false) {
+        return match result["peak_height"].as_u64() {
+            Some(h) => format!("current as of height {h}"),
+            None => "current".to_string(),
+        };
+    }
+    match (
+        result["peak_height"].as_u64(),
+        result["stale_by"].as_u64(),
+    ) {
+        (Some(h), Some(0)) => format!("NOT CURRENT — as of height {h}, level with the network"),
+        (Some(h), Some(n)) => format!("NOT CURRENT — as of height {h}, {n} blocks behind the network"),
+        (Some(h), None) => {
+            format!("NOT CURRENT — as of height {h}, distance from the network unknown")
+        }
+        (None, _) => "NOT CURRENT — this node cannot say what height this reflects;                       the figure may not reflect the wallet"
+            .to_string(),
     }
 }
 
@@ -2324,7 +2379,86 @@ mod tests {
         assert!(s.contains("12345"), "got: {s}");
         assert!(s.contains('6'), "got: {s}");
         assert!(!s.contains('?'), "must not fall back to `?`: {s}");
-        assert!(s.contains("synced"), "got: {s}");
+        assert!(s.contains("current"), "got: {s}");
+    }
+
+    /// dig-node#416 — the money lie, asserted at the surface a person reads.
+    ///
+    /// A stale-replica zero and an empty-wallet zero rendered the SAME line
+    /// (`balance 0 · pending 0 · syncing`). This asserts the two lines DIFFER, and it asserts
+    /// the specific direction: the unbounded one must not read as an answer.
+    ///
+    /// The empty-wallet control is what makes this load-bearing. An implementation that
+    /// appended a scary qualifier to every balance would satisfy "the stale line warns" on its
+    /// own; it cannot satisfy "and the synced line does not".
+    #[test]
+    fn a_stale_zero_and_an_empty_wallet_zero_do_not_render_alike() {
+        // The measured reading from the ticket: a fallback answer with no height at all.
+        let unknown = summarize(
+            "control.wallet.balance",
+            &json!({
+                "balance": 0, "pending": 0, "synced": false,
+                "source": "fallback", "peak_height": null, "stale_by": null,
+            }),
+        );
+        // The honest zero: a synced replica saying the wallet holds nothing.
+        let empty = summarize(
+            "control.wallet.balance",
+            &json!({
+                "balance": 0, "pending": 0, "synced": true,
+                "source": "db", "peak_height": 9_220_177u64, "stale_by": 0,
+            }),
+        );
+
+        assert_ne!(unknown, empty, "a stale zero must not read like an empty wallet");
+        assert!(
+            unknown.contains("NOT CURRENT"),
+            "an unbounded zero must be marked not current: {unknown}"
+        );
+        assert!(
+            !empty.contains("NOT CURRENT"),
+            "a synced zero is a real answer and must NOT be scare-marked: {empty}"
+        );
+
+        // A bounded-but-behind answer is a THIRD line: usable, and it names the gap.
+        let stale = summarize(
+            "control.wallet.balance",
+            &json!({
+                "balance": 0, "pending": 0, "synced": false,
+                "source": "db", "peak_height": 9_211_798u64, "stale_by": 8_380,
+            }),
+        );
+        assert!(stale.contains("8380"), "the gap must be named: {stale}");
+        assert!(stale.contains("9211798"), "the as-of height must be named: {stale}");
+        assert_ne!(stale, unknown, "a bounded stale figure differs from an unbounded one");
+    }
+
+    /// dig-node#416: an ABSENT balance field renders `unknown`, never `0`.
+    ///
+    /// The old summary read it with `.as_u64().unwrap_or(0)`, so a response short of the field —
+    /// or carrying it in any other JSON type — printed a confident zero balance. The synced
+    /// control in the same test proves the renderer still prints real zeros as `0`, so this
+    /// cannot be satisfied by never printing zero at all.
+    #[test]
+    fn an_unreadable_balance_field_renders_unknown_not_zero() {
+        let missing = summarize(
+            "control.wallet.balance",
+            &json!({ "synced": true, "peak_height": 42 }),
+        );
+        assert!(missing.contains("unknown"), "got: {missing}");
+        assert!(
+            !missing.contains("balance 0"),
+            "an absent field must not print a zero balance: {missing}"
+        );
+
+        let real_zero = summarize(
+            "control.wallet.balance",
+            &json!({ "balance": 0, "pending": 0, "synced": true, "peak_height": 42 }),
+        );
+        assert!(
+            real_zero.contains("balance 0"),
+            "a measured zero must still print as 0: {real_zero}"
+        );
     }
 
     /// REGRESSION (dig-node#260): a wallet mTLS listener that LOST its port must be
