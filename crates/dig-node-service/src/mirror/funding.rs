@@ -411,6 +411,142 @@ mod tests {
         );
     }
 
+    /// **Proves:** a create needing more inputs than [`MAX_SELECTED_FUNDING_COINS`] is refused
+    /// BEFORE any lineage read, and refused as `TooManyInputs` rather than as a shortfall.
+    ///
+    /// **Catches:** the unbounded selection of dig-node#427. The scan address is publicly derivable
+    /// — the operator puzzle hash is public and the CAT curry is canonical — so any stranger can pay
+    /// dust to it, and every input that survives selection costs one `coin_spend` in
+    /// [`authenticate`]. Unbounded, the number of chain reads one automated pass performs is chosen
+    /// by whoever sent the dust, on a timer, forever.
+    ///
+    /// # The fixture is built from the bound itself, from BOTH sides
+    ///
+    /// A single "lots of dust" case cannot tell a bound from a coincidence, and a case only over
+    /// the limit cannot tell a correct bound from one that refuses everything. So the same wallet
+    /// is asked for two amounts, chosen from `MAX_SELECTED_FUNDING_COINS` rather than picked to
+    /// look large:
+    ///
+    /// - **at the bound** — exactly `MAX_SELECTED_FUNDING_COINS` coins cover it, and selection must
+    ///   pass through to authentication (observable as a `coin_spend` having happened);
+    /// - **one over** — one more coin is needed, and it must be refused with the count and the
+    ///   limit, having read no lineage at all.
+    ///
+    /// The at-bound case is what makes this test load-bearing: `selected.len() >= LIMIT`, the
+    /// off-by-one, is green against an over-only fixture and red here.
+    ///
+    /// `coin_spend` answers `Ok(None)` rather than panicking, so reaching authentication produces
+    /// an ordinary `Unauthenticated` refusal. A panic would prove the same thing about the over
+    /// case and make the at-bound case unable to report anything but a crash.
+    #[test]
+    fn a_create_needing_more_inputs_than_the_bound_is_refused_before_any_lineage_read() {
+        use std::cell::RefCell;
+        type _CoinRecord = dig_chainsource_interface::CoinRecord;
+
+        /// A wallet whose $DIG is in `count` coins of one base unit each.
+        struct Dusted {
+            count: u64,
+            owner: Bytes32,
+            lineage_reads: RefCell<usize>,
+        }
+
+        impl ChainSource for Dusted {
+            type Error = std::io::Error;
+            fn coin_record(&self, _: Bytes32) -> Result<Option<_CoinRecord>, Self::Error> {
+                unreachable!("selection reads by puzzle hash, never by coin id")
+            }
+            fn coin_records_by_puzzle_hash(
+                &self,
+                puzzle_hash: Bytes32,
+                _: bool,
+            ) -> Result<Vec<_CoinRecord>, Self::Error> {
+                assert_eq!(
+                    puzzle_hash,
+                    dig_cat_puzzle_hash(self.owner),
+                    "the scan must be the CAT-wrapped operator hash, which is what makes it \
+                     publicly derivable and therefore dustable"
+                );
+                Ok((0..self.count)
+                    .map(|i| {
+                        let mut parent = [0u8; 32];
+                        parent[..8].copy_from_slice(&i.to_be_bytes());
+                        _CoinRecord {
+                            coin: chia_protocol::Coin::new(Bytes32::new(parent), puzzle_hash, 1),
+                            confirmed_height: Some(1),
+                            spent_height: None,
+                            timestamp: None,
+                            coinbase: false,
+                        }
+                    })
+                    .collect())
+            }
+            fn coin_records_by_parent(&self, _: Bytes32) -> Result<Vec<_CoinRecord>, Self::Error> {
+                unreachable!()
+            }
+            fn coin_spend(
+                &self,
+                _: Bytes32,
+            ) -> Result<Option<chia_protocol::CoinSpend>, Self::Error> {
+                *self.lineage_reads.borrow_mut() += 1;
+                Ok(None)
+            }
+            fn resolve_singleton_lineage(
+                &self,
+                _: Bytes32,
+            ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error>
+            {
+                unreachable!()
+            }
+            fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+                unreachable!()
+            }
+            fn block_timestamp(&self, _: u32) -> Result<Option<u64>, Self::Error> {
+                unreachable!()
+            }
+        }
+
+        let owner = owner(0x33);
+        let at_bound = MAX_SELECTED_FUNDING_COINS as u64;
+        let over_bound = at_bound + 1;
+
+        // Plenty of coins available either way: the wallet is NOT short, which is the whole point.
+        let source = Dusted {
+            count: over_bound + 10,
+            owner,
+            lineage_reads: RefCell::new(0),
+        };
+
+        let over = select_operator_dig_cats(&source, owner, over_bound, &HashSet::new());
+        assert_eq!(
+            over,
+            Err(FundingError::TooManyInputs {
+                needed: over_bound as usize,
+                limit: MAX_SELECTED_FUNDING_COINS,
+            }),
+            "a funded wallet whose $DIG is in too many pieces is refused for THAT reason; \
+             reporting a shortfall would send the operator looking for money they already have"
+        );
+        assert_eq!(
+            *source.lineage_reads.borrow(),
+            0,
+            "the refusal must happen before authentication, or the bound does not bound the chain \
+             reads it exists to bound"
+        );
+
+        let at = select_operator_dig_cats(&source, owner, at_bound, &HashSet::new());
+        assert!(
+            matches!(at, Err(FundingError::Unauthenticated { .. })),
+            "exactly at the bound the selection must PASS THROUGH to authentication; it refused \
+             with {at:?} instead, so the bound is off by one and rejects a fundable create"
+        );
+        assert_eq!(
+            *source.lineage_reads.borrow(),
+            1,
+            "reaching authentication is observed rather than assumed: one lineage read happened, \
+             and it stopped at the first unauthenticatable coin"
+        );
+    }
+
     /// An in-flight spend's funding coins are WITHHELD; a settled one's are released.
     ///
     /// The fixture varies ONE thing — the terminal status of the second spend — and keeps a truthful
