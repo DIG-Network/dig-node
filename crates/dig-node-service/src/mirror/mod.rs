@@ -83,12 +83,13 @@ pub mod lifecycle;
 pub mod observe;
 pub mod pass;
 pub mod plan;
+pub mod pointers;
 pub mod presence;
+pub(crate) mod resolve;
+#[cfg(test)]
+mod resolve_tests;
 pub mod runner;
 pub mod signer;
 pub mod spends;
 pub mod states;
 
-// WIP (loop/batch-mirror): resolving landed mirror spends (#412), feeding the DHT collateral
-// pointer (#435), the Disabled-bondability question (#429) and bounding mirror funding inputs
-// (#427). This marker is removed by the first real commit of the batch.

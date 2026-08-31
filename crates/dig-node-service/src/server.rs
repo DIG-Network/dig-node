@@ -2155,6 +2155,21 @@ where
     // path (`dig-runtime`) never routes through `serve_with_shutdown`, so the browser's
     // node keeps installing no P2P content — its in-process trust boundary is unchanged.
     if dig_node_core::peer::peer_network_enabled() {
+        // The untrusted mirror-coin pointers every DHT announce attaches (dig-node#435), installed
+        // BEFORE the bring-up reads them. The DHT lives in dig-node-core and the mirror lifecycle
+        // that knows which coin bonds which capsule lives here, so this shell is the one place that
+        // can join them. Until it did, the pointer mechanism was built, unit tested, and fed only by
+        // a test double: every live announce published no coin id at all.
+        //
+        // Installed unconditionally rather than behind the broadcast switch. The pointer is read
+        // from the observation a pass publishes, so a node that creates no coins simply has no
+        // `Bonded` row and answers `None` — the ordinary, fully supported case — while a node whose
+        // coins were created before the switch was turned off still points at them correctly.
+        state
+            .node
+            .set_mirror_coin_pointers(std::sync::Arc::new(
+                crate::mirror::pointers::SnapshotMirrorPointers::new(state.mirror_bonds.clone()),
+            ));
         dig_node_core::peer::spawn_peer_network(state.node.clone());
     }
 

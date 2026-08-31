@@ -78,6 +78,19 @@ pub enum FundingError {
     /// Fails closed for the reason the whole module does: an unreadable reservation set is
     /// indistinguishable from an empty one, and treating it as empty is what double-commits a coin.
     CommitmentsUnreadable(String),
+    /// Covering the create needs more inputs than a single bundle may draw
+    /// ([`MAX_SELECTED_FUNDING_COINS`]).
+    ///
+    /// Its own variant rather than an `Insufficient`, because the two send an operator to opposite
+    /// places: `Insufficient` says *find more $DIG*, and this says *you have the money, it is in
+    /// too many pieces*. Telling a funded operator they are short is the money-lie class this
+    /// module is built to avoid.
+    TooManyInputs {
+        /// How many coins largest-first selection needed to reach the target.
+        needed: usize,
+        /// The bound.
+        limit: usize,
+    },
     /// A create was asked for at zero collateral.
     ///
     /// Refused HERE, ahead of the builder, because zero is the one target for which selection
@@ -110,12 +123,47 @@ impl std::fmt::Display for FundingError {
                 "the spend audit record is unreadable ({e}), so which coins are already committed \
                  to an in-flight bundle is unknown; no coin is selected"
             ),
+            FundingError::TooManyInputs { needed, limit } => write!(
+                f,
+                "covering this create needs {needed} $DIG coins and a mirror create may draw at                  most {limit}; the wallet is not short, its $DIG is in too many pieces. No coin                  was authenticated and no spend was attempted; consolidating the operator's $DIG                  into fewer coins clears it"
+            ),
             FundingError::ZeroCollateral => {
                 f.write_str("a create at zero collateral stakes nothing and is refused")
             }
         }
     }
 }
+
+/// The most $DIG coins one mirror create may draw as inputs (dig-node#427).
+///
+/// # Why a bound is REQUIRED here specifically
+///
+/// The address selection scans — [`dig_cat_puzzle_hash`] of the operator hash — is **publicly
+/// derivable**: the operator puzzle hash is a public value and the CAT curry is canonical, so any
+/// stranger can compute where this node's $DIG lives and pay dust to it. Every input that survives
+/// selection then costs one `coin_spend` chain read in [`authenticate`], because a candidate's
+/// lineage is executed from the spend that created it. Unbounded, that makes the number of chain
+/// reads one automated pass performs a function of what an attacker chose to send — a cost this
+/// node pays, on a timer, forever.
+///
+/// Largest-first selection is not itself the defence. It is the reason the bound is rarely reached
+/// on a healthy wallet, but a wallet whose genuine $DIG has been ground into dust reaches it for
+/// entirely innocent reasons, and an attacker who out-values the honest coins reaches it on
+/// purpose.
+///
+/// # Which direction it fails in, stated deliberately
+///
+/// It fails **CLOSED**: the create is refused, the bond is not collateralised this pass, and
+/// [`FundingError::TooManyInputs`] names the reason and the remedy. That is recoverable — the next
+/// pass retries, and consolidating the operator's coins fixes it permanently. Failing open would
+/// mean a stranger can make this node perform thousands of chain reads per pass at the price of
+/// dust, which is not recoverable by anything the operator can do.
+///
+/// The refusal happens AFTER selection and BEFORE authentication, which is the only placement that
+/// achieves the point: selection is in-memory over rows already fetched, so it is free, while
+/// authentication is the per-input chain read being bounded. Bounding the CANDIDATE set instead
+/// would refuse a perfectly fundable create because a stranger sent dust this node never selected.
+pub const MAX_SELECTED_FUNDING_COINS: usize = 32;
 
 /// The puzzle hash the operator's ordinary $DIG coins sit at.
 ///
@@ -211,6 +259,13 @@ pub fn select_operator_dig_cats<S: ChainSource>(
         have_dig_base_units: available,
         need_dig_base_units,
     })?;
+
+    if selected.len() > MAX_SELECTED_FUNDING_COINS {
+        return Err(FundingError::TooManyInputs {
+            needed: selected.len(),
+            limit: MAX_SELECTED_FUNDING_COINS,
+        });
+    }
 
     let mut cats = Vec::with_capacity(selected.len());
     for record in &selected {
