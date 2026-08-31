@@ -8407,3 +8407,5 @@ on a claim the node cannot keep, which this section penalises. The operator sets
 Changing the value affects only coins created after the change. Bringing an existing coin into line
 means reclaiming and re-creating it — a round trip and a fee — and the node MUST NOT reclaim in
 response to a configuration edit.
+
+<!-- dig-node#447: mirror L1 genesis regression -- WIP -->
