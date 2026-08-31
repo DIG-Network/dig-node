@@ -167,12 +167,14 @@ fn the_required_message_ends_in_the_chia_mainnet_genesis_challenge() {
 fn the_mirror_signing_domain_is_never_a_dig_constants_genesis() {
     let chosen = mirror_agg_sig_data();
 
-    // Spelled as a list rather than a single comparison so adding a network to `dig-constants` and
-    // reaching for it here is caught, instead of being silently outside the guard.
-    for (name, genesis) in [(
+    // A `Vec` rather than an array literal so the guard reads as a LIST that grows: adding a network
+    // to `dig-constants` and reaching for it here should be caught, not silently outside the guard.
+    let l2_genesis_values: Vec<(&str, Bytes32)> = vec![(
         "DIG_MAINNET",
         dig_constants::DIG_MAINNET.genesis_challenge(),
-    )] {
+    )];
+
+    for (name, genesis) in l2_genesis_values {
         assert_ne!(
             chosen, genesis,
             "dig_constants::{name} is a DIG L2 anchor and must never be the mirror signing \
