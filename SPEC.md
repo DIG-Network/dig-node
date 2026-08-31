@@ -1818,6 +1818,17 @@ eviction. These additive fields/methods complete that surface; all are `served: 
   controller renders the eviction queue directly without re-deriving it. `last_used_unix_ms` is the
   file mtime, bumped to now on every local serve.
 
+- **The cap bounds the WHOLE cache, and is SPLIT across the evicting subtrees.** `cache_cap_bytes` is
+  ONE budget over the entire cache tree, never a per-subtree limit. It is divided into a reserved
+  **responses share** (`cap / 8`, for `<cache>/responses`) and a **modules share** (the remainder, for
+  `<cache>/modules`); each eviction sweep spends only its own share, so the SUM on disk is bounded by
+  the configured cap and `used_bytes` and `cap_bytes` describe the same thing. Reserving a share for
+  responses (rather than letting modules take whatever responses leave) is required so the small
+  regenerable response windows are not starved by whole capsules. Bytes under `<cache>/modules` that
+  the scan cannot identify as a capsule are COUNTED against the modules share and MUST NOT be deleted:
+  the bound is a bound on disk consumed, and the sweep does not exclusively own that directory, so
+  recognised capsules are evicted to compensate for bytes it cannot remove.
+
 - **`cache.setCapBytes { cap_bytes }` — the RESERVED cap.** Sets the reserved disk space for cached
   content, **floored at 64 MiB** (a `cap_bytes` below the floor is raised to it), and returns the
   applied `{ cap_bytes }`. `cache.getConfig` returns the live `{ cap_bytes, used_bytes, cache_dir,
@@ -7151,13 +7162,30 @@ Landing therefore gates on BOTH axes:
    serve surface AND the `POST /` JSON-RPC read methods (`dig.getContent`, `dig.fetchRange`), whose
    miss-path landing legs (the implicit warm/backfill/reshare fired when the resource is not held
    locally) would otherwise let a SAME-ORIGIN capsule page `POST dig.getContent` and drive landing —
-   the loopback address labels it `Local`, so §21.7 alone permits it. ONLY an explicit, case-insensitive
-   `cross-site` value is `CrossSite`; `same-origin`, `same-site`, `none`, an unknown value, AND an ABSENT
-   header are all `FirstParty`. Absence MUST map to `FirstParty` — non-browser clients (the CLI, the SDK)
-   send no `Sec-Fetch-*` header, and treating absence as cross-site would silently stop every CLI/SDK
-   read from landing.
-2. **A read lands only when it is BOTH `Local` (§21.7) AND `FirstParty`.** A `CrossSite` request collapses
-   its landing origin to `Peer`: the bytes are served identically, but no warm, reshare, promotion, or
+   the loopback address labels it `Local`, so §21.7 alone permits it. The mapping has THREE outcomes,
+   because same-origin is not a trust signal on a node that serves untrusted content on its control
+   origin (`/s/*` and `POST /` are the same router on the same port, and the store CSP grants store
+   pages `script-src 'unsafe-inline'` with `connect-src 'self'`):
+
+   | `Sec-Fetch-Site` | provenance | lands? |
+   |---|---|---|
+   | ABSENT | `FirstParty` | yes |
+   | `none` | `FirstParty` | yes |
+   | `same-origin`, `same-site`, any unknown value | `StoreServed` | NO |
+   | `cross-site` (case-insensitive, trimmed) | `CrossSite` | NO |
+
+   Absence MUST map to `FirstParty` — non-browser clients (the CLI, the SDK) send no `Sec-Fetch-*`
+   header, and treating absence as cross-site would silently stop every CLI/SDK read from landing.
+   `none` MUST map to `FirstParty`: it denotes a USER-initiated top-level navigation (address bar or
+   bookmark), a page-driven fetch can never produce it, and `Sec-*` is a forbidden header name so page
+   script cannot forge it. This is what keeps the reshare flywheel intact — opening a store in a
+   browser still lands its capsule, and every subresource is then served from that landed capsule.
+   Every other browser-reported value is PAGE-DRIVEN and MUST map to `StoreServed`, including values
+   this specification does not enumerate: the unknown arm fails CLOSED. Provenance MUST NOT be derived
+   from `Referer` or `Origin` — a page controls its own referrer-policy and can strip the path or the
+   whole header, so a `Referer`-derived rule is bypassable by exactly the party it constrains.
+2. **A read lands only when it is BOTH `Local` (§21.7) AND `FirstParty`.** A `CrossSite` or
+   `StoreServed` request collapses its landing origin to `Peer`: the bytes are served identically, but no warm, reshare, promotion, or
    announce fires. The READ MUST NEVER be blocked, throttled, or altered by provenance — only the side
    effect is suppressed.
 3. **The collapse is applied ONCE per landing site via the shared `landing_origin(origin, provenance)`
