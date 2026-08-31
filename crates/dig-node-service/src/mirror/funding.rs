@@ -125,7 +125,7 @@ impl std::fmt::Display for FundingError {
             ),
             FundingError::TooManyInputs { needed, limit } => write!(
                 f,
-                "covering this create needs {needed} $DIG coins and a mirror create may draw at                  most {limit}; the wallet is not short, its $DIG is in too many pieces. No coin                  was authenticated and no spend was attempted; consolidating the operator's $DIG                  into fewer coins clears it"
+                "covering this create needs {needed} $DIG coins and a mirror create may draw at most {limit}; the wallet is not short, its $DIG is in too many pieces. No coin was authenticated and no spend was attempted; consolidating the operator's $DIG into fewer coins clears it"
             ),
             FundingError::ZeroCollateral => {
                 f.write_str("a create at zero collateral stakes nothing and is refused")
@@ -163,6 +163,12 @@ impl std::fmt::Display for FundingError {
 /// achieves the point: selection is in-memory over rows already fetched, so it is free, while
 /// authentication is the per-input chain read being bounded. Bounding the CANDIDATE set instead
 /// would refuse a perfectly fundable create because a stranger sent dust this node never selected.
+/// UNMEASURED JUDGEMENT, stated so nobody reads it as a derived limit: nobody has measured how many
+/// $DIG coins a real operator wallet holds. 32 is chosen to bound the per-create chain reads, and if
+/// a legitimate wallet routinely exceeds it this fails CLOSED on that operator -- they see
+/// `TooManyInputs` and consolidate, rather than a spend going wrong. That direction is the safe one,
+/// and an attacker cannot cheaply force it (see dig-node#461 for the cheap attack that DOES exist on
+/// this path, which is the abort-on-unauthenticatable coin, not this bound).
 pub const MAX_SELECTED_FUNDING_COINS: usize = 32;
 
 /// The puzzle hash the operator's ordinary $DIG coins sit at.

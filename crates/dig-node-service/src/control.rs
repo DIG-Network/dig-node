@@ -2836,7 +2836,7 @@ const _: () = assert!(
 fn reserve_batch_refusal(len: usize) -> Option<String> {
     (len > MAX_RESERVE_COIN_IDS).then(|| {
         format!(
-            "params.coin_ids holds {len} ids, above the {MAX_RESERVE_COIN_IDS} this node will              reserve in one call. Split the request; a bundle that legitimately needs more inputs              than this could not fit in a block anyway"
+            "params.coin_ids holds {len} ids, above the {MAX_RESERVE_COIN_IDS} this node will reserve in one call. Split the request; a bundle that legitimately needs more inputs than this could not fit in a block anyway"
         )
     })
 }
@@ -3982,7 +3982,7 @@ mod tests {
         assert_eq!(
             bondable_pairs(&observation),
             5,
-            "only `Withheld` is excluded: `Disabled` is a reversible node-wide switch and              `Reclaiming` is a served pair whose coin is coming home, and both bond again next pass"
+            "only `Withheld` is excluded: `Disabled` is a reversible node-wide switch and `Reclaiming` is a served pair whose coin is coming home, and both bond again next pass"
         );
     }
 
@@ -4027,7 +4027,7 @@ mod tests {
         assert_eq!(
             bondable_pairs(&observation),
             2,
-            "switching collateralisation off must not advise a zero buffer: the switch is              reversible and these pairs lock $DIG on the pass after it is switched back on"
+            "switching collateralisation off must not advise a zero buffer: the switch is reversible and these pairs lock $DIG on the pass after it is switched back on"
         );
     }
 
@@ -4206,7 +4206,7 @@ mod tests {
         );
         assert!(
             !is_open_control_read("control.wallet.arrivals"),
-            "the arrival cursor names this node's own watched puzzle hashes to a caller that              supplied nothing, so it must stay behind the control token"
+            "the arrival cursor names this node's own watched puzzle hashes to a caller that supplied nothing, so it must stay behind the control token"
         );
     }
 
