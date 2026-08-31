@@ -317,13 +317,41 @@ pub(crate) fn accepted_by_mempool(status: &chia_query::TxStatus) -> Result<()> {
     )))
 }
 
+/// The most peer-supplied refusal text this node will ever quote or persist.
+///
+/// A `TransactionAck.error` arrives from a Chia full node we did not choose and do not trust, and
+/// tungstenite admits a frame up to 64 MiB. That text now reaches `spend_audit`'s append-only JSONL,
+/// which `SpendLog::ledger()` reads back with `read_to_string` on the mirror pass's production path
+/// -- so an unbounded string is amplified once per WRITE and again on every READ, permanently.
+/// chia-query 0.19 discarded the field entirely, so this exposure is new with the 0.20 adoption.
+///
+/// 512 bytes is far more than any real reason needs (`BAD_AGGREGATE_SIGNATURE`, the one that cost a
+/// mainnet debugging session, is 22) while making the worst case bounded and dull.
+const MAX_REFUSAL_DETAIL: usize = 512;
+
 /// Renders the node's own refusal text for inclusion in a message, or nothing when it sent none.
 ///
 /// Separate from [`accepted_by_mempool`] so the empty and present cases are both exercised without
 /// standing up an ack: an ack with no text must not render an empty `: ` that reads like a dropped
 /// reason.
+///
+/// TRUNCATED, and the truncation is announced rather than silent -- a reason cut off without saying
+/// so is a worse diagnostic than a short one, because the reader cannot tell the node's words from
+/// ours. Truncation is on a CHAR boundary, since the peer controls these bytes and slicing a UTF-8
+/// string mid-codepoint panics.
 fn refusal_detail(error: Option<&str>) -> String {
     match error.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(reason) if reason.len() > MAX_REFUSAL_DETAIL => {
+            let cut = (0..=MAX_REFUSAL_DETAIL)
+                .rev()
+                .find(|&i| reason.is_char_boundary(i))
+                .unwrap_or(0);
+            format!(
+                "; node said (truncated from {} bytes): {}",
+                reason.len(),
+                &reason[..cut]
+            )
+        }
         Some(reason) => format!("; node said: {reason}"),
         None => String::new(),
     }
@@ -1133,6 +1161,57 @@ mod tests {
             "two refusals with different causes must not render identically -- an implementation \
              that keeps the verdict and drops the reason passes every one-refusal assertion and \
              still leaves an operator unable to act"
+        );
+    }
+
+    /// **A peer cannot make this node persist an unbounded string.**
+    ///
+    /// `TransactionAck.error` comes from a full node we did not choose, and tungstenite admits a
+    /// 64 MiB frame. That text reaches `spend_audit`'s append-only JSONL, which `SpendLog::ledger()`
+    /// reads back whole with `read_to_string` on the mirror pass's production path -- so the cost is
+    /// paid once per write and again on EVERY read, permanently. chia-query 0.19 discarded the
+    /// field, so this exposure arrived with the 0.20 adoption.
+    ///
+    /// Asserts three things a length check alone would miss: the output is bounded, the truncation
+    /// is ANNOUNCED (a silently cut reason is a worse diagnostic than a short one, because the
+    /// reader cannot tell the node's words from ours), and a short reason is left completely alone.
+    ///
+    /// **Catches:** removing the cap, and truncating silently.
+    #[test]
+    fn an_oversized_peer_reason_is_bounded_and_says_that_it_was_cut() {
+        let huge = "A".repeat(100_000);
+        let rendered = refusal_detail(Some(&huge));
+
+        assert!(
+            rendered.len() < MAX_REFUSAL_DETAIL + 128,
+            "a peer must not be able to make this node persist an unbounded string: {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains("truncated from 100000 bytes"),
+            "the cut must be announced, or a reader cannot tell the node's words from ours: {rendered}"
+        );
+        assert_eq!(
+            refusal_detail(Some("BAD_AGGREGATE_SIGNATURE")),
+            "; node said: BAD_AGGREGATE_SIGNATURE",
+            "a real reason is well under the cap and must pass through untouched"
+        );
+    }
+
+    /// A multi-byte reason truncated at the cap must not panic.
+    ///
+    /// The peer controls these bytes, so it controls where the codepoints fall. Slicing a UTF-8
+    /// string off a char boundary panics, which would turn a diagnostic string into a remote crash.
+    ///
+    /// **Catches:** truncating with a plain byte slice.
+    #[test]
+    fn an_oversized_multibyte_reason_does_not_panic() {
+        let multibyte = "\u{4e16}".repeat(10_000);
+        let rendered = refusal_detail(Some(&multibyte));
+        assert!(
+            rendered.len() < MAX_REFUSAL_DETAIL + 128,
+            "bounded regardless of encoding: {} bytes",
+            rendered.len()
         );
     }
 
