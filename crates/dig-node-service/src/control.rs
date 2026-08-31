@@ -3730,6 +3730,29 @@ fn collateral_requirement(id: Value) -> Value {
 /// `Withheld` is the one row that describes a capsule relayed on a stranger's behalf, deliberately
 /// never advertised and therefore never bonded, so it locks nothing.
 ///
+/// # `Disabled` IS counted, and `Reclaiming` is too (dig-node#429)
+///
+/// Both look excludable and neither is, for the same reason: this is FORWARD-LOOKING advice about
+/// $DIG the operator must keep available, not a report of $DIG currently locked.
+///
+/// `Withheld` is a property of the CAPSULE - held on a stranger's behalf - and no setting makes a
+/// relayed capsule bondable, so its pair will never consume collateral and advising for it is
+/// advising for a spend that cannot occur.
+///
+/// `Disabled` is a node-wide SWITCH (SPEC 25.7), and every row reads `Disabled` while it is off.
+/// Were it excluded, the buffer advice would fall to zero for the whole node the moment
+/// collateralisation is switched off and leap back the moment it is switched on - telling an
+/// operator who is about to enable it that they need nothing, and stranding them short on the very
+/// next pass. Under-stating money the operator must hold is the reassuring direction, and it is the
+/// one direction a figure like this must never be wrong in.
+///
+/// `Reclaiming` is money in motion whose capsule is still served: at an epoch rollover the coin
+/// comes home and the SAME pair is bonded again next epoch, so the buffer it needs is unchanged.
+///
+/// So the exclusion is not "states where no coin exists right now" - `Unfunded` and `Deferred` have
+/// no coin either and are plainly counted. It is "pairs this node will never bond", which today is
+/// exactly `Withheld`.
+///
 /// Named and separated from [`collateral_buffer`] so the distinction is testable without a state
 /// directory: the caller feeds this into an amount of money, and a count that quietly includes rows
 /// locking nothing is a wrong figure on a money surface rather than a wrong figure about rows.
@@ -4071,6 +4094,22 @@ mod tests {
                         amount_dig_base_units: 1_000,
                     },
                 ),
+                // dig-node#429: switched off node-wide, and STILL bondable. A switch is not a
+                // property of the capsule; flip it and this pair locks collateral on the next pass.
+                (
+                    Bond::new("ff".repeat(32), "55".repeat(32)),
+                    BondState::Disabled,
+                ),
+                // Money in motion on a pair that is still served: the coin comes home at rollover
+                // and the same pair is bonded again, so the buffer it needs is unchanged.
+                (
+                    Bond::new("ab".repeat(32), "66".repeat(32)),
+                    BondState::Reclaiming {
+                        coin_id: "cd".repeat(32),
+                        epoch: 4,
+                        amount_dig_base_units: 1_000,
+                    },
+                ),
             ],
             locked_dig_base_units: 1_000,
             epoch: 4,
@@ -4078,14 +4117,59 @@ mod tests {
 
         assert_eq!(
             observation.states.len(),
-            4,
+            6,
             "the fixture must carry a row the answer EXCLUDES, or it cannot tell the contract from \
              a plain row count"
         );
         assert_eq!(
             bondable_pairs(&observation),
-            3,
-            "a `Withheld` row locks nothing and is not bondable; the other three are"
+            5,
+            "only `Withheld` is excluded: `Disabled` is a reversible node-wide switch and `Reclaiming` is a served pair whose coin is coming home, and both bond again next pass"
+        );
+    }
+
+    /// **Proves:** dig-node#429's contract question from the side that fails dangerously - a node
+    /// with collateralisation switched OFF still advises the buffer its pairs will need.
+    ///
+    /// **Catches:** excluding `Disabled` alongside `Withheld`, which is the plausible reading of
+    /// the exclusion's own doc and the one this ticket was opened to settle. The mixed fixture
+    /// above does detect that mistake as a count, but it cannot show the CONSEQUENCE, which is why
+    /// this case exists separately: when the switch is off, EVERY row is `Disabled`, so excluding
+    /// the state answers **zero** and tells a funded operator who is about to re-enable that they
+    /// need no $DIG at all.
+    ///
+    /// A `Withheld` row rides along as the control. Without it this fixture would also pass under
+    /// "count every row", which is not the contract either.
+    #[test]
+    fn a_node_with_collateralisation_switched_off_still_advises_for_the_pairs_it_will_bond() {
+        use crate::mirror::pass::BondState;
+        use crate::mirror::plan::Bond;
+        use crate::mirror::states::BondObservation;
+
+        let observation = BondObservation {
+            states: vec![
+                (
+                    Bond::new("aa".repeat(32), "11".repeat(32)),
+                    BondState::Disabled,
+                ),
+                (
+                    Bond::new("bb".repeat(32), "22".repeat(32)),
+                    BondState::Disabled,
+                ),
+                // The control: a relayed capsule is not bondable whatever the switch says.
+                (
+                    Bond::new("cc".repeat(32), "33".repeat(32)),
+                    BondState::Withheld,
+                ),
+            ],
+            locked_dig_base_units: 0,
+            epoch: 4,
+        };
+
+        assert_eq!(
+            bondable_pairs(&observation),
+            2,
+            "switching collateralisation off must not advise a zero buffer: the switch is reversible and these pairs lock $DIG on the pass after it is switched back on"
         );
     }
 
