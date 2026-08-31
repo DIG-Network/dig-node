@@ -903,10 +903,7 @@ impl RpcDispatch for Node {
             //     against, because it is not this operator's content. A `Local` read keeps `Announce`,
             //     which is the reshare flywheel: the operator's own read leaves content more
             //     available than it found it.
-            let claim = match origin {
-                crate::download::ReadOrigin::Local => crate::seams::dig_peer::HolderClaim::Announce,
-                _ => crate::seams::dig_peer::HolderClaim::Suppress,
-            };
+            let claim = holder_claim_for_read(origin);
             if node.sync_module_and_bound(store_hex, &root_hex, claim).await {
                 // The sync just wrote/replaced the on-disk module; drop any stale decoded entry so the
                 // cache reflects the newly-synced module rather than a prior decode.
@@ -1033,5 +1030,74 @@ impl RpcDispatch for Node {
             Err(e) => json!({"jsonrpc":"2.0","id":id,
             "error":{"code":-32000,"message":format!("upstream: {e}")}}),
         }
+    }
+}
+
+/// Which holder claim a `dig.getContent` miss-backfill lands under, decided from the read's origin.
+///
+/// This is the eleventh cache-write path (dig-node#436). `dig.getContent` for a capsule this node
+/// does not hold funnels through [`Node::sync_module_and_bound`] to `write_atomic`, reaching the
+/// cache WITHOUT passing `cache_fetch_and_cache` or `land_capsule_bytes`. It is remote-triggerable
+/// and behind no feature flag, so a stranger requesting content this node does not hold makes it
+/// pull a whole capsule — which, landed unmarked, would be `Held`: the bondable state a mirror coin
+/// is minted against.
+///
+/// A remote read therefore lands [`HolderClaim::Suppress`]. The capsule is still cached and still
+/// served to the requestor, exactly as before; it is simply never advertised and never bonded
+/// against, because it is not this operator's content.
+///
+/// A `Local` read keeps [`HolderClaim::Announce`], and that asymmetry is the point rather than an
+/// oversight: the operator's own read leaves content more available than it found it, which is the
+/// reshare flywheel. Suppressing every land through the shared choke point would satisfy the remote
+/// case while silently disabling that.
+///
+/// Extracted as a named function rather than left inline so the decision is testable on its own —
+/// an end-to-end assertion on the landed marker passes for many reasons, only one of which is this
+/// mapping being right.
+fn holder_claim_for_read(
+    origin: crate::download::ReadOrigin,
+) -> crate::seams::dig_peer::HolderClaim {
+    match origin {
+        crate::download::ReadOrigin::Local => crate::seams::dig_peer::HolderClaim::Announce,
+        // Every non-local origin is someone else's request, so its backfill is someone else's
+        // content. Enumerated exhaustively rather than by a wildcard would be better still, but the
+        // safe direction is the default here: a new origin variant lands SUPPRESSED, i.e. unbonded.
+        _ => crate::seams::dig_peer::HolderClaim::Suppress,
+    }
+}
+
+#[cfg(test)]
+mod holder_claim_tests {
+    use super::holder_claim_for_read;
+    use crate::download::ReadOrigin;
+    use crate::seams::dig_peer::HolderClaim;
+
+    /// **Proves (dig-node#436, the eleventh path):** a read arriving from a PEER backfills
+    /// unbonded.
+    ///
+    /// Before the fix this path landed with no claim at all, which reads as `Held` — so a stranger
+    /// could make this node stake its $DIG on content the stranger chose, in a default install.
+    ///
+    /// **Catches:** any relaxation of the remote arm back toward `Announce`.
+    #[test]
+    fn a_peer_read_backfills_suppressed() {
+        assert_eq!(
+            holder_claim_for_read(ReadOrigin::Peer),
+            HolderClaim::Suppress,
+            "a capsule pulled because a STRANGER asked for it is not this operator's content"
+        );
+    }
+
+    /// **The control.** The operator's own read must stay bondable, or the fix has disabled the
+    /// reshare flywheel for this node's own content while fixing the remote case.
+    ///
+    /// **Catches:** a blanket suppression of the shared choke point.
+    #[test]
+    fn a_local_read_backfills_announced() {
+        assert_eq!(
+            holder_claim_for_read(ReadOrigin::Local),
+            HolderClaim::Announce,
+            "the operator's own read leaves content more available than it found it"
+        );
     }
 }

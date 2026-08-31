@@ -6855,6 +6855,94 @@ mod tests {
         );
     }
 
+    /// **Proves (dig-node#436, the eleventh path):** a land driven by a REMOTE read must not be
+    /// bondable.
+    ///
+    /// `dig.getContent` for a capsule this node does not hold funnels through
+    /// `sync_module_and_bound` -> `sync_module` -> `sync_module_from`, reaching `write_atomic`
+    /// WITHOUT passing `cache_fetch_and_cache` or `land_capsule_bytes` — the two functions the
+    /// original enumeration was organised around, which is precisely why this path was missed. It
+    /// is remote-triggerable and behind no feature flag, so before the fix a stranger requesting
+    /// content this node did not hold made it pull a whole capsule and land it `Held` — the
+    /// bondable state — in a default install.
+    ///
+    /// **Catches:** any future caller of `sync_module_from` that lands a stranger's content
+    /// without suppressing the holder claim.
+    #[tokio::test]
+    async fn a_remote_read_path_land_is_not_bondable() {
+        let store = Bytes32([0x36u8; 32]);
+        let root = Bytes32([0x11u8; 32]);
+        let window = 4096;
+        let (capsule, root) = chain_anchored_module_with_filler(store.0, root.0, 64);
+        let base = spawn_capsule_rpc_upstream(
+            capsule.clone(),
+            window,
+            axum::http::StatusCode::BAD_REQUEST,
+        )
+        .await;
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
+
+        let served = node
+            .sync_module_from(
+                &base,
+                &store.to_hex(),
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Suppress,
+            )
+            .await
+            .expect("the capsule syncs");
+        assert_eq!(served, root);
+
+        let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        let marker = crate::capsule_key::relay_marker_beside(&path)
+            .expect("a cached capsule has a marker path beside it");
+        assert!(
+            marker.exists(),
+            "a capsule pulled on a stranger's behalf must carry its relay marker, so it is \
+             never announced and never bonded against"
+        );
+    }
+
+    /// **The control for [`a_remote_read_path_land_is_not_bondable`].**
+    ///
+    /// The operator's OWN read must stay bondable. Suppressing every land through
+    /// `sync_module_from` would satisfy the remote assertion above while silently disabling the
+    /// reshare flywheel for this operator's own content — the whole reason the claim is threaded
+    /// per call site instead of defaulted at the shared choke point.
+    ///
+    /// **Catches:** a fix that blanket-suppresses the choke point.
+    #[tokio::test]
+    async fn a_local_read_path_land_stays_bondable() {
+        let store = Bytes32([0x37u8; 32]);
+        let root = Bytes32([0x12u8; 32]);
+        let window = 4096;
+        let (capsule, root) = chain_anchored_module_with_filler(store.0, root.0, 64);
+        let base = spawn_capsule_rpc_upstream(
+            capsule.clone(),
+            window,
+            axum::http::StatusCode::BAD_REQUEST,
+        )
+        .await;
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
+
+        node.sync_module_from(
+            &base,
+            &store.to_hex(),
+            &root.to_hex(),
+            crate::seams::dig_peer::HolderClaim::Announce,
+        )
+        .await
+        .expect("the capsule syncs");
+
+        let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        let marker = crate::capsule_key::relay_marker_beside(&path)
+            .expect("a cached capsule has a marker path beside it");
+        assert!(
+            !marker.exists(),
+            "the operator's own read is this node's own content and must stay bondable"
+        );
+    }
+
     /// **#1886, the diagnosability half.** When both download paths fail, the reported reason
     /// carries the upstream's ACTUAL status. The message this replaced named three causes it
     /// had not checked ("no §21 identity, not authorized, or served root differs") and the
