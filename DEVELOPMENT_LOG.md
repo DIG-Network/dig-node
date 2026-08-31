@@ -4,6 +4,52 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## The mirror lifecycle observes correctly on a real machine, and `entries: []` there is a truth (#433)
+
+Measured 2026-08-31 on Windows 11 against a `dign` built from `9eb8fbd` (0.179.0), run with
+`RUST_LOG=mirror=debug`. The whole step-7 lifecycle is exercised at bring-up and answers:
+
+```
+$ dign mirror bond-states --json
+{"ok":true,...,"state":"known","entries":[],"complete":true,"cursor":null,
+ "locked_dig_base_units":0,"epoch":104}
+
+INFO  mirror: the mirror lifecycle is live: this node may create and reclaim collateral
+DEBUG mirror: mirror pass complete epoch=104 bonds=0 locked_dig_base_units=0 reclaimed=0 created=0
+```
+
+Three durable facts, each of which has already cost a wrong conclusion once:
+
+- **A `chain_unreadable` reading is only evidence about the binary that produced it.** #433 was
+  filed from installed `dign 0.172.0` = `6e8bfa7`, and step 7 (`5df3e34`) is not an ancestor of it.
+  That binary carried the stub, which answers `unknown { chain_unreadable }` by construction and
+  runs no pass at all. Before treating a mirror reading as a symptom, check
+  `git merge-base --is-ancestor <fix> $(git rev-list -n1 <version>)`.
+
+- **`entries: []` and a fabricated zero look identical on the wire, and are told apart by `state`.**
+  `state: "known"` with `complete: true` and a named epoch is a published observation from a pass
+  that genuinely read the chain — here, truthfully, that this node has never created a mirror coin.
+  The `Err` arms in `spawn_mirror_passes` deliberately do NOT publish, precisely so an empty page
+  can never mean "the read failed". Resolving a mirror `unknown` by returning an empty page would
+  destroy that distinction; it is a claim about money.
+
+- **`chain_unreadable` is the catch-all for five structurally different states**, only one of which
+  is a chain read failing: `enable_chain_sync == false` (no task is ever spawned), no operator
+  wallet (the task `return`s *permanently*), no epoch in force, `chain_source()` `Err`, and
+  `pass.run()` `Err`. The first two are terminal, not transient, so a node in either answers
+  `chain_unreadable` forever while its chain reads work perfectly — which sends an operator to
+  inspect peers that are fine. None was in force in this reading. Naming them needs a wider
+  `MirrorBondStatesUnknownReason`, which lives in `dig-node-control-interface` and is therefore a
+  release-first change rather than a dig-node edit.
+
+**What a mirror CREATE still needs, measured the same session.** Two independent blockers, so the
+#412 step-8 create/reclaim proof is not reachable by configuration alone: this node caches zero
+capsules (`observe_disk` reads `cache_list_cached`, and both pinned stores hold `capsule_count: 0`),
+so there is no `(store, root)` to bond; and it has no publishable advertise URL (#426), so `create`
+refuses by name ahead of any chain read. The advertise slot is not a formality to fill in — its
+value is written to chain as a claim about where this node can be fetched, so an invented URL is a
+permanent false advertisement on a money artifact.
+
 ## Two workflows assemble one release, so whichever finishes first used to publish it half-built (#335)
 
 A stable `vX.Y.Z` release of dig-node is built by **two** workflows that neither know about nor wait

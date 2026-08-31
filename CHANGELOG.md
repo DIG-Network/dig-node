@@ -4,14 +4,6 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.179.0] - 2026-08-31
-
-### Features
-- **mirror:** Construct the bond-state observation (#412 step 7) (#419)- **mirror:** Operator-scoped $DIG CAT coin selector for mirror creates (#421) (#423)- **mirror:** Advertised URLs this node can be fetched at (#426) (#430)- **dht:** Attach the untrusted mirror-coin pointer to the provider announce (#431)- **mirror:** Wire a production broadcaster for the mirror lifecycle (#424) (#434)
-
-### Bug Fixes
-- **wallet:** Honest refusal reasons when no signer is configured (#410) (#432)
-
 ## [0.172.0] - 2026-08-30
 
 ### Features
