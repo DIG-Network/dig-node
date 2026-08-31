@@ -74,6 +74,13 @@ mod forwarded_ask_tests;
 pub mod seams;
 pub mod tier0_live;
 pub mod tier0_prefetch;
+/// `dig-dht` itself, re-exported so a consumer implementing [`dht::MirrorCoinPointers`] names
+/// `ContentId` through THIS crate rather than declaring its own `dig-dht` dependency.
+///
+/// A second declaration is a second version constraint, and a consumer that resolved a different
+/// `dig-dht` minor would be handed a `ContentId` that is a different type with the same name — the
+/// split-line failure §2.4b exists to prevent, arriving through a trait nobody would think to check.
+pub use dig_dht;
 /// The `CapsuleStore` trait is seam 6's public surface (#1285 W1b-4) — bring it into scope to call
 /// `cache_list_cached`/`cache_remove_cached`/`cache_fetch_and_cache`/`gap_fill_generation`/
 /// `maybe_backfill_capsule`/`set_self_ref`/`arc_self` on a `Node`.
@@ -441,6 +448,19 @@ pub struct Node {
     /// on the FFI/consumer path (no peer network, no inbound peer demand), where the gate reads `None`
     /// and fails CLOSED (no peer-driven pull without a known identity to anchor the neighbourhood to).
     node_peer_id: OnceLock<[u8; 32]>,
+    /// This node's UNTRUSTED mirror-coin pointer source (dig-node#422/#435), attached to every DHT
+    /// announce so a verifier is told WHERE TO LOOK instead of scanning the shared mirror puzzle
+    /// hash.
+    ///
+    /// Installed by the service shell before [`peer::spawn_peer_network`], because the mirror
+    /// lifecycle that knows which coin bonds which capsule lives in `dig-node-service` and the DHT
+    /// lives here. A slot rather than a constructor argument for the same reason
+    /// [`Node::node_peer_id`] is one: the FFI/browser path has no mirror lifecycle and no peer
+    /// network, and must keep constructing a `Node` without either.
+    ///
+    /// `None` is an ORDINARY configuration, never a degraded one — a node with no pointer source
+    /// announces exactly as it always did, and the verifier's fallback is the hint scan.
+    mirror_pointers: OnceLock<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>>,
 }
 
 /// A boxed async hook that reconciles the node's DHT provider records with its current cache
@@ -4515,6 +4535,7 @@ impl Node {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         })
     }
 
@@ -4662,6 +4683,27 @@ impl Node {
     pub(crate) fn set_node_peer_id(&self, peer_id: [u8; 32]) {
         let _ = self.node_peer_id.set(peer_id);
     }
+
+    /// Install the untrusted mirror-coin pointer source every DHT announce attaches
+    /// (dig-node#435). Called by the service shell BEFORE the peer network is spawned; a later call
+    /// is ignored, so the source a running node publishes from cannot be swapped underneath it.
+    ///
+    /// Installing one is optional. What it must never do is fail an announce: the pointer is a hint
+    /// about where to look, and a node that could not produce one still holds and serves its
+    /// content.
+    pub fn set_mirror_coin_pointers(
+        &self,
+        pointers: std::sync::Arc<dyn crate::dht::MirrorCoinPointers>,
+    ) {
+        let _ = self.mirror_pointers.set(pointers);
+    }
+
+    /// The installed pointer source, if any.
+    pub(crate) fn mirror_coin_pointers(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>> {
+        self.mirror_pointers.get().cloned()
+    }
 }
 
 /// The COMPOSITION-ROOT upcasts (#1285 W1c — the locked "Option A" shape). `Node` stays ONE
@@ -4806,6 +4848,7 @@ pub(crate) mod test_support {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         };
         (Arc::new(node), td)
     }
@@ -5594,6 +5637,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         };
         (node, td)
     }
@@ -5726,6 +5770,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         };
 
         // Missing before the pull.
@@ -5792,6 +5837,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -5883,6 +5929,7 @@ mod tests {
                 chat: chat::ChatState::new(),
                 inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
+                mirror_pointers: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -5956,6 +6003,7 @@ mod tests {
                 chat: chat::ChatState::new(),
                 inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
+                mirror_pointers: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -8631,6 +8679,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         };
 
         let before = handle_rpc(
@@ -15486,6 +15535,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         // A holder for this EXACT content is known via the DHT.
@@ -15536,6 +15586,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
@@ -15585,6 +15636,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
 
@@ -15616,6 +15668,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -15656,6 +15709,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -15698,6 +15752,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);

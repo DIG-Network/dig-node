@@ -1707,7 +1707,62 @@ pub struct IncreaseDerivationIndex {
     pub index: u32,
 }
 
+/// `increase_derivation_index` response (dig-node#256).
+///
+/// # Why this method alone stopped sharing [`ActionResponse`]
+///
+/// The HD derivation floor decides WHICH addresses this node scans. Under the shared empty
+/// response a caller could not tell *"the floor was raised"* from *"nothing happened"* — and
+/// "nothing happened" is not hypothetical: the write is `MAX(col, ?)`, so a request below the
+/// current floor changes nothing by design, and a settings row that is absent updates no rows at
+/// all. In both cases the operator was told it succeeded, and **funds at higher indices stay
+/// invisible with no error, no retry and no way to know**. That is a surface lying about money.
+///
+/// # The shape is modelled on `ChiaPeerRemovalOutcome`, deliberately
+///
+/// The floors are reported as NUMBERS a consumer must read, not as a `bool` companion saying
+/// whether something changed. A boolean is ignorable; a floor is the actual answer to the
+/// question the caller asked — *up to which index is this wallet now scanning?* — and it is
+/// checkable against what they requested.
+///
+/// # Additive, so Sage parity holds (§5.1)
+///
+/// The wire shape was `{}`, and adding fields to it cannot break a client that parsed an empty
+/// object. A strict third-party client that ignores the new keys behaves exactly as before; one
+/// that reads them learns something it previously could not.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncreaseDerivationIndexResponse {
+    /// The hardened tree's derivation floor AFTER the call, or `None` when the caller did not ask
+    /// about the hardened tree.
+    ///
+    /// `None` is "not asked", never zero. A floor of 0 is a real claim — *this tree scans no
+    /// derived addresses* — and reporting one for a tree the request never mentioned would be the
+    /// same unknown-rendered-as-a-number defect this response exists to remove.
+    pub hardened_floor: Option<u32>,
+    /// The unhardened tree's derivation floor AFTER the call, under the same rule.
+    pub unhardened_floor: Option<u32>,
+}
+
 /// An empty response shared by every action method above (`{}`).
+///
+/// # When an empty response is the right answer, and when it is a lie (dig-node#256)
+///
+/// Nineteen methods return this. It is correct for the ones whose only outcomes are *the write
+/// landed* and *an `Err`*: a settings write (`set_network`, `set_target_peers`,
+/// `set_change_address`, `set_delta_sync`, …), a theme write, a peer add/remove, and the metadata
+/// resets (`resync_cat`, `update_cat`, `update_did_action`, `update_option_action`,
+/// `update_nft_action`, `update_nft_collection_action`, `redownload_nft_action`). Each is a true
+/// idempotent write with no observable difference between "changed it" and "it already said
+/// that", so there is nothing a richer response could truthfully report. This paragraph exists so
+/// the next reader does not re-litigate them.
+///
+/// It was NOT correct for `increase_derivation_index`, whose no-op is both reachable and
+/// money-class; that method now returns [`IncreaseDerivationIndexResponse`].
+///
+/// The remaining ones deserve outcomes of their own on evidence rather than on suspicion — a
+/// `redownload_nft` for an unknown id and an `update_nft` for an unknown id are the strongest
+/// candidates. They are NOT changed here, because this is a Sage-PARITY surface and a response
+/// shape must be established against Sage's own before it is widened.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ActionResponse {}
 
