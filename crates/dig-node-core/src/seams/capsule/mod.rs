@@ -5,7 +5,7 @@
 //! surface over it.
 
 mod capsule_download;
-mod capsule_store;
+pub(crate) mod capsule_store;
 pub(crate) mod push_capsule;
 
 pub use capsule_download::{download_capsule_via_rpc, CAPSULE_WINDOW_BYTES, MAX_CAPSULE_BYTES};

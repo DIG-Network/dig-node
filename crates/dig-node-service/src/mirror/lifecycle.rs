@@ -282,14 +282,22 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
                 // strand a coin every time a broadcast failed, and the failure path below already
                 // records that the money stayed put.
                 //
-                // That sentence is load-bearing and was FALSE until the broadcaster stopped reading
-                // `TxStatus::success`, which is true for a PENDING ack — a bundle the full node
-                // explicitly did not admit. `Ok` here therefore meant "reached the mempool OR was
-                // held for an unknown parent", and the held case took this branch: it extended the
-                // reservation, wrote a durable `Submitted` entry below, and every later pass then
-                // excluded those funding coins forever via `committed_funding_coin_ids`. Nothing
-                // reconciles that, so the coins were stranded against a spend nobody was holding.
-                // `dig_wallet::sage::spend::accepted_by_mempool` is what makes the sentence true.
+                // That sentence is load-bearing and was FALSE until the broadcaster stopped
+                // reading a flag that conflated admission with refusal. `chia_query` used to set
+                // `TxStatus::success` for a PENDING ack -- a bundle the full node explicitly did
+                // not admit -- so `Ok` here meant "reached the mempool OR was held for an unknown
+                // parent", and the held case took this branch: it extended the reservation, wrote a
+                // durable `Submitted` entry below, and every later pass then excluded those funding
+                // coins forever via `committed_funding_coin_ids`. Nothing reconciles that, so the
+                // coins were stranded against a spend nobody was holding.
+                //
+                // Two independent things now make the sentence true, and BOTH are deliberate.
+                // `dig_wallet::sage::spend::accepted_by_mempool` reads `MempoolInclusion`, so this
+                // node decides on admission rather than on a boolean; and `chia_query` 0.20 itself
+                // narrowed `success` to ack status 1 (DIG-Network/chia-query#48), so the flag no
+                // longer lies to any consumer. The local reading is not redundant: it is what keeps
+                // this branch correct without depending on a lower crate's flag continuing to mean
+                // what it means today.
                 //
                 // Reclaims feed it too, and that is deliberate: `funding_coin_ids` is read from the
                 // bundle, so this set holds exactly what the journal holds, and a set that

@@ -405,7 +405,16 @@ async fn dig_cache_fetch(headers: HeaderMap, Json(req): Json<CacheCapsuleReq>) -
         return (StatusCode::FORBIDDEN, "cache manager is wallet-local only").into_response();
     }
     let node = dig_node_core::Node::from_env();
-    match node.cache_fetch_and_cache(&req.store_id, &req.root).await {
+    // Self-origin only (refused above), so this is the operator caching their own capsule from
+    // their own wallet UI: bondable (dig-node#446 made the claim a required argument).
+    match node
+        .cache_fetch_and_cache(
+            &req.store_id,
+            &req.root,
+            dig_node_core::HolderClaim::Announce,
+        )
+        .await
+    {
         Ok((size_bytes, served_root)) => (
             StatusCode::OK,
             Json(serde_json::json!({

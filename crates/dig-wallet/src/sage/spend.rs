@@ -273,45 +273,88 @@ pub(crate) fn to_query_bundle(bundle: &SpendBundle) -> Result<chia_query::SpendB
     })
 }
 
-/// The ONE reading of a `push_tx` answer, and the reason it is not `status.success`.
+/// The ONE reading of a `push_tx` answer: admission, and the node's own words when it refused.
 ///
-/// A Chia `TransactionAck` carries three outcomes, and `chia_query` collapses two of them:
-/// `ack_to_tx_status` sets `success: true` for status **1 (SUCCESS)** *and* status **2 (PENDING)**.
-/// Those are not the same event. `SUCCESS` means the full node admitted the bundle to its mempool;
-/// `PENDING` means it did **not** — it is holding the bundle for an unknown parent, or refusing it
-/// for a fee below the mempool floor — and a held bundle may never be admitted at all.
+/// A Chia `TransactionAck` carries three outcomes. `chia_query` 0.20 reports them as
+/// [`chia_query::MempoolInclusion`] — `Admitted` (status 1), `NotAdmitted` (status 2, `PENDING`)
+/// and `Failed` (status 3) — with an `Unknown` default for a verdict the crate does not recognise.
+///
+/// `SUCCESS` means the full node admitted the bundle to its mempool; `PENDING` means it did **not**
+/// — it is holding the bundle for an unknown parent, or refusing it for a fee below the mempool
+/// floor — and a held bundle may never be admitted at all.
 ///
 /// [`Broadcaster::broadcast`] promises `Ok` "once the network has accepted it for the mempool", so
-/// only `SUCCESS` may return `Ok` here. Reading `success` instead would report a submission that
-/// never happened: the spend journal would record it, and the intra-pass reservation would strand
-/// the funding coin against a spend the network is not holding.
+/// only `Admitted` may return `Ok` here. `Unknown` fails closed with the rest: a verdict this crate
+/// cannot read is not evidence of admission.
+///
+/// This reads `inclusion`, not `status.success` and not the status NAME. Both of the older readings
+/// are now equivalent to it for every ack a full node sends — `chia_query` 0.20 narrowed `success`
+/// to status 1 alone (DIG-Network/chia-query#48) — but `inclusion` is the field that SAYS what is
+/// being asked, and a string comparison would silently start refusing every push if a label were
+/// ever relabelled upstream.
 ///
 /// Kept as a PURE function of the status rather than an inline branch so every ack shape is
 /// exercised directly — the mempool cannot be asked to produce a `PENDING` on demand.
 ///
 /// A refused push is FINAL, which is why this reads as a refusal rather than as "try again":
-/// `chia_query`'s router returns the FIRST `Ok` from `push_tx`, so a PENDING ack ends the push —
-/// there is no coinset second opinion and no retry against another peer.
+/// `chia_query`'s router returns the FIRST `Ok` from `push_tx`, so a `NotAdmitted` ack ends the
+/// push — there is no coinset second opinion and no retry against another peer.
 ///
-/// It cannot say WHY, and that is a limitation of the crate rather than a choice here: the
-/// `TransactionAck`'s own error text is discarded by `ack_to_tx_status`, so the ack NAME is the
-/// most specific thing available. An unknown parent and a fee below the mempool floor are
-/// different problems with different operator actions, and both arrive here as `PENDING`.
-///
-/// The comparison is on the status NAME, not the boolean: `chia_query`'s `success` is deliberately
-/// left alone. It is a published crate at a lower level whose other consumers may legitimately be
-/// asking "did the node take it" rather than "is it in the mempool"; widening this fix into that
-/// crate is a release-first cascade, tracked as DIG-Network/chia-query#48 — which also carries the
-/// discarded `ack.error`.
+/// It can now say WHY. The `TransactionAck`'s own `error` — `BAD_AGGREGATE_SIGNATURE`,
+/// `MEMPOOL_CONFLICT`, an unknown parent — is carried through verbatim by `chia_query` 0.20 and
+/// is appended to the refusal here, because those are different problems with different operator
+/// actions and recovering the text during a live incident previously cost hours. An ack that
+/// carries no text still names its verdict, which stays the most specific thing available.
 pub(crate) fn accepted_by_mempool(status: &chia_query::TxStatus) -> Result<()> {
-    if status.status == "SUCCESS" {
+    if status.inclusion.is_admitted() {
         return Ok(());
     }
     Err(Error::api(format!(
-        "the network did not admit the transaction to its mempool (ack: {}); nothing is pending on \
-         chain for this bundle",
-        status.status
+        "the network did not admit the transaction to its mempool (ack: {}{}); nothing is pending \
+         on chain for this bundle",
+        status.status,
+        refusal_detail(status.error.as_deref()),
     )))
+}
+
+/// The most peer-supplied refusal text this node will ever quote or persist.
+///
+/// A `TransactionAck.error` arrives from a Chia full node we did not choose and do not trust, and
+/// tungstenite admits a frame up to 64 MiB. That text now reaches `spend_audit`'s append-only JSONL,
+/// which `SpendLog::ledger()` reads back with `read_to_string` on the mirror pass's production path
+/// -- so an unbounded string is amplified once per WRITE and again on every READ, permanently.
+/// chia-query 0.19 discarded the field entirely, so this exposure is new with the 0.20 adoption.
+///
+/// 512 bytes is far more than any real reason needs (`BAD_AGGREGATE_SIGNATURE`, the one that cost a
+/// mainnet debugging session, is 22) while making the worst case bounded and dull.
+const MAX_REFUSAL_DETAIL: usize = 512;
+
+/// Renders the node's own refusal text for inclusion in a message, or nothing when it sent none.
+///
+/// Separate from [`accepted_by_mempool`] so the empty and present cases are both exercised without
+/// standing up an ack: an ack with no text must not render an empty `: ` that reads like a dropped
+/// reason.
+///
+/// TRUNCATED, and the truncation is announced rather than silent -- a reason cut off without saying
+/// so is a worse diagnostic than a short one, because the reader cannot tell the node's words from
+/// ours. Truncation is on a CHAR boundary, since the peer controls these bytes and slicing a UTF-8
+/// string mid-codepoint panics.
+fn refusal_detail(error: Option<&str>) -> String {
+    match error.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(reason) if reason.len() > MAX_REFUSAL_DETAIL => {
+            let cut = (0..=MAX_REFUSAL_DETAIL)
+                .rev()
+                .find(|&i| reason.is_char_boundary(i))
+                .unwrap_or(0);
+            format!(
+                "; node said (truncated from {} bytes): {}",
+                reason.len(),
+                &reason[..cut]
+            )
+        }
+        Some(reason) => format!("; node said: {reason}"),
+        None => String::new(),
+    }
 }
 
 #[async_trait]
@@ -1028,17 +1071,26 @@ mod tests {
     /// The exact ack `chia_query` produces for a `TransactionAck` status byte.
     ///
     /// This CALLS `chia_query::peer::translate::ack_to_tx_status` rather than restating its
-    /// mapping, so the coupling is real: rename a label there and these tests fail instead of
-    /// silently accommodating it. A hand-built `TxStatus` would leave [`accepted_by_mempool`]'s
-    /// `"SUCCESS"` literal free to drift out of agreement with the crate, and the node would refuse
-    /// every push with both tests still green.
+    /// mapping, so the coupling is real: change how a status byte maps there and these tests fail
+    /// instead of silently accommodating it. A hand-built `TxStatus` could assert an
+    /// `inclusion` the crate never produces, and the node would refuse every push with the tests
+    /// still green.
     ///
-    /// Boundary: this does NOT guard the `success` flag. [`accepted_by_mempool`] reads only
-    /// `status`, deliberately, because `success` conflates ACCEPTED with PENDING
-    /// (DIG-Network/chia-query#48) — so a change to that flag is invisible here by design, not by
-    /// omission.
+    /// Boundary: this builds the ack from the CRATE, including its `inclusion` and `error`, so the
+    /// tests below read whatever `chia_query` really produces for a status byte. That is the point
+    /// of routing through `ack_to_tx_status` rather than hand-building a `TxStatus`: a hand-built
+    /// fixture can assert a mapping the crate does not have, which is how a green test comes to
+    /// accompany a broken push.
     fn ack(status: u8) -> chia_query::TxStatus {
-        chia_query::peer::translate::ack_to_tx_status(status)
+        chia_query::peer::translate::ack_to_tx_status(status, None)
+    }
+
+    /// The same ack, carrying the full node's own refusal text.
+    ///
+    /// Kept beside [`ack`] rather than folded into it so every existing test keeps stating that it
+    /// does not care about the reason, and only the tests that DO care mention one.
+    fn ack_with_error(status: u8, error: &str) -> chia_query::TxStatus {
+        chia_query::peer::translate::ack_to_tx_status(status, Some(error.to_string()))
     }
 
     /// The status bytes, named, so the tests below read as the acks a full node actually sends.
@@ -1050,18 +1102,27 @@ mod tests {
     /// A PENDING ack is a REFUSAL, and it is the one ack that distinguishes this check from the
     /// obvious wrong one.
     ///
-    /// `chia_query` reports status 2 as `TxStatus { status: "PENDING", success: true }` — so a
-    /// broadcaster that reads `success` returns `Ok(())` for a bundle the full node never admitted
-    /// to its mempool. Every other ack shape agrees between the two readings; this fixture is the
-    /// only input that tells them apart, which is why it is written first and named for it.
+    /// `chia_query` reports status 2 as `NotAdmitted` -- the full node declining to take the
+    /// bundle, because it is holding it for an unknown parent or refusing it below the mempool
+    /// floor. It is the one ack that distinguishes admission from "the node answered", and every
+    /// other shape agrees between the two readings, which is why this case is written first.
+    ///
+    /// Before `chia_query` 0.20 this ack ALSO carried `success: true`, and the assertion below
+    /// pinned that conflation deliberately. 0.20 narrowed `success` to status 1 (#48), so the
+    /// assertion now pins the NARROWING instead: a regression that re-widened `success` fails here,
+    /// at the crate boundary, rather than silently in a broadcaster downstream.
     #[test]
     fn a_pending_ack_is_not_an_accepted_broadcast() {
         let pending = ack(ACK_PENDING);
         assert!(
-            pending.success,
-            "the fixture must carry the conflation it exists to catch: chia_query really does set \
-             success=true on PENDING, and a fixture with success=false would pass against the \
-             defect"
+            !pending.success,
+            "chia_query 0.20 narrowed `success` to ack status 1; a PENDING ack reporting success \
+             is the #48 conflation returning"
+        );
+        assert_eq!(
+            pending.inclusion,
+            chia_query::MempoolInclusion::NotAdmitted,
+            "a PENDING ack is the node DECLINING to admit, not a slow yes"
         );
 
         let err = accepted_by_mempool(&pending)
@@ -1070,6 +1131,131 @@ mod tests {
             err.to_string().contains("PENDING"),
             "the refusal must NAME the ack it saw, or an operator cannot tell a held bundle from a \
              rejected one: {err}"
+        );
+    }
+
+    /// The node's OWN refusal text reaches the caller, and it is what tells two refusals apart.
+    ///
+    /// This is the property #48 was filed for: `BAD_AGGREGATE_SIGNATURE` and `MEMPOOL_CONFLICT`
+    /// arrive as the SAME ack byte, so an operator reading only the verdict sees one message for
+    /// two problems with two different remedies. Recovering that text during a live incident cost
+    /// hours.
+    ///
+    /// The fixture is TWO refusals differing ONLY in their error text, because that is the pair the
+    /// nearest wrong implementation cannot separate: a version that formats the verdict and drops
+    /// the reason produces byte-identical messages here and passes any single-refusal assertion.
+    #[test]
+    fn a_refusal_carries_the_nodes_own_reason_and_two_reasons_read_differently() {
+        let bad_sig = accepted_by_mempool(&ack_with_error(ACK_FAILED, "BAD_AGGREGATE_SIGNATURE"))
+            .expect_err("a FAILED ack is never an admission");
+        let conflict = accepted_by_mempool(&ack_with_error(ACK_FAILED, "MEMPOOL_CONFLICT"))
+            .expect_err("a FAILED ack is never an admission");
+
+        assert!(
+            bad_sig.to_string().contains("BAD_AGGREGATE_SIGNATURE"),
+            "the node's own words must reach the operator: {bad_sig}"
+        );
+        assert_ne!(
+            bad_sig.to_string(),
+            conflict.to_string(),
+            "two refusals with different causes must not render identically -- an implementation \
+             that keeps the verdict and drops the reason passes every one-refusal assertion and \
+             still leaves an operator unable to act"
+        );
+    }
+
+    /// **A peer cannot make this node persist an unbounded string.**
+    ///
+    /// `TransactionAck.error` comes from a full node we did not choose, and tungstenite admits a
+    /// 64 MiB frame. That text reaches `spend_audit`'s append-only JSONL, which `SpendLog::ledger()`
+    /// reads back whole with `read_to_string` on the mirror pass's production path -- so the cost is
+    /// paid once per write and again on EVERY read, permanently. chia-query 0.19 discarded the
+    /// field, so this exposure arrived with the 0.20 adoption.
+    ///
+    /// Asserts three things a length check alone would miss: the output is bounded, the truncation
+    /// is ANNOUNCED (a silently cut reason is a worse diagnostic than a short one, because the
+    /// reader cannot tell the node's words from ours), and a short reason is left completely alone.
+    ///
+    /// **Catches:** removing the cap, and truncating silently.
+    #[test]
+    fn an_oversized_peer_reason_is_bounded_and_says_that_it_was_cut() {
+        let huge = "A".repeat(100_000);
+        let rendered = refusal_detail(Some(&huge));
+
+        assert!(
+            rendered.len() < MAX_REFUSAL_DETAIL + 128,
+            "a peer must not be able to make this node persist an unbounded string: {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains("truncated from 100000 bytes"),
+            "the cut must be announced, or a reader cannot tell the node's words from ours: {rendered}"
+        );
+        assert_eq!(
+            refusal_detail(Some("BAD_AGGREGATE_SIGNATURE")),
+            "; node said: BAD_AGGREGATE_SIGNATURE",
+            "a real reason is well under the cap and must pass through untouched"
+        );
+    }
+
+    /// A multi-byte reason truncated at the cap must not panic.
+    ///
+    /// The peer controls these bytes, so it controls where the codepoints fall. Slicing a UTF-8
+    /// string off a char boundary panics, which would turn a diagnostic string into a remote crash.
+    ///
+    /// **Catches:** truncating with a plain byte slice.
+    #[test]
+    fn an_oversized_multibyte_reason_does_not_panic() {
+        let multibyte = "\u{4e16}".repeat(10_000);
+        let rendered = refusal_detail(Some(&multibyte));
+        assert!(
+            rendered.len() < MAX_REFUSAL_DETAIL + 128,
+            "bounded regardless of encoding: {} bytes",
+            rendered.len()
+        );
+    }
+
+    /// An ack with NO reason renders cleanly, and an ack WITH one renders the reason -- the two
+    /// halves of the same decision, asserted against each other.
+    ///
+    /// A full node does not always send error text. Appending it unconditionally yields a dangling
+    /// `; node said: ` that reads like a reason the node gave and this code lost, which is a worse
+    /// failure than saying nothing: it sends an operator looking for a message that never existed.
+    #[test]
+    fn a_reasonless_refusal_does_not_render_an_empty_reason() {
+        let bare = accepted_by_mempool(&ack(ACK_PENDING))
+            .expect_err("a PENDING ack is never an admission")
+            .to_string();
+        let with_reason = accepted_by_mempool(&ack_with_error(ACK_PENDING, "unknown parent"))
+            .expect_err("a PENDING ack is never an admission")
+            .to_string();
+
+        assert!(
+            !bare.contains("node said"),
+            "an ack that carried no reason must not imply one was given: {bare}"
+        );
+        assert!(
+            bare.contains("PENDING"),
+            "the verdict is always available and must still be named: {bare}"
+        );
+        assert!(
+            with_reason.contains("unknown parent"),
+            "a reason that WAS given must appear: {with_reason}"
+        );
+    }
+
+    /// Whitespace-only error text is treated as no text at all.
+    ///
+    /// Kept as its own case because it is the input that makes the empty check and the presence
+    /// check disagree: `Some("  ")` is present to an `is_some()` reading and absent to a reader.
+    #[test]
+    fn whitespace_only_reason_is_treated_as_no_reason() {
+        let msg = accepted_by_mempool(&ack_with_error(ACK_FAILED, "   "))
+            .expect_err("a FAILED ack is never an admission")
+            .to_string();
+        assert!(
+            !msg.contains("node said"),
+            "blank text is not a reason and must not be presented as one: {msg}"
         );
     }
 

@@ -92,7 +92,9 @@ pub use seams::content::{bandwidth, verification_ledger, ContentServer};
 /// The `PeerNetwork` trait is seam 2's public surface (#1285 W1b-2) — bring it into scope to
 /// call `peer_status`/`set_inventory_refresher`/`set_gossip_handle`/`gossip_handle`/
 /// `refresh_dht_inventory` on a `Node`.
-pub use seams::dig_peer::{address_book, bootstrap, dht, net, pex, session, PeerNetwork};
+pub use seams::dig_peer::{
+    address_book, bootstrap, dht, net, pex, session, HolderClaim, PeerNetwork,
+};
 /// The `RpcDispatch` trait is seam 4's public surface (#1285 W1b-5) — the crate-root
 /// `handle_rpc`/`handle_rpc_json` free functions delegate to it; most callers keep using those
 /// stable entry points and never need this trait in scope directly.
@@ -4598,8 +4600,28 @@ impl Node {
             && self.inbound_demand_pull_admitted(store_hex, root_hex)
         {
             // Tier1Demand is asserted in the ledger above; the on-disk pull reuses the fetch-side
-            // machinery, which lands + announces the capsule exactly as every other cache path does.
-            self.spawn_capsule_backfill(store_hex, root_hex);
+            // machinery, which lands the capsule exactly as every other cache path does.
+            //
+            // The claim is DERIVED from this trigger's origin, and this trigger is a remote peer's
+            // serve request -- `ReadOrigin::Peer` -- so the land is `Suppress`: cached and served
+            // normally, never advertised and never bonded against (dig-node#446). It used to land
+            // ANNOUNCED, because the claim was hard-coded at the bottom of the chain where the
+            // control-plane call sites are; that made a stranger's chosen capsule this operator's
+            // own, with this operator's $DIG staked on it via the mirror broadcaster.
+            //
+            // `FirstParty` is correct on this axis and is not a shortcut: the cross-site axis
+            // exists to catch a LOCAL socket carrying a stranger's request, and there is no browser
+            // and no site here -- this is a peer connection, whose origin is already `Peer`. The
+            // fold is only ever restrictive, so the pair cannot resolve to anything weaker than
+            // `Peer` gives on its own.
+            self.spawn_capsule_backfill(
+                store_hex,
+                root_hex,
+                crate::seams::dig_rpc::holder_claim_for_landing(
+                    crate::download::ReadOrigin::Peer,
+                    crate::download::RequestProvenance::FirstParty,
+                ),
+            );
         }
     }
 
@@ -5709,7 +5731,15 @@ mod tests {
         assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
 
         // Gap-fill pulls + verifies + lands the module under (store, root).
-        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(
+                store_id,
+                root,
+                crate::seams::dig_peer::HolderClaim::Announce
+            )
+            .await,
+            Ok(())
+        );
         let cached =
             std::fs::read(module_path(&node.cache_dir, &store_hex, &root.to_hex())).unwrap();
         assert_eq!(
@@ -5718,7 +5748,15 @@ mod tests {
         );
 
         // A second gap-fill is an idempotent no-op (already held → cheap success).
-        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(
+                store_id,
+                root,
+                crate::seams::dig_peer::HolderClaim::Announce
+            )
+            .await,
+            Ok(())
+        );
     }
 
     /// **Proves:** the chain-watch loop's PRODUCTION seams (`NodeGapFiller` + `NodeHeldCheck`) wire the
@@ -6566,6 +6604,107 @@ mod tests {
         );
     }
 
+    /// **Proves (dig-node#446):** a REMOTE peer's inbound demand starts its backfill with
+    /// `HolderClaim::Suppress`, so the capsule it causes to land is cached and served but never
+    /// advertised and never bonded against.
+    ///
+    /// **Why this is not covered by the existing tests.** `holder_claim_for_landing` was already
+    /// correct and already had four unit tests over its four input combinations, and
+    /// `inbound_demand_opt_in_spawns_a_backfill_for_an_uncached_store` already proved this trigger
+    /// reaches the pull. The capsule still landed ANNOUNCED, because the claim was hard-coded at the
+    /// bottom of the chain and no test asserted which claim this trigger PASSES. The capability was
+    /// tested; the wiring was not.
+    ///
+    /// **Catches:** the claim reverting to a hard-coded `Announce` anywhere on
+    /// `note_inbound_demand` -> `spawn_capsule_backfill` -> `gap_fill_generation` ->
+    /// `cache_fetch_and_cache`, which stakes this operator's $DIG on a stranger's chosen content.
+    ///
+    /// Reachable only with `DIG_NODE_INBOUND_DEMAND_CACHE` on, which is default OFF -- so this was
+    /// never exploitable in a default install. An operator who enables a documented feature is
+    /// still not consenting to bond a stranger's capsule.
+    #[test]
+    fn inbound_demand_backfill_is_started_as_relayed_not_as_this_nodes_own() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        std::env::set_var("DIG_NODE_INBOUND_DEMAND_CACHE", "on");
+        crate::seams::capsule::capsule_store::backfill_claim_probe::reset();
+        let rt = pin_test_rt();
+        let (store, tip, _rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        node.set_node_peer_id(capsule_neighbourhood_peer_id(store.0, tip.0));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        let (s, r) = (store.to_hex(), tip.to_hex());
+        rt.block_on(async { node.note_inbound_demand(&s, &r) });
+        let started = crate::seams::capsule::capsule_store::backfill_claim_probe::take();
+        std::env::remove_var("DIG_NODE_INBOUND_DEMAND_CACHE");
+
+        assert_eq!(
+            started,
+            Some(crate::seams::dig_peer::HolderClaim::Suppress),
+            "a remote peer's demand must start a RELAYED backfill; `Announce` here lands a \
+             stranger's capsule bondable, and `None` means the trigger never reached the pull at \
+             all, which would make this assertion vacuous"
+        );
+    }
+
+    /// **The control for the test above, and the one that catches an OVER-correction.**
+    ///
+    /// The operator's OWN read must still start its backfill as `Announce`, i.e. bondable. The
+    /// tempting wrong fix for dig-node#446 is to suppress every land at the shared choke point:
+    /// that satisfies the remote case exactly, and silently disables the reshare flywheel for the
+    /// operator's own content -- a failure this repo would not see until nobody's node advertised
+    /// anything.
+    ///
+    /// The two tests differ in ONE input: which trigger fires. Both reach the same
+    /// `spawn_capsule_backfill`, so a single observable telling them apart is the whole proof.
+    #[test]
+    fn a_local_origin_miss_still_starts_a_bondable_backfill() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        crate::seams::capsule::capsule_store::backfill_claim_probe::reset();
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let _resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":9,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                "length": 4096, "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            crate::seams::capsule::capsule_store::backfill_claim_probe::take(),
+            Some(crate::seams::dig_peer::HolderClaim::Announce),
+            "the operator's own read must still leave content more available than it found it; \
+             suppressing here would fix dig-node#446 by disabling the reshare flywheel"
+        );
+    }
+
     /// **Proves (#1990):** with the operator opt-in ON, a peer's request for an UNCACHED store spawns
     /// a tier-1 whole-capsule backfill (the same single-flight machinery the fetch-side leg uses).
     /// **Catches:** the opt-in gate failing to reach the shared pull body, or the demand trigger not
@@ -7006,7 +7145,11 @@ mod tests {
         let root_hex = Bytes32([0x32u8; 32]).to_hex();
 
         let err = node
-            .cache_fetch_and_cache(&store_hex, &root_hex)
+            .cache_fetch_and_cache(
+                &store_hex,
+                &root_hex,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect_err("both paths refused");
 
@@ -7203,7 +7346,11 @@ mod tests {
         install_announce_spy(&node, announced.clone());
 
         let outcome = node
-            .cache_fetch_and_cache(&store_hex, &served_root.to_hex())
+            .cache_fetch_and_cache(
+                &store_hex,
+                &served_root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await;
 
         assert!(
@@ -7237,7 +7384,11 @@ mod tests {
         install_announce_spy(&node, announced.clone());
 
         let (len, _root) = node
-            .cache_fetch_and_cache(&store_hex, &root.to_hex())
+            .cache_fetch_and_cache(
+                &store_hex,
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("a chain-confirmed capsule is fetched and cached");
 
@@ -8088,7 +8239,11 @@ mod tests {
         seed_module(&node, &hex::encode(store), &root.to_hex(), b"already-here");
         // Upstream is unroutable in test_node, so a real pull would fail; an already-held
         // generation must succeed WITHOUT touching it.
-        assert_eq!(node.gap_fill_generation(store, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(store, root, crate::seams::dig_peer::HolderClaim::Announce)
+                .await,
+            Ok(())
+        );
     }
 
     // -- Cached-store management RPCs (the DIG-settings cache manager, task #32) -
@@ -8487,7 +8642,15 @@ mod tests {
             .as_u64()
             .unwrap();
 
-        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(
+                store_id,
+                root,
+                crate::seams::dig_peer::HolderClaim::Announce
+            )
+            .await,
+            Ok(())
+        );
 
         let after = handle_rpc(
             &node,
@@ -8506,7 +8669,15 @@ mod tests {
         // A second gap-fill of the SAME (already-held) generation is a no-op — it must NOT perform
         // another network land. Proved directly (not via the shared counter, for the same reason as
         // above): the cached bytes are exactly the original module, unchanged by the repeat call.
-        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(
+                store_id,
+                root,
+                crate::seams::dig_peer::HolderClaim::Announce
+            )
+            .await,
+            Ok(())
+        );
         let cached =
             std::fs::read(module_path(&node.cache_dir, &store_hex, &root.to_hex())).unwrap();
         assert_eq!(
@@ -8782,7 +8953,11 @@ mod tests {
         // A second fetch of the now-present capsule reports already_cached without
         // re-downloading.
         let again = node
-            .cache_fetch_and_cache(&store_hex, &root_hex)
+            .cache_fetch_and_cache(
+                &store_hex,
+                &root_hex,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .unwrap();
         assert_eq!(again.0, module.len() as u64);
@@ -8826,9 +9001,13 @@ mod tests {
         }));
 
         // Fresh land → exactly one announce.
-        node.cache_fetch_and_cache(&store_hex, &root_hex)
-            .await
-            .unwrap();
+        node.cache_fetch_and_cache(
+            &store_hex,
+            &root_hex,
+            crate::seams::dig_peer::HolderClaim::Announce,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             announces.load(Ordering::SeqCst),
             1,
@@ -8836,9 +9015,13 @@ mod tests {
         );
 
         // Already cached → no re-announce (dedupe; inventory unchanged).
-        node.cache_fetch_and_cache(&store_hex, &root_hex)
-            .await
-            .unwrap();
+        node.cache_fetch_and_cache(
+            &store_hex,
+            &root_hex,
+            crate::seams::dig_peer::HolderClaim::Announce,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             announces.load(Ordering::SeqCst),
             1,
@@ -8871,7 +9054,13 @@ mod tests {
 
         let store_id: [u8; 32] = hex::decode(&store_hex).unwrap().try_into().unwrap();
         let root = digstore_core::Bytes32::from_hex(&root_hex).unwrap();
-        node.gap_fill_generation(store_id, root).await.unwrap();
+        node.gap_fill_generation(
+            store_id,
+            root,
+            crate::seams::dig_peer::HolderClaim::Announce,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             announces.load(Ordering::SeqCst),
             1,
@@ -8886,7 +9075,10 @@ mod tests {
         let (node, _td) = test_node(None);
         let store = "ee".repeat(32);
         let root = "55".repeat(32);
-        let err = node.cache_fetch_and_cache(&store, &root).await.unwrap_err();
+        let err = node
+            .cache_fetch_and_cache(&store, &root, crate::seams::dig_peer::HolderClaim::Announce)
+            .await
+            .unwrap_err();
         assert!(!err.is_empty(), "fetch without identity surfaces an error");
 
         let resp = handle_rpc(

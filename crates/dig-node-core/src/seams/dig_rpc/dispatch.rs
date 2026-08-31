@@ -761,7 +761,15 @@ impl RpcDispatch for Node {
                 // `module_exists` re-validates the caller's key, so a non-canonical one reports
                 // not-already-cached without a path ever being built (#1599).
                 let already = crate::module_exists(&node.cache_dir, store_hex, root_hex);
-                return match node.cache_fetch_and_cache(store_hex, root_hex).await {
+                // DERIVED from this request's own two axes, not assumed to be operator-initiated
+                // (dig-node#446). `cache.fetchAndCache` reads as a control-plane verb, and for the
+                // control-plane call sites it is one -- but this dispatcher is handed an `origin`
+                // precisely because it does not get to assume who is calling. Deriving costs
+                // nothing and removes the assumption: a local operator invocation still lands
+                // `Announce` and keeps the flywheel, and anything arriving on a stranger's behalf
+                // lands `Suppress` -- cached and served, never advertised, never bonded against.
+                let claim = holder_claim_for_landing(origin, provenance);
+                return match node.cache_fetch_and_cache(store_hex, root_hex, claim).await {
                     Ok((size_bytes, served_root)) => {
                         // A freshly-cached capsule makes this node a discoverable DHT holder — that
                         // re-announce (§14.1) now fires once inside `cache_fetch_and_cache` on the fresh

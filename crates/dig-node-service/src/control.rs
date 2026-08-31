@@ -1203,7 +1203,13 @@ async fn hosted_pin(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 
     // Pre-fetch when we have a concrete root and §21 sync is available.
     let fetch = match (&root, ctx.sync_available) {
-        (Some(r), true) => match ctx.node.cache_fetch_and_cache(&store_id, r).await {
+        // `cache.pin` is an operator control verb, so its pre-fetch lands this operator's own
+        // content and stays bondable (dig-node#446 made the claim a required argument).
+        (Some(r), true) => match ctx
+            .node
+            .cache_fetch_and_cache(&store_id, r, dig_node_core::HolderClaim::Announce)
+            .await
+        {
             Ok((size_bytes, served_root)) => json!({
                 "status": "cached",
                 "size_bytes": size_bytes,
@@ -1453,7 +1459,12 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 
     // Rootless: the CHAIN picks the generation, never the serving upstream.
     let outcome = match &root {
-        Some(root) => ctx.node.cache_fetch_and_cache(&store_id, root).await,
+        // An operator-invoked control verb: this node's own capsule, bondable (dig-node#446).
+        Some(root) => {
+            ctx.node
+                .cache_fetch_and_cache(&store_id, root, dig_node_core::HolderClaim::Announce)
+                .await
+        }
         None => ctx.node.sync_whole_store(&store_id).await,
     };
 

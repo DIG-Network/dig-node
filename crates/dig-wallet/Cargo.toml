@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.42.1"
+version = "0.43.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -109,7 +109,7 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 # workspace repointed the digstore git rev onto it, and chia types now cross the
 # dig-wallet -> dig-node-core boundary on ONE line (0.36.1). So 0.19 needs no shim and none was
 # added. Verify from `Cargo.lock`, never from this comment.
-chia-query = "0.19.0"
+chia-query = "0.20.0"
 # Diagnostics MUST go through `tracing`, never stderr. dig-node installs the `dig-logging`
 # subscriber process-globally (dig-node-service::logging), and a Windows service has no stderr
 # to discard to — an `eprintln!` here reaches nobody, which is why a chain-source failure stayed

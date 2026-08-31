@@ -500,7 +500,16 @@ impl ChainTransport {
             .await
             .map_err(|e| Error::internal(format!("push failed to reach a mempool: {e}")))?;
 
-        Ok(if status.success {
+        // Read ADMISSION, not `success`, and not the status label.
+        //
+        // Until `chia_query` 0.20 this branch was `status.success`, which was also true for a
+        // status-2 (`PENDING`) ack -- the full node explicitly DECLINING to admit the bundle. That
+        // produced `PushOutcome { accepted: true, transaction_id: Some(..) }`: the node telling a
+        // caller its spend had landed, with a transaction id to point at, while no mempool held it.
+        // 0.20 narrowed `success` to status 1 alone (DIG-Network/chia-query#48), so that reading is
+        // no longer wrong -- but `inclusion` is the field that NAMES the question, and `Unknown`
+        // fails closed here for free.
+        Ok(if status.inclusion.is_admitted() {
             PushOutcome {
                 accepted: true,
                 transaction_id: Some(hex::encode(bundle.name())),
@@ -510,7 +519,15 @@ impl ChainTransport {
             PushOutcome {
                 accepted: false,
                 transaction_id: None,
-                rejection: Some(status.status),
+                // The node's OWN words when it sent them, so an operator sees
+                // `BAD_AGGREGATE_SIGNATURE` rather than a bare `PENDING`. Both are carried: the
+                // verdict is always present, the reason is not.
+                rejection: Some(match status.error.as_deref().map(str::trim) {
+                    Some(reason) if !reason.is_empty() => {
+                        format!("{}: {reason}", status.status)
+                    }
+                    _ => status.status.clone(),
+                }),
             }
         })
     }
