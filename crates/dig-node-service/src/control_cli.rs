@@ -400,8 +400,35 @@ impl ControlAction {
 /// `--json`). Transport / node errors surface as `io::Error` for the differentiated exit code.
 pub fn run(config: &Config, action: ControlAction) -> std::io::Result<Outcome> {
     let method = action.method();
-    let result = call_control(config, method, action.wire_params())?;
+    let result = call_control(config, method, action.wire_params())
+        .map_err(|e| explain_unreachable(method, e))?;
     Ok(Outcome::new(summarize(method, &result), result))
+}
+
+/// Restate an unreachable-node failure as what it is: the operation was never measured (#407).
+///
+/// Only the `ConnectionRefused` class is touched, and only its MESSAGE -- the kind is preserved
+/// so [`crate::cli::ExitCode::from_io_error`] still resolves it to `NODE_UNREACHABLE`. Any other
+/// error passes through untouched, because a node that answered and refused has measured
+/// something and its own words are the accurate ones.
+///
+/// `control.updater.*` gets a sharper sentence because it has a specific, EXPECTED cause. A
+/// successful update installs new bytes and cycles the service, so the pass that just succeeded
+/// is itself why the node stopped answering. Reporting that as a failure is the cry-wolf case
+/// the epic's silent-staged-install policy cannot afford: under a policy where nothing blocks and
+/// nothing asks, the status surface is all an operator has.
+fn explain_unreachable(method: &str, e: std::io::Error) -> std::io::Error {
+    if e.kind() != std::io::ErrorKind::ConnectionRefused {
+        return e;
+    }
+    let context = if method.starts_with("control.updater.") {
+        " — the update pass may have completed and restarted the node, which is the normal end \
+          of a successful update. This did NOT observe a failed update; it observed nothing. \
+          Re-run once the service is back."
+    } else {
+        " — nothing was measured about this request; it never reached the node."
+    };
+    std::io::Error::new(e.kind(), format!("{e}{context}"))
 }
 
 /// Every `control.*` method reachable from a `dig-node` CLI verb — the union of the
@@ -1495,6 +1522,56 @@ fn render_record(record: &crate::collateral::StoredRecord) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// #407 -- `dign updater check-now` probing inside the restart window reported IO_ERROR,
+    /// which reads to an operator exactly like an update that broke the node. It is the opposite:
+    /// a successful pass installs new bytes and cycles the service, so the restart is the normal
+    /// END of the thing that succeeded.
+    ///
+    /// The fixture varies the ERROR KIND against a fixed method, and the method against a fixed
+    /// kind, because the nearest wrong implementation is "treat every updater failure as a
+    /// restart" -- which would swallow a real decline and passes any assertion that only checks
+    /// the happy restart case.
+    #[test]
+    fn an_unreachable_updater_probe_says_it_measured_nothing() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "could not reach");
+        let out = explain_unreachable("control.updater.checkNow", e);
+
+        assert_eq!(
+            out.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "the kind carries the exit code and must survive"
+        );
+        let msg = out.to_string();
+        assert!(msg.contains("restarted the node"), "{msg}");
+        assert!(msg.contains("observed nothing"), "{msg}");
+    }
+
+    /// The control that makes the test above load-bearing: a node that ANSWERED and declined has
+    /// measured something, and its own words are the accurate ones. They must pass through
+    /// untouched -- no restart story bolted onto a real failure.
+    #[test]
+    fn a_genuine_decline_is_not_reframed_as_a_restart() {
+        let e = std::io::Error::other("dig-node: dig-updater declined the request: no such channel");
+        let out = explain_unreachable("control.updater.checkNow", e);
+
+        assert_eq!(out.kind(), std::io::ErrorKind::Other);
+        let msg = out.to_string();
+        assert!(msg.contains("declined the request"), "{msg}");
+        assert!(!msg.contains("restarted the node"), "a measured failure must not be excused: {msg}");
+    }
+
+    /// A non-updater verb hitting the same unreachable node gets the general statement, not the
+    /// update story -- there is no update pass to attribute the silence to.
+    #[test]
+    fn a_non_updater_verb_gets_the_general_unreachable_statement() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "could not reach");
+        let out = explain_unreachable("control.cache.get", e);
+
+        let msg = out.to_string();
+        assert!(msg.contains("never reached the node"), "{msg}");
+        assert!(!msg.contains("update pass"), "{msg}");
+    }
     use super::*;
     use crate::control::CONTROL_METHODS;
 

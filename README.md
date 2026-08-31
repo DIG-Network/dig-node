@@ -332,6 +332,7 @@ typed `ExitCode` enum in `src/cli.rs`:
 | 4 | `SERVICE_FAILED` | A service operation failed (register/start/stop/uninstall). |
 | 5 | `BIND_FAILED` | `run`: could not bind the loopback address. |
 | 6 | `IO_ERROR` | Other I/O error. |
+| 7 | `NODE_UNREACHABLE` | The node did not answer; the operation was not measured. |
 
 ### JSON-RPC error-code catalogue
 

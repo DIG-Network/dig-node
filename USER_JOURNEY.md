@@ -163,7 +163,7 @@ every subcommand (machine output to stdout, prose to stderr).
 - **`--json`** on the CLI: success → `{ ok:true, action, service, version, …result }`; failure →
   `{ ok:false, error:{ code, exit_code, message, hint } }`.
 - **Exit-code table** (documented in the README + `src/cli.rs`): `0 OK`, `1 NOT_SERVING`,
-  `2 USAGE`, `3 PERMISSION_DENIED`, `4 SERVICE_FAILED`, `5 BIND_FAILED`, `6 IO_ERROR`.
+  `2 USAGE`, `3 PERMISSION_DENIED`, `4 SERVICE_FAILED`, `5 BIND_FAILED`, `6 IO_ERROR`, `7 NODE_UNREACHABLE`.
 - **Stable JSON-RPC error codes** (UPPER_SNAKE in `error.data.code`): `PARSE_ERROR` (-32700),
   `INVALID_REQUEST` (-32600), `METHOD_NOT_FOUND` (-32601), `INVALID_PARAMS` (-32602),
   `DISPATCH_FAILED` (-32000, shell), `UPSTREAM_ERROR` (-32010, shell), and the control-plane codes

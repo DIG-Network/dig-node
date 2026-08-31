@@ -19,6 +19,7 @@
 //! | 4    | SERVICE_FAILED      | A service operation failed (register/start/stop).|
 //! | 5    | BIND_FAILED         | `run`: could not bind the loopback address.      |
 //! | 6    | IO_ERROR            | Other I/O error.                                 |
+//! | 7    | NODE_UNREACHABLE    | The node did not answer; nothing was measured.    |
 
 use serde_json::{json, Value};
 
@@ -43,6 +44,14 @@ pub enum ExitCode {
     BindFailed,
     /// 6 — any other I/O error.
     IoError,
+    /// 7 — the node did not answer, so the operation was never measured (dig-node#407).
+    ///
+    /// Deliberately NOT `IO_ERROR`: that code says an I/O operation was attempted and failed,
+    /// which is a claim about the requested operation. An unreachable node is a failure to
+    /// MEASURE, not a measured failure, and the two must not share an encoding -- the restart
+    /// window an update opens is exactly when the difference matters, and a caller that cannot
+    /// tell them apart learns to ignore both.
+    NodeUnreachable,
 }
 
 impl ExitCode {
@@ -56,6 +65,7 @@ impl ExitCode {
             ExitCode::ServiceFailed => 4,
             ExitCode::BindFailed => 5,
             ExitCode::IoError => 6,
+            ExitCode::NodeUnreachable => 7,
         }
     }
 
@@ -69,6 +79,7 @@ impl ExitCode {
             ExitCode::ServiceFailed => "SERVICE_FAILED",
             ExitCode::BindFailed => "BIND_FAILED",
             ExitCode::IoError => "IO_ERROR",
+            ExitCode::NodeUnreachable => "NODE_UNREACHABLE",
         }
     }
 
@@ -86,6 +97,9 @@ impl ExitCode {
             }
             ExitCode::BindFailed => "run: could not bind the loopback address.",
             ExitCode::IoError => "Other I/O error.",
+            ExitCode::NodeUnreachable => {
+                "The node did not answer; the operation was not measured (it may be restarting)."
+            }
         }
     }
 
@@ -99,6 +113,9 @@ impl ExitCode {
             // A bad argument surfaced as `InvalidInput` (e.g. `dig-node open` rejecting a
             // non-DIG/malformed link) is a USAGE error, not a generic I/O failure.
             InvalidInput => ExitCode::Usage,
+            // The node did not answer. Nothing was measured about the requested operation, so
+            // this must not be reported as an I/O failure OF that operation (#407).
+            ConnectionRefused => ExitCode::NodeUnreachable,
             _ => ExitCode::IoError,
         }
     }
@@ -113,6 +130,7 @@ impl ExitCode {
             ExitCode::ServiceFailed,
             ExitCode::BindFailed,
             ExitCode::IoError,
+            ExitCode::NodeUnreachable,
         ]
     }
 }
@@ -178,6 +196,42 @@ pub fn error_envelope(action: &str, exit: ExitCode, message: &str, hint: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #407 -- an unreachable node must not be reported as an I/O failure OF the request.
+    ///
+    /// The two arms are asserted TOGETHER because the property is a distinction, not an outcome:
+    /// a "fix" that renamed code 6, or that mapped every failure to the new code, satisfies
+    /// either arm alone. `Other` is the genuine-I/O-failure control and must stay `IO_ERROR`.
+    #[test]
+    fn an_unreachable_node_is_distinguished_from_a_measured_io_failure() {
+        let unreachable =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "node not answering");
+        let measured = std::io::Error::other("the disk gave up mid-write");
+
+        assert_eq!(ExitCode::from_io_error(&unreachable), ExitCode::NodeUnreachable);
+        assert_eq!(ExitCode::from_io_error(&measured), ExitCode::IoError);
+        assert_ne!(
+            ExitCode::from_io_error(&unreachable).code(),
+            ExitCode::from_io_error(&measured).code(),
+            "a failure to measure and a measured failure must not share an exit code"
+        );
+    }
+
+    /// The catalogue is the machine-readable contract (§6.2), and a code missing from it is
+    /// invisible to every consumer that enumerates rather than guesses.
+    #[test]
+    fn the_new_code_is_in_the_catalogue_with_a_stable_name_and_number() {
+        assert!(ExitCode::all().contains(&ExitCode::NodeUnreachable));
+        assert_eq!(ExitCode::NodeUnreachable.code(), 7);
+        assert_eq!(ExitCode::NodeUnreachable.name(), "NODE_UNREACHABLE");
+        // Every code's number is distinct -- an added arm that reused 6 would read as success
+        // against the two assertions above if either were relaxed.
+        let mut codes: Vec<u8> = ExitCode::all().iter().map(|c| c.code()).collect();
+        codes.sort_unstable();
+        let before = codes.len();
+        codes.dedup();
+        assert_eq!(codes.len(), before, "two exit codes share a number");
+    }
 
     #[test]
     fn exit_codes_are_unique_and_upper_snake() {

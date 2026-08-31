@@ -2620,6 +2620,7 @@ exit `1` (`NOT_SERVING`) so scripts can gate on liveness; the JSON result carrie
 | 4 | `SERVICE_FAILED` | A service-manager operation failed. |
 | 5 | `BIND_FAILED` | `run`: could not bind the loopback address. |
 | 6 | `IO_ERROR` | Other I/O error. |
+| 7 | `NODE_UNREACHABLE` | The node did not answer; the operation was not measured. |
 
 I/O-error mapping: `PermissionDenied` → 3; `AddrInUse`/`AddrNotAvailable` → 5; anything else → 6.
 Numeric values and symbolic names are a stable contract and MUST NOT be renumbered.
