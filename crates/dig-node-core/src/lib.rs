@@ -15805,4 +15805,3 @@ mod tests {
     }
 }
 
-// WIP(loop/batch-digsex): wiring dig-sex conduct/admission/acquisition/reward into the node.
