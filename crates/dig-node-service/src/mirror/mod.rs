@@ -79,12 +79,18 @@
 
 pub mod advertise;
 pub mod bond_verify;
+#[cfg(test)]
+mod converge_tests;
 pub mod funding;
 pub mod lifecycle;
 pub mod observe;
 pub mod pass;
 pub mod plan;
+pub mod pointers;
 pub mod presence;
+pub(crate) mod resolve;
+#[cfg(test)]
+mod resolve_tests;
 pub mod runner;
 pub mod signer;
 pub mod spends;

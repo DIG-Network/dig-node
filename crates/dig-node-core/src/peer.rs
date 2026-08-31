@@ -858,8 +858,13 @@ pub use crate::shared::identity::{install_crypto_provider, load_or_generate_node
 /// Sharing these files is what makes the pool's inbound listener present the node's ADVERTISED
 /// identity, so `peer_id = SHA-256(SPKI DER)` is identical across every listener the node runs (the
 /// peer-RPC server, the DHT dials, and the gossip pool). Without this the pool would present a cert
-/// hashing to a different peer_id and every dial to this node fails closed with `peer_id mismatch`
-/// (#1532). dig-gossip only READS these files (`dig_peer_protocol::load_ssl_cert`), so pointing at the
+/// hashing to a different peer_id than the one this node advertises (#1532).
+///
+/// **A dialler is not guaranteed to notice.** `dig-gossip` DERIVES a peer id from the presented SPKI
+/// and does not compare it against the one it dialled — every `expected_peer_id` occurrence in that
+/// crate is inside `#[cfg(test)]` (DIG-Network/dig-gossip#85). So a split identity is not caught by a
+/// fail-closed handshake in the general case; where pinning does happen it is the dialler's own
+/// (`dig-tls::pin_and_bind`, used by the ping path). Do not rely on a mismatch being refused. dig-gossip only READS these files (`dig_peer_protocol::load_ssl_cert`), so pointing at the
 /// canonical identity files can never clobber them.
 ///
 /// [`node_cert_dir`]: crate::seams::key_mgmt::key_manager::KeyManager::node_cert_dir
@@ -2459,7 +2464,9 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     //    that the node registers with the relay, advertises, and the auto-dialer PINS. So we point the
     //    pool's cert/key at the persisted `NodeCert` files themselves (dig-gossip only READS them);
     //    letting the GossipService mint its OWN throwaway cert would hash to a DIFFERENT peer_id and
-    //    every dial to this node fails closed with `peer_id mismatch` (#1532 — the identity split).
+    //    a dial to this node can reach a DIFFERENT identity than the one advertised (#1532 — the
+    //    identity split). Not every dialler refuses that: dig-gossip derives the peer id and does not
+    //    pin it (DIG-Network/dig-gossip#85), so this must be right at the source rather than caught.
     //    `cfg.peer_id` is set to that same identity so the pool's self-dial guard + handshake agree.
     //    The address book (`peers.json`) stays under `peer-net/`; only the identity is shared.
     let gossip_dir = node.peer_cert_dir();
@@ -3067,7 +3074,18 @@ async fn bring_up_dht(
         initial_ids.len()
     );
 
-    let dht = crate::dht::DhtHandle::new(service, initial_ids);
+    // The untrusted mirror-coin pointer source (dig-node#435), when the service shell installed
+    // one. Until it did, `DhtHandle::new` hard-coded `None` here and EVERY live announce published
+    // `unverified_mirror_coin_id = None` — the whole collateral-pointer mechanism was built, unit
+    // tested, and fed by nothing but a test double.
+    //
+    // `None` remains fully supported: the FFI path and any node without a mirror lifecycle announce
+    // exactly as before, and a verifier falls back to the hint scan.
+    let dht = crate::dht::DhtHandle::with_mirror_pointers(
+        service,
+        initial_ids,
+        node.mirror_coin_pointers(),
+    );
 
     // The real-time holdings layer (#1429): flood a signed opcode-222 announcement whenever this
     // node's inventory changes, and fold every peer's verified announcement into our provider set.

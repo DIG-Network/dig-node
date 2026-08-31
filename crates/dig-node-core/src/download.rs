@@ -4418,7 +4418,12 @@ pub(crate) mod tests {
 
         #[async_trait::async_trait]
         impl MirrorBondVerifier for ByFirstByte {
-            async fn verify(&self, _c: &ContentId, claimed: Option<[u8; 32]>) -> BondVerdict {
+            async fn verify(
+                &self,
+                _c: &ContentId,
+                _claiming_peer_id: &str,
+                claimed: Option<[u8; 32]>,
+            ) -> BondVerdict {
                 match claimed {
                     None => BondVerdict::Unverified,
                     Some(coin) if coin[0] == 0x01 => BondVerdict::Bonded,
@@ -4466,7 +4471,8 @@ pub(crate) mod tests {
                 mock_peer_hex(7)[..2].to_string(),
                 mock_peer_hex(8)[..2].to_string(),
             ],
-            "bonded first, unprovable next, disproven last"
+            "the provable holder is promoted; the other two keep their located order, because a \
+             disproven pointer withholds credit rather than demoting (dig-node#466)"
         );
         assert_eq!(
             located.len(),
