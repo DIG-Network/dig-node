@@ -151,6 +151,10 @@ pub mod wallet_authz;
 /// Never fatal, never a fallback. See [`wallet_bootstrap`].
 pub mod wallet_bootstrap;
 
+/// Latching the fact that the node's own wallet has held funds, so no surface calls a funded
+/// auto-created wallet disposable (dig-node#286). See [`wallet_funded`].
+pub mod wallet_funded;
+
 /// The Sage-parity wallet mTLS listener: its bring-up and the state `dign info` reports
 /// when it could not take its port (dig-node#260). See [`wallet_mtls`].
 pub mod wallet_mtls;
