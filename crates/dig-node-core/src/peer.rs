@@ -854,6 +854,11 @@ pub trait PeerRpcResponder: Send + Sync {
     /// by the SAME per-requestor miss-lookup budget as the single-item legs (dig_ecosystem#2007). A
     /// batch is the LARGEST amplification vector (up to `MAX_AVAILABILITY_ITEMS` lookups per request),
     /// so it must key by the ASKING peer, never one shared peer bucket every peer could exhaust.
+    ///
+    /// A batch LARGER than `MAX_AVAILABILITY_ITEMS` is refused whole at the admission boundary
+    /// (`-32000`, reason `request too large`) rather than answered as a truncated prefix: the node
+    /// admits exactly the batch size it advertises, and a caller that asked for more is told so
+    /// instead of being handed a short answer it must diff against its request to notice.
     async fn handle_availability(&self, items: Value, conn_key: &str) -> Value;
 
     /// Stream a `dig.fetchRange` response for `req` (the RangeRequest value) by writing framed
@@ -992,13 +997,22 @@ async fn reconcile_and_flood(
 /// [`PeerRpcResponder::handle_availability`], a range fetch via [`PeerRpcResponder::stream_range`].
 /// Returns when the peer closes the connection. The caller has already verified the remote `peer_id`
 /// (dig-nat enforces it during the mTLS handshake), so every stream here is from an authenticated peer.
+///
+/// This entry point threads NO caller identity through to the responder, and since #269 that is
+/// observable: the JSON-RPC and availability paths meter against the mTLS-verified `peer_id` and
+/// refuse a session without one (`-32000`, reason `unauthenticated`). Callers that have the verified
+/// identity — every production listener does — MUST use [`serve_peer_session_from`], which is what
+/// keeps those two paths served.
 pub async fn serve_peer_session(
     mut session: dig_nat::mux::PeerSession,
     responder: Arc<dyn PeerRpcResponder>,
 ) {
     // No authenticated caller threaded here (the mTLS-verified caller is supplied by the listener via
-    // `serve_peer_session_from`); a caller-less session still serves the JSON-RPC/range/availability
-    // paths — only DHT routing-table population needs the caller.
+    // `serve_peer_session_from`). Since #269 a caller-less session serves the RANGE and module-range
+    // paths only: JSON-RPC and availability now meter against the mTLS-verified peer_id, and an
+    // absent one is refused `-32000` (`unauthenticated`) rather than admitted unmetered — otherwise
+    // presenting no identity would be the cheapest way out of the meter. DHT routing-table
+    // population likewise needs the caller. Every production listener supplies one.
     serve_peer_session_from(None, &mut session, responder).await
 }
 
@@ -5301,6 +5315,54 @@ pub(crate) mod tests {
         assert!(
             served.get("result").is_some(),
             "an authenticated peer must still be served, or the meter is refusing everybody"
+        );
+    }
+    /// **Proves (#269):** the admission clamp and the availability batch's own advertised limit are
+    /// the SAME number, measured through the responder that actually decides.
+    ///
+    /// The clamp lives in [`NodeResponder::handle_availability`], above
+    /// [`crate::Node::availability_batch`]. `lib.rs`'s cap test calls the batch directly, BELOW that
+    /// decision, so it passes identically whether the clamp admits this batch, refuses it, or is not
+    /// wired at all — a test below the decision passes under the defect. This one asks the responder.
+    ///
+    /// Both sides are pinned, because a bound tested only from below can only confirm itself: a batch
+    /// AT [`crate::MAX_AVAILABILITY_ITEMS`] must be ANSWERED (a clamp set lower than the advertised
+    /// limit would refuse work this node says it serves), and one item past it must be REFUSED at
+    /// admission (a clamp set higher would let the meter admit work the batch will not answer).
+    #[tokio::test]
+    async fn the_responder_serves_a_batch_at_the_advertised_limit_and_refuses_one_past_it() {
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let responder = NodeResponder::without_pool(node);
+        let authenticated = "ef".repeat(32);
+        let batch = |n: usize| -> Value {
+            (0..n)
+                .map(|_| json!({ "store_id": "ee".repeat(32) }))
+                .collect::<Vec<Value>>()
+                .into()
+        };
+
+        let at_bound = responder
+            .handle_availability(batch(crate::MAX_AVAILABILITY_ITEMS), &authenticated)
+            .await;
+        assert_eq!(
+            at_bound["items"].as_array().map(Vec::len),
+            Some(crate::MAX_AVAILABILITY_ITEMS),
+            "a batch at the advertised limit must be ANSWERED in full — the node states it serves \
+             this many items, so refusing it denies work of its own contract"
+        );
+
+        let past_bound = responder
+            .handle_availability(batch(crate::MAX_AVAILABILITY_ITEMS + 1), &authenticated)
+            .await;
+        assert_eq!(
+            past_bound["error"]["data"]["reason"],
+            json!("request too large"),
+            "one item past the advertised limit must be refused AT admission, before the batch is \
+             read — not silently truncated after the cost is committed"
+        );
+        assert!(
+            past_bound.get("items").is_none(),
+            "a refused batch must produce no answers at all"
         );
     }
 

@@ -117,9 +117,26 @@ pub struct PeerAdmission {
     meter: Mutex<AdmissionMeter>,
 }
 
+/// The limits this node admits under.
+///
+/// dig-sex's own defaults are used for every dimension EXCEPT `max_request_units`, which is raised
+/// to [`crate::MAX_AVAILABILITY_ITEMS`] — the largest batch this node advertises it answers. The
+/// crate's default of 256 is half that, and a clamp set below the advertised limit refuses work the
+/// node's own contract says it serves: a 257-512 item `dig.getAvailability` batch would have been
+/// answered `-32000 "request too large"` while [`crate::Node::availability_batch`] stood ready to
+/// answer all 512. The clamp and the limit it clamps to must be the SAME number, so this derives one
+/// from the other rather than restating it.
+#[must_use]
+pub fn node_limits() -> AdmissionLimits {
+    AdmissionLimits {
+        max_request_units: crate::MAX_AVAILABILITY_ITEMS as u32,
+        ..AdmissionLimits::default()
+    }
+}
+
 impl Default for PeerAdmission {
     fn default() -> Self {
-        Self::new(AdmissionLimits::default())
+        Self::new(node_limits())
     }
 }
 
@@ -300,6 +317,24 @@ mod tests {
         assert!(
             admission.admit(&peer, WorkKind::Own, 8).is_ok(),
             "the at-bound request must still be admitted, or the clamp denies legitimate work"
+        );
+    }
+
+    /// **Proves (#269):** the node's admitted request size is the availability batch's OWN advertised
+    /// limit, not the crate's smaller default.
+    ///
+    /// Asserting a literal 512 here would pass on a hard-coded constant that had drifted from
+    /// `MAX_AVAILABILITY_ITEMS`; asserting the derivation is what keeps the two numbers one number.
+    #[test]
+    fn the_node_admits_a_request_as_large_as_the_availability_batch_it_advertises() {
+        assert_eq!(
+            node_limits().max_request_units,
+            crate::MAX_AVAILABILITY_ITEMS as u32,
+            "the admission clamp must equal the advertised batch limit, or the node refuses batches              it says it serves"
+        );
+        assert!(
+            node_limits().max_request_units > AdmissionLimits::default().max_request_units,
+            "the crate default is the smaller of the two — if this ever stops holding, the override              is doing nothing and the comment above it is false"
         );
     }
 

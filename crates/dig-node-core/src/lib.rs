@@ -3926,7 +3926,11 @@ impl Node {
     /// a per-request walk of the whole cache is a cost amplifier a peer controls.
     ///
     /// The batch is CAPPED at [`MAX_AVAILABILITY_ITEMS`] — the item count is caller-controlled — with
-    /// the excess simply not answered (the result array is aligned to the answered prefix).
+    /// the excess simply not answered (the result array is aligned to the answered prefix). That
+    /// truncation is the LAST line of defence, reached only by in-process callers: on the peer
+    /// surface an oversized batch never gets here, because
+    /// `NodeResponder::handle_availability` (peer.rs) meters the requested item
+    /// count against the same limit and refuses the whole request at the boundary (#269).
     ///
     /// `requestor` keys the per-item not-held → DHT `find_providers` enrichment against its
     /// per-requestor miss-lookup budget (dig_ecosystem#2007), so a large batch of not-held items from
@@ -10266,6 +10270,10 @@ mod tests {
         assert_eq!(arr[2]["available"], false, "unknown capsule is a miss");
     }
 
+    /// Pins the IN-PROCESS truncation only. A peer-surface batch this size is refused whole at
+    /// admission long before it reaches here, and this test cannot see that: it calls the batch
+    /// BELOW the responder that decides. The responder-level pair lives in `peer.rs`
+    /// (`the_responder_serves_a_batch_at_the_advertised_limit_and_refuses_one_past_it`).
     #[tokio::test]
     async fn availability_batch_caps_the_item_count() {
         let (node, _td) = test_node(None);
