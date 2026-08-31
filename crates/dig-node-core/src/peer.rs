@@ -1192,7 +1192,10 @@ fn admission_refused(
     id: Value,
     refusal: crate::seams::dig_peer::admission::AdmissionRefusal,
 ) -> Value {
-    tracing::debug!(reason = refusal.reason(), "peer serve: inbound work refused at admission");
+    tracing::debug!(
+        reason = refusal.reason(),
+        "peer serve: inbound work refused at admission"
+    );
     json!({"jsonrpc":"2.0","id":id,
         "error":{"code":-32000,"message":"request refused","data":{"reason":refusal.reason()}}})
 }
@@ -1343,11 +1346,11 @@ impl PeerRpcResponder for NodeResponder {
         // refused request costs a hex decode and a counter bump rather than a read, a decode or a DHT
         // lookup. The guard is held for the whole method: it releases on `Drop`, including on the
         // early `return`s below, which is why no path here needs to remember to.
-        let _admitted = match self.node.peer_admission().admit(
-            conn_key,
-            dig_sex::WorkKind::Own,
-            1,
-        ) {
+        let _admitted = match self
+            .node
+            .peer_admission()
+            .admit(conn_key, dig_sex::WorkKind::Own, 1)
+        {
             Ok(guard) => guard,
             Err(refusal) => return admission_refused(id, refusal),
         };
@@ -1417,7 +1420,8 @@ impl PeerRpcResponder for NodeResponder {
         // ADMISSION (dig-sex SPEC 8.5, #269) — before the items are even read. `items.len()` is the
         // attacker-chosen quantity this request asks for, so it is what gets clamped at the boundary
         // (`AdmissionLimits::max_request_units`); clamping it deeper in would already have paid for it.
-        let requested_units = u32::try_from(items.as_array().map_or(0, Vec::len)).unwrap_or(u32::MAX);
+        let requested_units =
+            u32::try_from(items.as_array().map_or(0, Vec::len)).unwrap_or(u32::MAX);
         let _admitted = match self.node.peer_admission().admit(
             conn_key,
             dig_sex::WorkKind::Own,
@@ -5214,8 +5218,17 @@ pub(crate) mod tests {
         // End-to-end over the responder: a peer JSON-RPC frame naming a management/mutation
         // method is answered with -32601 (method not found) WITHOUT ever reaching the
         // node's `handle_rpc` dispatch (which would run the mutation). getPeers still works.
+        //
+        // The conn_key is a well-formed 64-hex peer id — the shape every production session supplies,
+        // since both listeners derive it from the verified client leaf. It became load-bearing when
+        // admission landed (#269): the meter runs AHEAD of this allowlist and refuses a session with
+        // no verified identity, so an empty key would now answer -32000 and this test would stop
+        // exercising the allowlist at all. Using a real one keeps the property under test unchanged —
+        // an AUTHENTICATED peer is still merely "some peer_id", never an authorized admin, which is
+        // the whole point of audit #179.
         let (node, _td) = crate::test_support::test_node_for_peer_surface();
         let responder = NodeResponder::without_pool(node);
+        let authenticated = "ab".repeat(32);
         for m in [
             "cache.clear",
             "cache.setCapBytes",
@@ -5224,7 +5237,7 @@ pub(crate) mod tests {
             "dig.stage",
         ] {
             let req = json!({"jsonrpc":"2.0","id":1,"method":m,"params":{}});
-            let resp = responder.handle_json_rpc(req, "").await;
+            let resp = responder.handle_json_rpc(req, &authenticated).await;
             assert_eq!(
                 resp["error"]["code"],
                 json!(-32601),
@@ -5239,7 +5252,7 @@ pub(crate) mod tests {
         let ok = responder
             .handle_json_rpc(
                 json!({"jsonrpc":"2.0","id":1,"method":"dig.getNetworkInfo"}),
-                "",
+                &authenticated,
             )
             .await;
         assert!(
@@ -5248,9 +5261,47 @@ pub(crate) mod tests {
         );
         // getPeers is answered from the (empty) pool view, not -32601.
         let peers = responder
-            .handle_json_rpc(json!({"jsonrpc":"2.0","id":1,"method":"dig.getPeers"}), "")
+            .handle_json_rpc(
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getPeers"}),
+                &authenticated,
+            )
             .await;
         assert!(peers["result"]["peers"].is_array());
+    }
+
+    /// **Proves (#269):** the admission meter is LIVE on the responder — not merely implemented
+    /// beside it — and it refuses a session that carries no verified identity BEFORE the method
+    /// allowlist is consulted.
+    ///
+    /// This is the wiring assertion. `admission.rs`'s unit tests prove the meter behaves; they cannot
+    /// prove anything calls it, and a meter nothing calls is the exact defect this ticket describes.
+    /// The authenticated control is what makes the refusal meaningful: without it, a responder that
+    /// refused EVERY request would pass.
+    #[tokio::test]
+    async fn the_responder_refuses_an_unauthenticated_session_before_consulting_the_allowlist() {
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let responder = NodeResponder::without_pool(node);
+        let method = json!({"jsonrpc":"2.0","id":1,"method":"dig.getNetworkInfo"});
+
+        // No verified peer id: refused at admission, and NOT with the allowlist's -32601 — which is
+        // how we know the meter ran first rather than the request simply failing later.
+        let refused = responder.handle_json_rpc(method.clone(), "").await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32000),
+            "an unauthenticated peer session must be refused at admission"
+        );
+        assert!(
+            refused.get("result").is_none(),
+            "a refused request must produce no result — the work must not have been done"
+        );
+
+        // CONTROL: the same method, from an authenticated session, is served.
+        let served = responder.handle_json_rpc(method, &"cd".repeat(32)).await;
+        assert!(
+            served.get("result").is_some(),
+            "an authenticated peer must still be served, or the meter is refusing everybody"
+        );
     }
 
     // -- OUTGOING-BANDWIDTH THROTTLE on the peer range-stream (dig_ecosystem #30) --------------------

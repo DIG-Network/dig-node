@@ -68,7 +68,10 @@ impl ConductState {
     /// identity would be *better* than an honest long-lived one and the ranking would reward churn.
     pub(crate) fn observe(&self, peer: RoutedPeer, evidence: ConductEvidence, now_ticks: u64) {
         let mut records = self.lock();
-        let record = records.get(&peer).copied().unwrap_or_else(ConductRecord::neutral);
+        let record = records
+            .get(&peer)
+            .copied()
+            .unwrap_or_else(ConductRecord::neutral);
         records.insert(peer, dig_sex::observe(record, evidence, now_ticks));
     }
 
@@ -214,7 +217,7 @@ mod tests {
     fn sustained_non_performance_never_silences_a_peer_completely() {
         let conduct = ConductState::new();
         let distressed = peer(0xd4);
-        for _ in 0..(u32::from(dig_sex::NON_PERFORMANCE_CEILING) * 10) {
+        for _ in 0..(dig_sex::NON_PERFORMANCE_CEILING * 10) {
             conduct.observe(distressed, ConductEvidence::NonPerformance, 0);
         }
 
@@ -280,7 +283,7 @@ mod tests {
 
         conduct.observe(liar, ConductEvidence::ProvenLie, 0);
         // Far past the ceiling: as much non-performance as an attacker could ever manufacture.
-        for _ in 0..(u32::from(dig_sex::NON_PERFORMANCE_CEILING) * 10) {
+        for _ in 0..(dig_sex::NON_PERFORMANCE_CEILING * 10) {
             conduct.observe(slow, ConductEvidence::NonPerformance, 0);
         }
 

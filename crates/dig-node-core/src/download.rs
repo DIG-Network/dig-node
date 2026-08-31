@@ -2026,12 +2026,6 @@ impl NodeContent {
         self.conduct_epoch.elapsed().as_secs()
     }
 
-    /// What this node has observed its pool peers do (#268), so a test can drive the forwarded ask
-    /// and then ask what it left behind.
-    pub(crate) fn conduct(&self) -> &crate::seams::dig_peer::conduct::ConductState {
-        &self.conduct
-    }
-
     /// This node's routing memory, so a test can drive the forwarded ask and then ask what the ask
     /// LEFT BEHIND. Without it the recording leg would only be observable through its effect on a
     /// later round, and a test that could not see the write directly could not tell a missing write
