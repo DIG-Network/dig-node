@@ -157,6 +157,26 @@ pub fn required_signatures(
         .map_err(|e| Error::internal(format!("required-signature extraction: {e:?}")))
 }
 
+/// Every BLS signature `coin_spends` requires, as `(public_key, message)` pairs.
+///
+/// The message is what the CONSENSUS will hash under `agg_sig_data`, so a caller holding these can
+/// check a produced signature against the network's own requirement rather than against the
+/// signer's opinion of it. That distinction is the whole point: a signer asked for the message it
+/// already believes in will always agree with itself, and the mirror-coin L1/L2 genesis regression
+/// (dig-node#447) was invisible to every such self-consistent check.
+pub fn required_bls_signatures(
+    coin_spends: &[CoinSpend],
+    agg_sig_data: Bytes32,
+) -> Result<Vec<(PublicKey, Vec<u8>)>> {
+    Ok(required_signatures(coin_spends, agg_sig_data)?
+        .into_iter()
+        .filter_map(|req| match req {
+            RequiredSignature::Bls(bls) => Some((bls.public_key, bls.message().to_vec())),
+            _ => None,
+        })
+        .collect())
+}
+
 /// The BLS public keys that must sign `coin_spends` for it to be valid.
 ///
 /// The push guard asks this instead of inspecting puzzle hashes, because a puzzle hash tells you

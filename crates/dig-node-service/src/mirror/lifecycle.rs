@@ -656,6 +656,25 @@ pub async fn production_broadcaster(
     }
 }
 
+/// The `AGG_SIG_ME` domain every mirror-coin spend must be signed under: **Chia mainnet's**.
+///
+/// A mirror coin is an ordinary Chia L1 CAT, so the consensus that validates its spend appends
+/// Chia mainnet's genesis challenge to every `AGG_SIG_ME` message. Signing under any other domain
+/// produces a signature over a different message, and Chia's mempool answers
+/// `BAD_AGGREGATE_SIGNATURE` -- deterministically, from every peer, on every retry.
+///
+/// **`dig-constants` is the DIG L2 chain's constants crate and has no business in an L1 CAT spend.**
+/// `DIG_MAINNET.genesis_challenge()` is the L2 genesis anchor; it is the right value for the DIG
+/// peer network id (`peer::genesis_challenge_from_env`) and the wrong one here. Passing it locked
+/// 1010 $DIG base units in an unspendable mirror coin on mainnet (dig-node#447), and the failure is
+/// invisible locally: the bundle builds, signs, and broadcasts, and only the network disagrees.
+///
+/// This is a function rather than an inline constant so the choice has a name a test can assert on,
+/// and so the reason above lives beside the value instead of at one call site.
+pub fn mirror_agg_sig_data() -> chia_protocol::Bytes32 {
+    chia_sdk_types::MAINNET_CONSTANTS.genesis_challenge
+}
+
 /// Open the operator wallet, or say why the lifecycle cannot spend.
 ///
 /// [`OperatorWallet::open`] returns `None` for BOTH §16.4 `Locked` and `Orphaned`, which is the
@@ -666,8 +685,7 @@ pub async fn open_signer(
     live_broadcast: bool,
     chain: &ChainTransport,
 ) -> (Option<MirrorSigner>, SpendCapability) {
-    let Some(wallet) = OperatorWallet::open(paths, dig_constants::DIG_MAINNET.genesis_challenge())
-    else {
+    let Some(wallet) = OperatorWallet::open(paths, mirror_agg_sig_data()) else {
         return (None, SpendCapability::WalletUnavailable);
     };
     if !live_broadcast {
