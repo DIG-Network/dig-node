@@ -4453,9 +4453,8 @@ pub(crate) mod tests {
             "the engine accepts exactly one verifier"
         );
 
-        let got = pc.find_providers(&cid).await;
-        let peers: Vec<String> = got
-            .for_finding()
+        let located = pc.find_providers(&cid).await.for_finding();
+        let peers: Vec<String> = located
             .iter()
             .map(|r| r.provider_peer_id[..2].to_string())
             .collect();
@@ -4470,7 +4469,7 @@ pub(crate) mod tests {
             "bonded first, unprovable next, disproven last"
         );
         assert_eq!(
-            got.for_finding().len(),
+            located.len(),
             3,
             "a disproven claim is demoted on the redirect path, never withheld from it"
         );
