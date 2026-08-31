@@ -756,7 +756,10 @@ fn summarize(method: &str, result: &Value) -> String {
         // panic on one — so every field is read with `get`, and a coin record short of a field
         // prints an honest unknown instead of aborting the CLI.
         "control.wallet.resetCoinDb" => format!(
-            "coin database reset · {} coin(s) and {} staged discovery row(s) discarded · the              replica is no longer authoritative and will re-sync from chain",
+            concat!(
+                "coin database reset · {} coin(s) and {} staged discovery row(s) discarded ",
+                "· the replica is no longer authoritative and will re-sync from chain"
+            ),
             amount(&result["coins_dropped"]),
             amount(&result["staged_dropped"]),
         ),
@@ -1447,17 +1450,19 @@ fn balance_freshness(result: &Value) -> String {
             None => "current".to_string(),
         };
     }
-    match (
-        result["peak_height"].as_u64(),
-        result["stale_by"].as_u64(),
-    ) {
+    match (result["peak_height"].as_u64(), result["stale_by"].as_u64()) {
         (Some(h), Some(0)) => format!("NOT CURRENT — as of height {h}, level with the network"),
-        (Some(h), Some(n)) => format!("NOT CURRENT — as of height {h}, {n} blocks behind the network"),
+        (Some(h), Some(n)) => {
+            format!("NOT CURRENT — as of height {h}, {n} blocks behind the network")
+        }
         (Some(h), None) => {
             format!("NOT CURRENT — as of height {h}, distance from the network unknown")
         }
-        (None, _) => "NOT CURRENT — this node cannot say what height this reflects;                       the figure may not reflect the wallet"
-            .to_string(),
+        (None, _) => concat!(
+            "NOT CURRENT — this node cannot say what height this reflects; the figure may ",
+            "not reflect the wallet"
+        )
+        .to_string(),
     }
 }
 

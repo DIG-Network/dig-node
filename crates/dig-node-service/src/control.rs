@@ -2377,7 +2377,11 @@ async fn wallet_reset_coin_db(ctx: &ControlCtx, id: Value, params: &Value) -> Va
         return control_error(
             id,
             ErrorCode::InvalidParams,
-            "control.wallet.resetCoinDb is DESTRUCTIVE: it discards this node's cached coin database \n             and re-syncs from chain. Pass params.confirm = true to proceed. No key \n             material is affected.",
+            concat!(
+                "control.wallet.resetCoinDb is DESTRUCTIVE: it discards this node's cached ",
+                "coin database and re-syncs from chain. Pass params.confirm = true to ",
+                "proceed. No key material is affected."
+            ),
         );
     }
 
@@ -2904,7 +2908,13 @@ const _: () = assert!(
 fn reserve_batch_refusal(len: usize) -> Option<String> {
     (len > MAX_RESERVE_COIN_IDS).then(|| {
         format!(
-            "params.coin_ids holds {len} ids, above the {MAX_RESERVE_COIN_IDS} this node will              reserve in one call. Split the request; a bundle that legitimately needs more inputs              than this could not fit in a block anyway"
+            concat!(
+                "params.coin_ids holds {len} ids, above the {MAX_RESERVE_COIN_IDS} this ",
+                "node will reserve in one call. Split the request; a bundle that ",
+                "legitimately needs more inputs than this could not fit in a block anyway"
+            ),
+            len = len,
+            MAX_RESERVE_COIN_IDS = MAX_RESERVE_COIN_IDS
         )
     })
 }
@@ -4190,7 +4200,10 @@ mod tests {
         );
         assert!(
             !is_open_control_read("control.wallet.arrivals"),
-            "the arrival cursor names this node's own watched puzzle hashes to a caller that              supplied nothing, so it must stay behind the control token"
+            concat!(
+                "the arrival cursor names this node's own watched puzzle hashes to a caller ",
+                "that supplied nothing, so it must stay behind the control token"
+            )
         );
     }
 

@@ -144,7 +144,10 @@ mod derivation_floor_tests {
         assert_eq!(
             down.unhardened_floor,
             Some(500),
-            "a request below the floor is a no-op, and the response must say so by reporting 500              — echoing back the requested 5 is the lie this ticket removes"
+            concat!(
+                "a request below the floor is a no-op, and the response must say so by ",
+                "reporting 500 — echoing back the requested 5 is the lie this ticket removes"
+            )
         );
     }
 

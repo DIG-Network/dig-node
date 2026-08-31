@@ -5680,7 +5680,10 @@ mod tests {
         assert_eq!(
             ids,
             ["real-dig"],
-            "the confirmed $DIG coin: not an empty set (the #306 under-report), and not the              hinted XCH or foreign CAT (the #2879 over-report)"
+            concat!(
+                "the confirmed $DIG coin: not an empty set (the #306 under-report), and not ",
+                "the hinted XCH or foreign CAT (the #2879 over-report)"
+            )
         );
         // `pending-dig` has no created height and the default filter mode excludes unconfirmed
         // coins — pinned here so a later widening of that filter is a deliberate change rather
@@ -5733,7 +5736,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             dig.count, 1,
-            "the ONE confirmed $DIG coin — `pending-dig` has no created height and is not              spendable, so a count of 2 would mean unconfirmed value was offered to a spend"
+            concat!(
+                "the ONE confirmed $DIG coin — `pending-dig` has no created height and is ",
+                "not spendable, so a count of 2 would mean unconfirmed value was offered ",
+                "to a spend"
+            )
         );
 
         let xch = be
