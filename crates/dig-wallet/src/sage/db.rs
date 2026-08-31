@@ -2647,7 +2647,6 @@ impl WalletDb {
 
         Ok(n)
     }
-
 }
 
 /// Why a coin-database reset was refused (dig-node#384).
@@ -5200,7 +5199,9 @@ mod tests {
     async fn a_reset_does_not_discard_configuration_it_cannot_re_derive() {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.save_user_theme("nft1", "dark-purple").await.unwrap();
-        db.upsert_coin(&coin("c1", 1, Some(10), None)).await.unwrap();
+        db.upsert_coin(&coin("c1", 1, Some(10), None))
+            .await
+            .unwrap();
 
         db.reset_chain_cache(0).await.unwrap().expect("not refused");
 
@@ -5210,7 +5211,10 @@ mod tests {
             "a theme is not chain-derived and a re-sync cannot bring it back"
         );
         assert!(
-            db.coins_by_ids(&["c1".to_string()]).await.unwrap().is_empty(),
+            db.coins_by_ids(&["c1".to_string()])
+                .await
+                .unwrap()
+                .is_empty(),
             "control: the chain-derived half WAS discarded"
         );
     }

@@ -2428,7 +2428,10 @@ mod tests {
             }),
         );
 
-        assert_ne!(unknown, empty, "a stale zero must not read like an empty wallet");
+        assert_ne!(
+            unknown, empty,
+            "a stale zero must not read like an empty wallet"
+        );
         assert!(
             unknown.contains("NOT CURRENT"),
             "an unbounded zero must be marked not current: {unknown}"
@@ -2447,8 +2450,14 @@ mod tests {
             }),
         );
         assert!(stale.contains("8380"), "the gap must be named: {stale}");
-        assert!(stale.contains("9211798"), "the as-of height must be named: {stale}");
-        assert_ne!(stale, unknown, "a bounded stale figure differs from an unbounded one");
+        assert!(
+            stale.contains("9211798"),
+            "the as-of height must be named: {stale}"
+        );
+        assert_ne!(
+            stale, unknown,
+            "a bounded stale figure differs from an unbounded one"
+        );
     }
 
     /// dig-node#416: an ABSENT balance field renders `unknown`, never `0`.
