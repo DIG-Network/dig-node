@@ -375,9 +375,19 @@ pub enum ReadOrigin {
 /// provenance closes that CSRF door WITHOUT ever throttling the read: the bytes always serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestProvenance {
-    /// A first-party request: the user's own navigation, a same-origin/same-site subresource, a
-    /// direct address-bar hit, OR any non-browser client (CLI/SDK send no `Sec-Fetch-*` header).
+    /// A first-party request: the user's own top-level navigation (`Sec-Fetch-Site: none` — the
+    /// address bar or a bookmark, which no page script can forge), OR any non-browser client
+    /// (CLI/SDK send no `Sec-Fetch-*` header at all).
     FirstParty,
+    /// A request driven by a page THIS NODE is serving on its own control origin — i.e. by store
+    /// content published by a stranger (`Sec-Fetch-Site: same-origin`/`same-site`, or any value the
+    /// browser reports that is neither `none` nor `cross-site`).
+    ///
+    /// `/s/*` is the ONLY HTML surface this router serves (`server.rs` — `/`, `/health`,
+    /// `/version`, `/openrpc.json`, `/.well-known/*`, `/ws*`, `/verify/*` are all non-HTML), so a
+    /// page-driven request arriving on this origin was, by construction, authored by store content.
+    /// The read still serves; landing does not.
+    StoreServed,
     /// A cross-site subresource: the browser explicitly reported `Sec-Fetch-Site: cross-site`,
     /// meaning some OTHER origin's page drove this request. The read still serves; landing does not.
     CrossSite,
@@ -386,16 +396,41 @@ pub enum RequestProvenance {
 /// Classify a request's provenance from its `Sec-Fetch-Site` header value (already extracted from
 /// the header map; `None` when the header is absent).
 ///
-/// ONLY an explicit, case-insensitive `cross-site` denies landing. Everything else — `same-origin`,
-/// `same-site`, `none`, an unknown value, AND (critically) an ABSENT header — is [`FirstParty`], so
-/// non-browser clients that never send `Sec-Fetch-*` (the CLI, the SDK) are never mistaken for a
-/// cross-site attacker. Absence must NEVER map to `CrossSite`.
+/// The mapping, and why each arm is where it is:
+///
+/// | `Sec-Fetch-Site` | provenance | why |
+/// |---|---|---|
+/// | absent | [`FirstParty`] | a non-browser client (CLI/SDK). Absence must NEVER deny a CLI read's landing. |
+/// | `none` | [`FirstParty`] | a user-initiated top-level navigation — address bar or bookmark. A page-driven fetch can NEVER produce `none`, and `Sec-*` is a forbidden header name, so script cannot forge it. |
+/// | `cross-site` | [`CrossSite`] | another origin's page drove it. |
+/// | anything else (`same-origin`, `same-site`, an unknown future value) | [`StoreServed`] | page-driven on an origin whose only HTML is `/s/*`. |
+///
+/// **Why `same-origin` is not first-party here (dig-node#450).** `/s/*path` and `POST /` are the
+/// same router on the same port, and `STORE_CSP` grants store pages `script-src 'unsafe-inline'`
+/// plus `connect-src 'self'` — where `'self'` IS the RPC endpoint. So a stranger's store page can
+/// script a request that the browser truthfully labels `same-origin`, and under the old mapping
+/// that landed the attacker's chosen capsule `Held` — bondable, with the operator's $DIG staked on
+/// it. Same-origin stopped being a trust signal the moment the node began serving untrusted content
+/// on its control origin, so the fix is a THIRD provenance rather than a tighter reading of two.
+///
+/// This deliberately does NOT consult `Referer`: a page controls its own referrer-policy and can
+/// strip the path (or the whole header), so a `Referer`-derived rule is bypassable by the exact
+/// party it constrains. `Sec-Fetch-Site` is browser-set and unforgeable by page script.
+///
+/// **Cost, stated plainly:** a subresource of an operator-initiated store view no longer lands on
+/// its own. The flywheel survives because the top-level navigation that opened the store IS `none`
+/// and lands the capsule, and every subresource is then served from that already-landed capsule.
 ///
 /// [`FirstParty`]: RequestProvenance::FirstParty
+/// [`StoreServed`]: RequestProvenance::StoreServed
+/// [`CrossSite`]: RequestProvenance::CrossSite
 pub fn from_sec_fetch_site(hdr: Option<&str>) -> RequestProvenance {
     match hdr.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("none") => RequestProvenance::FirstParty,
         Some("cross-site") => RequestProvenance::CrossSite,
-        _ => RequestProvenance::FirstParty,
+        // Fails CLOSED: an unknown/future value is page-driven until proven otherwise. It still
+        // serves; it merely does not land.
+        Some(_) => RequestProvenance::StoreServed,
     }
 }
 
@@ -412,7 +447,10 @@ pub fn from_sec_fetch_site(hdr: Option<&str>) -> RequestProvenance {
 pub(crate) fn landing_origin(origin: ReadOrigin, provenance: RequestProvenance) -> ReadOrigin {
     match provenance {
         RequestProvenance::FirstParty => origin,
-        RequestProvenance::CrossSite => ReadOrigin::Peer,
+        // A page THIS NODE serves at `/s/` is a stranger's content running on the control origin
+        // (dig-node#450). It folds exactly as a cross-site page does: the bytes serve, nothing
+        // durable lands, so the operator never bonds a capsule an attacker chose.
+        RequestProvenance::StoreServed | RequestProvenance::CrossSite => ReadOrigin::Peer,
     }
 }
 
@@ -5267,14 +5305,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sec_fetch_site_first_party_values_are_first_party() {
-        for value in ["same-origin", "same-site", "none"] {
+    fn sec_fetch_site_page_driven_values_are_store_served() {
+        // dig-node#450. `same-origin` and `same-site` mean A PAGE drove this request, and the only
+        // HTML this router serves is `/s/*` — a stranger's store. Classifying either as FirstParty
+        // let that page choose which capsule the operator bonds $DIG against.
+        for value in ["same-origin", "same-site"] {
             assert_eq!(
                 from_sec_fetch_site(Some(value)),
-                RequestProvenance::FirstParty,
-                "{value} is a first-party fetch and must land normally"
+                RequestProvenance::StoreServed,
+                "{value} is page-driven on a node whose only HTML surface is store content"
             );
         }
+    }
+
+    #[test]
+    fn sec_fetch_site_none_is_first_party_so_the_operator_still_lands_a_store_they_opened() {
+        // The counterpart to the test above, and the reason the fix does not cost the flywheel:
+        // `none` is a USER-initiated top-level navigation (address bar / bookmark). A page-driven
+        // fetch can never produce it, and `Sec-*` is a forbidden header name so script cannot forge
+        // it. If this arm ever folded to StoreServed, opening a store in a browser would stop
+        // landing it at all.
+        assert_eq!(
+            from_sec_fetch_site(Some("none")),
+            RequestProvenance::FirstParty,
+            "a user-initiated top-level navigation must still land"
+        );
     }
 
     #[test]
@@ -5295,16 +5350,43 @@ pub(crate) mod tests {
             RequestProvenance::CrossSite,
             "the header match must be trimmed + case-insensitive"
         );
+        assert_eq!(
+            from_sec_fetch_site(Some("  Same-Origin ")),
+            RequestProvenance::StoreServed,
+            "the page-driven arm must be trimmed + case-insensitive too, or a browser that cases \
+             the value differently would land an attacker's capsule"
+        );
     }
 
     #[test]
-    fn sec_fetch_site_unknown_value_is_first_party() {
-        // Only an explicit "cross-site" denies landing; an unrecognized value fails OPEN (serves +
-        // lands) so a future/odd Sec-Fetch-Site value never silently breaks landing.
+    fn sec_fetch_site_unknown_value_fails_closed_to_store_served() {
+        // Inverted by dig-node#450: an unrecognised value is PAGE-DRIVEN until proven otherwise.
+        // The request still serves; it merely does not land. Failing open here would make the whole
+        // gate optional to any browser that ships a new value.
         assert_eq!(
             from_sec_fetch_site(Some("wat")),
-            RequestProvenance::FirstParty,
-            "an unknown Sec-Fetch-Site value must default to first-party"
+            RequestProvenance::StoreServed,
+            "an unknown Sec-Fetch-Site value must fail closed"
+        );
+    }
+
+    // -- landing_origin: the fold every landing leg shares -------------------------------------
+
+    #[test]
+    fn a_store_served_request_never_lands_however_local_its_transport_is() {
+        // The decision under test is the FOLD, not the marker a leg later writes. A loopback
+        // transport is the strongest case for landing and is exactly the one dig-node#450 exploits,
+        // so `Local` is the input that distinguishes this fix from doing nothing.
+        assert_eq!(
+            landing_origin(ReadOrigin::Local, RequestProvenance::StoreServed),
+            ReadOrigin::Peer,
+            "a page the node serves at /s/ must not land on the operator's behalf"
+        );
+        // The truthful control, on the same axis: same transport, only the provenance differs.
+        assert_eq!(
+            landing_origin(ReadOrigin::Local, RequestProvenance::FirstParty),
+            ReadOrigin::Local,
+            "the operator's own read must still land, or the fix has disabled the flywheel"
         );
     }
 }
