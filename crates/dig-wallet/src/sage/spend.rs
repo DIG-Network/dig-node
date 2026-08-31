@@ -1053,11 +1053,7 @@ mod tests {
     fn only_a_success_ack_reports_an_accepted_broadcast() {
         accepted_by_mempool(&ack(ACK_SUCCESS)).expect("status 1 is mempool admission");
 
-        for refused in [
-            ack(ACK_PENDING),
-            ack(ACK_FAILED),
-            ack(ACK_UNKNOWN),
-        ] {
+        for refused in [ack(ACK_PENDING), ack(ACK_FAILED), ack(ACK_UNKNOWN)] {
             let name = refused.status.clone();
             assert!(
                 accepted_by_mempool(&refused).is_err(),
