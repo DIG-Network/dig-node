@@ -903,7 +903,7 @@ impl RpcDispatch for Node {
             //     against, because it is not this operator's content. A `Local` read keeps `Announce`,
             //     which is the reshare flywheel: the operator's own read leaves content more
             //     available than it found it.
-            let claim = holder_claim_for_read(origin);
+            let claim = holder_claim_for_read(origin, provenance);
             if node
                 .sync_module_and_bound(store_hex, &root_hex, claim)
                 .await
@@ -1059,12 +1059,25 @@ impl RpcDispatch for Node {
 /// mapping being right.
 fn holder_claim_for_read(
     origin: crate::download::ReadOrigin,
+    provenance: crate::download::RequestProvenance,
 ) -> crate::seams::dig_peer::HolderClaim {
-    match origin {
+    // BOTH axes, folded through `landing_origin` exactly as every other landing decision in this
+    // file does (`dispatch.rs:381`, `:953`, `content_serve.rs:366`, `push_capsule.rs:272`). The
+    // transport axis alone is NOT sufficient, and reading it alone was a real exploit: a browser
+    // page served from `dig.local` -- or any extension origin -- can POST `dig.getContent` to the
+    // loopback port, which CORS admits, so the request arrives over a genuinely local socket
+    // (`origin = Local`, un-spoofable and correct) while being made on a STRANGER's behalf
+    // (`provenance = CrossSite`). Deciding on `origin` alone announced that stranger's chosen
+    // capsule as this operator's own, and -- because `Announce` REMOVES an existing marker -- could
+    // additionally un-suppress a capsule already correctly relayed.
+    //
+    // The fold is only ever restrictive (`CrossSite` -> `Peer`, `FirstParty` -> unchanged), so it
+    // cannot cost the operator their own flywheel.
+    match crate::download::landing_origin(origin, provenance) {
         crate::download::ReadOrigin::Local => crate::seams::dig_peer::HolderClaim::Announce,
-        // Every non-local origin is someone else's request, so its backfill is someone else's
-        // content. Enumerated exhaustively rather than by a wildcard would be better still, but the
-        // safe direction is the default here: a new origin variant lands SUPPRESSED, i.e. unbonded.
+        // Every non-local landing origin is someone else's request, so its backfill is someone
+        // else's content. The wildcard is the safe direction: a new origin variant lands
+        // SUPPRESSED, i.e. unbonded.
         _ => crate::seams::dig_peer::HolderClaim::Suppress,
     }
 }
@@ -1072,7 +1085,7 @@ fn holder_claim_for_read(
 #[cfg(test)]
 mod holder_claim_tests {
     use super::holder_claim_for_read;
-    use crate::download::ReadOrigin;
+    use crate::download::{ReadOrigin, RequestProvenance};
     use crate::seams::dig_peer::HolderClaim;
 
     /// **Proves (dig-node#436, the eleventh path):** a read arriving from a PEER backfills
@@ -1085,7 +1098,7 @@ mod holder_claim_tests {
     #[test]
     fn a_peer_read_backfills_suppressed() {
         assert_eq!(
-            holder_claim_for_read(ReadOrigin::Peer),
+            holder_claim_for_read(ReadOrigin::Peer, RequestProvenance::FirstParty),
             HolderClaim::Suppress,
             "a capsule pulled because a STRANGER asked for it is not this operator's content"
         );
@@ -1098,9 +1111,44 @@ mod holder_claim_tests {
     #[test]
     fn a_local_read_backfills_announced() {
         assert_eq!(
-            holder_claim_for_read(ReadOrigin::Local),
+            holder_claim_for_read(ReadOrigin::Local, RequestProvenance::FirstParty),
             HolderClaim::Announce,
             "the operator's own read leaves content more available than it found it"
+        );
+    }
+    /// **Proves (dig-node#436, the confused deputy):** a request arriving over a genuinely LOCAL
+    /// socket but made on a STRANGER's behalf backfills unbonded.
+    ///
+    /// This is the finding the first version of this fix missed, and the reason the decision folds
+    /// both axes instead of reading `origin` alone. A page served from `dig.local` — or any
+    /// extension origin — can POST `dig.getContent` to the loopback port; CORS admits it, so the
+    /// transport axis says `Local` and says so *correctly*. Only `provenance` distinguishes "the
+    /// operator asked for this" from "a web page asked for this using the operator's browser".
+    ///
+    /// Deciding on `origin` alone let an attacker-chosen capsule land bondable in a default
+    /// install, and — since `Announce` REMOVES an existing marker — un-suppress a capsule already
+    /// correctly relayed.
+    ///
+    /// **Catches:** any regression to a single-axis decision here. Both sibling tests in this
+    /// module pass with that bug present, which is precisely why this one exists.
+    #[test]
+    fn a_cross_site_read_over_a_local_socket_backfills_suppressed() {
+        assert_eq!(
+            holder_claim_for_read(ReadOrigin::Local, RequestProvenance::CrossSite),
+            HolderClaim::Suppress,
+            "a local socket driven by a stranger's page is a confused deputy, not the operator"
+        );
+    }
+
+    /// **The fold is restrictive-only.** A cross-site request that already arrived from a peer
+    /// stays suppressed — the fold can never *widen* a claim, so it cannot cost the operator their
+    /// own flywheel.
+    #[test]
+    fn a_cross_site_peer_read_stays_suppressed() {
+        assert_eq!(
+            holder_claim_for_read(ReadOrigin::Peer, RequestProvenance::CrossSite),
+            HolderClaim::Suppress,
+            "folding both axes is only ever restrictive"
         );
     }
 }

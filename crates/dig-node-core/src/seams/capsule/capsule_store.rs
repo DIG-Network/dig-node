@@ -274,10 +274,19 @@ impl CapsuleStore for Node {
         // the remote head advanced mid-sync, so we read the file back to report size + confirm
         // THIS capsule is now present.
         let sync = self
-            // `cache.fetchAndCache` is operator-initiated -- a control-plane method, not peer
-            // reachable -- so this land is genuinely this node's own capsule and stays bondable.
-            // Threaded per call site deliberately: suppressing every land through this shared choke
-            // point would disable the flywheel for the operator's own content.
+            // `cache.fetchAndCache` as INVOKED BY THE OPERATOR is a control-plane method, so this
+            // land is genuinely this node's own capsule and stays bondable. Threaded per call site
+            // deliberately: suppressing every land through this shared choke point would disable
+            // the flywheel for the operator's own content.
+            //
+            // NOT "unreachable by a peer", which an earlier version of this comment claimed and
+            // which is false: the inbound-demand backfill reaches this same function from a remote
+            // request (`peer.rs` -> `note_inbound_demand` -> the backfill task), so a peer's demand
+            // can drive a land that lands ANNOUNCED here. That path is gated behind the default-OFF
+            // `DIG_NODE_INBOUND_DEMAND_CACHE`, so it is not reachable in a default install -- but
+            // "behind a flag" is a different claim from "not reachable", and only the first is
+            // true. Tracked as dig-node#446; it wants the claim derived from the demand's origin
+            // rather than hard-coded here.
             .sync_module_from(
                 &self.upstream,
                 store_id_hex,
