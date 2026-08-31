@@ -1005,17 +1005,22 @@ mod tests {
     use chia_sdk_test::Simulator;
     use chia_wallet_sdk::types::TESTNET11_CONSTANTS;
 
-    /// The exact ack `chia_query` produces for each `TransactionAck` status byte.
+    /// The exact ack `chia_query` produces for a `TransactionAck` status byte.
     ///
-    /// Built from `chia_query::peer::translate::ack_to_tx_status`'s own mapping rather than from
-    /// what this module would like it to be, so a change to that mapping shows up here as a
-    /// failure instead of being silently accommodated.
-    fn ack(status: &str, success: bool) -> chia_query::TxStatus {
-        chia_query::TxStatus {
-            status: status.to_string(),
-            success,
-        }
+    /// This CALLS `chia_query::peer::translate::ack_to_tx_status` rather than restating its
+    /// mapping, so the coupling is real: rename a label there, or flip a `success` flag, and these
+    /// tests fail instead of silently accommodating it. A hand-built `TxStatus` would leave
+    /// [`accepted_by_mempool`]'s `"SUCCESS"` literal free to drift out of agreement with the crate,
+    /// and the node would refuse every push with both tests still green.
+    fn ack(status: u8) -> chia_query::TxStatus {
+        chia_query::peer::translate::ack_to_tx_status(status)
     }
+
+    /// The status bytes, named, so the tests below read as the acks a full node actually sends.
+    const ACK_SUCCESS: u8 = 1;
+    const ACK_PENDING: u8 = 2;
+    const ACK_FAILED: u8 = 3;
+    const ACK_UNKNOWN: u8 = 9;
 
     /// A PENDING ack is a REFUSAL, and it is the one ack that distinguishes this check from the
     /// obvious wrong one.
@@ -1026,7 +1031,7 @@ mod tests {
     /// only input that tells them apart, which is why it is written first and named for it.
     #[test]
     fn a_pending_ack_is_not_an_accepted_broadcast() {
-        let pending = ack("PENDING", true);
+        let pending = ack(ACK_PENDING);
         assert!(
             pending.success,
             "the fixture must carry the conflation it exists to catch: chia_query really does set \
@@ -1046,12 +1051,12 @@ mod tests {
     /// SUCCESS, and only SUCCESS, is admission.
     #[test]
     fn only_a_success_ack_reports_an_accepted_broadcast() {
-        accepted_by_mempool(&ack("SUCCESS", true)).expect("status 1 is mempool admission");
+        accepted_by_mempool(&ack(ACK_SUCCESS)).expect("status 1 is mempool admission");
 
         for refused in [
-            ack("PENDING", true),
-            ack("FAILED", false),
-            ack("UNKNOWN", false),
+            ack(ACK_PENDING),
+            ack(ACK_FAILED),
+            ack(ACK_UNKNOWN),
         ] {
             let name = refused.status.clone();
             assert!(
