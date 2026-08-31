@@ -4613,6 +4613,45 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 mod tests {
     use super::*;
 
+    /// **Proves (dig-node#462):** the only public write of `initial_sync_complete` that production
+    /// can reach DISARMS, and it really does clear a flag that was armed.
+    ///
+    /// # What enforces the other half, and why it is not asserted here
+    ///
+    /// The ticket asks that production be unable to ARM except through a `reset_epoch`-guarded
+    /// path, "enforced by the compiler rather than by convention", and explicitly rules out a test
+    /// that greps for callers. That half is discharged STRUCTURALLY and cannot be written as a
+    /// runtime assertion: [`WalletDb::clear_initial_sync_complete`] takes no argument, so there is
+    /// no `true` to pass, and the raw `write_initial_sync_complete` is private. The type cannot
+    /// express the unguarded arm — the same shape as a scalar that cannot represent a set of two.
+    ///
+    /// So this test pins the direction that IS representable, and the compiler pins the one that is
+    /// not. A future change that re-widens this to `fn set_initial_sync_complete(&self, bool)` is
+    /// caught by review against this doc-comment, not by a green suite — which is stated here
+    /// rather than implied, because a reader who finds only this test could otherwise conclude the
+    /// arming direction was never considered.
+    ///
+    /// **Catches:** a `clear_` that no longer clears — e.g. one wired to the wrong column, or one
+    /// that writes `true` because the parameter was removed by editing the call rather than the
+    /// body.
+    #[tokio::test]
+    async fn clear_initial_sync_complete_disarms_an_armed_flag() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
+        assert!(
+            db.sync_state().await.unwrap().initial_sync_complete,
+            "the fixture must start ARMED, or the clear below would prove nothing"
+        );
+
+        db.clear_initial_sync_complete().await.unwrap();
+        assert!(
+            !db.sync_state().await.unwrap().initial_sync_complete,
+            "the reorg path's disarm must actually reach the flag — sync.rs relies on it to make \
+             wallet reads fall back after the replica moves backwards"
+        );
+    }
+
     fn coin(id: &str, amount: u64, created: Option<i64>, spent: Option<i64>) -> CoinRow {
         CoinRow {
             coin_id: id.into(),
