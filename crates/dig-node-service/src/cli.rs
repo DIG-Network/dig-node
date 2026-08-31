@@ -208,7 +208,10 @@ mod tests {
             std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "node not answering");
         let measured = std::io::Error::other("the disk gave up mid-write");
 
-        assert_eq!(ExitCode::from_io_error(&unreachable), ExitCode::NodeUnreachable);
+        assert_eq!(
+            ExitCode::from_io_error(&unreachable),
+            ExitCode::NodeUnreachable
+        );
         assert_eq!(ExitCode::from_io_error(&measured), ExitCode::IoError);
         assert_ne!(
             ExitCode::from_io_error(&unreachable).code(),

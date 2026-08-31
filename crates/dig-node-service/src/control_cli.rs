@@ -1552,13 +1552,17 @@ mod tests {
     /// untouched -- no restart story bolted onto a real failure.
     #[test]
     fn a_genuine_decline_is_not_reframed_as_a_restart() {
-        let e = std::io::Error::other("dig-node: dig-updater declined the request: no such channel");
+        let e =
+            std::io::Error::other("dig-node: dig-updater declined the request: no such channel");
         let out = explain_unreachable("control.updater.checkNow", e);
 
         assert_eq!(out.kind(), std::io::ErrorKind::Other);
         let msg = out.to_string();
         assert!(msg.contains("declined the request"), "{msg}");
-        assert!(!msg.contains("restarted the node"), "a measured failure must not be excused: {msg}");
+        assert!(
+            !msg.contains("restarted the node"),
+            "a measured failure must not be excused: {msg}"
+        );
     }
 
     /// A non-updater verb hitting the same unreachable node gets the general statement, not the

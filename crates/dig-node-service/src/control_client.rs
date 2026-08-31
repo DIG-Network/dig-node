@@ -83,19 +83,15 @@ async fn call_async(
     if let Some(token) = token {
         req = req.header(control::CONTROL_TOKEN_HEADER, token);
     }
-    let resp = req
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                format!(
-                    "could not reach the dig-node at {url}: {e} — is it running? \
+    let resp = req.json(&body).send().await.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!(
+                "could not reach the dig-node at {url}: {e} — is it running? \
                      Start it with `dig-node run` (or `dig-node start` for the service)."
-                ),
-            )
-        })?;
+            ),
+        )
+    })?;
     let v: Value = resp.json().await.map_err(std::io::Error::other)?;
     if let Some(err) = v.get("error") {
         let msg = err

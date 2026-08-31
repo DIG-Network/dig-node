@@ -5779,8 +5779,14 @@ mod tests {
         let windows = remedy_for_unreadable_token(path, "/var/lib/dig-node", false);
 
         assert!(unix.contains("elevated"), "{unix}");
-        assert!(unix.contains("dign pair"), "the scoped-credential route must be named: {unix}");
-        assert!(unix.contains("revoke"), "a grant with no stated revocation is a permanent one: {unix}");
+        assert!(
+            unix.contains("dign pair"),
+            "the scoped-credential route must be named: {unix}"
+        );
+        assert!(
+            unix.contains("revoke"),
+            "a grant with no stated revocation is a permanent one: {unix}"
+        );
         assert!(
             !unix.contains("uninstall"),
             "reinstalling does not grant read access on Unix; advising it is the dead end: {unix}"

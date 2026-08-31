@@ -126,6 +126,9 @@ mod tests {
     fn an_absent_field_prints_unknown_rather_than_a_plausible_default() {
         let s = format_network_info(&json!({ "peer_id": "cc33" }));
         assert!(s.contains("unknown"), "{s}");
-        assert!(!s.contains("direct"), "a missing reachability must not read as direct: {s}");
+        assert!(
+            !s.contains("direct"),
+            "a missing reachability must not read as direct: {s}"
+        );
     }
 }
