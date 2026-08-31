@@ -87,6 +87,13 @@ pub enum ControlAction {
     WalletSyncStatus,
     /// `control.wallet.peak` — the READ-ONLY chain peak height the node can see.
     WalletPeak,
+    /// `control.wallet.resetCoinDb` — **DESTRUCTIVE.** Drop the cached coin database and force a
+    /// re-sync from chain (dig-node#384).
+    ///
+    /// Discards only chain-derived rows, which a re-sync reproduces; it NEVER touches a seed, a
+    /// device key or any other key material. It refuses while a spend is in flight. Requires
+    /// `confirm: true`, so a mistyped verb cannot wipe the cache by accident.
+    WalletResetCoinDb { confirm: bool },
     /// `control.wallet.broadcast` — push an ALREADY-SIGNED spend bundle. The node signs nothing.
     WalletBroadcast { signed_bundle_hex: String },
     /// `control.wallet.watch` — register PUBLIC keys whose addresses this node should follow.
@@ -224,6 +231,7 @@ impl ControlAction {
             ControlAction::WalletCoinsByParent { .. } => "control.wallet.coinsByParent",
             ControlAction::WalletArrivals { .. } => "control.wallet.arrivals",
             ControlAction::WalletPeak => "control.wallet.peak",
+            ControlAction::WalletResetCoinDb { .. } => "control.wallet.resetCoinDb",
             ControlAction::WalletSyncStatus => "control.wallet.syncStatus",
             ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
             ControlAction::WalletWatch { .. } => "control.wallet.watch",
@@ -311,6 +319,10 @@ impl ControlAction {
             ControlAction::WalletBalance { address, asset } => {
                 json!({ "address": address, "asset": asset_to_wire(asset) })
             }
+            // The confirmation travels as a REQUIRED field rather than being asserted CLI-side,
+            // so every client of the control plane faces the same gate. A destructive method that
+            // only the CLI guards is a destructive method with no guard (dig-node#384).
+            ControlAction::WalletResetCoinDb { confirm } => json!({ "confirm": confirm }),
             // Split from the balance arm because this read is PAGED. The two page fields are
             // OMITTED when unset rather than sent as null, so the node applies the CONTRACT's
             // default page size -- sending a number this CLI invented would make `dign wallet
@@ -499,6 +511,7 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         }
         .method(),
         ControlAction::WalletPeak.method(),
+        ControlAction::WalletResetCoinDb { confirm: false }.method(),
         ControlAction::WalletSyncStatus.method(),
         ControlAction::WalletBroadcast {
             signed_bundle_hex: String::new(),
@@ -742,6 +755,11 @@ fn summarize(method: &str, result: &Value) -> String {
         // `result["coin"]` yields `Null` for a missing key, but indexing the INNER map would
         // panic on one — so every field is read with `get`, and a coin record short of a field
         // prints an honest unknown instead of aborting the CLI.
+        "control.wallet.resetCoinDb" => format!(
+            "coin database reset · {} coin(s) and {} staged discovery row(s) discarded · the              replica is no longer authoritative and will re-sync from chain",
+            amount(&result["coins_dropped"]),
+            amount(&result["staged_dropped"]),
+        ),
         "control.wallet.arrivals" => {
             let n = result["arrivals"].as_array().map(Vec::len).unwrap_or(0);
             format!(

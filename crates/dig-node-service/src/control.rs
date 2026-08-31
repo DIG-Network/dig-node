@@ -195,6 +195,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
     "control.wallet.unwatch",
@@ -260,6 +261,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
     "control.wallet.unwatch",
@@ -966,6 +968,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.coinsByParent" => wallet_coins_by_parent(ctx, id, params).await,
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
+        "control.wallet.resetCoinDb" => wallet_reset_coin_db(ctx, id, params).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
         "control.wallet.watch" => wallet_watch(ctx, id, params).await,
         "control.wallet.unwatch" => wallet_unwatch(ctx, id, params),
@@ -2318,6 +2321,76 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 /// rather than one field — the #2609 regression. A new phase is published in that crate FIRST and
 /// emitted here second; `every_phase_the_node_can_emit_is_declared_by_the_published_contract`
 /// enforces the ordering.
+/// `control.wallet.resetCoinDb` (dig-node#384) — **DESTRUCTIVE.** Drop the cached coin database
+/// and force a re-sync from chain.
+///
+/// # Why it exists, given that attribution self-repairs
+///
+/// `reconstruct_all` walks every coin and repairs unattributed ones on the next tick, so a merely
+/// STALE database needs no reset. The case that does is narrower and permanent: a coin whose
+/// parent spend could not be fetched — an unreachable source, a transient failure, a pruned
+/// response — is skipped silently and **never re-queued**. Its asset never resolves and its value
+/// never appears in an asset-scoped balance, for the life of the file. Until this method the only
+/// recovery was deleting the database by hand.
+///
+/// # It is NOT an open read, deliberately
+///
+/// Absent from [`is_open_control_read`], so it takes the control-plane token like every other
+/// privileged method, and the node binds loopback-only. A caller on another machine cannot reach
+/// it. **The one exception is an operator who sets `DIG_NODE_ALLOW_REMOTE=1`**, which widens every
+/// privileged method at once; that is a deliberate, documented choice and not specific to this
+/// one, but it is stated here because this method destroys state.
+///
+/// # `confirm: true` is required
+///
+/// A destructive method that runs on an empty parameter object is one keystroke from a wiped
+/// cache. The flag travels on the WIRE rather than being asserted in the CLI, so every client
+/// faces the gate — a guard only the CLI applies is not a guard.
+///
+/// # What it never touches
+///
+/// Key material. Every table it clears is chain-derived and reproduced by syncing; a seed is not.
+/// See [`dig_wallet::sage::db::WalletDb::reset_chain_cache`] for the table list, for why the
+/// authoritative flag is cleared in the SAME transaction, and for the in-flight-spend refusal.
+async fn wallet_reset_coin_db(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    if params.get("confirm").and_then(Value::as_bool) != Some(true) {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            "control.wallet.resetCoinDb is DESTRUCTIVE: it discards this node's cached coin              database and re-syncs from chain. Pass params.confirm = true to proceed. No key              material is affected.",
+        );
+    }
+
+    // The node's own clock. A caller-supplied instant would be a lapse oracle: a far-future value
+    // makes every live spend reservation read as expired, which is exactly the guard being asked
+    // to stand down.
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX);
+
+    match ctx.wallet.reset_coin_db(now_ms).await {
+        Ok(Ok(report)) => control_ok(
+            id,
+            json!({
+                "coins_dropped": report.coins_dropped,
+                "staged_dropped": report.staged_dropped,
+            }),
+        ),
+        // A refusal is an ERROR, not a success with a flag. A caller that ignored a
+        // `refused: true` field would read "your cache was reset" and act on it.
+        Ok(Err(refusal)) => control_error(id, ErrorCode::InvalidParams, refusal.to_string()),
+        Err(e) => control_error(
+            id,
+            ErrorCode::WalletReadFailed,
+            format!("control.wallet.resetCoinDb: the reset could not be applied: {e}"),
+        ),
+    }
+}
+
 async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
     match ctx.wallet.wallet_sync_status().await {
         Ok(s) => control_ok(

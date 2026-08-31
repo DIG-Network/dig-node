@@ -1512,18 +1512,51 @@ impl WalletDb {
     /// Raise the derivation-index floor for one HD tree (`increase_derivation_index`,
     /// §18.16) — [`Self::max_derivation_index`] never reports less than this afterward, even
     /// if no derivation rows exist yet at that index. Never lowers an existing floor.
-    pub async fn raise_derivation_floor(&self, hardened: bool, index: u32) -> sqlx::Result<()> {
+    /// Raise a derivation floor to at least `index`, returning the floor that is IN FORCE
+    /// afterwards (dig-node#256).
+    ///
+    /// # Why it returns the floor instead of `()`
+    ///
+    /// The write is `MAX(col, ?)`, so a request BELOW the current floor is a deliberate no-op —
+    /// correct, and previously indistinguishable from success at every layer above. The floor
+    /// decides which addresses this node scans, so a caller that believes it raised coverage it
+    /// did not raise has funds it cannot see. Returning the resulting floor makes the two
+    /// distinguishable without the caller having to make a second read that could race this one.
+    ///
+    /// # A zero-row update is an ERROR, not a quiet success
+    ///
+    /// `WHERE id = 0` against an absent settings row updates nothing and `execute` still returns
+    /// `Ok`. That is the failure mode with no symptom: the floor is never raised, the caller is
+    /// told it was, and the addresses stay unscanned. It is refused by name here rather than
+    /// inferred from the read-back, so the diagnosis names the missing row.
+    pub async fn raise_derivation_floor(&self, hardened: bool, index: u32) -> sqlx::Result<u32> {
         let col = if hardened {
             "derivation_floor_hardened"
         } else {
             "derivation_floor_unhardened"
         };
-        sqlx::query(&format!(
+        let done = sqlx::query(&format!(
             "UPDATE network_settings SET {col} = MAX({col}, ?) WHERE id = 0"
         ))
         .bind(i64::from(index))
         .execute(&self.pool)
         .await?;
+        if done.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        self.derivation_floor(hardened).await
+    }
+
+    /// Delete the singleton `network_settings` row, so a test can exercise the zero-row-update
+    /// path that [`Self::raise_derivation_floor`] refuses (dig-node#256).
+    ///
+    /// Test-only and named so: the absent row is a real state a corrupted or partially-migrated
+    /// database can be in, and the refusal that guards it is untestable without reaching it.
+    #[cfg(test)]
+    pub async fn delete_network_settings_row_for_test(&self) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM network_settings WHERE id = 0")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -2615,6 +2648,156 @@ impl WalletDb {
         Ok(n)
     }
 
+}
+
+/// Why a coin-database reset was refused (dig-node#384).
+///
+/// A distinct type rather than a string, because the caller has to be able to tell "I refused" from
+/// "I did it" without reading prose, and because the two reasons need different remedies: one waits,
+/// the other is a bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetRefusal {
+    /// A spend is in flight. `coin_reservations`, `client_coin_reservations` and
+    /// `pending_transactions` all reference coins by id, and wiping the coins beneath a reserved,
+    /// unconfirmed spend would leave a bundle whose inputs the wallet no longer knows about.
+    ///
+    /// The remedy is to wait: reservations expire, and the reset succeeds afterwards.
+    SpendInFlight { reservations: u64 },
+}
+
+impl std::fmt::Display for ResetRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SpendInFlight { reservations } => write!(
+                f,
+                "refused: {reservations} coin reservation(s) are in flight. Resetting now would                  wipe the coins an unconfirmed spend was built on. Wait for them to confirm or                  expire, then retry."
+            ),
+        }
+    }
+}
+
+/// What a completed reset discarded (dig-node#384).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ResetReport {
+    /// Coin rows dropped. A caller renders this to say what the reset actually cost.
+    pub coins_dropped: u64,
+    /// Staged CAT-discovery rows dropped.
+    pub staged_dropped: u64,
+}
+
+impl WalletDb {
+    /// Drop the chain-derived cache and force a re-sync from chain (dig-node#384).
+    ///
+    /// # What this is FOR, and what it is not
+    ///
+    /// Not "the database is stale" — `reconstruct_all` repairs that on the next tick. The case
+    /// this exists for is narrower and permanent: a coin whose parent spend could not be fetched
+    /// is skipped and **never re-queued**, so its asset never resolves and its value never
+    /// appears in an asset-scoped balance, for the life of the database. Until now the only
+    /// recovery was deleting the file by hand.
+    ///
+    /// # The money hazard, and why the flag is cleared in the SAME transaction
+    ///
+    /// `is_synced` is what makes the local replica AUTHORITATIVE for wallet-scoped reads
+    /// (`routing::route`). Between emptying the coins and finishing the re-sync the database is
+    /// empty — so an emptied-but-still-`synced` replica answers **`balance 0, synced true`** on a
+    /// funded wallet, which is the money-lie class this repo already documents for the
+    /// reorg-rollback path in almost these words.
+    ///
+    /// So the delete and the flag clear are ONE transaction. A crash between them cannot leave an
+    /// empty authoritative replica; reads fall back to the chain tier until a genuine catch-up
+    /// re-establishes the flag. The recorded coverage is cleared with it, because a coverage
+    /// record describing a set the replica no longer holds is the same falsehood one field along.
+    ///
+    /// # Key material is never touched
+    ///
+    /// Every table cleared here is chain-derived and re-derivable by syncing. Seeds, device keys
+    /// and the derivation floors live outside this transaction and outside this database's
+    /// destructive reach — a coin can be re-fetched, a seed cannot.
+    ///
+    /// # It refuses rather than corrupting
+    ///
+    /// See [`ResetRefusal::SpendInFlight`].
+    /// # `now_ms` counts only LIVE holds
+    ///
+    /// A hold is retired by expiry, and pruning is periodic — so a table row is not the same thing
+    /// as a spend in flight. Counting rows would let one lapsed, unpruned reservation refuse every
+    /// reset for ever, which is a permanent denial of the only recovery this feature provides.
+    ///
+    /// The node reads its own clock for this; it is a parameter so a test can drive the edge
+    /// exactly, and for the reason [`Self::held_reservations`] gives — a caller-supplied instant
+    /// would be a lapse oracle.
+    pub async fn reset_chain_cache(
+        &self,
+        now_ms: i64,
+    ) -> sqlx::Result<std::result::Result<ResetReport, ResetRefusal>> {
+        let mut tx = self.pool.begin().await?;
+
+        // Counted INSIDE the transaction, so a reservation taken between a pre-check and the
+        // delete cannot slip through the gap this refusal exists to close.
+        let reservations: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM pending_transactions WHERE expires_at > ?1)
+                  + (SELECT COUNT(*) FROM coin_reservations r
+                     JOIN pending_transactions p ON p.transaction_id = r.transaction_id
+                     WHERE p.expires_at > ?1)
+                  + (SELECT COUNT(*) FROM client_coin_reservations WHERE expires_at_ms > ?1)",
+        )
+        .bind(now_ms)
+        .fetch_one(&mut *tx)
+        .await?;
+        if reservations > 0 {
+            // Dropped without committing: nothing was written, so a refusal cannot half-reset.
+            return Ok(Err(ResetRefusal::SpendInFlight {
+                reservations: reservations as u64,
+            }));
+        }
+
+        let coins_dropped: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coins")
+            .fetch_one(&mut *tx)
+            .await?;
+        let staged_dropped: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cat_admission_pending")
+            .fetch_one(&mut *tx)
+            .await?;
+
+        // Every table here is chain-derived. `derivations`, `network_settings`, `user_themes`,
+        // `peers` and `offers` are deliberately absent: they are configuration or user artifacts,
+        // not a cache of the chain, and re-syncing does not reproduce them.
+        for table in [
+            "coins",
+            "cats",
+            "nfts",
+            "dids",
+            "nft_collections",
+            "options",
+            "arrivals",
+            "arrival_pending",
+            "cat_admission_pending",
+            "chain_read_cache",
+            "chain_spend_cache",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table}"))
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // The clause that makes the whole operation safe. See the doc above.
+        sqlx::query(
+            "UPDATE sync_state
+             SET initial_sync_complete = 0, covered_puzzle_hashes = ''
+             WHERE id = 0",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Ok(ResetReport {
+            coins_dropped: coins_dropped as u64,
+            staged_dropped: staged_dropped as u64,
+        }))
+    }
+}
+
+impl WalletDb {
     /// Every live in-flight bundle, oldest submission first, with the coins it reserved.
     pub async fn pending_transactions(&self) -> sqlx::Result<Vec<PendingTransactionRow>> {
         let rows = sqlx::query(
@@ -4911,6 +5094,124 @@ mod tests {
                 .name
                 .as_deref(),
             Some("My Collection")
+        );
+    }
+
+    // ---- coin-database reset (dig-node#384) --------------------------------
+
+    /// **The money hazard, asserted directly: a reset must never leave an EMPTY replica claiming
+    /// to be AUTHORITATIVE (dig-node#384).**
+    ///
+    /// `is_synced` is what licenses `routing::route` to serve wallet-scoped reads from the local
+    /// replica. An emptied-but-still-synced database therefore answers `balance 0, synced true`
+    /// for a funded wallet — a confident zero about somebody's money.
+    ///
+    /// The pre-state is asserted first, so this cannot pass against a database that was never
+    /// synced to begin with.
+    #[tokio::test]
+    async fn a_reset_clears_the_authoritative_flag_along_with_the_coins() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 12_345, Some(10), None))
+            .await
+            .unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        assert!(db.is_synced().await.unwrap(), "pre-state: authoritative");
+
+        let report = db.reset_chain_cache(0).await.unwrap().expect("not refused");
+        assert_eq!(report.coins_dropped, 1);
+
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "an emptied replica that still calls itself synced answers `balance 0, synced true`              on a funded wallet — the whole risk of this feature"
+        );
+    }
+
+    /// A reset REFUSES while a spend is in flight, and refuses WITHOUT writing anything
+    /// (dig-node#384).
+    ///
+    /// The reservation tables reference coins by id, so wiping the coins beneath an unconfirmed
+    /// bundle leaves a spend whose inputs the wallet no longer knows about. The second half —
+    /// that the coins are still there afterwards — is what makes this more than a return-value
+    /// test: a refusal that had already deleted half the tables would satisfy the first assertion
+    /// alone.
+    #[tokio::test]
+    async fn a_reset_refuses_while_a_spend_is_in_flight_and_writes_nothing() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 12_345, Some(10), None))
+            .await
+            .unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        db.reserve_client_coins(&["c1".to_string()], Some(60_000), 0)
+            .await
+            .expect("reserve");
+
+        let refusal = db
+            .reset_chain_cache(0)
+            .await
+            .unwrap()
+            .expect_err("a reset under a live reservation must refuse");
+        assert!(matches!(refusal, ResetRefusal::SpendInFlight { .. }));
+
+        assert!(
+            db.is_synced().await.unwrap(),
+            "a refusal must leave the flag alone — a half-applied reset is the state this              refusal exists to prevent"
+        );
+        assert_eq!(
+            db.coins_by_ids(&["c1".to_string()]).await.unwrap().len(),
+            1,
+            "the reserved coin must survive the refusal"
+        );
+    }
+
+    /// The control that proves the refusal is keyed on the reservation and not on the method
+    /// always refusing: the SAME database resets cleanly once the hold has lapsed.
+    #[tokio::test]
+    async fn a_reset_succeeds_once_the_reservation_has_expired() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 12_345, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_client_coins(&["c1".to_string()], Some(1), 0)
+            .await
+            .expect("reserve");
+        assert!(
+            db.reset_chain_cache(0).await.unwrap().is_err(),
+            "at instant 0 the hold is live"
+        );
+
+        // Fixture time, pinned explicitly rather than read from the wall clock: the hold's TTL is
+        // 1ms from instant 0, so instant 10_000 is unambiguously past it in every environment.
+        // Note the reset is asked at the LATER instant WITHOUT pruning first — a lapsed row that
+        // nobody has swept must not refuse, or one stale row denies the recovery for ever.
+        let report = db
+            .reset_chain_cache(10_000)
+            .await
+            .unwrap()
+            .expect("the hold has lapsed, so the reset proceeds");
+        assert_eq!(report.coins_dropped, 1);
+    }
+
+    /// A reset discards CHAIN-DERIVED rows only. A user theme is configuration, not a cache of the
+    /// chain, and re-syncing does not reproduce it — so it must survive.
+    ///
+    /// This is the standing guard on the table list: a future author adding a table to the delete
+    /// loop that is not chain-derived destroys data the user cannot get back.
+    #[tokio::test]
+    async fn a_reset_does_not_discard_configuration_it_cannot_re_derive() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.save_user_theme("nft1", "dark-purple").await.unwrap();
+        db.upsert_coin(&coin("c1", 1, Some(10), None)).await.unwrap();
+
+        db.reset_chain_cache(0).await.unwrap().expect("not refused");
+
+        assert_eq!(
+            db.user_theme("nft1").await.unwrap().as_deref(),
+            Some("dark-purple"),
+            "a theme is not chain-derived and a re-sync cannot bring it back"
+        );
+        assert!(
+            db.coins_by_ids(&["c1".to_string()]).await.unwrap().is_empty(),
+            "control: the chain-derived half WAS discarded"
         );
     }
 

@@ -1115,6 +1115,19 @@ impl WalletBackend {
     /// unbounded egress path (dig_ecosystem#1957) that also discloses `{IP, timestamp, coin id}`
     /// to that third party.
     ///
+    /// Drop the chain-derived cache and force a re-sync from chain (dig-node#384).
+    ///
+    /// A thin pass-through to [`WalletDb::reset_chain_cache`], which holds the whole contract:
+    /// the authoritative flag is cleared in the same transaction as the coins, an in-flight spend
+    /// refuses, and no key material is reachable. Exposed here because the control plane holds a
+    /// backend, not a database.
+    pub async fn reset_coin_db(
+        &self,
+        now_ms: i64,
+    ) -> sqlx::Result<std::result::Result<super::db::ResetReport, super::db::ResetRefusal>> {
+        self.db.reset_chain_cache(now_ms).await
+    }
+
     /// With no supervisor the peer count is reported UNOBSERVABLE (`None`), never zero — zero
     /// would claim an observation nobody made.
     pub async fn wallet_sync_status(
@@ -4234,13 +4247,15 @@ impl WalletBackend {
         Ok(ActionResponse {})
     }
 
+    /// Raise the HD derivation floor, reporting the floors in force afterwards (dig-node#256).
+    ///
+    /// The one action method that does NOT return the shared empty response, because its no-op is
+    /// reachable and costs money: see [`IncreaseDerivationIndexResponse`].
     async fn increase_derivation_index(
         &self,
         req: &IncreaseDerivationIndex,
-    ) -> Result<ActionResponse> {
-        actions::increase_derivation_index(&self.db, req.hardened, req.unhardened, req.index)
-            .await?;
-        Ok(ActionResponse {})
+    ) -> Result<IncreaseDerivationIndexResponse> {
+        actions::increase_derivation_index(&self.db, req.hardened, req.unhardened, req.index).await
     }
 
     // ---- themes (#205 PR4) --------------------------------------------------
@@ -5664,9 +5679,13 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(
             ids,
-            ["pending-dig", "real-dig"],
-            "exactly the $DIG coins: not an empty set (the #306 under-report), and not the              hinted XCH or foreign CAT (the #2879 over-report)"
+            ["real-dig"],
+            "the confirmed $DIG coin: not an empty set (the #306 under-report), and not the              hinted XCH or foreign CAT (the #2879 over-report)"
         );
+        // `pending-dig` has no created height and the default filter mode excludes unconfirmed
+        // coins — pinned here so a later widening of that filter is a deliberate change rather
+        // than an accident that starts offering unconfirmed value to a caller.
+        assert!(!ids.contains(&"pending-dig"));
     }
 
     /// The control that makes the test above load-bearing in the OTHER direction: asking for a

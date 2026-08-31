@@ -5,7 +5,7 @@
 //! ([`super::rpc`]) dispatches to after normalizing wire ids (hex/bech32m → stored hex).
 
 use super::db::WalletDb;
-use super::types::TokenRecord;
+use super::types::{IncreaseDerivationIndexResponse, TokenRecord};
 use super::{Error, Result};
 
 /// `resync_cat` — clear a CAT's cached display metadata, forcing a future re-fetch. The
@@ -81,12 +81,16 @@ pub async fn redownload_nft(db: &WalletDb, nft_id: &str) -> Result<()> {
 /// HD tree(s) so `get_sync_status`/`get_derivations` report at least `index` coverage, even
 /// before any coin activity at those indices. At least one of `hardened`/`unhardened` must be
 /// requested.
+/// Raise the derivation floor(s), reporting the floors IN FORCE afterwards (dig-node#256).
+///
+/// A tree the request did not name reports `None` — "not asked", never a floor of 0. See
+/// [`crate::sage::types::IncreaseDerivationIndexResponse`] for why this returns figures at all.
 pub async fn increase_derivation_index(
     db: &WalletDb,
     hardened: Option<bool>,
     unhardened: Option<bool>,
     index: u32,
-) -> Result<()> {
+) -> Result<IncreaseDerivationIndexResponse> {
     let want_hardened = hardened.unwrap_or(false);
     let want_unhardened = unhardened.unwrap_or(false);
     if !want_hardened && !want_unhardened {
@@ -94,13 +98,107 @@ pub async fn increase_derivation_index(
             "increase_derivation_index requires hardened and/or unhardened to be true",
         ));
     }
+    let mut out = IncreaseDerivationIndexResponse {
+        hardened_floor: None,
+        unhardened_floor: None,
+    };
     if want_hardened {
-        db.raise_derivation_floor(true, index).await?;
+        out.hardened_floor = Some(db.raise_derivation_floor(true, index).await?);
     }
     if want_unhardened {
-        db.raise_derivation_floor(false, index).await?;
+        out.unhardened_floor = Some(db.raise_derivation_floor(false, index).await?);
     }
-    Ok(())
+    Ok(out)
+}
+
+#[cfg(test)]
+mod derivation_floor_tests {
+    use super::*;
+
+    /// **dig-node#256 — a clamped request must not report success (the money case).**
+    ///
+    /// The write is `MAX(col, ?)`, so asking for an index BELOW the current floor changes
+    /// nothing. Under the shared empty `ActionResponse {}` the caller was told it succeeded, and
+    /// addresses above the index they thought they had raised to stay unscanned — funds that are
+    /// invisible with no error and no retry.
+    ///
+    /// The raise is asserted FIRST as the control. Without it a response that reported the
+    /// REQUESTED index back would pass the second half, and an implementation that always
+    /// reported the same figure would pass the first.
+    #[tokio::test]
+    async fn a_clamped_raise_reports_the_floor_in_force_not_the_one_requested() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+
+        let up = increase_derivation_index(&db, None, Some(true), 500)
+            .await
+            .unwrap();
+        assert_eq!(
+            up.unhardened_floor,
+            Some(500),
+            "control: a genuine raise reports the new floor"
+        );
+
+        let down = increase_derivation_index(&db, None, Some(true), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            down.unhardened_floor,
+            Some(500),
+            "a request below the floor is a no-op, and the response must say so by reporting 500              — echoing back the requested 5 is the lie this ticket removes"
+        );
+    }
+
+    /// A tree the request did not name reports `None`, never a floor of `0`.
+    ///
+    /// Zero is a real claim — *this tree scans no derived addresses* — so rendering "not asked"
+    /// as zero is the unknown-as-a-number defect this whole batch is about, one field along.
+    #[tokio::test]
+    async fn an_unrequested_tree_reports_unknown_rather_than_a_floor_of_zero() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+
+        let r = increase_derivation_index(&db, Some(true), None, 12)
+            .await
+            .unwrap();
+        assert_eq!(r.hardened_floor, Some(12));
+        assert_eq!(
+            r.unhardened_floor, None,
+            "the unhardened tree was not asked about; `Some(0)` would assert it scans nothing"
+        );
+
+        // Both trees at once, so the `None` above cannot be an artefact of the field never being
+        // populated at all.
+        let both = increase_derivation_index(&db, Some(true), Some(true), 20)
+            .await
+            .unwrap();
+        assert_eq!(both.hardened_floor, Some(20));
+        assert_eq!(both.unhardened_floor, Some(20));
+    }
+
+    /// A write that updates NO ROW is an error, not a quiet success (dig-node#256).
+    ///
+    /// `UPDATE … WHERE id = 0` against an absent settings row affects zero rows and `execute`
+    /// returns `Ok`. That is the shape with no symptom at all: the floor is never raised and the
+    /// caller is told it was. The seeded control in the same test proves the refusal is keyed on
+    /// the missing row rather than on the method always failing.
+    #[tokio::test]
+    async fn a_zero_row_update_fails_rather_than_reporting_a_raise() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        assert!(
+            increase_derivation_index(&db, None, Some(true), 7)
+                .await
+                .is_ok(),
+            "control: with the settings row present the raise succeeds"
+        );
+
+        db.delete_network_settings_row_for_test().await.unwrap();
+
+        assert!(
+            increase_derivation_index(&db, None, Some(true), 7)
+                .await
+                .is_err(),
+            "with no settings row nothing is written; reporting success here is the defect"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,118 @@
+    Checking serde_json v1.0.151
+    Checking regex-automata v0.4.18
+    Checking bitflags v2.13.1
+    Checking simd-adler32 v0.3.10
+    Checking tower-http v0.6.11
+    Checking miniz_oxide v0.9.1
+    Checking reqwest v0.12.28
+    Checking digstore-core v0.29.0 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking regex v1.13.1
+    Checking flate2 v1.1.10
+    Checking wasmparser v0.221.3
+    Checking wasmparser v0.252.0
+    Checking digstore-crypto v0.1.1 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking dig-nat v0.21.0
+    Checking chialisp v0.4.6
+    Checking clvm_tools_rs v0.3.0
+    Checking chia-sdk-coinset v0.36.0
+    Checking chia-sdk-coinset v0.30.0
+    Checking digstore-chunker v0.29.0 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking windows-sys v0.59.0
+    Checking dig-rpc-protocol v0.10.2
+    Checking windows-sys v0.52.0
+    Checking object_store v0.11.2
+    Checking rusqlite v0.32.1
+    Checking matchers v0.2.0
+    Checking sharded-slab v0.1.7
+    Checking axum v0.7.9
+    Checking nu-ansi-term v0.50.3
+    Checking errno v0.3.14
+    Checking thread_local v1.1.10
+    Checking crossbeam-channel v0.5.16
+    Checking zopfli v0.8.3
+    Checking dig-ipc-protocol v0.3.0
+    Checking dirs-sys v0.3.7
+    Checking dig-pex v0.1.1
+    Checking home v0.5.12
+    Checking quick-xml v0.41.0
+    Checking symlink v0.1.0
+    Checking dig-node-control-interface v0.27.0
+    Checking digstore-core v0.13.4
+    Checking dig-mirror-collateral v0.3.0
+    Checking rtoolbox v0.0.6
+    Checking digstore-prover v0.1.0 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking digstore-store v0.1.0 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking widestring v1.2.1
+   Compiling dig-node-service v0.189.0 (C:\tmp\worktrees\dn-wallet\crates\dig-node-service)
+    Checking dig-cert v0.1.2
+    Checking tracing-subscriber v0.3.23
+    Checking dig-dht v0.15.0
+    Checking chia-sdk-types v0.30.0
+    Checking socket2 v0.5.10
+    Checking dig-peer v0.13.0
+    Checking rustix v0.38.44
+    Checking rue-lir v0.8.5
+    Checking rue-lir v0.6.0
+    Checking zip v2.4.2
+    Checking dirs v4.0.0
+    Checking dig-capsule v0.5.0
+    Checking wasm-encoder v0.221.3
+    Checking wasmprinter v0.252.0
+    Checking plist v1.10.0
+    Checking dig-urn-resolver v0.5.3
+    Checking rpassword v7.5.4
+    Checking windows-service v0.7.0
+    Checking tracing-appender v0.2.5
+    Checking dig-peer-selector v0.11.0
+    Checking dig-download v0.22.0
+    Checking which v4.4.2
+    Checking rue-hir v0.6.0
+    Checking rue-hir v0.8.5
+    Checking chia-sdk-signer v0.30.0
+    Checking chia-sdk-client v0.30.0
+    Checking digstore-compiler v1.0.0 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking wasmtime-environ v47.0.4
+    Checking dig-logging v0.2.0
+    Checking service-manager v0.7.1
+    Checking rue-compiler v0.8.5
+    Checking rue-compiler v0.6.0
+    Checking chia-sdk-test v0.30.0
+    Checking chia-sdk-driver v0.30.0
+    Checking digstore-stage v0.1.0 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking chia-sdk-types v0.36.0
+    Checking chia-sdk-types v0.34.0
+    Checking chia-wallet-sdk v0.30.0
+    Checking dig-merkle v0.4.5
+    Checking chia-sdk-client v0.34.0
+    Checking dig-store v0.5.1
+    Checking dig-peer-protocol v0.7.0
+    Checking dig-store-cache v0.1.1
+    Checking dig-gossip v0.32.0 (https://github.com/DIG-Network/dig-gossip?rev=1a3391662ecce1a3cbe8b74122a52bbb1b28d3ee#1a339166)
+    Checking dig-sex v0.5.0
+    Checking chia-sdk-signer v0.36.0
+    Checking chia-sdk-client v0.36.0
+    Checking chia-sdk-driver v0.36.0
+    Checking chia-sdk-daemon v0.36.0
+    Checking chia-sdk-test v0.36.0
+    Checking wasmtime-internal-unwinder v47.0.4
+    Checking wasmtime-internal-cranelift v47.0.4
+    Checking chia-wallet-sdk v0.36.0
+    Checking dig-clvm v0.4.0
+    Checking dig-mirror-coin v0.7.0
+    Checking dig-cat v0.3.0
+    Checking dig-did v0.8.0
+    Checking dig-offers v0.3.0
+    Checking dig-options v0.4.0
+    Checking dig-nft v0.3.0
+    Checking datalayer-driver v5.0.0
+    Checking chia-query v0.20.0
+    Checking dig-tips v0.3.0
+    Checking wasmtime v47.0.4
+    Checking dig-wallet-backend v0.31.0
+    Checking digstore-chain v0.29.0 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking digstore-host v0.3.0 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking digstore-remote v0.29.0 (https://github.com/DIG-Network/digstore.git?rev=161c2a3108cb4bb6c8791e96a26588ec99afb029#161c2a31)
+    Checking dig-node-core v0.64.0 (C:\tmp\worktrees\dn-wallet\crates\dig-node-core)
+    Checking dig-wallet v0.43.0 (C:\tmp\worktrees\dn-wallet\crates\dig-wallet)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 41s
+RC=0
