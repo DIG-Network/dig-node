@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.183.0] - 2026-08-31
+
+### Bug Fixes
+- **mirror:** Log the cause when a mirror pass stops at a failed create (#443)
+
+### Documentation
+- **wallet:** Disclose that live broadcast also enables automatic collateral commitment (#445)
+
 ## [0.179.0] - 2026-08-31
 
 ### Features
