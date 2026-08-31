@@ -429,11 +429,9 @@ pub fn control_token_remedy_for(path: &Path) -> String {
         Ok(_) => format!(
             "the presented control token was not accepted. Ensure the node and this command resolve the SAME state dir ({dir}) — if you set DIG_NODE_STATE_DIR it must match on both the node and this command."
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => format!(
-            "the node's control token at {} exists but is NOT readable by your account — the node runs as a service under a different account (Windows LocalSystem / a root daemon). Re-run this command elevated (Administrator on Windows, sudo on Unix), or reinstall the current dig-node so the service grants your account read access to {} (`dig-node uninstall` then an elevated `dig-node install`, then `dig-node start`).",
-            path.display(),
-            dir
-        ),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            permission_denied_remedy(path, &dir)
+        }
         // Absent (NotFound) — the node has not minted one here yet. Either it is not running,
         // or a STALE older build (installed before the machine-wide state dir) is running and
         // never mints the token at this path; reinstalling the current dig-node fixes the latter.
@@ -441,6 +439,56 @@ pub fn control_token_remedy_for(path: &Path) -> String {
             "no control token found at {}. Start the node so it mints one (`dig-node run`, or `dig-node start` for the installed service), then retry. If the service IS already running, it is likely a STALE older build — reinstall the current dig-node (`dig-node uninstall` then an elevated `dig-node install`, then `dig-node start`) so the running service mints the token here.",
             path.display()
         ),
+    }
+}
+
+/// The remedy for a control token that EXISTS but this account cannot read (dig-node#403).
+///
+/// The two platforms genuinely differ, and a single sentence covering both was false on one of
+/// them. On Windows the installer establishes an ACL that keeps an explicit read grant for the
+/// interactive install-user, so "reinstall and the service will grant your account read access"
+/// is accurate there. On Unix the `.deb` creates `/var/lib/dig-node` as `0700 root:root` with the
+/// token `0600 root:root`, and reinstalling changes NOTHING — an operator following that advice
+/// loops through an uninstall/install cycle and arrives back at the same denial.
+///
+/// # Why the fix is not to loosen the mode
+///
+/// The natural server shape — node as a system service, app as a user Agent — cannot read this
+/// file, and the tempting repairs both widen a privilege boundary. This token is the MASTER
+/// capability: it authorizes pairing administration (mint, list, revoke) and `chiaPeers.add`,
+/// which grants chain authority over the node's wallet replica. A `dig` group at `0640` hands
+/// that, permanently and to every future member, in exchange for a convenience; and it outlives
+/// the app that motivated it.
+///
+/// The node already has the right primitive for a client that cannot read a file: PAIRING
+/// ([`crate::pairing`]), built for exactly this and currently used by the MV3 extension. It
+/// yields a SCOPED, REVOCABLE per-client token that cannot mint or revoke pairings and cannot
+/// grant chain authority, gated on a local approval the operator performs once with the master
+/// token they already hold. The principal admitted is one approved client on this host, with
+/// mutation rights minus the master tier — strictly less than a group grant, and revocable
+/// without touching a file mode.
+fn permission_denied_remedy(path: &Path, dir: &str) -> String {
+    remedy_for_unreadable_token(path, dir, cfg!(unix))
+}
+
+/// The pure core of [`permission_denied_remedy`], with the platform as an ARGUMENT.
+///
+/// A `cfg!(unix)` branch is only ever exercised on the half of the fleet that compiles it, so the
+/// sentence shown to Ubuntu operators would be untested on the machine most likely to be running
+/// these tests. Passing the platform in makes both branches assertable everywhere.
+fn remedy_for_unreadable_token(path: &Path, dir: &str, unix: bool) -> String {
+    let elevated = format!(
+        "the node's control token at {} exists but is NOT readable by your account — the node runs as a service under a different account (Windows LocalSystem / a root daemon). Re-run this command elevated (Administrator on Windows, sudo on Unix)",
+        path.display()
+    );
+    if unix {
+        format!(
+            "{elevated}. For a program that must keep running as an ordinary user (the dig-app Agent on a server), do NOT widen the mode on this file — it is the master capability. Pair a scoped, revocable token for that client instead: `sudo dign pair` approves the client's pending request, and the token it receives cannot mint or revoke pairings and cannot grant chain authority. Revoke it any time with `sudo dign pair revoke <id>`."
+        )
+    } else {
+        format!(
+            "{elevated}, or reinstall the current dig-node so the service grants your account read access to {dir} (`dig-node uninstall` then an elevated `dig-node install`, then `dig-node start`)."
+        )
     }
 }
 
@@ -5717,6 +5765,39 @@ mod tests {
     /// The remedy hint names the concrete token path and, when the token is absent from
     /// the caller's perspective, tells them to start the node — never the old generic
     /// "<config_dir>" wording.
+    #[test]
+    /// dig-node#403 -- the unreadable-token remedy must not promise a grant the platform never
+    /// performs. On Unix the `.deb` leaves the token 0600 root:root and reinstalling changes
+    /// nothing, so the reinstall clause sent an operator round a loop that cannot succeed.
+    ///
+    /// Asserted BOTH ways rather than only on the presence of the new advice: a remedy that
+    /// appended the pairing sentence while keeping the false reinstall clause reads as fixed and
+    /// still contains the dead end.
+    fn the_unreadable_token_remedy_offers_a_scoped_credential_not_a_wider_file() {
+        let path = Path::new("/var/lib/dig-node/control-token");
+        let unix = remedy_for_unreadable_token(path, "/var/lib/dig-node", true);
+        let windows = remedy_for_unreadable_token(path, "/var/lib/dig-node", false);
+
+        assert!(unix.contains("elevated"), "{unix}");
+        assert!(unix.contains("dign pair"), "the scoped-credential route must be named: {unix}");
+        assert!(unix.contains("revoke"), "a grant with no stated revocation is a permanent one: {unix}");
+        assert!(
+            !unix.contains("uninstall"),
+            "reinstalling does not grant read access on Unix; advising it is the dead end: {unix}"
+        );
+
+        // Windows genuinely DOES keep an explicit read grant for the interactive install-user,
+        // so its reinstall clause is accurate and must survive. This is the truthful control: a
+        // fix that simply deleted the clause everywhere would pass the Unix assertions alone.
+        assert!(windows.contains("uninstall"), "{windows}");
+
+        // Never, on either platform, advise widening the mode of the master capability.
+        for r in [&unix, &windows] {
+            assert!(!r.contains("chmod"), "{r}");
+            assert!(!r.contains("0640"), "{r}");
+        }
+    }
+
     #[test]
     fn control_token_remedy_names_a_concrete_path() {
         let remedy = control_token_remedy();

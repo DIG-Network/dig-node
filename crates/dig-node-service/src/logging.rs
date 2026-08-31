@@ -82,6 +82,19 @@ pub fn init(run_context: RunContext) {
     }
     match dig_logging::init(service(run_context)) {
         Ok(guard) => {
+            // ANNOUNCE a degrade, do not merely record it (dig-node#392). `control.status` has
+            // carried `file_error` since the 0.2.0 uplift, but nothing was said at the moment it
+            // happened -- so on a non-admin run denied `C:\ProgramData\DigNetwork\logs` the node
+            // came up console-only in silence, and an operator later found an empty log directory
+            // with no way to tell "nothing went wrong" from "logging never started". The console
+            // layer IS installed on this path, which is precisely why the warning reaches someone.
+            if let Some(reason) = guard.file_error() {
+                tracing::warn!(
+                    dir = %guard.log_dir().display(),
+                    reason = %reason,
+                    "the rolling log FILE could not be opened; this run logs to the console ONLY.                      Nothing is being written to that directory -- an empty log directory here                      means logging was denied, not that the node was quiet."
+                );
+            }
             // A `set` race (two serve paths initialising at once) is benign: the first guard
             // wins and stays live; a losing guard is dropped, which only detaches a writer
             // that was never wired into the global subscriber.
