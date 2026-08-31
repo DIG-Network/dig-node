@@ -240,6 +240,12 @@ impl Config {
         // Live mainnet broadcast is OFF unless explicitly enabled (money-safe default).
         let enable_live_broadcast =
             parse_live_broadcast_flag(std::env::var("DIG_WALLET_ENABLE_LIVE_BROADCAST").ok());
+        // Disclosed HERE, at the parse, because this is the moment the operator's setting takes
+        // effect and the only moment both of its effects are in view. The collateral half is
+        // started later, by a different task, and says nothing about the flag that enabled it.
+        if enable_live_broadcast {
+            tracing::warn!("{}", live_broadcast_disclosure());
+        }
 
         // Chain sync is on unless explicitly turned off (a read, not a spend).
         let enable_chain_sync =
@@ -375,6 +381,33 @@ pub fn parse_live_broadcast_flag(raw: Option<String>) -> bool {
             .as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
+}
+
+/// What setting `DIG_WALLET_ENABLE_LIVE_BROADCAST` actually enables, in BOTH senses.
+///
+/// The flag's name describes one of its two effects. It permits the node's own custodied wallet to
+/// push spends, and — because [`crate::collateral::CollateralConfig::mirror_enabled`] defaults to
+/// `true` — it is also the last switch standing between a default install and the mirror-coin
+/// lifecycle committing operator `$DIG` as collateral, unattended, on a schedule (`SPEC.md` §25.7).
+///
+/// Neither half is a defect. The pair is only honest if an operator can read the composition at the
+/// moment they act, so this text is emitted where the flag is PARSED rather than where either half
+/// is used: the collateral half lives in a different task, started later, and an operator who reads
+/// the first line and stops has been told the smaller of the two facts.
+///
+/// A `&'static str` rather than a log call, so the property under test is the TEXT — a test that
+/// only asserted "a warning was emitted" passes on the wording that hid this coupling in the first
+/// place.
+#[must_use]
+pub fn live_broadcast_disclosure() -> &'static str {
+    "DIG_WALLET_ENABLE_LIVE_BROADCAST is ON. This enables TWO things, not one. \
+     (1) The node's own custodied wallet may push spends to mainnet, moving real $DIG. \
+     (2) The mirror-coin collateral lifecycle may CREATE bonds, committing this node's operator \
+     $DIG as collateral automatically, on a schedule, without a per-spend prompt (SPEC.md §25.7) \
+     — because the `mirror_enabled` collateral preference defaults to true. \
+     To keep (1) and disable (2), set \"mirror_enabled\": false in collateral.json in the node's \
+     state directory; that stops CREATES only, and already-locked collateral is then reclaimed. \
+     To disable both, unset DIG_WALLET_ENABLE_LIVE_BROADCAST."
 }
 
 /// Parse the `DIG_WALLET_ENABLE_CHAIN_SYNC` toggle (§18.6, #2501). Falsy
@@ -638,6 +671,51 @@ pub fn cache_dir_env_value(cache_dir: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The disclosure names the SECOND effect, not merely the first.
+    ///
+    /// **Catches:** the wording that produced dig-node#437 — a live-broadcast warning that is
+    /// perfectly true about broadcasting and silent about automatic collateral commitment. Every
+    /// assertion here is on a term an operator would search for, and each fails independently, so
+    /// dropping the collateral half fails this test while the broadcast half keeps passing. A test
+    /// asserting only that the string is non-empty, or that a warning is emitted, passes on the
+    /// pre-#437 text and is why the gap survived.
+    #[test]
+    fn live_broadcast_disclosure_states_the_collateral_half_and_how_to_disable_it() {
+        let text = live_broadcast_disclosure();
+
+        // (1) the effect the flag is NAMED for.
+        assert!(
+            text.contains("DIG_WALLET_ENABLE_LIVE_BROADCAST"),
+            "the disclosure must name the flag it describes: {text}"
+        );
+        // (2) the effect it is NOT named for -- the whole point of #437.
+        assert!(
+            text.contains("collateral"),
+            "the disclosure must say the flag also enables collateral commitment: {text}"
+        );
+        assert!(
+            text.contains("automatically"),
+            "the disclosure must say the collateral commitment is unattended, not operator-driven: \
+             {text}"
+        );
+        // The operator must be able to find the OTHER half's switch by name.
+        assert!(
+            text.contains("mirror_enabled") && text.contains("collateral.json"),
+            "the disclosure must name the setting AND the file that turns the collateral half off \
+             independently: {text}"
+        );
+    }
+
+    /// The disclosure is emitted only when the flag is on.
+    ///
+    /// **Catches:** a bring-up that warns about real-money behaviour on a default install, which
+    /// trains an operator to ignore the line that matters.
+    #[test]
+    fn the_disclosure_is_gated_on_the_flag_being_enabled() {
+        assert!(!parse_live_broadcast_flag(None));
+        assert!(parse_live_broadcast_flag(Some("1".to_string())));
+    }
+
     use super::*;
 
     #[test]
