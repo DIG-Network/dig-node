@@ -896,7 +896,18 @@ impl RpcDispatch for Node {
             //     falls through to the per-resource proxy below. `sync_module` returns
             //     true only when the SERVED root == the requested (= pinned) root, so a
             //     synced module is keyed by the anchored root before we serve it.
-            if node.sync_module_and_bound(store_hex, &root_hex).await {
+            //     PROVENANCE (dig-node#436): this land is remote-triggerable with no feature flag in
+            //     front of it -- a stranger asking for content this node does not hold makes it pull
+            //     a whole capsule -- so a non-`Local` read lands `Suppress`. It is cached and served
+            //     to the requestor exactly as before; it is simply never advertised and never bonded
+            //     against, because it is not this operator's content. A `Local` read keeps `Announce`,
+            //     which is the reshare flywheel: the operator's own read leaves content more
+            //     available than it found it.
+            let claim = match origin {
+                crate::download::ReadOrigin::Local => crate::seams::dig_peer::HolderClaim::Announce,
+                _ => crate::seams::dig_peer::HolderClaim::Suppress,
+            };
+            if node.sync_module_and_bound(store_hex, &root_hex, claim).await {
                 // The sync just wrote/replaced the on-disk module; drop any stale decoded entry so the
                 // cache reflects the newly-synced module rather than a prior decode.
                 node.invalidate_content_cache(store_hex, &root_hex);

@@ -2399,8 +2399,13 @@ impl Node {
     /// request locally. The REASON for a `false` is available from
     /// [`Node::sync_module_from`] — this thin wrapper exists for the read path, which only
     /// needs to know whether it may now serve locally.
-    async fn sync_module(&self, store_hex: &str, root_hex: &str) -> bool {
-        self.sync_module_from(&self.upstream, store_hex, root_hex)
+    async fn sync_module(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        claim: crate::seams::dig_peer::HolderClaim,
+    ) -> bool {
+        self.sync_module_from(&self.upstream, store_hex, root_hex, claim)
             .await
             .is_ok_and(|served| served.to_hex() == root_hex)
     }
@@ -2429,8 +2434,13 @@ impl Node {
     /// also funnels through it while holding `cache_lock`, so sweeping there would double-sweep and
     /// risk a lock inversion. Returns whatever [`Node::sync_module`] returned — whether the caller may
     /// now serve locally.
-    async fn sync_module_and_bound(&self, store_hex: &str, root_hex: &str) -> bool {
-        let may_serve_locally = self.sync_module(store_hex, root_hex).await;
+    async fn sync_module_and_bound(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        claim: crate::seams::dig_peer::HolderClaim,
+    ) -> bool {
+        let may_serve_locally = self.sync_module(store_hex, root_hex, claim).await;
         self.evict_modules_if_needed().await;
         may_serve_locally
     }
@@ -2471,6 +2481,7 @@ impl Node {
         base_url: &str,
         store_hex: &str,
         root_hex: &str,
+        claim: crate::seams::dig_peer::HolderClaim,
     ) -> Result<Bytes32, String> {
         if !sync_eligible(store_hex, root_hex) {
             return Err("store id and root must each be 64-hex".to_string());
@@ -2528,6 +2539,23 @@ impl Node {
         let served_key = CapsuleKey::parse(store_hex, &served_hex)
             .ok_or("the upstream served a root that is not 64-hex")?;
         let path = served_key.module_path(&self.cache_dir);
+        // PROVENANCE FIRST (dig-node#436). This is the choke point EVERY on-demand landing funnels
+        // through, including the read path — where `dig.getContent` for a capsule this node does not
+        // hold lands one on a REMOTE peer's request, with no feature flag in front of it. An unmarked
+        // capsule reads as `Held`, and `Held` is the bondable state a mirror coin is minted against,
+        // so the claim is a required argument here for the same reason it is on `land_capsule_bytes`:
+        // a land route cannot inherit "this operator's own content" by omission.
+        //
+        // Written BEFORE the bytes become visible (`write_atomic` publishes at its rename), so no
+        // window exists in which a capsule is discoverable with its provenance unwritten, and the
+        // store directory is created first because the marker would otherwise be the first thing
+        // written into a directory that does not yet exist.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create the capsule's store directory: {e}"))?;
+        }
+        crate::seams::dig_peer::persist_holder_claim(&path, claim)
+            .map_err(|_| "could not record the capsule's provenance".to_string())?;
         write_atomic(&path, &bytes).map_err(|e| format!("could not write the capsule: {e}"))?;
         // #1991 telemetry: this is the choke-point every ON-DEMAND landing path funnels through —
         // `cache.fetchAndCache`, chain gap-fill, and fetch-side backfill all call down to here — so
@@ -5574,7 +5602,7 @@ mod tests {
             test_node_with_resolver(Some([5u8; 32]), MockResolver::one(&store_hex, root));
         let root_hex = root.to_hex();
         let served = node
-            .sync_module_from(&base, &store_hex, &root_hex)
+            .sync_module_from(&base, &store_hex, &root_hex, crate::seams::dig_peer::HolderClaim::Announce)
             .await
             .expect("authed sync succeeds");
         assert_eq!(served.to_hex(), root_hex, "served root == requested root");
@@ -6148,7 +6176,7 @@ mod tests {
             node.upstream = base;
             // The read-path land: no tier-0 loop, no `cache.fetchAndCache` — only this sync runs.
             assert!(
-                node.sync_module_and_bound(&store_a.to_hex(), &root.to_hex())
+                node.sync_module_and_bound(&store_a.to_hex(), &root.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
                     .await,
                 "the read-path sync landed the chain-anchored capsule and may serve locally"
             );
@@ -6218,7 +6246,7 @@ mod tests {
             // whole capsule DID land under the served root, so the sweep must still fire.
             assert!(
                 !node
-                    .sync_module_and_bound(&store.to_hex(), &requested.to_hex())
+                    .sync_module_and_bound(&store.to_hex(), &requested.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
                     .await,
                 "served (AA..) != requested (BB..), so the caller may NOT serve locally"
             );
@@ -6810,7 +6838,7 @@ mod tests {
         // the node holding a §21 identity key.
         let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
         let served = node
-            .sync_module_from(&base, &store.to_hex(), &root.to_hex())
+            .sync_module_from(&base, &store.to_hex(), &root.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
             .await
             .expect("the chunked dig.getCapsule path syncs the capsule");
 
@@ -6885,7 +6913,7 @@ mod tests {
         let (node, _td) =
             test_node_with_resolver(Some(seed), MockResolver::one(&store.to_hex(), root));
         let served = node
-            .sync_module_from(&url, &store.to_hex(), &root.to_hex())
+            .sync_module_from(&url, &store.to_hex(), &root.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
             .await
             .expect("authed sync succeeds");
         assert_eq!(served, root, "served root == requested root");
@@ -6940,7 +6968,7 @@ mod tests {
         let (node, _td) =
             test_node_with_resolver(Some(seed), MockResolver::one(&store.to_hex(), served));
         let served = node
-            .sync_module_from(&url, &store.to_hex(), &requested.to_hex())
+            .sync_module_from(&url, &store.to_hex(), &requested.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
             .await
             .expect("the sync itself succeeds — it just landed a different generation");
         assert_ne!(served, requested, "served (AA..) != requested (BB..)");
@@ -7632,7 +7660,7 @@ mod tests {
         // No identity → must short-circuit to false WITHOUT touching the network
         // (the URL is intentionally unroutable; the call returns immediately).
         let failure = node
-            .sync_module_from("http://127.0.0.1:1", &store.to_hex(), &root.to_hex())
+            .sync_module_from("http://127.0.0.1:1", &store.to_hex(), &root.to_hex(), crate::seams::dig_peer::HolderClaim::Announce)
             .await
             .expect_err("no identity and an unroutable upstream cannot sync");
         assert!(
@@ -8255,7 +8283,7 @@ mod tests {
         let store = "33".repeat(32);
         let root = "44".repeat(32);
         let result = node
-            .sync_module_from("http://unreachable.invalid", &store, &root)
+            .sync_module_from("http://unreachable.invalid", &store, &root, crate::seams::dig_peer::HolderClaim::Announce)
             .await;
         assert!(result.is_err(), "no upstream reachable → the sync fails");
         assert!(

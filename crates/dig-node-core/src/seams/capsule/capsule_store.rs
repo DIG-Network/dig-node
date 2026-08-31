@@ -274,7 +274,16 @@ impl CapsuleStore for Node {
         // the remote head advanced mid-sync, so we read the file back to report size + confirm
         // THIS capsule is now present.
         let sync = self
-            .sync_module_from(&self.upstream, store_id_hex, root_hex)
+            // `cache.fetchAndCache` is operator-initiated -- a control-plane method, not peer
+            // reachable -- so this land is genuinely this node's own capsule and stays bondable.
+            // Threaded per call site deliberately: suppressing every land through this shared choke
+            // point would disable the flywheel for the operator's own content.
+            .sync_module_from(
+                &self.upstream,
+                store_id_hex,
+                root_hex,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await;
         // A fresh land is written as `.dig`; resolve tolerates a legacy `.module` already on disk.
         let path = capsule.resolve_cached_path(&self.cache_dir);
