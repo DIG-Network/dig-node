@@ -1363,11 +1363,7 @@ impl NodeResponder {
 /// Pure, and separate from [`NodeResponder::pool_peers`], so the decision "does this address go on
 /// the wire?" is testable without a live `GossipHandle`. The plumbing beneath it (reading the pool,
 /// truncating to `limit`) is not the property under test; which addresses survive is.
-fn pool_peer_row(
-    peer_id: impl AsRef<[u8]>,
-    addr: std::net::SocketAddr,
-    network_id: &str,
-) -> Value {
+fn pool_peer_row(peer_id: impl AsRef<[u8]>, addr: std::net::SocketAddr, network_id: &str) -> Value {
     // The type boundary: an address reaches the wire only through `ContactAddr`, whose construction
     // IS the "is this a destination?" question. A wildcard yields no entry, so the row keeps the
     // peer and withholds the address.
@@ -4483,11 +4479,14 @@ pub(crate) mod tests {
     fn the_three_isolation_knobs_share_one_off_vocabulary() {
         // Unset is NOT a disable on either knob — #923's no-configuration anchor depends on it.
         assert!(is_relay_enabled(None), "unset relay → enabled");
-        assert!(is_peer_network_enabled(None), "unset peer network → enabled");
+        assert!(
+            is_peer_network_enabled(None),
+            "unset peer network → enabled"
+        );
 
         for off in [
-            "off", "OFF", " off ", "Off", "disabled", "DISABLED", "0", "false", "False", "no", "No",
-            "", "   ",
+            "off", "OFF", " off ", "Off", "disabled", "DISABLED", "0", "false", "False", "no",
+            "No", "", "   ",
         ] {
             assert!(
                 is_off_token(off),
@@ -4505,7 +4504,15 @@ pub(crate) mod tests {
 
         // An UNRECOGNISED value is not a disable. For the relay it is a URL, so reading it as an
         // off-token would silently unplug a configured relay — the opposite failure to #282's.
-        for on in ["on", "1", "true", "yes", "wss://my-relay:9450", "offline", "no-thanks"] {
+        for on in [
+            "on",
+            "1",
+            "true",
+            "yes",
+            "wss://my-relay:9450",
+            "offline",
+            "no-thanks",
+        ] {
             assert!(
                 !is_off_token(on),
                 "{on:?} must NOT be read as an explicit disable"

@@ -884,17 +884,47 @@ mod tests {
         // (malformed → refused) paired with (well-formed → the stated host and port).
         let pairs: &[(&str, &str, &str, u16)] = &[
             // Unknown scheme. Was: accepted, host salvaged, port defaulted to 443.
-            ("http://relay.dig.net", "wss://relay.dig.net", "relay.dig.net", 443),
+            (
+                "http://relay.dig.net",
+                "wss://relay.dig.net",
+                "relay.dig.net",
+                443,
+            ),
             // No scheme at all. Was: accepted.
-            ("relay.dig.net:9450", "ws://relay.dig.net:9450", "relay.dig.net", 9450),
+            (
+                "relay.dig.net:9450",
+                "ws://relay.dig.net:9450",
+                "relay.dig.net",
+                9450,
+            ),
             // Unparsable port. Was: port -> None -> `.unwrap_or(443)`, so it DIALLED 443.
-            ("wss://relay.dig.net:notaport", "wss://relay.dig.net:9450", "relay.dig.net", 9450),
+            (
+                "wss://relay.dig.net:notaport",
+                "wss://relay.dig.net:9450",
+                "relay.dig.net",
+                9450,
+            ),
             // Port out of range. Same fail-open path as the non-numeric one.
-            ("wss://relay.dig.net:99999", "wss://relay.dig.net:65535", "relay.dig.net", 65535),
+            (
+                "wss://relay.dig.net:99999",
+                "wss://relay.dig.net:65535",
+                "relay.dig.net",
+                65535,
+            ),
             // Empty host behind userinfo.
-            ("wss://user@", "wss://user@relay.dig.net", "relay.dig.net", 443),
+            (
+                "wss://user@",
+                "wss://user@relay.dig.net",
+                "relay.dig.net",
+                443,
+            ),
             // Malformed IPv6 authority — no closing bracket.
-            ("wss://[2001:db8::1", "wss://[2001:db8::1]", "2001:db8::1", 443),
+            (
+                "wss://[2001:db8::1",
+                "wss://[2001:db8::1]",
+                "2001:db8::1",
+                443,
+            ),
         ];
         for (bad, good, host, port) in pairs {
             assert_eq!(
@@ -925,7 +955,10 @@ mod tests {
 
         // The scheme selects the default port and nothing else, case-insensitively.
         assert_eq!(parse_relay_endpoint("ws://relay.dig.net").unwrap().port, 80);
-        assert_eq!(parse_relay_endpoint("WSS://relay.dig.net").unwrap().port, 443);
+        assert_eq!(
+            parse_relay_endpoint("WSS://relay.dig.net").unwrap().port,
+            443
+        );
 
         // And the shipped default endpoint must survive the stricter parser — a fail-closed parse
         // that refuses the compiled-in relay would take the whole relay tier down.
