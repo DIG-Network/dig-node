@@ -174,8 +174,8 @@ ARE `DIG_NODE_*`, full stop.
 | `DIG_NODE_ALLOW_REMOTE` | permit a non-loopback `DIG_NODE_HOST` bind | `false` | Truthy = `1`/`true`/`yes`/`on`; anything else (unset/blank/falsy/unrecognized) ⇒ the security-safe default **false**. When false, a non-loopback `DIG_NODE_HOST` is a fatal configuration error at startup (§3.2.1). Loopback overrides and the no-override default never require it. |
 | `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | *(unset — NO default upstream)* | Normalized (§3.3); highest precedence (§3.4). Unset ⇒ passthrough is OFF and an unimplemented method answers a local `-32601` (§5.4). A value naming THIS node is REFUSED (§3.4.1). |
 | `DIG_NODE_CACHE` | explicit on-disk `.dig` cache dir | *(unset)* | Blank/whitespace ⇒ unset. Unset ⇒ shared canonical default (§3.5). |
-| `DIG_NODE_DIGLOCAL` | toggle for the bare `dig.local` listeners (`http://dig.local` on `127.0.0.2:80` AND, when a dig-cert leaf is present, `https://dig.local` on `127.0.0.2:443` — §4.1a) | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
-| `DIG_NODE_PROFILE_SYNC` | operator kill switch for profile-body sync (opcodes 223/224/225, §22) | `true` | Falsy = `0`/`false`/`no`/`off`, case- and whitespace-insensitive; unset or unrecognized ⇒ **default true**. Off means the node neither fetches nor serves profile bodies; nothing else depends on it, so it is a clean degradation. |
+| `DIG_NODE_DIGLOCAL` | toggle for the bare `dig.local` listeners (`http://dig.local` on `127.0.0.2:80` AND, when a dig-cert leaf is present, `https://dig.local` on `127.0.0.2:443` — §4.1a) | `true` | Off = `off`/`disabled`/`0`/`false`/`no`; on = `on`/`enabled`/`1`/`true`/`yes`; case/whitespace-insensitive. Unset or EMPTY ⇒ **default true**. An UNRECOGNIZED value ⇒ default true AND a warning naming the variable, the rejected value and the applied default (see **Capability-flag vocabulary and failure direction**). |
+| `DIG_NODE_PROFILE_SYNC` | operator kill switch for profile-body sync (opcodes 223/224/225, §22) | `true` | Off = `off`/`disabled`/`0`/`false`/`no`, case- and whitespace-insensitive; unset, empty or unrecognized ⇒ **default true**. Off means the node neither fetches nor serves profile bodies; nothing else depends on it, so it is a clean degradation. |
 
 The default port is the UNCOMMON high port **`9778`** (not `80`/`8080`). Port 80 requires elevation
 on most OSes, and both `80` and `8080` are the collision-prone common-dev ports most likely already
@@ -455,6 +455,38 @@ governs the `/health` `addr` field, the `status` output, the control-client's JS
    **best-effort**: on failure (no privilege, port in use, missing macOS `127.0.0.2` loopback
    alias) the node MUST log a structured warning to stderr and continue serving localhost-only —
    it MUST NOT abort. Skipped entirely when `DIG_NODE_DIGLOCAL` is falsy.
+
+### Capability-flag vocabulary and failure direction
+
+NORMATIVE. Complements **The shared off-token** above, which governs the isolation knobs; this governs the capability knobs.
+
+A **capability flag** is a `DIG_*` environment switch that enables or disables a node capability and
+holds no list. `DIG_WALLET_ENABLE_CHAIN_SYNC`, `DIG_NODE_DIGLOCAL`, `DIG_HOLDINGS_INGEST`,
+`DIG_NODE_STORE_MELT` and `DIG_NODE_PROFILE_SYNC` are capability flags. `DIG_BOOTSTRAP_PEERS`, `DIG_RELAY_URL` and
+`DIG_PEER_NETWORK` are **isolation** flags and are governed by **The shared off-token** above instead.
+
+1. **One vocabulary.** Every capability flag MUST read the same off-tokens — `off`, `disabled`, `0`,
+   `false`, `no` — and the same on-tokens — `on`, `enabled`, `1`, `true`, `yes` — each trimmed and
+   compared case-insensitively. A flag that recognizes a token another flag rejects is non-conforming:
+   an operator who learns a word works on one switch will use it on the next.
+
+2. **An EMPTY value is ABSENT, not OFF.** A capability flag set to the empty string MUST take its
+   default. This differs deliberately from an isolation flag, where an empty value names the empty list
+   and MUST disable (see **The shared off-token**). A capability flag holds no list, and an empty value is what a shell
+   produces from an unset expansion.
+
+3. **Failure direction: fail in whichever direction cannot make a surface assert a falsehood.** An
+   unrecognized value MUST NOT be resolved in a direction that lets any surface state something untrue.
+   For a default-ON read path such as chain sync this means keeping the default: disabling it silently
+   stops the replica advancing, and a stale replica's zero balance is indistinguishable from an empty
+   wallet (§18.6). For an isolation flag the same principle requires the opposite resolution, because
+   a node that keeps dialling reports an isolation it does not have.
+
+4. **An unrecognized value MUST be disclosed.** The node MUST emit a warning naming the VARIABLE, the
+   REJECTED VALUE, and the DEFAULT it applied, and MUST state that the operator's setting had no
+   effect. A recognized value, including an absent or empty one, MUST NOT warn. Silence is what makes a
+   typo indistinguishable from a deliberate omission, and it is the residue that survives whichever
+   failure direction a flag takes.
 
 The distinct loopback IP `.2` exists so the port-80 bind can never collide with an unrelated
 `localhost:80` service. The dig-installer writes the hosts entry `127.0.0.2  dig.local`; this
@@ -4188,7 +4220,7 @@ Two cheaper signals MUST NOT be used, both having shipped and been found unsound
   a delete decision.
 
 **Operator kill switch.** Store-melt propagation MUST be disableable at runtime via
-`DIG_NODE_STORE_MELT` (default ON; only an explicit `off`/`0`/`false`/`no` disables it), matching the
+`DIG_NODE_STORE_MELT` (default ON; only an explicit off-token — `off`/`disabled`/`0`/`false`/`no` — disables it), matching the
 shape of `DIG_NODE_BACKFILL_ON_MISS`. This is the node's only path that irreversibly deletes content
 in response to chain state, and it propagates, so a fault is correlated across holders rather than
 isolated; an operator MUST be able to stop the deleting without downgrading the node. Disabling is

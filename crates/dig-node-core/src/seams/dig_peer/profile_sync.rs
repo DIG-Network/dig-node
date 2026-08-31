@@ -95,16 +95,16 @@ use crate::AnchoredRootResolver;
 /// having run — profiles simply stop syncing — so it is a clean degradation, not an outage.
 pub const PROFILE_SYNC_ENV: &str = "DIG_NODE_PROFILE_SYNC";
 
-/// Whether profile sync is enabled. Default ON; `0`/`false`/`off`/`no` (case-insensitive) disable it.
+/// Whether profile sync is enabled. Default ON; an off-token (`off`/`disabled`/`0`/`false`/`no`,
+/// trimmed and case-insensitive) disables it.
+///
+/// Reads the SHARED capability vocabulary (dig-node#459). It was found while writing that ticket's
+/// `SPEC.md` clause, which asserts that every capability flag reads one vocabulary — a sixth private
+/// copy would have made the clause false in the commit that introduced it. The four knobs #459 names
+/// were the four someone had listed, not the four that exist.
 #[must_use]
 pub fn profile_sync_enabled() -> bool {
-    match std::env::var(PROFILE_SYNC_ENV) {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
+    !crate::is_capability_off_token(std::env::var(PROFILE_SYNC_ENV).unwrap_or_default().as_str())
 }
 
 /// How long a recorded solicitation stays answerable.
@@ -2043,7 +2043,7 @@ mod tests {
         let _guard = env_lock();
         std::env::remove_var(PROFILE_SYNC_ENV);
         assert!(profile_sync_enabled(), "absent must mean ON");
-        for off in ["0", "false", "OFF", "no"] {
+        for off in ["0", "false", "OFF", "no", "disabled", " Disabled "] {
             std::env::set_var(PROFILE_SYNC_ENV, off);
             assert!(!profile_sync_enabled(), "{off} must disable profile sync");
         }
