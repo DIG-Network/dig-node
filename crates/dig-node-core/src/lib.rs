@@ -2407,9 +2407,26 @@ impl Node {
         root_hex: &str,
         claim: crate::seams::dig_peer::HolderClaim,
     ) -> bool {
-        self.sync_module_from(&self.upstream, store_hex, root_hex, claim)
+        // This wrapper is the BACKGROUND path: it has no caller that will surface the reason, unlike
+        // `control.sync.trigger`, which returns it to the operator verbatim. Collapsing the `Err` to a
+        // bare `false` here is what left a failed sync with no log line of its own — and therefore with
+        // the preceding "received a capsule's bytes" line as its only trace (#341). The wording follows
+        // the control verb's own (`control.rs`), so the two surfaces read alike.
+        match self
+            .sync_module_from(&self.upstream, store_hex, root_hex, claim)
             .await
-            .is_ok_and(|served| served.to_hex() == root_hex)
+        {
+            Ok(served) => served.to_hex() == root_hex,
+            Err(reason) => {
+                tracing::warn!(
+                    store = %store_hex,
+                    root = %root_hex,
+                    error = %reason,
+                    "whole-store sync failed"
+                );
+                false
+            }
+        }
     }
 
     /// [`Node::sync_module`] followed by the tier-aware size-cap sweep, for the read path.
@@ -2510,11 +2527,16 @@ impl Node {
             }
         };
 
+        // RECEIVED, not stored (dig-node#341). Three refusals still lie between here and a resident
+        // capsule — the chain-anchored verify, the provenance marker, and the atomic write — so the
+        // only fact this point has is that the bytes crossed the wire. On a headless node the log is
+        // the whole diagnostic surface, and an operator who reads a completed download here stops
+        // looking, having been told something the node does not yet know.
         tracing::info!(
             store = %store_hex,
             served_root = %served_root.to_hex(),
             bytes = bytes.len(),
-            "whole-store sync downloaded a capsule"
+            "whole-store sync received a capsule's bytes; verifying and storing"
         );
 
         // Chain-anchored verify BEFORE the module lands (#1623): landing is announcing (§14.1), so an
@@ -2579,6 +2601,15 @@ impl Node {
         // The reshare-warm land is a SEPARATE write path (`module_reshare::promote_into_cache`,
         // never calls this function) and counts itself at its own successful write.
         CACHE_REFETCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The capsule is now RESIDENT, and this is the first point at which that is true (#341).
+        // Deleting this line rather than moving it would be the wrong fix: an operator with no line
+        // is better off than one with a false line, but a correct line is better than both.
+        tracing::info!(
+            store = %store_hex,
+            served_root = %served_hex,
+            bytes = bytes.len(),
+            "whole-store sync stored a capsule"
+        );
         Ok(served_root)
     }
 
@@ -7112,6 +7143,151 @@ mod tests {
         assert!(
             !marker.exists(),
             "the operator's own read is this node's own content and must stay bondable"
+        );
+    }
+
+    // ---- Whole-store sync log honesty (dig-node#341) -------------------------------------------
+    //
+    // A headless node's log IS its diagnostic surface, so a line there is a claim the same way a
+    // rendered balance is. These tests read the REAL emitted records rather than asserting that a
+    // failure path is reachable, because the defect was never that the path was unreachable — it was
+    // that the path emitted a sentence about a capsule that had not been stored.
+
+    /// An in-memory sink a `tracing_subscriber::fmt` layer writes formatted records into.
+    #[derive(Clone, Default)]
+    struct SyncLogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SyncLogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SyncLogCapture {
+        type Writer = SyncLogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` under a scoped capturing subscriber at `TRACE` and return everything it logged —
+    /// i.e. exactly what an operator tailing the node log would see, and nothing a different test's
+    /// concurrently-running subscriber emitted.
+    async fn capture_sync_logs<T, F: std::future::Future<Output = T>>(body: F) -> (T, String) {
+        let buffer = SyncLogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false) // plain text: the assertions read the fields as an operator would
+            .with_writer(buffer.clone())
+            .finish();
+        let outcome = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            body.await
+        };
+        let captured = buffer.0.lock().unwrap().clone();
+        (outcome, String::from_utf8_lossy(&captured).into_owned())
+    }
+
+    /// **Proves (dig-node#341):** a background whole-store sync that stores NOTHING never logs that
+    /// it downloaded or stored a capsule, and does name why it failed.
+    ///
+    /// The fixture serves the requested capsule successfully and then makes the CHAIN disagree: the
+    /// resolver anchors the store at a different root, so `verify_synced_capsule_is_chain_anchored`
+    /// refuses after the bytes have crossed the wire. That is the real observed shape — the download
+    /// genuinely succeeded, which is precisely why the old line read as true — rather than a wire
+    /// failure, which would never have reached the log statement at all.
+    ///
+    /// **Non-vacuous:** the assertions below are checked against a `false` return AND an empty cache
+    /// dir, so the run really did store nothing; and the reason assertion fails if the wrapper goes
+    /// back to swallowing the `Err`.
+    ///
+    /// **Catches:** the shipped defect verbatim — an `info!` claiming a completed download emitted
+    /// before the verify/marker/write can refuse. It also catches the wrong fix: silencing the path
+    /// leaves the operator with nothing, which the reason assertion rejects.
+    #[tokio::test]
+    async fn a_background_sync_that_stored_nothing_never_logs_a_download() {
+        let store = Bytes32([0x41u8; 32]);
+        let (capsule, root) = chain_anchored_module_with_filler(store.0, [0x13u8; 32], 64);
+        let base =
+            spawn_capsule_rpc_upstream(capsule, 4096, axum::http::StatusCode::BAD_REQUEST).await;
+
+        // The chain anchors this store at a DIFFERENT generation than the one served.
+        let chain_root = Bytes32([0x99u8; 32]);
+        let (mut node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store.to_hex(), chain_root));
+        node.upstream = base;
+
+        let (may_serve, logs) = capture_sync_logs(node.sync_module(
+            &store.to_hex(),
+            &root.to_hex(),
+            crate::seams::dig_peer::HolderClaim::Announce,
+        ))
+        .await;
+
+        assert!(!may_serve, "the sync must fail — the served root is not anchored");
+        let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        assert!(
+            !path.exists(),
+            "nothing was stored, so the assertions below are about a genuinely empty outcome"
+        );
+
+        assert!(
+            !logs.contains("downloaded a capsule"),
+            "a sync that stored nothing must not report a completed download; log was:\n{logs}"
+        );
+        assert!(
+            !logs.contains("stored a capsule"),
+            "a sync that stored nothing must not report a stored capsule; log was:\n{logs}"
+        );
+        assert!(
+            logs.contains("whole-store sync failed"),
+            "the background path must name its failure — it is the only surface a headless \
+             operator has; log was:\n{logs}"
+        );
+        assert!(
+            logs.contains("is not the store's chain-anchored root"),
+            "the reason must be the ACTUAL one, not a generic failure; log was:\n{logs}"
+        );
+    }
+
+    /// **The control for [`a_background_sync_that_stored_nothing_never_logs_a_download`].**
+    ///
+    /// Deleting the success line would satisfy every assertion above while removing the operator's
+    /// only confirmation that a capsule is resident — the fix the ticket explicitly rules out. A
+    /// stored capsule must still announce itself, and only AFTER it is on disk.
+    ///
+    /// **Catches:** a fix that silences the path instead of correcting it.
+    #[tokio::test]
+    async fn a_background_sync_that_stored_a_capsule_says_so() {
+        let store = Bytes32([0x42u8; 32]);
+        let (capsule, root) = chain_anchored_module_with_filler(store.0, [0x14u8; 32], 64);
+        let base =
+            spawn_capsule_rpc_upstream(capsule, 4096, axum::http::StatusCode::BAD_REQUEST).await;
+        let (mut node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
+        node.upstream = base;
+
+        let (may_serve, logs) = capture_sync_logs(node.sync_module(
+            &store.to_hex(),
+            &root.to_hex(),
+            crate::seams::dig_peer::HolderClaim::Announce,
+        ))
+        .await;
+
+        assert!(may_serve, "the served root is the anchored root, so the sync succeeds");
+        let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        assert!(path.exists(), "the capsule is resident");
+        assert!(
+            logs.contains("stored a capsule"),
+            "a stored capsule must be reported as stored; log was:\n{logs}"
+        );
+        assert!(
+            !logs.contains("whole-store sync failed"),
+            "a successful sync must not report a failure; log was:\n{logs}"
         );
     }
 
