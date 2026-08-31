@@ -1419,6 +1419,35 @@ impl WalletDb {
         Ok(())
     }
 
+    /// Record a NON-catch-up coverage set and latch `initial_sync_complete` together, unless the
+    /// coin database was reset since `observed` (dig-node#454).
+    ///
+    /// The oracle-tier refresh ([`super::rpc::WalletBackend::refresh_tracked_coins`]) is the other
+    /// writer of the authoritative flag, and it races a reset exactly as the catch-up did: it
+    /// fetches rows, the user resets, and it then latches the flag over whatever survived. The
+    /// guard is the same reset counter, observed before the refresh's own writes.
+    ///
+    /// The coverage and the flag move together because a flag with stale coverage beside it is the
+    /// half-truth dig_ecosystem#2871 already records; splitting them would leave a window where the
+    /// replica claims authority over a set it did not fetch.
+    ///
+    /// Returns whether the latch was RECORDED.
+    pub async fn latch_synced_over_unless_reset(
+        &self,
+        covered: &CoveredSet,
+        observed: ResetEpoch,
+    ) -> sqlx::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE sync_state SET covered_puzzle_hashes = ?, initial_sync_complete = 1
+             WHERE id = 0 AND reset_epoch = ?",
+        )
+        .bind(covered.to_storage())
+        .bind(observed.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Record that a full address-history catch-up finished: advance the peak, mark the replica
     /// authoritative, and ARM the arrival baseline — all in one transaction.
     ///
@@ -5187,6 +5216,76 @@ mod tests {
     ///
     /// The pre-state is asserted first, so this cannot pass against a database that was never
     /// synced to begin with.
+    /// **Proves (dig-node#454, the guard at the persistence seam):** a completion carrying the
+    /// epoch observed BEFORE a reset must not land, and one carrying the epoch AFTER it must.
+    ///
+    /// Pinned from BOTH sides deliberately. A guard tested only on the stale value cannot notice
+    /// one that refuses every completion, which would leave the replica permanently
+    /// non-authoritative — a different failure, and one a user would feel just as hard.
+    #[tokio::test]
+    async fn a_completion_from_before_a_reset_cannot_mark_the_replica_synced() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let stale = db.reset_epoch().await.unwrap();
+        db.reset_chain_cache(0).await.unwrap().unwrap();
+
+        let recorded = db
+            .complete_catch_up_unless_reset(
+                &CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap(),
+                stale,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !recorded,
+            "a completion observed before the reset must not land"
+        );
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "the replica the reset emptied must stay non-authoritative"
+        );
+
+        let fresh = db.reset_epoch().await.unwrap();
+        let recorded = db
+            .complete_catch_up_unless_reset(
+                &CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap(),
+                fresh,
+            )
+            .await
+            .unwrap();
+        assert!(
+            recorded && db.is_synced().await.unwrap(),
+            "control: a catch-up that ran wholly AFTER the reset is exactly the one entitled to \
+             re-establish the flag"
+        );
+    }
+
+    /// **Proves (dig-node#454, the oracle-tier writer):** the point-read refresh latches the same
+    /// flag and races the same reset, so it takes the same guard.
+    #[tokio::test]
+    async fn an_oracle_latch_from_before_a_reset_cannot_mark_the_replica_synced() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let stale = db.reset_epoch().await.unwrap();
+        db.reset_chain_cache(0).await.unwrap().unwrap();
+
+        let covered = CoveredSet::from_hex(&["aa".repeat(32)]);
+        assert!(
+            !db.latch_synced_over_unless_reset(&covered, stale)
+                .await
+                .unwrap(),
+            "a refresh that began before the reset must not latch over what the reset left"
+        );
+        assert!(!db.is_synced().await.unwrap());
+
+        let fresh = db.reset_epoch().await.unwrap();
+        assert!(
+            db.latch_synced_over_unless_reset(&covered, fresh)
+                .await
+                .unwrap()
+                && db.is_synced().await.unwrap(),
+            "control: a refresh that ran wholly after the reset latches normally"
+        );
+    }
+
     #[tokio::test]
     async fn a_reset_clears_the_authoritative_flag_along_with_the_coins() {
         let db = WalletDb::open_in_memory().await.unwrap();

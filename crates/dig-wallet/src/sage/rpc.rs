@@ -3265,6 +3265,10 @@ impl WalletBackend {
         if phs.is_empty() {
             return Ok(0);
         }
+        // Observed BEFORE this refresh writes anything, so a reset landing while it runs makes
+        // its latch below a no-op rather than a re-declaration of the emptied replica as
+        // authoritative (dig-node#454). Same guard, same counter, as the catch-up path.
+        let epoch_at_start = self.db.reset_epoch().await?;
         // XCH coins sitting at our puzzle hashes + CAT coins hinted to them (unspent + recent).
         let mut fetched = self.fallback.coin_records_by_puzzle_hashes(&phs).await?;
         fetched.extend(self.fallback.coin_records_by_hints(&phs).await?);
@@ -3385,8 +3389,17 @@ impl WalletBackend {
             // `phs` is what this pass actually fetched, so recording it is the honest claim: it
             // covers custody's own addresses, and `watchlist_is_covered_by` above has already
             // established that it covers every enrolled one too.
-            self.db.record_coverage(&CoveredSet::from_hex(&phs)).await?;
-            self.db.set_initial_sync_complete(true).await?;
+            if !self
+                .db
+                .latch_synced_over_unless_reset(&CoveredSet::from_hex(&phs), epoch_at_start)
+                .await?
+            {
+                tracing::info!(concat!(
+                    "wallet sync: the coin database was reset while this refresh ran, ",
+                    "so its result was discarded rather than used to mark the emptied ",
+                    "replica synced"
+                ));
+            }
         } else {
             tracing::info!(
                 "wallet sync: a point-read refresh covered only this node's own custody, so the \

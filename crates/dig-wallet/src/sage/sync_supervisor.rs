@@ -1656,7 +1656,10 @@ impl Supervisor {
         let round = match corroborator.corroborate().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::debug!(error = %e, "wallet sync: corroboration probe failed; the peer                      stays uncorroborated and writes nothing");
+                tracing::debug!(error = %e, concat!(
+                    "wallet sync: corroboration probe failed; the peer stays ",
+                    "uncorroborated and writes nothing"
+                ));
                 return SessionTrust::refused(RefusalReason::Undecided);
             }
         };
@@ -1665,7 +1668,9 @@ impl Supervisor {
         let writer_answer = match session.header_hash_at(round.height).await {
             Ok(answer) => answer,
             Err(e) => {
-                tracing::debug!(error = %e, height = round.height, "wallet sync: the writer could                      not answer the corroboration question");
+                tracing::debug!(error = %e, height = round.height, concat!(
+                    "wallet sync: the writer could not answer the corroboration question"
+                ));
                 None
             }
         };
@@ -1756,7 +1761,11 @@ impl Supervisor {
             height = round.height,
             peer = %session.peer_ip(),
             verdict = ?round.verdict,
-            "wallet sync: peers persistently disagree about settled chain state; the                      replica is deliberately NOT being written. This is evidence of a network                      partition or a hostile peer set, not of a slow connection."
+            concat!(
+                "wallet sync: peers persistently disagree about settled chain state; the ",
+                "replica is deliberately NOT being written. This is evidence of a network ",
+                "partition or a hostile peer set, not of a slow connection."
+            )
         );
         true
     }
