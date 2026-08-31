@@ -896,7 +896,18 @@ impl RpcDispatch for Node {
             //     falls through to the per-resource proxy below. `sync_module` returns
             //     true only when the SERVED root == the requested (= pinned) root, so a
             //     synced module is keyed by the anchored root before we serve it.
-            if node.sync_module_and_bound(store_hex, &root_hex).await {
+            //     PROVENANCE (dig-node#436): this land is remote-triggerable with no feature flag in
+            //     front of it -- a stranger asking for content this node does not hold makes it pull
+            //     a whole capsule -- so a non-`Local` read lands `Suppress`. It is cached and served
+            //     to the requestor exactly as before; it is simply never advertised and never bonded
+            //     against, because it is not this operator's content. A `Local` read keeps `Announce`,
+            //     which is the reshare flywheel: the operator's own read leaves content more
+            //     available than it found it.
+            let claim = holder_claim_for_landing(origin, provenance);
+            if node
+                .sync_module_and_bound(store_hex, &root_hex, claim)
+                .await
+            {
                 // The sync just wrote/replaced the on-disk module; drop any stale decoded entry so the
                 // cache reflects the newly-synced module rather than a prior decode.
                 node.invalidate_content_cache(store_hex, &root_hex);
@@ -1022,5 +1033,127 @@ impl RpcDispatch for Node {
             Err(e) => json!({"jsonrpc":"2.0","id":id,
             "error":{"code":-32000,"message":format!("upstream: {e}")}}),
         }
+    }
+}
+
+/// Which holder claim an on-demand landing records, decided from BOTH axes of the request.
+///
+/// Shared by the read path (`dig.getContent`'s miss-backfill) and the push path
+/// (`cache.pushCapsule`), because the rule is the same one and two copies of it would be a rival
+/// implementation that can drift apart — which is exactly how the push site kept the single-axis
+/// bug after the read site was fixed.
+///
+/// This is the eleventh cache-write path (dig-node#436). `dig.getContent` for a capsule this node
+/// does not hold funnels through [`Node::sync_module_and_bound`] to `write_atomic`, reaching the
+/// cache WITHOUT passing `cache_fetch_and_cache` or `land_capsule_bytes`. It is remote-triggerable
+/// and behind no feature flag, so a stranger requesting content this node does not hold makes it
+/// pull a whole capsule — which, landed unmarked, would be `Held`: the bondable state a mirror coin
+/// is minted against.
+///
+/// A remote read therefore lands [`HolderClaim::Suppress`]. The capsule is still cached and still
+/// served to the requestor, exactly as before; it is simply never advertised and never bonded
+/// against, because it is not this operator's content.
+///
+/// A `Local` read keeps [`HolderClaim::Announce`], and that asymmetry is the point rather than an
+/// oversight: the operator's own read leaves content more available than it found it, which is the
+/// reshare flywheel. Suppressing every land through the shared choke point would satisfy the remote
+/// case while silently disabling that.
+///
+/// Extracted as a named function rather than left inline so the decision is testable on its own —
+/// an end-to-end assertion on the landed marker passes for many reasons, only one of which is this
+/// mapping being right.
+pub(crate) fn holder_claim_for_landing(
+    origin: crate::download::ReadOrigin,
+    provenance: crate::download::RequestProvenance,
+) -> crate::seams::dig_peer::HolderClaim {
+    // BOTH axes, folded through `landing_origin` exactly as every other landing decision in this
+    // file does (`dispatch.rs:381`, `:953`, `content_serve.rs:366`, `push_capsule.rs:272`). The
+    // transport axis alone is NOT sufficient, and reading it alone was a real exploit: a browser
+    // page served from `dig.local` -- or any extension origin -- can POST `dig.getContent` to the
+    // loopback port, which CORS admits, so the request arrives over a genuinely local socket
+    // (`origin = Local`, un-spoofable and correct) while being made on a STRANGER's behalf
+    // (`provenance = CrossSite`). Deciding on `origin` alone announced that stranger's chosen
+    // capsule as this operator's own, and -- because `Announce` REMOVES an existing marker -- could
+    // additionally un-suppress a capsule already correctly relayed.
+    //
+    // The fold is only ever restrictive (`CrossSite` -> `Peer`, `FirstParty` -> unchanged), so it
+    // cannot cost the operator their own flywheel.
+    match crate::download::landing_origin(origin, provenance) {
+        crate::download::ReadOrigin::Local => crate::seams::dig_peer::HolderClaim::Announce,
+        // Every non-local landing origin is someone else's request, so its backfill is someone
+        // else's content. The wildcard is the safe direction: a new origin variant lands
+        // SUPPRESSED, i.e. unbonded.
+        _ => crate::seams::dig_peer::HolderClaim::Suppress,
+    }
+}
+
+#[cfg(test)]
+mod holder_claim_tests {
+    use super::holder_claim_for_landing;
+    use crate::download::{ReadOrigin, RequestProvenance};
+    use crate::seams::dig_peer::HolderClaim;
+
+    /// **Proves (dig-node#436, the eleventh path):** a read arriving from a PEER backfills
+    /// unbonded.
+    ///
+    /// Before the fix this path landed with no claim at all, which reads as `Held` — so a stranger
+    /// could make this node stake its $DIG on content the stranger chose, in a default install.
+    ///
+    /// **Catches:** any relaxation of the remote arm back toward `Announce`.
+    #[test]
+    fn a_peer_read_backfills_suppressed() {
+        assert_eq!(
+            holder_claim_for_landing(ReadOrigin::Peer, RequestProvenance::FirstParty),
+            HolderClaim::Suppress,
+            "a capsule pulled because a STRANGER asked for it is not this operator's content"
+        );
+    }
+
+    /// **The control.** The operator's own read must stay bondable, or the fix has disabled the
+    /// reshare flywheel for this node's own content while fixing the remote case.
+    ///
+    /// **Catches:** a blanket suppression of the shared choke point.
+    #[test]
+    fn a_local_read_backfills_announced() {
+        assert_eq!(
+            holder_claim_for_landing(ReadOrigin::Local, RequestProvenance::FirstParty),
+            HolderClaim::Announce,
+            "the operator's own read leaves content more available than it found it"
+        );
+    }
+    /// **Proves (dig-node#436, the confused deputy):** a request arriving over a genuinely LOCAL
+    /// socket but made on a STRANGER's behalf backfills unbonded.
+    ///
+    /// This is the finding the first version of this fix missed, and the reason the decision folds
+    /// both axes instead of reading `origin` alone. A page served from `dig.local` — or any
+    /// extension origin — can POST `dig.getContent` to the loopback port; CORS admits it, so the
+    /// transport axis says `Local` and says so *correctly*. Only `provenance` distinguishes "the
+    /// operator asked for this" from "a web page asked for this using the operator's browser".
+    ///
+    /// Deciding on `origin` alone let an attacker-chosen capsule land bondable in a default
+    /// install, and — since `Announce` REMOVES an existing marker — un-suppress a capsule already
+    /// correctly relayed.
+    ///
+    /// **Catches:** any regression to a single-axis decision here. Both sibling tests in this
+    /// module pass with that bug present, which is precisely why this one exists.
+    #[test]
+    fn a_cross_site_read_over_a_local_socket_backfills_suppressed() {
+        assert_eq!(
+            holder_claim_for_landing(ReadOrigin::Local, RequestProvenance::CrossSite),
+            HolderClaim::Suppress,
+            "a local socket driven by a stranger's page is a confused deputy, not the operator"
+        );
+    }
+
+    /// **The fold is restrictive-only.** A cross-site request that already arrived from a peer
+    /// stays suppressed — the fold can never *widen* a claim, so it cannot cost the operator their
+    /// own flywheel.
+    #[test]
+    fn a_cross_site_peer_read_stays_suppressed() {
+        assert_eq!(
+            holder_claim_for_landing(ReadOrigin::Peer, RequestProvenance::CrossSite),
+            HolderClaim::Suppress,
+            "folding both axes is only ever restrictive"
+        );
     }
 }
