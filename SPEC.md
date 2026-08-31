@@ -2512,6 +2512,13 @@ which fail unless the parser really accepts the verb and carries its operands th
   port `0`, which is what dig-nat records for a relay-accepted circuit with no configured relay
   endpoint — MUST OMIT the key rather than emit the wildcard. A consumer MUST therefore treat a
   missing `address` as "this peer has no known dialable address", never as a malformed element.
+  The peer-facing `dig.getPeers` carries the SAME rule in the shape its own wire uses: each peer
+  row's `addresses` is an ARRAY, so a peer with no dialable destination MUST be emitted with an
+  EMPTY array — the row kept, the address withheld. The row MUST NOT be dropped (the asking node
+  would not learn the peer exists, and it may still be reachable via the relay), and the key MUST
+  NOT be omitted or set to null (`dig.announce` validates that `addresses` IS an array). A node
+  MUST NOT serve a non-destination to a remote peer as a dial candidate: a peer that dials it
+  wastes one of its few dial slots, and a peer that caches it caches a hole.
   The array is present whenever a peer network is running and
   omitted (count only) on the in-process FFI path / before bring-up. The per-peer `peer_id` is the
   machine-checkable proof of a mutual A↔B connection (each side lists the other's `peer_id`). Peer
@@ -5397,6 +5404,17 @@ Every reservation MUST expire. Release is normally observational — the coin is
 bundle is definitively refused — and the expiry is the backstop that keeps a release path which never
 runs from stranding a coin permanently. Failing to record a reservation MUST NOT fail a push that the
 mempool already accepted.
+
+A push MUST reserve its inputs unless the network DEFINITIVELY refused the bundle. A refusal is
+definitive only when the mempool stated its reason (`accepted:false` WITH a `rejection`); a bare
+denial carrying no reason, and any transport failure, MUST be treated as POSSIBLY IN FLIGHT and hold
+the inputs to the TTL. The node cannot distinguish "never relayed" from "relayed, and the
+acknowledgement was lost", and under §13 every dialled peer is untrusted, so a source that denies a
+relay it performed MUST NOT thereby return the coins to selection — a second send inside the
+confirmation window could otherwise reselect the same inputs. The TTL MUST NOT be shortened to
+compensate for the wider hold: that trades a double-select for a lockout, and a lockout is the worse
+failure. Requiring a STATED reason is what keeps a genuine mempool rejection from holding a user's
+coins for the full TTL.
 
 18.8. **Method surface — reads (served).** `login`, `logout`, `get_version`,
 `get_sync_status`, `check_address`, `get_derivations`, `get_are_coins_spendable`,
