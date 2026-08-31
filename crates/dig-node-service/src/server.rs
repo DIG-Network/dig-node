@@ -2156,6 +2156,18 @@ where
     // node keeps installing no P2P content — its in-process trust boundary is unchanged.
     if dig_node_core::peer::peer_network_enabled() {
         dig_node_core::peer::spawn_peer_network(state.node.clone());
+        // #466: nothing anywhere read a peer's claimed mirror coin against a chain, so the
+        // collateral economy's one guarantee was unenforced end to end. Installed HERE because this
+        // is where both halves exist at once -- the content engine the peer network is bringing up,
+        // and this node's chain transport. Gated on `enable_chain_sync` for the reason the census
+        // is: that flag already means "this node talks to the Chia network", and a harness sets it
+        // false precisely so nothing dials.
+        if config.enable_chain_sync {
+            crate::mirror::bond_verify::spawn_bond_verifier_install(
+                state.node.clone(),
+                state.wallet_chain.clone(),
+            );
+        }
     }
 
     // Prove the configured upstream is not this node (#1997). Fire-and-forget: the evidence is the

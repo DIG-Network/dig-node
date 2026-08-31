@@ -2547,7 +2547,7 @@ impl crate::Node {
     }
 
     /// The attached P2P content engine, if the peer network brought one up.
-    pub(crate) fn p2p_content(&self) -> Option<&Arc<NodeContent>> {
+    pub fn p2p_content(&self) -> Option<&Arc<NodeContent>> {
         self.p2p_content.get()
     }
 
@@ -4396,6 +4396,84 @@ pub(crate) mod tests {
             .fetch_resource(&mock_content_id(), ReadOrigin::Local)
             .await
             .is_err());
+    }
+
+    /// **Proves (dig-node#466):** the bond ranking is live on the ENGINE's own discovery path —
+    /// `NodeContent::find_providers`, the source the redirect-on-miss handler names holders from —
+    /// and not merely inside a locator a test assembled for itself.
+    ///
+    /// **Catches:** the exact state this ticket exists to end. `BondRankingLocator` can be perfect
+    /// and still be reachable from nothing; the whole point of #466 is that a verifier with no
+    /// consumer changes nothing. This test builds the engine through its real constructor and asks
+    /// it, so a wiring that silently dropped the layer fails here even with every unit test in
+    /// `mirror_bond` green.
+    ///
+    /// The slate's input order is neither the expected answer nor its reverse, so an engine that
+    /// ignored the verdicts entirely cannot pass by coincidence.
+    #[tokio::test]
+    async fn the_engine_ranks_a_disproven_bond_last_on_its_own_discovery_path() {
+        use crate::mirror_bond::{BondVerdict, MirrorBondVerifier};
+
+        struct ByFirstByte;
+
+        #[async_trait::async_trait]
+        impl MirrorBondVerifier for ByFirstByte {
+            async fn verify(&self, _c: &ContentId, claimed: Option<[u8; 32]>) -> BondVerdict {
+                match claimed {
+                    None => BondVerdict::Unverified,
+                    Some(coin) if coin[0] == 0x01 => BondVerdict::Bonded,
+                    Some(_) => BondVerdict::Unbonded,
+                }
+            }
+        }
+
+        let td = tempfile::tempdir().unwrap();
+        let cid = mock_content_id();
+        let claimed = |peer: u8, coin: Option<[u8; 32]>| {
+            let record = mock_provider(peer, &cid);
+            match coin {
+                Some(id) => record.with_unverified_mirror_coin_id(id),
+                None => record,
+            }
+        };
+
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![
+                claimed(7, None),              // claims nothing      -> Unverified
+                claimed(8, Some([0x02; 32])), // claims a coin bonding something else
+                claimed(9, Some([0x01; 32])), // claims a coin that really bonds this
+            ])),
+            Arc::new(MockRangeTransport::new(anchored_mock_content(30, 3))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        assert!(
+            pc.set_bond_verifier(Arc::new(ByFirstByte)),
+            "the engine accepts exactly one verifier"
+        );
+
+        let got = pc.find_providers(&cid).await;
+        let peers: Vec<String> = got
+            .for_finding()
+            .iter()
+            .map(|r| r.provider_peer_id[..2].to_string())
+            .collect();
+
+        assert_eq!(
+            peers,
+            vec![
+                mock_peer_hex(9)[..2].to_string(),
+                mock_peer_hex(7)[..2].to_string(),
+                mock_peer_hex(8)[..2].to_string(),
+            ],
+            "bonded first, unprovable next, disproven last"
+        );
+        assert_eq!(
+            got.for_finding().len(),
+            3,
+            "a disproven claim is demoted on the redirect path, never withheld from it"
+        );
     }
 
     /// A locator whose walk cannot be performed at all — the network is down, not the content absent.
