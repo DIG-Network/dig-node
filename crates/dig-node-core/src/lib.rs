@@ -7228,7 +7228,10 @@ mod tests {
         ))
         .await;
 
-        assert!(!may_serve, "the sync must fail — the served root is not anchored");
+        assert!(
+            !may_serve,
+            "the sync must fail — the served root is not anchored"
+        );
         let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
         assert!(
             !path.exists(),
@@ -7278,7 +7281,10 @@ mod tests {
         ))
         .await;
 
-        assert!(may_serve, "the served root is the anchored root, so the sync succeeds");
+        assert!(
+            may_serve,
+            "the served root is the anchored root, so the sync succeeds"
+        );
         let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
         assert!(path.exists(), "the capsule is resident");
         assert!(
