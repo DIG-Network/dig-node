@@ -87,6 +87,7 @@ pub fn authenticated_peer(conn_key: &str) -> Option<AuthenticatedPeer> {
 ///
 /// Held by value across the work it admits; the borrow checker then makes "return before releasing"
 /// impossible rather than merely discouraged.
+#[derive(Debug)]
 pub struct AdmissionGuard<'a> {
     admission: &'a PeerAdmission,
     peer: AuthenticatedPeer,
