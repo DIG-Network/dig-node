@@ -8198,6 +8198,11 @@ itself (SYSTEM.md §4.1).
 >   by name BEFORE any chain read (dig-node#426). **RECLAIMS are implemented** and are supported at `fee = 0` with
 >   no fee coins, which is §25.4.4 — and are never gated on any funding read, including the
 >   committed-coin read.
+> * **§25.10's verification of OTHER peers' claims is implemented** — `dig-node-core`'s
+>   `mirror_bond` (the three verdicts and the ranking locator, installed inside `NodeContent::new`)
+>   and `dig-node-service`'s `mirror/bond_verify.rs` (the chain read, installed on the running node
+>   by `spawn_bond_verifier_install`). What is verified is a peer's claim; this node still attaches
+>   no pointer of its own, per the next bullet.
 > * **§25.6's DHT pointer is not attached.** `ProviderRecord::unverified_mirror_coin_id` lives in
 >   dig-dht 0.15, and `dig-download` 0.21.0 and `dig-peer-selector` 0.10.0 both require
 >   `dig-dht ^0.13` — semver-incompatible on a `0.x` line, so taking 0.15 here would resolve two
@@ -8491,6 +8496,38 @@ genuinely $DIG with the asset id re-derived from the creating spend, carries the
 collateral, and `MirrorCoin::advertises(store, root, epoch)` passes — an exact equality on the
 declared tuple plus a recomputed hint, which is what defeats the constructible additive-morph
 collision (the epoch term is freely chosen, so hint equality alone proves nothing).
+
+### 25.6a. Acting on another peer's claim
+
+A node that LOCATES a holder verifies that holder's claimed bond and **ranks the located set by the
+answer**. The verdict has three states and they are never collapsed into two:
+
+| verdict | established | ranking |
+|---|---|---|
+| bonded | the named coin passes every §25.6 check for this exact `(store, root, epoch)` | first |
+| unverified | no pointer was published, the chain could not answer, or this node holds no censused requirement for the epoch | unchanged |
+| unbonded | the chain answered and the claim is false | last |
+
+The verification is performed in the ORDER §25.6 states, with one refinement that is normative: the
+`advertises` binding is checked BEFORE the collateral magnitude. A node that has not censused the
+epoch cannot price a bond, and checking magnitude first would make every verdict on such a node
+`unverified` — including a holder pointing at a coin that plainly bonds a different store.
+
+**A holder is never refused, dropped, or blocklisted on a verdict.** A chain outage, an epoch
+rollover, a republished record carrying a pointer that has since gone stale, and a deliberate lie are
+indistinguishable at the moment of reading, and only one of them is an attack; a node that refuses on
+any of them converts its own partition into a rejection of honest peers. Demotion is the whole
+remedy: a lying publisher is served last on every read, and an honest one that cannot prove itself
+loses nothing.
+
+Absence of a pointer is the ORDINARY case and MUST cost no chain read at all. `unverified` for an
+absent pointer is not a degraded answer — it is the honest state of a claim nobody looked at.
+
+A verdict is cached only for the exact `(coin id, store, root, epoch)` it answered, because one coin
+bonds one tuple; caching by coin id alone would let a genuine bond answer for content the same coin
+does not bond, which is the substitution `advertises` exists to refuse. Only DEFINITE verdicts are
+cached: `unverified` records this node's own momentary inability to look, and holding it would keep
+an outage in force after it had ended.
 
 ### 25.7. Consent, the switch, and revocation
 

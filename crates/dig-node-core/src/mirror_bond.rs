@@ -32,7 +32,8 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use dig_dht::{ContentId, ProviderRecord};
+pub use dig_dht::ContentId;
+use dig_dht::ProviderRecord;
 use dig_download::{DownloadError, ProviderLocator};
 
 /// What a chain had to say about one holder's claimed bond.

@@ -70,6 +70,9 @@ rpassword = "7"
 # adds only the HTTP transport, control-plane auth, CLI, and OS-service registration
 # around it, and produces the `dig-node` binary (distinct name from the engine lib).
 dig-node-core = { path = "../dig-node-core" }
+# Implementing `dig_node_core::mirror_bond::MirrorBondVerifier` (dig-node#466), whose seam is an
+# async trait. The SAME version dig-node-core already resolves, so no new graph entry appears.
+async-trait = "0.1"
 
 # The PUBLISHED control-plane contract (dig_ecosystem#2376, #2392).
 #

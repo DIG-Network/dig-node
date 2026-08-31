@@ -37,9 +37,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chia_protocol::Bytes32;
 use dig_chainsource_interface::ChainSource;
-use dig_dht::ContentId;
 use dig_mirror_coin::{mirror_coin_puzzle_hash, MirrorCoin, MirrorError};
-use dig_node_core::mirror_bond::{BondVerdict, MirrorBondVerifier};
+use dig_node_core::mirror_bond::{BondVerdict, ContentId, MirrorBondVerifier};
 use num_bigint::BigInt;
 
 use crate::collateral::{current_epoch_now, requirement, EpochRecordStore};
