@@ -575,6 +575,83 @@ pub fn normalize_upstream(raw: &str) -> String {
     }
 }
 
+/// Reject an upstream that is not a well-formed, honestly-readable URL (dig-node#255 item 3).
+///
+/// The only pre-existing check was for control characters, and it exists for an unrelated reason
+/// (#526/B2 — a control character would be baked verbatim into a root-owned systemd unit line).
+/// So every other malformed value persisted silently and became the passthrough target for every
+/// method this node does not implement.
+///
+/// Three rules, each closing something an operator reading `control.config.get` back could be
+/// fooled by:
+///
+/// 1. **A scheme, and only the two we speak.** [`normalize_upstream`] prepends `https://` to a
+///    bare host, so anything still lacking a scheme here carries one we do not speak.
+/// 2. **A non-empty host with no whitespace.** An empty host means "use the default" and must be
+///    said that way rather than smuggled in as `https://`.
+/// 3. **No userinfo (`@`).** `https://rpc.dig.net@evil.example` READS as the legitimate host to a
+///    person and RESOLVES to the attacker's. That is the same forgery class as an unmarked
+///    truncation: the display is honest about the bytes and dishonest about the meaning.
+///
+/// Plain `http://` is permitted ONLY for loopback, so a developer's local upstream keeps working
+/// while a remote cleartext upstream — which any on-path party could answer — does not.
+pub fn validate_upstream(normalized: &str) -> Result<(), String> {
+    let rest = if let Some(r) = normalized.strip_prefix("https://") {
+        r
+    } else if let Some(r) = normalized.strip_prefix("http://") {
+        let host = host_of(r);
+        if !is_loopback_host(host) {
+            return Err(format!(
+                "an http:// upstream is only allowed for loopback (got host {host:?}); any \
+                 on-path party can answer cleartext, and this node forwards every unimplemented \
+                 method to it"
+            ));
+        }
+        r
+    } else {
+        return Err("upstream must be an http:// or https:// URL".to_string());
+    };
+
+    let host = host_of(rest);
+    if host.is_empty() {
+        return Err(
+            "upstream has no host; pass an empty string to restore the default".to_string(),
+        );
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err(format!("upstream host {host:?} contains whitespace"));
+    }
+    if rest.contains('@') {
+        return Err(
+            "upstream must not carry userinfo (`user@host`): such a URL reads as one host and \
+             resolves to another"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The authority portion of a URL remainder (everything before the first `/`, `?` or `#`), with
+/// any `host:port` left intact.
+fn host_of(rest: &str) -> &str {
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Whether an authority names the local machine, for the cleartext carve-out above.
+fn is_loopback_host(authority: &str) -> bool {
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.eq_ignore_ascii_case("dig.local")
+}
+
 /// Split a normalised upstream into `(host, port)`, defaulting the port from the scheme.
 ///
 /// Pure, and deliberately tolerant: anything it cannot parse yields `None`, which the caller
@@ -717,6 +794,67 @@ mod tests {
     }
 
     use super::*;
+
+    /// **Proves (dig-node#255 item 3):** a userinfo URL is refused.
+    ///
+    /// `https://rpc.dig.net@evil.example` READS as the legitimate host to an operator checking
+    /// `control.config.get` and RESOLVES to the attacker's. Only the control-character check
+    /// existed before, and it exists for an unrelated reason, so this value persisted silently and
+    /// became the passthrough target for every unimplemented method.
+    #[test]
+    fn a_userinfo_upstream_is_refused_while_the_host_it_impersonates_is_accepted() {
+        assert!(
+            validate_upstream("https://rpc.dig.net@evil.example").is_err(),
+            "a userinfo URL reads as one host and resolves to another"
+        );
+        assert!(
+            validate_upstream("https://rpc.dig.net").is_ok(),
+            "the host it impersonates must still be accepted, or this proves nothing"
+        );
+    }
+
+    /// **Proves:** cleartext is confined to loopback.
+    ///
+    /// A remote `http://` upstream can be answered by any on-path party, and this node forwards
+    /// every method it does not implement to whatever answers. A developer's local upstream keeps
+    /// working, which is the control that stops the rule collapsing into "refuse all http".
+    #[test]
+    fn cleartext_upstream_is_loopback_only() {
+        for ok in [
+            "http://localhost:9779",
+            "http://127.0.0.1:8080",
+            "http://dig.local",
+        ] {
+            assert!(validate_upstream(ok).is_ok(), "{ok} is local cleartext");
+        }
+        for bad in ["http://rpc.dig.net", "http://evil.example:80"] {
+            assert!(validate_upstream(bad).is_err(), "{bad} is remote cleartext");
+        }
+    }
+
+    /// **Proves:** a scheme we do not speak, and a scheme-less-after-normalisation value, are
+    /// refused rather than persisted.
+    #[test]
+    fn only_http_and_https_upstreams_are_accepted() {
+        for bad in [
+            "ftp://rpc.dig.net",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://",
+            "https:// rpc.dig.net",
+        ] {
+            assert!(validate_upstream(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// **Proves:** normalisation and validation compose the way the control method uses them — a
+    /// bare host becomes a valid `https://` URL rather than being refused for lacking a scheme.
+    #[test]
+    fn a_bare_host_normalises_into_an_accepted_https_upstream() {
+        let normalized = normalize_upstream("rpc.dig.net/");
+        assert_eq!(normalized, "https://rpc.dig.net");
+        assert!(validate_upstream(&normalized).is_ok());
+    }
 
     #[test]
     fn normalize_upstream_trims_and_strips_trailing_slash() {

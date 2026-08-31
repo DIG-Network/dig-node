@@ -1479,7 +1479,30 @@ mod tests {
         let running_as_root = std::fs::metadata(&path)
             .map(|m| m.uid() == 0)
             .unwrap_or(false);
-        if !running_as_root {
+        if running_as_root {
+            // Under root the MODE is not the discriminator, so asserting nothing here would make
+            // the whole branch a silent pass on the CI runners that are root (dig-node#355).
+            // Assert the carve-out itself, then the observable that IS still discriminating:
+            // ownership. Only root can hand the fixture to another uid, which is precisely the
+            // planting the guard refuses.
+            assert!(
+                token_file_is_trusted(&path, false),
+                "a root-owned token is trusted regardless of mode"
+            );
+            const FOREIGN_UID: u32 = 65534; // `nobody`
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::os::unix::fs::chown(&path, Some(FOREIGN_UID), None)
+                .expect("root must be able to chown; without it this branch proves nothing");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().uid(),
+                FOREIGN_UID,
+                "the fixture must actually be foreign-owned"
+            );
+            assert!(
+                !token_file_is_trusted(&path, false),
+                "a foreign-uid token is never trusted, even by root"
+            );
+        } else {
             assert!(
                 !token_file_is_trusted(&path, false),
                 "a group/other-readable token is not trusted"

@@ -42,6 +42,58 @@ use tower_http::cors::{Any, CorsLayer};
 use super::events::SyncEvent;
 use super::rpc::WalletBackend;
 
+/// The header a node-class client presents its control/paired token in, byte-identical to the
+/// control plane's `X-Dig-Control-Token`.
+///
+/// It is declared HERE, in the crate that owns the transport, because the transport is what must
+/// read it; `dig-node-service` asserts the two spellings agree rather than each guessing.
+pub const WALLET_TOKEN_HEADER: &str = "x-dig-control-token";
+
+/// The authorization decision every route into [`WalletBackend::dispatch`] MUST obtain first.
+///
+/// # Why this is a constructor parameter rather than a middleware someone remembers to add
+///
+/// The Sage-parity mTLS listener used to authenticate with [`SharedCertVerifier`] alone and then
+/// dispatch the entire wallet surface — custody, spends and master-tier peer mutations — on
+/// possession of the shared cert (dig-node#257). The two token-bearing planes in
+/// `dig-node-service` were gated; this third one was not, because nothing in the type system
+/// asked it to be. A per-route test could not see the hole either, since the hole was a route
+/// nobody had written a test for.
+///
+/// [`build_router`] therefore takes a gate and there is exactly ONE handler behind `POST
+/// /{method}`, so a fourth transport cannot reach `dispatch` without answering this question. The
+/// POLICY still lives in `dig-node-service` (`wallet_authz`), which is the only place that knows
+/// the tier of a capability; this crate owns only the obligation to ask.
+pub trait WalletCallGate: Send + Sync + 'static {
+    /// Whether `method` may run for a caller presenting `presented`.
+    ///
+    /// `presented` is the raw token from [`WALLET_TOKEN_HEADER`], or `None` when the caller sent
+    /// no token at all. An implementation MUST treat `None` as unauthenticated rather than as a
+    /// local-possession grant — reaching the loopback socket is not a capability tier.
+    fn authorize(&self, method: &str, presented: Option<&str>) -> bool;
+}
+
+/// A gate that authorizes NOTHING.
+///
+/// This is the correct default for a transport whose policy owner has not been wired yet: a node
+/// that cannot decide serves no wallet method. It exists so "no gate available" is expressible as
+/// a refusal instead of as an omission.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DenyAll;
+
+impl WalletCallGate for DenyAll {
+    fn authorize(&self, _method: &str, _presented: Option<&str>) -> bool {
+        false
+    }
+}
+
+/// The shared axum state: the handler set plus the gate that guards it.
+#[derive(Clone)]
+struct TransportState {
+    backend: Arc<WalletBackend>,
+    gate: Arc<dyn WalletCallGate>,
+}
+
 /// The default loopback port for the Sage-parity wallet mTLS listener (design C.4).
 ///
 /// **This is deliberately NOT Sage's own RPC port.** Sage defaults its RPC to `9257`
@@ -163,26 +215,55 @@ pub fn build_server_config(cert: &SharedCert) -> Result<rustls::ServerConfig, Ru
         .with_single_cert(vec![CertificateDer::from(cert.cert_der.clone())], key)
 }
 
-/// The axum handler for `POST /{method}` — read the body, run [`WalletBackend::dispatch`],
-/// and reproduce Sage's response model: `200` + JSON on success, the mapped status + a
-/// plain-text message on error (design A.1/A.3).
+/// The axum handler for `POST /{method}` — AUTHORIZE, then read the body, run
+/// [`WalletBackend::dispatch`], and reproduce Sage's response model: `200` + JSON on success, the
+/// mapped status + a plain-text message on error (design A.1/A.3).
+///
+/// The gate runs BEFORE the body is even interpreted, so a refused call cannot reach a handler,
+/// touch the db, or spend. A refusal is `401` + plain text, distinct from Sage's `404` for an
+/// unsupported method: a caller must be able to tell "you may not" from "there is no such thing".
 async fn handle(
-    State(backend): State<Arc<WalletBackend>>,
+    State(state): State<TransportState>,
     Path(method): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    let presented = headers
+        .get(WALLET_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok());
+    if !state.gate.authorize(&method, presented) {
+        return plain_response(
+            StatusCode::UNAUTHORIZED,
+            "this wallet method requires the local control token (X-Dig-Control-Token) or a \
+             paired controller token (see `dig-node pair`); presenting the shared wallet \
+             certificate authenticates the transport, it does not authorize the capability"
+                .to_string(),
+        );
+    }
     let body_str = String::from_utf8_lossy(&body);
-    let (status, out) = backend.dispatch(&method, &body_str).await;
+    let (status, out) = state.backend.dispatch(&method, &body_str).await;
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let content_type = if status == 200 {
-        "application/json"
+    if status == 200 {
+        let mut resp = Response::new(axum::body::Body::from(out));
+        *resp.status_mut() = code;
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        resp
     } else {
-        "text/plain; charset=utf-8"
-    };
-    let mut resp = Response::new(axum::body::Body::from(out));
+        plain_response(code, out)
+    }
+}
+
+/// A `text/plain` response with `code` — Sage's error shape, and the shape a refusal takes.
+fn plain_response(code: StatusCode, body: String) -> Response {
+    let mut resp = Response::new(axum::body::Body::from(body));
     *resp.status_mut() = code;
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
     resp
 }
 
@@ -209,10 +290,14 @@ fn event_type_tag(event: &SyncEvent) -> &'static str {
 /// subscriber (missed events dropped from the broadcast channel) simply skips the gap rather
 /// than erroring the stream — `get_sync_status` polling remains the authoritative source of
 /// truth regardless.
+///
+/// `GET /events` does NOT reach [`WalletBackend::dispatch`] and carries no method name, so the
+/// per-method gate has nothing to answer about it; it streams the same sync notifications the
+/// open read plane already publishes.
 async fn handle_events(
-    State(backend): State<Arc<WalletBackend>>,
+    State(state): State<TransportState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = backend.events().subscribe();
+    let rx = state.backend.events().subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|item| {
         let event = item.ok()?;
         let tag = event_type_tag(&event);
@@ -226,21 +311,26 @@ async fn handle_events(
 }
 
 /// Build the shared `Router` (`POST /{method}` + `GET /events`) both transports dispatch.
-pub fn build_router(backend: Arc<WalletBackend>) -> Router {
+///
+/// `gate` is REQUIRED: there is no router without an authorization policy (dig-node#257).
+pub fn build_router(backend: Arc<WalletBackend>, gate: Arc<dyn WalletCallGate>) -> Router {
     Router::new()
         .route("/:method", post(handle))
         .route("/events", get(handle_events))
-        .with_state(backend)
+        .with_state(TransportState { backend, gate })
 }
 
 /// The browser mirror's router: the shared routes + permissive CORS (loopback only, so a
 /// wildcard origin is safe; the extension origin is `chrome-extension://…`).
-pub fn build_cors_router(backend: Arc<WalletBackend>) -> Router {
+///
+/// CORS widens who may SPEAK to the surface; it does not widen what they may do. The same gate
+/// applies, which is why a browser client must present the same token a node-class client does.
+pub fn build_cors_router(backend: Arc<WalletBackend>, gate: Arc<dyn WalletCallGate>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::POST, Method::OPTIONS])
         .allow_headers(Any);
-    build_router(backend).layer(cors)
+    build_router(backend, gate).layer(cors)
 }
 
 /// Serve the wallet mTLS listener (Sage byte-parity) on a pre-bound std listener.
@@ -248,11 +338,12 @@ pub async fn serve_mtls(
     backend: Arc<WalletBackend>,
     listener: std::net::TcpListener,
     cert: &SharedCert,
+    gate: Arc<dyn WalletCallGate>,
 ) -> std::io::Result<()> {
     let config = build_server_config(cert).map_err(|e| std::io::Error::other(e.to_string()))?;
     let rustls_config = RustlsConfig::from_config(Arc::new(config));
     axum_server::from_tcp_rustls(listener, rustls_config)
-        .serve(build_router(backend).into_make_service())
+        .serve(build_router(backend, gate).into_make_service())
         .await
 }
 
@@ -260,26 +351,29 @@ pub async fn serve_mtls(
 pub async fn serve_http(
     backend: Arc<WalletBackend>,
     listener: tokio::net::TcpListener,
+    gate: Arc<dyn WalletCallGate>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, build_cors_router(backend)).await
+    axum::serve(listener, build_cors_router(backend, gate)).await
 }
 
 /// Bring up BOTH transports on loopback (design C.3): the wallet mTLS listener and the
-/// plain-HTTP+CORS browser mirror, each dispatching the shared handler set. Returns once
-/// either listener exits. Both bind `127.0.0.1` only.
+/// plain-HTTP+CORS browser mirror, each dispatching the shared handler set behind the SAME gate.
+/// Returns once either listener exits. Both bind `127.0.0.1` only.
 pub async fn serve_dual(
     backend: Arc<WalletBackend>,
     mtls_port: u16,
     http_port: u16,
     cert: SharedCert,
+    gate: Arc<dyn WalletCallGate>,
 ) -> std::io::Result<()> {
     let mtls_listener = std::net::TcpListener::bind(("127.0.0.1", mtls_port))?;
     let http_listener = tokio::net::TcpListener::bind(("127.0.0.1", http_port)).await?;
     let mtls = {
         let backend = backend.clone();
-        tokio::spawn(async move { serve_mtls(backend, mtls_listener, &cert).await })
+        let gate = gate.clone();
+        tokio::spawn(async move { serve_mtls(backend, mtls_listener, &cert, gate).await })
     };
-    let http = tokio::spawn(async move { serve_http(backend, http_listener).await });
+    let http = tokio::spawn(async move { serve_http(backend, http_listener, gate).await });
     tokio::select! {
         r = mtls => r.map_err(|e| std::io::Error::other(e.to_string()))?,
         r = http => r.map_err(|e| std::io::Error::other(e.to_string()))?,
@@ -326,6 +420,63 @@ mod tests {
         );
     }
 
+    /// A test gate that authorizes everything, so the pre-existing transport tests keep
+    /// exercising the dispatch path they were written for.
+    ///
+    /// It is deliberately test-only: the production crate offers [`DenyAll`] and nothing else, so
+    /// an allow-everything policy cannot be reached by a shipping call site.
+    struct AllowAll;
+    impl WalletCallGate for AllowAll {
+        fn authorize(&self, _method: &str, _presented: Option<&str>) -> bool {
+            true
+        }
+    }
+
+    fn allow_all() -> Arc<dyn WalletCallGate> {
+        Arc::new(AllowAll)
+    }
+
+    /// One question the gate was asked: the method name, and the token presented with it.
+    type GateQuestion = (String, Option<String>);
+
+    /// The shared log of every question a [`RecordingGate`] answered.
+    type GateLog = Arc<std::sync::Mutex<Vec<GateQuestion>>>;
+
+    /// A gate that records every question it was asked and answers with a fixed verdict.
+    #[derive(Clone)]
+    struct RecordingGate {
+        verdict: bool,
+        asked: GateLog,
+    }
+
+    impl RecordingGate {
+        fn new(verdict: bool) -> Self {
+            Self {
+                verdict,
+                asked: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn asked_methods(&self) -> Vec<String> {
+            self.asked
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(m, _)| m.clone())
+                .collect()
+        }
+    }
+
+    impl WalletCallGate for RecordingGate {
+        fn authorize(&self, method: &str, presented: Option<&str>) -> bool {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((method.to_string(), presented.map(str::to_string)));
+            self.verdict
+        }
+    }
+
     async fn test_backend() -> Arc<WalletBackend> {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.set_initial_sync_complete(true).await.unwrap();
@@ -354,8 +505,8 @@ mod tests {
         let backend = test_backend().await;
         // The two transports differ only by the CORS layer; the dispatched body must be
         // byte-identical (acceptance #3, structural proof).
-        let base = build_router(backend.clone());
-        let cors = build_cors_router(backend.clone());
+        let base = build_router(backend.clone(), allow_all());
+        let cors = build_cors_router(backend.clone(), allow_all());
         let (s1, b1) = oneshot_body(base, "get_version").await;
         let (s2, b2) = oneshot_body(cors, "get_version").await;
         let direct = backend.dispatch("get_version", "{}").await;
@@ -367,7 +518,8 @@ mod tests {
     #[tokio::test]
     async fn error_body_is_plain_text_with_mapped_status() {
         let backend = test_backend().await;
-        let (status, body) = oneshot_body(build_router(backend), "get_secret_key").await;
+        let (status, body) =
+            oneshot_body(build_router(backend, allow_all()), "get_secret_key").await;
         assert_eq!(status, 404);
         assert!(body.contains("unsupported"));
     }
@@ -412,7 +564,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_http(backend, listener));
+        tokio::spawn(serve_http(backend, listener, allow_all()));
 
         // Retry-connect so the test never races the server's first accept.
         let mut stream = None;
@@ -447,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn events_sse_streams_a_published_sync_event() {
         let backend = test_backend().await;
-        let router = build_cors_router(backend.clone());
+        let router = build_cors_router(backend.clone(), allow_all());
 
         let req = axum::http::Request::builder()
             .method("GET")
@@ -495,7 +647,118 @@ mod tests {
     #[tokio::test]
     async fn events_route_coexists_with_method_dispatch_route() {
         let backend = test_backend().await;
-        let (status, _) = oneshot_body(build_router(backend), "events").await;
+        let (status, _) = oneshot_body(build_router(backend, allow_all()), "events").await;
         assert_eq!(status, 405);
+    }
+
+    /// **Proves (dig-node#257):** NO route into [`WalletBackend::dispatch`] runs without the gate
+    /// having answered first — for a wallet read, a custody mutation, a master-tier peer
+    /// mutation, a retired custody name, and a method name that does not exist at all.
+    ///
+    /// The unknown name is the load-bearing case. A per-route or per-method-list gate is
+    /// satisfied by enumerating the methods someone thought of, which is exactly how the mTLS
+    /// plane came to serve the whole surface ungated: the hole was a route nobody had listed.
+    /// Asking the gate about a name the backend has never heard of proves the question is asked
+    /// by the ROUTER, not by a table.
+    #[tokio::test]
+    async fn every_route_into_dispatch_consults_the_gate_including_unknown_methods() {
+        const PROBES: &[&str] = &[
+            "get_version",
+            "get_sync_status",
+            "send_xch",
+            "sign_coin_spends",
+            "submit_transaction",
+            "add_peer",
+            "wallet.unlock",
+            "a_method_that_has_never_existed",
+        ];
+
+        let backend = test_backend().await;
+        let gate = RecordingGate::new(false);
+        let router = build_router(backend.clone(), Arc::new(gate.clone()));
+
+        for method in PROBES {
+            let (status, body) = oneshot_body(router.clone(), method).await;
+            assert_eq!(
+                status, 401,
+                "`{method}` was served by a denying gate; the transport authorizes on cert \
+                 possession alone"
+            );
+            assert!(
+                body.contains("control token"),
+                "the refusal must name the credential it wants, got: {body}"
+            );
+        }
+
+        assert_eq!(
+            gate.asked_methods(),
+            PROBES.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+            "the gate must be consulted once per call, for every method name"
+        );
+    }
+
+    /// **Proves:** a denied call never reaches the handler set — the refusal body is not the
+    /// dispatch output, so the method did not run and merely had its answer suppressed.
+    ///
+    /// Asserting the status alone would pass against an implementation that dispatched first and
+    /// rewrote the status afterwards, which for `submit_transaction` would have already
+    /// broadcast.
+    #[tokio::test]
+    async fn a_denied_call_does_not_reach_dispatch() {
+        let backend = test_backend().await;
+        let dispatched = backend.dispatch("get_version", "{}").await.1;
+        assert!(
+            dispatched.contains(env!("CARGO_PKG_VERSION")),
+            "control: dispatch really does answer get_version"
+        );
+
+        let router = build_router(backend.clone(), Arc::new(DenyAll));
+        let (status, body) = oneshot_body(router, "get_version").await;
+
+        assert_eq!(status, 401);
+        assert_ne!(
+            body, dispatched,
+            "the denied call still produced the dispatch body"
+        );
+    }
+
+    /// **Proves:** the gate receives the token verbatim from [`WALLET_TOKEN_HEADER`], and `None`
+    /// when the caller sends nothing — so a policy that distinguishes master from paired from
+    /// absent can actually express that distinction on this transport.
+    #[tokio::test]
+    async fn the_presented_token_reaches_the_gate_verbatim() {
+        let backend = test_backend().await;
+        let gate = RecordingGate::new(true);
+        let router = build_router(backend, Arc::new(gate.clone()));
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/get_version")
+            .header("content-type", "application/json")
+            .header(WALLET_TOKEN_HEADER, "tok-abc")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        router.clone().oneshot(req).await.unwrap();
+        let (_, _) = oneshot_body(router, "get_version").await;
+
+        let asked = gate.asked.lock().unwrap().clone();
+        assert_eq!(
+            asked,
+            vec![
+                ("get_version".to_string(), Some("tok-abc".to_string())),
+                ("get_version".to_string(), None),
+            ],
+            "the header token must reach the gate unchanged, and its absence must read as None"
+        );
+    }
+
+    /// **Proves:** [`DenyAll`] is the only policy this crate ships. A transport whose policy
+    /// owner has not been wired serves nothing rather than everything.
+    #[test]
+    fn deny_all_refuses_every_method_with_and_without_a_token() {
+        for method in ["get_version", "send_xch", ""] {
+            assert!(!DenyAll.authorize(method, None));
+            assert!(!DenyAll.authorize(method, Some("any-token")));
+        }
     }
 }

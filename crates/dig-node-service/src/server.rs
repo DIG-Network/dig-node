@@ -2185,10 +2185,18 @@ where
     // `POST /{method}` surface + the `/ws` transport, which is what the extension uses — but it is
     // no longer SILENT: `crate::wallet_mtls` logs it and publishes it on `control.status`. The
     // listener stops when the process exits with the rest of the node.
+    //
+    // The listener is GATED by the same `wallet_authz` policy the HTTP and `/ws` planes use
+    // (dig-node#257): the shared client certificate authenticates the transport, it does not
+    // authorize a capability.
     crate::wallet_mtls::spawn(
         DEFAULT_MTLS_PORT,
         wallet_backend.clone(),
         wallet_cert.clone(),
+        std::sync::Arc::new(crate::wallet_mtls::NodeWalletGate::new(
+            state.control_token.clone(),
+            &state.state_dir,
+        )),
     );
 
     let app = router(state);

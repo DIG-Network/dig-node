@@ -76,7 +76,16 @@ const PAIRING_TTL_MS: u64 = 5 * 60 * 1000;
 /// pending entries are dropped past this.
 const MAX_PENDING: usize = 32;
 
-/// The longest `client_name` retained (defensive — it is echoed to the operator).
+/// The longest `client_name` this node will ACCEPT, in characters.
+///
+/// It is a REFUSAL bound, not a clip (dig-node#346). Silently truncating an attacker-supplied
+/// label is a forgery the node performs on the attacker's behalf: pad a hostile name with
+/// characters that spend the budget while rendering as nothing, and the node's own clip produces
+/// a short, trusted-looking name for the operator to approve. Refusing an over-long request is
+/// visible to the caller and invents nothing.
+///
+/// The stored value stays BYTE-VERBATIM; neutralisation happens at render time
+/// ([`crate::untrusted_text::render_untrusted`]), because only the display is a lie surface.
 const MAX_CLIENT_NAME: usize = 64;
 
 /// Current unix time in milliseconds (0 on a clock error — only affects TTL math).
@@ -128,9 +137,16 @@ pub fn request(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> V
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("unknown controller")
-        .chars()
-        .take(MAX_CLIENT_NAME)
-        .collect();
+        .to_string();
+    if client_name.chars().count() > MAX_CLIENT_NAME {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!(
+                "client_name must be at most {MAX_CLIENT_NAME} characters; this request is                  refused rather than shortened, because a name the node shortened is a name the                  node partly wrote"
+            ),
+        );
+    }
 
     // Fail CLOSED: the pairing id + code gate the consent step, so if the OS CSPRNG is
     // unavailable refuse the request rather than mint guessable pairing material (§7.3).
@@ -444,6 +460,60 @@ pub fn is_paired_token(path: &Path, presented: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Proves (dig-node#346):** an over-long `client_name` is REFUSED, not shortened.
+    ///
+    /// The ingest used to `.take(64)`, which is an unmarked truncation on the OPEN,
+    /// unauthenticated `pairing.request` — so an attacker could pad a hostile label with budget
+    /// -consuming characters and have the NODE produce a short, trusted-looking name for the
+    /// operator to approve. Refusing is the only answer that invents nothing.
+    ///
+    /// The at-bound case is asserted alongside, because a bound tested only from above cannot
+    /// distinguish "refuses over-long" from "refuses everything".
+    #[test]
+    fn an_over_long_client_name_is_refused_rather_than_silently_shortened() {
+        let pending = Mutex::new(PendingPairings::default());
+
+        let at_bound = "n".repeat(MAX_CLIENT_NAME);
+        let ok = request(&pending, json!(1), &json!({ "client_name": at_bound }));
+        assert!(
+            ok.get("result").is_some(),
+            "a name exactly at the bound must be accepted: {ok}"
+        );
+
+        let too_long = "n".repeat(MAX_CLIENT_NAME + 1);
+        let refused = request(&pending, json!(2), &json!({ "client_name": too_long }));
+        assert_eq!(
+            refused["error"]["data"]["code"],
+            json!(ErrorCode::InvalidParams.name()),
+            "an over-long name must be refused: {refused}"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("refused rather than shortened"),
+            "the refusal must say why it is a refusal: {refused}"
+        );
+    }
+
+    /// **Proves:** the accepted `client_name` is stored BYTE-VERBATIM.
+    ///
+    /// Neutralisation belongs at the render, never at the store: a value that is ever compared or
+    /// used as an identity must not be quietly rewritten, and rewriting at ingest would also make
+    /// the stored value disagree with what the requester believes it sent.
+    #[test]
+    fn an_accepted_client_name_is_stored_verbatim() {
+        let pending = Mutex::new(PendingPairings::default());
+        // Contains characters the RENDERER must neutralise; the STORE must not.
+        let raw = "app\u{200b}\u{202e}name";
+        let resp = request(&pending, json!(1), &json!({ "client_name": raw }));
+        let pairing_id = resp["result"]["pairing_id"].as_str().unwrap().to_string();
+
+        let g = pending.lock().unwrap();
+        let stored = &g.map.get(&pairing_id).expect("pending entry").client_name;
+        assert_eq!(stored, raw, "the stored label must be byte-verbatim");
+    }
 
     /// A unique temp STATE dir (#501: the paired-token store now lives in the state
     /// dir, not beside a `config.json`). Returns `(state_dir, state_dir)` so both

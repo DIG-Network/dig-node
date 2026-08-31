@@ -203,6 +203,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Charging an operator-facing budget on RENDERED WIDTH rather than code points
+# (`untrusted_text`, dig-node#346) needs the real Unicode width tables.
+unicode-width = "0.2"
 
 # Structured logging. The node's engine library (`dig_node_core`) and its transitive
 # P2P/TLS stack emit `tracing` events; WITHOUT a subscriber installed here every one is
