@@ -74,6 +74,12 @@ struct VerdictKey {
 }
 
 /// What a mirror coin's advertised terms say about the peer claiming it.
+///
+/// `DeclaresThisPeer` and `Silent` are matched but not yet constructed: nothing can construct them
+/// until [`peer_declaration`] has a typed source for the binding, which is exactly the promotion gate
+/// described there. They are written now so the shape of the answer is fixed before the source
+/// arrives, and so the call site reads as the full decision rather than a placeholder.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerDeclaration {
     /// The coin's owner declared this exact peer, in code the chain executed.
@@ -434,6 +440,107 @@ mod tests {
     ///
     /// This test is expected to FAIL when 0.8.0's typed accessor lands. That is its second job: the
     /// authoritative-record restriction must land in the same change that makes promotion live.
+    use async_trait::async_trait;
+    use dig_node_core::mirror_bond::{
+        bond_verifier_slot, BondRankingLocator, CandidateAddr, DownloadError, PeerId,
+        ProviderLocator, ProviderRecord,
+    };
+
+    const STORE: [u8; 32] = [0x11; 32];
+    const ROOT: [u8; 32] = [0x22; 32];
+
+    fn capsule() -> ContentId {
+        ContentId::capsule(STORE, ROOT)
+    }
+
+    fn holder_at(peer: u8, coin: Option<[u8; 32]>, host: &str) -> ProviderRecord {
+        let record = ProviderRecord::new(
+            &capsule().to_key(),
+            &PeerId::from_bytes([peer; 32]),
+            vec![CandidateAddr::direct(host, 9444)],
+            u64::MAX,
+        );
+        match coin {
+            Some(id) => record.with_unverified_mirror_coin_id(id),
+            None => record,
+        }
+    }
+
+    /// A slate exactly as a single lookup answer would deliver it.
+    struct Slate(Vec<ProviderRecord>);
+
+    #[async_trait]
+    impl ProviderLocator for Slate {
+        async fn find_providers(
+            &self,
+            _content: &ContentId,
+        ) -> Result<Vec<ProviderRecord>, DownloadError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A chain that answers YES to everything `verdict_for` can check without this node's own
+    /// judgement: the coin exists, is unspent, is a mirror coin, is fully collateralised, and
+    /// advertises exactly this `(store, root, epoch)`. The ONLY step left is the real production
+    /// gate — [`peer_declaration`] — so this double cannot make the layer look safer than it is.
+    struct EveryChainCheckPasses;
+
+    #[async_trait]
+    impl dig_node_core::mirror_bond::MirrorBondVerifier for EveryChainCheckPasses {
+        async fn verify(
+            &self,
+            _content: &ContentId,
+            claiming_peer_id: &str,
+            claimed: Option<[u8; 32]>,
+        ) -> BondVerdict {
+            if claimed.is_none() {
+                return BondVerdict::Unverified;
+            }
+            // The coin's memo tail as a coin owned by this claimant would carry it.
+            let terms = vec![format!("dig-peer:{claiming_peer_id}")];
+            match peer_declaration(&terms, claiming_peer_id) {
+                PeerDeclaration::DeclaresThisPeer => BondVerdict::Bonded,
+                PeerDeclaration::Silent | PeerDeclaration::NotReadable => BondVerdict::Unverified,
+            }
+        }
+    }
+
+    /// **Proves (dig-node#466, HIGH finding 2 — the residual the credit-only lattice does NOT
+    /// close):** a hearsay record naming an honest holder's peer id AND its real coin id, but
+    /// carrying the ATTACKER's addresses, is not promoted — so the address a redirected reader
+    /// dials is unchanged by it.
+    ///
+    /// **Catches:** the hole neither other test can see. Every field of this record is honest
+    /// except the one that matters, so a coin-id check passes, a peer-id check passes, and the peer
+    /// id is IDENTICAL in the passing and failing versions of the code — which is why the assertion
+    /// is on the addresses. `stop_on_providers` means one answer can be the whole slate, so a
+    /// promotion here puts the attacker's host first for every reader that trusts the ranking, and
+    /// the dial does not pin the peer id (DIG-Network/dig-gossip#85) to catch it afterwards.
+    ///
+    /// The verifier is driven through the REAL [`peer_declaration`] gate rather than a hand-written
+    /// verdict, so this test measures production's answer: with no sound coin -> peer binding
+    /// available, nothing is promoted at all.
+    #[tokio::test]
+    async fn an_honest_peer_id_with_attacker_addresses_is_not_promoted() {
+        let slate = Slate(vec![
+            holder_at(0xCC, None, "honest.example"), // an ordinary holder, no pointer
+            holder_at(0xAA, Some([0x01; 32]), "attacker.example"),
+        ]);
+        let slot = bond_verifier_slot();
+        let _ = slot.set(Arc::new(EveryChainCheckPasses));
+        let locator = BondRankingLocator::new(Arc::new(slate), slot);
+
+        let got = locator.find_providers(&capsule()).await.expect("located");
+        let hosts: Vec<String> = got.iter().map(|r| r.addresses[0].host.clone()).collect();
+
+        assert_eq!(
+            hosts,
+            vec!["honest.example", "attacker.example"],
+            "a record whose peer id and coin id are both honest must still not promote the \
+             addresses it chose for itself"
+        );
+    }
+
     #[test]
     fn no_visible_term_promotes_a_claim_before_the_typed_accessor_exists() {
         let peer = "aa".repeat(32);

@@ -8542,14 +8542,32 @@ collision (the epoch term is freely chosen, so hint equality alone proves nothin
 
 ### 25.6a. Acting on another peer's claim
 
-A node that LOCATES a holder verifies that holder's claimed bond and **ranks the located set by the
-answer**. The verdict has three states and they are never collapsed into two:
+A node that LOCATES a holder verifies that holder's claimed bond and **promotes a proven one**. The
+verdict has three states, which are never collapsed into two, but the ranking has exactly TWO tiers:
 
 | verdict | established | ranking |
 |---|---|---|
-| bonded | the named coin passes every §25.6 check for this exact `(store, root, epoch)` | first |
-| unverified | no pointer was published, the chain could not answer, or this node holds no censused requirement for the epoch | unchanged |
-| unbonded | the chain answered and the claim is false | last |
+| bonded | the named coin passes every §25.6 check for this exact `(store, root, epoch)` AND declares the peer claiming it | promoted |
+| unverified | no pointer was published, the chain could not answer, this node holds no censused requirement for the epoch, or the coin does not declare the claimant | baseline, position unchanged |
+| unbonded | the chain answered and the claim is false | baseline, position unchanged |
+
+**Ranking gives credit; it MUST NOT take credit away.** A provider record is hearsay — whoever
+answers a lookup chooses every field of it, including a coin id it attributes to somebody else — so a
+disproven pointer MUST NOT rank a holder below where no pointer at all would have put it. Otherwise
+attaching a bogus coin id to an honest holder's record would be a demotion primitive available to any
+stranger at no cost. Withholding credit has no such abuse: the most a liar achieves is the ranking
+that would have existed had it said nothing.
+
+**A coin id proves the bond, never the bearer.** A coin id is a public fact, so a coin that bonds the
+content says nothing about WHO is offering it; a record may carry an honest holder's peer id, that
+holder's real coin id, and the attacker's addresses. Promotion therefore additionally requires the
+coin's own owner-written declaration of the claiming `peer_id`, and a node that cannot read such a
+declaration MUST NOT promote. A dialler is not a backstop for this: peer ids are derived from the
+presented certificate rather than pinned against the dialled identity.
+
+**One locate is bounded work.** The size of a located set is chosen by whoever answered the lookup,
+so a node MUST bound the number of bonds it reads against a chain per locate, verifying in source
+order and leaving the remainder at baseline.
 
 The verification is performed in the ORDER §25.6 states, with one refinement that is normative: the
 `advertises` binding is checked BEFORE the collateral magnitude. A node that has not censused the
@@ -8559,9 +8577,9 @@ epoch cannot price a bond, and checking magnitude first would make every verdict
 **A holder is never refused, dropped, or blocklisted on a verdict.** A chain outage, an epoch
 rollover, a republished record carrying a pointer that has since gone stale, and a deliberate lie are
 indistinguishable at the moment of reading, and only one of them is an attack; a node that refuses on
-any of them converts its own partition into a rejection of honest peers. Demotion is the whole
-remedy: a lying publisher is served last on every read, and an honest one that cannot prove itself
-loses nothing.
+any of them converts its own partition into a rejection of honest peers. Promotion is the whole
+remedy: a holder that proves its bond is served first, and every other holder keeps exactly the
+standing its source gave it.
 
 Absence of a pointer is the ORDINARY case and MUST cost no chain read at all. `unverified` for an
 absent pointer is not a degraded answer — it is the honest state of a claim nobody looked at.
@@ -8570,7 +8588,9 @@ A verdict is cached only for the exact `(coin id, store, root, epoch)` it answer
 bonds one tuple; caching by coin id alone would let a genuine bond answer for content the same coin
 does not bond, which is the substitution `advertises` exists to refuse. Only DEFINITE verdicts are
 cached: `unverified` records this node's own momentary inability to look, and holding it would keep
-an outage in force after it had ended.
+an outage in force after it had ended. The cache is keyed partly on attacker-chosen input, so it MUST
+be bounded, and overflow MUST evict rather than clear — clearing would let a stranger discard every
+verdict a node has earned by rotating coin ids.
 
 ### 25.7. Consent, the switch, and revocation
 

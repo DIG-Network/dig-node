@@ -48,9 +48,11 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-pub use dig_dht::ContentId;
-use dig_dht::ProviderRecord;
-use dig_download::{DownloadError, ProviderLocator};
+// The seam's own vocabulary is re-exported, so an implementer of [`MirrorBondVerifier`] -- or a
+// test of the ranking -- needs no direct dependency on the discovery and download crates to name
+// the types this trait already speaks in.
+pub use dig_dht::{CandidateAddr, ContentId, PeerId, ProviderRecord};
+pub use dig_download::{DownloadError, ProviderLocator};
 
 /// What a chain had to say about one holder's claimed bond.
 ///
@@ -219,16 +221,12 @@ mod tests {
         ContentId::capsule(STORE, ROOT)
     }
 
-    /// A holder record for `peer`, carrying `coin` as its claimed bond, reachable at `host`.
-    ///
-    /// The host is a parameter because the field a redirected reader actually DIALS is the address,
-    /// and a test that only ever inspects peer ids cannot see a record that keeps an honest peer id
-    /// while pointing somewhere else.
-    fn holder_at(peer: u8, coin: Option<[u8; 32]>, host: &str) -> ProviderRecord {
+    /// A holder record for `peer`, carrying `coin` as its claimed bond.
+    fn holder(peer: u8, coin: Option<[u8; 32]>) -> ProviderRecord {
         let record = ProviderRecord::new(
             &capsule().to_key(),
             &PeerId::from_bytes([peer; 32]),
-            vec![CandidateAddr::direct(host, 9444)],
+            vec![CandidateAddr::direct("::1", 9444)],
             u64::MAX,
         );
         match coin {
@@ -237,21 +235,10 @@ mod tests {
         }
     }
 
-    fn holder(peer: u8, coin: Option<[u8; 32]>) -> ProviderRecord {
-        holder_at(peer, coin, "::1")
-    }
-
     fn peer_ids(records: &[ProviderRecord]) -> Vec<String> {
         records
             .iter()
             .map(|r| r.provider_peer_id[..2].to_string())
-            .collect()
-    }
-
-    fn hosts(records: &[ProviderRecord]) -> Vec<String> {
-        records
-            .iter()
-            .map(|r| r.addresses[0].host.clone())
             .collect()
     }
 
@@ -416,7 +403,11 @@ mod tests {
             holder(0xBB, None),
             holder(0xCC, Some([0x09; 32])),
         ]);
-        let without_pointers = Slate(vec![holder(0xAA, None), holder(0xBB, None), holder(0xCC, None)]);
+        let without_pointers = Slate(vec![
+            holder(0xAA, None),
+            holder(0xBB, None),
+            holder(0xCC, None),
+        ]);
         let verifier = || ByCoinByte::new(&[(0x09, BondVerdict::Unbonded)]);
 
         let smeared = BondRankingLocator::new(Arc::new(with_bogus_pointers), installed(verifier()))
@@ -434,37 +425,6 @@ mod tests {
             "a disproven pointer must not rank a holder below where NO pointer would have put it"
         );
         assert_eq!(peer_ids(&smeared), vec!["aa", "bb", "cc"]);
-    }
-
-    /// **Proves (dig-node#466, HIGH finding 2, the residual):** a record naming an honest holder's
-    /// peer id AND its real coin id, but carrying the ATTACKER's addresses, is not promoted — so the
-    /// addresses a redirected reader dials are unchanged by it.
-    ///
-    /// **Catches:** the hole the other two tests cannot see. Every field this record carries is
-    /// honest except the one that matters, so a check on the peer id passes, a check on the coin
-    /// passes, and the peer id is identical in the passing and failing versions of the code. The
-    /// assertion is therefore on the ADDRESSES: with promotion granted, the attacker's host is
-    /// returned first and every reader that trusts the ranking dials the attacker.
-    #[tokio::test]
-    async fn an_honest_peer_id_with_attacker_addresses_is_not_promoted() {
-        let honest = 0xAA;
-        let slate = Slate(vec![
-            holder_at(0xCC, None, "honest.example"), // an ordinary holder, no pointer
-            // Hearsay: the honest holder's peer id, the honest holder's real coin, and the
-            // attacker's addresses.
-            holder_at(honest, Some([0x01; 32]), "attacker.example"),
-        ]);
-        let verifier = CoinDeclaringOnePeer::new(0x01, honest);
-        let locator = BondRankingLocator::new(Arc::new(slate), installed(verifier));
-
-        let got = locator.find_providers(&capsule()).await.expect("located");
-
-        assert_eq!(
-            hosts(&got),
-            vec!["honest.example", "attacker.example"],
-            "a record whose peer id and coin id are both honest still must not promote the \
-             addresses it chose"
-        );
     }
 
     /// **Proves:** one locate reads at most [`MAX_VERIFIED_PER_LOCATE`] bonds off the chain, whatever
