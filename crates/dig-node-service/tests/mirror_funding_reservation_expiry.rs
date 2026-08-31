@@ -28,6 +28,7 @@
 mod support;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chia_protocol::{Bytes32, CoinSpend};
 use chia_sha2::Sha256;
@@ -143,14 +144,21 @@ impl ChainSource for Chain {
     }
 }
 
+/// A log at a path no other probe in this binary can reach.
+///
+/// The counter is not decoration. Integration tests in one binary run on parallel THREADS, so two
+/// probes deriving the same path append to one file -- and the failure that produces is a ledger
+/// with a foreign record in it, which reads as the code under test having written something it
+/// never wrote. Measured here on the first run.
 fn tmp_log(name: &str) -> SpendLog {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "dig-node-471-{}-{}-{name}",
-        std::process::id(),
-        NOW
+        "dig-node-471-{}-{NOW}-{name}-{n}",
+        std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("a temp dir");
-    SpendLog::at(dir.join(format!("spend-audit-{name}.jsonl")))
+    SpendLog::at(dir.join("spend-audit.jsonl"))
 }
 
 fn intent() -> SpendIntent {
