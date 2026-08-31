@@ -119,7 +119,15 @@ pub fn is_usable_contact(addr: &SocketAddr) -> bool {
 /// A guard adopted one call site at a time will keep missing one, and the count reached five before
 /// anyone looked at the site that faced other nodes. So the question moves into the type: a
 /// `ContactAddr` cannot be constructed without answering "is this a destination?", and
-/// [`ContactAddr::address_json`] is the only way to render the shipped `{host, port, kind}` entry.
+/// [`ContactAddr::address_json`] is the only way to render the shipped `{host, port, kind}` entry
+/// ON THIS PATH.
+///
+/// It is NOT the only way this node emits a peer address to a stranger, and saying so would be
+/// false: `provider_json` (`download.rs`) serialises remote-supplied `CandidateAddr`s into the
+/// peer-facing `providers` array unchecked, and `parse_candidate_addr` (`forwarded_ask.rs`) accepts
+/// `{"host":"::","port":0}` -- so a stranger can inject the very wildcard removed here and have this
+/// node relay it onward. That path is pre-existing and is tracked separately; this type closes the
+/// `dig.getPeers` emitter, not the class.
 /// A new emitter reaches for the renderer, and the renderer is only reachable through the check.
 ///
 /// This does not make the raw `SocketAddr` unreachable — that would require changing what

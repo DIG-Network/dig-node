@@ -475,7 +475,15 @@ fn is_peer_network_enabled(env: Option<&str>) -> bool {
     !env.is_some_and(is_off_token)
 }
 
-/// The ONE reading of "the operator turned this off", shared by every network-reaching `DIG_*` knob.
+/// The ONE reading of "the operator turned this off", shared by the three ISOLATION knobs --
+/// `DIG_BOOTSTRAP_PEERS`, `DIG_RELAY_URL`, `DIG_PEER_NETWORK`.
+///
+/// NOT by every network-reaching `DIG_*` knob, which an earlier version of this comment claimed.
+/// At least four others read a narrower vocabulary and accept neither `disabled` nor an empty
+/// value: `DIG_WALLET_ENABLE_CHAIN_SYNC` (`config.rs`), `DIG_NODE_DIGLOCAL` (`config.rs`),
+/// `DIG_HOLDINGS_INGEST` (`holdings.rs`), `DIG_NODE_STORE_MELT` (`store_melted.rs`). Tracked as
+/// dig-node#459. An operator who learns `off` works for three switches will reasonably try it on a
+/// fourth, so the divergence is a real trap and not a tidiness point.
 ///
 /// `off`, `disabled`, `0`, `false`, `no`, or an explicitly EMPTY value — trimmed and
 /// case-insensitive. An empty value counts because a variable that is *set* to nothing is an
