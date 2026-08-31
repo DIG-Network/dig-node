@@ -77,6 +77,9 @@ pub(super) struct ResolveSummary {
     pub chain_unreadable: usize,
     /// Open records left alone because more than one of them claims the same coin.
     pub ambiguous: usize,
+    /// Entries the audit record lost. Non-zero means the sweep refused outright and resolved
+    /// nothing, so a test can tell a refusal apart from an empty ledger.
+    pub unreadable_lines: usize,
 }
 
 /// Promote every open mirror-coin spend whose coin the chain now shows.
@@ -105,6 +108,26 @@ pub(super) fn resolve_landed_spends<E: MirrorEffects + ?Sized>(
         }
     };
 
+    // A LOST LINE IS A REFUSAL, NOT A SHORTER LEDGER — and the refusal happens HERE, before any
+    // chain read, so it cannot be mistaken for "the chain had nothing to say".
+    //
+    // The same folded ledger decides three things below, and a dropped line corrupts all three: the
+    // `Confirmed` set that stops one coin being attributed twice; the claimant count, whose `> 1`
+    // guard then fails OPEN for the survivor of a dropped rival; and the per-id revision fold, which
+    // can present a `Confirmed` record as `Submitted` when it is the LATEST line that was lost.
+    //
+    // `funding::committed_funding_coin_ids` already refuses a whole selection on the same signal for
+    // the same reason. Resolving is a money write; it gets the same treatment.
+    if ledger.unreadable_lines > 0 {
+        tracing::warn!(
+            target: "mirror",
+            unreadable_lines = ledger.unreadable_lines,
+            "the spend audit record has unreadable entries; no landed mirror spend is resolved this pass"
+        );
+        summary.unreadable_lines = ledger.unreadable_lines;
+        return summary;
+    }
+
     // Coins already attributed to a settled record. A second record must not be confirmed against
     // a coin some other spend is already recorded as having created.
     let attributed: HashSet<&str> = ledger
@@ -121,10 +144,15 @@ pub(super) fn resolve_landed_spends<E: MirrorEffects + ?Sized>(
         if record.kind.as_str() != kinds::MIRROR_COIN {
             continue;
         }
-        if !matches!(
-            record.status,
-            SpendStatus::Submitted | SpendStatus::Unresolved { .. }
-        ) {
+        // The open set is "the bundle MAY HAVE REACHED THE NETWORK", decided in one place by
+        // `SpendStatus::may_have_reached_the_network`. Re-listing the variants here dropped
+        // `Failed { stage: Broadcast }` -- a spend that failed AFTER the bundle went to a mempool,
+        // which is an unknown wearing a failure's name; treating it as settled is how a spend that
+        // actually landed stops being chased.
+        //
+        // NOT `!is_terminal()`, which is a different question and admits `Pending` -- a spend that
+        // never left this node, and which no coin can be attributed to.
+        if !record.status.may_have_reached_the_network() {
             continue;
         }
         let coin_id = match &record.intended_coin_id {

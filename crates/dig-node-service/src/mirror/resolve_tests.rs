@@ -372,3 +372,151 @@ fn a_spend_that_never_reached_the_network_is_not_confirmed_by_a_coin_that_matche
     );
     drop(recorded);
 }
+
+/// **Proves:** an audit record with an unparseable entry resolves NOTHING, and does not even ask the
+/// chain.
+///
+/// **Catches:** the sweep reading the folded ledger less carefully than its own sibling does.
+/// [`crate::mirror::funding::committed_funding_coin_ids`] refuses an entire selection on a non-zero
+/// [`crate::spend_audit::SpendLedger::unreadable_lines`], for the reason it states in its own
+/// comment: the lost lines may be exactly the ones naming a committed coin. The same folded ledger
+/// decides three things here, and a lost line corrupts all three — the `Confirmed` set that stops a
+/// coin being attributed twice, the claimant count whose `> 1` guard then fails OPEN for the
+/// survivor of a dropped rival, and the per-id revision fold, which can present a `Confirmed`
+/// record as `Submitted` when it is the LATEST line that was lost.
+///
+/// # The fixture varies ONE thing
+///
+/// The record is a reclaim whose coin the chain genuinely confirms — the exact input
+/// [`a_landed_reclaim_is_confirmed_at_the_height_the_chain_reported`] resolves successfully. The
+/// only difference is one corrupt line appended after it. So a green here cannot come from there
+/// being nothing to resolve: without the guard the sweep confirms this record, and the assertion on
+/// `asked` shows the refusal happens at the ledger rather than incidentally at the chain read.
+#[test]
+fn an_unparseable_audit_entry_resolves_nothing_and_asks_the_chain_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (journal, log) = journal(dir.path());
+
+    let audit_id = open_spend(&journal, "aa", "11", 7, Some("c9"));
+
+    // A crash mid-append: the ordinary case this module already models. Written by hand because a
+    // truncated line is by definition not something the producer can emit.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log.path())
+            .expect("the audit log exists");
+        f.write_all(b"{\"id\":\"trunc\",\"revi\n")
+            .expect("append a torn line");
+    }
+
+    let chain = Chain {
+        confirmations: HashMap::from([(id("c9"), LANDED_HEIGHT)]),
+        ..Chain::default()
+    };
+
+    let summary = resolve_landed_spends(&journal, &chain, &[]);
+
+    assert_eq!(
+        summary.unreadable_lines, 1,
+        "the refusal is reported, not only logged"
+    );
+    assert_eq!(
+        summary.recorded, 0,
+        "a lost line is a refusal, not a shorter ledger"
+    );
+    assert!(
+        matches!(status_of(&log, &audit_id), SpendStatus::Unresolved { .. }),
+        "a record left open by an unreadable ledger is the honest state"
+    );
+    assert!(
+        chain.asked.borrow().is_empty(),
+        "the refusal must happen at the ledger, before any chain read — otherwise it is only \
+         accidentally safe"
+    );
+}
+
+/// **Proves:** a create whose broadcast call ERRORED after the network had already admitted the
+/// bundle is still chased and resolved, while a spend that failed at SIGNING never is.
+///
+/// **Catches:** the open set hard-coded as `Submitted | Unresolved` instead of asked of
+/// [`SpendStatus::is_terminal`]. `mirror/lifecycle.rs`'s `Err` arm — the sibling of the very `Ok`
+/// arm this resolver follows up — writes `Failed { stage: Broadcast }`, and
+/// [`crate::spend_audit::FailureStage::money_may_have_moved`] already says that stage is an unknown
+/// wearing a failure's name. Hard-coding the pair therefore left exactly the input class the module
+/// documents as most needing to be chased permanently unchased: the coin sits on chain while
+/// `dign spends` reports a failure for money that moved, which is dig-node#412's symptom surviving
+/// the fix for it.
+///
+/// # Two records, opposite directions
+///
+/// Widening on `is_terminal` must not widen to everything. `Failed { Signing }` is terminal because
+/// no signed bundle ever existed, and its bond is deliberately given a coin on chain too — a
+/// resolver that widened by dropping the filter rather than by asking the stage confirms it and
+/// fails here. The writer is asserted directly as well, because the sweep's filter and
+/// [`SpendJournal::resolve_landed`]'s guard mask each other.
+#[test]
+fn a_create_whose_broadcast_errored_after_admission_is_resolved_but_a_signing_failure_is_not() {
+    use crate::spend_audit::FailureStage;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (journal, log) = journal(dir.path());
+
+    // The `Err` arm of `mirror/lifecycle.rs`'s broadcast: `failed`, never `submitted`. So there is
+    // no `intended_coin_id`, and the create path's `(store, root, epoch)` key is the only key —
+    // which is why this must be a create rather than a reclaim.
+    let broadcast = journal.begin(intent("aa", "11", 7));
+    let broadcast_id = broadcast.id().to_string();
+    journal.failed(&broadcast, FailureStage::Broadcast, "connection reset");
+    drop(broadcast);
+
+    let signing = journal.begin(intent("bb", "22", 7));
+    let signing_id = signing.id().to_string();
+    journal.failed(&signing, FailureStage::Signing, "no spendable $DIG");
+    drop(signing);
+
+    let chain = Chain {
+        confirmations: HashMap::from([(id("c1"), LANDED_HEIGHT), (id("c2"), LANDED_HEIGHT)]),
+        ..Chain::default()
+    };
+
+    let summary = resolve_landed_spends(
+        &journal,
+        &chain,
+        &[mirror("c1", "aa", "11", 7), mirror("c2", "bb", "22", 7)],
+    );
+
+    assert_eq!(
+        summary.recorded, 1,
+        "exactly the broadcast failure is chased"
+    );
+    assert_eq!(
+        status_of(&log, &broadcast_id),
+        SpendStatus::Confirmed {
+            height: LANDED_HEIGHT,
+            coin_id: TargetCoinId(id("c1")),
+        },
+        "a bundle the network admitted before the call errored did move money, and the record must \
+         say so"
+    );
+    assert!(
+        matches!(
+            status_of(&log, &signing_id),
+            SpendStatus::Failed {
+                stage: FailureStage::Signing,
+                ..
+            }
+        ),
+        "nothing was ever signed, so a coin matching this bond was created by some OTHER spend"
+    );
+
+    // The authoritative guard, asked directly: the sweep's filter and the writer's mask each other.
+    assert_eq!(
+        journal
+            .resolve_landed(&signing_id, TargetCoinId(id("c2")), LANDED_HEIGHT)
+            .expect("the record is readable"),
+        crate::spend_audit::Resolution::NotOpen,
+        "the writer must refuse a spend that never reached the network, whatever asks it"
+    );
+}

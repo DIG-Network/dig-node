@@ -298,6 +298,27 @@ impl SpendStatus {
     /// a `Failed` entry whose stage [may have moved money](FailureStage::money_may_have_moved) — it
     /// is an unknown wearing a failure's name, and calling it settled is how a spend that actually
     /// landed stops being chased.
+    /// May this spend's bundle have REACHED THE NETWORK — i.e. is it worth asking the chain about?
+    ///
+    /// Distinct from [`is_terminal`](Self::is_terminal), and the distinction is the whole point.
+    /// `Pending` is NOT terminal (nothing has settled it) but also never left this node, so no coin
+    /// can be attributed to it; resolving one would confirm a spend that was never broadcast.
+    /// `Failed { stage: Broadcast }` is the mirror case — a failure by name, but the bundle may
+    /// already sit in a mempool, so it MUST stay chaseable.
+    ///
+    /// Written as an exhaustive `match`, like
+    /// [`FailureStage::money_may_have_moved`](FailureStage::money_may_have_moved) and for the same
+    /// reason: a new variant must be a compile error here, forcing whoever adds it to decide which
+    /// side it falls on. A `matches!` at a call site routes around that, which is exactly how
+    /// `Failed { stage: Broadcast }` came to be dropped from the resolver's open set.
+    pub fn may_have_reached_the_network(&self) -> bool {
+        match self {
+            SpendStatus::Submitted | SpendStatus::Unresolved { .. } => true,
+            SpendStatus::Failed { stage, .. } => stage.money_may_have_moved(),
+            SpendStatus::Pending | SpendStatus::Confirmed { .. } => false,
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         match self {
             SpendStatus::Confirmed { .. } => true,
@@ -938,10 +959,9 @@ impl SpendJournal {
         let Some(current) = ledger.records.iter().find(|r| r.id == id) else {
             return Ok(Resolution::NoSuchSpend);
         };
-        if !matches!(
-            current.status,
-            SpendStatus::Submitted | SpendStatus::Unresolved { .. }
-        ) {
+        // OPEN here means "the bundle may have reached the network", which is NOT the same question
+        // as `is_terminal`. See `SpendStatus::may_have_reached_the_network`.
+        if !current.status.may_have_reached_the_network() {
             return Ok(Resolution::NotOpen);
         }
 
