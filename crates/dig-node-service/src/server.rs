@@ -2165,11 +2165,9 @@ where
         // from the observation a pass publishes, so a node that creates no coins simply has no
         // `Bonded` row and answers `None` — the ordinary, fully supported case — while a node whose
         // coins were created before the switch was turned off still points at them correctly.
-        state
-            .node
-            .set_mirror_coin_pointers(std::sync::Arc::new(
-                crate::mirror::pointers::SnapshotMirrorPointers::new(state.mirror_bonds.clone()),
-            ));
+        state.node.set_mirror_coin_pointers(std::sync::Arc::new(
+            crate::mirror::pointers::SnapshotMirrorPointers::new(state.mirror_bonds.clone()),
+        ));
         dig_node_core::peer::spawn_peer_network(state.node.clone());
     }
 

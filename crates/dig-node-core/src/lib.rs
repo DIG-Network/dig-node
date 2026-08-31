@@ -74,6 +74,13 @@ mod forwarded_ask_tests;
 pub mod seams;
 pub mod tier0_live;
 pub mod tier0_prefetch;
+/// `dig-dht` itself, re-exported so a consumer implementing [`dht::MirrorCoinPointers`] names
+/// `ContentId` through THIS crate rather than declaring its own `dig-dht` dependency.
+///
+/// A second declaration is a second version constraint, and a consumer that resolved a different
+/// `dig-dht` minor would be handed a `ContentId` that is a different type with the same name — the
+/// split-line failure §2.4b exists to prevent, arriving through a trait nobody would think to check.
+pub use dig_dht;
 /// The `CapsuleStore` trait is seam 6's public surface (#1285 W1b-4) — bring it into scope to call
 /// `cache_list_cached`/`cache_remove_cached`/`cache_fetch_and_cache`/`gap_fill_generation`/
 /// `maybe_backfill_capsule`/`set_self_ref`/`arc_self` on a `Node`.
@@ -95,13 +102,6 @@ pub use seams::content::{bandwidth, verification_ledger, ContentServer};
 pub use seams::dig_peer::{
     address_book, bootstrap, dht, net, pex, session, HolderClaim, PeerNetwork,
 };
-/// `dig-dht` itself, re-exported so a consumer implementing [`dht::MirrorCoinPointers`] names
-/// `ContentId` through THIS crate rather than declaring its own `dig-dht` dependency.
-///
-/// A second declaration is a second version constraint, and a consumer that resolved a different
-/// `dig-dht` minor would be handed a `ContentId` that is a different type with the same name — the
-/// split-line failure §2.4b exists to prevent, arriving through a trait nobody would think to check.
-pub use dig_dht;
 /// The `RpcDispatch` trait is seam 4's public surface (#1285 W1b-5) — the crate-root
 /// `handle_rpc`/`handle_rpc_json` free functions delegate to it; most callers keep using those
 /// stable entry points and never need this trait in scope directly.

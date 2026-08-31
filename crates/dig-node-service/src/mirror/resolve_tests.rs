@@ -173,7 +173,10 @@ fn a_landed_reclaim_is_confirmed_at_the_height_the_chain_reported() {
         "the height and the coin come from the chain read, not from the attempt"
     );
     assert!(
-        matches!(status_of(&log, &still_flying), SpendStatus::Unresolved { .. }),
+        matches!(
+            status_of(&log, &still_flying),
+            SpendStatus::Unresolved { .. }
+        ),
         "a spend the chain has no coin for stays unresolved; broadcasting is not landing"
     );
 }

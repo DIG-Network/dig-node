@@ -133,10 +133,9 @@ pub(super) fn resolve_landed_spends<E: MirrorEffects + ?Sized>(
                 let (Some(store_id), Some(bond)) = (&record.store_id, &record.bond) else {
                     continue; // a record written before the bond was carried structurally
                 };
-                let Some(found) = on_chain
-                    .iter()
-                    .find(|m| m.store_id == *store_id && m.root == bond.root && m.epoch == bond.epoch)
-                else {
+                let Some(found) = on_chain.iter().find(|m| {
+                    m.store_id == *store_id && m.root == bond.root && m.epoch == bond.epoch
+                }) else {
                     continue; // no coin for this bond yet: nothing positive to confirm against
                 };
                 found.coin_id.clone()
