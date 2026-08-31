@@ -1183,6 +1183,20 @@ where
     }
 }
 
+/// The JSON-RPC error body for inbound work refused at the admission boundary (#269).
+///
+/// `-32000` (server error) rather than a method/param error: the request was well-formed and the node
+/// simply declined to spend on it now. The reason names the LIMIT, never the peer's standing, so shed
+/// load stays distinguishable from a ban by the peer and from an outage by the operator.
+fn admission_refused(
+    id: Value,
+    refusal: crate::seams::dig_peer::admission::AdmissionRefusal,
+) -> Value {
+    tracing::debug!(reason = refusal.reason(), "peer serve: inbound work refused at admission");
+    json!({"jsonrpc":"2.0","id":id,
+        "error":{"code":-32000,"message":"request refused","data":{"reason":refusal.reason()}}})
+}
+
 /// Whether `method` may be answered over the **mTLS peer surface** (other DIG nodes).
 ///
 /// The allowlist itself lives in ONE place — [`dig_rpc_protocol::Method::is_peer_reachable`],
@@ -1325,6 +1339,18 @@ impl PeerRpcResponder for NodeResponder {
     async fn handle_json_rpc(&self, req: Value, conn_key: &str) -> Value {
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         let id = req.get("id").cloned().unwrap_or(json!(1));
+        // ADMISSION (dig-sex SPEC 8.5, #269) — ahead of the allowlist and every dispatch below, so a
+        // refused request costs a hex decode and a counter bump rather than a read, a decode or a DHT
+        // lookup. The guard is held for the whole method: it releases on `Drop`, including on the
+        // early `return`s below, which is why no path here needs to remember to.
+        let _admitted = match self.node.peer_admission().admit(
+            conn_key,
+            dig_sex::WorkKind::Own,
+            1,
+        ) {
+            Ok(guard) => guard,
+            Err(refusal) => return admission_refused(id, refusal),
+        };
         // PEER-SURFACE ALLOWLIST (audit #179 CRITICAL). The mTLS verifier accepts any self-signed
         // leaf, so an "authenticated" peer is merely "some peer_id", NOT an authorized admin. Route
         // ONLY the intended L7 read/discovery/announce methods to the shared dispatch; return -32601
@@ -1388,6 +1414,18 @@ impl PeerRpcResponder for NodeResponder {
     }
 
     async fn handle_availability(&self, items: Value, conn_key: &str) -> Value {
+        // ADMISSION (dig-sex SPEC 8.5, #269) — before the items are even read. `items.len()` is the
+        // attacker-chosen quantity this request asks for, so it is what gets clamped at the boundary
+        // (`AdmissionLimits::max_request_units`); clamping it deeper in would already have paid for it.
+        let requested_units = u32::try_from(items.as_array().map_or(0, Vec::len)).unwrap_or(u32::MAX);
+        let _admitted = match self.node.peer_admission().admit(
+            conn_key,
+            dig_sex::WorkKind::Own,
+            requested_units,
+        ) {
+            Ok(guard) => guard,
+            Err(refusal) => return admission_refused(json!(1), refusal),
+        };
         let items = items.as_array().cloned().unwrap_or_default();
         // The verified mTLS peer_id (`conn_key`) keys the per-requestor miss-lookup budget, identical
         // to the range-stream miss on this same peer surface (dig_ecosystem#2007).

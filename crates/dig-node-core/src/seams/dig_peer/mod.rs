@@ -11,6 +11,7 @@
 //! (matching W1b-0's pattern) but is out of scope for this trait carve.
 
 pub mod address_book;
+pub mod admission;
 pub mod ask_routing;
 pub mod bootstrap;
 pub mod capsule_fallback;

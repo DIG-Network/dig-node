@@ -386,6 +386,12 @@ pub struct Node {
     /// registry. The registry's distinct-generation cap ([`crate::seams::dig_peer::DEFAULT_MAX_CONCURRENT_WARMS`])
     /// therefore bounds concurrent acquisitions across BOTH legs, not each in isolation.
     capsule_acquisition: Arc<crate::seams::dig_peer::WarmRegistry>,
+    /// Inbound admission for the mTLS peer surface (dig-sex SPEC 8.5, #269).
+    ///
+    /// One meter for the whole NODE, not one per connection or per responder: the ceiling it enforces
+    /// is node-wide, and a per-connection meter would let a peer buy more allowance simply by opening
+    /// more connections.
+    peer_admission: Arc<crate::seams::dig_peer::admission::PeerAdmission>,
     /// A WEAK self-reference, installed by the standalone peer-network bring-up (which holds the
     /// `Arc<Node>`), so a `&self` read handler can spawn a detached background task that needs an owned
     /// `Arc<Node>` — the capsule backfill (§14.3). `Weak` (not `Arc`) so the node's refcount is
@@ -4425,6 +4431,13 @@ impl Node {
     /// ([`Node::maybe_backfill_capsule`]) and the #1576 reshare warm. Handed to
     /// [`crate::download::NodeContent::wire_capsule_reshare`] so both legs claim the same registry and a
     /// read triggers at most one whole-capsule acquisition.
+    /// The node-wide inbound admission meter (dig-sex SPEC 8.5, #269).
+    pub(crate) fn peer_admission(
+        &self,
+    ) -> &Arc<crate::seams::dig_peer::admission::PeerAdmission> {
+        &self.peer_admission
+    }
+
     pub(crate) fn capsule_acquisition_gate(&self) -> Arc<crate::seams::dig_peer::WarmRegistry> {
         self.capsule_acquisition.clone()
     }
@@ -4506,6 +4519,9 @@ impl Node {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(
+                crate::seams::dig_peer::admission::PeerAdmission::default(),
+            ),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -4797,6 +4813,9 @@ pub(crate) mod test_support {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(
+                crate::seams::dig_peer::admission::PeerAdmission::default(),
+            ),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5585,6 +5604,9 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(
+                crate::seams::dig_peer::admission::PeerAdmission::default(),
+            ),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5717,6 +5739,9 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(
+                crate::seams::dig_peer::admission::PeerAdmission::default(),
+            ),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5783,6 +5808,9 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(
+                crate::seams::dig_peer::admission::PeerAdmission::default(),
+            ),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5874,6 +5902,9 @@ mod tests {
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
                 capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(
+                crate::seams::dig_peer::admission::PeerAdmission::default(),
+            ),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
@@ -5947,6 +5978,9 @@ mod tests {
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
                 capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(
+                crate::seams::dig_peer::admission::PeerAdmission::default(),
+            ),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
@@ -8622,6 +8656,9 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(
+                crate::seams::dig_peer::admission::PeerAdmission::default(),
+            ),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
