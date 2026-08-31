@@ -379,21 +379,55 @@ impl MachineKeyStore {
     ) -> Result<Zeroizing<[u8; 32]>, MachineKeyError> {
         let seed_key = BackendKey::new(SEED_RECORD);
         // `presence`, never `Path::exists`. `exists()` reports a locked, permission-denied or
-        // otherwise unreadable path as ABSENT, and the very next thing this function does with an
-        // "absent" answer is MINT — overwriting both halves of a real identity that was merely
-        // unreadable for a moment. Before this seed was sealed that misread cost a recoverable
-        // duplicate; now both halves would be gone, so the read has to refuse instead.
-        if self.seed_presence()? == Presence::Present {
-            return self.unseal_stored(&seed_key);
+        // otherwise unreadable path as ABSENT, and the one branch below that mints would then
+        // overwrite both halves of a real identity that was merely unreadable for a moment.
+        // Before this seed was sealed that misread cost a recoverable duplicate; now both halves
+        // would be gone, so the read refuses instead.
+        //
+        // Written as a MATCH with both arms named rather than as an early `return`: the mint is
+        // reachable from exactly one arm, and a reader can see which one without tracing control
+        // flow (dig-node#345).
+        match self.seed_presence()? {
+            Presence::Present => self.unseal_stored(&seed_key),
+            Presence::Absent => self.mint_or_migrate(&seed_key, legacy_dir),
         }
-        let seed = match legacy_dir.map(Self::read_legacy).transpose()?.flatten() {
-            Some(seed) => seed,
-            None => Zeroizing::new(random_bytes::<32>()),
+    }
+
+    /// No sealed blob exists: adopt a legacy plaintext seed if there is one, else mint a fresh one.
+    ///
+    /// # The no-mint rule, stated as an arm rather than carried by an operator
+    ///
+    /// This is the only code path in the module that can create a new identity, and the only one
+    /// that deletes the legacy plaintext. It may run ONLY on
+    /// [`LegacySeed::ConfirmedAbsent`] — a value [`Self::read_legacy`] constructs in a single
+    /// place, from a [`Presence::Absent`] answer, and never from a failed read.
+    ///
+    /// The previous shape was safe only because `read_legacy` happened to use `?` on its
+    /// `fs::read`. Swap that one operator for `.ok()` and an unreadable-but-present legacy seed
+    /// reads as absent, so this function mints over it and then deletes it — irreversible key
+    /// loss, produced by a character. A rule that depends on which operator someone typed is one
+    /// refactor away from being gone, so it is a named variant now and
+    /// `an_unreadable_legacy_seed_is_never_minted_over_or_deleted` fails if that relaxation is
+    /// ever made.
+    fn mint_or_migrate(
+        &self,
+        seed_key: &BackendKey,
+        legacy_dir: Option<&Path>,
+    ) -> Result<Zeroizing<[u8; 32]>, MachineKeyError> {
+        let legacy = match legacy_dir {
+            Some(dir) => Self::read_legacy(dir)?,
+            None => LegacySeed::ConfirmedAbsent,
         };
-        let settled = self.seal_new(&seed_key, &seed)?;
-        if let Some(dir) = legacy_dir {
-            // Only reached once `seal_new` has proven the sealed copy reads back from storage:
-            // removing the one plaintext copy before that would destroy the node's identity.
+        let seed = match &legacy {
+            LegacySeed::Found(seed) => seed.clone(),
+            LegacySeed::ConfirmedAbsent => Zeroizing::new(random_bytes::<32>()),
+        };
+        let settled = self.seal_new(seed_key, &seed)?;
+        if let (LegacySeed::Found(_), Some(dir)) = (&legacy, legacy_dir) {
+            // Two conditions, both required, and both now visible in the pattern: the legacy seed
+            // was CONFIRMED READ (never merely "not seen"), and `seal_new` has proven the sealed
+            // copy reads back from storage. Removing the one plaintext copy without either would
+            // destroy the node's identity.
             let _ = std::fs::remove_file(dir.join(LEGACY_SEED_FILE));
         }
         Ok(settled)
@@ -421,7 +455,30 @@ impl MachineKeyStore {
         Ok(self.backend.blob_tier(&BackendKey::new(SEED_RECORD))?)
     }
 
-    /// One honest sentence about the stored seed's protection, fit for a log line or status field.
+    /// One honest sentence about the stored SEED's protection, fit for a log line or status field.
+    ///
+    /// # What sealing does NOT buy, and why that must be said here (dig-node#343)
+    ///
+    /// Every sentence below describes the stored SEED. It does not describe
+    /// `<cache_dir>/peer-net/identity/node.key` — the BLS/TLS key DERIVED from that seed, which
+    /// `dig_tls::NodeCert::load_or_generate` persists UNSEALED because the dig-gossip pool
+    /// listener loads it from disk by path (`dig_peer_protocol::load_ssl_cert`).
+    ///
+    /// That derived key is the artifact peers actually authenticate: `peer_id` is
+    /// `SHA-256(TLS SPKI DER)`, so whoever reads that one file has this node's network identity
+    /// for every purpose the network cares about — dialing as it, serving as it, and any
+    /// authorization keyed on it — WITHOUT touching either half of the sealed pair.
+    ///
+    /// So a summary that said only "sealed to this host" would be true of the seed and false of
+    /// the thing a reader assumes it means. [`DERIVED_KEY_CAVEAT`] is therefore appended to every
+    /// variant, including the failure one, and
+    /// `the_protection_summary_never_claims_copy_resistance_without_naming_the_derived_key`
+    /// fails if a variant is added without it.
+    ///
+    /// Sealing the derived key is the better fix and is NOT done here: the key is written by
+    /// `dig-tls`, in another repo, and is read back by path by a third crate, so it is a
+    /// release-first cascade rather than a change this module can make. An honest documented gap
+    /// beats an unstated one in the meantime.
     ///
     /// On a host with no provider this says the key is protected by file permissions and names the
     /// reason the tier degraded — it never implies hardware backing the key does not have. On a
@@ -431,6 +488,14 @@ impl MachineKeyStore {
     /// original machine with its trusted component wiped (permanent). Any reassurance would be a
     /// guess, and the wrong guess is the irreversible one.
     pub fn protection_summary(&self) -> String {
+        format!("{}. {DERIVED_KEY_CAVEAT}", self.seed_protection_summary())
+    }
+
+    /// The seed-only half of [`Self::protection_summary`], without the derived-key caveat.
+    ///
+    /// Split out so the caveat is appended in ONE place rather than in each arm: a variant added
+    /// later cannot forget it, because there is nowhere to forget it.
+    fn seed_protection_summary(&self) -> String {
         match self.protection() {
             // The blob names a hardware CLASS and carries no device identity, so "it is wrapped"
             // is NOT "this host can open it". Only a host bound to the same class may speak in the
@@ -569,8 +634,14 @@ impl MachineKeyStore {
         }
     }
 
-    /// The legacy plaintext seed, if `dir` holds one.
-    fn read_legacy(dir: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, MachineKeyError> {
+    /// The legacy plaintext seed at `dir`, three-valued by construction (dig-node#345).
+    ///
+    /// The two safe answers are VALUES; every unsafe answer is an `Err`. In particular there is
+    /// no way to obtain [`LegacySeed::ConfirmedAbsent`] from a failed read: it is produced in
+    /// exactly one place, from a [`Presence::Absent`] verdict, which is what makes
+    /// "never mint over a seed that is merely unreadable" a property of the type rather than of
+    /// the error operator on the next line.
+    fn read_legacy(dir: &Path) -> Result<LegacySeed, MachineKeyError> {
         let path = dir.join(LEGACY_SEED_FILE);
         // Same refusal as the mint decision: an unreadable legacy path reported as absent would
         // mint a NEW identity while the real one sat right there, unreadable for a moment.
@@ -579,11 +650,41 @@ impl MachineKeyStore {
             source,
         })?;
         match found {
-            Presence::Absent => Ok(None),
-            Presence::Present => exactly_32(LEGACY_SEED_FILE, &std::fs::read(&path)?).map(Some),
+            Presence::Absent => Ok(LegacySeed::ConfirmedAbsent),
+            Presence::Present => match std::fs::read(&path) {
+                Ok(bytes) => exactly_32(LEGACY_SEED_FILE, &bytes).map(LegacySeed::Found),
+                // NAMED, so the rule is legible at the point it is enforced: a legacy seed that
+                // is PRESENT but unreadable is a refusal, never an absence. An on-access scanner,
+                // a roaming-profile sync or a permission blip all land here, and every one of
+                // them resolves by itself — whereas treating any of them as "no seed" mints over
+                // the real identity and then deletes it.
+                Err(source) => Err(MachineKeyError::ExistenceUndeterminable { path, source }),
+            },
         }
     }
 }
+
+/// What the legacy plaintext seed read established. Three-valued: the two safe answers are
+/// variants and everything else is an `Err` (dig-node#345).
+enum LegacySeed {
+    /// A legacy plaintext seed was READ and validated. Migrating it is safe, and it is the only
+    /// answer that permits deleting the plaintext copy afterwards.
+    Found(Zeroizing<[u8; 32]>),
+    /// The legacy path was determined to be ABSENT. The ONLY answer that permits minting.
+    ///
+    /// Constructed in exactly one place, from [`Presence::Absent`]. A read failure can never
+    /// produce it, which is the whole point of the variant.
+    ConfirmedAbsent,
+}
+
+/// The sentence appended to every protection summary, naming what sealing the seed does NOT cover
+/// (dig-node#343).
+///
+/// It is a constant rather than prose repeated per arm so the claim cannot drift between the
+/// variants, and so a test can assert its presence rather than matching on wording.
+pub const DERIVED_KEY_CAVEAT: &str = "The DERIVED peer key at peer-net/identity/node.key is NOT \
+     sealed \u{2014} it is stored readable because the peer listener loads it by path, and \
+     possession of that one file is possession of this node's peer_id";
 
 /// Narrow a stored record to the 32 bytes a seed must be.
 fn exactly_32(record: &'static str, bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, MachineKeyError> {
@@ -793,6 +894,172 @@ mod tests {
     /// Whether `haystack` contains `needle` as a contiguous run.
     fn contains_run(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// **Proves (dig-node#345):** a legacy plaintext seed that is PRESENT but unreadable is never
+    /// minted over, and is never deleted.
+    ///
+    /// This is the destructive case the module exists to prevent, and until now nothing tested
+    /// it: `read_legacy` was safe only because its `fs::read` happened to carry a `?`. Replace
+    /// that operator with `.ok()` — a one-character relaxation a refactor could make in good
+    /// faith — and the unreadable seed reads as ABSENT, so `load_or_create` mints a new identity,
+    /// seals it, and then removes the real seed. Both halves gone, from a character.
+    ///
+    /// The fixture is a DIRECTORY at the legacy seed path. It is the one shape that makes
+    /// `presence` answer `Present` while `fs::read` fails, on every platform, without needing
+    /// permissions the runner may or may not have — which matters because a `chmod`-based fixture
+    /// is exactly the kind that silently stops discriminating under root (dig-node#355).
+    #[test]
+    fn an_unreadable_legacy_seed_is_never_minted_over_or_deleted() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        std::fs::create_dir_all(&dir).expect("identity dir");
+        let legacy_dir = root.path().join("legacy");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+
+        // Present to `presence`, unreadable to `fs::read`, on every platform.
+        let legacy_path = legacy_dir.join(LEGACY_SEED_FILE);
+        std::fs::create_dir(&legacy_path).expect("the unreadable fixture");
+        assert_eq!(
+            presence(&legacy_path).expect("presence"),
+            Presence::Present,
+            "the fixture must LOOK present, or this test proves nothing"
+        );
+        assert!(
+            std::fs::read(&legacy_path).is_err(),
+            "the fixture must be unreadable, or this test proves nothing"
+        );
+
+        let store = software_store(&dir);
+        let err = store
+            .load_or_create(Some(&legacy_dir))
+            .expect_err("an unreadable legacy seed must refuse, never mint");
+
+        assert!(
+            matches!(err, MachineKeyError::ExistenceUndeterminable { .. }),
+            "the refusal must name the undetermined read, got: {err}"
+        );
+        assert!(
+            legacy_path.exists(),
+            "the legacy seed must NOT be deleted when it could not be read"
+        );
+        assert!(
+            !store.seed_blob_path().exists(),
+            "nothing may be sealed over an identity we could not read"
+        );
+    }
+
+    /// The control for the test above: a legacy seed that IS readable is migrated, and only then
+    /// is the plaintext removed.
+    ///
+    /// Without this, an implementation that refused every legacy path would pass the refusal test
+    /// while breaking migration entirely — the failure mode a one-sided assertion cannot see.
+    #[test]
+    fn a_readable_legacy_seed_is_adopted_and_then_removed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = identity_dir(&root);
+        std::fs::create_dir_all(&dir).expect("identity dir");
+        let legacy_dir = root.path().join("legacy");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+
+        let legacy_path = legacy_dir.join(LEGACY_SEED_FILE);
+        let planted = [7u8; 32];
+        std::fs::write(&legacy_path, planted).expect("plant the legacy seed");
+
+        let store = software_store(&dir);
+        let settled = store
+            .load_or_create(Some(&legacy_dir))
+            .expect("a readable legacy seed migrates");
+
+        assert_eq!(
+            settled.as_slice(),
+            &planted,
+            "the legacy identity must be ADOPTED, not replaced"
+        );
+        assert!(
+            !legacy_path.exists(),
+            "the plaintext copy is removed once the sealed copy reads back"
+        );
+    }
+
+    /// **Proves:** `ConfirmedAbsent` is the ONLY answer that reaches the mint, and it is produced
+    /// only from a determined absence.
+    ///
+    /// Asserted directly on `read_legacy` because the destructive consequence is two calls away
+    /// from the read, and a test that only observes the consequence cannot say which of the two
+    /// decisions was wrong.
+    #[test]
+    fn read_legacy_reports_confirmed_absence_only_for_a_determined_absence() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let empty = root.path().join("empty");
+        std::fs::create_dir_all(&empty).expect("dir");
+        assert!(
+            matches!(
+                MachineKeyStore::read_legacy(&empty),
+                Ok(LegacySeed::ConfirmedAbsent)
+            ),
+            "a determined absence is the one value that permits a mint"
+        );
+
+        let blocked = root.path().join("blocked");
+        std::fs::create_dir_all(&blocked).expect("dir");
+        std::fs::create_dir(blocked.join(LEGACY_SEED_FILE)).expect("unreadable fixture");
+        assert!(
+            matches!(
+                MachineKeyStore::read_legacy(&blocked),
+                Err(MachineKeyError::ExistenceUndeterminable { .. })
+            ),
+            "an unreadable legacy seed must be an Err, never ConfirmedAbsent"
+        );
+    }
+
+    /// **Proves (dig-node#343):** no protection summary ever claims copy-resistance without also
+    /// naming the derived peer key that is NOT covered.
+    ///
+    /// Sealing the seed builds a real partial-exfiltration boundary — recovering it needs BOTH
+    /// `machine-identity.dks` and the sibling `device.dks`. But the key peers actually
+    /// authenticate is the DERIVED one at `peer-net/identity/node.key`, stored unsealed one
+    /// directory away, and `peer_id = SHA-256(SPKI DER)`. So "sealed to this host; it does not
+    /// open on another machine" is true of the seed and false of the artifact a reader assumes it
+    /// means — a shipped surface asserting a protection that does not cover the thing at risk.
+    ///
+    /// Asserted over BOTH tiers and the error path, because the caveat is only load-bearing if it
+    /// cannot be lost by adding one more arm.
+    #[test]
+    fn the_protection_summary_never_claims_copy_resistance_without_naming_the_derived_key() {
+        let root = tempfile::tempdir().expect("tempdir");
+
+        let software_dir = identity_dir(&root);
+        let software = software_store(&software_dir);
+        software.load_or_create(None).expect("mint + seal");
+        let software_summary = software.protection_summary();
+        assert!(
+            software_summary.contains(DERIVED_KEY_CAVEAT),
+            "the software-tier summary must name the uncovered derived key: {software_summary}"
+        );
+
+        let hardware_dir = root.path().join("hw");
+        let hardware = hardware_store(&hardware_dir, 1);
+        hardware.load_or_create(None).expect("mint + seal");
+        let hardware_summary = hardware.protection_summary();
+        assert!(
+            hardware_summary.contains("does not open on another machine"),
+            "the hardware-tier claim under test must actually be made: {hardware_summary}"
+        );
+        assert!(
+            hardware_summary.contains(DERIVED_KEY_CAVEAT),
+            "the copy-resistance claim must be scoped to the SEED: {hardware_summary}"
+        );
+
+        // The error path too: a store with nothing sealed yet still reports a tier, and the
+        // caveat is exactly as true there.
+        let empty_dir = root.path().join("empty");
+        let empty_summary = software_store(&empty_dir).protection_summary();
+        assert!(
+            empty_summary.contains(DERIVED_KEY_CAVEAT),
+            "even an unknown-protection summary must not imply the derived key is covered: \
+             {empty_summary}"
+        );
     }
 
     /// **Proves:** `DIG_IDENTITY_DIR` still selects the identity directory.

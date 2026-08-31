@@ -2518,12 +2518,36 @@ async fn control_method_with_wrong_token_is_rejected() {
 // revoke immediately un-authorizes it.
 
 /// A control MUTATION probe (`control.config.setUpstream`) for the pairing test —
-/// reusable across the un-paired / paired / revoked assertions.
+/// reusable across the un-paired / revoked assertions.
+///
+/// This method is MASTER tier (`LOCALLY_MASTER_TIER_CONTROL_METHODS`, dig-node#255): the upstream
+/// it persists is the third party every unimplemented method is forwarded to, and `pairing.revoke`
+/// does not take it back. So it proves a token is REJECTED; it can never prove a PAIRED token is
+/// live — use [`paired_tier_mutation`] for that.
 async fn setupstream_mutation(addr: &SocketAddr, token: Option<&str>) -> Value {
     post_rpc(
         addr,
         json!({ "jsonrpc": "2.0", "id": 1, "method": "control.config.setUpstream",
                 "params": { "upstream": "https://paired.example" } }),
+        token,
+    )
+    .await
+}
+
+/// A control MUTATION probe on the ORDINARY tier (`control.cache.setCap`), for asserting that a
+/// PAIRED token is genuinely live.
+///
+/// `cache.setCap` is the method dig-app already drives with a paired token, and
+/// [`requires_master_token`]'s stated rule places it on the ordinary tier deliberately: it moves a
+/// local resource budget, names no principal, and confers no authority that survives the token.
+/// It therefore mutates for a paired token and is refused without one — exactly the discrimination
+/// a liveness precondition needs. `cap_bytes` is echoed from the request, so the assertion reads
+/// the call's own answer rather than process-global cache state a sibling test also writes.
+async fn paired_tier_mutation(addr: &SocketAddr, token: Option<&str>) -> Value {
+    post_rpc(
+        addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.cache.setCap",
+                "params": { "cap_bytes": 128 * 1024 * 1024u64 } }),
         token,
     )
     .await
@@ -2545,9 +2569,15 @@ async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
     let (upstream, _calls) = start_mock_upstream().await;
     let (addr, master, _hold) = start_companion_full(&upstream).await;
 
-    // A control MUTATION with no token is rejected (the extension can't read the file).
+    // A control MUTATION with no token is rejected (the extension can't read the file) — on the
+    // ordinary tier too, so the rejection is about the missing token and not about the tier.
     let denied = setupstream_mutation(&addr, None).await;
     assert_eq!(denied["error"]["data"]["code"], json!("UNAUTHORIZED"));
+    let denied_ordinary = paired_tier_mutation(&addr, None).await;
+    assert_eq!(
+        denied_ordinary["error"]["data"]["code"],
+        json!("UNAUTHORIZED")
+    );
 
     // 1. OPEN pairing.request → a pairing_id + a compare-codes value.
     let req = post_rpc(
@@ -2583,9 +2613,9 @@ async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
     let scoped = approved["result"]["token"].as_str().unwrap().to_string();
     assert_eq!(scoped.len(), 64);
 
-    // 5. The scoped token AUTHORIZES a control mutation.
-    let ok = setupstream_mutation(&addr, Some(&scoped)).await;
-    assert_eq!(ok["result"]["upstream"], json!("https://paired.example"));
+    // 5. The scoped token AUTHORIZES an ordinary-tier control mutation.
+    let ok = paired_tier_mutation(&addr, Some(&scoped)).await;
+    assert_eq!(ok["result"]["cap_bytes"], json!(128 * 1024 * 1024u64));
 
     // 6. But the scoped token CANNOT administer pairings (master-only).
     let admin = post_rpc(
@@ -2606,7 +2636,7 @@ async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
     .await;
     assert_eq!(revoke["result"]["revoked"], json!(true));
 
-    let after_revoke = setupstream_mutation(&addr, Some(&scoped)).await;
+    let after_revoke = paired_tier_mutation(&addr, Some(&scoped)).await;
     assert_eq!(after_revoke["error"]["data"]["code"], json!("UNAUTHORIZED"));
 }
 
@@ -2650,11 +2680,11 @@ async fn a_paired_token_cannot_grant_itself_a_trusted_chia_peer() {
         .unwrap()
         .to_string();
 
-    // The scoped token is genuinely live: it drives an ordinary control mutation.
-    let live = setupstream_mutation(&addr, Some(&scoped)).await;
+    // The scoped token is genuinely live: it drives an ordinary-tier control mutation.
+    let live = paired_tier_mutation(&addr, Some(&scoped)).await;
     assert_eq!(
-        live["result"]["upstream"],
-        json!("https://paired.example"),
+        live["result"]["cap_bytes"],
+        json!(128 * 1024 * 1024u64),
         "the token must be VALID, or the refusals below prove nothing"
     );
 

@@ -4463,9 +4463,10 @@ impl Node {
                     // NOTE: this copies the seed out of its `Zeroizing` wrapper, because
                     // `Node::identity_seed` is a plain `Option<[u8; 32]>` that seam 7's
                     // `KeyManager::identity_seed_for_peer` returns by value. Narrowing that type
-                    // is a seam-wide change, tracked separately -- it is not made cheaper by
-                    // doing it here, and doing it here would widen this diff across the peer
-                    // seam. The copy lives as long as the node does either way.
+                    // is a seam-wide change, tracked at
+                    // https://github.com/DIG-Network/dig-node/issues/345 -- it is not made
+                    // cheaper by doing it here, and doing it here would widen this diff across
+                    // the peer seam. The copy lives as long as the node does either way.
                     Some(*seed)
                 }
                 Err(e) => {

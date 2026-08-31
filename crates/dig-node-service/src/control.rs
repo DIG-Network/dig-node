@@ -367,6 +367,52 @@ pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] =
 /// the latter widened silently: a newly served-but-unpublished method inherited the exemption the
 /// moment it was added to [`CONTROL_METHODS`], and no lockstep test could see it (a method the
 /// contract does not know is absent from both sides of every comparison they make).
+/// Capabilities dig-node enforces at MASTER tier AHEAD of the published contract (dig-node#255).
+///
+/// # Why an overlay exists at all, given #254 removed the last one
+///
+/// The tier of a capability belongs in `dig-node-control-interface`, and restating it here as a
+/// string match is the byte-drift bug that produced this whole family. This list is therefore NOT
+/// a second opinion about tiers — it is a strictly-stricter, self-retiring bridge for a capability
+/// the contract has not classified yet, and
+/// [`locally_master_tier_methods_are_still_unclassified_by_the_contract`] FAILS the moment the
+/// contract adopts one, so it cannot quietly outlive its reason.
+///
+/// # The one member, and the rule that puts it here
+///
+/// The contract's rule is *"master tier means the effect outlives the token that invoked it"*.
+/// `control.config.setUpstream` persists a CALLER-CHOSEN URL that `Config::from_env` reads on the
+/// next start as the RPC passthrough target, and `pairing.revoke` — the designated remedy for a
+/// compromised paired app — does not touch it. So the escalation delegates and is not revocable:
+/// after the call the attacker no longer needs the token.
+///
+/// The reach is wider than `chiaPeers.add`, which is already master tier for the same shape. The
+/// upstream is where every method this node does NOT implement is forwarded, and dig-node ships
+/// with it EMPTY precisely so an unimplemented method answers a truthful local `-32601` rather
+/// than something a third party made up. Pointing it at an attacker-controlled URL makes that
+/// whole surface answerable by the attacker.
+///
+/// # What is NOT here, judged rather than left unexamined (#255 item 2)
+///
+/// `control.cache.setCap` and `control.log.setLevel` also persist, and they also survive a
+/// revocation — so "outlives the token" alone would sweep them in. It is not the whole rule. The
+/// discriminating question is whether the surviving effect confers AUTHORITY: whether it installs
+/// a principal the node will thereafter believe, obey, or speak to.
+///
+/// - `chiaPeers.add` installs a peer believed WITHOUT corroboration — a principal. Master.
+/// - `config.setUpstream` installs a third party every unimplemented method is forwarded to — a
+///   principal. Master.
+/// - `cache.setCap` moves a local resource budget. It names nobody, is plainly visible on
+///   `control.cache.get`, and is reset through the same ordinary-tier door it was set through.
+///   Ordinary. (Promoting it would also break the cache-size control dig-app drives with a paired
+///   token, which is a real cost for no authority gained.)
+/// - `log.setLevel` changes local verbosity in a restricted-ACL log dir. It names nobody and
+///   confers nothing. Ordinary.
+///
+/// Stating the refinement as a rule — *outlives the token AND confers authority on a principal* —
+/// is what lets the NEXT method be judged instead of matched against these four by analogy.
+pub const LOCALLY_MASTER_TIER_CONTROL_METHODS: &[&str] = &["control.config.setUpstream"];
+
 pub fn requires_master_token(method: &str) -> bool {
     requires_master_token_given(method, KNOWN_UNPUBLISHED_CONTROL_METHODS)
 }
@@ -379,6 +425,13 @@ pub fn requires_master_token(method: &str) -> bool {
 /// this rule from the one it replaces, because both answer "master" there. Injecting the list is
 /// what makes the difference observable.
 fn requires_master_token_given(method: &str, exempt: &[&str]) -> bool {
+    // The overlay is applied FIRST and only ever widens the master set, so this predicate can
+    // never be looser than the contract's — a contract that later promotes the same method
+    // changes nothing here, and one that never does still cannot leave the capability reachable
+    // by a paired token.
+    if LOCALLY_MASTER_TIER_CONTROL_METHODS.contains(&method) {
+        return true;
+    }
     match ControlMethod::from_name(method) {
         Some(published) => published.requires_master_token(),
         None => !exempt.contains(&method),
@@ -1109,6 +1162,17 @@ fn config_set_upstream(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         );
     }
     let normalized = crate::config::normalize_upstream(upstream);
+    // An EMPTY normalized value is the documented "restore the default" request and is the one
+    // value that must not be validated as a URL.
+    if !normalized.is_empty() {
+        if let Err(why) = crate::config::validate_upstream(&normalized) {
+            return control_error(
+                id,
+                ErrorCode::InvalidParams,
+                format!("control.config.setUpstream: {why}"),
+            );
+        }
+    }
     match set_upstream_override(&ctx.config_path, &normalized) {
         Ok(()) => control_ok(
             id,
@@ -5489,6 +5553,10 @@ mod tests {
             "control.pairing.revoke",
             "control.chiaPeers.add",
             "control.chiaPeers.remove",
+            // Master tier HERE ahead of the contract (dig-node#255): it persists a caller-chosen
+            // third party the node forwards every unimplemented method to, and it survives
+            // `pairing.revoke`. See LOCALLY_MASTER_TIER_CONTROL_METHODS.
+            "control.config.setUpstream",
         ]
         .into_iter()
         .collect();
@@ -5505,9 +5573,18 @@ mod tests {
             .map(|m| m.name())
             .filter(|n| CONTROL_METHODS.contains(n))
             .collect();
+        let overlay: BTreeSet<&str> = LOCALLY_MASTER_TIER_CONTROL_METHODS
+            .iter()
+            .copied()
+            .collect();
         assert_eq!(
-            actual, contract,
-            "this node's master tier disagrees with dig-node-control-interface"
+            actual,
+            contract.union(&overlay).copied().collect::<BTreeSet<_>>(),
+            "this node's master tier disagrees with dig-node-control-interface plus the declared              local overlay"
+        );
+        assert!(
+            contract.is_subset(&actual),
+            "the overlay may only WIDEN the contract's master set, never narrow it"
         );
     }
 
@@ -5801,6 +5878,78 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    /// **Proves (dig-node#255):** a PAIRED token cannot reach `control.config.setUpstream`, while
+    /// the ordinary-tier methods it legitimately drives stay reachable.
+    ///
+    /// The escalation this closes delegates and is NOT revocable: the value persists into
+    /// `config.json`, `Config::from_env` reads it on the next start as the RPC passthrough target,
+    /// and `pairing.revoke` — the operator's designated remedy — does not touch it. So the
+    /// attacker stops needing the token the moment the call returns.
+    ///
+    /// The ordinary-tier half is the control. Without it, an implementation that answered "master"
+    /// for EVERY `control.*` method would pass the first assertion while breaking every paired
+    /// client, and the test could not tell the two apart.
+    #[test]
+    fn a_paired_token_cannot_set_the_rpc_upstream_but_still_drives_ordinary_config() {
+        assert!(
+            requires_master_token("control.config.setUpstream"),
+            "setUpstream persists a caller-chosen third party the node forwards to, and survives \
+             pairing.revoke"
+        );
+
+        for ordinary in [
+            "control.config.get",
+            "control.cache.setCap",
+            "control.log.setLevel",
+            "control.cache.get",
+            "control.status",
+        ] {
+            assert!(
+                !requires_master_token(ordinary),
+                "{ordinary} confers no authority over a principal and must stay paired-reachable"
+            );
+        }
+    }
+
+    /// **Proves:** the local master-tier overlay is a BRIDGE, not a second opinion — every member
+    /// is a capability the published contract has not classified yet.
+    ///
+    /// This is what makes the overlay self-retiring. When `dig-node-control-interface` promotes
+    /// `control.config.setUpstream`, this test fails and the entry must be deleted, so the repo
+    /// cannot end up with two disagreeing statements of the same tier — which is the byte-drift
+    /// bug that produced this whole family (#254 item 1).
+    #[test]
+    fn locally_master_tier_methods_are_still_unclassified_by_the_contract() {
+        for method in LOCALLY_MASTER_TIER_CONTROL_METHODS {
+            let published = ControlMethod::from_name(method)
+                .unwrap_or_else(|| panic!("{method} must be a published control method"));
+            assert!(
+                !published.requires_master_token(),
+                "the contract now puts {method} on the master tier; DELETE it from \
+                 LOCALLY_MASTER_TIER_CONTROL_METHODS so there is one rule rather than two"
+            );
+        }
+    }
+
+    /// **Proves:** the overlay can only WIDEN the master set — it never demotes a capability the
+    /// contract already protects.
+    ///
+    /// Asserted over the whole published method list rather than over the overlay, because the
+    /// failure being excluded is one the overlay's own contents cannot exhibit.
+    #[test]
+    fn the_overlay_never_demotes_a_contract_master_method() {
+        for method in CONTROL_METHODS {
+            if let Some(published) = ControlMethod::from_name(method) {
+                if published.requires_master_token() {
+                    assert!(
+                        requires_master_token(method),
+                        "{method} is master tier in the contract and must remain so here"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn load_or_create_token_persists_and_is_stable() {
         let dir = std::env::temp_dir().join(format!(
@@ -5817,12 +5966,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// SECURITY (#501 residual): a pre-existing control-token file that is NOT owned by a
-    /// trusted principal (here forced group/other-readable, so not owner-only) MUST be DELETED
-    /// and REGENERATED — never returned — so a planted/squatted token can never become the
-    /// trusted one (which would hand an attacker full local node control). Unix-gated: it
-    /// relies on mode bits (CI runs on Linux). Skipped when running as root, where a
-    /// root-owned file is legitimately trusted regardless of mode.
+    /// SECURITY (#501 residual, dig-node#355): a pre-existing control-token file that is NOT
+    /// owned by a trusted principal MUST be DELETED and REGENERATED — never returned — so a
+    /// planted/squatted token can never become the trusted one (which would hand an attacker
+    /// full local node control).
+    ///
+    /// # Why this test has two branches instead of one branch and a hole
+    ///
+    /// It used to put EVERY assertion inside `if !running_as_root`, so under root it built the
+    /// fixture, called the function, checked nothing, and printed `ok`. CI containers commonly
+    /// run as root, so the one test standing between a planted token and full local node control
+    /// had plausibly never executed an assertion.
+    ///
+    /// Under root the MODE is genuinely not the discriminator — `unix_token_owner_is_trusted`
+    /// trusts any root-owned file, whatever its bits — but OWNERSHIP still is. So the root branch
+    /// chowns a second fixture to a foreign uid (which only root can do) and asserts THAT one is
+    /// regenerated. Both branches therefore exercise the guard, and deleting the guard fails this
+    /// test whichever uid runs it.
     #[cfg(unix)]
     #[test]
     fn foreign_owned_token_file_is_regenerated_not_trusted() {
@@ -5843,7 +6003,44 @@ mod tests {
             .map(|m| m.uid() == 0)
             .unwrap_or(false);
         let got = load_or_create_token_at(&path).unwrap();
-        if !running_as_root {
+
+        if running_as_root {
+            // The carve-out, stated as an assertion rather than as a skip: a root-owned file is
+            // written by a trusted principal, so it is kept as-is even at 0644.
+            assert_eq!(
+                got, planted,
+                "a root-owned token is trusted regardless of mode; it must not be regenerated"
+            );
+
+            // The real second case. Only root can hand a file to another uid, which is exactly
+            // the planting an unprivileged attacker would have to achieve — and it is what the
+            // guard exists to refuse.
+            let foreign = dir.join("foreign").join(CONTROL_TOKEN_FILE);
+            std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+            std::fs::write(&foreign, &planted).unwrap();
+            std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o600)).unwrap();
+            const FOREIGN_UID: u32 = 65534; // `nobody` on every mainstream distro
+            std::os::unix::fs::chown(&foreign, Some(FOREIGN_UID), None).expect(
+                "root must be able to chown the fixture; without it this branch proves nothing",
+            );
+            assert_eq!(
+                std::fs::metadata(&foreign).unwrap().uid(),
+                FOREIGN_UID,
+                "the fixture must actually be foreign-owned before the assertion below means anything"
+            );
+
+            let from_foreign = load_or_create_token_at(&foreign).unwrap();
+            assert_ne!(
+                from_foreign, planted,
+                "a foreign-uid token must be regenerated, not returned — deleting the trust check \
+                 makes this equal the planted value"
+            );
+            assert_eq!(
+                from_foreign.len(),
+                64,
+                "the regenerated token is a fresh 64-hex value"
+            );
+        } else {
             assert_ne!(
                 got, planted,
                 "an untrusted (group-readable) token must be regenerated, not returned"
@@ -5861,6 +6058,46 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The trust RULE itself, asserted independently of whichever uid the suite happens to run
+    /// as (dig-node#355).
+    ///
+    /// [`crate::state::unix_token_owner_is_trusted`] is pure, so it can be interrogated for the
+    /// foreign-owner case on a root runner and the root case on an unprivileged one. A
+    /// filesystem test can only ever see the cases its runner's privileges permit; this one sees
+    /// all of them, and it fails the moment the rule is relaxed.
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_token_trust_rule_refuses_a_foreign_owner_at_every_mode() {
+        use crate::state::unix_token_owner_is_trusted;
+
+        for mode in [0o600, 0o644, 0o666, 0o400] {
+            assert!(
+                !unix_token_owner_is_trusted(4242, mode, 1000),
+                "a token owned by uid 4242 must never be trusted by uid 1000 (mode {mode:o})"
+            );
+            assert!(
+                !unix_token_owner_is_trusted(4242, mode, 0),
+                "a foreign-owned token must not become trusted merely because WE are root \
+                 (mode {mode:o})"
+            );
+            assert!(
+                unix_token_owner_is_trusted(0, mode, 1000),
+                "a root-owned token is written by a trusted principal (mode {mode:o})"
+            );
+        }
+
+        assert!(
+            unix_token_owner_is_trusted(1000, 0o600, 1000),
+            "our own owner-only token is trusted"
+        );
+        for loose in [0o601, 0o640, 0o604, 0o660] {
+            assert!(
+                !unix_token_owner_is_trusted(1000, loose, 1000),
+                "our own token must be owner-only; {loose:o} lets another local user read it"
+            );
+        }
     }
 
     /// A trusted (owner-only `0600`, current-user-owned) pre-existing token is loaded AS-IS —
@@ -6075,7 +6312,15 @@ mod tests {
         std::fs::write(&path, "a".repeat(64)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let running_as_root = std::fs::read_to_string(&path).is_ok();
-        if !running_as_root {
+        if running_as_root {
+            // Root reads through mode `000`, so `PermissionDenied` is unreachable here. Assert
+            // the complementary observable instead of skipping (dig-node#355): the token is
+            // returned, and in particular the classifier does NOT invent the misleading
+            // `NotFound` for a file that is plainly present.
+            let got = read_token_readonly_at(&path)
+                .expect("root reads through mode 000; the reader must return the token");
+            assert_eq!(got, "a".repeat(64), "the token is returned verbatim");
+        } else {
             let err = read_token_readonly_at(&path).unwrap_err();
             assert_eq!(
                 err.kind(),

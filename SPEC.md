@@ -2230,6 +2230,23 @@ These methods are NEVER relayed upstream — a signing request must never leave 
 authorized call is served locally (or, until the wallet surface is served on a given transport, returns
 a catalogued error — it is never proxied to the public gateway).
 
+**The gate binds EVERY transport into the wallet handler set, and the binding MUST be structural
+(dig-node#257).** The tier is a property of the CAPABILITY, never of the transport a caller reached
+it through. The Sage-parity mTLS listener authenticates with a shared client certificate whose DER
+must equal the server's own; that authenticates the transport and MUST NOT be treated as
+authorizing a capability. A node MUST NOT serve any route into the wallet handler set without first
+obtaining an authorization decision for the requested method name — including for a method name the
+node does not implement, so a future method cannot arrive ungated.
+
+This MUST be enforced by construction rather than by a per-route check: the router is built with an
+authorization gate as a REQUIRED parameter, there is exactly one handler behind the method route,
+and the only gate the transport crate itself offers denies everything. A per-route test set cannot
+see a route nobody wrote a test for, which is how this listener came to serve custody, spends and
+master-tier peer mutations on certificate possession alone.
+
+A refused call MUST be answered `401` and MUST NOT reach the handler, so a refused spend has not
+been built or broadcast. The refusal MUST be distinguishable from "no such method".
+
 **Retired namespaces (`wallet.*`, `auth.*`) MUST be refused outright.** Node-side USER custody and its
 unlock-auth gate were removed by dig_ecosystem#1701, superseded by the #1500 ratification: the node holds
 no user spend key. No method exists under either prefix, and a node MUST classify the whole prefix as
@@ -6185,6 +6202,92 @@ this host cannot open, the node MUST NOT make a recovery promise: per dig-keysto
 §17.5b the envelope records a hardware *class* and carries no device identity, so the same error is
 returned for a blob copied off its machine (recoverable) and for the original machine with its
 trusted component wiped (permanent). The node MAY state that condition; it MUST NOT resolve it.
+### 18.25a. What sealing the seed does NOT cover: the derived peer key (dig-node#343)
+
+Sealing the seed (§18.25) protects the ability to **re-derive** the node's identity. It does NOT
+protect the **derived** material, and a surface MUST NOT imply that it does.
+
+`dig_tls::NodeCert::load_or_generate` persists the derived BLS/TLS leaf key **UNSEALED** at
+`<cache_dir>/peer-net/identity/node.key`, because the dig-gossip pool listener loads it from disk
+BY PATH (`dig_peer_protocol::load_ssl_cert`) and holds no key material of its own at that point.
+
+Since `peer_id = SHA-256(TLS SPKI DER)`, possession of that one file IS possession of the node's
+network identity for every purpose the network cares about — dialing as it, serving as it, and any
+authorization keyed on it — **without touching either half of the sealed pair**. The
+partial-exfiltration boundary §16.4 and §18.25 describe therefore holds for the SEED and does not
+extend to the key peers authenticate.
+
+- Any surface reporting the machine key's protection tier **MUST name this gap in the same
+  sentence**, so a reader cannot take a copy-resistance claim about the seed as a claim about the
+  node's network identity. The node satisfies this by appending a fixed caveat to every protection
+  summary, in one place, so a later tier cannot be added without it.
+- The node MUST NOT change `peer_id` in the course of closing this gap. A changed `peer_id`
+  silently orphans every peer holding the old one, which is a worse outcome than the exposure.
+- Sealing `node.key` is the preferred end state and MUST use the **same device key** as the seed.
+  A separate device key would make the derived key unrecoverable after a device-key loss without
+  also making the seed unrecoverable, and dig-keystore `SPEC.md` §17.5b establishes that
+  `HardwareUnwrapFailed` cannot distinguish a copied blob from a wiped device — so an
+  independently-sealed derived key turns a recoverable state into a bricked node identity.
+- Until then the gap is DOCUMENTED, not implied. An honest stated gap is correctable; an unstated
+  one is a shipped claim that is false about the artifact at risk.
+
+### 18.25b. Master tier is authority that outlives the token (dig-node#255)
+
+`dig-node-control-interface` states the rule as *"the effect outlives the token that invoked it"*.
+That is necessary and not sufficient, and a node MUST apply the refined rule: a capability is
+**master tier** when its effect both **outlives the token** AND **confers authority on a
+principal** — installs someone the node will thereafter believe, obey, or speak to.
+
+- `control.chiaPeers.add` / `.remove` — installs a peer believed WITHOUT corroboration. Master.
+- `control.config.setUpstream` — persists a caller-chosen third party that every method this node
+  does not implement is FORWARDED to, read on next start, and untouched by `pairing.revoke`.
+  Master. The node ships with no upstream precisely so an unimplemented method answers a truthful
+  local `-32601`; pointing it at an attacker-controlled URL makes that surface answerable by the
+  attacker, and the escalation delegates — after the call the caller no longer needs the token.
+- `control.cache.setCap`, `control.log.setLevel` — persist and survive revocation, but move a
+  local resource budget or local verbosity. They name no principal and confer no authority.
+  ORDINARY, deliberately: promoting them would break paired clients for nothing gained.
+
+A node MUST resolve the tier by CALLING the contract's predicate, never by restating it as a string
+match. Where the node enforces master tier AHEAD of the contract, the additional names MUST be a
+single declared list that only ever WIDENS the contract's set, and a test MUST fail once the
+contract adopts a name from it, so the two statements of one rule cannot drift.
+
+**A persisted upstream MUST be a well-formed `http(s)` URL.** The node MUST reject a value with no
+scheme it speaks, an empty host, whitespace in the host, or userinfo (`user@host` reads as one host
+and resolves to another). Cleartext `http://` MUST be confined to loopback.
+
+### 18.25c. Attacker-supplied text in an operator prompt (dig-node#346)
+
+`pairing.request` is OPEN and unauthenticated, and the `client_name` it carries is composed into
+the sentence an operator reads before granting a control token. It is therefore an input to a
+privileged decision and MUST be treated as hostile.
+
+- **The node MUST NOT silently truncate it.** An unmarked truncation is a forgery the node
+  performs: padding with budget-consuming characters that render as nothing makes the node itself
+  produce a short, trusted-looking name. The node MUST either REFUSE an over-long value at ingest —
+  which is what `pairing.request` does — or mark the clip **IN-BAND**, as part of the rendered
+  string, never as a separate flag a caller can drop.
+- **The display budget MUST be charged on RENDERED WIDTH**, and Unicode `Cf` format characters,
+  zero-width characters and bidi overrides MUST be neutralised — not merely `is_control()`. A
+  neutralised character MUST render VISIBLY; deleting it lets an attacker choose what the operator
+  sees just as effectively as inserting one.
+- **Only the RENDERING is neutralised.** The stored `client_name` MUST stay byte-verbatim, because
+  a value that is ever compared or used as an identity must not be quietly rewritten.
+- **The value MUST NOT be able to add a line to the prompt**, which is line-oriented, and its slot
+  MUST be quoted such that an embedded quote cannot terminate it and let the remainder read as the
+  node's own words.
+
+### 18.25d. A privilege-gated test MUST assert in every privilege branch (dig-node#355)
+
+A security test that skips its assertions under `root` reports `ok` while proving nothing, and CI
+containers commonly run as root — so the guard may never have executed. A silently-skipping test is
+worse than a missing one, because it is counted as coverage.
+
+Where a discriminator (a Unix mode bit) is genuinely not meaningful under `root`, the test MUST
+assert the COMPLEMENTARY observable that still is — ownership, which only `root` can manipulate —
+rather than skipping. Every branch must be able to fail.
+
 ## 18.26. Coin reservations — the two phases, and who owns the truth (dig_ecosystem#3127)
 
 A **coin reservation** records that a coin is already committed to a spend that has not settled, so a
