@@ -776,7 +776,6 @@ pub fn cache_budget() -> CacheBudget {
     }
 }
 
-
 /// Persist the cache size cap (bytes) to config.json (the DIG settings page).
 /// Read-modify-write under the cross-process lock so a concurrent writer (e.g.
 /// dig-companion setting `wc_project_id`) can't lose this update or vice-versa.
