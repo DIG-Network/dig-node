@@ -2749,6 +2749,32 @@ fn spawn_mirror_passes(
         let journal = lifecycle::journal();
         let mut presence = crate::mirror::presence::PresenceTracker::new();
 
+        // The disk-event accelerant (dig-node#465). Strictly a hint about WHEN to run the next
+        // pass: `wait_for_next_pass` never lets an event push the round deadline out, and a `None`
+        // here is a node that waits on the timer alone and converges identically, one round later.
+        let capsule_cache = crate::mirror::events::capsule_cache_dir(node.cache_dir_path());
+        // The watcher can only attach to a directory that exists, and a node that has never cached
+        // anything has not created it yet. Creating it is harmless: the inventory scan already
+        // treats an empty cache and a missing one the same way.
+        let _ = std::fs::create_dir_all(&capsule_cache);
+        let disk_events = crate::mirror::events::watch_capsule_cache(&capsule_cache);
+        if disk_events.is_some() {
+            tracing::info!(
+                target: "mirror",
+                dir = %capsule_cache.display(),
+                "watching the capsule cache, so a capsule landing is reconciled in seconds rather \
+                 than at the next round; the round timer remains the backstop"
+            );
+        } else {
+            tracing::info!(
+                target: "mirror",
+                dir = %capsule_cache.display(),
+                "the capsule cache could not be watched, so the round timer is the only trigger; \
+                 this costs latency and changes nothing the node concludes"
+            );
+        }
+        let mut wake = crate::mirror::events::WakeCoalescer::new();
+
         loop {
             let epoch = match current_epoch_now() {
                 CurrentEpoch::Final(epoch) => epoch as i64,
@@ -2852,9 +2878,65 @@ fn spawn_mirror_passes(
                 ),
             }
 
-            tokio::time::sleep(MIRROR_PASS_INTERVAL).await;
+            wait_for_next_pass(disk_events.as_ref(), &mut wake).await;
         }
     });
+}
+
+/// Wait until the next mirror pass should run: the round deadline, or sooner on a disk event.
+///
+/// # The deadline is a CEILING that events can only lower
+///
+/// `MIRROR_PASS_INTERVAL` from the moment this is entered is computed once, up front, and every
+/// return happens at or before it. An event cannot postpone a pass, and neither can a flood of them:
+/// the loop below only ever chooses an EARLIER instant to wake at. That is what makes the timer a
+/// backstop rather than a fallback — it fires on its own schedule whether or not any event ever
+/// arrives, and this function is why silencing the watcher changes latency and nothing else.
+///
+/// # Passes still cannot overlap
+///
+/// The caller is one sequential task: it runs a pass, then awaits this. Waking early moves the next
+/// pass forward; it does not start a second one. A pass that wedges therefore blocks its own
+/// successor and nothing else, and the events that arrive meanwhile collapse into the single owed
+/// wake [`crate::mirror::events::WakeCoalescer`] holds — never a queue that drains as a burst of
+/// passes once the wedge clears.
+async fn wait_for_next_pass(
+    events: Option<&crate::mirror::events::DiskEvents>,
+    wake: &mut crate::mirror::events::WakeCoalescer,
+) {
+    let deadline = tokio::time::Instant::now() + MIRROR_PASS_INTERVAL;
+
+    // No watcher: the behaviour that shipped before events existed, unchanged.
+    let Some(events) = events else {
+        tokio::time::sleep_until(deadline).await;
+        return;
+    };
+
+    loop {
+        let now_ms = crate::mirror::lifecycle::now_unix_ms();
+        if wake.take_due(now_ms) {
+            return;
+        }
+
+        // Wake at whichever comes first: the owed event wake, or the round deadline.
+        let next = match wake.due_at_ms() {
+            Some(due) => (tokio::time::Instant::now()
+                + std::time::Duration::from_millis(due.saturating_sub(now_ms)))
+            .min(deadline),
+            None => deadline,
+        };
+
+        tokio::select! {
+            _ = tokio::time::sleep_until(next) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                // Otherwise an event wake has come due; the next turn of the loop takes it.
+            }
+            // Cancel-safe, so an event arriving mid-sleep is never lost to the select.
+            _ = events.changed() => wake.record_event(crate::mirror::lifecycle::now_unix_ms()),
+        }
+    }
 }
 
 /// Report what one mirror pass did, to whoever is reading the node's log.

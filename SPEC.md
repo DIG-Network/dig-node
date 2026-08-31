@@ -8448,7 +8448,9 @@ coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile acc
 > not.** The stability-across-a-window rule, in both directions, is satisfied by the pure tracker in
 > `mirror/presence.rs` and its `SETTLING_WINDOW_MS`, and `mirror::runner::PassRunner` debounces the
 > advertisable half of every observation through it. **Nothing feeds THAT**: there is no periodic
-> scan, no start-up scan and no watcher, because `MirrorEffects::observe_disk` has no implementation
+> scan, no start-up scan, because `MirrorEffects::observe_disk` has no implementation. The WATCHER half is
+> no longer pending: `mirror/events.rs` watches the capsule cache and accelerates the pass, bounded
+> by the four rules below
 > — so the scanning cadence described below, the un-debounced start-up exemption, and the claim that
 > the periodic pass is the correctness mechanism are all still pending, tracked as
 > <https://github.com/DIG-Network/dig-node/issues/412>.
@@ -8456,6 +8458,27 @@ coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile acc
 Presence changes are detected by SCANNING, with an optional watcher as an accelerator — never the
 reverse. A watcher event is exactly what a crash, an unmounted volume, or an uncovered path loses;
 the periodic pass (§25.4) is the correctness mechanism.
+
+The watcher is implemented (`mirror/events.rs`). It watches the capsule cache directory and MUST
+obey all four of the following; a node whose watcher cannot be established, or whose events are all
+dropped, MUST still converge on the round timer alone.
+
+1. **An event MAY only lower the instant of the next pass, never raise it.** The round deadline is
+   computed on entry to the wait and every return happens at or before it, so the timer is a
+   backstop rather than a fallback. The round length MUST NOT be lengthened to compensate for having
+   events.
+2. **Events are COALESCED, never queued.** The pending state is one instant, so N events in a window
+   — including events arriving while a pass is running or wedged — owe exactly ONE wake.
+3. **An observing wake fires after `QUIET_PERIOD_MS` (5_000) of quiet**, and schedules exactly one
+   **settling** wake `SETTLING_WINDOW_MS` later. That second wake MUST NOT re-arm, so a burst of any
+   size causes at most two passes.
+4. **No two event-driven passes are closer than `SETTLING_WINDOW_MS`.** A pass cannot act on a change
+   the tracker has not yet seen hold for a window, so anything closer is amplification on a path that
+   spends money.
+
+**Chain events do NOT trigger a pass.** A create is decided from disk presence, a new peak arrives
+roughly every 18.75 seconds, and the epoch rollover a reclaim waits on is wall-clock rather than a
+chain event. Chain is observed inside the pass, on the round timer.
 
 The debounce is **presence-stable-for-a-window**, not a timer after an event: a bond must be
 observed in the SAME state across `SETTLING_WINDOW_MS` (default 30_000) before that state is acted
