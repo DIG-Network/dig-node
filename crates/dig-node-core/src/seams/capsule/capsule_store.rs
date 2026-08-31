@@ -386,18 +386,64 @@ impl Node {
     ///
     /// The caller MUST hold `cache_lock` so a concurrent pull-land of the same capsule cannot race the
     /// write (matching `cache_fetch_and_cache`, which lands under the same lock).
+    ///
+    /// # `claim` is required, and that is the point (dig-node#436)
+    ///
+    /// Provenance is not carried in a capsule's bytes — they are content-addressed and identical
+    /// whether this node pulled them for itself or for a stranger — so it lives in a `<root>.relay`
+    /// sidecar that the inventory scan reads. Its ABSENCE means `Held`, and `Held` is the bondable
+    /// state a mirror coin is minted against. A land route that simply forgot to write the marker
+    /// therefore failed OPEN, spending the operator's $DIG on a stranger's content.
+    ///
+    /// Naming the claim is a required ARGUMENT rather than a step a caller performs afterwards, so a
+    /// future land route cannot inherit `Held` by omission: there is no signature to call incorrectly.
+    /// The same reasoning that made [`crate::CapsuleProvenance`] an enum with no `Default`, extended
+    /// to the filesystem that was quietly supplying one.
     pub(crate) async fn land_capsule_bytes(
         &self,
         key: &crate::CapsuleKey,
         bytes: &[u8],
+        claim: crate::seams::dig_peer::HolderClaim,
     ) -> Result<(u64, bool), String> {
         let path = key.module_path(&self.cache_dir);
         if let Ok(md) = std::fs::metadata(&path) {
-            // Already a holder — do not re-write, do not re-announce (no double-announce).
+            // Already a holder — do not re-write, do not re-announce (no double-announce). The claim
+            // already recorded beside it stands: a re-push cannot silently PROMOTE a relayed capsule
+            // into a bondable one, which is the same fail-closed direction the rest of this path takes.
+            //
+            // DELIBERATE, and it has a cost worth naming: a genuinely LOCAL re-push of a capsule this
+            // node previously relayed stays `Relayed` until the capsule is evicted, so the operator
+            // forgoes a bond they were entitled to. That is the direction to err in — it costs a bond
+            // that could have been had, never a bond staked on a stranger's content. Changing it is a
+            // decision that gets a ticket, not a quiet relaxation of this early return.
             return Ok((md.len(), false));
         }
-        crate::write_atomic(&path, bytes)
-            .map_err(|e| format!("could not write the capsule: {e}"))?;
+        // PROVENANCE FIRST, and it is not optional (dig-node#436). The `<root>.relay` sidecar decides
+        // whether this node later announces the capsule and stakes the operator's $DIG on it, and it
+        // is recorded BEFORE the bytes become visible — so there is no window in which a capsule is
+        // discoverable while its provenance is still unwritten. A marker that cannot be written fails
+        // the land outright rather than landing unmarked, because unmarked reads as `Held`, and `Held`
+        // is the bondable state: a silent failure here spends money.
+        // The store directory must exist before the marker can be written into it. `write_atomic`
+        // creates it for the capsule, but the marker is deliberately written FIRST, so it has to
+        // create it too — otherwise a first-ever capsule for a store fails its land on a missing
+        // directory. (It failed exactly that way when this guard was introduced, which is the correct
+        // direction: refusing to land beats landing unmarked, because unmarked is bondable.)
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create the capsule's store directory: {e}"))?;
+        }
+        crate::seams::dig_peer::persist_holder_claim(&path, claim)
+            .map_err(|_| "could not record the capsule's provenance".to_string())?;
+        crate::write_atomic(&path, bytes).map_err(|e| {
+            // The land failed, so the marker must not outlive it and mis-describe a later capsule that
+            // arrives at the same path by a different route.
+            let _ = crate::seams::dig_peer::persist_holder_claim(
+                &path,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            );
+            format!("could not write the capsule: {e}")
+        })?;
         self.announce_and_bound_after_land(key.identity()).await;
         Ok((bytes.len() as u64, true))
     }

@@ -342,7 +342,7 @@ fn promote_into_cache(
 /// A marker that cannot be written is a hard [`WarmFailure::CacheWriteFailed`], never a warning: a
 /// relayed capsule promoted without its marker is exactly the advertised-stranger-content state this
 /// mechanism exists to prevent, so the promotion is abandoned instead.
-fn persist_holder_claim(cached: &Path, claim: HolderClaim) -> Result<(), WarmFailure> {
+pub(crate) fn persist_holder_claim(cached: &Path, claim: HolderClaim) -> Result<(), WarmFailure> {
     let Some(marker) = crate::capsule_key::relay_marker_beside(cached) else {
         return Err(WarmFailure::CacheWriteFailed);
     };

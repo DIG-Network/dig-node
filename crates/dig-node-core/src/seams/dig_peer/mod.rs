@@ -60,7 +60,8 @@ pub(crate) use forwarded_ask::{
 };
 pub(crate) use holder_cache::{AskId, AskSeenSet, FirstHandHolderCache};
 pub use module_anchor::ChainAnchoredModuleVerifier;
-pub(crate) use module_reshare::DEFAULT_MAX_CONCURRENT_WARMS;
+pub use module_reshare::HolderClaim;
+pub(crate) use module_reshare::{persist_holder_claim, DEFAULT_MAX_CONCURRENT_WARMS};
 pub use module_reshare::{
     spawn_capsule_warm, AnnounceHolder, CapsuleWarmer, WarmFailure, WarmOutcome, WarmPaths,
     WarmRegistry,
