@@ -459,6 +459,72 @@ mod tests {
         }
     }
 
+    /// **Proves:** a partially funded pass reports the money that must actually be ADDED, not the
+    /// whole cost of the creates it could not make.
+    ///
+    /// **Catches:** the two plausible wrong figures, each of which is a false money statement to an
+    /// operator (dig-node#469):
+    ///
+    /// * quoting the WALLET BALANCE as what is available — money that has already been spent on the
+    ///   affordable creates, so the deficit reads as smaller than it is and an operator who adds
+    ///   that much is still short;
+    /// * quoting zero as available — the deficit then reads as the full cost of every unmade create,
+    ///   sending them to buy $DIG they already hold.
+    ///
+    /// # The fixture is chosen so the three candidate figures all DIFFER
+    ///
+    /// Three bonds at 1,000 each against a balance of 2,400: two are affordable, one is not, and
+    /// 400 is left over. So the honest answer is *400 towards the 1,000 still needed*. A balance of
+    /// 2,000 or 3,000 would make the remainder zero and let a wrong implementation agree by
+    /// accident; the deliberate 400 is what separates them.
+    #[test]
+    fn a_partially_funded_pass_reports_the_leftover_against_what_is_still_needed() {
+        let held = [bond("aa", "11"), bond("bb", "22"), bond("cc", "33")];
+        let requirement = known();
+        let mut inputs = inputs(&held, &[], &requirement);
+        inputs.dig_balance_base_units = Some(REQUIRED * 2 + 400);
+
+        let decision = decide(&inputs);
+
+        assert_eq!(
+            decision.create.len(),
+            2,
+            "the fixture must genuinely fund some and not others, or it tests nothing"
+        );
+        assert_eq!(
+            decision.funding_shortfall,
+            Some(FundingShortfall {
+                have_dig_base_units: 400,
+                need_dig_base_units: REQUIRED,
+            }),
+            concat!(
+                "the leftover $DIG and the cost of the unmade create are what an operator needs; ",
+                "quoting the whole balance understates the deficit and quoting zero overstates it"
+            )
+        );
+    }
+
+    /// **Proves:** a pass that funded everything it planned reports NO shortfall.
+    ///
+    /// The other half of the pair above, and the reason it is a separate test: without it, an
+    /// implementation that reports a shortfall on every pass satisfies the partial case and turns
+    /// the funding alert into the per-pass stream `FundingAlertGate` exists to prevent. A node with
+    /// nothing new to bond is the ordinary state and must be silent.
+    #[test]
+    fn a_pass_that_afforded_everything_reports_no_shortfall() {
+        let held = [bond("aa", "11")];
+        let requirement = known();
+        let inputs = inputs(&held, &[], &requirement);
+
+        let decision = decide(&inputs);
+
+        assert_eq!(decision.create.len(), 1, "the create is affordable");
+        assert_eq!(
+            decision.funding_shortfall, None,
+            "a funded pass must not report a shortfall, or every pass alerts"
+        );
+    }
+
     #[test]
     fn a_held_capsule_on_a_funded_node_is_created_at_the_margined_requirement() {
         let held = [bond("aa", "11")];
