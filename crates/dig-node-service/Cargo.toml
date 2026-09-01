@@ -250,6 +250,12 @@ dig-urn-resolver = "0.5.3"
 # line (dig_ecosystem#3161) — so the two node crates can never disagree about a canonical value.
 dig-constants = "0.13.0"
 
+# Filesystem notification, for the §25 mirror pass's disk-event accelerant (dig-node#465). The
+# watcher is strictly an ACCELERANT: the round timer and the start-up reconcile remain the
+# correctness path, and `watch_capsule_cache` returns `None` rather than erroring when no watcher
+# can be established, so a platform this crate cannot watch simply keeps the timer.
+notify = "8"
+
 # Windows Service Control Protocol. service-manager only REGISTERS the service in the
 # SCM; the binary the SCM launches must itself speak the service protocol
 # (StartServiceCtrlDispatcher → report RUNNING/STOPPED) or the SCM kills it with error
