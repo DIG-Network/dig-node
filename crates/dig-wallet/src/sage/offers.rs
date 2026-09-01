@@ -409,24 +409,30 @@ fn cat_offer_asset(asset_id: Bytes32, amount: u64) -> OfferAsset {
 }
 
 /// Greedily select XCH coins (largest first) covering `need`.
+///
+/// The ordering, the tiebreak and the refusal are
+/// [`super::selection::select_largest_first`]'s — the same ones the wallet's row selector, the CAT
+/// leg selector and the mirror lifecycle's operator-scoped selector already use (dig-node#428).
+///
+/// It was the LAST of the four to still carry its own loop, and the divergence had become
+/// asymmetric rather than merely duplicated: this one accumulated with a bare `+=`, where the other
+/// three saturate. On a coin set summing past `u64::MAX` that panics in a debug build and wraps in a
+/// release one, and a wrapped total is read back as a shortfall — so the shipped failure was a
+/// spurious "insufficient XCH" on a set that could in fact pay, rather than the false success the
+/// ticket anticipated. Safe direction, wrong answer, and a debug-build panic on a money path.
+///
+/// The tiebreak was CONFIRMED identical before deleting, not assumed: this sorted
+/// `b.amount.cmp(&a.amount).then(a.coin_id().cmp(&b.coin_id()))`, which is exactly the canonical
+/// key `(amount, coin_id)` — descending amount, ascending coin id. The refusal message is kept
+/// verbatim, so an operator's log line does not change spelling under a refactor.
 fn select_xch(coins: &[Coin], need: u64) -> Result<Vec<Coin>> {
-    let mut sorted: Vec<Coin> = coins.to_vec();
-    sorted.sort_by(|a, b| b.amount.cmp(&a.amount).then(a.coin_id().cmp(&b.coin_id())));
-    let mut sum = 0u64;
-    let mut out = Vec::new();
-    for c in sorted {
-        if sum >= need {
-            break;
-        }
-        sum += c.amount;
-        out.push(c);
-    }
-    if sum < need {
-        return Err(Error::api(format!(
-            "insufficient XCH to offer: need {need} have {sum}"
-        )));
-    }
-    Ok(out)
+    super::selection::select_largest_first(coins.to_vec(), need, |c| (c.amount, c.coin_id()))
+        .map_err(|s| {
+            Error::api(format!(
+                "insufficient XCH to offer: need {} have {}",
+                s.need, s.have
+            ))
+        })
 }
 
 /// Greedily select CAT coins of `asset_id` (largest first) covering `need`.
@@ -453,6 +459,72 @@ fn select_cats(cats: &[Cat], asset_id: Bytes32, need: u64) -> Result<Vec<Cat>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Proves (dig-node#428):** `select_xch` accumulates its running total the way every other
+    /// selector in this crate does, so a coin set whose amounts sum past `u64::MAX` is handled
+    /// rather than overflowed.
+    ///
+    /// # The fixture, and the assertion it took two attempts to get right
+    ///
+    /// Two coins of `2^63` with a target just above one of them is the ONLY shape that reaches the
+    /// overflow at all:
+    ///
+    /// - the walk stops the moment `total >= target` and the set is sorted DESCENDING, so the
+    ///   largest coin is added to a zero total and cannot overflow on its own;
+    /// - to overflow on the second coin, `a1 + a2` must exceed `u64::MAX` while `a1 < target`,
+    ///   which forces BOTH `a1 > u64::MAX / 2` and `target > u64::MAX / 2`.
+    ///
+    /// So the intuitive "one huge coin plus small change" fixture proves nothing — the huge coin is
+    /// taken first, covers the target, and the loop breaks before a second addition happens.
+    ///
+    /// **The expected outcome is SUCCESS, not refusal.** Two coins of `2^63` genuinely do cover
+    /// `2^63 + 5`; a refusal would be the wrong answer. This test first asserted a shortfall and
+    /// failed against the correct implementation, which is the useful half of writing it: any set
+    /// that overflows sums to more than `u64::MAX`, hence more than any `u64` target, so
+    /// **saturation cannot manufacture a false success here** — the saturated total is only ever
+    /// reached when the real total is larger still.
+    ///
+    /// **Catches:** the bare `sum += c.amount` this replaces. In a debug build — which is how tests
+    /// run — that PANICS with `attempt to add with overflow` at the accumulation, so this test
+    /// fails loudly rather than by assertion. In a release build it wraps to a small total and the
+    /// caller reads back a spurious "insufficient XCH" on a set that could in fact pay.
+    #[test]
+    fn select_xch_covers_a_target_from_coins_that_sum_past_u64_max() {
+        let half = u64::MAX / 2 + 1; // 2^63
+        let coins = vec![
+            Coin::new(Bytes32::default(), Bytes32::default(), half),
+            Coin::new(Bytes32::new([1u8; 32]), Bytes32::default(), half),
+        ];
+        // Above the first coin, so the walk must add the second and cross u64::MAX.
+        let target = half + 5;
+
+        let selected = select_xch(&coins, target)
+            .expect("two coins of 2^63 cover 2^63 + 5; only the arithmetic could fail here");
+        assert_eq!(
+            selected.len(),
+            2,
+            "both coins are needed — one 2^63 alone does not reach 2^63 + 5"
+        );
+    }
+
+    /// **The control.** The saturating total must not turn a genuinely-covered target into a
+    /// refusal — a selector that always refused would pass the test above.
+    #[test]
+    fn select_xch_still_covers_an_ordinary_target_largest_first() {
+        let coins = vec![
+            Coin::new(Bytes32::new([1u8; 32]), Bytes32::default(), 30),
+            Coin::new(Bytes32::new([2u8; 32]), Bytes32::default(), 100),
+            Coin::new(Bytes32::new([3u8; 32]), Bytes32::default(), 70),
+        ];
+        let selected = select_xch(&coins, 90).expect("100 alone covers 90");
+        assert_eq!(
+            selected.len(),
+            1,
+            "largest-first must take the single 100 rather than 70 + 30"
+        );
+        assert_eq!(selected[0].amount, 100);
+    }
+
     use chia_sdk_test::Simulator;
     use chia_wallet_sdk::types::TESTNET11_CONSTANTS;
 
