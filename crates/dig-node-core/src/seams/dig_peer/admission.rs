@@ -139,7 +139,9 @@ impl Drop for AdmissionGuard<'_> {
         };
         // A poisoned meter is recovered rather than propagated: refusing to RELEASE on the panic path
         // would leak the very allowance this guard exists to return, permanently.
-        let mut meter = meter.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut meter = meter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         meter.release(self.peer, self.kind);
     }
 }
@@ -265,7 +267,8 @@ impl PeerAdmission {
                 Err(_) => {}
             }
         }
-        Self::charge(&self.burst, peer, kind, requested_units).map_err(AdmissionRefusal::Limited)?;
+        Self::charge(&self.burst, peer, kind, requested_units)
+            .map_err(AdmissionRefusal::Limited)?;
         Ok(self.guard(peer, kind, Tier::Burst))
     }
 
@@ -500,10 +503,7 @@ mod tests {
     ///
     /// Loops until the meter refuses rather than counting to a literal, so it measures the allowance
     /// the node actually grants instead of restating the number the test hoped for.
-    fn hold_until_refused<'a>(
-        admission: &'a PeerAdmission,
-        peer: &str,
-    ) -> Vec<AdmissionGuard<'a>> {
+    fn hold_until_refused<'a>(admission: &'a PeerAdmission, peer: &str) -> Vec<AdmissionGuard<'a>> {
         let mut held = Vec::new();
         while let Ok(guard) = admission.admit(peer, WorkKind::Own, 1) {
             held.push(guard);
@@ -573,7 +573,10 @@ mod tests {
             }
             identities += 1;
             held.push(guards);
-            assert!(identities < 64, "the meter must refuse a newcomer eventually");
+            assert!(
+                identities < 64,
+                "the meter must refuse a newcomer eventually"
+            );
         }
 
         assert!(
