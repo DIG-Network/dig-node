@@ -1252,6 +1252,56 @@ mod tests {
             .expect("temp dir")
     }
 
+    /// **Proves (dig-node#370):** the scratch tree is removed when the guard goes out of
+    /// scope, **and on an unwind** — the case that produced the leak, because every test in
+    /// this module used to end with a manual `remove_dir_all` that a failing assertion skips.
+    ///
+    /// # Why it asserts on a path it captured rather than on a directory count
+    ///
+    /// Counting entries under the system temp root would be measuring every other test in the
+    /// workspace at the same time, on a machine where lanes run concurrently — a flaky
+    /// disk-state assertion is worse than none. This owns one path, and asks about that path.
+    ///
+    /// The panic half is the load-bearing half, and it is what separates this fix from the
+    /// nearest wrong one: a helper that called `TempDir::keep` (or handed back an unowned
+    /// `PathBuf`) would satisfy nothing here, while a merely-tidier manual cleanup would pass
+    /// the success case and fail this one.
+    #[test]
+    fn the_scratch_tree_is_removed_on_drop_and_on_an_unwind() {
+        let on_success = {
+            let dir = tempdir();
+            let path = dir.path().to_path_buf();
+            assert!(path.is_dir(), "the helper must create the tree it hands back");
+            path
+        };
+        assert!(
+            !on_success.exists(),
+            "the tree must be gone once the guard leaves scope: {}",
+            on_success.display()
+        );
+
+        // The path has to escape the unwinding closure to be asserted on afterwards.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = std::sync::Arc::clone(&seen);
+        let unwound = std::panic::catch_unwind(move || {
+            let dir = tempdir();
+            *captured.lock().expect("a fresh mutex") = Some(dir.path().to_path_buf());
+            panic!("stand in for a failing assertion");
+        });
+        assert!(unwound.is_err(), "the fixture must actually have panicked");
+
+        let on_panic = seen
+            .lock()
+            .expect("the mutex outlives the unwind")
+            .take()
+            .expect("the closure must have recorded its path before panicking");
+        assert!(
+            !on_panic.exists(),
+            "the tree must be gone after an unwind too — this is the leak: {}",
+            on_panic.display()
+        );
+    }
+
     // -- Spies -------------------------------------------------------------------------------------
 
     struct Subs(Vec<[u8; 32]>);

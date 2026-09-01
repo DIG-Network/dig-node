@@ -3625,9 +3625,9 @@ pub(crate) mod tests {
             .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new([1u8; 32]),
-            cert_path: dir.join("node.cert").display().to_string(),
-            key_path: dir.join("node.key").display().to_string(),
-            peers_file_path: dir.join("peers.json"),
+            cert_path: dir.path().join("node.cert").display().to_string(),
+            key_path: dir.path().join("node.key").display().to_string(),
+            peers_file_path: dir.path().join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
             listen_addr: fresh_pool_listen_addr().await,
             ..Default::default()
@@ -3670,9 +3670,9 @@ pub(crate) mod tests {
             .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new([3u8; 32]),
-            cert_path: dir.join("node.cert").display().to_string(),
-            key_path: dir.join("node.key").display().to_string(),
-            peers_file_path: dir.join("peers.json"),
+            cert_path: dir.path().join("node.cert").display().to_string(),
+            key_path: dir.path().join("node.key").display().to_string(),
+            peers_file_path: dir.path().join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
             listen_addr: fresh_pool_listen_addr().await,
             ..Default::default()
@@ -3729,9 +3729,9 @@ pub(crate) mod tests {
             .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new([2u8; 32]),
-            cert_path: dir.join("node.cert").display().to_string(),
-            key_path: dir.join("node.key").display().to_string(),
-            peers_file_path: dir.join("peers.json"),
+            cert_path: dir.path().join("node.cert").display().to_string(),
+            key_path: dir.path().join("node.key").display().to_string(),
+            peers_file_path: dir.path().join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
             listen_addr: fresh_pool_listen_addr().await,
             ..Default::default()
@@ -4245,9 +4245,9 @@ pub(crate) mod tests {
             .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new(network),
-            cert_path: dir.join("node.cert").display().to_string(),
-            key_path: dir.join("node.key").display().to_string(),
-            peers_file_path: dir.join("peers.json"),
+            cert_path: dir.path().join("node.cert").display().to_string(),
+            key_path: dir.path().join("node.key").display().to_string(),
+            peers_file_path: dir.path().join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
             listen_addr,
             ..Default::default()

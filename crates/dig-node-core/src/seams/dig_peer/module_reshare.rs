@@ -1511,6 +1511,7 @@ mod tests {
         );
 
         let cached_path = dir
+            .path()
             .join("cache")
             .join("modules")
             .join(&store_hex)
@@ -1522,6 +1523,7 @@ mod tests {
         );
 
         let staged_path = dir
+            .path()
             .join("staging")
             .join("modules")
             .join(format!("{store_hex}-{root_hex}.dig"));

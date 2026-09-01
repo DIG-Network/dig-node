@@ -131,7 +131,7 @@ fn node_with_pool_peer(pool_peer: &str, self_peer_id: Option<String>) -> Arc<Nod
         Arc::new(MockRangeTransport::new(MockContent::even(4, 1))),
         MissMode::Redirect,
         self_peer_id,
-        &dir,
+        dir.path(),
     );
     content.connected_pool().lock().expect("pool lock").insert(
         pool_peer.to_string(),
@@ -180,7 +180,7 @@ async fn a_warm_reaches_a_holder_that_only_the_connected_pool_can_name() {
     let holder = mock_peer_hex(9);
     let content = node_with_pool_peer(&holder, Some(mock_peer_hex(1)));
     let transport = Arc::new(RecordingModuleTransport::default());
-    let warmer = warmer_over(&content, Arc::clone(&transport), &dir);
+    let warmer = warmer_over(&content, Arc::clone(&transport), dir.path());
 
     warmer.warm(&hex32(STORE), &hex32(ROOT)).await;
 
@@ -221,7 +221,7 @@ async fn a_pool_entry_naming_this_node_is_never_a_dial_candidate() {
     let me = mock_peer_hex(9);
     let content = node_with_pool_peer(&me, Some(me.clone()));
     let transport = Arc::new(RecordingModuleTransport::default());
-    let warmer = warmer_over(&content, Arc::clone(&transport), &dir);
+    let warmer = warmer_over(&content, Arc::clone(&transport), dir.path());
 
     warmer.warm(&hex32(STORE), &hex32(ROOT)).await;
 
