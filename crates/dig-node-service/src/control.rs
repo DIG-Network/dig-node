@@ -6042,7 +6042,7 @@ mod tests {
             .prefix("dig-node-token-test-")
             .tempdir()
             .expect("a scratch dir");
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         let first = load_or_create_token_at(&path).unwrap();
         let second = load_or_create_token_at(&path).unwrap();
         assert_eq!(first, second, "token must be stable across reads");
@@ -6309,7 +6309,7 @@ mod tests {
             .prefix("dig-node-token-roundtrip-")
             .tempdir()
             .expect("a scratch dir");
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         let minted = load_or_create_token_at(&path).unwrap();
         let read_back = read_token_readonly_at(&path).unwrap();
         assert_eq!(
@@ -6331,7 +6331,7 @@ mod tests {
             .expect("a scratch dir");
         // The dir pre-exists but holds NO token (a freshly (re)created state dir).
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         assert!(!path.exists(), "precondition: the dir starts tokenless");
 
         let first = load_or_create_token_at(&path).unwrap();
@@ -6354,7 +6354,7 @@ mod tests {
             .prefix("dig-node-token-absent-")
             .tempdir()
             .expect("a scratch dir");
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         let err = read_token_readonly_at(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         let msg = err.to_string();
@@ -6426,7 +6426,7 @@ mod tests {
             .prefix("dig-node-pins-test-")
             .tempdir()
             .expect("a scratch dir");
-        let config_path = dir.join("config.json");
+        let config_path = dir.path().join("config.json");
         let store = "c".repeat(64);
         let root = "d".repeat(64);
 
@@ -6454,7 +6454,7 @@ mod tests {
             .prefix("dig-node-config-merge-test-")
             .tempdir()
             .expect("a scratch dir");
-        let config_path = dir.join("config.json");
+        let config_path = dir.path().join("config.json");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             &config_path,
@@ -6482,7 +6482,7 @@ mod tests {
             .prefix("dig-node-upstream-test-")
             .tempdir()
             .expect("a scratch dir");
-        let config_path = dir.join("config.json");
+        let config_path = dir.path().join("config.json");
         assert_eq!(read_upstream_override_from(&config_path), None);
         set_upstream_override(&config_path, "https://up.test").unwrap();
         assert_eq!(

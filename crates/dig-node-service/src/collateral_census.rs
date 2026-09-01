@@ -998,7 +998,7 @@ mod tests {
             use std::io::Write as _;
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
-                .open(dir.join("epochs.jsonl"))
+                .open(dir.path().join("epochs.jsonl"))
                 .expect("open the store for the rotted append");
             writeln!(f, "{{\"epoch\":2}}").expect("append the rotted line");
         }

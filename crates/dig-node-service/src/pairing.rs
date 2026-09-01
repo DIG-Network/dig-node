@@ -548,7 +548,8 @@ mod tests {
 
     #[test]
     fn poll_unknown_then_pending_then_approved_delivers_token_once() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let p = pending();
 
         // Unknown id → status unknown.
@@ -591,7 +592,8 @@ mod tests {
 
     #[test]
     fn approve_unknown_pairing_is_invalid_params() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let p = pending();
         let resp = approve(&p, &config, json!(1), &json!({ "pairing_id": "nope" }));
         assert_eq!(
@@ -602,7 +604,8 @@ mod tests {
 
     #[test]
     fn list_shows_pending_and_issued_tokens() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let p = pending();
         let req = request(&p, json!(1), &json!({ "client_name": "ext-A" }));
         let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
@@ -655,7 +658,8 @@ mod tests {
 
     #[test]
     fn load_paired_tokens_tolerates_missing_and_malformed() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let path = paired_tokens_path(&config);
         assert!(load_paired_tokens(&path).is_empty(), "missing file → empty");
         std::fs::write(&path, b"not json").unwrap();
