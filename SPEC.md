@@ -174,8 +174,8 @@ ARE `DIG_NODE_*`, full stop.
 | `DIG_NODE_ALLOW_REMOTE` | permit a non-loopback `DIG_NODE_HOST` bind | `false` | Truthy = `1`/`true`/`yes`/`on`; anything else (unset/blank/falsy/unrecognized) ⇒ the security-safe default **false**. When false, a non-loopback `DIG_NODE_HOST` is a fatal configuration error at startup (§3.2.1). Loopback overrides and the no-override default never require it. |
 | `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | *(unset — NO default upstream)* | Normalized (§3.3); highest precedence (§3.4). Unset ⇒ passthrough is OFF and an unimplemented method answers a local `-32601` (§5.4). A value naming THIS node is REFUSED (§3.4.1). |
 | `DIG_NODE_CACHE` | explicit on-disk `.dig` cache dir | *(unset)* | Blank/whitespace ⇒ unset. Unset ⇒ shared canonical default (§3.5). |
-| `DIG_NODE_DIGLOCAL` | toggle for the bare `dig.local` listeners (`http://dig.local` on `127.0.0.2:80` AND, when a dig-cert leaf is present, `https://dig.local` on `127.0.0.2:443` — §4.1a) | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
-| `DIG_NODE_PROFILE_SYNC` | operator kill switch for profile-body sync (opcodes 223/224/225, §22) | `true` | Falsy = `0`/`false`/`no`/`off`, case- and whitespace-insensitive; unset or unrecognized ⇒ **default true**. Off means the node neither fetches nor serves profile bodies; nothing else depends on it, so it is a clean degradation. |
+| `DIG_NODE_DIGLOCAL` | toggle for the bare `dig.local` listeners (`http://dig.local` on `127.0.0.2:80` AND, when a dig-cert leaf is present, `https://dig.local` on `127.0.0.2:443` — §4.1a) | `true` | Off = `off`/`disabled`/`0`/`false`/`no`; on = `on`/`enabled`/`1`/`true`/`yes`; case/whitespace-insensitive. Unset or EMPTY ⇒ **default true**. An UNRECOGNIZED value ⇒ default true AND a warning naming the variable, the rejected value and the applied default (see **Capability-flag vocabulary and failure direction**). |
+| `DIG_NODE_PROFILE_SYNC` | operator kill switch for profile-body sync (opcodes 223/224/225, §22) | `true` | Off = `off`/`disabled`/`0`/`false`/`no`, case- and whitespace-insensitive; unset, empty or unrecognized ⇒ **default true**. Off means the node neither fetches nor serves profile bodies; nothing else depends on it, so it is a clean degradation. |
 
 The default port is the UNCOMMON high port **`9778`** (not `80`/`8080`). Port 80 requires elevation
 on most OSes, and both `80` and `8080` are the collision-prone common-dev ports most likely already
@@ -223,8 +223,27 @@ does not own them (except `DIG_NODE_UPSTREAM`, which the shell SETS — see belo
 | `DIG_WALLET_WC_PROJECT_ID` | initial/default WalletConnect projectId for the wallet host (§16) | *(unset ⇒ none)* | A persisted `wc_project_id` in `config.json` wins over this; a blank persisted value falls through to this env. Blank ⇒ treated as unset. |
 | `DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC` | outgoing-bandwidth throttle cap, in bytes/second (§17) | `0` (UNLIMITED — opt-in) | Parsed as `u64`; `0`, unparsable, or unset ⇒ unlimited (the throttle is a no-op until an operator configures a cap). Resolved ONCE at node construction. |
 
-The peer-network layer additionally honors `DIG_PEER_NETWORK` (set to a falsy value to disable the L7
-peer network) and `DIG_RELAY_URL` (override or disable the relay), which gate the P2P bring-up, and
+### The shared off-token
+
+`DIG_PEER_NETWORK`, `DIG_RELAY_URL` and `DIG_BOOTSTRAP_PEERS` are the three knobs that decide whether
+this node reaches the network at all. All three read ONE off-vocabulary: **`off`, `disabled`, `0`,
+`false`, `no`, or an explicitly empty value** — trimmed and case-insensitive. Any of those disables
+the knob; anything else does not.
+
+A node MUST NOT accept a disable token on one of these knobs and ignore the same token on another.
+An operator who writes `OFF` and gets an isolated relay but a live peer network has been told the
+switch worked when it did not.
+
+An explicitly EMPTY value counts as a disable on all three, for the reason given under
+`DIG_BOOTSTRAP_PEERS` below: a variable set to nothing is an operator saying "none", and resolving
+it to the compiled-in default makes a node believed to be isolated dial production infrastructure.
+An UNSET variable is a different thing and keeps its documented default.
+
+An unrecognised value is NOT a disable. For `DIG_RELAY_URL` an unrecognised value is a relay URL, so
+reading one as a disable would silently unplug a configured relay.
+
+The peer-network layer honors `DIG_PEER_NETWORK` (disable the L7 peer network) and `DIG_RELAY_URL`
+(override or disable the relay), which gate the P2P bring-up, and
 **`DIG_PEER_PORT`** — the mTLS peer-RPC server listen port (dig-node-to-dig-node RPC traffic, §5.2).
 Parsed as `u16`; unparsable/unset ⇒ the default **`9444`** (`peer::DEFAULT_P2P_PORT`).
 Bound dual-stack IPv6-first with an IPv4 fallback, per §5.2.
@@ -436,6 +455,38 @@ governs the `/health` `addr` field, the `status` output, the control-client's JS
    **best-effort**: on failure (no privilege, port in use, missing macOS `127.0.0.2` loopback
    alias) the node MUST log a structured warning to stderr and continue serving localhost-only —
    it MUST NOT abort. Skipped entirely when `DIG_NODE_DIGLOCAL` is falsy.
+
+### Capability-flag vocabulary and failure direction
+
+NORMATIVE. Complements **The shared off-token** above, which governs the isolation knobs; this governs the capability knobs.
+
+A **capability flag** is a `DIG_*` environment switch that enables or disables a node capability and
+holds no list. `DIG_WALLET_ENABLE_CHAIN_SYNC`, `DIG_NODE_DIGLOCAL`, `DIG_HOLDINGS_INGEST`,
+`DIG_NODE_STORE_MELT` and `DIG_NODE_PROFILE_SYNC` are capability flags. `DIG_BOOTSTRAP_PEERS`, `DIG_RELAY_URL` and
+`DIG_PEER_NETWORK` are **isolation** flags and are governed by **The shared off-token** above instead.
+
+1. **One vocabulary.** Every capability flag MUST read the same off-tokens — `off`, `disabled`, `0`,
+   `false`, `no` — and the same on-tokens — `on`, `enabled`, `1`, `true`, `yes` — each trimmed and
+   compared case-insensitively. A flag that recognizes a token another flag rejects is non-conforming:
+   an operator who learns a word works on one switch will use it on the next.
+
+2. **An EMPTY value is ABSENT, not OFF.** A capability flag set to the empty string MUST take its
+   default. This differs deliberately from an isolation flag, where an empty value names the empty list
+   and MUST disable (see **The shared off-token**). A capability flag holds no list, and an empty value is what a shell
+   produces from an unset expansion.
+
+3. **Failure direction: fail in whichever direction cannot make a surface assert a falsehood.** An
+   unrecognized value MUST NOT be resolved in a direction that lets any surface state something untrue.
+   For a default-ON read path such as chain sync this means keeping the default: disabling it silently
+   stops the replica advancing, and a stale replica's zero balance is indistinguishable from an empty
+   wallet (§18.6). For an isolation flag the same principle requires the opposite resolution, because
+   a node that keeps dialling reports an isolation it does not have.
+
+4. **An unrecognized value MUST be disclosed.** The node MUST emit a warning naming the VARIABLE, the
+   REJECTED VALUE, and the DEFAULT it applied, and MUST state that the operator's setting had no
+   effect. A recognized value, including an absent or empty one, MUST NOT warn. Silence is what makes a
+   typo indistinguishable from a deliberate omission, and it is the residue that survives whichever
+   failure direction a flag takes.
 
 The distinct loopback IP `.2` exists so the port-80 bind can never collide with an unrelated
 `localhost:80` service. The dig-installer writes the hosts entry `127.0.0.2  dig.local`; this
@@ -1605,13 +1656,14 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.capsule.fetch` | `store` (64-hex), `root` (64-hex) — BOTH REQUIRED and both canonical; there is no root-less form, because a capsule pull names one concrete generation and choosing one is the chain’s decision (`control.sync.trigger`), not this verb’s | `store`, `root`, `status` ∈ {`"started"`, `"already_cached"`, `"unavailable"`} | This is an ACKNOWLEDGEMENT, not a completion report: a whole-`.dig` pull crosses the network and takes arbitrarily long, so the call MUST return as soon as the pull is launched and MUST NOT block on the transfer. `"started"` therefore means STARTED and MUST NOT be answered for a pull that was not launched; completion is observed through the cache (`control.hostedStores.status`). `"already_cached"` means the capsule was on disk and no pull was started — read from the filesystem, the same evidence the serve path uses, never from an index that could disagree with it. `"unavailable"` means nothing could be started because this build has no capsule warmer (the FFI/base path has no P2P engine). `INVALID_PARAMS` on a missing or non-64-hex `store`/`root`. Authorized like every other write on this plane; it is NOT an open read, because a pull spends this node’s bandwidth on the caller’s choice of content. |
 | `control.sync.status` | — | `available` (always `true` — the chunked capsule download needs no identity), `method: "chunked-capsule-download-with-section-21-clone-fallback"`, `identity_loaded`, `pinned_total`, `pinned_synced`, `whole_store_trigger_supported` (`true` — a store id alone is enough) |
 | `control.sync.trigger` | `store` = `storeId[:rootHash]`, or `store_id` [+ `root`] — the root is OPTIONAL; without one the node resolves the store's CHAIN-ANCHORED tip and syncs that generation | `status: "synced"`, `root`, `size_bytes`, `served_root` |
-| `control.wallet.balance` | `address` (bech32m string), `asset` (`"xch"` \| `"dig"` \| `{"cat":"<64-hex asset id>"}`, default `"xch"`) | `balance` (confirmed, spendable — JSON NUMBER, u64 base units), `pending` (unspent + unconfirmed — JSON NUMBER, u64 base units), `source` (`"db"` \| `"fallback"` — which tier produced the figure, §18.7b), `synced` (bool), `peak_height` (`u32` or `null`). Matches `dig-node-control-interface` 0.3.0's `WalletBalanceResult { balance: u64, pending: u64, .. }` and dig-app's `BalanceResponse { balance: u64 }` — a Rust-to-Rust numeric contract, never a decimal string. The wallet backend tracks the base-unit total as `u128` (headroom for summed intermediate math); the wire boundary saturating-casts to `u64` (a single address's balance can never exceed `u64::MAX` mojos, ~18.4M XCH). READ-ONLY chain read of a PUBLIC address (no seed/signing key). Reuses the B.6 sync-state routing: the local DB when the address is the wallet's own and the DB is synced, else the coinset fallback. Per §18.7b, `source`/`synced`/`peak_height` describe the TIER that answered: a `"db"` answer reports the node's own peak and reports `synced: true` only while the replica is FOLLOWING the chain, so a behind-but-once-synced replica answers `synced: false` WITH its real `peak_height` rather than presenting a stale figure as current; a tier with NO observable peer height also answers `synced: false`, because nothing corroborated the figure, and so does a replica with NO peak of its OWN — `synced: true` beside `peak_height: null` would claim a reading is current while refusing to say what it is a reading of (§18.7b); a `"fallback"` answer reports `synced: false` and `peak_height: null`. This is an OPEN read (`is_open_control_read`, no token); the cheap local-DB fast path is unbounded, but the EXPENSIVE coinset-fallback leg is subject to a GLOBAL token-bucket rate bound (defense-in-depth against an open-read amplification/oracle sweep — #1957): a burst of arbitrary-address fallback reads beyond the bound is refused with `WALLET_RATE_LIMITED` (§10), while any single honest read (DB fast path or one fallback) always succeeds. A CAT scopes by the asset id the REQUEST named -- any CAT, not only `$DIG` -- and BOTH tiers MUST scope to that id. `"dig"` is the canonical id `digstore_chain::dig::DIG_ASSET_ID` spelled as a token, and `{"cat":"<that id>"}` MUST mean the same asset. Every scoping hash a tier derives MUST be derived FROM the requested id: a filter keyed to a fixed asset answers every other CAT an EMPTY list, which is indistinguishable from holding none of it -- a silent wrong answer with nothing to observe. An `asset` that is PRESENT and does not parse is `INVALID_PARAMS`; it MUST NOT default to `"xch"`, because a mistyped asset id would then read as a balance for the wrong token. An OMITTED `asset` is the documented `"xch"` default. A hint is not an asset: the fallback tier finds CAT coins with `get_coin_records_by_hints`, which takes no asset id and answers with EVERY coin hinted to the address -- any CAT of any TAIL, and any plain XCH coin whose spend carried a hint memo -- so a `"fallback"` answer MUST keep only the coins sitting at that asset's CAT puzzle hash (`digstore_chain::cat::cat_puzzle_hash(owner_p2_hash, asset_id)`, the canonical curry), the exact equivalent of the DB tier's `hint IN (...) AND asset_id = ?`. Summing the raw hint answer reports a holding the address does not have, at the asked-for asset's scale rather than each coin's own: one hinted XCH coin of 10^8 mojos (`0.0001 XCH`) totals as `100000` at `$DIG`'s 3 decimals. Over-filtering is the same lie mirrored -- a real `$DIG` holder answered zero -- so the filter MUST key on that puzzle hash and nothing heuristic. A synced empty address is a SUCCESS `{balance:0, synced:true}`, never an error (and `synced` there means MEASURED-current, never merely eligible); the read-failure shapes are DISTINCT errors `WALLET_NO_CHAIN_SOURCE`/`WALLET_NOT_SYNCED`/`WALLET_READ_FAILED`/`WALLET_RATE_LIMITED` (§10), never a fabricated `0`. `INVALID_PARAMS` on a missing/malformed `address` or a bad `asset`. |
+| `control.wallet.balance` | `address` (bech32m string), `asset` (`"xch"` \| `"dig"` \| `{"cat":"<64-hex asset id>"}`, default `"xch"`) | `balance` (confirmed, spendable — JSON NUMBER, u64 base units), `pending` (unspent + unconfirmed — JSON NUMBER, u64 base units), `source` (`"db"` \| `"fallback"` — which tier produced the figure, §18.7b), `synced` (bool), `peak_height` (`u32` or `null`). Matches `dig-node-control-interface` 0.3.0's `WalletBalanceResult { balance: u64, pending: u64, .. }` and dig-app's `BalanceResponse { balance: u64 }` — a Rust-to-Rust numeric contract, never a decimal string. The wallet backend tracks the base-unit total as `u128` (headroom for summed intermediate math); the wire boundary saturating-casts to `u64` (a single address's balance can never exceed `u64::MAX` mojos, ~18.4M XCH). READ-ONLY chain read of a PUBLIC address (no seed/signing key). Reuses the B.6 sync-state routing: the local DB when the address is the wallet's own and the DB is synced, else the coinset fallback. Per §18.7b, `source`/`synced`/`peak_height` describe the TIER that answered: a `"db"` answer reports the node's own peak and reports `synced: true` only while the replica is FOLLOWING the chain, so a behind-but-once-synced replica answers `synced: false` WITH its real `peak_height` rather than presenting a stale figure as current; a tier with NO observable peer height also answers `synced: false`, because nothing corroborated the figure, and so does a replica with NO peak of its OWN — `synced: true` beside `peak_height: null` would claim a reading is current while refusing to say what it is a reading of (§18.7b); a `"fallback"` answer reports `synced: false` and `peak_height: null`. This is an OPEN read (`is_open_control_read`, no token); the cheap local-DB fast path is unbounded, but the EXPENSIVE coinset-fallback leg is subject to a GLOBAL token-bucket rate bound (defense-in-depth against an open-read amplification/oracle sweep — #1957): a burst of arbitrary-address fallback reads beyond the bound is refused with `WALLET_RATE_LIMITED` (§10), while any single honest read (DB fast path or one fallback) always succeeds. A CAT scopes by the asset id the REQUEST named -- any CAT, not only `$DIG` -- and BOTH tiers MUST scope to that id. `"dig"` is the canonical id `digstore_chain::dig::DIG_ASSET_ID` spelled as a token, and `{"cat":"<that id>"}` MUST mean the same asset. Every scoping hash a tier derives MUST be derived FROM the requested id: a filter keyed to a fixed asset answers every other CAT an EMPTY list, which is indistinguishable from holding none of it -- a silent wrong answer with nothing to observe. An `asset` that is PRESENT and does not parse is `INVALID_PARAMS`; it MUST NOT default to `"xch"`, because a mistyped asset id would then read as a balance for the wrong token. An OMITTED `asset` is the documented `"xch"` default. A hint is not an asset: the fallback tier finds CAT coins with `get_coin_records_by_hints`, which takes no asset id and answers with EVERY coin hinted to the address -- any CAT of any TAIL, and any plain XCH coin whose spend carried a hint memo -- so a `"fallback"` answer MUST keep only the coins sitting at that asset's CAT puzzle hash (`digstore_chain::cat::cat_puzzle_hash(owner_p2_hash, asset_id)`, the canonical curry), the exact equivalent of the DB tier's `hint IN (...) AND asset_id = ?`. Summing the raw hint answer reports a holding the address does not have, at the asked-for asset's scale rather than each coin's own: one hinted XCH coin of 10^8 mojos (`0.0001 XCH`) totals as `100000` at `$DIG`'s 3 decimals. Over-filtering is the same lie mirrored -- a real `$DIG` holder answered zero -- so the filter MUST key on that puzzle hash and nothing heuristic. A synced empty address is a SUCCESS `{balance:0, synced:true}`, never an error (and `synced` there means MEASURED-current, never merely eligible); the read-failure shapes are DISTINCT errors `WALLET_NO_CHAIN_SOURCE`/`WALLET_NOT_SYNCED`/`WALLET_READ_FAILED`/`WALLET_RATE_LIMITED` (§10), never a fabricated `0`. `INVALID_PARAMS` on a missing/malformed `address` or a bad `asset`.  Additionally `network_peak_height` (`u32` or `null`) — the peak this node's own held Chia peers have ANNOUNCED — and `stale_by` (`u32` or `null`) — how many blocks behind that peak this figure is. `stale_by` MUST be `null` unless BOTH the answer's `peak_height` and `network_peak_height` are known: a zero is a positive claim that the figure is level with the network, and absence is the opposite claim, so a consumer MUST NOT render them alike. It MUST saturate at zero rather than underflow when the replica is momentarily ahead. Both fields are ADDITIVE (§5.1). They exist because `balance 0, synced false, peak_height null` — the answer a replica ~8,380 blocks behind its peers actually gave — is indistinguishable from an empty wallet, and a consumer had nothing with which to tell them apart. |
 | `control.wallet.coins` | `address` (bech32m string), `asset` (`"xch"` \| `"dig"` \| `{"cat":"<64-hex asset id>"}`, default `"xch"`), `after_coin_id` (OPTIONAL, 64 lowercase-hex, an `0x` prefix TOLERATED and normalized away), `limit` (OPTIONAL, `1..=1000`, default `100`) | `coins` (array of `{coin_id, asset, amount, parent_coin_info, puzzle_hash, created_height, spent_height}`; all hashes lowercase 64-hex unprefixed, `amount` a JSON NUMBER in base units), `complete` (bool), `cursor` (string \| `null`), `source`, `synced`, `peak_height` — the tier fields carrying exactly their `control.wallet.balance` meanings (§18.7b). ONE PAGE of the UNSPENT coins at the address for the asset, i.e. the read a caller building a spend needs; a balance is this read reduced to a sum, which is why the two take identical params. It scopes to the asset by the SAME tier-agnostic rule, for the sharper reason: a coin list is spend INPUTS, so a hinted XCH or foreign-CAT coin served as a `$DIG` coin is a spend built on inputs of the wrong asset. Coins seen only in the mempool are INCLUDED with `created_height: null`, so the caller decides what is spendable for its purpose rather than the node hiding one. `coins: []` MUST mean a chain WAS consulted and the address holds nothing; every way of failing to consult one is a DISTINCT error (`WALLET_NO_CHAIN_SOURCE`/`WALLET_NOT_SYNCED`/`WALLET_READ_FAILED`/`WALLET_RATE_LIMITED`, §10), NEVER an empty list — an empty list would tell a holder of funds that they hold none, and a spend built on it refuses with an untrue shortfall. The read is PAGED, because an address's unspent-coin count is unbounded and every spend's change coin adds one — the same exposure `control.wallet.coinsByParent` carries, on a control plane with no request rate limiting. A node MUST return coins ASCENDING by `coin_id`, MUST keep that order stable across the pages of one walk, and MUST NOT page by OFFSET: an address's unspent set SHRINKS as coins are spent, so under an offset every row after a departed coin moves one position earlier and the next page begins one row late — a coin the caller never sees, on the read whose purpose is coin selection. A node MUST derive `complete` from whether rows remain BEYOND the page, never from the page LENGTH: a coin count that is an exact multiple of the page size makes the final full page indistinguishable from a truncated one, and a caller stopping there builds a spend from half an address's coins and refuses with an untrue shortfall. The scope, asset, unspent predicate and page bound MUST be applied at the SAME level: paginating a broader read and filtering afterwards cuts the page before the filter, so pages arrive short and `complete` is computed from a count that no longer describes what remains. `cursor` is the `coin_id` of the LAST record actually returned, or `null` for an empty page, and is what a caller passes back as `after_coin_id`. An out-of-range `limit` is REFUSED as `INVALID_PARAMS`, never clamped — a silently shrunk page hands back a cursor for a position the caller did not ask about. Both page params are OPTIONAL and a request naming neither is byte-identical to the pre-paging request. OPEN read, same global fallback rate bound as the balance. `INVALID_PARAMS` on a missing/malformed `address`, a bad `asset`, a malformed `after_coin_id`, or a `limit` outside `1..=1000`. |
 | `control.wallet.coinById` | `coin_id` (64 lowercase-hex, an optional `0x` prefix TOLERATED and normalized away) | `coin` (`{coin_id, asset, amount, parent_coin_info, puzzle_hash, created_height, spent_height}` or `null`), `source`, `synced`, `peak_height` — the tier fields carrying exactly their `control.wallet.balance` meanings (§18.7b); the tier fields MUST describe WHAT ANSWERED THIS READ. Where the local replica HOLDS the named coin and is authoritative for the set it follows (the same `control.wallet.balance` eligibility test, §18.7b), the node MUST answer from the replica: `source: "db"`, `peak_height` the replica's own peak, and `synced` MEASURED against the peers' announced peak rather than assumed — a replica that completed a catch-up and then fell behind still serves the coin, with its real peak, labelled stale. A replica MISS MUST fall through to the chain tier and be reported as such (`source: "fallback"`, `synced: false`, `peak_height: null`); it MUST NEVER be served as an absence, because the replica is populated only from this node's own subscriptions, so a miss means "this node does not watch that coin", which is NOT absence. A node MUST NOT report `source: "fallback"`, `synced: false` for a coin it holds: a warrant no read can ever carry turns every consumer-side freshness guard into an unconditional refusal, which ends a mint watch in "the chain could not be reached" on a healthy node. ONE coin by its own id, SPENT OR UNSPENT — the read a caller polling a spend needs and `control.wallet.coins` structurally cannot give: a created DID coin sits at nobody's wallet address, and a spent funding coin is gone from every unspent list. `asset` in the record is ALWAYS `null`: a coin id alone does not reveal whether a coin is XCH, a CAT or a singleton — that needs the puzzle, which this read never inspects — so naming one would assert a classification the node did not verify. A returned record MUST be bound to the id asked for: a coin id is self-certifying (`SHA256(parent ‖ puzzle_hash ‖ amount)`), so a source that answers with a DIFFERENT coin is a `WALLET_READ_FAILED` (§10) — never that coin's record, and never `coin: null`. `coin: null` MUST mean a chain source ANSWERED and reported no such coin; every way of failing to get an answer is a DISTINCT error (`WALLET_NO_CHAIN_SOURCE`/`WALLET_READ_FAILED`/`WALLET_RATE_LIMITED`, §10), NEVER a `null` — a `null` for an outage would tell a caller polling a mint that its coin does not exist, so a pending mint reads as awaiting forever. A caller MUST treat `null` as "not seen yet" and keep polling, not as "never happened". OPEN read (no token), same global fallback rate bound as the balance. `INVALID_PARAMS` on a missing/malformed `coin_id`, refused BEFORE any network call — an unanswerable question and a chain that answered "no" must never wear the same shape; the well-formedness rule is `dig-node-control-interface`'s own `WalletCoinByIdParams::validated()`, consumed rather than restated. |
 | `control.wallet.coinSpend` | `coin_id` (64 lowercase-hex, an optional `0x` prefix TOLERATED and normalized away) | `spend` (`{coin, puzzle_reveal, solution}` or `null`), `source`, `synced`, `peak_height` -- the tier fields carrying exactly their `control.wallet.coinById` meanings, and here always `"fallback"` / `false` / `null`: the local replica stores coin records, not spends, so it can never produce this answer. THE SPEND THAT SPENT ONE COIN, named by that coin's own id (a spend has no id of its own on chain). A coin record carries a puzzle HASH and says only that a coin is gone; the puzzle REVEAL and the solution exist only here, and they are what a caller reconstructing a lineage -- following a dig-profile's DID singleton forward -- needs. `coin` is the full record shape `control.wallet.coinById` returns, with `asset` ALWAYS `null` (this read classifies nothing) and `spent_height` ALWAYS non-null (a spend of a coin nothing calls spent is a contradiction; the node MUST fail closed rather than emit one). The node MUST verify that `puzzle_reveal` tree-hashes to `coin.puzzle_hash` and MUST refuse -- `WALLET_READ_FAILED` (§10) -- when it does not or will not parse: the reveal comes from an unauthenticated peer, a puzzle hash IS the reveal's CLVM tree hash, so the lie is locally detectable and a caller would otherwise curry a forged program into the spend it signs. The returned spend MUST be bound to the id asked for, by the same self-certifying coin-id recomputation `control.wallet.coinById` requires. `spend: null` MUST mean a chain source ANSWERED and holds no spend of that coin -- it is UNSPENT, or unknown; distinguishing those two is `control.wallet.coinById`'s job. Every way of failing to get an answer is a DISTINCT error, NEVER `null`: a caller walking a lineage reads "no spend" as *this is the tip* and stops, so a failure disguised as absence yields a spend built against a superseded singleton, and a mint poll reads it as "my funding coin is still there" and funds the same mint twice. OPEN read (no token), same global fallback rate bound. `INVALID_PARAMS` on a missing/malformed `coin_id`, refused BEFORE any network call; the rule is `dig-node-control-interface`'s own `WalletCoinSpendParams::validated()`, consumed rather than restated. |
 | `control.wallet.coinsByParent` | `parent_coin_id` (64 lowercase-hex, `0x` TOLERATED), optional `after_coin_id` (same rule), optional `limit` (1..=1000, default 100) | `coins` (array of the `control.wallet.coinById` record shape), `complete`, `cursor`, `source`, `synced`, `peak_height`. ONE PAGE of the DIRECT children created by spending the named parent. ONE HOP, never a walk: the node MUST NOT recurse -- a transitive walk over caller-supplied input is unbounded work the caller cannot bound, and a partial walk returned as complete is a lineage with a silent hole in it. A caller composes hops itself, pairing this with `control.wallet.coinSpend`. Children MUST be returned in ASCENDING `coin_id` order and that order MUST be stable across the pages of one walk, because `after_coin_id` means *strictly after this id in that order* and without a fixed order a cursor names no position (a walk would repeat some children and skip others). `complete` states whether the page is the WHOLE child set and MUST be derived from whether further children EXIST -- never from whether the page filled: the two differ exactly when the child count is an integer multiple of `limit`, where the second declares a truncated page whole and ends a lineage walk one hop early while looking finished. `cursor` is the LAST child in the page (the id the caller was handed), or `null` for an empty page; a node MUST NOT emit `complete: false` with `cursor: null`, which leaves a caller with no way to make progress. An out-of-range `limit` is REFUSED as `INVALID_PARAMS`, never clamped: the page boundary is what the caller resumes from, so a silently shrunk page hands back a cursor for a position the caller never asked about. Every record MUST report `asset: null` (naming a coin by its parent classifies nothing). Every child MUST name the requested parent; a source that returns one that does not fails the WHOLE read (`WALLET_READ_FAILED`, §10) rather than having the row filtered out. `coins: []` MUST mean a chain ANSWERED and the parent created no children it knows of -- typically it is unspent; every way of failing to consult a chain is a DISTINCT error, never an empty page, because an empty page reads as *that spend created nothing*. OPEN read (no token), same global fallback rate bound. `INVALID_PARAMS` on a missing/malformed id or an illegal `limit`, refused BEFORE any network call; the rules are `dig-node-control-interface`'s own `WalletCoinsByParentParams::validated()`. |
 | `control.wallet.arrivals` | `after_seq` (integer ≥ 0, default `0`), `limit` (integer, default `50`, CLAMPED to `1..=500`) | `arrivals` (`[{seq, coin_id, puzzle_hash, amount, asset_id, confirmed_height}]`, oldest first), `cursor` (the RESUME position: the last `seq` actually returned, or the caller's own `after_seq` on an empty page), `latest` (the newest position the ledger holds). A client MUST resume from `cursor` and MUST NOT resume from `latest`: `latest` is read after the page, so an arrival recorded in between sits above the page and below `latest`, and resuming from `latest` would step over it. `latest` exists for the first-run case only — a client with no stored cursor reads it and passes it back as `after_seq` to start from NOW rather than replaying the ledger as a burst of notifications. INCOMING FUNDS the node determined ARRIVED, since a cursor (dig_ecosystem#2548) — the question neither `.balance` (a total the user's own change also moves) nor `.coins` (no notion of "new") can answer. A row is written ONLY for a coin that is (a) CONFIRMED — `confirmed_height` is `NOT NULL` in the store, so a mempool sighting is unwritable, not merely unwritten; (b) confirmed STRICTLY ABOVE the wallet's arrival baseline, which is armed ONLY by the statement that records a COMPLETED address-history catch-up — the one caller that has demonstrably replayed everything — so a first catch-up announces nothing, and a point read against the fallback oracle, which replays nothing, cannot arm a baseline at all; (c) not already recorded, enforced by a `UNIQUE` coin id on disk, so a restart, a reconnect or a rebuilt replica re-announces nothing; and (d) NOT created by spending a coin this wallet holds, so the user's own change is never reported as a receipt. `amount` is a decimal STRING (the full `u64` range; a JSON number would round it). `asset_id` is `null` for native XCH and the CAT's hex TAIL otherwise — NEVER a ticker, because naming an asset the node did not attribute would assert a classification it cannot support; a coin whose asset is not yet determinable is HELD and re-examined, never announced as XCH. A reorg DELETES the arrivals above the fork with the coins they describe, and walks the baseline back; `seq` is `AUTOINCREMENT`, so a deleted row's position is never reused and a stored cursor cannot come to mean a different arrival. `arrivals: []` means the node consulted its OWN replica and nothing arrived since the cursor — it is NOT a claim that the replica is current (ask `control.wallet.syncStatus`), and a node that has never completed a catch-up has no baseline and reports empty forever. OPEN read (no token) and the NARROWEST of the open reads: it touches only the local replica, has no oracle path, and so discloses nothing off-node and cannot amplify a poll into outbound requests. `INVALID_PARAMS` on a negative `after_seq`; `WALLET_READ_FAILED` if the local ledger cannot be read. |
 | `control.wallet.peak` | — | `peak_height` (`u32` or `null`), `synced` (bool). The node's current chain peak, independent of any address. Its OWN method rather than a field on a balance because a balance reports `peak_height: null` on every `"fallback"`-tier answer by design (§18.7b), so a caller bounding a claimed confirmation could not obtain one from the node that most needs to answer. Prefers the node's own replica and falls back to the chain tier. The chain tier is the node's OWN dialled Chia peers, asked CONCURRENTLY and settled on their AGREEMENT (NC-12): the height is the settled height every credible peer in the sample has passed, and a sample that collapses to one voice, or splits, MUST report `peak_height: null` rather than a repaired number. A node MUST NOT satisfy this read from a single public oracle, and MUST NOT fall through to one when its peers fail to agree — falling through would let one endpoint overrule the peers at exactly the moment corroboration failed, which is the single-source dependency NC-12 exists to remove. `peak_height: null` means UNKNOWN and MUST NOT be read as height zero, which every block is trivially above. `synced` carries EXACTLY its `control.wallet.balance` meaning (§18.7b) and MUST be MEASURED by the same predicate: a replica-served peak reports `synced: true` only while the replica is FOLLOWING the chain, so a behind-but-once-synced replica answers `synced: false` WITH its real `peak_height`, and a tier with no observable peer height, or a replica with no peak of its own, also answers `synced: false` — neither an unmeasured peer tier nor an unknown replica height can establish currency. A node MUST NOT derive this flag from `initial_sync_complete`, which latches on the first completed catch-up and is cleared only by a backwards chain move: a replica hundreds of blocks behind still satisfies it, so `control.wallet.peak` would report `synced: true` about the same replica `control.wallet.syncStatus` is simultaneously reporting as `syncing`. This is the endpoint a caller uses to bound a claimed confirmation, so the overstatement lands on the read that decides whether money has settled. A chain-tier answer reports `synced: false`, because a height the replica did not produce says nothing about the replica. OPEN read. |
+| `control.wallet.resetCoinDb` | `confirm` (bool, MUST be `true`) | `coins_dropped` (`u64`), `staged_dropped` (`u64`). **DESTRUCTIVE.** Discards this node's chain-derived cache and forces a re-sync from chain. The node MUST clear the `initial_sync_complete` flag and the recorded coverage in the SAME transaction that empties the coins: that flag is what makes the local replica authoritative for wallet-scoped reads, so an emptied-but-still-synced replica answers `balance 0, synced true` on a funded wallet, and a crash between two separate writes would leave exactly that state. Reads then fall back to the chain tier until a genuine catch-up re-establishes the flag. No sync pass that was ALREADY RUNNING when the reset landed may re-establish it. The node MUST record a reset counter that the reset increments in that same transaction; every writer of `initial_sync_complete` — the address-history catch-up and the oracle-tier point-read refresh alike — MUST observe that counter BEFORE its own first write and present it again in the statement that sets the flag, which MUST NOT take effect if the counter has moved. Without that condition the reset and the sync pass are separate transactions that nothing serialises, and the interrupted pass marks the emptied — or partially refilled — replica synced one statement later: the same `balance 0, synced true`, or the likelier understated balance from a partial coin set. An address-history CATCH-UP whose completion is refused this way MUST report an error rather than success, so a fresh pass runs. The oracle-tier point-read refresh MAY instead log and return success, because it re-reads on its next call and has no pass to re-run; what it MUST NOT do is set the flag. A pass that began wholly AFTER the reset is unaffected and re-establishes the flag normally. It MUST discard chain-derived rows ONLY — never a seed, a device key, or any configuration a re-sync does not reproduce. It MUST REFUSE, writing nothing, while any spend is in flight, and liveness MUST be judged by EXPIRY against the node's own clock rather than by row presence: a lapsed hold that nobody has pruned MUST NOT deny the reset, and the instant MUST NOT be caller-supplied, since a far-future value would make every live hold read as expired. A refusal is an ERROR, never a success carrying a flag. `confirm != true` is `INVALID_PARAMS`. Token-gated (PAIRED tier: the DIG App drives this and holds a paired token, so reserving it to the master token would make it unreachable by its only consumer); loopback-only; NEVER an open read. |
 | `control.wallet.broadcast` | `signed_bundle_hex` (lowercase hex, optionally `0x`-prefixed, of a chia `Streamable` `SpendBundle`) | `accepted` (bool), `transaction_id` (lowercase 64-hex or `null`), `rejection` (string or `null`). Pushes an ALREADY-SIGNED bundle. **§908: this method signs nothing and is never given anything it could sign with** — there is no key, seed, phrase or unsigned-plan parameter here and none may be added; on this surface the node's role is to read chain state and relay what somebody else signed. The node's OWN automated spends (§23, §25) never transit this method and are not reachable from it. A mempool that examined the bundle and refused it is a SUCCESSFUL call reporting `{accepted:false, rejection}`; failing to REACH a mempool is `WALLET_READ_FAILED`, and a node with no chain source is `WALLET_NO_CHAIN_SOURCE`. These MUST NOT be collapsed: the first says build a different bundle, the second says retry this one. `accepted:true` reports mempool admission ONLY and is NOT evidence anything reached a block — a caller MUST NOT record an outcome from it; only a buried confirmation of the created coin is evidence. `INVALID_PARAMS` on hex that is not a streamable `SpendBundle`, refused BEFORE any network call. A bundle requiring a signature from any key the NODE custodies — whatever puzzle wraps the coin — while `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off is `WALLET_NODE_SPEND_DISABLED`, also refused before any network call — the node relays what somebody ELSE signed, and it signs on request, so whether the node could have signed it is CHECKED rather than assumed. TOKEN-GATED (not an open read). |
 | `control.chiaPeers.add` | `ip` (a bare IPv4/IPv6 literal — no brackets, no port, no hostname; the standard full-node port is assumed) | `{added: true, ip, port, corroboration_bypassed, notice}`. TRUSTS a Chia full node: it writes the `user_managed` peer row that is the ONLY way to reach `PeerTrust::Operator`, the trust level whose answers may drive catch-up, rollback and the `initial_sync_complete` flag WITHOUT a quorum. Every other peer is `Discovered` and must be corroborated by independently chosen peers first (§18.16). `ip` is CANONICALISED on the way in (`IpAddr` display form — RFC 5952 lowercase compressed for v6) and echoed back in that form, so one host is one entry however it was spelled; `INVALID_PARAMS` on anything that is not a bare literal, refused before any write. `corroboration_bypassed` is the RESULTING trust state, NOT a restatement of the request: a node MUST report `false` where the entry did not end up trusted — adding a peer that was BANNED un-bans it and confers no bypass. `notice` carries the cost as a sentence and MUST be non-empty, name the corroboration bypass, and be rendered VERBATIM; a client MUST NOT paraphrase, truncate or suppress it. The wording MUST authorise only **a node the operator runs themselves** — never vouching or recommending, which widen the case past what justifies the entry's unbounded authority. Idempotent — re-adding a known peer succeeds and un-bans it. A node MUST serve this from the SAME peer store its wallet replica consults. **MASTER-TOKEN TIER** (`ControlMethod::requires_master_token`): a paired token MUST be refused, because the entry outlives the token that wrote it and `pairing.revoke` removes no peer row. |
 | `control.chiaPeers.list` | — | `{peers: [{ip, port, peak_height, user_managed, banned}]}` — every tracked Chia peer: TRUSTED, DISCOVERED **AND BANNED** alike. `user_managed` tells the trusted set from the discovered one and MUST be reported rather than filtered on: a list showing only the trusted set would let a person conclude the node talks to nobody else. `banned` MUST likewise be reported and its rows MUST NOT be omitted — this is the ONLY enumeration of the ban set, and a blocklist a person cannot read is a blocklist they cannot correct. This enumeration is DISTINCT from the dialling read, which excludes banned peers; a node MUST NOT serve both from one relaxed query. `peak_height` is `null` where the node holds no telemetry for that peer yet — `null` means UNOBSERVABLE and MUST NEVER be reported as `0`, which would render an unpolled peer as one stalled at genesis. A reported height is that peer's CLAIM, never a verified fact, and MUST NOT be aggregated into a chain position (NC-12). TOKEN-GATED at the ORDINARY tier — a read grants nothing that outlives the token, and a paired client must stay able to show the operator the trust state it is subject to. |
@@ -2221,6 +2273,23 @@ These methods are NEVER relayed upstream — a signing request must never leave 
 authorized call is served locally (or, until the wallet surface is served on a given transport, returns
 a catalogued error — it is never proxied to the public gateway).
 
+**The gate binds EVERY transport into the wallet handler set, and the binding MUST be structural
+(dig-node#257).** The tier is a property of the CAPABILITY, never of the transport a caller reached
+it through. The Sage-parity mTLS listener authenticates with a shared client certificate whose DER
+must equal the server's own; that authenticates the transport and MUST NOT be treated as
+authorizing a capability. A node MUST NOT serve any route into the wallet handler set without first
+obtaining an authorization decision for the requested method name — including for a method name the
+node does not implement, so a future method cannot arrive ungated.
+
+This MUST be enforced by construction rather than by a per-route check: the router is built with an
+authorization gate as a REQUIRED parameter, there is exactly one handler behind the method route,
+and the only gate the transport crate itself offers denies everything. A per-route test set cannot
+see a route nobody wrote a test for, which is how this listener came to serve custody, spends and
+master-tier peer mutations on certificate possession alone.
+
+A refused call MUST be answered `401` and MUST NOT reach the handler, so a refused spend has not
+been built or broadcast. The refusal MUST be distinguishable from "no such method".
+
 **Retired namespaces (`wallet.*`, `auth.*`) MUST be refused outright.** Node-side USER custody and its
 unlock-auth gate were removed by dig_ecosystem#1701, superseded by the #1500 ratification: the node holds
 no user spend key. No method exists under either prefix, and a node MUST classify the whole prefix as
@@ -2412,11 +2481,28 @@ flood of never-attached `begin`s cannot grow engine state without bound.
 `install` · `uninstall` · `start` · `stop` (each accepting `--scope <auto|system|user>`, §9.1) ·
 `status` · `pair` (§7.11) · `open` (§8.5) ·
 the **control-parity** subcommands `info` · `config` · `cache` · `stores` · `sync` · `updater` ·
-`subscriptions` (§8.6) · `peers` (§8.7) · `logs` (§11).
+`subscriptions` (§8.6) · `peers` (§8.7) · `network-info` (§8.8) · `logs` (§11).
 
 The `dign` alias binary (§2.1a) exposes this SAME subcommand set with the SAME semantics — `dign
 <subcommand>` is equivalent to `dig-node <subcommand>` in every respect except the reported program
 name.
+
+### 8.8. `network-info` — this node's own network posture (#303)
+
+`network-info` prints this node's `peer_id`, network id, effective L2 genesis, listen address,
+reachability, and its advertised candidate addresses in the node's own advertisement order, which
+is IPv6-first (§5.2). The order MUST be passed through untouched: re-sorting would hide a node
+whose IPv6 advertisement is missing, which is the fault an operator runs the command to find. An
+absent field MUST render as `unknown` and MUST NOT be filled with a plausible default — a
+fabricated `direct` or an invented `0.0.0.0` reads exactly like a measurement.
+
+**It reads the OPEN surface and is NOT token-gated, deliberately.** It is the one documented
+exception to §8.6's rule that a CLI subcommand presents the master control token: it calls
+`dig.getNetworkInfo`, whose body this node already hands any peer that dials it, so a loopback
+caller learns nothing a stranger does not. Gating it would buy no confidentiality while costing
+real availability — on a `.deb` install the control token is `0600 root:root` (§7.11/#501), so an
+ordinary user asking "what is my node's address" would be told to elevate for a read the network
+performs for free. This is a property to PRESERVE, not an oversight to tighten later.
 
 ### 8.6. Control-parity subcommands (#426)
 
@@ -2426,7 +2512,9 @@ extension drives it from a browser. Each subcommand is a THIN dispatch — it ca
 `control.*` method over the node's loopback endpoint, presenting the MASTER control token
 (`X-Dig-Control-Token`, read WITHOUT minting — §7.11/#501); no CLI logic is forked from the control
 plane. A mutating CLI control is therefore gated by the identical capability as the WS surface (the
-on-disk master token = local-machine control), never an unauthenticated backdoor.
+on-disk master token = local-machine control), never an unauthenticated backdoor. The one
+documented exception is `network-info` (§8.8), which reads an OPEN, already-public surface and is
+token-free by design; it is not a control-parity subcommand and this rule does not reach it.
 
 - `info` → `control.status` — the rich node status (version, uptime, cache, hosted-store +
   cached-capsule counts, §21 sync availability). DISTINCT from `status` (§8.3), which is an
@@ -2445,7 +2533,8 @@ on-disk master token = local-machine control), never an unauthenticated backdoor
   `wallet coins-by-parent <parent_coin_id> [--after-coin-id <id>] [--limit <n>]` →
   `control.wallet.coinsByParent`;
   `wallet arrivals [--after-seq <n>] [--limit <n>]` → `control.wallet.arrivals`; `wallet peak` →
-  `control.wallet.peak`; `wallet broadcast <signed_bundle_hex>` → `control.wallet.broadcast`. The
+  `control.wallet.peak`; `wallet reset-coin-db --confirm` → `control.wallet.resetCoinDb`;
+  `wallet broadcast <signed_bundle_hex>` → `control.wallet.broadcast`. The
   open chain reads (everything above except `broadcast` and `arrivals`) need no token; `broadcast` is token-gated like every
   other mutation, and carries only already-signed bytes (§908).
 - `wallet export-seed [--path <file>]` reaches NO control method. It is a LOCAL, OFFLINE read of
@@ -2485,6 +2574,13 @@ which fail unless the parser really accepts the verb and carries its operands th
   port `0`, which is what dig-nat records for a relay-accepted circuit with no configured relay
   endpoint — MUST OMIT the key rather than emit the wildcard. A consumer MUST therefore treat a
   missing `address` as "this peer has no known dialable address", never as a malformed element.
+  The peer-facing `dig.getPeers` carries the SAME rule in the shape its own wire uses: each peer
+  row's `addresses` is an ARRAY, so a peer with no dialable destination MUST be emitted with an
+  EMPTY array — the row kept, the address withheld. The row MUST NOT be dropped (the asking node
+  would not learn the peer exists, and it may still be reachable via the relay), and the key MUST
+  NOT be omitted or set to null (`dig.announce` validates that `addresses` IS an array). A node
+  MUST NOT serve a non-destination to a remote peer as a dial candidate: a peer that dials it
+  wastes one of its few dial slots, and a peer that caches it caches a hole.
   The array is present whenever a peer network is running and
   omitted (count only) on the in-process FFI path / before bring-up. The per-peer `peer_id` is the
   machine-checkable proof of a mutual A↔B connection (each side lists the other's `peer_id`). Peer
@@ -2631,9 +2727,42 @@ exit `1` (`NOT_SERVING`) so scripts can gate on liveness; the JSON result carrie
 | 4 | `SERVICE_FAILED` | A service-manager operation failed. |
 | 5 | `BIND_FAILED` | `run`: could not bind the loopback address. |
 | 6 | `IO_ERROR` | Other I/O error. |
+| 12 | `NODE_UNREACHABLE` | The node did not answer; the operation was not measured. |
 
-I/O-error mapping: `PermissionDenied` → 3; `AddrInUse`/`AddrNotAvailable` → 5; anything else → 6.
+I/O-error mapping, in the order `ExitCode::from_io_error` matches — every arm, because a partial
+list reads as complete and the omitted arms are exactly the ones a caller gets wrong:
+`PermissionDenied` → 3; `AddrInUse`/`AddrNotAvailable` → 5; `InvalidInput` → 2 (a bad argument
+surfaced as an I/O error is still a usage error); `ConnectionRefused` → 12; anything else → 6.
+
 Numeric values and symbolic names are a stable contract and MUST NOT be renumbered.
+
+**The occupied numbers span the whole DIG command line, not this CLI alone (MUST).** `dign` and
+dig-app's `diga` deliberately share one numbering so a caller sees one surface across both
+(`dig-app-core/src/gateway/outcome.rs`), so a code is available only if it is unoccupied
+ECOSYSTEM-WIDE. Absence from the table above does NOT make a number free — this repo has already
+paid for that reasoning once in the JSON-RPC error space, where `-32015` was taken as "the next
+free code" from the owning crate's own list and collided with a released `METADATA_TOO_LARGE`,
+forcing a yank. The full occupied set, measured, is:
+
+| Code | `dign` (this CLI) | `diga` (dig-app gateway) |
+|---|---|---|
+| 0 | `OK` | `OK` |
+| 1 | `NOT_SERVING` | — |
+| 2 | `USAGE` | `USAGE` |
+| 3 | `PERMISSION_DENIED` | — |
+| 4 | `SERVICE_FAILED` | — |
+| 5 | `BIND_FAILED` | — |
+| 6 | `IO_ERROR` | `IO_ERROR` |
+| 7 | — | `NOT_CONNECTED` |
+| 8 | — | `ENGINE_ERROR` |
+| 9 | — | `LOCKED` |
+| 10 | — | `NOT_FOUND` |
+| 11 | — | `DENIED` |
+| 12 | `NODE_UNREACHABLE` | — |
+
+0–11 were therefore taken before this CLI added a code, and 12 is the first free number. A new
+code MUST be drawn from 13 upward and MUST re-check BOTH tables first; 126, 127 and 128+n are
+reserved by the shell and MUST NOT be used.
 
 ---
 
@@ -4102,7 +4231,7 @@ Two cheaper signals MUST NOT be used, both having shipped and been found unsound
   a delete decision.
 
 **Operator kill switch.** Store-melt propagation MUST be disableable at runtime via
-`DIG_NODE_STORE_MELT` (default ON; only an explicit `off`/`0`/`false`/`no` disables it), matching the
+`DIG_NODE_STORE_MELT` (default ON; only an explicit off-token — `off`/`disabled`/`0`/`false`/`no` — disables it), matching the
 shape of `DIG_NODE_BACKFILL_ON_MISS`. This is the node's only path that irreversibly deletes content
 in response to chain state, and it propagates, so a fault is correlated across holders rather than
 isolated; an operator MUST be able to stop the deleting without downgrading the node. Disabling is
@@ -4362,12 +4491,15 @@ ONLY when `origin` is `auto` AND `ever_funded` is false. An absent or unparsable
 MUST answer "not disposable". A momentarily-zero or unreadable balance is not evidence a wallet never
 mattered, which is why this is a stored latch rather than a live predicate.
 
-> **NOT YET SATISFIED — no balance observer calls `latch_ever_funded` today.** The latch persists
-> correctly when called and is covered against disk, but nothing in the balance-read path calls it, so
-> in the shipped build `ever_funded` remains `false` and a funded auto-created wallet is still reported
-> as disposable. Wiring the balance observer is required before any surface acts on disposability. This
-> paragraph states the intended contract; the sentence above is what is *implemented*, and the two must
-> not be conflated.
+**The observation point.** The mirror pass observes the operator wallet's own balance on a timer and
+classifies each reading before latching. The classification has THREE outcomes, not two, and the
+distinction is normative: a non-zero figure latches from EITHER tier, so a stale replica or a chain
+fallback answer showing money latches immediately; a CURRENT zero from an authoritative tier is real
+evidence of emptiness and does NOT latch; and an unreadable or non-current zero says nothing and
+latches nothing. That last case DEFERS rather than latching, because every node is in it for the
+first seconds of its life — latching there would make the disposable predicate vacuously false for
+every wallet in the ecosystem, and the latch is monotonic, so deferring can never settle into
+describing a funded wallet as disposable.
 
 **The device key and the wallet directory are a COUPLED PAIR.** `<device_dir>` and `<wallet_dir>` are
 meaningful only together: neither opens the seed alone. Any operation that removes one MUST remove or
@@ -4920,7 +5052,8 @@ Beyond the boundary, the supervisor MUST hold all four of the following for an o
   blocks, however many individually-legal frames they arrived in.
 * **Fail closed on any backwards move.** When a rollback is applied, or the update's height is below the
   current peak, `initial_sync_complete` MUST be cleared. Wallet-scoped reads then route to the fallback
-  tier (§18.7) until a genuine catch-up re-establishes the flag. Without this a single frame makes a funded
+  tier (§18.7) until a later sync pass re-establishes the flag — an address-history catch-up, or the
+  oracle-tier point-read refresh, which is the other writer of it. Without this a single frame makes a funded
   wallet report `balance 0` with `phase: synced`.
 * **A monotonic replica peak.** `new_peak_wallet` MUST only ADVANCE `sync_state.peak_height`; a backwards
   claim is refused. That height bounds a claimed confirmation on an OPEN read, so a peer able to lower it
@@ -5337,6 +5470,17 @@ Every reservation MUST expire. Release is normally observational — the coin is
 bundle is definitively refused — and the expiry is the backstop that keeps a release path which never
 runs from stranding a coin permanently. Failing to record a reservation MUST NOT fail a push that the
 mempool already accepted.
+
+A push MUST reserve its inputs unless the network DEFINITIVELY refused the bundle. A refusal is
+definitive only when the mempool stated its reason (`accepted:false` WITH a `rejection`); a bare
+denial carrying no reason, and any transport failure, MUST be treated as POSSIBLY IN FLIGHT and hold
+the inputs to the TTL. The node cannot distinguish "never relayed" from "relayed, and the
+acknowledgement was lost", and under §13 every dialled peer is untrusted, so a source that denies a
+relay it performed MUST NOT thereby return the coins to selection — a second send inside the
+confirmation window could otherwise reselect the same inputs. The TTL MUST NOT be shortened to
+compensate for the wider hold: that trades a double-select for a lockout, and a lockout is the worse
+failure. Requiring a STATED reason is what keeps a genuine mempool rejection from holding a user's
+coins for the full TTL.
 
 18.8. **Method surface — reads (served).** `login`, `logout`, `get_version`,
 `get_sync_status`, `check_address`, `get_derivations`, `get_are_coins_spendable`,
@@ -6101,6 +6245,92 @@ this host cannot open, the node MUST NOT make a recovery promise: per dig-keysto
 §17.5b the envelope records a hardware *class* and carries no device identity, so the same error is
 returned for a blob copied off its machine (recoverable) and for the original machine with its
 trusted component wiped (permanent). The node MAY state that condition; it MUST NOT resolve it.
+### 18.25a. What sealing the seed does NOT cover: the derived peer key (dig-node#343)
+
+Sealing the seed (§18.25) protects the ability to **re-derive** the node's identity. It does NOT
+protect the **derived** material, and a surface MUST NOT imply that it does.
+
+`dig_tls::NodeCert::load_or_generate` persists the derived BLS/TLS leaf key **UNSEALED** at
+`<cache_dir>/peer-net/identity/node.key`, because the dig-gossip pool listener loads it from disk
+BY PATH (`dig_peer_protocol::load_ssl_cert`) and holds no key material of its own at that point.
+
+Since `peer_id = SHA-256(TLS SPKI DER)`, possession of that one file IS possession of the node's
+network identity for every purpose the network cares about — dialing as it, serving as it, and any
+authorization keyed on it — **without touching either half of the sealed pair**. The
+partial-exfiltration boundary §16.4 and §18.25 describe therefore holds for the SEED and does not
+extend to the key peers authenticate.
+
+- Any surface reporting the machine key's protection tier **MUST name this gap in the same
+  sentence**, so a reader cannot take a copy-resistance claim about the seed as a claim about the
+  node's network identity. The node satisfies this by appending a fixed caveat to every protection
+  summary, in one place, so a later tier cannot be added without it.
+- The node MUST NOT change `peer_id` in the course of closing this gap. A changed `peer_id`
+  silently orphans every peer holding the old one, which is a worse outcome than the exposure.
+- Sealing `node.key` is the preferred end state and MUST use the **same device key** as the seed.
+  A separate device key would make the derived key unrecoverable after a device-key loss without
+  also making the seed unrecoverable, and dig-keystore `SPEC.md` §17.5b establishes that
+  `HardwareUnwrapFailed` cannot distinguish a copied blob from a wiped device — so an
+  independently-sealed derived key turns a recoverable state into a bricked node identity.
+- Until then the gap is DOCUMENTED, not implied. An honest stated gap is correctable; an unstated
+  one is a shipped claim that is false about the artifact at risk.
+
+### 18.25b. Master tier is authority that outlives the token (dig-node#255)
+
+`dig-node-control-interface` states the rule as *"the effect outlives the token that invoked it"*.
+That is necessary and not sufficient, and a node MUST apply the refined rule: a capability is
+**master tier** when its effect both **outlives the token** AND **confers authority on a
+principal** — installs someone the node will thereafter believe, obey, or speak to.
+
+- `control.chiaPeers.add` / `.remove` — installs a peer believed WITHOUT corroboration. Master.
+- `control.config.setUpstream` — persists a caller-chosen third party that every method this node
+  does not implement is FORWARDED to, read on next start, and untouched by `pairing.revoke`.
+  Master. The node ships with no upstream precisely so an unimplemented method answers a truthful
+  local `-32601`; pointing it at an attacker-controlled URL makes that surface answerable by the
+  attacker, and the escalation delegates — after the call the caller no longer needs the token.
+- `control.cache.setCap`, `control.log.setLevel` — persist and survive revocation, but move a
+  local resource budget or local verbosity. They name no principal and confer no authority.
+  ORDINARY, deliberately: promoting them would break paired clients for nothing gained.
+
+A node MUST resolve the tier by CALLING the contract's predicate, never by restating it as a string
+match. Where the node enforces master tier AHEAD of the contract, the additional names MUST be a
+single declared list that only ever WIDENS the contract's set, and a test MUST fail once the
+contract adopts a name from it, so the two statements of one rule cannot drift.
+
+**A persisted upstream MUST be a well-formed `http(s)` URL.** The node MUST reject a value with no
+scheme it speaks, an empty host, whitespace in the host, or userinfo (`user@host` reads as one host
+and resolves to another). Cleartext `http://` MUST be confined to loopback.
+
+### 18.25c. Attacker-supplied text in an operator prompt (dig-node#346)
+
+`pairing.request` is OPEN and unauthenticated, and the `client_name` it carries is composed into
+the sentence an operator reads before granting a control token. It is therefore an input to a
+privileged decision and MUST be treated as hostile.
+
+- **The node MUST NOT silently truncate it.** An unmarked truncation is a forgery the node
+  performs: padding with budget-consuming characters that render as nothing makes the node itself
+  produce a short, trusted-looking name. The node MUST either REFUSE an over-long value at ingest —
+  which is what `pairing.request` does — or mark the clip **IN-BAND**, as part of the rendered
+  string, never as a separate flag a caller can drop.
+- **The display budget MUST be charged on RENDERED WIDTH**, and Unicode `Cf` format characters,
+  zero-width characters and bidi overrides MUST be neutralised — not merely `is_control()`. A
+  neutralised character MUST render VISIBLY; deleting it lets an attacker choose what the operator
+  sees just as effectively as inserting one.
+- **Only the RENDERING is neutralised.** The stored `client_name` MUST stay byte-verbatim, because
+  a value that is ever compared or used as an identity must not be quietly rewritten.
+- **The value MUST NOT be able to add a line to the prompt**, which is line-oriented, and its slot
+  MUST be quoted such that an embedded quote cannot terminate it and let the remainder read as the
+  node's own words.
+
+### 18.25d. A privilege-gated test MUST assert in every privilege branch (dig-node#355)
+
+A security test that skips its assertions under `root` reports `ok` while proving nothing, and CI
+containers commonly run as root — so the guard may never have executed. A silently-skipping test is
+worse than a missing one, because it is counted as coverage.
+
+Where a discriminator (a Unix mode bit) is genuinely not meaningful under `root`, the test MUST
+assert the COMPLEMENTARY observable that still is — ownership, which only `root` can manipulate —
+rather than skipping. Every branch must be able to fail.
+
 ## 18.26. Coin reservations — the two phases, and who owns the truth (dig_ecosystem#3127)
 
 A **coin reservation** records that a coin is already committed to a spend that has not settled, so a
@@ -8275,6 +8505,55 @@ A pass runs: at start-up (once the wallet and a chain source are available), on 
    the plan's create set until that entry resolves. The audit record is the in-flight ledger; the
    disk and the chain remain the only steady-state truths.
 
+   **A funding-coin reservation is a BOUNDED hold.** The audit record also reserves the funding
+   coins a non-terminal entry consumed, so a second create in the same confirmation window cannot
+   re-select them. That reservation MUST expire: it holds a coin for
+   `FUNDING_RESERVATION_WINDOW_MS` = `2 x MIRROR_ROUND_LENGTH_MS` (20 minutes) measured from the
+   entry's LAST revision, after which the coin returns to the selectable set. An unbounded hold is a
+   lockout — a spend that never lands would strand its inputs forever and a genuinely funded
+   operator wallet would report `Insufficient` permanently. The window is derived: the chain-side
+   figure is the wallet's own post-broadcast reservation lifetime (10 minutes, roughly a dozen Chia
+   blocks), and one further round is added because this hold is re-evaluated only once per
+   `MIRROR_ROUND_LENGTH_MS`, so a threshold equal to the poll interval would release an entry on the
+   first pass at which its confirmation could even have been observed. A record whose `updated_ms`
+   is in the FUTURE keeps its hold.
+
+   **Expiry MUST NOT change the record.** The entry stays exactly the `submitted` or `unresolved` it
+   was, and stays resolvable by step 7 and by §23.5's reconcile indefinitely. Releasing a coin is
+   not a claim that the spend failed: `unresolved` means "this node signed and does not know what
+   happened", which remains true afterwards. Writing a `failed` entry to settle the bookkeeping is
+   forbidden, for the same reason a `confirmed` entry carries its height and coin id inside the
+   variant.
+
+7. **Resolves spends an EARLIER pass broadcast.** A mirror spend is broadcast in one pass and
+   confirms during a later one, so the outcome MUST be recorded by an id-keyed resolution over the
+   audit record rather than by the handle that opened it. Before the observation of step 2 is
+   planned against, every mirror-coin entry that is `submitted` or `unresolved` is resolved as
+   follows, and only as follows:
+
+   | operation | its positive key | how the height is obtained |
+   |---|---|---|
+   | reclaim | the `intended_coin_id` the submission recorded | a coin read on that id |
+   | create | the coin in step 2's observation matching `(store, root, epoch)` | a coin read on THAT coin's id |
+
+   A create records no `intended_coin_id` — the created coin's parent is whichever funding input the
+   builder drew from — so its key MUST be the coin's appearance in the chain observation. A coin id
+   MUST NOT be derived, guessed, or otherwise invented for this purpose.
+
+   The coin read has THREE outcomes and they MUST stay three: a height (resolve to `confirmed`); the
+   coin absent, or present with no height (resolve nothing); the source unable to answer (resolve
+   nothing, and NOT as an absence). A source that cannot be reached is not evidence about a coin in
+   either direction.
+
+   Disappearance MUST NOT be used as a key. The mirror puzzle hash is shared by every mirror coin,
+   so a coin leaving the owned set proves only that SOMEONE spent it, and a short scan is
+   indistinguishable from a spend.
+
+   Where more than one open entry claims one coin — two reclaim attempts of the same coin derive the
+   same child id, and step 6 deliberately does not suppress on `unresolved` — NONE of them is
+   resolved. At most one of those bundles created the coin, and this node cannot tell which; the
+   entries remain `unresolved`, which is what they are.
+
 A confirmed create is `Confirmed { height, coin_id }` in the audit record, observed on the created
 coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile accounts for it.
 
@@ -8308,16 +8587,24 @@ cannot observe a half-written file the node produced itself.
 
 ### 25.6. The DHT pointer, and epoch rollover
 
-> **PENDING — not yet implemented.** This subsection is normative and is NOT satisfied by
-> code as of this section's introduction. Tracked as dig-node#377 step 7 (the dig-dht 0.12.1 → 0.15 bump and the
-> announce-seam attach). Until it lands, a reader MUST NOT
-> rely on the behaviour described here.
+> **IMPLEMENTED.** The announce seam attaches the pointer
+> (`dig_node_core::dht::announce_inventory_ids_with_pointers`), the rollover re-announce is
+> `DhtHandle::reannounce_on_epoch_rollover`, and the node's production pointer source is
+> `dig_node_service::mirror::pointers::SnapshotMirrorPointers`, which reads the observation the last
+> pass published. A node with no observation, or with no coin for a capsule, publishes no pointer;
+> that is an ordinary configuration and not a fault.
 
 After a create confirms, the node attaches the coin id to its DHT provider record
 (`dig_dht::ProviderRecord::unverified_mirror_coin_id`) for that content, and it MUST re-announce on
 epoch rollover once the new epoch's coin confirms — dig-dht has no clock and republish re-attaches
 whatever was recorded at announce time, so an un-refreshed pointer goes stale one epoch after
 publication and a correctly-collateralised node reads as uncollateralised.
+
+Only a coin bonding the CURRENT epoch may be published. A coin from a previous epoch advertises
+nothing, and pointing at it makes a correctly-collateralised node read as uncollateralised — the
+same failure the rollover re-announce exists to prevent, reached without any rollover. A whole-store
+announce carries no pointer at all: a coin bonds one `(store, root, epoch)` tuple and cannot speak
+for every generation of a store.
 
 The pointer is an UNTRUSTED convenience (NC-12): it tells a verifier where to look, never what the
 coin is. Its absence MUST NOT degrade discovery or be treated as a fault. A verifier — this node

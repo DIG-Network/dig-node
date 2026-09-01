@@ -154,8 +154,18 @@ pub struct PushOutcome {
     /// The bundle's transaction id (its name), lowercase 64-hex. Reported only on acceptance —
     /// a refused bundle has no transaction to point at.
     pub transaction_id: Option<String>,
-    /// The mempool's own words for the refusal, when it refused.
+    /// The mempool's own words for the refusal, when it refused AND stated a reason.
+    ///
+    /// `None` for a bare verdict, and that absence is load-bearing: dig-node#348's reservation
+    /// hold keys on it, because a refusal the mempool did not explain may still be in flight.
     pub rejection: Option<String>,
+    /// The source's label for the answer (`SUCCESS`, `PENDING`, `FAILED`, `UNKNOWN`) — always
+    /// present, whether or not a reason came with it.
+    ///
+    /// Separate from `rejection` because the two answer different questions and only one of them
+    /// may drive the hold. Narrowing `rejection` to a STATED reason would otherwise have left an
+    /// operator debugging a bare `PENDING` with three nulls and no label at all.
+    pub verdict: String,
 }
 
 /// Pushes an ALREADY-SIGNED bundle to the network.
@@ -492,6 +502,29 @@ impl ChainTransport {
     /// The node never signs and is never given anything it could sign with (§908): this takes a
     /// complete bundle and relays it. A mempool refusal comes back as `Ok(PushOutcome)` with
     /// `accepted: false`; an unreachable network is an `Err`.
+    /// The mempool's OWN stated reason for refusing a bundle, or `None` when it stated none.
+    ///
+    /// Load-bearing for dig-node#348, not cosmetic. `is_definitive_rejection` (`sage/rpc.rs`) frees a
+    /// bundle's inputs back into selection only for a refusal the mempool STATED, and holds them to the
+    /// TTL otherwise -- because a peer that relayed the bundle and then answered with a bare verdict may
+    /// still have put it in flight, and reselecting those coins opens the double-select window §13 and
+    /// SPEC §18.7 exist to close.
+    ///
+    /// An earlier version manufactured a reason here from `status.status`, so `rejection` was
+    /// `Some(..)` on EVERY non-admitted answer, `is_definitive_rejection` was true every time, and the
+    /// hold could never fire. The guard read as shipped and was vacuous.
+    ///
+    /// **A verdict is not a reason.** `PENDING` says the node did not admit the bundle; it does not say
+    /// why, and it does not say the bundle is gone.
+    fn stated_rejection(status: &chia_query::TxStatus) -> Option<String> {
+        status
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .map(|reason| format!("{}: {reason}", status.status))
+    }
+
     pub async fn push(&self, bundle: &SpendBundle) -> Result<PushOutcome> {
         let status = self
             .client()
@@ -514,20 +547,28 @@ impl ChainTransport {
                 accepted: true,
                 transaction_id: Some(hex::encode(bundle.name())),
                 rejection: None,
+                verdict: status.status.clone(),
             }
         } else {
             PushOutcome {
                 accepted: false,
                 transaction_id: None,
-                // The node's OWN words when it sent them, so an operator sees
-                // `BAD_AGGREGATE_SIGNATURE` rather than a bare `PENDING`. Both are carried: the
-                // verdict is always present, the reason is not.
-                rejection: Some(match status.error.as_deref().map(str::trim) {
-                    Some(reason) if !reason.is_empty() => {
-                        format!("{}: {reason}", status.status)
-                    }
-                    _ => status.status.clone(),
-                }),
+                // The node's OWN words, and ONLY its own words. `None` when it sent none.
+                //
+                // This is load-bearing for #348, not cosmetic. `is_definitive_rejection`
+                // (`rpc.rs`) frees the inputs only for a rejection the mempool STATED, and holds
+                // them otherwise — because a peer that relayed the bundle and then answered with a
+                // bare verdict may still have put it in flight, and reselecting those coins opens
+                // the double-select window.
+                //
+                // Manufacturing a reason here from `status.status` defeated exactly that: it made
+                // `rejection` `Some(..)` on EVERY non-admitted answer, so the guard was true every
+                // time and the hold could never fire. The fix was vacuous while reading as shipped.
+                //
+                // A verdict is not a reason. `PENDING` says the node did not admit it; it does not
+                // say why, and it does not say the bundle is gone.
+                rejection: Self::stated_rejection(&status),
+                verdict: status.status.clone(),
             }
         })
     }
@@ -669,6 +710,77 @@ mod tests {
         let coin = Coin::new(Bytes32::new([1u8; 32]), Bytes32::new([2u8; 32]), 1_000);
         let spend = CoinSpend::new(coin, Program::from(vec![0x01]), Program::from(vec![0x80]));
         SpendBundle::new(vec![spend], Default::default())
+    }
+
+    fn status(verdict: &str, error: Option<&str>) -> chia_query::TxStatus {
+        chia_query::TxStatus {
+            status: verdict.to_string(),
+            success: false,
+            inclusion: chia_query::MempoolInclusion::NotAdmitted,
+            error: error.map(str::to_string),
+        }
+    }
+
+    /// **The label survives even when the reason does not.**
+    ///
+    /// Narrowing `rejection` to a STATED reason is what lets dig-node#348's hold fire — but taken
+    /// alone it left an operator debugging a bare `PENDING` with `accepted:false`,
+    /// `transaction_id:null`, `rejection:null` and **no label at all**. The response did not lie;
+    /// it just said strictly less than before, which is its own kind of regression on a money path.
+    ///
+    /// `verdict` and `rejection` answer different questions and only one of them may drive the
+    /// hold, which is why they are separate fields rather than one string.
+    ///
+    /// **Catches:** folding the label back into `rejection` (which re-breaks the hold), or dropping
+    /// it again (which re-blinds the operator).
+    #[test]
+    fn the_verdict_label_survives_a_refusal_that_states_no_reason() {
+        let bare = status("PENDING", None);
+        assert_eq!(
+            super::ChainTransport::stated_rejection(&bare),
+            None,
+            "a bare verdict must not read as a stated reason, or the #348 hold cannot fire"
+        );
+        assert_eq!(
+            bare.status, "PENDING",
+            "and the label itself must still be available to carry into the response"
+        );
+    }
+
+    /// **Proves (dig-node#348):** a bare verdict is NOT a stated reason.
+    ///
+    /// `is_definitive_rejection` (`sage/rpc.rs`) frees a bundle's inputs only for a refusal the
+    /// mempool STATED. An earlier version manufactured a reason here from `status.status`, so
+    /// `rejection` was `Some(..)` on every non-admitted answer, the guard was true every time, and
+    /// the hold could NEVER FIRE — the fix read as shipped and was vacuous. SPEC §18.7 says a bare
+    /// denial "MUST be treated as POSSIBLY IN FLIGHT"; this is what makes that true in code.
+    ///
+    /// The two rows differ ONLY in whether the node sent text, which is the distinction the guard
+    /// branches on. A version that keeps the verdict and drops the reason renders them identically
+    /// and passes any single-row assertion.
+    ///
+    /// **Catches:** re-manufacturing a reason from the verdict.
+    #[test]
+    fn a_bare_verdict_is_not_a_stated_rejection() {
+        assert_eq!(
+            super::ChainTransport::stated_rejection(&status("PENDING", None)),
+            None,
+            "a bare PENDING says the node did not admit the bundle, not why and not that it is \
+             gone — treating it as definitive frees coins that may still be in flight"
+        );
+        assert_eq!(
+            super::ChainTransport::stated_rejection(&status("PENDING", Some("   "))),
+            None,
+            "whitespace is not a reason"
+        );
+        assert_eq!(
+            super::ChainTransport::stated_rejection(&status(
+                "FAILED",
+                Some("BAD_AGGREGATE_SIGNATURE")
+            )),
+            Some("FAILED: BAD_AGGREGATE_SIGNATURE".to_string()),
+            "a reason the node actually stated must survive to the operator"
+        );
     }
 
     /// **The hex form round-trips.** Pinned because the wire carries hex, not a struct: a bundle

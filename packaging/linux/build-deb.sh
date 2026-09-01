@@ -73,8 +73,8 @@ printf '/etc/dig-node/dig-node.env\n' > "$STAGE/DEBIAN/conffiles"
 
 # --- maintainer scripts -----------------------------------------------------
 # postinst: pre-create the restrictive machine-wide state dir (#501 — root-owned 0700 so
-# the control token is not world-readable), enable+start the service, register the scheme
-# handler as the system default.
+# the control token is not world-readable), enable+start the service, cycle it on upgrade
+# (#305), and register the scheme handler as the system default.
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
@@ -126,6 +126,25 @@ case "$1" in
         echo "dig-node: configure /etc/dig-node/dig-node.env, then: systemctl enable --now net.dignetwork.dig-node.service"
       else
         systemctl enable --now net.dignetwork.dig-node.service || true
+      fi
+      # dig-node#305 — an UPGRADE must cycle the unit, or the old process keeps serving.
+      #
+      # `enable --now` above is a no-op on a unit that is already enabled and running, so before
+      # this the upgrade replaced /usr/bin/dig-node and left the OLD binary executing. That is
+      # silent in both directions an operator would check: `dig-node --version` reads the on-disk
+      # image and reports the NEW version immediately, and `systemctl is-active` reports active
+      # because the old process is genuinely healthy. Only MainPID moves, and nobody reads it. A
+      # security fix shipped through the .deb therefore did not take effect on upgrade.
+      #
+      # dpkg passes the previously-configured version as $2 only on an upgrade, so this is scoped
+      # to the case that needs it: on a first install `enable --now` has already started the new
+      # binary and a restart would be redundant churn.
+      #
+      # `try-restart` rather than `restart`: it cycles the unit ONLY if it is already running, so
+      # a node the operator deliberately stopped — including one held back by the #317
+      # no-autostart marker — stays stopped across every future upgrade.
+      if [ -n "${2:-}" ]; then
+        systemctl try-restart net.dignetwork.dig-node.service || true
       fi
     fi
     # Register the chia:// handler as the system default + refresh the desktop DB.

@@ -1067,10 +1067,11 @@ pub fn now_unix_secs() -> u64 {
 /// behaving exactly as it does today. The switch exists to let an operator SHED inbound work under a
 /// flood, so a typo must never silently disable discovery instead.
 fn ingest_enabled(raw: Option<&str>) -> bool {
-    !matches!(
-        raw.unwrap_or_default().trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "off" | "no"
-    )
+    // The SHARED off-vocabulary (dig-node#459), not a fifth private copy: `disabled` now works here
+    // exactly as it does on `DIG_PEER_NETWORK`. An operator shedding load under a flood reaches for
+    // whichever word they last saw work, and a switch that ignores it looks like a switch that does
+    // not work.
+    !crate::is_capability_off_token(raw.unwrap_or_default())
 }
 
 #[cfg(test)]

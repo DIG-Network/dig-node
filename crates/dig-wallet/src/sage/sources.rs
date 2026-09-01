@@ -1052,12 +1052,12 @@ mod sole_owner_tests {
     /// why the demonstration is needed rather than the real assertion alone.
     #[test]
     fn a_second_fabric_in_the_new_root_is_seen_and_judged_a_stray() {
-        let root = std::env::temp_dir().join(format!(
-            "dig-wallet-sole-owner-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let nested = root.join("seams");
+        // Owned by the guard, so the tree goes away on drop and on an unwind (dig-node#370).
+        let root = tempfile::Builder::new()
+            .prefix("dig-wallet-sole-owner-")
+            .tempdir()
+            .expect("a temporary root");
+        let nested = root.path().join("seams");
         std::fs::create_dir_all(&nested).expect("a temporary root");
         // Built from `CONSTRUCTOR` rather than written out, so this file never contains the
         // needle it sweeps for; and named `sources.rs` because that is the name the unqualified
@@ -1068,7 +1068,7 @@ mod sole_owner_tests {
         )
         .expect("write the fixture");
 
-        let roots = vec![("dig-node-core".to_string(), root.clone())];
+        let roots = vec![("dig-node-core".to_string(), root.path().to_path_buf())];
         let (sites, unread) = production_call_sites_in(&roots);
         std::fs::remove_dir_all(&root).expect("clean up the temporary root");
 

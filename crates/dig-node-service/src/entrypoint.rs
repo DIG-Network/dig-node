@@ -13,6 +13,7 @@
 //!   start      Start the installed service.
 //!   stop       Stop the running service.
 //!   status     Report whether the node is serving (probes /health).
+//!   network-info  This node's own network posture (peer id, addresses, reachability).
 //!
 //! With no subcommand, the binary runs in the foreground (equivalent to `run`), so a
 //! bare invocation just serves — the least-surprise default for a localhost endpoint.
@@ -35,6 +36,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use crate::cli::{error_envelope, success_envelope, ExitCode, Outcome};
 use crate::config::Config;
 use crate::control_cli::{self, ControlAction};
+use crate::network_info;
 use crate::open;
 use crate::pair::{self, PairAction};
 use crate::peers::{self, BanState, PeersAction};
@@ -185,6 +187,13 @@ enum Command {
         #[command(subcommand)]
         action: Option<SubscriptionsCommand>,
     },
+    /// This node's own network posture: peer id, network + genesis, advertised addresses
+    /// (IPv6-first, §5.2), reachability and relay reservation.
+    ///
+    /// Answers the question `peers` cannot: `peers` describes who this node is TALKING to, this
+    /// describes how this node is REACHABLE. Reads the node's open `dig.getNetworkInfo` surface,
+    /// so it needs no control token — every field here is already published to any peer.
+    NetworkInfo,
     /// View + manage the node's peer connections — parity with the extension's peer surface.
     /// With no sub-action, lists the live peer status (running flag, connected count, relay, and —
     /// on a newer node — the per-peer list with addresses shown IPv6-first per §5.2).
@@ -375,6 +384,21 @@ enum WalletCommand {
     },
     /// Print the chain peak this node reads against (READ-ONLY).
     Peak,
+    /// DESTRUCTIVE: discard this node's cached coin database and re-sync it from chain.
+    ///
+    /// Use when a coin's asset never resolves — a parent spend that could not be fetched is
+    /// skipped and never retried, so its value stays missing from asset-scoped balances for the
+    /// life of the database. An ordinary stale cache repairs itself and needs no reset.
+    ///
+    /// Discards CHAIN-DERIVED rows only; they come back by syncing. It never touches your seed,
+    /// your device key, or any other key material. It refuses while a spend is in flight.
+    ///
+    /// Requires `--confirm`.
+    ResetCoinDb {
+        /// Acknowledge that this discards the cached coin database.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Print the wallet's chain-sync phase, replica height and Chia peer count (READ-ONLY).
     ///
     /// Distinct from `dig-node sync status`, which is about DIG stores, not the chain.
@@ -750,6 +774,7 @@ impl Command {
             Command::Spends { .. } => "spends",
             Command::Updater { .. } => "updater",
             Command::Subscriptions { .. } => "subscriptions",
+            Command::NetworkInfo => "network-info",
             Command::Peers { .. } => "peers",
             Command::Collateral { .. } => "collateral",
             Command::Mirror { .. } => "mirror",
@@ -904,6 +929,7 @@ pub fn run() -> std::process::ExitCode {
             action,
             json,
         ),
+        Command::NetworkInfo => render(network_info::run(&config), action, json),
         Command::Peers { action: cmd } => match peers_action(cmd) {
             Ok(a) => render(peers::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
@@ -1052,6 +1078,7 @@ fn wallet_action(cmd: WalletCommand) -> Option<ControlAction> {
             ControlAction::WalletArrivals { after_seq, limit }
         }
         WalletCommand::Peak => ControlAction::WalletPeak,
+        WalletCommand::ResetCoinDb { confirm } => ControlAction::WalletResetCoinDb { confirm },
         WalletCommand::SyncStatus => ControlAction::WalletSyncStatus,
         WalletCommand::Broadcast { signed_bundle_hex } => {
             ControlAction::WalletBroadcast { signed_bundle_hex }
@@ -1407,6 +1434,41 @@ fn run_service(config: Config) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// **The bare `pair` verb LISTS; only `pair approve <id>` approves.**
+    ///
+    /// This exists because a remedy string in `control.rs` told an operator that `sudo dign pair`
+    /// "approves the client's pending request". It does not, and nothing could see the mistake:
+    /// the remedy's own test asserted `contains("dign pair")`, which the wrong sentence satisfies
+    /// as its own substring. Pinning the mapping HERE means the claim is measured against the
+    /// parser rather than against a phrase, so the two cannot drift apart silently.
+    #[test]
+    fn the_bare_pair_verb_lists_and_only_approve_approves() {
+        let pair_action = |argv: &[&str]| match Cli::try_parse_from(argv)
+            .expect("the verb parses")
+            .command
+            .expect("a subcommand was given")
+        {
+            Command::Pair { action } => match action {
+                None | Some(PairCommand::List) => PairAction::List,
+                Some(PairCommand::Approve { pairing_id }) => PairAction::Approve { pairing_id },
+                Some(PairCommand::Revoke { token_id }) => PairAction::Revoke { token_id },
+            },
+            _ => panic!("expected a pair command from {argv:?}"),
+        };
+
+        assert!(
+            matches!(pair_action(&["dig-node", "pair"]), PairAction::List),
+            "a bare `pair` must remain a LIST -- the remedy text depends on it"
+        );
+        assert!(
+            matches!(
+                pair_action(&["dig-node", "pair", "approve", "abc123"]),
+                PairAction::Approve { ref pairing_id } if pairing_id == "abc123"
+            ),
+            "`pair approve <id>` must approve, and must carry the id through"
+        );
+    }
+
     /// **`dign mirror bond-states --after` sends the cursor to the node.**
     ///
     /// Asserted on the WIRE params rather than on the selected method, because a parser that
@@ -1745,6 +1807,10 @@ mod tests {
                 "control.wallet.arrivals",
             ),
             (vec!["dig-node", "wallet", "peak"], "control.wallet.peak"),
+            (
+                vec!["dig-node", "wallet", "reset-coin-db", "--confirm"],
+                "control.wallet.resetCoinDb",
+            ),
             (
                 vec!["dig-node", "wallet", "broadcast", "deadbeef"],
                 "control.wallet.broadcast",

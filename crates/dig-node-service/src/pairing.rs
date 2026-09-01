@@ -76,7 +76,16 @@ const PAIRING_TTL_MS: u64 = 5 * 60 * 1000;
 /// pending entries are dropped past this.
 const MAX_PENDING: usize = 32;
 
-/// The longest `client_name` retained (defensive — it is echoed to the operator).
+/// The longest `client_name` this node will ACCEPT, in characters.
+///
+/// It is a REFUSAL bound, not a clip (dig-node#346). Silently truncating an attacker-supplied
+/// label is a forgery the node performs on the attacker's behalf: pad a hostile name with
+/// characters that spend the budget while rendering as nothing, and the node's own clip produces
+/// a short, trusted-looking name for the operator to approve. Refusing an over-long request is
+/// visible to the caller and invents nothing.
+///
+/// The stored value stays BYTE-VERBATIM; neutralisation happens at render time
+/// ([`crate::untrusted_text::render_untrusted`]), because only the display is a lie surface.
 const MAX_CLIENT_NAME: usize = 64;
 
 /// Current unix time in milliseconds (0 on a clock error — only affects TTL math).
@@ -128,9 +137,16 @@ pub fn request(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> V
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("unknown controller")
-        .chars()
-        .take(MAX_CLIENT_NAME)
-        .collect();
+        .to_string();
+    if client_name.chars().count() > MAX_CLIENT_NAME {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!(
+                "client_name must be at most {MAX_CLIENT_NAME} characters; this request is                  refused rather than shortened, because a name the node shortened is a name the                  node partly wrote"
+            ),
+        );
+    }
 
     // Fail CLOSED: the pairing id + code gate the consent step, so if the OS CSPRNG is
     // unavailable refuse the request rather than mint guessable pairing material (§7.3).
@@ -445,24 +461,71 @@ pub fn is_paired_token(path: &Path, presented: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// **Proves (dig-node#346):** an over-long `client_name` is REFUSED, not shortened.
+    ///
+    /// The ingest used to `.take(64)`, which is an unmarked truncation on the OPEN,
+    /// unauthenticated `pairing.request` — so an attacker could pad a hostile label with budget
+    /// -consuming characters and have the NODE produce a short, trusted-looking name for the
+    /// operator to approve. Refusing is the only answer that invents nothing.
+    ///
+    /// The at-bound case is asserted alongside, because a bound tested only from above cannot
+    /// distinguish "refuses over-long" from "refuses everything".
+    #[test]
+    fn an_over_long_client_name_is_refused_rather_than_silently_shortened() {
+        let pending = Mutex::new(PendingPairings::default());
+
+        let at_bound = "n".repeat(MAX_CLIENT_NAME);
+        let ok = request(&pending, json!(1), &json!({ "client_name": at_bound }));
+        assert!(
+            ok.get("result").is_some(),
+            "a name exactly at the bound must be accepted: {ok}"
+        );
+
+        let too_long = "n".repeat(MAX_CLIENT_NAME + 1);
+        let refused = request(&pending, json!(2), &json!({ "client_name": too_long }));
+        assert_eq!(
+            refused["error"]["data"]["code"],
+            json!(ErrorCode::InvalidParams.name()),
+            "an over-long name must be refused: {refused}"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("refused rather than shortened"),
+            "the refusal must say why it is a refusal: {refused}"
+        );
+    }
+
+    /// **Proves:** the accepted `client_name` is stored BYTE-VERBATIM.
+    ///
+    /// Neutralisation belongs at the render, never at the store: a value that is ever compared or
+    /// used as an identity must not be quietly rewritten, and rewriting at ingest would also make
+    /// the stored value disagree with what the requester believes it sent.
+    #[test]
+    fn an_accepted_client_name_is_stored_verbatim() {
+        let pending = Mutex::new(PendingPairings::default());
+        // Contains characters the RENDERER must neutralise; the STORE must not.
+        let raw = "app\u{200b}\u{202e}name";
+        let resp = request(&pending, json!(1), &json!({ "client_name": raw }));
+        let pairing_id = resp["result"]["pairing_id"].as_str().unwrap().to_string();
+
+        let g = pending.lock().unwrap();
+        let stored = &g.map.get(&pairing_id).expect("pending entry").client_name;
+        assert_eq!(stored, raw, "the stored label must be byte-verbatim");
+    }
+
     /// A unique temp STATE dir (#501: the paired-token store now lives in the state
     /// dir, not beside a `config.json`). Returns `(state_dir, state_dir)` so both
     /// tuple bindings point at the dir a test seeds + cleans.
-    fn tmp_config() -> (PathBuf, PathBuf) {
-        // A process-wide counter makes the dir unique even when two tests build it in
-        // the same millisecond (parallel test threads) — otherwise one test's
-        // remove_dir_all could nuke another's dir mid-run.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-pairing-{}-{}-{}",
-            std::process::id(),
-            now_ms(),
-            n
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        (dir.clone(), dir)
+    /// The tree is OWNED by the returned guard: `TempDir`'s `Drop` removes it, including on
+    /// an unwind, so a failing assertion cannot leak it (dig-node#370). `tempfile`'s random
+    /// component also subsumes the hand-rolled pid + counter name, which repeated across runs.
+    fn tmp_config() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dig-node-pairing-")
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     fn pending() -> Mutex<PendingPairings> {
@@ -485,7 +548,8 @@ mod tests {
 
     #[test]
     fn poll_unknown_then_pending_then_approved_delivers_token_once() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let p = pending();
 
         // Unknown id → status unknown.
@@ -499,7 +563,7 @@ mod tests {
         assert_eq!(pend["result"]["status"], json!("pending"));
 
         // Approve (master path) → the token is minted + persisted.
-        let ap = approve(&p, &config, json!(4), &json!({ "pairing_id": pid }));
+        let ap = approve(&p, config, json!(4), &json!({ "pairing_id": pid }));
         assert_eq!(ap["result"]["approved"], json!(true));
         let token_id = ap["result"]["token_id"].as_str().unwrap().to_string();
 
@@ -510,27 +574,25 @@ mod tests {
         assert_eq!(token.len(), 64, "64-hex scoped token");
 
         // The token is a valid paired token; a wrong one is not.
-        assert!(is_paired_token(&paired_tokens_path(&config), &token));
-        assert!(!is_paired_token(
-            &paired_tokens_path(&config),
-            "not-a-token"
-        ));
+        assert!(is_paired_token(&paired_tokens_path(config), &token));
+        assert!(!is_paired_token(&paired_tokens_path(config), "not-a-token"));
 
         // Delivered ONCE: a second poll no longer knows the id.
         let again = poll(&p, json!(6), &json!({ "pairing_id": pid }));
         assert_eq!(again["result"]["status"], json!("unknown"));
 
         // Revoke → the token stops authorizing.
-        let rv = revoke(&config, json!(7), &json!({ "token_id": token_id }));
+        let rv = revoke(config, json!(7), &json!({ "token_id": token_id }));
         assert_eq!(rv["result"]["revoked"], json!(true));
-        assert!(!is_paired_token(&paired_tokens_path(&config), &token));
+        assert!(!is_paired_token(&paired_tokens_path(config), &token));
     }
 
     #[test]
     fn approve_unknown_pairing_is_invalid_params() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let p = pending();
-        let resp = approve(&p, &config, json!(1), &json!({ "pairing_id": "nope" }));
+        let resp = approve(&p, config, json!(1), &json!({ "pairing_id": "nope" }));
         assert_eq!(
             resp["error"]["code"],
             json!(ErrorCode::InvalidParams.code())
@@ -539,23 +601,24 @@ mod tests {
 
     #[test]
     fn list_shows_pending_and_issued_tokens() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let p = pending();
         let req = request(&p, json!(1), &json!({ "client_name": "ext-A" }));
         let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
 
         // Before approval: one pending, no tokens.
-        let l1 = list(&p, &config, json!(2));
+        let l1 = list(&p, config, json!(2));
         assert_eq!(l1["result"]["pending"].as_array().unwrap().len(), 1);
         assert_eq!(l1["result"]["pending"][0]["client_name"], json!("ext-A"));
         assert_eq!(l1["result"]["tokens"].as_array().unwrap().len(), 0);
 
-        approve(&p, &config, json!(3), &json!({ "pairing_id": pid.clone() }));
+        approve(&p, config, json!(3), &json!({ "pairing_id": pid.clone() }));
         // consume the pending via poll
         poll(&p, json!(4), &json!({ "pairing_id": pid }));
 
         // After: no pending, one issued token (value never listed).
-        let l2 = list(&p, &config, json!(5));
+        let l2 = list(&p, config, json!(5));
         assert_eq!(l2["result"]["pending"].as_array().unwrap().len(), 0);
         let tokens = l2["result"]["tokens"].as_array().unwrap();
         assert_eq!(tokens.len(), 1);
@@ -592,8 +655,9 @@ mod tests {
 
     #[test]
     fn load_paired_tokens_tolerates_missing_and_malformed() {
-        let (config, _d) = tmp_config();
-        let path = paired_tokens_path(&config);
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let path = paired_tokens_path(config);
         assert!(load_paired_tokens(&path).is_empty(), "missing file → empty");
         std::fs::write(&path, b"not json").unwrap();
         assert!(load_paired_tokens(&path).is_empty(), "malformed → empty");

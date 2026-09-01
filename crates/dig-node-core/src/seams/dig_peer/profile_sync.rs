@@ -95,16 +95,16 @@ use crate::AnchoredRootResolver;
 /// having run — profiles simply stop syncing — so it is a clean degradation, not an outage.
 pub const PROFILE_SYNC_ENV: &str = "DIG_NODE_PROFILE_SYNC";
 
-/// Whether profile sync is enabled. Default ON; `0`/`false`/`off`/`no` (case-insensitive) disable it.
+/// Whether profile sync is enabled. Default ON; an off-token (`off`/`disabled`/`0`/`false`/`no`,
+/// trimmed and case-insensitive) disables it.
+///
+/// Reads the SHARED capability vocabulary (dig-node#459). It was found while writing that ticket's
+/// `SPEC.md` clause, which asserts that every capability flag reads one vocabulary — a sixth private
+/// copy would have made the clause false in the commit that introduced it. The four knobs #459 names
+/// were the four someone had listed, not the four that exist.
 #[must_use]
 pub fn profile_sync_enabled() -> bool {
-    match std::env::var(PROFILE_SYNC_ENV) {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    }
+    !crate::is_capability_off_token(std::env::var(PROFILE_SYNC_ENV).unwrap_or_default().as_str())
 }
 
 /// How long a recorded solicitation stays answerable.
@@ -1227,38 +1227,96 @@ mod tests {
         }
     }
 
-    /// A fresh directory for one test.
+    /// A fresh directory for one test, OWNED by the returned guard.
     ///
-    /// # Why the clock is in the name
+    /// # Why a guard rather than a hand-built path
     ///
-    /// `(process id, unique_suffix())` is unique WITHIN a run and repeats ACROSS runs: the counter
-    /// restarts at zero every process, and the OS recycles process ids. These tests never remove
-    /// what they create, so a later run that draws a recycled pid inherits an earlier run's
-    /// directory — already populated — and a test asserting on the FULL contents of its own
-    /// temp tree fails on somebody else's leftovers.
+    /// Two properties are needed here, and a `PathBuf` gave neither.
     ///
-    /// That is not hypothetical: `held_pairs_skips_names_this_module_did_not_write` failed once in
-    /// a full-suite run against 223 leaked `dig-profile-sync-test-<pid>-<n>` directories, passed
-    /// alone, and passed on a re-run — the signature of a name collision rather than a defect in
-    /// the code under test. A monotonic component makes the name unrepeatable across runs, which
-    /// is what the tests actually need from it.
+    /// **Removal that a failing assertion cannot skip** (dig-node#370). Every test in this module
+    /// used to end with a manual `remove_dir_all`, which is exactly the line an unwinding test
+    /// never reaches — so the runs a developer repeats were the runs that leaked. `TempDir`'s
+    /// `Drop` runs on the unwind.
     ///
-    /// The LEAK itself is untouched here and is still real (dig-node#365 lane finding): the fix
-    /// for it is a drop guard per test, which is a larger change than this file's share of the
-    /// work.
-    fn tempdir() -> PathBuf {
-        let since_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("a clock after 1970")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "dig-profile-sync-test-{}-{}-{}",
-            std::process::id(),
-            since_epoch,
-            unique_suffix()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    /// **A name that does not repeat across runs** (dig-node#369). `(process id, counter)` is
+    /// unique within a run and repeats between them: the counter restarts every process and the OS
+    /// recycles pids, so a later run could inherit an earlier run's populated tree. That was not
+    /// hypothetical — `held_pairs_skips_names_this_module_did_not_write`, which asserts on the full
+    /// contents of its own tree, failed once in a full-suite run against 223 leftover directories,
+    /// passed alone, and passed on re-run. `tempfile`'s random component supplies that property
+    /// directly, and removal makes the collision unreachable rather than merely unlikely.
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dig-profile-sync-test-")
+            .tempdir()
+            .expect("temp dir")
+    }
+
+    /// **Proves (dig-node#370):** the scratch tree is removed when the guard goes out of
+    /// scope, **and on an unwind** — the case that produced the leak, because every test in
+    /// this module used to end with a manual `remove_dir_all` that a failing assertion skips.
+    ///
+    /// # Why it asserts on a path it captured rather than on a directory count
+    ///
+    /// Counting entries under the system temp root would be measuring every other test in the
+    /// workspace at the same time, on a machine where lanes run concurrently — a flaky
+    /// disk-state assertion is worse than none. This owns one path, and asks about that path.
+    ///
+    /// The panic half is the load-bearing half, and it is what separates this fix from the
+    /// nearest wrong one: a helper that called `TempDir::keep` (or handed back an unowned
+    /// `PathBuf`) would satisfy nothing here, while a merely-tidier manual cleanup would pass
+    /// the success case and fail this one.
+    ///
+    /// # Each half is independently load-bearing, and each was proved by a SEPARATE mutation
+    ///
+    /// One mutation cannot demonstrate both, because `TempDir`'s cleanup is a single `Drop` on
+    /// both paths: breaking it fails the success assertion first, and the unwind assertion never
+    /// gets to speak. So the halves were mutated separately.
+    ///
+    /// - **Success half:** `tempfile::Builder::disable_cleanup(true)` in [`tempdir`] — the first
+    ///   assertion fails and the unwind half is never reached.
+    /// - **Unwind half:** both blocks rewritten to the pre-fix idiom this ticket removes — a raw
+    ///   `create_dir_all` with a manual `remove_dir_all` at the end of the block. The success half
+    ///   REACHES that line and passes; the panicking closure skips it, and the run fails at the
+    ///   unwind assertion alone. That is the nearest wrong implementation — a merely tidier manual
+    ///   cleanup — and this assertion is the only thing in the suite that rejects it.
+    #[test]
+    fn the_scratch_tree_is_removed_on_drop_and_on_an_unwind() {
+        let on_success = {
+            let dir = tempdir();
+            let path = dir.path().to_path_buf();
+            assert!(
+                path.is_dir(),
+                "the helper must create the tree it hands back"
+            );
+            path
+        };
+        assert!(
+            !on_success.exists(),
+            "the tree must be gone once the guard leaves scope: {}",
+            on_success.display()
+        );
+
+        // The path has to escape the unwinding closure to be asserted on afterwards.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = std::sync::Arc::clone(&seen);
+        let unwound = std::panic::catch_unwind(move || {
+            let dir = tempdir();
+            *captured.lock().expect("a fresh mutex") = Some(dir.path().to_path_buf());
+            panic!("stand in for a failing assertion");
+        });
+        assert!(unwound.is_err(), "the fixture must actually have panicked");
+
+        let on_panic = seen
+            .lock()
+            .expect("the mutex outlives the unwind")
+            .take()
+            .expect("the closure must have recorded its path before panicking");
+        assert!(
+            !on_panic.exists(),
+            "the tree must be gone after an unwind too — this is the leak: {}",
+            on_panic.display()
+        );
     }
 
     // -- Spies -------------------------------------------------------------------------------------
@@ -1410,20 +1468,18 @@ mod tests {
     fn stored_bytes_are_returned_byte_identical() {
         // The whole portability claim: what one machine writes, another reads unchanged.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         store.put(&store_id(1), &root, &bytes).unwrap();
         assert_eq!(store.get(&store_id(1), &root).unwrap(), Some(bytes));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_missing_body_is_none_not_an_error() {
         // "Consulted, holds nothing" and "the read failed" need opposite remedies from a caller.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         assert_eq!(store.get(&store_id(1), &[9u8; 32]).unwrap(), None);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1431,7 +1487,7 @@ mod tests {
         // Pins the bound from BOTH sides: three writes leave TWO artifacts — not one (which a
         // delete-every-other implementation would leave) and not three (which no pruning would).
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let sid = store_id(7);
         let mut roots = Vec::new();
         for name in ["gen1", "gen2", "gen3"] {
@@ -1447,7 +1503,6 @@ mod tests {
         assert!(store.has(&sid, &roots[2]), "the newest must survive");
         assert!(store.has(&sid, &roots[1]), "so must its predecessor");
         assert!(!store.has(&sid, &roots[0]), "the oldest must be pruned");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1455,14 +1510,13 @@ mod tests {
         // A PLACEMENT property, asserted on the path relationship rather than on an outcome a
         // differently-placed store would satisfy identically.
         let cache = tempdir();
-        let store = ProfileBodyStore::under_cache_dir(&cache);
+        let store = ProfileBodyStore::under_cache_dir(cache.path());
         let path = store.path(&store_id(1), &[2u8; 32]);
-        assert!(path.starts_with(cache.join(PROFILES_DIR)));
+        assert!(path.starts_with(cache.path().join(PROFILES_DIR)));
         assert!(
-            !path.starts_with(cache.join("modules")),
+            !path.starts_with(cache.path().join("modules")),
             "a profile under modules/ would become a phantom DHT provider record"
         );
-        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[test]
@@ -1482,7 +1536,7 @@ mod tests {
     #[tokio::test]
     async fn a_solicited_body_matching_the_requested_root_is_accepted_and_re_announced() {
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let sid = store_id(1);
         let (subs, sol, tx, pen) = gate_fixtures(sid);
@@ -1517,7 +1571,6 @@ mod tests {
              excluding the peer that supplied it"
         );
         drop(announces);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1529,7 +1582,7 @@ mod tests {
         // unsolicited is not evidence of lying. An implementation that penalized everything it
         // refuses fails here.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let sid = store_id(1);
         let (subs, sol, tx, pen) = gate_fixtures(sid);
@@ -1553,7 +1606,6 @@ mod tests {
             "a late or forged answer must never cost a peer"
         );
         assert!(!store.has(&sid, &root));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1562,7 +1614,7 @@ mod tests {
         // profile — so the failure is precisely "does not hash to the root you were asked for" and
         // not "unparseable bytes", which a weaker fixture would conflate.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (_, requested_root) = dpb("Ada");
         let (wrong, _) = dpb("Mallory");
         let sid = store_id(1);
@@ -1584,7 +1636,6 @@ mod tests {
         assert_eq!(pen.count(), 1);
         assert!(!store.has(&sid, &requested_root));
         assert!(tx.announces.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1594,7 +1645,7 @@ mod tests {
         // the first answer would read peer 8 as unsolicited and lose the honest body — and a
         // single-peer fixture could not tell the two apart.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let (wrong, _) = dpb("Mallory");
         let sid = store_id(1);
@@ -1626,13 +1677,12 @@ mod tests {
         assert_eq!(first, AcceptOutcome::RootMismatch);
         assert!(matches!(second, AcceptOutcome::Accepted { .. }));
         assert_eq!(pen.count(), 1, "only the peer that lied is demoted");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn a_body_for_an_unsubscribed_store_is_refused() {
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let sid = store_id(1);
         let (_, sol, tx, pen) = gate_fixtures(sid);
@@ -1652,7 +1702,6 @@ mod tests {
 
         assert_eq!(outcome, AcceptOutcome::NotSubscribed);
         assert_eq!(pen.count(), 0);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1660,7 +1709,7 @@ mod tests {
         // The bound comes from the protocol own frame ceiling, not from feel: one byte past
         // `MAX_PROFILE_BODY_BYTES` is exactly the largest body a 225 frame could carry.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let sid = store_id(1);
         let root = [4u8; 32];
         let (subs, sol, tx, pen) = gate_fixtures(sid);
@@ -1680,13 +1729,12 @@ mod tests {
 
         assert_eq!(outcome, AcceptOutcome::TooLarge);
         assert_eq!(pen.count(), 0);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn re_receiving_a_held_body_is_idempotent_and_does_not_re_announce() {
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let sid = store_id(1);
         let (subs, sol, tx, pen) = gate_fixtures(sid);
@@ -1706,7 +1754,6 @@ mod tests {
 
         assert_eq!(outcome, AcceptOutcome::AlreadyHeld);
         assert!(tx.announces.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     // -- The local (control-plane) entry point ------------------------------------------------------
@@ -1714,14 +1761,13 @@ mod tests {
     #[tokio::test]
     async fn a_local_body_matching_the_confirmed_chain_root_is_stored() {
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let path = accept_local_body(&store, &chain_at(root), store_id(1), root, &bytes)
             .await
             .expect("chain confirms this exact root");
         assert!(path.is_file());
         assert_eq!(store.get(&store_id(1), &root).unwrap(), Some(bytes));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1731,7 +1777,7 @@ mod tests {
         // comparing against the INDEPENDENTLY resolved chain root refuses it. The chain is pinned
         // to a different generation, which is what a stale or forged publish looks like.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, declared) = dpb("Ada");
         let (_, on_chain) = dpb("the real current generation");
         assert_ne!(declared, on_chain);
@@ -1743,7 +1789,6 @@ mod tests {
         assert!(matches!(err, LocalAcceptError::RootNotConfirmed(_)));
         assert!(!store.has(&store_id(1), &declared));
         assert!(!store.has(&store_id(1), &on_chain));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1751,14 +1796,13 @@ mod tests {
         // Fail closed. Again the body is genuinely valid for its declared root, so the ONLY thing
         // standing between it and disk is the missing chain answer.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let err = accept_local_body(&store, &chain_unreachable(), store_id(1), root, &bytes)
             .await
             .expect_err("no root means nothing to compare against");
         assert!(matches!(err, LocalAcceptError::RootNotConfirmed(_)));
         assert!(!store.has(&store_id(1), &root));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1766,14 +1810,13 @@ mod tests {
         // `Ok(None)` is a DIFFERENT chain answer from `Err`, and an implementation that only
         // guarded the error path would accept here.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let err = accept_local_body(&store, &Chain(Ok(None)), store_id(1), root, &bytes)
             .await
             .expect_err("an unminted store confirms nothing");
         assert!(matches!(err, LocalAcceptError::RootNotConfirmed(_)));
         assert!(!store.has(&store_id(1), &root));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1782,13 +1825,12 @@ mod tests {
         // the control-plane error uninterpretable. The chain here confirms the declared root,
         // isolating the failure to the bytes.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (_, root) = dpb("Ada");
         let err = accept_local_body(&store, &chain_at(root), store_id(1), root, b"not a DPB")
             .await
             .expect_err("garbage is not a body");
         assert!(matches!(err, LocalAcceptError::Malformed(_)));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     // -- The 224 responder --------------------------------------------------------------------------
@@ -1796,7 +1838,7 @@ mod tests {
     #[tokio::test]
     async fn a_held_body_is_served_and_an_unheld_one_is_not() {
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let sid = store_id(1);
         store.put(&sid, &root, &bytes).unwrap();
@@ -1810,7 +1852,6 @@ mod tests {
         assert_eq!(served, ServeOutcome::Served(bytes.len()));
         assert_eq!(missing, ServeOutcome::NotHeld);
         assert_eq!(tx.sent_bodies.lock().unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1819,7 +1860,7 @@ mod tests {
         // bound tested only from above would pass for an off-by-one that throttles too early), and
         // the third must not.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let sid = store_id(1);
         store.put(&sid, &root, &bytes).unwrap();
@@ -1838,7 +1879,6 @@ mod tests {
             "at capacity must pass"
         );
         assert_eq!(c, ServeOutcome::Throttled, "one over must fail");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1847,7 +1887,7 @@ mod tests {
         // the artifact is known to exist. A capacity of ONE makes the difference observable — under
         // the wrong ordering the single token is spent on a miss and the real request throttles.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let sid = store_id(1);
         store.put(&sid, &root, &bytes).unwrap();
@@ -1862,7 +1902,6 @@ mod tests {
         let real = serve_body_request(&store, &tx, &budget, peer(9), &root_ref(sid, root)).await;
 
         assert_eq!(real, ServeOutcome::Served(bytes.len()));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     // -- The 223-driven fetch -----------------------------------------------------------------------
@@ -1870,7 +1909,7 @@ mod tests {
     #[tokio::test]
     async fn an_announce_the_chain_confirms_solicits_the_body_under_the_chain_root() {
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (_, root) = dpb("Ada");
         let sid = store_id(1);
         let tx = Transport::with_peers(vec![peer(9)]);
@@ -1892,7 +1931,6 @@ mod tests {
             "the solicitation must be recorded under the CHAIN-resolved root"
         );
         assert_eq!(tx.sent_requests.lock().unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1901,7 +1939,7 @@ mod tests {
         // nothing else — in particular it must not produce a solicitation, because a solicitation
         // is exactly what would later make an attacker body acceptable.
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (_, forged) = dpb("Mallory");
         let (_, on_chain) = dpb("Ada");
         let sid = store_id(1);
@@ -1921,13 +1959,12 @@ mod tests {
         assert_eq!(asked, None);
         assert!(!sol.is_solicited(&sid, &forged, &peer(9)));
         assert!(tx.sent_requests.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn an_announce_is_not_chased_while_the_chain_is_unreachable() {
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (_, root) = dpb("Ada");
         let sid = store_id(1);
         let tx = Transport::with_peers(vec![peer(9)]);
@@ -1945,7 +1982,6 @@ mod tests {
 
         assert_eq!(asked, None);
         assert!(tx.sent_requests.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// **A repeated announce buys the attacker nothing, and costs this node nothing.**
@@ -1962,7 +1998,7 @@ mod tests {
     #[tokio::test]
     async fn a_repeated_announce_neither_re_reads_the_chain_nor_re_asks_a_peer() {
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (_, root) = dpb("Ada");
         let sid = store_id(1);
         let tx = Transport::with_peers(vec![peer(9)]);
@@ -1991,7 +2027,6 @@ mod tests {
             1,
             "eight announces produced more than one chain lineage walk"
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A DIFFERENT root is still chased — the dedupe must not swallow a genuine new generation.
@@ -2001,7 +2036,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_root_for_the_same_store_is_still_chased() {
         let dir = tempdir();
-        let store = ProfileBodyStore::new(dir.clone());
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (_, first) = dpb("Ada");
         let (_, second) = dpb("Grace");
         assert_ne!(first, second, "the fixture roots must differ");
@@ -2033,7 +2068,6 @@ mod tests {
             2,
             "a new generation was suppressed by the duplicate-announce guard"
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     // -- The kill switch ----------------------------------------------------------------------------
@@ -2043,7 +2077,7 @@ mod tests {
         let _guard = env_lock();
         std::env::remove_var(PROFILE_SYNC_ENV);
         assert!(profile_sync_enabled(), "absent must mean ON");
-        for off in ["0", "false", "OFF", "no"] {
+        for off in ["0", "false", "OFF", "no", "disabled", " Disabled "] {
             std::env::set_var(PROFILE_SYNC_ENV, off);
             assert!(!profile_sync_enabled(), "{off} must disable profile sync");
         }
@@ -2065,7 +2099,8 @@ mod tests {
     /// right. Retention keeps current-plus-one, so two roots per store is the real maximum.
     #[test]
     fn held_pairs_enumerates_every_store_and_every_root() {
-        let store = ProfileBodyStore::new(tempdir());
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (alice, alice_root) = dpb("alice");
         let (bob, bob_root) = dpb("bob");
         store.put(&store_id(1), &alice_root, &alice).expect("put");
@@ -2088,16 +2123,20 @@ mod tests {
     #[test]
     fn held_pairs_skips_names_this_module_did_not_write() {
         let root_dir = tempdir();
-        let store = ProfileBodyStore::new(root_dir.clone());
+        let store = ProfileBodyStore::new(root_dir.path().to_path_buf());
         let (bytes, root) = dpb("alice");
         store.put(&store_id(1), &root, &bytes).expect("put");
 
         // A short name, an uppercase-hex name of the right length, and a loose file at the top of
         // the tree — each is 64-hex-adjacent and none of them is a store id.
-        std::fs::create_dir_all(root_dir.join("not-a-store-id")).expect("dir");
-        std::fs::create_dir_all(root_dir.join(hex::encode(store_id(9)).to_uppercase()))
-            .expect("dir");
-        std::fs::write(root_dir.join("README.txt"), b"not a store").expect("file");
+        std::fs::create_dir_all(root_dir.path().join("not-a-store-id")).expect("dir");
+        std::fs::create_dir_all(
+            root_dir
+                .path()
+                .join(hex::encode(store_id(9)).to_uppercase()),
+        )
+        .expect("dir");
+        std::fs::write(root_dir.path().join("README.txt"), b"not a store").expect("file");
 
         assert_eq!(store.held_pairs(), vec![(store_id(1), root)]);
     }
