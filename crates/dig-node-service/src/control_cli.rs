@@ -87,6 +87,9 @@ pub enum ControlAction {
     WalletSyncStatus,
     /// `control.wallet.peak` — the READ-ONLY chain peak height the node can see.
     WalletPeak,
+    /// `control.wallet.operatorAddress` — the READ-ONLY address of this node's OWN machine
+    /// wallet, the one that pays mirror collateral. Never the user's, and never a key.
+    WalletOperatorAddress,
     /// `control.wallet.resetCoinDb` — **DESTRUCTIVE.** Drop the cached coin database and force a
     /// re-sync from chain (dig-node#384).
     ///
@@ -231,6 +234,7 @@ impl ControlAction {
             ControlAction::WalletCoinsByParent { .. } => "control.wallet.coinsByParent",
             ControlAction::WalletArrivals { .. } => "control.wallet.arrivals",
             ControlAction::WalletPeak => "control.wallet.peak",
+            ControlAction::WalletOperatorAddress => "control.wallet.operatorAddress",
             ControlAction::WalletResetCoinDb { .. } => "control.wallet.resetCoinDb",
             ControlAction::WalletSyncStatus => "control.wallet.syncStatus",
             ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
@@ -511,6 +515,7 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         }
         .method(),
         ControlAction::WalletPeak.method(),
+        ControlAction::WalletOperatorAddress.method(),
         ControlAction::WalletResetCoinDb { confirm: false }.method(),
         ControlAction::WalletSyncStatus.method(),
         ControlAction::WalletBroadcast {

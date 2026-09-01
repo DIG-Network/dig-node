@@ -195,6 +195,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.operatorAddress",
     "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
@@ -261,6 +262,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.operatorAddress",
     "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
@@ -1032,6 +1034,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.coinsByParent" => wallet_coins_by_parent(ctx, id, params).await,
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
+        "control.wallet.operatorAddress" => wallet_operator_address(ctx, id),
         "control.wallet.resetCoinDb" => wallet_reset_coin_db(ctx, id, params).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
         "control.wallet.watch" => wallet_watch(ctx, id, params).await,
@@ -2311,6 +2314,65 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
             json!({ "peak_height": peak.peak_height, "synced": peak.synced }),
         ),
         Err(e) => wallet_read_error("control.wallet.peak", id, "", e),
+    }
+}
+
+/// `control.wallet.operatorAddress` — where is this node's OWN machine wallet?
+///
+/// # Two wallets, and nothing used to name which
+///
+/// The node holds a machine-custody operator wallet, autoseed-derived, and it is the wallet that
+/// pays mirror-coin collateral. It is not the user's. A node reported three mirror bonds
+/// `unfunded, short 1010` while the operator's own wallet held 1,015,000 base units of $DIG: both
+/// statements were true, each was about a different wallet, and no surface let a person tell which
+/// — nor find the address to fund. This method is that address.
+///
+/// # It cannot reach a signing capability, by construction
+///
+/// It goes through `dig_wallet::operator_wallet::operator_address`, which is built on
+/// `operator_puzzle_hash`. No `WalletSigner` is constructed anywhere on this path, so there is no
+/// signing capability for a control-plane read to reach even in principle. That is a property of
+/// the types rather than of this function's discipline (§908).
+///
+/// # The prefix comes from the wallet backend, not from a constant
+///
+/// Encoding with a hardcoded `xch` would render a MAINNET address on a node reading testnet coins
+/// — one wallet in appearance and two in fact, on a surface whose whole purpose is to end exactly
+/// that confusion.
+fn wallet_operator_address(ctx: &ControlCtx, id: Value) -> Value {
+    use dig_wallet::operator_wallet::{operator_address, OperatorAddressUnavailable};
+
+    let paths = dig_wallet::autoseed::default_paths();
+    match operator_address(&paths, ctx.wallet.address_prefix()) {
+        Ok(address) => {
+            // The puzzle hash is re-read rather than decoded back out of the address: decoding an
+            // address to prove what it encodes asserts only that bech32m round-trips.
+            let puzzle_hash = dig_wallet::operator_wallet::operator_puzzle_hash(&paths)
+                .map(|ph| hex::encode(ph.to_bytes()));
+            match puzzle_hash {
+                Some(puzzle_hash) => control_ok(
+                    id,
+                    json!({ "state": "known", "address": address, "puzzle_hash": puzzle_hash }),
+                ),
+                // Unreachable in practice -- the address derived from that same hash a moment ago
+                // -- but reported rather than papered over with a placeholder, because a partial
+                // answer on a funding surface is the failure this method exists to prevent.
+                None => control_ok(
+                    id,
+                    json!({ "state": "unavailable", "reason": "unreadable" }),
+                ),
+            }
+        }
+        Err(reason) => control_ok(
+            id,
+            json!({
+                "state": "unavailable",
+                "reason": match reason {
+                    OperatorAddressUnavailable::NotInitialized => "not_initialized",
+                    OperatorAddressUnavailable::Unreadable => "unreadable",
+                },
+            }),
+        ),
     }
 }
 

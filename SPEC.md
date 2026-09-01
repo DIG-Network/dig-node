@@ -8727,6 +8727,24 @@ on purpose" without guessing from the store list. Conflating those two produces 
 a healthy node (dig-app#300). The method is declared in `dig-node-control-interface` (release-first)
 before the node serves it.
 
+**The mirror wallet is the node's OWN, and `control.wallet.operatorAddress` names it.** The wallet
+that pays mirror collateral is the §16.4 machine-custody operator wallet, derived from the autoseed
+— never the user's. Every figure in this section is about that wallet, and until it could be named
+an operator reading `unfunded, short 1010` had no way to learn which wallet was short, nor where to
+send money to fix it: one node reported exactly that while its operator's own wallet held 1,015,000
+base units of $DIG, both statements true and each about a different wallet. The method answers
+`{state:"known", address, puzzle_hash}` for this node's own wallet, or
+`{state:"unavailable", reason}` — `not_initialized` for a node that has never run autoseed setup,
+which is not a fault, and `unreadable` for one whose seed will not open, which is, and which also
+means the node cannot pay collateral. It is TOKEN-GATED, because the caller does not name the
+address and the node therefore volunteers its own node-to-address association; it is OWNED rather
+than delegated, because forwarding it upstream would answer with another machine's wallet; and it
+returns a DESTINATION only — no seed, key or derivation material, in any encoding. The
+implementation reaches the address through `dig_wallet::operator_wallet::operator_address`, which is
+built on `operator_puzzle_hash` and constructs no `WalletSigner` at all, so §908 holds by the types
+rather than by discipline. The address is encoded with the wallet backend's own network prefix,
+never a constant, so a node reading testnet coins cannot render a mainnet address beside them.
+
 **`disabled` and `unadvertised` are both node-wide, and only ONE of them is a fault.** Both make every
 row read the same token together and neither has a coin. They differ in whether the operator already
 knows: `disabled` is that operator's own switch (§25.7) and MUST NOT be presented as a fault, while

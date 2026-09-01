@@ -1281,6 +1281,16 @@ impl WalletBackend {
 
     // ---- address helpers --------------------------------------------------
 
+    /// The bech32m human-readable prefix this backend's network uses -- `xch` on mainnet, `txch`
+    /// on testnet11.
+    ///
+    /// Exposed so a caller encoding an address OUTSIDE this backend encodes it for the SAME network
+    /// the backend reads coins on. A second source for the prefix is how a node ends up rendering a
+    /// mainnet address beside a testnet balance, which reads as one wallet and is two.
+    pub fn address_prefix(&self) -> &str {
+        &self.config.address_prefix
+    }
+
     fn address_of(&self, puzzle_hash_hex: &str) -> String {
         encode_address(puzzle_hash_hex, &self.config.address_prefix)
             .unwrap_or_else(|| puzzle_hash_hex.to_string())
