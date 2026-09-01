@@ -66,7 +66,7 @@
 //! a corrupt audit trail that reads as an empty one is the same lie as a missing entry.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -438,6 +438,157 @@ impl SpendRecord {
             }),
         }
     }
+
+    /// Does this record still hold its funding coins out of selection, as of `now_ms`?
+    ///
+    /// Two conditions, and they answer different questions. The status must be non-terminal — the
+    /// bundle's outcome is genuinely unsettled, so its coins may still be consumed. AND the hold
+    /// must not have lapsed: see [`FUNDING_RESERVATION_WINDOW_MS`] for why a status alone cannot
+    /// bound this, and how the window is derived.
+    ///
+    /// Measured from `updated_ms`, the instant of the LAST revision, rather than from
+    /// `initiated_ms`. The two differ for a spend that was resolved and then reopened, and it is the
+    /// last OBSERVATION that says how long the node has been waiting — restarting the clock on new
+    /// information is the honest reading, and it is also the one that holds longer.
+    ///
+    /// `saturating_sub` so a record dated in the future stays HELD rather than lapsing instantly.
+    pub fn reserves_funding_at(&self, now_ms: u64) -> bool {
+        !self.status.is_terminal()
+            && now_ms.saturating_sub(self.updated_ms) < FUNDING_RESERVATION_WINDOW_MS
+    }
+}
+
+/// How long the audit record holds a spend's funding coins out of selection, measured from the last
+/// thing this node OBSERVED about that spend (dig-node#471).
+///
+/// # Why a bound is needed at all, when `is_terminal` already answers the question
+///
+/// [`SpendStatus::is_terminal`] answers "is any further observation expected to change this", and
+/// that is the right question for a spend whose outcome eventually ARRIVES. The resolver added in
+/// dig-node#457 promotes only POSITIVELY — on observing the created coin — so a `Submitted` or
+/// `Unresolved` spend whose coin never appears is never settled by anything, and a predicate keyed
+/// on status alone therefore withholds its coins forever. A genuinely funded operator wallet then
+/// reports `Insufficient` permanently.
+///
+/// That is reachable with no attacker present: a hard kill between
+/// [`SpendJournal::begin`] and any outcome, or a `Submitted` bundle evicted from a mempool without
+/// confirming. And unlike §25.4.6's create suppression — keyed on the bond's epoch, so it self-clears
+/// at the rollover — nothing here lapses on its own.
+///
+/// # How the figure is DERIVED, and where the derivation stops
+///
+/// Two named quantities, neither invented here:
+///
+/// * **The chain-side figure is ten minutes.** `dig_wallet`'s own post-broadcast
+///   `RESERVATION_TTL_MS` holds a pushed bundle's inputs for `10 * 60 * 1000` ms, and its rationale
+///   is written out in that crate: Chia blocks are ~52 s apart, so ten minutes is roughly a dozen
+///   chances for the spend to land — past the point where a still-unconfirmed bundle is more likely
+///   dropped than pending. This module covers the SAME phase of the same lifecycle, so it takes the
+///   same figure rather than inventing a second one. Two lifetimes for one phase is the
+///   disagreement `CLIENT_RESERVATION_DEFAULT_TTL_MS` was written to resolve, not to repeat.
+///
+/// * **This hold is re-evaluated only once per `MIRROR_ROUND_LENGTH_MS`**, which is also ten
+///   minutes. A threshold equal to the poll interval aliases badly: a record could be released by
+///   the very first pass at which the resolver is even ELIGIBLE to have observed its confirmation.
+///   The smallest window that leaves a full round of chain observation AFTER the chain-side figure
+///   has elapsed is therefore two rounds.
+///
+/// **Twenty minutes, i.e. N = 2 passes.** The second round is the part that is this module's
+/// judgement rather than dig-wallet's, and it is stated so nobody reads the whole figure as derived.
+///
+/// # Which direction it fails in
+///
+/// Releasing too EARLY re-opens dig-node#348's double-select: a second create draws a coin the first
+/// bundle can still spend, and the mempool refuses one of them. Releasing too LATE strands spendable
+/// money in a wallet that reports `Insufficient`. Neither is free, which is why this is a window and
+/// not a flag.
+///
+/// The asymmetry that makes the early direction survivable is NOT §25.4.6's suppression, and it is
+/// worth stating exactly, because a stuck record is precisely the case that suppression does not
+/// cover: `runner.rs` filters `Pending | Submitted` and excludes `Unresolved` deliberately, while
+/// `RecordedSpend`'s `Drop` writes `Unresolved` — so a record reaching this window is ALWAYS
+/// `Unresolved`, and its bond is NOT suppressed. `mirror/resolve.rs` states the same fact.
+///
+/// What actually holds is the mempool rule. A released coin re-drawn by any create collides with a
+/// bundle that may still be resident, and Chia's replace-by-fee requires the replacement to spend a
+/// SUPERSET of the conflicting coins — which two independent mirror creates never do. So the
+/// collision is a REFUSAL, not a double spend: one bundle is rejected, no funds move twice, and the
+/// refused create is retried on the next pass like any other.
+///
+/// This hold is also strictly MORE conservative than the ecosystem's shipped answer for the same
+/// phase: `dig-wallet`'s `RESERVATION_TTL_MS` already releases the same coin at 10 minutes.
+///
+/// # What this must NOT be confused with
+///
+/// It is emphatically not a shortening of `RESERVATION_TTL_MS`, which the wallet's own docs record
+/// as trading a double-select for a LOCKOUT — the strictly worse failure, and the one dig-node#471
+/// is an instance of arriving by another route.
+pub const FUNDING_RESERVATION_WINDOW_MS: u64 = 2 * dig_constants::MIRROR_ROUND_LENGTH_MS as u64;
+
+/// The audit record could not be read, so which coins are already committed is UNKNOWN.
+///
+/// Its own type rather than an `io::Error` because the two conditions it covers are different and
+/// both are refusals: the file could not be read at all, and the file was read but LOST LINES. A
+/// reservation set that silently shrinks is worse than none — the lost lines may be exactly the ones
+/// naming a committed coin — so a partial read is an error here and never a shorter answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitmentsUnreadable(pub String);
+
+impl fmt::Display for CommitmentsUnreadable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let CommitmentsUnreadable(detail) = self;
+        write!(
+            f,
+            "the spend audit record is unreadable ({detail}), so which coins are already committed \
+             to an in-flight bundle is unknown; no coin is selected"
+        )
+    }
+}
+
+impl std::error::Error for CommitmentsUnreadable {}
+
+/// The coins this node has committed to a bundle whose outcome is not yet settled AND whose hold
+/// has not yet lapsed (dig-node#421, bounded by dig-node#471).
+///
+/// Read from the audit record rather than a side table, because the audit record survives a restart
+/// and the window this guards is measured in confirmation times, which outlast a process.
+///
+/// # The hold is a TIME BOX, not a status
+///
+/// A record whose hold lapses is not rewritten, not settled, and not failed. It stays exactly the
+/// `Submitted` or `Unresolved` it was, and stays chaseable by
+/// [`SpendJournal::resolve_landed`] and [`reconcile`] indefinitely — `Unresolved` means "this node
+/// signed and does not know what happened", and that remains true after the coins are released.
+/// Writing a fabricated failure to tidy the bookkeeping would be the money lie `Confirmed`'s shape,
+/// which carries its height and coin id INSIDE the variant, exists to make inexpressible.
+///
+/// # `now_ms` is a parameter, deliberately
+///
+/// One pass takes ONE reading of the clock, in the same way it takes one reading of the disk, the
+/// balance and the chain. It is also what lets a test pin fixture time explicitly instead of passing
+/// a small number through a wall-clock API and silently exercising only the already-lapsed path.
+///
+/// A record dated in the FUTURE — clock skew, or a file written by a machine ahead of this one —
+/// yields a saturated elapsed time of zero and stays held. That is the closed direction.
+pub fn committed_funding_coin_ids(
+    log: &SpendLog,
+    now_ms: u64,
+) -> Result<HashSet<String>, CommitmentsUnreadable> {
+    let ledger = log
+        .ledger()
+        .map_err(|e| CommitmentsUnreadable(e.to_string()))?;
+    if ledger.unreadable_lines > 0 {
+        return Err(CommitmentsUnreadable(format!(
+            "{} entries could not be parsed",
+            ledger.unreadable_lines
+        )));
+    }
+    Ok(ledger
+        .records
+        .iter()
+        .filter(|r| r.reserves_funding_at(now_ms))
+        .flat_map(|r| r.funding_coin_ids.iter().map(|c| c.0.clone()))
+        .collect())
 }
 
 /// Filters over the record. Every field is an AND; an unset field constrains nothing.
@@ -1981,5 +2132,195 @@ mod tests {
         assert_eq!(page.records.len(), 1);
         assert_eq!(page.unreadable_lines, 2);
         assert!(!page.complete);
+    }
+
+    /// **A stuck spend's funding coins are released once its hold lapses — and its record is not
+    /// touched** (dig-node#471).
+    ///
+    /// The fixture varies ONE thing: the OBSERVER's clock. Fixture time is pinned at `NOW` through
+    /// `with_clock`, so both records are written at exactly the same instant and every difference
+    /// below is the elapsed time being asked about. Passing a small number through a wall-clock API
+    /// is how a test group asserts the establishment path while exercising only the expired one.
+    ///
+    /// The control is deliberate and it is a SECOND submitted record, not a confirmed one. A
+    /// confirmed control would be released by the pre-#471 predicate too, so a fix that released
+    /// EVERYTHING immediately would pass. Two records in the same status, distinguished only by how
+    /// long ago they were observed, cannot be satisfied that way.
+    #[test]
+    fn a_stuck_spend_releases_its_funding_coins_once_the_hold_lapses() {
+        let log = tmp_log();
+        let journal = SpendJournal::with_clock(log.clone(), clock);
+
+        let stuck = journal.begin(intent());
+        journal.submitted(
+            &stuck,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("11".repeat(32))],
+            },
+        );
+        std::mem::forget(stuck);
+
+        let inside = journal.begin(intent());
+        journal.submitted(
+            &inside,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("22".repeat(32))],
+            },
+        );
+        std::mem::forget(inside);
+
+        // One millisecond before the window closes, BOTH are held. This is the half most fixes get
+        // wrong: without it, a fix that releases every coin unconditionally passes the release
+        // assertion below and nothing notices.
+        let at_bound = committed_funding_coin_ids(&log, NOW + FUNDING_RESERVATION_WINDOW_MS - 1)
+            .expect("readable");
+        assert!(
+            at_bound.contains(&"11".repeat(32)) && at_bound.contains(&"22".repeat(32)),
+            "a coin committed to a spend still inside the confirmation window must NOT be \
+             released; releasing it re-opens the double-select dig-node#348 closed"
+        );
+
+        // One millisecond after, both lapse. Two passes at MIRROR_ROUND_LENGTH_MS: N = 2.
+        let lapsed = committed_funding_coin_ids(&log, NOW + FUNDING_RESERVATION_WINDOW_MS)
+            .expect("readable");
+        assert!(
+            lapsed.is_empty(),
+            "a spend that never lands must not withhold its funding coins forever; got {lapsed:?}"
+        );
+
+        // AND the records are untouched. Releasing the coins is not declaring the spend failed:
+        // `Unresolved` means "this node signed and does not know what happened", which stays true.
+        let ledger = log.ledger().expect("readable");
+        assert_eq!(ledger.records.len(), 2);
+        assert!(
+            ledger
+                .records
+                .iter()
+                .all(|r| r.status == SpendStatus::Submitted),
+            "the hold lapsed; nothing may have written an outcome this node never observed"
+        );
+        assert!(
+            ledger
+                .records
+                .iter()
+                .all(|r| r.status.may_have_reached_the_network()),
+            "a released record stays chaseable by resolve_landed and reconcile"
+        );
+    }
+
+    /// **A record dated in the FUTURE stays held.**
+    ///
+    /// Clock skew, or an audit file written by a machine ahead of this one. `saturating_sub` makes
+    /// the elapsed time zero rather than wrapping to ~584 million years, which would read as
+    /// long-lapsed and release a coin that was committed moments ago. The closed direction.
+    #[test]
+    fn a_record_dated_in_the_future_keeps_its_hold() {
+        let log = tmp_log();
+        let journal = SpendJournal::with_clock(log.clone(), clock);
+
+        let spend = journal.begin(intent());
+        journal.submitted(
+            &spend,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("33".repeat(32))],
+            },
+        );
+        std::mem::forget(spend);
+
+        let committed = committed_funding_coin_ids(&log, NOW - 1).expect("readable");
+        assert!(
+            committed.contains(&"33".repeat(32)),
+            "a record from the future is not a lapsed record"
+        );
+    }
+
+    /// **A terminal record releases immediately; the window never EXTENDS a hold.**
+    ///
+    /// The window bounds a hold from above. It must not become a second reason to withhold a coin
+    /// that `is_terminal` already released — a `Confirmed` spend's coins are spent on chain, and a
+    /// `Failed { stage: Signing }` spend never moved money.
+    #[test]
+    fn the_window_never_extends_a_hold_a_terminal_status_already_released() {
+        let log = tmp_log();
+        let journal = SpendJournal::with_clock(log.clone(), clock);
+
+        let confirmed = journal.begin(intent());
+        journal.submitted(
+            &confirmed,
+            Submission {
+                intended_coin_id: Some(TargetCoinId("aa".repeat(32))),
+                funding_coin_ids: vec![FundingCoinId("11".repeat(32))],
+            },
+        );
+        journal.confirmed(&confirmed, TargetCoinId("aa".repeat(32)), 100);
+
+        let never_signed = journal.begin(intent());
+        journal.submitted(
+            &never_signed,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("22".repeat(32))],
+            },
+        );
+        journal.failed(&never_signed, FailureStage::Signing, "no key");
+
+        // The control: an open record written at the same instant, still inside its window. Without
+        // it, an implementation that released everything at `NOW` would satisfy the two assertions
+        // above and look correct.
+        let open = journal.begin(intent());
+        journal.submitted(
+            &open,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("33".repeat(32))],
+            },
+        );
+        std::mem::forget(open);
+
+        let committed = committed_funding_coin_ids(&log, NOW).expect("readable");
+        assert_eq!(
+            committed,
+            HashSet::from(["33".repeat(32)]),
+            "only the open, unlapsed record withholds anything"
+        );
+    }
+
+    /// **A lost line refuses the whole answer, and the window does not change that.**
+    ///
+    /// The lost lines may be exactly the ones naming a committed coin, so a reservation set that
+    /// silently shrinks is worse than none. The fixture keeps a readable, held record beside the
+    /// corruption: without it, an implementation that returned an empty set on corruption would be
+    /// indistinguishable from one that refused.
+    #[test]
+    fn a_lost_line_refuses_the_committed_set() {
+        let log = tmp_log();
+        let journal = SpendJournal::with_clock(log.clone(), clock);
+
+        let spend = journal.begin(intent());
+        journal.submitted(
+            &spend,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("44".repeat(32))],
+            },
+        );
+        std::mem::forget(spend);
+
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(log.path())
+                .expect("the log");
+            writeln!(f, "not-json").expect("append");
+        }
+
+        let refused = committed_funding_coin_ids(&log, NOW).expect_err("a lost line refuses");
+        assert_eq!(
+            refused,
+            CommitmentsUnreadable("1 entries could not be parsed".to_string())
+        );
     }
 }

@@ -8450,6 +8450,26 @@ A pass runs: at start-up (once the wallet and a chain source are available), on 
    the plan's create set until that entry resolves. The audit record is the in-flight ledger; the
    disk and the chain remain the only steady-state truths.
 
+   **A funding-coin reservation is a BOUNDED hold.** The audit record also reserves the funding
+   coins a non-terminal entry consumed, so a second create in the same confirmation window cannot
+   re-select them. That reservation MUST expire: it holds a coin for
+   `FUNDING_RESERVATION_WINDOW_MS` = `2 x MIRROR_ROUND_LENGTH_MS` (20 minutes) measured from the
+   entry's LAST revision, after which the coin returns to the selectable set. An unbounded hold is a
+   lockout — a spend that never lands would strand its inputs forever and a genuinely funded
+   operator wallet would report `Insufficient` permanently. The window is derived: the chain-side
+   figure is the wallet's own post-broadcast reservation lifetime (10 minutes, roughly a dozen Chia
+   blocks), and one further round is added because this hold is re-evaluated only once per
+   `MIRROR_ROUND_LENGTH_MS`, so a threshold equal to the poll interval would release an entry on the
+   first pass at which its confirmation could even have been observed. A record whose `updated_ms`
+   is in the FUTURE keeps its hold.
+
+   **Expiry MUST NOT change the record.** The entry stays exactly the `submitted` or `unresolved` it
+   was, and stays resolvable by step 7 and by §23.5's reconcile indefinitely. Releasing a coin is
+   not a claim that the spend failed: `unresolved` means "this node signed and does not know what
+   happened", which remains true afterwards. Writing a `failed` entry to settle the bookkeeping is
+   forbidden, for the same reason a `confirmed` entry carries its height and coin id inside the
+   variant.
+
 7. **Resolves spends an EARLIER pass broadcast.** A mirror spend is broadcast in one pass and
    confirms during a later one, so the outcome MUST be recorded by an id-keyed resolution over the
    audit record rather than by the handle that opened it. Before the observation of step 2 is
