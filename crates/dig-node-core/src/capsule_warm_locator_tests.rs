@@ -120,7 +120,13 @@ impl AnnounceHolder for SilentAnnounce {
 /// The locator is built through [`NodeContent::provider_locator_chain`] — the union, the
 /// self-exclusion and the capsule fallback `for_dht` installs — so these fixtures drive the layers
 /// production drives.
-fn node_with_pool_peer(pool_peer: &str, self_peer_id: Option<String>) -> Arc<NodeContent> {
+///
+/// The scratch guard is returned with the node rather than bound here: dropping it at the end of
+/// THIS function would delete the directory the returned `NodeContent` is rooted at.
+fn node_with_pool_peer(
+    pool_peer: &str,
+    self_peer_id: Option<String>,
+) -> (Arc<NodeContent>, tempfile::TempDir) {
     let dir = temp_dir("engine");
     let content = NodeContent::new(
         NodeContent::provider_locator_chain(
@@ -136,7 +142,7 @@ fn node_with_pool_peer(pool_peer: &str, self_peer_id: Option<String>) -> Arc<Nod
         pool_peer.to_string(),
         vec!["10.0.0.9:9444".parse::<SocketAddr>().expect("test address")],
     );
-    content
+    (content, dir)
 }
 
 /// A warmer built over `content`'s PRODUCTION warm locator and a recording transport.
@@ -177,7 +183,7 @@ fn warmer_over(
 async fn a_warm_reaches_a_holder_that_only_the_connected_pool_can_name() {
     let dir = temp_dir("reachability");
     let holder = mock_peer_hex(9);
-    let content = node_with_pool_peer(&holder, Some(mock_peer_hex(1)));
+    let (content, _scratch) = node_with_pool_peer(&holder, Some(mock_peer_hex(1)));
     let transport = Arc::new(RecordingModuleTransport::default());
     let warmer = warmer_over(&content, Arc::clone(&transport), dir.path());
 
@@ -218,7 +224,7 @@ async fn a_warm_reaches_a_holder_that_only_the_connected_pool_can_name() {
 async fn a_pool_entry_naming_this_node_is_never_a_dial_candidate() {
     let dir = temp_dir("self-exclusion");
     let me = mock_peer_hex(9);
-    let content = node_with_pool_peer(&me, Some(me.clone()));
+    let (content, _scratch) = node_with_pool_peer(&me, Some(me.clone()));
     let transport = Arc::new(RecordingModuleTransport::default());
     let warmer = warmer_over(&content, Arc::clone(&transport), dir.path());
 
@@ -247,7 +253,7 @@ async fn a_pool_entry_naming_this_node_is_never_a_dial_candidate() {
 #[tokio::test]
 async fn discovery_still_excludes_the_pool_that_the_warm_locator_includes() {
     let peer = mock_peer_hex(9);
-    let content = node_with_pool_peer(&peer, Some(mock_peer_hex(1)));
+    let (content, _scratch) = node_with_pool_peer(&peer, Some(mock_peer_hex(1)));
     let capsule = dig_dht::ContentId::capsule(STORE, ROOT);
 
     let discovered = content
