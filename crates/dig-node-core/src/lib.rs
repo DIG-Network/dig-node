@@ -3894,9 +3894,7 @@ impl Node {
         let resolved =
             match digstore_chain::collection_index::index_collection_items(&chain, &page).await {
                 Ok(items) => items,
-                Err(e) => {
-                    return rpc_err(&id, -32000, &format!("list collection items: {e}"))
-                }
+                Err(e) => return rpc_err(&id, -32000, &format!("list collection items: {e}")),
             };
         let items: Vec<Value> = resolved.iter().map(Self::item_json).collect();
         // next_offset points past this page unless we have reached the end of the input.
@@ -4439,9 +4437,7 @@ pub async fn handle_rpc_json(
 ) -> String {
     let req: Value = match serde_json::from_str(req_json) {
         Ok(v) => v,
-        Err(e) => {
-            return rpc_err(&Value::Null, -32700, &format!("parse error: {e}")).to_string()
-        }
+        Err(e) => return rpc_err(&Value::Null, -32700, &format!("parse error: {e}")).to_string(),
     };
     handle_rpc(node, req, origin, provenance).await.to_string()
 }
@@ -9218,7 +9214,11 @@ mod tests {
         let resp: Value = serde_json::from_str(&out).expect("the refusal is itself valid JSON");
 
         assert_eq!(resp["error"]["code"], json!(-32700), "{resp}");
-        assert_eq!(resp["error"]["data"]["code"], json!("PARSE_ERROR"), "{resp}");
+        assert_eq!(
+            resp["error"]["data"]["code"],
+            json!("PARSE_ERROR"),
+            "{resp}"
+        );
     }
 
     /// **Proves:** the collection readers and `dig.anchoredRoot` reject bad params with the shared
