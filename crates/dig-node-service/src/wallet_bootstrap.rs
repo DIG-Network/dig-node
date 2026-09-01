@@ -27,27 +27,34 @@ use crate::wallet_env::{self, MintDecision};
 ///
 /// Returns the state so a caller can surface it; callers must not treat any outcome as fatal.
 ///
-/// Minting is REFUSED when the wallet's per-user root and the node's disagree and there is no seed
-/// yet (dig-node#392): the new seed would land under one root while the `wallet.sqlite` coin
-/// replica opens under the other, and the operator would be told only that a wallet was minted. A
-/// host that ALREADY has a seed proceeds unchanged - it is running, and refusing would break a
-/// working install to enforce a layout rule.
+/// Minting is REFUSED only when an OVERRIDDEN `LOCALAPPDATA` split the wallet root away from the
+/// node root, no seed exists yet, and `DIG_NODE_CACHE` is unset (dig-node#392): the new seed would
+/// land under one root while the `wallet.sqlite` coin replica opens under the other, and the
+/// operator would be told only that a wallet was minted. Every other shape proceeds - see
+/// [`wallet_env::mint_decision`] for why each one must, and in particular why the stock Linux
+/// service unit, whose roots diverge with nobody overriding anything, mints normally.
 pub fn ensure_wallet_seed() -> Option<BootstrapState> {
-    ensure_wallet_seed_unless_split(&autoseed::default_paths(), wallet_env::wallet_root_split())
+    ensure_wallet_seed_unless_split(
+        &autoseed::default_paths(),
+        wallet_env::wallet_root_split(),
+        wallet_env::cache_override_set(),
+    )
 }
 
 /// [`ensure_wallet_seed`] against an explicit layout and an explicit split verdict.
 ///
-/// The split is a PARAMETER for the same reason `ensure_wallet_seed_at` takes its paths: proving
+/// The split and the cache override are PARAMETERS for the same reason `ensure_wallet_seed_at`
+/// takes its paths: proving
 /// that the refusal writes nothing means running it with a split present and no seed on disk, and a
 /// test that produced that state by setting the real `LOCALAPPDATA` would be exercising the
 /// developer's own wallet directory to assert a property about a refusal.
 pub fn ensure_wallet_seed_unless_split(
     paths: &WalletPaths,
     split: Option<wallet_env::WalletRootSplit>,
+    cache_override: bool,
 ) -> Option<BootstrapState> {
     if let MintDecision::RefuseSplitRoot =
-        wallet_env::mint_decision(split.as_ref(), seed_present(paths))
+        wallet_env::mint_decision(split.as_ref(), seed_present(paths), cache_override)
     {
         tracing::error!("{}", wallet_env::REFUSED_SPLIT_MINT);
         return None;
@@ -140,14 +147,78 @@ mod tests {
             device_key: td.path().join("DigNode").join("device").join("device.key"),
             meta: td.path().join("DigWallet").join("wallet.meta.json"),
         };
-        let split = wallet_env::split_of(Path::new("/wallet-root"), Path::new("/node-root"));
-        assert!(split.is_some(), "the fixture must actually be split");
+        let split = wallet_env::split_of(
+            Path::new("/wallet-root"),
+            Path::new("/node-root"),
+            Some(Path::new("/wallet-root")),
+            false,
+        );
+        assert_eq!(
+            split.as_ref().map(|s| s.cause),
+            Some(wallet_env::SplitCause::Overridden),
+            "the fixture must be the OVERRIDE-caused split, the only one that refuses"
+        );
 
-        let state = ensure_wallet_seed_unless_split(&paths, split);
+        let state = ensure_wallet_seed_unless_split(&paths, split, false);
 
         assert!(state.is_none(), "a refused mint reports no wallet state");
         assert!(!paths.seed.exists(), "the seed file was NOT created");
         assert!(!paths.meta.exists(), "no metadata was written either");
         assert!(!paths.device_key.exists(), "no device key was written");
+    }
+
+    /// A layout under a temporary directory, so nothing here touches the real per-user profile.
+    fn scratch_paths(td: &Path) -> WalletPaths {
+        WalletPaths {
+            seed: td.join("DigWallet").join("seed.bin"),
+            device_key: td.join("DigNode").join("device").join("device.key"),
+            meta: td.join("DigWallet").join("wallet.meta.json"),
+        }
+    }
+
+    /// **Proves:** a stock Linux `.deb` service still mints.
+    ///
+    /// The shipped unit sets no `User=`, no `HOME=` and no `LOCALAPPDATA`, so the wallet root
+    /// collapses to "." while the node root falls through `getpwuid_r` to the account home. Nobody
+    /// overrode anything, so a refusal here would leave every such install permanently wallet-less
+    /// - the exact silent-start shape this ticket exists to remove.
+    #[test]
+    fn a_stock_linux_service_shaped_split_still_mints() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let paths = scratch_paths(td.path());
+        let split = wallet_env::split_of(Path::new("."), Path::new("/root"), None, false);
+        assert_eq!(
+            split.as_ref().map(|s| s.cause),
+            Some(wallet_env::SplitCause::Ambient),
+            "the fixture must be the ambient split, not an override"
+        );
+
+        let state = ensure_wallet_seed_unless_split(&paths, split, false);
+
+        assert!(state.is_some(), "the bootstrap must have run");
+        assert!(paths.seed.exists(), "a wallet was minted");
+    }
+
+    /// **Proves:** the escape the refusal NAMES is one this caller HONOURS.
+    ///
+    /// Same override-shaped split as the refusal test above, differing only in `DIG_NODE_CACHE`
+    /// being set - so an operator who follows the error message gets a wallet rather than the same
+    /// error a second time. Asserted on the seed file, because that is what the operator was
+    /// promised.
+    #[test]
+    fn setting_the_cache_override_lets_the_split_root_mint() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let paths = scratch_paths(td.path());
+        let split = wallet_env::split_of(
+            Path::new("/wallet-root"),
+            Path::new("/node-root"),
+            Some(Path::new("/wallet-root")),
+            false,
+        );
+
+        let state = ensure_wallet_seed_unless_split(&paths, split, true);
+
+        assert!(state.is_some(), "the named remedy must lift the refusal");
+        assert!(paths.seed.exists(), "and it must actually produce a wallet");
     }
 }

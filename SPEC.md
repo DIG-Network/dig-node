@@ -4391,8 +4391,20 @@ Likewise `LOCALAPPDATA` relocates only the wallet's OWN artifacts — `DigWallet
 `wallet.meta.json` and `DigNode/device/device.key`, which resolve env-first. It does NOT relocate the
 node's cache, `config.json`, or the `wallet.sqlite` coin replica, which resolve through the OS
 known-folder API; `DIG_NODE_CACHE` is the variable that moves those. A `dig-node` start-up that
-resolves the two roots differently WARNS, and REFUSES to mint a new seed into the split layout
-(nothing is written).
+resolves the two roots differently MUST WARN, naming both resolved roots.
+
+It MUST additionally REFUSE to mint a new seed (writing nothing) when, and ONLY when, all three of
+the following hold: `LOCALAPPDATA` is set to a root other than the node's own, no seed exists yet,
+and `DIG_NODE_CACHE` is unset. Roots MUST be compared ignoring trailing separators, and ignoring
+case on Windows, so a host whose environment and known-folder result differ only in spelling is NOT
+a split.
+
+Every other divergence MUST proceed and warn only. In particular, roots that diverge with NO
+override — the wallet's env-first resolver falling back to the working directory while the node's
+falls through the platform's passwd entry, which is what a service unit with no `HOME=` produces —
+MUST mint normally: there is no override to undo, `DIG_NODE_CACHE` would not address it, and
+refusing would leave such an install permanently without a wallet. The warning on that path MUST NOT
+prescribe `DIG_NODE_CACHE`, because setting it changes nothing an operator would observe.
 
 ### 16.1. Method surface + dispatch
 
