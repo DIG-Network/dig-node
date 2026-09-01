@@ -78,9 +78,9 @@
 //! `*_mojos` and come from separate coins so a fee can never shave collateral.
 
 pub mod advertise;
-pub mod events;
 #[cfg(test)]
 mod converge_tests;
+pub mod events;
 pub mod funding;
 pub mod lifecycle;
 pub mod observe;

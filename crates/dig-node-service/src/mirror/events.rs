@@ -254,7 +254,7 @@ mod tests {
         // Up to the last event's quiet period plus one step, which is still well before the settling
         // wake the observing pass schedules, so only observing passes are counted here.
         while now <= last_event + QUIET_PERIOD_MS + step {
-            if now <= last_event && (now - T0) % step == 0 {
+            if now <= last_event && (now - T0).is_multiple_of(step) {
                 c.record_event(now);
             }
             if c.take_due(now) {
@@ -334,7 +334,7 @@ mod tests {
         let spacing = QUIET_PERIOD_MS + 1_000;
         let mut now = T0;
         while now < T0 + ROUND_MS {
-            if (now - T0) % spacing == 0 {
+            if (now - T0).is_multiple_of(spacing) {
                 c.record_event(now);
             }
             if c.take_due(now) {
