@@ -126,6 +126,10 @@ dig-chainsource-interface = "0.3"
 # builder wants is a different type from the one the caller holds.
 chia-bls = "0.36.1"
 chia-protocol = "0.36.1"
+# The mirror-coin verdict cache keys on a hash of the claiming peer id, so the key stays fixed-size
+# and `Copy` against an attacker-chosen string. Same 0.36.1 line as every other chia primitive here
+# -- a second line would be a second `Sha256`.
+chia-sha2 = "0.36.1"
 chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
 # `MAINNET_CONSTANTS` -- the Chia L1 `AGG_SIG_ME` domain every mirror-coin spend is signed under
 # (`mirror::lifecycle::mirror_agg_sig_data`, dig-node#447). This is the crate `chia_wallet_sdk::types`

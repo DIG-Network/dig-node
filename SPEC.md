@@ -8604,9 +8604,24 @@ standing its source gave it.
 Absence of a pointer is the ORDINARY case and MUST cost no chain read at all. `unverified` for an
 absent pointer is not a degraded answer — it is the honest state of a claim nobody looked at.
 
-A verdict is cached only for the exact `(coin id, store, root, epoch)` it answered, because one coin
-bonds one tuple; caching by coin id alone would let a genuine bond answer for content the same coin
-does not bond, which is the substitution `advertises` exists to refuse. Only DEFINITE verdicts are
+A verdict is cached only for the exact `(coin id, store, root, epoch, claiming peer id)` it answered.
+Every component is load-bearing. One coin bonds one `(store, root, epoch)` tuple, so caching by coin
+id alone would let a genuine bond answer for content the same coin does not bond — the substitution
+`advertises` exists to refuse. And the verdict is peer-DEPENDENT: it is `bonded` only when the coin
+declares the peer offering the record, so a key omitting the claiming peer id would serve one
+holder's earned `bonded`, for the whole cache lifetime, to any stranger republishing the same
+publicly-visible coin id — reinstating through the memo the substitution the ownership question
+exists to refuse. The cache MUST also be probed under the node's TRUE current epoch rather than a
+remembered one, or a probe taken after a rollover hits the entry stored under the previous epoch and
+returns a verdict taken under the wrong one.
+
+While the node has no sound source for the coin-to-peer binding, `bonded` is unreachable for every
+input, and the verifier MUST then read no chain at all: the reads would be paid, at a third party, for
+a verdict the credit-only ranking provably discards. That short-circuit MUST be conditioned on the
+binding source itself, so that it lifts when the source arrives rather than needing a second switch
+to be remembered.
+
+Only DEFINITE verdicts are
 cached: `unverified` records this node's own momentary inability to look, and holding it would keep
 an outage in force after it had ended. The cache is keyed partly on attacker-chosen input, so it MUST
 be bounded, and overflow MUST evict rather than clear — clearing would let a stranger discard every
