@@ -4968,7 +4968,9 @@ mod tests {
 
         // The frame: an ordinary XCH coin at our own address, and a $DIG CAT that lands at a
         // derived outer hash and is therefore only STAGED.
-        db.upsert_coin(&incoming("xchcoin", 500, 101)).await.unwrap();
+        db.upsert_coin(&incoming("xchcoin", 500, 101))
+            .await
+            .unwrap();
         let staged = StagedCatRow {
             coin_id: "digcoin".into(),
             parent_coin_info: "foreign_parent_of_digcoin".into(),
@@ -5060,7 +5062,10 @@ mod tests {
         assert_eq!(db.arrival_baseline().await.unwrap(), Some(100));
 
         // The attribution pass promotes it afterwards, over a network round trip.
-        assert!(db.promote_cat_admission(&old, "a406d3a9", "ph").await.unwrap());
+        assert!(db
+            .promote_cat_admission(&old, "a406d3a9", "ph")
+            .await
+            .unwrap());
 
         // It is history. The user was not just paid, and must not be told they were.
         assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 0);
@@ -5103,7 +5108,10 @@ mod tests {
         db.stage_cat_admissions(std::slice::from_ref(&old))
             .await
             .unwrap();
-        assert!(db.promote_cat_admission(&old, "a406d3a9", "ph").await.unwrap());
+        assert!(db
+            .promote_cat_admission(&old, "a406d3a9", "ph")
+            .await
+            .unwrap());
 
         assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 0);
         assert!(db.arrivals_since(0, 100).await.unwrap().is_empty());
