@@ -8551,7 +8551,9 @@ coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile acc
 > not.** The stability-across-a-window rule, in both directions, is satisfied by the pure tracker in
 > `mirror/presence.rs` and its `SETTLING_WINDOW_MS`, and `mirror::runner::PassRunner` debounces the
 > advertisable half of every observation through it. **Nothing feeds THAT**: there is no periodic
-> scan, no start-up scan and no watcher, because `MirrorEffects::observe_disk` has no implementation
+> scan, no start-up scan, because `MirrorEffects::observe_disk` has no implementation. The WATCHER half is
+> no longer pending: `mirror/events.rs` watches the capsule cache and accelerates the pass, bounded
+> by the four rules below
 > — so the scanning cadence described below, the un-debounced start-up exemption, and the claim that
 > the periodic pass is the correctness mechanism are all still pending, tracked as
 > <https://github.com/DIG-Network/dig-node/issues/412>.
@@ -8559,6 +8561,47 @@ coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile acc
 Presence changes are detected by SCANNING, with an optional watcher as an accelerator — never the
 reverse. A watcher event is exactly what a crash, an unmounted volume, or an uncovered path loses;
 the periodic pass (§25.4) is the correctness mechanism.
+
+The watcher is implemented (`mirror/events.rs`). It watches the capsule cache directory and MUST
+obey all four of the following; a node whose watcher cannot be established, or whose events are all
+dropped, MUST still converge on the round timer alone.
+
+1. **An event MAY only lower the instant of the next pass, never raise it.** The round deadline is
+   computed on entry to the wait and every return happens at or before it, so the timer is a
+   backstop rather than a fallback. The round length MUST NOT be lengthened to compensate for having
+   events.
+2. **Events are COALESCED, never queued.** The pending state is one instant, so N events in a window
+   — including events arriving while a pass is running or wedged — owe exactly ONE wake.
+3. **An observing wake fires after `QUIET_PERIOD_MS` (5_000) of quiet**, and schedules exactly one
+   **settling** wake `SETTLING_WINDOW_MS` later. That second wake MUST NOT re-arm, so a burst of any
+   size causes at most two passes.
+4. **No two event-driven passes are closer than `SETTLING_WINDOW_MS`.** A pass cannot act on a change
+   the tracker has not yet seen hold for a window, so anything closer is amplification on a path that
+   spends money.
+
+**Chain events do NOT trigger a pass, and no mechanism exists by which they could.** Chain is
+observed inside the pass, on the round timer. This is a limitation of the interfaces available, not
+only a design preference, and the two are worth separating:
+
+- **There is no chain event to subscribe to.** `MirrorEffects::observe_chain` reads through
+  `ChainSource` (`dig-chainsource-interface`), whose entire surface is request/response —
+  `coin_record`, `coin_records_by_puzzle_hash`, `coin_records_by_parent`, `coin_spend`. It exposes
+  no subscription, no stream and no callback, so there is nothing for a waiting pass to select on.
+  The node's own §14.2 chain-watch is likewise a POLL loop, not a push source.
+- **The one push path in the node cannot say a mirror coin changed.** The wallet's direct-peer sync
+  (§18.6) does hold a real `request_puzzle_state(subscribe = true)` subscription and publishes to
+  the §18.14 `EventBus` — but `SyncEvent::CoinState` is fieldless. It names no coin, no puzzle hash
+  and no height, and it reports the WALLET DB rather than the mirror's chain view. Waking a pass on
+  it would wake a money-spending pass on any wallet coin activity whatsoever, with no evidence the
+  event was relevant, at up to the `SETTLING_WINDOW_MS` floor rather than the round.
+
+Independently of both, the two things a pass acts on are not chain-shaped: a CREATE is decided from
+disk presence, which IS event-driven; and the epoch rollover a RECLAIM waits on is wall-clock.
+
+What a chain event WOULD buy is freshness of the §25.8 observation — a mirror coin spent out from
+under this node is reported up to one round late. That is a staleness bound on a read-only surface,
+never a money-safety gap, and closing it needs a coin-state push carrying the coin it is about.
+Tracked as <https://github.com/DIG-Network/dig-node/issues/482>.
 
 The debounce is **presence-stable-for-a-window**, not a timer after an event: a bond must be
 observed in the SAME state across `SETTLING_WINDOW_MS` (default 30_000) before that state is acted

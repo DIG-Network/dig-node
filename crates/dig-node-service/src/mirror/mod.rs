@@ -80,6 +80,7 @@
 pub mod advertise;
 #[cfg(test)]
 mod converge_tests;
+pub mod events;
 pub mod funding;
 pub mod lifecycle;
 pub mod observe;
