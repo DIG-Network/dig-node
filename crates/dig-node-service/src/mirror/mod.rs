@@ -81,6 +81,7 @@ pub mod advertise;
 pub mod bond_verify;
 #[cfg(test)]
 mod converge_tests;
+pub mod events;
 pub mod funding;
 pub mod lifecycle;
 pub mod observe;

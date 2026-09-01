@@ -73,6 +73,10 @@ pub struct ObserveContext {
     pub margin_bp: u64,
     /// §25.7's switch. Reported because a node with creates OFF describes its bonds differently.
     pub creates_enabled: bool,
+    /// Whether this node has anywhere to advertise from (SPEC.md §25.10). Reported because a node
+    /// that advertises nothing can create no bond at any balance, and describing that in money is
+    /// the conflation this surface exists to remove.
+    pub can_advertise: bool,
 }
 
 /// The whole §25.8 answer before paging, from four readings and a context.
@@ -110,6 +114,7 @@ pub fn observe(
         margin_bp: ctx.margin_bp,
         dig_balance_base_units,
         creates_enabled: ctx.creates_enabled,
+        can_advertise: ctx.can_advertise,
     });
 
     BondObservation {
@@ -205,6 +210,7 @@ mod tests {
             },
             margin_bp: 0,
             creates_enabled: true,
+            can_advertise: true,
         }
     }
 

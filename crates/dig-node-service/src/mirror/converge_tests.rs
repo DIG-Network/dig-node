@@ -238,6 +238,7 @@ fn ctx_at(epoch: i64) -> PassContext {
         requirement: known(),
         margin_bp: 0,
         creates_enabled: true,
+        can_advertise: true,
     }
 }
 

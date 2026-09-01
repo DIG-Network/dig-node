@@ -851,6 +851,49 @@ pub fn cache_cap_bytes() -> u64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CACHE_CAP)
 }
+/// The share of [`cache_cap_bytes`] reserved for the per-resource response cache
+/// (`<cache>/responses`), expressed as a divisor: `cap / RESPONSE_CACHE_SHARE_DIVISOR`.
+///
+/// **Why a split rather than one number applied twice (dig-node#284).** The cap used to be read
+/// independently by BOTH eviction paths over BOTH subtrees, so a node configured for N bytes held
+/// close to 2N: neither sweep knew the other existed. A user setting a cap did not get it.
+///
+/// **Why a reserved share rather than "modules take whatever responses leave".** Sizing each sweep
+/// against the other's live usage converges to the right total but starves whichever subtree loses
+/// the race — and the response cache, being made of small regenerable windows, always loses to
+/// ~135 MiB capsules. A cache that evicts every response the instant it is written is a bound that
+/// starves the work it protects. An eighth is small enough that capsules keep the bulk of the disk
+/// and large enough that the response cache is never pointless.
+const RESPONSE_CACHE_SHARE_DIVISOR: u64 = 8;
+
+/// How the single [`cache_cap_bytes`] budget is divided between the two evicting subtrees, so their
+/// SUM is bounded by the cap the operator configured and `used_bytes` and `cap_bytes` describe the
+/// same thing (dig-node#284).
+///
+/// Unrecognised bytes are charged to the modules half by [`Node::evict_modules_locked`] rather than
+/// being represented here, because only the sweep that walks `<cache>/modules` can measure them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheBudget {
+    /// The whole operator-configured cap. The sum of the two shares below never exceeds it.
+    pub total: u64,
+    /// Bytes `<cache>/responses` may hold.
+    pub responses: u64,
+    /// Bytes `<cache>/modules` may hold, BEFORE unrecognised bytes are charged against it.
+    pub modules: u64,
+}
+
+/// Split the configured cap into its two shares. See [`CacheBudget`].
+pub fn cache_budget() -> CacheBudget {
+    let total = cache_cap_bytes();
+    let responses = total / RESPONSE_CACHE_SHARE_DIVISOR;
+    CacheBudget {
+        total,
+        responses,
+        // Saturating rather than plain subtraction so the invariant holds even if the divisor is
+        // ever changed to something that could exceed the total.
+        modules: total.saturating_sub(responses),
+    }
+}
 
 /// Persist the cache size cap (bytes) to config.json (the DIG settings page).
 /// Read-modify-write under the cross-process lock so a concurrent writer (e.g.
@@ -2276,9 +2319,11 @@ impl Node {
                 }
             }
         }
-        // Read the cap dynamically so changes from the DIG settings page apply
-        // without restarting the browser. `self.cache_cap` is the startup default.
-        let cap = cache_cap_bytes();
+        // Read the budget dynamically so changes from the DIG settings page apply without
+        // restarting the browser (`self.cache_cap` is the startup default), and take only the
+        // RESPONSES SHARE of it — the modules sweep spends the rest. Reading the whole cap here,
+        // as this did, let the two subtrees each grow to the full cap (dig-node#284).
+        let cap = cache_budget().responses;
         for victim in plan_eviction(&entries, cap) {
             // Size of the victim, looked up from the scan, so the reclaimed-bytes
             // counter is accurate even though the file is about to be unlinked.
@@ -2387,6 +2432,44 @@ impl Node {
         self.refresh_dht_inventory().await;
     }
 
+    /// Total bytes under `<cache>/modules` that [`Node::scan_cached_modules`] does NOT return as an
+    /// eviction candidate — anything whose store directory is not lowercase 64-hex, plus any file
+    /// inside a recognised store directory that is not a capsule (a `.tier` sidecar, a `.tmp-*`
+    /// write-atomic scratch file, a stray subdirectory).
+    ///
+    /// **Why this exists (dig-node#265).** The scan's hex64 filter governed BOTH the total the sweep
+    /// measured AND the candidate set it could evict, so unrecognised bytes were invisible to the
+    /// bound while still consuming the disk the bound protects. They could grow without limit.
+    ///
+    /// **The semantics chosen, stated here because nowhere else records it:** COUNT, never DELETE.
+    /// These bytes are charged against the modules budget, so recognised capsules are evicted to
+    /// compensate; the sweep never removes a file it cannot identify.
+    fn unrecognised_module_bytes(&self) -> u64 {
+        fn walk(p: &Path, total: &mut u64) {
+            let Ok(rd) = std::fs::read_dir(p) else { return };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, total);
+                } else if let Ok(md) = e.metadata() {
+                    *total += md.len();
+                }
+            }
+        }
+
+        let modules = self.cache_dir.join("modules");
+        let mut everything = 0u64;
+        walk(&modules, &mut everything);
+        // Subtract exactly what the scan WOULD evict, so the two halves partition the subtree by
+        // construction rather than by two filters that must be kept in agreement by hand.
+        let recognised: u64 = self
+            .scan_cached_modules()
+            .iter()
+            .map(|m| m.size_bytes)
+            .sum();
+        everything.saturating_sub(recognised)
+    }
+
     /// Every capsule file under `<cache>/modules`, as the eviction decision needs to see it.
     ///
     /// Also refreshes each store's persisted `.tier` sidecar from the live composition, so tier
@@ -2466,9 +2549,24 @@ impl Node {
     /// advertising content it had deleted (#267).
     fn evict_modules_locked(&self) -> Vec<dig_sex::CapsuleIdentity> {
         let _xproc = acquire_cache_lock();
-        let cap = cache_cap_bytes();
+        // The MODULES SHARE of the one budget, not the whole cap (dig-node#284) — the response
+        // cache spends the rest, so the two subtrees together stay under what the operator set.
+        let budget = cache_budget().modules;
         let cached = self.scan_cached_modules();
         let total: u64 = cached.iter().map(|m| m.size_bytes).sum();
+
+        // dig-node#265: bytes under `<cache>/modules` that this sweep cannot identify as a capsule
+        // are COUNTED but never DELETED. Counted, because they consume exactly the disk the bound
+        // exists to protect, and a bound that cannot see half the directory is not a bound.
+        // Never deleted, because the sweep does not exclusively own this directory and removing
+        // files it does not understand is the kind of thing that is fine until the once it is not.
+        //
+        // The consequence is deliberate and worth stating plainly: unrecognised bytes shrink the
+        // budget available to recognised capsules, so the sweep evicts MORE capsules to stay under
+        // the cap. That is the honest direction — the operator asked for a disk bound, not for a
+        // bound on the subset of the disk this version happens to recognise.
+        let unrecognised = self.unrecognised_module_bytes();
+        let cap = budget.saturating_sub(unrecognised);
 
         // The DECISION — whose capsules to sacrifice, and in what order — belongs to `dig-sex`. This
         // node supplies only the facts (`tier_algorithms`) and performs only the I/O. Note what is
@@ -6629,6 +6727,165 @@ mod tests {
         assert!(
             path.exists(),
             "the untagged module survives a no-pressure sweep"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// Total bytes actually on disk under `dir`, recursively. The tests below assert against THIS
+    /// rather than against a function having been called: dig-node#284 is a defect about how many
+    /// bytes survive a sweep, so only the bytes can witness it.
+    fn bytes_on_disk(dir: &Path) -> u64 {
+        let mut total = 0u64;
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                total += bytes_on_disk(&p);
+            } else if let Ok(md) = e.metadata() {
+                total += md.len();
+            }
+        }
+        total
+    }
+
+    /// **Proves (dig-node#284):** the configured cap bounds the WHOLE cache, not each subtree
+    /// separately. Both subtrees are filled well past the cap, both sweeps run, and the bytes left
+    /// on disk are measured against the number the operator configured.
+    ///
+    /// **Catches:** either sweep reading `cache_cap_bytes()` instead of its share of
+    /// [`cache_budget`]. With that defect the cache settles near 2x the cap, which is exactly what
+    /// this asserts against — and no assertion about a call, a policy, or a victim list can see it,
+    /// because both sweeps behave *correctly* in isolation. That is the whole shape of the bug.
+    #[test]
+    fn one_budget_bounds_both_cache_subtrees_together() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let (node, _td) = test_node(None);
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+
+        const CAP: u64 = 40_960;
+        set_cache_cap_bytes(CAP).unwrap();
+
+        // Fill `modules` with sacrificial (tier-0) capsules far past the whole cap, so the modules
+        // sweep has real work and cannot pass by holding nothing.
+        let root = "cd".repeat(32);
+        for i in 0..12u8 {
+            let store = format!("{:02x}", i).repeat(32);
+            crate::tier0_live::mark_tier0_land(&store);
+            let p = module_path(&node.cache_dir, &store, &root);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![0u8; 8_192]).unwrap();
+        }
+
+        // Fill `responses` past the cap too.
+        let responses = node.cache_dir.join("responses");
+        std::fs::create_dir_all(&responses).unwrap();
+        for i in 0..12u8 {
+            std::fs::write(responses.join(format!("window-{i}")), vec![0u8; 8_192]).unwrap();
+        }
+
+        let before = bytes_on_disk(&node.cache_dir);
+        assert!(
+            before > CAP * 2,
+            "the fixture must start ABOVE twice the cap or it cannot distinguish one budget from \
+             two, got {before} against a cap of {CAP}"
+        );
+
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+        node.evict_if_needed(&responses);
+
+        let after = bytes_on_disk(&node.cache_dir);
+        assert!(
+            after <= CAP,
+            "the whole cache must fit the ONE configured cap after both sweeps: {after} bytes on \
+             disk against a cap of {CAP}. Roughly 2x the cap means each subtree enforced the cap \
+             independently (dig-node#284)."
+        );
+        // The truthful control: the bound must not be satisfied by deleting everything. A cache
+        // that evicts itself to nothing is a different defect wearing this test's green.
+        assert!(
+            after > 0,
+            "the sweeps must leave the cache populated, not empty — an empty cache trivially fits \
+             any cap and would prove nothing"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// **Proves (dig-node#265):** bytes under `<cache>/modules` that the scan cannot identify are
+    /// COUNTED against the budget and are NEVER DELETED — the two halves of the semantics chosen in
+    /// [`Node::unrecognised_module_bytes`], asserted separately because a fix could get either one
+    /// right alone.
+    ///
+    /// **Catches:** the hex64 filter governing both the measured total and the candidate set, which
+    /// made unrecognised bytes invisible to the bound. Under that defect the recognised capsule fits
+    /// the budget on its own and survives, so the eviction assertion below fails — the unrecognised
+    /// directory is the ONLY reason the sweep is under pressure at all.
+    #[test]
+    fn unrecognised_bytes_under_modules_are_counted_but_never_deleted() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let (node, _td) = test_node(None);
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+
+        // Sized FROM the split, not guessed: the modules share is 7/8 of the cap. One 4 KiB capsule
+        // fits that share comfortably on its own; adding 8 KiB of unrecognised bytes puts the
+        // subtree over it. So the two worlds — counted and not-counted — give opposite verdicts.
+        // Sized FROM the split rather than guessed, and the sizing IS the fixture. The modules
+        // share is 7/8 of the cap = 10_752. A lone 4 KiB capsule fits it, so under the OLD
+        // behaviour (unrecognised bytes invisible) nothing is evicted. Charging the 8 KiB stray
+        // leaves 2_560, which the same capsule does NOT fit. The two worlds give opposite verdicts
+        // on the identical fixture, which is what makes the eviction assertion evidence about the
+        // COUNTING decision rather than about eviction working at all.
+        const CAP: u64 = 12_288;
+        const CAPSULE: u64 = 4_096;
+        const STRAY: u64 = 8_192;
+        set_cache_cap_bytes(CAP).unwrap();
+        let modules_budget = cache_budget().modules;
+        assert!(
+            modules_budget > CAPSULE,
+            "the capsule must fit the modules share ALONE, or it would be evicted whether or not              the stray bytes were counted"
+        );
+        assert!(
+            modules_budget.saturating_sub(STRAY) < CAPSULE,
+            "charging the stray bytes must push the capsule OVER the share, or counting them              changes nothing observable"
+        );
+
+        let store = "9a".repeat(32);
+        let root = "cd".repeat(32);
+        crate::tier0_live::mark_tier0_land(&store); // sacrificial, so pressure CAN evict it
+        let capsule = module_path(&node.cache_dir, &store, &root);
+        std::fs::create_dir_all(capsule.parent().unwrap()).unwrap();
+        std::fs::write(&capsule, vec![0u8; CAPSULE as usize]).unwrap();
+
+        // A directory whose name is not a lowercase 64-hex store id — invisible to the scan.
+        let stray = node.cache_dir.join("modules").join("not-a-store-id");
+        std::fs::create_dir_all(&stray).unwrap();
+        let stray_file = stray.join("blob.bin");
+        std::fs::write(&stray_file, vec![0u8; STRAY as usize]).unwrap();
+
+        assert_eq!(
+            node.unrecognised_module_bytes(),
+            STRAY,
+            "the unrecognised bytes must be measured, or nothing downstream can charge for them"
+        );
+
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+
+        assert!(
+            !capsule.exists(),
+            "the recognised capsule must be evicted to make room for bytes the sweep counted but \
+             cannot remove — under the old filter it fits the budget alone and survives"
+        );
+        assert!(
+            stray_file.exists(),
+            "the sweep must NEVER delete a file it cannot identify from a directory it does not \
+             exclusively own"
         );
 
         std::env::remove_var("DIG_NODE_CACHE");

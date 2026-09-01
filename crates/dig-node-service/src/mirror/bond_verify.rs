@@ -454,14 +454,13 @@ fn settled_epoch() -> Option<u64> {
 /// A file read plus a line-by-line JSON parse, so it is paid only on a cache miss.
 fn current_requirement() -> Option<u64> {
     let current = current_epoch_now();
-    let required = match requirement(&EpochRecordStore::in_state_dir(), current) {
+    match requirement(&EpochRecordStore::in_state_dir(), current) {
         CollateralRequirementResult::Known {
             required_per_store_dig_base_units,
             ..
         } => Some(required_per_store_dig_base_units),
         _ => None,
-    };
-    required
+    }
 }
 
 #[async_trait]

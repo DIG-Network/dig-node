@@ -92,7 +92,7 @@ async-trait = "0.1"
 # "0.6.0" the suite went green over a `control.wallet.coinById` the contract had never heard of --
 # it checked nothing about the very method the change added. A caret range keeps the pin moving
 # with the published catalog instead of silently narrowing what CI can see.
-dig-node-control-interface = "0.27"
+dig-node-control-interface = "0.30"
 
 # The deterministic mirror-coin collateral model: the per-epoch requirement, the controller
 # multiplier, the small-network handicap, the floor clamp, and the safety-margin arithmetic.
@@ -256,6 +256,12 @@ dig-urn-resolver = "0.5.3"
 # literal. Held in lockstep with dig-node-core's pin (#2072) — 0.11.2, on dig-node's chia 0.36.1
 # line (dig_ecosystem#3161) — so the two node crates can never disagree about a canonical value.
 dig-constants = "0.13.0"
+
+# Filesystem notification, for the §25 mirror pass's disk-event accelerant (dig-node#465). The
+# watcher is strictly an ACCELERANT: the round timer and the start-up reconcile remain the
+# correctness path, and `watch_capsule_cache` returns `None` rather than erroring when no watcher
+# can be established, so a platform this crate cannot watch simply keeps the timer.
+notify = "8"
 
 # Windows Service Control Protocol. service-manager only REGISTERS the service in the
 # SCM; the binary the SCM launches must itself speak the service protocol

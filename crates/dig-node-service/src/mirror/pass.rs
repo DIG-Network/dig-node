@@ -53,6 +53,39 @@ pub struct PassDecision {
     pub per_coin_dig_base_units: Option<u64>,
     /// One state per bond the node holds, for the §25.8 surface.
     pub states: Vec<(Bond, BondState)>,
+    /// What this pass could NOT afford to create, when the wallet was readable and came up short.
+    ///
+    /// `Some` exactly when at least one create was priced and left uncreated for want of funds —
+    /// [`BondState::Unfunded`]'s condition, carried in a shape the alert gate can decide on. `None`
+    /// means every planned create was affordable, which includes the ordinary case of a node with
+    /// nothing new to bond.
+    ///
+    /// It exists because "this pass created nothing" has two opposite causes, and the pass that
+    /// created nothing because it could afford nothing is precisely the shortfall dig-node#463 was
+    /// built to report. Reading it off the create loop cannot tell them apart; reading it off the
+    /// funds split can (dig-node#469).
+    pub funding_shortfall: Option<FundingShortfall>,
+}
+
+/// A pass that could not afford every create it planned.
+///
+/// # Why this carries the requirement and NOT the balance (dig-node#469)
+///
+/// It once carried a `have_dig_base_units` too — the $DIG left over after the affordable creates
+/// were funded, `balance % per_coin`. That figure is derived from `dig_balance_base_units`, the raw
+/// sum over `dig_cat_puzzle_hash(owner)`, and NEITHER balance tier authenticates CAT lineage. The
+/// address is publicly derivable, so the figure is one a stranger can move by paying a coin into
+/// it: planting just under one create's cost has the operator told they are a hair short when they
+/// are half a create short, and the alert gate then suppresses the correction as immaterial.
+///
+/// So the field is GONE rather than merely unused. An unauthenticated money figure that no caller
+/// currently renders is one refactor away from being rendered again; a struct that cannot hold it
+/// cannot regress. What survives is the requirement, which is derived from the epoch and the plan
+/// and which no stranger can move — see SPEC §25.11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingShortfall {
+    /// What the creates left uncreated would cost together, in $DIG base units.
+    pub need_dig_base_units: u64,
 }
 
 /// What the node can say about one bond right now.
@@ -102,6 +135,23 @@ pub enum BondState {
     /// provenance — and decisively in REMEDY: an operator told "withheld" about a disabled node goes
     /// looking at content when they should be looking for a switch.
     Disabled,
+    /// This node advertises NOTHING, so no bond of any kind can be created (SPEC.md §25.10).
+    ///
+    /// `dig_mirror_coin::create` refuses an advertisement carrying no URL, so a node with an empty
+    /// `DIG_MIRROR_ADVERTISE_URLS` cannot bond a capsule however much $DIG it holds. The node says
+    /// so in its own log at bring-up; until this variant existed the §25.8 surface could not, and
+    /// reported the funding split instead — telling an operator whose operator wallet is empty that
+    /// they were `Unfunded` by a named number of base units, when adding that money would have
+    /// changed nothing at all.
+    ///
+    /// That is the conflation this enum exists to prevent, in its most expensive direction: the
+    /// remedy for `Unfunded` is to buy $DIG, and the remedy here is to set one environment
+    /// variable. It outranks the funding split for exactly that reason — a blocker no amount of
+    /// money can clear must not be described in money.
+    ///
+    /// It does NOT outrank [`Self::Bonded`] or [`Self::Reclaiming`]: a coin already on chain is
+    /// real money whose state does not depend on what this node can advertise today.
+    Unadvertised,
     /// This capsule is `Relayed` (§25.1): held on a stranger's behalf, served, and never advertised.
     ///
     /// Not a failure and not a shortfall. There is no remedy because nothing is wrong — which is
@@ -168,6 +218,17 @@ pub struct PassInputs<'a> {
     pub dig_balance_base_units: Option<u64>,
     /// Whether creates are enabled (§25.7). Reclaims ignore this.
     pub creates_enabled: bool,
+    /// Whether this node has anywhere to advertise FROM (SPEC.md §25.10, dig-node#426).
+    ///
+    /// `false` means `MirrorEffects::create` refuses every bond by name before any chain read, so a
+    /// pass that priced creates would price them only to throw them away. Taken as an INPUT rather
+    /// than discovered inside the effect, because the §25.8 state surface never invokes the effect
+    /// at all — it only decides — and a blocker visible only inside `create` is invisible to the
+    /// one surface an operator reads.
+    ///
+    /// Reclaims ignore it, exactly as they ignore [`Self::creates_enabled`]: money already locked
+    /// must come home whether or not this node can advertise anything today.
+    pub can_advertise: bool,
 }
 
 /// Decide one pass.
@@ -178,6 +239,13 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
     // Rule 2. OFF forces the DESIRED set empty rather than short-circuiting the pass, so the ordinary
     // plan reclaims every live coin. A `return` here would freeze the locked collateral instead of
     // releasing it, which is the failure that inverts the meaning of "revoke".
+    // `can_advertise` is deliberately NOT tested here, and the distinction is money. Emptying the
+    // desired set is how the SWITCH revokes: the plan then reclaims every live coin. Doing the same
+    // for an unset `DIG_MIRROR_ADVERTISE_URLS` would spend a reclaim per bond in response to a
+    // missing environment variable — precisely what `super::advertise`'s own contract forbids
+    // ("nothing here reclaims on a config change — spending money in response to a text edit is not
+    // a behaviour an operator asked for"). The advertisement blocker suppresses CREATES only, at
+    // the pricing step below, and leaves everything already on chain exactly as it was.
     let desired: &[Bond] = if inputs.creates_enabled {
         inputs.held
     } else {
@@ -207,8 +275,12 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
     // Rule 1, continued: the balance is read AFTER the plan too, and an unknown balance prices no
     // create rather than aborting anything. `reclaim` above is already decided and is untouched by
     // either arm below.
+    // `can_advertise` gates the SPLIT rather than the plan, so an unadvertisable node prices
+    // nothing: no create is selected, and — because the shortfall is read off the split — no
+    // funding alarm is raised about creates that were never going to be attempted. The reclaim
+    // list above is already decided and is untouched by this arm.
     let (affordable, split) = match (per_coin, inputs.dig_balance_base_units) {
-        (Some(per_coin), Some(balance)) => {
+        (Some(per_coin), Some(balance)) if inputs.can_advertise => {
             let split = super::plan::split_by_funds(&create, balance, per_coin);
             (split.affordable.clone(), Some(split))
         }
@@ -217,11 +289,28 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
 
     let states = bond_states(inputs, &affordable, split.as_ref(), per_coin, &reclaim);
 
+    // The shortfall is read off the split rather than off the states, because the split is what
+    // decided it: `short` is non-empty exactly when a priced create went unmade for want of funds.
+    // What it reports is the COST of those unmade creates and nothing about the wallet — the
+    // balance that produced the split is unauthenticated, and no figure derived from it may reach
+    // an operator (SPEC §25.11, dig-node#469).
+    let funding_shortfall = match (per_coin, split.as_ref()) {
+        // `per_coin` of zero is refused as a create everywhere else in this crate; a requirement of
+        // zero is a caller defect, not an empty wallet, so it reports no shortfall.
+        (Some(per_coin), Some(split)) if per_coin > 0 && !split.is_funded() => {
+            Some(FundingShortfall {
+                need_dig_base_units: split.shortfall_dig_base_units,
+            })
+        }
+        _ => None,
+    };
+
     PassDecision {
         reclaim,
         create: affordable,
         per_coin_dig_base_units: per_coin,
         states,
+        funding_shortfall,
     }
 }
 
@@ -288,6 +377,14 @@ fn bond_states(
             }
         } else if !inputs.creates_enabled {
             BondState::Disabled
+        } else if !inputs.can_advertise {
+            // Above the funding split and above `Pending`, below `Bonded`/`Reclaiming`/`Disabled`.
+            // Below the first two because a coin on chain is money whose state does not depend on
+            // today's configuration; below `Disabled` because the operator's own switch is the more
+            // proximate answer when both hold. Above everything after it because no amount of $DIG
+            // and no pending spend can clear this one — and describing it in money is what sent an
+            // operator to buy $DIG that would have bonded nothing.
+            BondState::Unadvertised
         } else if inputs.in_flight.contains(bond) {
             BondState::Pending
         } else {
@@ -409,7 +506,147 @@ mod tests {
             margin_bp: 0,
             dig_balance_base_units: Some(1_000_000),
             creates_enabled: true,
+            can_advertise: true,
         }
+    }
+
+    /// **Proves:** a node that advertises nothing reports WHY, and never as a money shortfall.
+    ///
+    /// **Catches** the defect measured on a real node on 2026-09-01 (dig_ecosystem, this ticket).
+    /// That node held three capsules, had `DIG_MIRROR_ADVERTISE_URLS` unset, and logged
+    /// *"no DIG_MIRROR_ADVERTISE_URLS entry is publishable, so this node advertises nothing and
+    /// creates no mirror coin"* at every bring-up — while `dign mirror bond-states` answered
+    /// `unfunded, short_dig_base_units: 1010` on all three rows. Both statements were produced by
+    /// the same process minutes apart, and only one of them was true.
+    ///
+    /// The cost of the wrong one is not confusion, it is money: `unfunded` names a figure and an
+    /// action, and the action is to go and buy $DIG. An operator who did that would have bonded
+    /// nothing, because the create refuses on the advertisement before it ever reaches a coin.
+    ///
+    /// # The fixture makes the two answers DIFFER
+    ///
+    /// The balance is deliberately ZERO, so the funding split genuinely puts every bond in `short`
+    /// and the pre-fix implementation produces `Unfunded` rather than agreeing by accident. An
+    /// implementation that merely stopped pricing creates — without the state precedence — would
+    /// report `Pending`, which is the other plausible wrong answer and is equally false: nothing is
+    /// pending, and nothing ever will be.
+    #[test]
+    fn a_node_that_can_advertise_nothing_says_so_instead_of_claiming_it_is_short_of_dig() {
+        let held = [bond("aa", "11"), bond("bb", "22")];
+        let requirement = known();
+        let mut inputs = inputs(&held, &[], &requirement);
+        inputs.can_advertise = false;
+        // Zero, not merely small: the funding split must genuinely want to report a shortfall, or
+        // this fixture cannot tell the fix from the defect.
+        inputs.dig_balance_base_units = Some(0);
+
+        let decision = decide(&inputs);
+
+        for (bond, state) in &decision.states {
+            assert_eq!(
+                *state,
+                BondState::Unadvertised,
+                "{bond:?} must name the advertisement blocker, never a $DIG shortfall"
+            );
+        }
+        assert!(
+            decision.create.is_empty(),
+            "a node with nowhere to advertise plans no creates"
+        );
+        assert_eq!(
+            decision.funding_shortfall, None,
+            "a shortfall alert for creates that were never going to be attempted is the same false \
+             money statement reached through the alert path instead of the state path"
+        );
+    }
+
+    /// **Proves:** the advertisement blocker does NOT rewrite what is already on chain.
+    ///
+    /// **Catches** the over-broad fix — a `return` at the top of `decide`, or a precedence that
+    /// outranks `Bonded`. Collateral already locked is real money, and a node that stopped
+    /// reporting it because a config value is unset would tell an operator their bond had vanished.
+    #[test]
+    fn an_unadvertised_node_still_reports_the_coins_it_already_has_on_chain() {
+        let held = [bond("aa", "11")];
+        let on_chain = [coin("c1", "aa", "11", NOW_EPOCH, REQUIRED)];
+        let requirement = known();
+        let mut inputs = inputs(&held, &on_chain, &requirement);
+        inputs.can_advertise = false;
+
+        let decision = decide(&inputs);
+
+        assert!(
+            decision
+                .states
+                .iter()
+                .any(|(_, s)| matches!(s, BondState::Bonded { .. })),
+            "a coin on chain outranks the advertisement blocker"
+        );
+    }
+
+    /// **Proves:** a partially funded pass reports the money that must actually be ADDED, not the
+    /// whole cost of the creates it could not make.
+    ///
+    /// **Catches:** the two plausible wrong figures, each of which is a false money statement to an
+    /// operator (dig-node#469):
+    ///
+    /// * quoting the WALLET BALANCE as what is available — money that has already been spent on the
+    ///   affordable creates, so the deficit reads as smaller than it is and an operator who adds
+    ///   that much is still short;
+    /// * quoting zero as available — the deficit then reads as the full cost of every unmade create,
+    ///   sending them to buy $DIG they already hold.
+    ///
+    /// # The fixture is chosen so the three candidate figures all DIFFER
+    ///
+    /// Three bonds at 1,000 each against a balance of 2,400: two are affordable, one is not, and
+    /// 400 is left over. So the honest answer is *400 towards the 1,000 still needed*. A balance of
+    /// 2,000 or 3,000 would make the remainder zero and let a wrong implementation agree by
+    /// accident; the deliberate 400 is what separates them.
+    #[test]
+    fn a_partially_funded_pass_reports_the_leftover_against_what_is_still_needed() {
+        let held = [bond("aa", "11"), bond("bb", "22"), bond("cc", "33")];
+        let requirement = known();
+        let mut inputs = inputs(&held, &[], &requirement);
+        inputs.dig_balance_base_units = Some(REQUIRED * 2 + 400);
+
+        let decision = decide(&inputs);
+
+        assert_eq!(
+            decision.create.len(),
+            2,
+            "the fixture must genuinely fund some and not others, or it tests nothing"
+        );
+        assert_eq!(
+            decision.funding_shortfall,
+            Some(FundingShortfall {
+                need_dig_base_units: REQUIRED,
+            }),
+            concat!(
+                "the cost of the unmade create is the one figure here no stranger can move; the ",
+                "leftover balance is an unauthenticated sum over a public address (SPEC 25.11)"
+            )
+        );
+    }
+
+    /// **Proves:** a pass that funded everything it planned reports NO shortfall.
+    ///
+    /// The other half of the pair above, and the reason it is a separate test: without it, an
+    /// implementation that reports a shortfall on every pass satisfies the partial case and turns
+    /// the funding alert into the per-pass stream `FundingAlertGate` exists to prevent. A node with
+    /// nothing new to bond is the ordinary state and must be silent.
+    #[test]
+    fn a_pass_that_afforded_everything_reports_no_shortfall() {
+        let held = [bond("aa", "11")];
+        let requirement = known();
+        let inputs = inputs(&held, &[], &requirement);
+
+        let decision = decide(&inputs);
+
+        assert_eq!(decision.create.len(), 1, "the create is affordable");
+        assert_eq!(
+            decision.funding_shortfall, None,
+            "a funded pass must not report a shortfall, or every pass alerts"
+        );
     }
 
     #[test]

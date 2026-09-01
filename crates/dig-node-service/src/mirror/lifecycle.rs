@@ -525,10 +525,12 @@ fn parse_id(hex_id: &str, what: &str) -> Result<Bytes32, PassError> {
 /// condition of this NODE. Collapsing them would tell an operator to add funds when the truth is
 /// that a read timed out.
 fn funding_refusal(error: FundingError) -> PassError {
-    match &error {
-        FundingError::Chain(_) => PassError::Chain(error.to_string()),
-        _ => PassError::Wallet(error.to_string()),
-    }
+    // Carried WHOLE rather than split into `Chain` and `Wallet` by its variant. The distinction is
+    // not lost: it lives inside the `FundingError`, where the alert gate can read it -- and reads it
+    // better than a string tag could, since `Chain` and `CommitmentsUnreadable` are both "this pass
+    // learned nothing" while `Insufficient` and `TooManyInputs` are two different things to tell an
+    // operator to do. Splitting here is what forced the only consumer to guess from prose.
+    PassError::Funding(error)
 }
 
 /// The coin a reclaim of `mirror` CREATES, derived rather than guessed.
@@ -1242,6 +1244,7 @@ mod tests {
             )],
             per_coin_dig_base_units: None,
             locked_dig_base_units: 4_242,
+            funding_alert: None,
         };
 
         publish(&snapshot, &report, 9);
