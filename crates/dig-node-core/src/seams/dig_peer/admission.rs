@@ -175,6 +175,16 @@ pub struct PeerAdmission {
 ///
 /// These are the BURST pool limits. They no longer describe the whole surface a peer can reach:
 /// [`RESERVED_FIRST_SLOTS`] peers hold a guaranteed slot outside them.
+///
+/// # `relay_ceiling` is VACUOUS on this node today (gate S4 on dig-node#456)
+///
+/// Nothing in this crate constructs [`WorkKind::Relayed`] — every production `admit` call site passes
+/// [`WorkKind::Own`] (`crate::peer::NodeResponder`). The separate relay budget of dig-sex SPEC 6.1.8
+/// is therefore configured and never consulted: it is satisfied because the case it governs never
+/// occurs, not because it is enforced. Stated here rather than left to read as an active rule, since
+/// a limit nobody reaches and a limit nobody applies are indistinguishable from the number alone. The
+/// ceiling is kept, not removed, so that the first producer of relayed work inherits a budget instead
+/// of an omission.
 #[must_use]
 pub fn node_limits() -> AdmissionLimits {
     AdmissionLimits {
@@ -456,6 +466,10 @@ mod tests {
 
     /// **Proves (#269):** relayed work draws on its own ceiling, so work done on other nodes' behalf
     /// cannot consume the whole node-wide allowance (SPEC 6.1.8).
+    ///
+    /// **This test is the ONLY producer of [`WorkKind::Relayed`] in the crate** (gate S4 on #456). It
+    /// proves the meter would enforce the budget; it does not show the budget being enforced in
+    /// production, because no production call site asks for relayed work. See [`node_limits`].
     #[test]
     fn relayed_work_exhausts_the_relay_ceiling_while_own_work_still_admits() {
         let admission = PeerAdmission::new(AdmissionLimits {

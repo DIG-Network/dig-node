@@ -1247,10 +1247,17 @@ where
 /// load stays distinguishable from a ban by the peer and from an outage by the operator.
 fn admission_refused(
     id: Value,
+    conn_key: &str,
     refusal: crate::seams::dig_peer::admission::AdmissionRefusal,
 ) -> Value {
+    // The refused PEER is named, because a refusal log that omits it cannot answer the only question
+    // an operator has when the node starts shedding: is one caller taking the allowance, or is the
+    // node simply loaded? A count without identities looks identical in both cases (gate S3 on
+    // dig-node#456). Truncated to the 16-hex prefix — enough to tell callers apart in a log, short
+    // enough not to turn every refusal into a full identity dump.
     tracing::debug!(
         reason = refusal.reason(),
+        peer = %conn_key.get(..16).unwrap_or(conn_key),
         "peer serve: inbound work refused at admission"
     );
     json!({"jsonrpc":"2.0","id":id,
@@ -1432,7 +1439,7 @@ impl PeerRpcResponder for NodeResponder {
             .admit(conn_key, dig_sex::WorkKind::Own, 1)
         {
             Ok(guard) => guard,
-            Err(refusal) => return admission_refused(id, refusal),
+            Err(refusal) => return admission_refused(id, conn_key, refusal),
         };
         // PEER-SURFACE ALLOWLIST (audit #179 CRITICAL). The mTLS verifier accepts any self-signed
         // leaf, so an "authenticated" peer is merely "some peer_id", NOT an authorized admin. Route
@@ -1508,7 +1515,7 @@ impl PeerRpcResponder for NodeResponder {
             requested_units,
         ) {
             Ok(guard) => guard,
-            Err(refusal) => return admission_refused(json!(1), refusal),
+            Err(refusal) => return admission_refused(json!(1), conn_key, refusal),
         };
         let items = items.as_array().cloned().unwrap_or_default();
         // The verified mTLS peer_id (`conn_key`) keys the per-requestor miss-lookup budget, identical
