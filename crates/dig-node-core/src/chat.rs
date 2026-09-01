@@ -500,12 +500,39 @@ impl crate::Node {
 }
 
 /// Build a chat JSON-RPC error response.
+///
+/// Framed through the shared minter so a chat refusal carries the same `data.code` +
+/// `data.origin` discriminators as every other error this node emits — directed messaging is
+/// not a separate protocol, it rides the node's ordinary JSON-RPC surface (dig-node#340).
 fn chat_err(id: &Value, code: i64, message: &str) -> Value {
-    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+    crate::seams::dig_rpc::errors::error_frame(id, code, message)
 }
 
 #[cfg(test)]
 mod tests {
+    /// **Proves:** two different directed-send refusals are distinguishable by `data.code` alone.
+    ///
+    /// "this node has no identity to seal as" and "this node has no peer transport" demand
+    /// different remedies from the caller, so collapsing them into one prose message is what the
+    /// taxonomy exists to prevent (dig-node#340).
+    #[test]
+    fn two_chat_refusals_carry_two_different_machine_codes() {
+        let id = serde_json::json!(1);
+        let no_identity = super::chat_err(&id, super::rpc_code::NO_IDENTITY, "no identity");
+        let no_network = super::chat_err(&id, super::rpc_code::NO_PEER_NETWORK, "no peers");
+
+        let a = no_identity["error"]["data"]["code"]
+            .as_str()
+            .expect("data.code");
+        let b = no_network["error"]["data"]["code"]
+            .as_str()
+            .expect("data.code");
+
+        assert_eq!(a, "NO_IDENTITY");
+        assert_eq!(b, "NO_PEER_NETWORK");
+        assert_ne!(a, b, "the two refusals must not share a branch key");
+    }
+
     use super::*;
 
     /// A deterministic BLS key from a hashed label — never a hard-coded literal (CodeQL).
