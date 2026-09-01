@@ -98,6 +98,23 @@ pub enum FundingError {
         /// COVERED the target and was refused for the shape of the cover, not its size.
         need_dig_base_units: u64,
     },
+    /// The authentication budget ran out before the requirement was covered, so how much the
+    /// operator can spend is UNKNOWN.
+    ///
+    /// Carries no total, deliberately. Every other refusal here can state one because it walked the
+    /// whole candidate pool; this one stopped early, so any total it quoted would be the total of a
+    /// truncated walk — understated by an amount chosen by whoever paid the coins that consumed the
+    /// budget. An understated total sends an operator to buy $DIG they already hold, and
+    /// `grew_materially` then suppresses the correction, so silence about the amount is the only
+    /// honest option (dig-node#469).
+    CandidatesUnverifiable {
+        /// How many candidates were authenticated before the budget ran out.
+        attempted: usize,
+        /// How many of those could not be proven spendable.
+        skipped: usize,
+        /// The margined requirement that was not reached, in $DIG base units.
+        need_dig_base_units: u64,
+    },
     /// A create was asked for at zero collateral.
     ///
     /// Refused HERE, ahead of the builder, because zero is the one target for which selection
@@ -123,7 +140,18 @@ impl std::fmt::Display for FundingError {
             FundingError::Unauthenticated { coin_id, reason } => write!(
                 f,
                 "coin {coin_id} at the operator address could not be proven spendable $DIG \
-                 ({reason}), so the whole selection is refused"
+                 ({reason}), so it was passed over"
+            ),
+            FundingError::CandidatesUnverifiable {
+                attempted,
+                skipped,
+                need_dig_base_units,
+            } => write!(
+                f,
+                "the operator address holds more coins than one pass may authenticate: \
+                 {attempted} were checked and {skipped} could not be proven spendable, without \
+                 reaching the {need_dig_base_units} DIG base units this create needs. How much \
+                 the operator can spend is UNKNOWN, not low; no spend was attempted"
             ),
             FundingError::CommitmentsUnreadable(e) => write!(
                 f,
@@ -132,7 +160,10 @@ impl std::fmt::Display for FundingError {
             ),
             FundingError::TooManyInputs { needed, limit, .. } => write!(
                 f,
-                "covering this create needs {needed} $DIG coins and a mirror create may draw at most {limit}; the wallet is not short, its $DIG is in too many pieces. No coin was authenticated and no spend was attempted; consolidating the operator's $DIG into fewer coins clears it"
+                "covering this create needs {needed} authenticated $DIG coins and a mirror create \
+                 may draw at most {limit}; the wallet is not short, its $DIG is in too many \
+                 pieces. No spend was attempted; consolidating the operator's $DIG into fewer \
+                 coins clears it"
             ),
             FundingError::ZeroCollateral => {
                 f.write_str("a create at zero collateral stakes nothing and is refused")
@@ -166,17 +197,58 @@ impl std::fmt::Display for FundingError {
 /// mean a stranger can make this node perform thousands of chain reads per pass at the price of
 /// dust, which is not recoverable by anything the operator can do.
 ///
-/// The refusal happens AFTER selection and BEFORE authentication, which is the only placement that
-/// achieves the point: selection is in-memory over rows already fetched, so it is free, while
-/// authentication is the per-input chain read being bounded. Bounding the CANDIDATE set instead
-/// would refuse a perfectly fundable create because a stranger sent dust this node never selected.
+/// The refusal happens over the AUTHENTICATED candidates only, and never over the raw scan. The
+/// scan address is public, so the count of rows at it is chosen by whoever last paid a coin to it;
+/// a bound applied to that count is a bound an attacker sets, and the refusal it produces is an
+/// operator-facing money statement (`FundingRemedy::Consolidate`) that the same attacker therefore
+/// chooses. Authentication is what turns a row into one of this operator's coins, so it runs first
+/// and the bound is applied to what survives it (dig-node#469).
+///
+/// The per-pass chain reads that ordering could otherwise cost are bounded separately and
+/// explicitly, by [`MAX_AUTHENTICATION_ATTEMPTS`] — a constant, rather than a function of how many
+/// coins a stranger sent.
+///
 /// UNMEASURED JUDGEMENT, stated so nobody reads it as a derived limit: nobody has measured how many
-/// $DIG coins a real operator wallet holds. 32 is chosen to bound the per-create chain reads, and if
-/// a legitimate wallet routinely exceeds it this fails CLOSED on that operator -- they see
-/// `TooManyInputs` and consolidate, rather than a spend going wrong. That direction is the safe one,
-/// and an attacker cannot cheaply force it (see dig-node#461 for the cheap attack that DOES exist on
-/// this path, which is the abort-on-unauthenticatable coin, not this bound).
+/// $DIG coins a real operator wallet holds. 32 is chosen to bound the inputs one bundle draws, and
+/// if a legitimate wallet routinely exceeds it this fails CLOSED on that operator -- they see
+/// `TooManyInputs` and consolidate, rather than a spend going wrong.
 pub const MAX_SELECTED_FUNDING_COINS: usize = 32;
+
+/// The most candidates one selection may authenticate — the per-pass chain-read bound
+/// (dig-node#469).
+///
+/// # Why the input bound cannot serve as this bound
+///
+/// [`MAX_SELECTED_FUNDING_COINS`] bounds how many coins one bundle SPENDS. It says nothing about
+/// how many were examined to find them, and the two diverge exactly under attack: a stranger who
+/// pays N coins into the publicly derivable operator address adds N candidates that must each be
+/// authenticated — one chain round trip apiece — while contributing nothing to any selection. The
+/// input bound is unreached the whole time, because the coins that fail authentication never enter
+/// a selection at all.
+///
+/// So the read count was previously a function of N, which is attacker-chosen and unbounded, and
+/// the pass body runs under `tokio::task::block_in_place` — a worker is held for the whole walk and
+/// the next pass cannot start inside it.
+///
+/// # Why a constant, and why this one
+///
+/// A constant is the property that matters: whatever a stranger pays into the address, one pass
+/// costs at most this many reads. 128 is four times the input bound, so a wallet fragmented right
+/// up to the point where [`FundingError::TooManyInputs`] is the correct answer still reaches that
+/// answer with room for noise, while a wallet with nothing planted in it never comes close — the
+/// walk stops the moment the requirement is covered, so a healthy pass pays for the coins it
+/// spends and not for this bound.
+///
+/// # Which direction it fails in
+///
+/// CLOSED, and silently about money. Exhausting the budget yields
+/// [`FundingError::CandidatesUnverifiable`], which states no total and maps to
+/// [`FundingObservation::Unknown`] — so the pass raises no alert and clears none. That is the
+/// honest reading: the walk was truncated, so the wallet was not measured. An attacker who buries
+/// the honest coins under 128 larger unauthenticatable ones can stop this node bonding, which is a
+/// denial of service and is recorded as one; what they cannot do is make the node tell its operator
+/// something false about their money.
+pub const MAX_AUTHENTICATION_ATTEMPTS: usize = 128;
 
 /// The puzzle hash the operator's ordinary $DIG coins sit at.
 ///
@@ -292,14 +364,38 @@ pub fn select_operator_dig_cats<S: ChainSource>(
 /// * **A skip is counted and reported**, never swallowed. The same path covers a genuine defect in
 ///   lineage handling, and a selection that quietly discarded the operator's own coins while
 ///   reporting a shortfall would be indistinguishable from an empty wallet.
-/// * **A skip costs no selection budget.** Candidates are authenticated against the POOL, and a
-///   failed one is removed from the pool before the requirement is covered again — so the coins
-///   handed back are honest coins only, and their number is a function of the honest set alone. An
-///   attacker who could spend an input slot per dust coin would reinstate the same denial in a
-///   slower form.
+/// * **A skip costs no selection budget.** Candidates are authenticated BEFORE anything is
+///   selected, so a candidate that fails is never in a selection, never occupies an input slot and
+///   never contributes to a total. An attacker who could spend an input slot per dust coin would
+///   reinstate the same denial in a slower form.
 ///
 /// A chain that cannot ANSWER is still fatal, and deliberately so: an unreadable source is not a
 /// verdict about a coin, and treating it as one would silently shrink the wallet.
+///
+/// # Authentication comes FIRST, and is itself bounded (dig-node#469)
+///
+/// Two figures leave this function and become sentences shown to an operator: the total they are
+/// told they can spend, and whether their money is merely in too many pieces. Both were previously
+/// computed over the raw scan — a set of rows at a PUBLIC puzzle hash, whose size and whose
+/// declared amounts are chosen by whoever paid the last coin into it. So an attacker chose which of
+/// two opposite instructions the operator was given, and could tell an operator holding nothing
+/// that they held enough and that adding more would not help.
+///
+/// The order is therefore: authenticate, then decide. Every candidate that reaches a total, a
+/// selection or the input bound has had its creating spend executed and its lineage matched, so
+/// every figure this function reports is a figure about this operator's own coins.
+///
+/// That ordering moves the cost, so the cost is bounded in its own right.
+/// [`MAX_AUTHENTICATION_ATTEMPTS`] caps the chain reads one call may make, and the walk stops as
+/// soon as the authenticated total covers the requirement — so a funded wallet pays for the coins
+/// it spends and nothing more, and an unfunded one pays a constant. A cheap pre-filter on the
+/// candidate set would have bounded the work while leaving both figures attacker-chosen, which is
+/// the half of the defect that is a money lie rather than a cost.
+///
+/// When the cap is reached with the requirement still uncovered, this refuses with
+/// [`FundingError::CandidatesUnverifiable`] and states NO total, because it does not have one:
+/// coins remain unexamined, and a figure computed from a truncated walk is exactly the understated
+/// total this ordering exists to remove.
 pub fn select_operator_dig_cats_detailed<S: ChainSource>(
     source: &S,
     owner_puzzle_hash: Bytes32,
@@ -324,80 +420,119 @@ pub fn select_operator_dig_cats_detailed<S: ChainSource>(
         .filter(|r| !committed.contains(&hex::encode(r.coin.coin_id())))
         .collect();
 
-    // Authenticating a candidate costs a chain read, so each is authenticated at most once however
-    // many times the requirement is covered again.
-    let mut authenticated: Vec<(String, Cat)> = Vec::new();
+    // Walked largest-first, the same order `select_largest_first` selects in, so the coins
+    // authenticated are the coins a covering selection would draw and the walk can stop the moment
+    // the requirement is covered.
+    pool.sort_by(|a, b| {
+        b.coin
+            .amount
+            .cmp(&a.coin.amount)
+            .then_with(|| a.coin.coin_id().cmp(&b.coin.coin_id()))
+    });
+
+    let mut authenticated: Vec<(dig_chainsource_interface::CoinRecord, Cat)> = Vec::new();
+    let mut authenticated_total: u64 = 0;
     let mut skipped: Vec<SkippedCandidate> = Vec::new();
+    let mut attempts: usize = 0;
+    let mut walked_whole_pool = true;
 
-    loop {
-        let available = pool
-            .iter()
-            .fold(0u64, |sum, r| sum.saturating_add(r.coin.amount));
-
-        let selected = select_largest_first(pool.clone(), need_dig_base_units, |r| {
-            (r.coin.amount, r.coin.coin_id())
-        })
-        .map_err(|_| FundingError::Insufficient {
-            // The honest total: every candidate proven unauthenticatable has already left the pool,
-            // so this is what the operator can actually spend rather than what the address happens
-            // to hold. Reporting the latter would tell an operator their wallet holds money that is
-            // not theirs.
-            have_dig_base_units: available,
-            need_dig_base_units,
-        })?;
-
-        // The bound (dig-node#427) is applied to the CURRENT selection, which by construction
-        // contains no candidate already proven unauthenticatable -- those left the pool. So a
-        // skipped coin costs no input slot, and an attacker cannot reinstate dig-node#461 in a
-        // slower form by dusting the address until the bound alone refuses every create.
-        if selected.len() > MAX_SELECTED_FUNDING_COINS {
-            return Err(FundingError::TooManyInputs {
-                needed: selected.len(),
-                limit: MAX_SELECTED_FUNDING_COINS,
-                have_dig_base_units: available,
-                need_dig_base_units,
-            });
+    for record in &pool {
+        // Enough of this operator's own money is proven spendable. Every further authentication is
+        // a chain read that cannot change the answer.
+        if authenticated_total >= need_dig_base_units {
+            break;
         }
-
-        let mut rejected: Option<Bytes32> = None;
-        let mut cats = Vec::with_capacity(selected.len());
-        for record in &selected {
-            let candidate_id = hex::encode(record.coin.coin_id());
-            if let Some((_, cat)) = authenticated.iter().find(|(id, _)| id == &candidate_id) {
-                cats.push(*cat);
-                continue;
-            }
-            match authenticate(source, record, owner_puzzle_hash) {
-                Ok(cat) => {
-                    authenticated.push((candidate_id, cat));
-                    cats.push(cat);
-                }
-                Err(FundingError::Unauthenticated { coin_id, reason }) => {
-                    tracing::warn!(
-                        coin_id = %coin_id,
-                        reason = %reason,
-                        concat!(
-                            "a coin at the operator's $DIG address could not be proven spendable ",
-                            "and was passed over; if it is one of this node's own coins, its ",
-                            "lineage is not readable from the chain"
-                        )
-                    );
-                    skipped.push(SkippedCandidate { coin_id, reason });
-                    rejected = Some(record.coin.coin_id());
-                    break;
-                }
-                // A source that cannot answer is not a verdict about the coin.
-                Err(fatal) => return Err(fatal),
-            }
+        if attempts >= MAX_AUTHENTICATION_ATTEMPTS {
+            walked_whole_pool = false;
+            break;
         }
-
-        match rejected {
-            // The rejected candidate leaves the POOL, so it can neither be walked again nor occupy
-            // an input slot, and the requirement is covered again from what remains.
-            Some(coin_id) => pool.retain(|r| r.coin.coin_id() != coin_id),
-            None => return Ok(FundingSelection { cats, skipped }),
+        attempts += 1;
+        match authenticate(source, record, owner_puzzle_hash) {
+            Ok(cat) => {
+                authenticated_total = authenticated_total.saturating_add(record.coin.amount);
+                authenticated.push((record.clone(), cat));
+            }
+            Err(FundingError::Unauthenticated { coin_id, reason }) => {
+                tracing::warn!(
+                    coin_id = %coin_id,
+                    reason = %reason,
+                    concat!(
+                        "a coin at the operator's $DIG address could not be proven spendable ",
+                        "and was passed over; if it is one of this node's own coins, its ",
+                        "lineage is not readable from the chain"
+                    )
+                );
+                skipped.push(SkippedCandidate { coin_id, reason });
+            }
+            // A source that cannot answer is not a verdict about the coin.
+            Err(fatal) => return Err(fatal),
         }
     }
+
+    // The walk was truncated and the requirement is uncovered, so the honest total is UNKNOWN
+    // rather than low. Refused as its own condition, which reports no amount at all — see the note
+    // above on why an understated total is worse than silence.
+    if !walked_whole_pool && authenticated_total < need_dig_base_units {
+        return Err(FundingError::CandidatesUnverifiable {
+            attempted: attempts,
+            skipped: skipped.len(),
+            need_dig_base_units,
+        });
+    }
+
+    // From here every input is an authenticated coin of this operator, so both figures below are
+    // statements about this operator's own money.
+    let cats = select_within_input_bound(
+        authenticated
+            .into_iter()
+            .map(|(record, cat)| (record.coin.amount, record.coin.coin_id(), cat))
+            .collect(),
+        need_dig_base_units,
+    )?;
+
+    Ok(FundingSelection { cats, skipped })
+}
+
+/// Cover `need_dig_base_units` from AUTHENTICATED coins, or refuse with the reason and the amount.
+///
+/// Split out from [`select_operator_dig_cats_detailed`] because it is where both operator-facing
+/// money figures are decided — the total in [`FundingError::Insufficient`] and the *you have enough,
+/// it is in too many pieces* of [`FundingError::TooManyInputs`] — and because the caller's
+/// authenticated coins cannot be fabricated in a test. A [`Cat`] is only produced by executing a
+/// real lineage, so a test driving the whole function can only ever supply candidates that FAIL
+/// authentication, and the bound would then be provable from one side and by accident.
+///
+/// The input is `(amount, coin_id, payload)` per coin, already proven spendable by the caller.
+/// Nothing here re-checks that, and nothing here reads the chain: the ordering that makes these
+/// figures honest is the caller's, and this function's job is only to state them.
+fn select_within_input_bound<T>(
+    authenticated: Vec<(u64, Bytes32, T)>,
+    need_dig_base_units: u64,
+) -> Result<Vec<T>, FundingError> {
+    let authenticated_total = authenticated
+        .iter()
+        .fold(0u64, |sum, (amount, _, _)| sum.saturating_add(*amount));
+
+    let selected = select_largest_first(authenticated, need_dig_base_units, |(amount, id, _)| {
+        (*amount, *id)
+    })
+    .map_err(|shortfall| FundingError::Insufficient {
+        // Every coin the chain would prove has been offered, so this is what the operator can
+        // actually spend rather than what the address happens to hold.
+        have_dig_base_units: shortfall.have,
+        need_dig_base_units,
+    })?;
+
+    if selected.len() > MAX_SELECTED_FUNDING_COINS {
+        return Err(FundingError::TooManyInputs {
+            needed: selected.len(),
+            limit: MAX_SELECTED_FUNDING_COINS,
+            have_dig_base_units: authenticated_total,
+            need_dig_base_units,
+        });
+    }
+
+    Ok(selected.into_iter().map(|(_, _, payload)| payload).collect())
 }
 
 /// What an operator must actually DO about a funding shortfall.
@@ -491,6 +626,12 @@ impl FundingObservation {
             FundingError::Unauthenticated { .. } | FundingError::ZeroCollateral => {
                 FundingObservation::Unknown
             }
+            // A truncated walk is not a measurement of the wallet. `Short` would have to quote a
+            // total, and the only total available is the one from the coins that happened to be
+            // walked -- understated by however many the budget did not reach. Reporting it would
+            // send an operator to buy $DIG they already hold, and `grew_materially` would then
+            // suppress the correction. So this says nothing, and clears nothing either.
+            FundingError::CandidatesUnverifiable { .. } => FundingObservation::Unknown,
         }
     }
 }
@@ -936,152 +1077,345 @@ mod tests {
         );
     }
 
-    /// **Proves:** a create needing more inputs than [`MAX_SELECTED_FUNDING_COINS`] is refused
-    /// BEFORE any lineage read, and refused as `TooManyInputs` rather than as a shortfall.
+    /// A wallet at the operator's $DIG address, whose coins never authenticate.
     ///
-    /// **Catches:** the unbounded selection of dig-node#427. The scan address is publicly derivable
-    /// — the operator puzzle hash is public and the CAT curry is canonical — so any stranger can pay
-    /// dust to it, and every input that survives selection costs one `coin_spend` in
-    /// [`authenticate`]. Unbounded, the number of chain reads one automated pass performs is chosen
-    /// by whoever sent the dust, on a timer, forever.
+    /// Every candidate a test can build is one that FAILS authentication — `coin_spend` answers
+    /// `Ok(None)`, so no lineage resolves — and that is not a limitation of the fixture but of what
+    /// a coin IS: a `Cat` exists only once a real creating spend has been executed against it. That
+    /// is exactly the population an attacker supplies, so it is the right fixture for what a
+    /// stranger's coins are worth; the honest side of every claim below is asserted separately
+    /// against [`select_within_input_bound`], which takes authenticated coins directly.
+    struct Planted {
+        /// How many coins sit at the address.
+        count: u64,
+        /// What each one declares.
+        amount: u64,
+        owner: Bytes32,
+        /// Every `coin_spend` this source was asked for — the per-pass chain-read count.
+        lineage_reads: std::cell::RefCell<usize>,
+    }
+
+    impl Planted {
+        fn new(count: u64, amount: u64, owner: Bytes32) -> Self {
+            Planted {
+                count,
+                amount,
+                owner,
+                lineage_reads: std::cell::RefCell::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            *self.lineage_reads.borrow()
+        }
+    }
+
+    impl ChainSource for Planted {
+        type Error = std::io::Error;
+        fn coin_record(
+            &self,
+            _: Bytes32,
+        ) -> Result<Option<dig_chainsource_interface::CoinRecord>, Self::Error> {
+            unreachable!("selection reads by puzzle hash, never by coin id")
+        }
+        fn coin_records_by_puzzle_hash(
+            &self,
+            puzzle_hash: Bytes32,
+            _: bool,
+        ) -> Result<Vec<dig_chainsource_interface::CoinRecord>, Self::Error> {
+            assert_eq!(
+                puzzle_hash,
+                dig_cat_puzzle_hash(self.owner),
+                "the scan must be the CAT-wrapped operator hash, which is what makes it publicly \
+                 derivable and therefore plantable"
+            );
+            Ok((0..self.count)
+                .map(|i| {
+                    let mut parent = [0u8; 32];
+                    parent[..8].copy_from_slice(&i.to_be_bytes());
+                    dig_chainsource_interface::CoinRecord {
+                        coin: chia_protocol::Coin::new(
+                            Bytes32::new(parent),
+                            puzzle_hash,
+                            self.amount,
+                        ),
+                        confirmed_height: Some(1),
+                        spent_height: None,
+                        timestamp: None,
+                        coinbase: false,
+                    }
+                })
+                .collect())
+        }
+        fn coin_records_by_parent(
+            &self,
+            _: Bytes32,
+        ) -> Result<Vec<dig_chainsource_interface::CoinRecord>, Self::Error> {
+            unreachable!()
+        }
+        fn coin_spend(&self, _: Bytes32) -> Result<Option<chia_protocol::CoinSpend>, Self::Error> {
+            *self.lineage_reads.borrow_mut() += 1;
+            Ok(None)
+        }
+        fn resolve_singleton_lineage(
+            &self,
+            _: Bytes32,
+        ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error> {
+            unreachable!()
+        }
+        fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+            unreachable!()
+        }
+        fn block_timestamp(&self, _: u32) -> Result<Option<u64>, Self::Error> {
+            unreachable!()
+        }
+    }
+
+    /// An authenticated coin for [`select_within_input_bound`], identified by its amount.
     ///
-    /// # The fixture is built from the bound itself, from BOTH sides
+    /// The payload is the amount rather than a `Cat`, because the bound and the totals are decided
+    /// on `(amount, coin_id)` alone and a real `Cat` would add nothing an assertion could read.
+    fn proven(amount: u64, tag: u8) -> (u64, Bytes32, u64) {
+        let mut id = [0u8; 32];
+        id[0] = tag;
+        id[1..9].copy_from_slice(&amount.to_be_bytes());
+        (amount, Bytes32::new(id), amount)
+    }
+
+    /// **Proves:** the input bound is decided over AUTHENTICATED coins, from both sides of the
+    /// limit, and the total it quotes is theirs.
     ///
-    /// A single "lots of dust" case cannot tell a bound from a coincidence, and a case only over
-    /// the limit cannot tell a correct bound from one that refuses everything. So the same wallet
-    /// is asked for two amounts, chosen from `MAX_SELECTED_FUNDING_COINS` rather than picked to
-    /// look large:
+    /// **Catches:** the off-by-one (`>=` for `>`), which refuses a create that exactly fits and
+    /// sends a fundable operator to consolidate a wallet that needs nothing done to it.
     ///
-    /// - **at the bound** — exactly `MAX_SELECTED_FUNDING_COINS` coins cover it, and selection must
-    ///   pass through to authentication (observable as a `coin_spend` having happened);
-    /// - **one over** — one more coin is needed, and it must be refused with the count and the
-    ///   limit, having read no lineage at all.
+    /// # Why this is asserted here and not through the whole selection (dig-node#469)
     ///
-    /// The at-bound case is what makes this test load-bearing: `selected.len() >= LIMIT`, the
-    /// off-by-one, is green against an over-only fixture and red here.
+    /// It used to be driven through `select_operator_dig_cats` over a wallet of unauthenticatable
+    /// dust, which is precisely the shape the bound must no longer respond to — a stranger's coins
+    /// are not this operator's money, so they cannot make the node say *you have enough*. Driving
+    /// the bound through candidates that fail authentication could only ever prove the defect.
     ///
-    /// `coin_spend` answers `Ok(None)` rather than panicking, so reaching authentication produces
-    /// an ordinary `Unauthenticated` refusal. A panic would prove the same thing about the over
-    /// case and make the at-bound case unable to report anything but a crash.
+    /// The fixture is built FROM the bound: exactly `MAX_SELECTED_FUNDING_COINS` coins must pass,
+    /// and one more must be refused with the count, the limit, and the operator's real total. An
+    /// over-only fixture is green against the off-by-one; the at-bound half is what discriminates.
     #[test]
-    fn a_create_needing_more_inputs_than_the_bound_is_refused_before_any_lineage_read() {
-        use std::cell::RefCell;
-        type _CoinRecord = dig_chainsource_interface::CoinRecord;
-
-        /// A wallet whose $DIG is in `count` coins of one base unit each.
-        struct Dusted {
-            count: u64,
-            owner: Bytes32,
-            lineage_reads: RefCell<usize>,
-        }
-
-        impl ChainSource for Dusted {
-            type Error = std::io::Error;
-            fn coin_record(&self, _: Bytes32) -> Result<Option<_CoinRecord>, Self::Error> {
-                unreachable!("selection reads by puzzle hash, never by coin id")
-            }
-            fn coin_records_by_puzzle_hash(
-                &self,
-                puzzle_hash: Bytes32,
-                _: bool,
-            ) -> Result<Vec<_CoinRecord>, Self::Error> {
-                assert_eq!(
-                    puzzle_hash,
-                    dig_cat_puzzle_hash(self.owner),
-                    "the scan must be the CAT-wrapped operator hash, which is what makes it \
-                     publicly derivable and therefore dustable"
-                );
-                Ok((0..self.count)
-                    .map(|i| {
-                        let mut parent = [0u8; 32];
-                        parent[..8].copy_from_slice(&i.to_be_bytes());
-                        _CoinRecord {
-                            coin: chia_protocol::Coin::new(Bytes32::new(parent), puzzle_hash, 1),
-                            confirmed_height: Some(1),
-                            spent_height: None,
-                            timestamp: None,
-                            coinbase: false,
-                        }
-                    })
-                    .collect())
-            }
-            fn coin_records_by_parent(&self, _: Bytes32) -> Result<Vec<_CoinRecord>, Self::Error> {
-                unreachable!()
-            }
-            fn coin_spend(
-                &self,
-                _: Bytes32,
-            ) -> Result<Option<chia_protocol::CoinSpend>, Self::Error> {
-                *self.lineage_reads.borrow_mut() += 1;
-                Ok(None)
-            }
-            fn resolve_singleton_lineage(
-                &self,
-                _: Bytes32,
-            ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error>
-            {
-                unreachable!()
-            }
-            fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
-                unreachable!()
-            }
-            fn block_timestamp(&self, _: u32) -> Result<Option<u64>, Self::Error> {
-                unreachable!()
-            }
-        }
-
-        let owner = owner(0x33);
-        let at_bound = MAX_SELECTED_FUNDING_COINS as u64;
+    fn the_input_bound_is_decided_over_authenticated_coins_and_holds_from_both_sides() {
+        let at_bound = MAX_SELECTED_FUNDING_COINS;
         let over_bound = at_bound + 1;
 
-        // Plenty of coins available either way: the wallet is NOT short, which is the whole point.
-        let source = Dusted {
-            count: over_bound + 10,
-            owner,
-            lineage_reads: RefCell::new(0),
+        // One base unit each, so covering N base units takes exactly N coins.
+        let coins = |n: usize| -> Vec<(u64, Bytes32, u64)> {
+            (0..n).map(|i| proven(1, i as u8)).collect()
         };
 
-        let over = select_operator_dig_cats(&source, owner, over_bound, &HashSet::new());
+        let at = select_within_input_bound(coins(at_bound), at_bound as u64);
         assert_eq!(
-            over,
-            Err(FundingError::TooManyInputs {
-                needed: over_bound as usize,
-                limit: MAX_SELECTED_FUNDING_COINS,
-                have_dig_base_units: source.count,
-                need_dig_base_units: over_bound,
-            }),
-            "a funded wallet whose $DIG is in too many pieces is refused for THAT reason; \
-             reporting a shortfall would send the operator looking for money they already have"
-        );
-        assert_eq!(
-            *source.lineage_reads.borrow(),
-            0,
-            "the refusal must happen before authentication, or the bound does not bound the chain \
-             reads it exists to bound"
+            at.as_deref().map(<[u64]>::len),
+            Ok(at_bound),
+            concat!(
+                "a create that exactly fits the bound must be funded; refusing it sends an ",
+                "operator to consolidate a wallet that is already spendable"
+            )
         );
 
-        // The at-bound half asserts what it can now that dig-node#461 landed: an unauthenticatable
-        // candidate is SKIPPED rather than aborting the selection, so this fixture -- in which
-        // `coin_spend` answers `Ok(None)` for every coin -- can no longer come back
-        // `Unauthenticated`. It walks the pool, skips all of it, and ends short. What still
-        // discriminates the off-by-one is that the bound did NOT speak and that authentication WAS
-        // reached: under `selected.len() >= LIMIT` this returns `TooManyInputs` having read no
-        // lineage at all, and both assertions below go red.
-        let at = select_operator_dig_cats(&source, owner, at_bound, &HashSet::new());
-        assert!(
-            !matches!(at, Err(FundingError::TooManyInputs { .. })),
+        let over = select_within_input_bound(coins(over_bound), over_bound as u64);
+        assert_eq!(
+            over.err(),
+            Some(FundingError::TooManyInputs {
+                needed: over_bound,
+                limit: MAX_SELECTED_FUNDING_COINS,
+                have_dig_base_units: over_bound as u64,
+                need_dig_base_units: over_bound as u64,
+            }),
+            "one coin over the bound is refused for the SHAPE of the cover, quoting the total the \
+             operator genuinely holds"
+        );
+    }
+
+    /// **Proves:** an operator holding nothing is never told they hold enough, however many coins a
+    /// stranger pays into their publicly derivable $DIG address.
+    ///
+    /// **Catches:** the dig-node#469 finding 1 — the input bound returning BEFORE authentication
+    /// began, so a selection composed entirely of unchecked coins produced
+    /// [`FundingRemedy::Consolidate`] and the message *"the operator wallet holds enough $DIG …
+    /// adding more will not help"*. An attacker paying 33 small coins to an address anyone can
+    /// derive chose which of two OPPOSITE instructions the operator was given, and the state does
+    /// not converge: no planted coin is ever authenticated, so none is ever removed, so the same
+    /// wrong message is the answer on every pass forever.
+    ///
+    /// # The fixture varies ONE actor and keeps a truthful control
+    ///
+    /// Two wallets are asked the same question: one with nothing at the address at all, and one
+    /// with `MAX_SELECTED_FUNDING_COINS + 1` planted coins. The operator's own holdings are
+    /// identical — nothing — in both, so the ONLY difference is what a stranger did, and the
+    /// assertion is that it made no difference to what the operator is told. An assertion that the
+    /// planted case merely "is not `TooManyInputs`" would also pass on an implementation that
+    /// refused everything; requiring the two to AGREE pins the property to the stranger's coins
+    /// being worth exactly zero rather than to a blanket refusal.
+    #[test]
+    fn coins_a_stranger_planted_never_become_a_statement_about_the_operators_money() {
+        let owner = owner(0x44);
+        // One base unit each and a requirement of one more than the bound, so covering it takes
+        // more coins than a bundle may draw -- the exact shape that produced `Consolidate`.
+        let need = MAX_SELECTED_FUNDING_COINS as u64 + 1;
+
+        let planted = Planted::new(need, 1, owner);
+        let refusal = select_operator_dig_cats(&planted, owner, need, &HashSet::new())
+            .expect_err("no coin here is spendable by this operator");
+
+        let empty = Planted::new(0, 1, owner);
+        let control = select_operator_dig_cats(&empty, owner, need, &HashSet::new())
+            .expect_err("an empty address funds nothing");
+
+        assert_eq!(
+            refusal, control,
             concat!(
-                "exactly at the bound the selection must PASS THROUGH to authentication; it ",
-                "refused with {:?} instead, so the bound is off by one and rejects a fundable ",
-                "create"
-            ),
-            at
+                "a stranger changed what this node tells its operator about their own money; ",
+                "the planted address must be worth exactly what the empty one is"
+            )
+        );
+        assert_eq!(
+            refusal,
+            FundingError::Insufficient {
+                have_dig_base_units: 0,
+                need_dig_base_units: need,
+            },
+            "and the truthful answer is that the operator can spend nothing"
+        );
+        assert_eq!(
+            FundingObservation::from_error(&refusal),
+            FundingObservation::Short {
+                have_dig_base_units: 0,
+                need_dig_base_units: need,
+                remedy: FundingRemedy::TopUp,
+            },
+            concat!(
+                "the operator must be sent to ADD $DIG; `Consolidate` here tells someone holding ",
+                "nothing that adding more will not help, and it is an attacker who chose it"
+            )
         );
         assert!(
-            *source.lineage_reads.borrow() > 0,
+            planted.reads() > 0,
             concat!(
-                "reaching authentication is observed rather than assumed: no lineage read ",
-                "happened, so the bound refused before the coins were ever examined"
+                "every planted coin must be authenticated and rejected; a refusal reached without ",
+                "reading any lineage is a verdict about rows a stranger wrote"
+            )
+        );
+    }
+
+    /// **Proves:** the reported spendable total counts only coins the chain PROVED, never the
+    /// address total.
+    ///
+    /// **Catches:** the dig-node#469 finding 4 — `available` summed the pool at the top of the
+    /// iteration, before anything in it was authenticated, so the first-iteration shortfall (the
+    /// ordinary case) quoted what the address held. An operator who adds the amount they were told
+    /// is still short, and `grew_materially` then suppresses the correction, so the node goes quiet
+    /// while they believe they fixed it.
+    ///
+    /// # Both directions, because one alone is satisfiable by a constant
+    ///
+    /// The planted half asserts an address total of 30,000 base units reports ZERO, which is red
+    /// against the old arithmetic. On its own it is also green against an implementation that
+    /// always reports zero — so the honest half asserts, over the same figures, that authenticated
+    /// coins totalling 20,000 report 20,000. Together they pin the total to the authenticated set.
+    #[test]
+    fn the_reported_total_is_what_the_chain_proved_not_what_the_address_holds() {
+        let owner = owner(0x55);
+        let need = 40_000;
+
+        // Three coins of 10,000 at the address, none of them this operator's.
+        let planted = Planted::new(3, 10_000, owner);
+        assert_eq!(
+            select_operator_dig_cats(&planted, owner, need, &HashSet::new()).err(),
+            Some(FundingError::Insufficient {
+                have_dig_base_units: 0,
+                need_dig_base_units: need,
+            }),
+            concat!(
+                "the address total was reported as the operator's spendable total; they would be ",
+                "told to add 10,000 when they are 40,000 short, and the correction is then ",
+                "suppressed as immaterial"
+            )
+        );
+        assert_eq!(
+            planted.reads(),
+            3,
+            "the honest total is established by reading, not by summing rows"
+        );
+
+        // The same shortfall with coins that ARE the operator's: the figure must be theirs.
+        assert_eq!(
+            select_within_input_bound(vec![proven(10_000, 1), proven(10_000, 2)], need).err(),
+            Some(FundingError::Insufficient {
+                have_dig_base_units: 20_000,
+                need_dig_base_units: need,
+            }),
+            "a proven 20,000 must be reported as 20,000, or the total is a constant rather than a \
+             measurement"
+        );
+    }
+
+    /// **Proves:** the chain reads one selection performs are bounded by a CONSTANT, whatever a
+    /// stranger pays into the address.
+    ///
+    /// **Catches:** the dig-node#469 finding 3 — one network round trip per planted coin, per pass,
+    /// forever. Measured on the pre-fix tree at 11, 51 and 201 reads for 10, 50 and 200 planted
+    /// coins: linear in an attacker-chosen number, on a ten-minute timer, under
+    /// `tokio::task::block_in_place` so the worker is held for the whole walk.
+    ///
+    /// # Two sizes, because one cannot tell a bound from a coincidence
+    ///
+    /// The pool is grown well past [`MAX_AUTHENTICATION_ATTEMPTS`] and then DOUBLED. A single large
+    /// fixture is green against any limit at or above it; requiring the two counts to be EQUAL is
+    /// what distinguishes a bound from a fixture that merely did not reach one.
+    ///
+    /// The refusal is asserted too. Exhausting the budget leaves the wallet unmeasured, so it must
+    /// state no total and must classify as [`FundingObservation::Unknown`] — an amount taken from a
+    /// truncated walk is the understated total this whole ordering exists to remove, and it would
+    /// raise a wrong alert AND suppress the right one.
+    #[test]
+    fn authentication_is_bounded_by_a_constant_however_many_coins_a_stranger_sends() {
+        let owner = owner(0x66);
+        let planted_count = (MAX_AUTHENTICATION_ATTEMPTS * 2) as u64;
+        let need = planted_count;
+
+        let smaller = Planted::new(planted_count, 1, owner);
+        let refusal = select_operator_dig_cats(&smaller, owner, need, &HashSet::new())
+            .expect_err("nothing here is spendable");
+
+        let larger = Planted::new(planted_count * 2, 1, owner);
+        let _ = select_operator_dig_cats(&larger, owner, need, &HashSet::new())
+            .expect_err("nothing here is spendable");
+
+        assert_eq!(
+            smaller.reads(),
+            MAX_AUTHENTICATION_ATTEMPTS,
+            "one pass must never read more than the budget"
+        );
+        assert_eq!(
+            larger.reads(),
+            smaller.reads(),
+            concat!(
+                "doubling what a stranger planted doubled the chain reads, so the cost of one ",
+                "pass is still chosen by the attacker rather than by this node"
+            )
+        );
+
+        assert_eq!(
+            refusal,
+            FundingError::CandidatesUnverifiable {
+                attempted: MAX_AUTHENTICATION_ATTEMPTS,
+                skipped: MAX_AUTHENTICATION_ATTEMPTS,
+                need_dig_base_units: need,
+            },
+            "a truncated walk refuses as itself, stating no total"
+        );
+        assert_eq!(
+            FundingObservation::from_error(&refusal),
+            FundingObservation::Unknown,
+            concat!(
+                "an unmeasured wallet must not alert and must not clear a live shortfall; ",
+                "quoting the total of the coins that happened to be walked would understate it"
             )
         );
     }

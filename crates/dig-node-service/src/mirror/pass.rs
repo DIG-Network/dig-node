@@ -53,6 +53,34 @@ pub struct PassDecision {
     pub per_coin_dig_base_units: Option<u64>,
     /// One state per bond the node holds, for the §25.8 surface.
     pub states: Vec<(Bond, BondState)>,
+    /// What this pass could NOT afford to create, when the wallet was readable and came up short.
+    ///
+    /// `Some` exactly when at least one create was priced and left uncreated for want of funds —
+    /// [`BondState::Unfunded`]'s condition, carried in a shape the alert gate can decide on. `None`
+    /// means every planned create was affordable, which includes the ordinary case of a node with
+    /// nothing new to bond.
+    ///
+    /// It exists because "this pass created nothing" has two opposite causes, and the pass that
+    /// created nothing because it could afford nothing is precisely the shortfall dig-node#463 was
+    /// built to report. Reading it off the create loop cannot tell them apart; reading it off the
+    /// funds split can (dig-node#469).
+    pub funding_shortfall: Option<FundingShortfall>,
+}
+
+/// A pass that could not afford every create it planned, in the two figures an operator needs.
+///
+/// Both are stated from the SAME funds split that caused the refusal, so the message cannot
+/// disagree with the decision it describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingShortfall {
+    /// The $DIG left over after the affordable creates were funded — what is still spendable
+    /// towards the ones that were not, in base units.
+    ///
+    /// Not the wallet balance: a balance that funded three of five creates is not money available
+    /// for the remaining two, and quoting it would overstate what the operator has to work with.
+    pub have_dig_base_units: u64,
+    /// What the creates left uncreated would cost together, in the same units.
+    pub need_dig_base_units: u64,
 }
 
 /// What the node can say about one bond right now.
@@ -217,11 +245,30 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
 
     let states = bond_states(inputs, &affordable, split.as_ref(), per_coin, &reclaim);
 
+    // The shortfall is read off the split rather than off the states, because the split is what
+    // decided it: `short` is non-empty exactly when a priced create went unmade for want of funds.
+    // `have` is the remainder after the affordable prefix was funded — `balance % per_coin` — so
+    // the deficit these two imply is the money that must actually be ADDED, not the whole cost of
+    // the unmade creates.
+    let funding_shortfall = match (per_coin, split.as_ref(), inputs.dig_balance_base_units) {
+        // `per_coin` of zero is refused as a create everywhere else in this crate, and would make
+        // the remainder below a division by zero. It reports no shortfall rather than panicking:
+        // a requirement of zero is a caller defect, not an empty wallet.
+        (Some(per_coin), Some(split), Some(balance)) if per_coin > 0 && !split.is_funded() => {
+            Some(FundingShortfall {
+                have_dig_base_units: balance % per_coin,
+                need_dig_base_units: split.shortfall_dig_base_units,
+            })
+        }
+        _ => None,
+    };
+
     PassDecision {
         reclaim,
         create: affordable,
         per_coin_dig_base_units: per_coin,
         states,
+        funding_shortfall,
     }
 }
 

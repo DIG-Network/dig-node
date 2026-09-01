@@ -382,6 +382,7 @@ impl<E: MirrorEffects> PassRunner<E> {
             create,
             per_coin_dig_base_units,
             states,
+            funding_shortfall: decision_shortfall,
         } = decision;
 
         let mut reclaimed = Vec::new();
@@ -442,9 +443,27 @@ impl<E: MirrorEffects> PassRunner<E> {
             // CLEAR a live shortfall would tell an operator their funding recovered on the strength
             // of an unrelated error.
             Some(_) => super::funding::FundingObservation::Unknown,
-            // Nothing stopped. `per_coin` is `Some` exactly when the requirement was known, so this
-            // is a pass that funded every create it planned -- including a pass that planned none,
-            // which is the healthy state a node with nothing new to bond sits in.
+            // Nothing stopped, and the wallet could not afford every create the pass priced. This
+            // is the ORDINARY shortfall -- a wallet holding less than one create's collateral --
+            // and it never reaches `stopped_at` at all, because the create loop is handed the
+            // affordable prefix and an empty prefix simply does not iterate.
+            //
+            // Classifying it `Healthy` (dig-node#469) left the Short alert with no producer for the
+            // commonest real case, and worse: a pass that could afford nothing CLEARED a live
+            // shortfall and announced a recovery that had not happened. A pass that never asked the
+            // wallet for money is not evidence that the wallet has any.
+            None if decision_shortfall.is_some() => {
+                let shortfall = decision_shortfall.expect("matched Some directly above");
+                super::funding::FundingObservation::Short {
+                    have_dig_base_units: shortfall.have_dig_base_units,
+                    need_dig_base_units: shortfall.need_dig_base_units,
+                    remedy: super::funding::FundingRemedy::TopUp,
+                }
+            }
+            // Nothing stopped and nothing was unaffordable. `per_coin` is `Some` exactly when the
+            // requirement was known, so this is a pass that funded every create it planned --
+            // including a pass that planned none, which is the healthy state a node with nothing
+            // new to bond sits in.
             None if per_coin_dig_base_units.is_some() => {
                 super::funding::FundingObservation::Healthy
             }
@@ -819,6 +838,96 @@ mod tests {
                 "a refusal carrying only prose was classified as a shortfall; the observation must ",
                 "be read from the structured error, never recovered by matching on a message"
             )
+        );
+    }
+
+    /// **A wallet that can afford NOTHING alerts Short, and never announces a false recovery.**
+    ///
+    /// **Proves** the producer dig-node#463's Short alert was missing for its commonest real case.
+    /// A pass reaches `PassError::Funding` only when a create was ATTEMPTED and refused — but a
+    /// wallet holding less than one create's collateral never attempts one at all: `decide` hands
+    /// `execute` the affordable prefix, and an empty prefix simply does not iterate. Nothing stops,
+    /// so the pass classified itself `Healthy` (dig-node#469 finding 2).
+    ///
+    /// **Catches** two things, and only the sequence catches the second:
+    ///
+    /// * an empty wallet reporting `Healthy`, so the ordinary shortfall is never reported at all;
+    /// * worse, that same pass CLEARING a live shortfall and announcing *"collateral resumed …
+    ///   your content is being bonded"*. Both clauses are false, and the recovery message is the
+    ///   one an operator acts on by stopping work. It needs no attacker: coins committed to an
+    ///   in-flight bundle are withheld from selection but counted by the balance oracle, so pass N
+    ///   alerts Short and pass N+1 reads a balance under one create and announces recovery.
+    ///
+    /// # The control is a pass that genuinely DID recover
+    ///
+    /// The third pass funds the create for real. Without it this test is equally green against an
+    /// implementation that simply never recovers — which would leave an operator who fixed their
+    /// wallet permanently told it is broken. Varying only the balance between passes two and three
+    /// is what makes the distinction the wallet's rather than the gate's.
+    #[test]
+    fn a_wallet_that_can_afford_nothing_alerts_short_and_never_announces_a_false_recovery() {
+        use super::super::funding::{FundingAlertGate, FundingRemedy};
+
+        let capsule = bond("aa", "11");
+        // The pass is otherwise ORDINARY: a held bond, a known requirement, nothing injected. The
+        // only variable is what the wallet holds.
+        let effects = |balance: u64| FakeEffects {
+            disk: held(std::slice::from_ref(&capsule)),
+            balance,
+            ..FakeEffects::default()
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+        let run = |gate, balance| {
+            let mut pass = runner(effects(balance), log.clone()).with_funding_gate(gate);
+            let report = pass.run(&ctx()).expect("the pass observes");
+            (report, pass.take_funding_gate())
+        };
+
+        // Pass 1: a wallet holding nothing, and a bond waiting to be collateralised.
+        let (first, gate) = run(FundingAlertGate::default(), 0);
+        assert!(
+            first.created.is_empty(),
+            "the fixture must genuinely afford nothing, or the shortfall below is not the one \
+             under test"
+        );
+        let alert = first.funding_alert.expect(concat!(
+            "a wallet that cannot afford a single create raised no alert; this is the commonest ",
+            "real shortfall there is, and it was being reported as a healthy node"
+        ));
+        assert_eq!(
+            alert.remedy,
+            Some(FundingRemedy::TopUp),
+            "an empty wallet is told to add $DIG"
+        );
+
+        // Pass 2: the same empty wallet again. Silent -- the operator has already been told, and
+        // nothing about the shortfall has changed. Silence is what a persisting shortfall sounds
+        // like; a RECOVERY is what the old classification announced here.
+        let (second, gate) = run(gate, 0);
+        assert_eq!(
+            second.funding_alert, None,
+            concat!(
+                "the shortfall was CLEARED by a pass that never asked the wallet for anything, ",
+                "and the operator was told their content is being bonded again"
+            )
+        );
+
+        // Pass 3: the wallet is funded and the create is made. NOW a recovery is the truth.
+        let (third, _) = run(gate, REQUIRED * 10);
+        assert_eq!(
+            third.created,
+            vec![capsule.clone()],
+            "the control must genuinely fund the create"
+        );
+        let recovery = third
+            .funding_alert
+            .expect("an operator who fixed their wallet must be told it worked");
+        assert_eq!(
+            recovery.remedy, None,
+            "a recovery asks for nothing; reporting one only when the wallet really recovered is \
+             the half of this that keeps the fix from silencing recoveries altogether"
         );
     }
 
