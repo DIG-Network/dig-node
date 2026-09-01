@@ -250,7 +250,10 @@ pub fn module_frame(offset: u64, bytes: &[u8], complete: bool, total_length: Opt
 /// Names the outcome in the node's own vocabulary; it never echoes the caller's ids back into a message
 /// (the log's sentinel is where ids are rendered, #1603).
 pub fn module_unavailable_frame(code: i64) -> Value {
-    json!({"error": {"code": code, "message": "this node does not hold the requested .dig module"}})
+    json!({"error": crate::seams::dig_rpc::errors::error_object(
+        code,
+        "this node does not hold the requested .dig module",
+    )})
 }
 
 /// The frame a hop sends while it is STILL RELAYING the requested capsule (dig-node#333).
@@ -264,11 +267,7 @@ pub fn module_unavailable_frame(code: i64) -> Value {
 /// progressing relay from a stalled one; it is never evidence about the bytes themselves, which are
 /// merkle-verified against the chain-anchored root like every other peer's (NC-12).
 pub fn module_relay_pending_frame(staged_bytes: u64) -> Value {
-    json!({"error": {
-        "code": crate::download::content_miss_inconclusive(),
-        "message": "relaying the requested capsule on your behalf; not yet complete",
-        "data": { crate::RELAY_PROGRESS_FIELD: staged_bytes },
-    }})
+    json!({ "error": crate::seams::dig_rpc::errors::relay_pending_object(staged_bytes) })
 }
 
 /// Lower-case hex of 32 raw bytes.
