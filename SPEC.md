@@ -1662,7 +1662,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
 | `control.cache.get` | — | `cap_bytes`, `used_bytes`, `capsule_bytes`, `response_bytes`, `dir`, `shared` |
 | `control.profile.putBody` | `store_id`, `root` (64-hex), `body_b64` (standard padded base64 of the DPB bytes) | `stored: true`, `store_id`, `root`, `body_bytes`, `announced_to_peers`, `unreachable_peers`. `announced_to_peers` is a TRUE delivery count — peers the 223 announce was actually sent to, excluding lazy and NAT-bound peers that are connected but cannot be pushed to — so `0` does NOT mean failure and MUST NOT be treated as one: the body is persisted either way and the periodic re-announce reaches whoever connects later. `unreachable_peers` reports that connected-but-unreachable remainder, so a caller can distinguish "no peers exist" from "peers exist and none could be reached". The node MUST independently resolve the root on chain and refuse unless the chain confirms exactly that root AND the bytes hash to it (§22.3). A refusal is an ERROR, never an `Ok` carrying `stored: false`. A decoded body above `MAX_BODY_BYTES` (4 MiB) is `INVALID_PARAMS` before anything is persisted. |
-| `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. |
+| `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`, `standing`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. `standing` is `{state, chain_root, held_roots, detail}` and carries §22.5c's reconciliation: `state` is one of `current` / `superseded` / `nothing_held` / `no_generation` / `chain_unreadable`, and it is what distinguishes an un-published store from an empty one — `body_b64: null` alone is the same answer for at least four different situations. `chain_root` is `null` (NEVER an all-zero root, which the body format rejects outright) whenever the chain named none or could not be read. The chain read is ADDITIVE: `body_b64` keeps its exact meaning as the disk read at the REQUESTED root, a failed disk read is still `CONTROL_ERROR`, and a chain that cannot be read degrades to `state: "chain_unreadable"` rather than failing the call — a node whose chain access is down MUST still be able to answer what it holds. |
 | `control.cache.setCap` | `cap_bytes` (number) | `cap_bytes` (floored at 64 MiB) |
 | `control.cache.clear` | — | `cleared: true` |
 | `control.hostedStores.list` | — | `stores[]`: `store_id`, `pinned`, `capsule_count`, `total_bytes`, `capsules[]` (capsule, root, size_bytes, last_used_unix_ms) — cached stores ∪ pinned stores |
@@ -7551,9 +7551,9 @@ quiesces.
 
 ### 22.5b. Originating an announce (MUST)
 
-A node MUST announce (opcode 223) every profile body it holds, both **immediately** when it accepts
-one from a local caller (`control.profile.putBody`) and **periodically** thereafter, to every peer
-with no exclusion.
+A node MUST announce (opcode 223) every profile body it holds **whose root the chain has not
+retired** (§22.5c), both **immediately** when it accepts one from a local caller
+(`control.profile.putBody`) and **periodically** thereafter, to every peer with no exclusion.
 
 The follow-on announce of §22.5 step 5 fires only for a body ingested FROM a peer, so a node whose
 only announces were re-announces could never START the exchange: a body handed to it locally, or
@@ -7563,6 +7563,43 @@ replayed to it.
 
 An announce carries no authority, so originating one is safe unconditionally: a receiver ignores a
 store it is not subscribed to and resolves the root on chain itself before requesting anything.
+
+### 22.5c. A retired root MUST NOT be announced, and the drift MUST be reported (MUST)
+
+A store's on-chain root can advance while the body a node holds stays where it was. A DPB's root is
+a hash of its own bytes, so a body **cannot** be re-anchored under the new root: a root that
+advanced means the content changed, and only the publisher can produce bytes hashing to it. A node
+therefore MUST NOT attempt any repair, and MUST instead do two things.
+
+**1. Withhold the announce for a root the chain positively contradicts.** Each periodic sweep MUST
+resolve the store's current on-chain root — **once per store**, not once per held root, so the two
+bodies current-plus-one retention keeps are never judged against two different chain reads — and
+MUST NOT announce a held root the chain names as superseded. Retention keeps one predecessor beside
+every current body, so this obligation binds healthy stores too.
+
+The withholding condition is a **positive contradiction only**. A chain that cannot be read, and a
+store the chain reports as having no confirmed generation, both leave the announce standing. This
+direction is deliberately the OPPOSITE of the accept gate's (§22.3), and the asymmetry is the
+point: acceptance is irreversible and so fails closed, while an announce carries no authority —
+every receiver resolves the root itself before asking for anything — so an unconfirmable announce
+costs one ignored frame, whereas silence would take a healthy node off the air for the duration of
+a chain outage.
+
+**2. Report the drift.** The failure is the ABSENCE of a later write, so it produces no error
+anywhere and is invisible to the publisher, who is the only party that can fix it. A node MUST
+therefore surface a store whose held bodies are all superseded — in its own log on each sweep, and
+in `control.profile.getBody`'s `standing` (§10) — naming the chain's current root and the remedy.
+
+A node MUST distinguish these five standings, because each needs a different remedy and a caller
+shown a merged answer cannot choose between them:
+
+| `state` | Means | Remedy |
+|---|---|---|
+| `current` | the chain's root is held | none |
+| `superseded` | bodies held, none at the chain's root | the publisher re-publishes at the chain's root |
+| `nothing_held` | the chain names a root, this node holds nothing for the store | publish here |
+| `no_generation` | the chain reports no confirmed generation | an unconfirmed mint, or a store id naming nothing |
+| `chain_unreadable` | the chain could not be read | the standing is UNKNOWN, not absent; fix chain access |
 
 ### 22.6. Penalization is narrow (MUST NOT widen)
 

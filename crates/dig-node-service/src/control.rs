@@ -3389,7 +3389,7 @@ fn distinct_store_count(cached: &[dig_node_core::CachedCapsule]) -> usize {
 /// The maximum DECODED body size, taken from the control interface rather than restated, so this
 /// node and every client agree on the bound by construction.
 use base64::Engine as _;
-use dig_node_core::seams::dig_peer::profile_sync::MAX_PROFILE_BODY_BYTES;
+use dig_node_core::seams::dig_peer::profile_sync::{root_standing, MAX_PROFILE_BODY_BYTES};
 
 /// Parse a lowercase, unprefixed 64-hex field into its 32 raw bytes.
 ///
@@ -3546,7 +3546,8 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
     }
 }
 
-/// `control.profile.getBody` — the body this node holds at `(store_id, root)`, if it holds one.
+/// `control.profile.getBody` — the body this node holds at `(store_id, root)`, if it holds one,
+/// and how this node's held bodies stand against the root the chain currently anchors.
 ///
 /// `body_b64: null` means "consulted, holds nothing". A read that FAILED is an error instead: a
 /// caller that cannot tell the two apart renders an existing profile as an empty one, and the
@@ -3554,6 +3555,26 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
 ///
 /// The echoed `root` is always the root the caller asked for — this node never substitutes a newer
 /// body it happens to hold.
+///
+/// # Why `standing` exists (dig-node#294)
+///
+/// `body_b64: null` is one answer for at least four different situations: the store never
+/// published here, the store's on-chain root advanced past everything this node holds, the store
+/// has no confirmed generation at all, and this node cannot read the chain to tell. A publisher
+/// debugging "nobody can see my profile" gets the same `null` in every case, so it cannot tell an
+/// un-published store from an empty one. `standing` names which it is, and names the remedy.
+///
+/// # The chain read is ADDITIVE and never fatal
+///
+/// Every pre-existing field keeps its exact meaning: `body_b64` is still the disk read at the
+/// REQUESTED root, and a failed disk read is still `CONTROL_ERROR`. A chain that cannot be read
+/// degrades to `state: "chain_unreadable"` rather than failing the call, because a node whose
+/// coinset access is down must still be able to answer what it holds. Turning a working disk read
+/// into an error on a chain outage would break every existing caller to add a diagnosis.
+///
+/// The chain read follows the precedent `control.profile.putBody` already sets — it resolves the
+/// root through the same [`AnchoredRootResolver`] with no timeout of its own — rather than
+/// inventing a different bound for the same call.
 async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     const METHOD: &str = "control.profile.getBody";
     let store_id = match parse_hex32_param(METHOD, "store_id", &id, params) {
@@ -3564,24 +3585,40 @@ async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
         Ok(v) => v,
         Err(e) => return e,
     };
-    match profile_body_store(ctx).get(&store_id, &root) {
-        Ok(held) => control_ok(
-            id,
-            json!({
-                "store_id": hex::encode(store_id),
-                "root": hex::encode(root),
-                "body_b64": held.as_ref().map(|b| {
-                    base64::engine::general_purpose::STANDARD.encode(b)
-                }),
-                "body_bytes": held.map_or(0u64, |b| b.len() as u64),
+    let store = profile_body_store(ctx);
+    // The disk read FIRST, and its failure still ends the call: a chain read must never be able to
+    // mask a broken disk, which is the one condition whose remedy is on this machine.
+    let held = match store.get(&store_id, &root) {
+        Ok(held) => held,
+        Err(e) => {
+            return control_error(
+                id,
+                ErrorCode::ControlError,
+                format!("{METHOD}: the profile body could not be read from disk: {e}"),
+            )
+        }
+    };
+    let standing = root_standing(&store, &*ctx.node.anchored_root_resolver_arc(), &store_id).await;
+    control_ok(
+        id,
+        json!({
+            "store_id": hex::encode(store_id),
+            "root": hex::encode(root),
+            "body_b64": held.as_ref().map(|b| {
+                base64::engine::general_purpose::STANDARD.encode(b)
             }),
-        ),
-        Err(e) => control_error(
-            id,
-            ErrorCode::ControlError,
-            format!("{METHOD}: the profile body could not be read from disk: {e}"),
-        ),
-    }
+            "body_bytes": held.map_or(0u64, |b| b.len() as u64),
+            "standing": {
+                "state": standing.state(),
+                // `null`, never an all-zero root: a zero root is a value `VerifiedBody::open`
+                // rejects outright, so emitting one would hand a caller a refused sentinel dressed
+                // as an answer.
+                "chain_root": standing.chain_root().map(hex::encode),
+                "held_roots": standing.held().iter().map(hex::encode).collect::<Vec<_>>(),
+                "detail": standing.detail(),
+            },
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
