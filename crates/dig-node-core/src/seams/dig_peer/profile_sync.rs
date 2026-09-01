@@ -1285,7 +1285,10 @@ mod tests {
         let on_success = {
             let dir = tempdir();
             let path = dir.path().to_path_buf();
-            assert!(path.is_dir(), "the helper must create the tree it hands back");
+            assert!(
+                path.is_dir(),
+                "the helper must create the tree it hands back"
+            );
             path
         };
         assert!(
@@ -2127,8 +2130,12 @@ mod tests {
         // A short name, an uppercase-hex name of the right length, and a loose file at the top of
         // the tree — each is 64-hex-adjacent and none of them is a store id.
         std::fs::create_dir_all(root_dir.path().join("not-a-store-id")).expect("dir");
-        std::fs::create_dir_all(root_dir.path().join(hex::encode(store_id(9)).to_uppercase()))
-            .expect("dir");
+        std::fs::create_dir_all(
+            root_dir
+                .path()
+                .join(hex::encode(store_id(9)).to_uppercase()),
+        )
+        .expect("dir");
         std::fs::write(root_dir.path().join("README.txt"), b"not a store").expect("file");
 
         assert_eq!(store.held_pairs(), vec![(store_id(1), root)]);
