@@ -278,7 +278,24 @@ fn promotion_does_not_slurp_the_staged_artifact() {
         )
     });
 
-    for banned in ["fs::read(", "fs::write("] {
+    // The POSITIVE assertion first, because it is the one a new slurping API cannot slip past. A ban
+    // list can only ever check the names on it: swap `fs::read` for a `File::open` plus some future
+    // read-everything helper and an enumeration stays green while the defect returns. Requiring the
+    // streaming primitive by name fails on any rewrite that stops using it, whatever it uses instead.
+    assert!(
+        body.contains("module_stream::copy_verifying"),
+        "`promote_into_cache` no longer routes through `module_stream::copy_verifying`. Whatever \
+         replaced it must hash and copy in one bounded pass, or a promotion makes the whole ~135 MB \
+         capsule resident again (#302)."
+    );
+
+    // Then the ban list, for the specific slurps that were actually here.
+    for banned in [
+        "fs::read(",
+        "fs::write(",
+        "read_to_end(",
+        "read_to_string(",
+    ] {
         assert!(
             !body.contains(banned),
             "`promote_into_cache` contains `{banned}`, which makes the whole staged capsule resident. \

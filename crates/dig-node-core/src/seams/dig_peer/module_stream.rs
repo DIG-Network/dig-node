@@ -7,10 +7,18 @@
 //!
 //! # Why these paths are streamable when the interpreting paths are not
 //!
-//! Three other whole-capsule reads in this crate hand the buffer to `digstore_compiler`
-//! (`serve_blind`, `extract_data_section_blob`, `verify_module_root`), whose signatures take `&[u8]`
-//! and whose work needs the blob in wasm linear memory or a parsed wasm binary. Those are blocked on
-//! the format side (DIG-Network/digs#49) and are deliberately untouched here.
+//! Three other whole-capsule reads in this crate hand their buffer to a `digstore_compiler` entry
+//! point whose signature takes `&[u8]`, and whose work needs the blob in wasm linear memory or a
+//! parsed wasm binary. Those are blocked on the format side (DIG-Network/digs#49) and are deliberately
+//! untouched here. Named by the DIG-NODE function that does the reading, so they stay greppable:
+//!
+//! - `crate::serve_local_blocking` (`lib.rs`), which calls `serve_blind`
+//! - `crate::cached_manifests_blocking` (`lib.rs`), which calls `extract_data_section_blob`
+//! - `crate::seams::content::content_serve`'s `tip_capsule_backs_its_committed_root`, which calls
+//!   `verify_module_root`
+//!
+//! The three names in parentheses are `digstore_compiler`'s, not this crate's, so grepping for them
+//! here finds nothing.
 //!
 //! The two paths in this module are different in kind: they do not INTERPRET the capsule at all. They
 //! compute SHA-256 over opaque bytes. Incremental SHA-256 is defined to produce the identical digest
@@ -215,8 +223,9 @@ fn copy_hashing(src: &Path, dst: &Path, expected: &[u8; 32]) -> Result<u64, Stre
 
 #[cfg(test)]
 mod tests {
+    // `Write` (for `write_all` in the fixtures) already arrives via `use super::*`, which imports the
+    // parent module's `std::io::{self, Read, Write}`.
     use super::*;
-    use std::io::Write as _;
 
     fn write_fixture(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let p = dir.join(name);
