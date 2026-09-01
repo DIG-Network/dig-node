@@ -1348,7 +1348,7 @@ mod tests {
         let dir = scratch();
         let owner = MockOwner::some(&owner_hex());
         let sp = MockSpender::new();
-        let eng = make(&dir, owner.clone(), sp, FixedClock::at(DAY0), test_config()).await;
+        let eng = make(dir.path(), owner.clone(), sp, FixedClock::at(DAY0), test_config()).await;
 
         // Two auto-tips for the same store on the same day: the first tips, the second is an
         // idempotent skip — but the owner is resolved only ONCE (cached).
@@ -1362,7 +1362,7 @@ mod tests {
         let dir = scratch();
         let sp = MockSpender::new();
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::none(),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1383,7 +1383,7 @@ mod tests {
         cfg.creator.enabled = false;
         let sp = MockSpender::new();
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1402,7 +1402,7 @@ mod tests {
         let dir = scratch();
         let sp = MockSpender::new();
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1447,7 +1447,7 @@ mod tests {
         let sp = MockSpender::new();
         let clock = FixedClock::at(DAY0);
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             clock.clone(),
@@ -1481,7 +1481,7 @@ mod tests {
         {
             let sp = MockSpender::new();
             let eng = make(
-                &dir,
+                dir.path(),
                 MockOwner::some(&owner_hex()),
                 sp.clone(),
                 FixedClock::at(DAY0),
@@ -1498,7 +1498,7 @@ mod tests {
         // already reserved → SKIP, never a second spend.
         let sp2 = MockSpender::new();
         let eng2 = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp2.clone(),
             FixedClock::at(DAY0),
@@ -1525,7 +1525,7 @@ mod tests {
         cfg.daily_total_cap = 10_000; // not the binding constraint here
         let sp = MockSpender::new();
         let clock = FixedClock::at(DAY0);
-        let eng = make(&dir, MockOwner::some(&owner_hex()), sp.clone(), clock, cfg).await;
+        let eng = make(dir.path(), MockOwner::some(&owner_hex()), sp.clone(), clock, cfg).await;
 
         // First store → owner tipped. A DIFFERENT store with the SAME owner the same day would
         // exceed the per-site cap (idempotency already blocks the same store; force a manual-style
@@ -1536,8 +1536,9 @@ mod tests {
         cfg2.creator.dig_amount = 200;
         cfg2.creator.per_site_cap = 100; // 200 > 100 → blocked
         let sp2 = MockSpender::new();
+        let dir2 = scratch();
         let eng2 = make(
-            &scratch(),
+            dir2.path(),
             MockOwner::some(&owner_hex()),
             sp2.clone(),
             FixedClock::at(DAY0),
@@ -1581,7 +1582,7 @@ mod tests {
             ("s2".into(), b.clone()),
             ("s3".into(), c.clone()),
         ]);
-        let eng = make(&dir, resolver, sp.clone(), clock, cfg).await;
+        let eng = make(dir.path(), resolver, sp.clone(), clock, cfg).await;
 
         assert!(matches!(
             eng.auto_tip_for_store("s1").await.unwrap(),
@@ -1613,7 +1614,7 @@ mod tests {
         let sp = MockSpender::new();
         let clock = FixedClock::at(DAY0);
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             clock.clone(),
@@ -1670,7 +1671,7 @@ mod tests {
         cfg.daily_total_cap = 150; // one 100 tip fits; the second (creator OR dev) is blocked
         let sp = MockSpender::new();
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1700,7 +1701,7 @@ mod tests {
         let sp = MockSpender::new();
         sp.set(SpendBehaviour::NotExecutable);
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1728,7 +1729,7 @@ mod tests {
         let sp = MockSpender::new();
         sp.set(SpendBehaviour::Ambiguous);
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1757,7 +1758,7 @@ mod tests {
         let sp = MockSpender::new();
         sp.set(SpendBehaviour::BroadcastUnconfirmed);
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1793,7 +1794,7 @@ mod tests {
         cfg.daily_total_cap = 0; // and it ignores the auto daily cap
         let sp = MockSpender::new();
         let eng = make(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1829,7 +1830,7 @@ mod tests {
         cfg.creator.dig_amount = 777;
         {
             let eng = make(
-                &dir,
+                dir.path(),
                 MockOwner::some(&owner_hex()),
                 sp.clone(),
                 FixedClock::at(DAY0),
@@ -1840,7 +1841,7 @@ mod tests {
         }
         // A fresh engine over the same dir reads the persisted config.
         let eng2 = TippingEngine::load(
-            &dir,
+            dir.path(),
             Box::new(MockOwner::some(&owner_hex())),
             Box::new(sp),
             Box::new(FixedClock::at(DAY0)),
@@ -1874,10 +1875,10 @@ mod tests {
     #[tokio::test]
     async fn present_but_corrupt_ledger_fails_closed_no_retip() {
         let dir = scratch();
-        std::fs::write(dir.join("tip-ledger.json"), b"{ this is not valid json ]").unwrap();
+        std::fs::write(dir.path().join("tip-ledger.json"), b"{ this is not valid json ]").unwrap();
         let sp = MockSpender::new();
         let eng = load_only(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1906,10 +1907,10 @@ mod tests {
     #[tokio::test]
     async fn truncated_zero_length_ledger_fails_closed() {
         let dir = scratch();
-        std::fs::write(dir.join("tip-ledger.json"), b"").unwrap(); // zero-length
+        std::fs::write(dir.path().join("tip-ledger.json"), b"").unwrap(); // zero-length
         let sp = MockSpender::new();
         let eng = load_only(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -1930,7 +1931,7 @@ mod tests {
         {
             let sp = MockSpender::new();
             let eng = make(
-                &dir,
+                dir.path(),
                 MockOwner::some(&owner_hex()),
                 sp.clone(),
                 FixedClock::at(DAY0),
@@ -1944,10 +1945,10 @@ mod tests {
             assert_eq!(sp.call_count(), 1);
         }
         // Corrupt the persisted ledger (e.g. AV/indexer lock recovery, partial write).
-        std::fs::write(dir.join("tip-ledger.json"), b"\x00\x00corrupt").unwrap();
+        std::fs::write(dir.path().join("tip-ledger.json"), b"\x00\x00corrupt").unwrap();
         let sp2 = MockSpender::new();
         let eng2 = load_only(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp2.clone(),
             FixedClock::at(DAY0),
@@ -1970,10 +1971,10 @@ mod tests {
     #[tokio::test]
     async fn present_but_corrupt_config_does_not_reenable_autotip() {
         let dir = scratch();
-        std::fs::write(dir.join("tipping-config.json"), b"{ not: valid").unwrap();
+        std::fs::write(dir.path().join("tipping-config.json"), b"{ not: valid").unwrap();
         let sp = MockSpender::new();
         let eng = load_only(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -2002,7 +2003,7 @@ mod tests {
         let dir = scratch(); // fresh, empty dir — no config or ledger files
         let sp = MockSpender::new();
         let eng = load_only(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp.clone(),
             FixedClock::at(DAY0),
@@ -2024,7 +2025,7 @@ mod tests {
         {
             let sp = MockSpender::new();
             let eng = make(
-                &dir,
+                dir.path(),
                 MockOwner::some(&owner_hex()),
                 sp.clone(),
                 FixedClock::at(DAY0),
@@ -2039,7 +2040,7 @@ mod tests {
         // Reload: the persisted ledger parses (not poisoned) and the day is already tipped.
         let sp2 = MockSpender::new();
         let eng2 = load_only(
-            &dir,
+            dir.path(),
             MockOwner::some(&owner_hex()),
             sp2.clone(),
             FixedClock::at(DAY0),

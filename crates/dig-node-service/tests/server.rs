@@ -90,11 +90,20 @@ async fn start_mock_upstream() -> (String, Arc<Mutex<Vec<Value>>>) {
 /// global env stays pinned to ITS dir for the whole test, then releases it on drop.
 /// (Per-test unique dirs alone are not enough precisely because the reads are live
 /// and global — the lock is what makes them consistent.)
+///
+/// It also carries the harness's scratch tree, when there is one (dig-node#370). The tree
+/// must outlive the spawned server rather than the builder that made it, and this guard is
+/// already the value every caller keeps alive for exactly that span — so hanging the
+/// `TempDir` here removes the directory at the same instant the test ends, on an unwind as
+/// well as on success. `Drop` cannot reclaim what a still-open handle pins, so on Windows a
+/// tree whose `wallet.sqlite` the detached serve task still holds may survive; the residue
+/// is bounded by that and is not pretended away.
 #[must_use]
 struct EnvHold(
     // Held purely for its Drop (RAII release of the serialization lock). The field is
     // never read — the value's lifetime IS its purpose — so silence dead_code.
     #[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>,
+    #[allow(dead_code)] Option<tempfile::TempDir>,
 );
 
 /// Start the companion app on a random loopback port pointed at the given upstream
@@ -129,7 +138,7 @@ async fn start_companion_full_inner(
     // node, but the server then reads DIG_NODE_CACHE/config_path LIVE per request, so
     // the lock must outlive construction to keep those reads consistent (see EnvHold).
     let hold = env_guard().lock_owned().await;
-    let (state, token) = {
+    let (state, token, base) = {
         // Isolate dig-node's on-disk state PER CALL so the test never touches the
         // real cache AND no two concurrent tests share state.
         //
@@ -143,10 +152,11 @@ async fn start_companion_full_inner(
         // token-gated control.* call (the flaky failure this guards). Give each call
         // its own PARENT dir (`<temp>/dig-node-test-<pid>-<seq>/cache`) so the
         // token + config.json are unique per server. (Set before from_env reads it.)
-        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
-        let cache = base.join("cache");
+        let base = tempfile::Builder::new()
+            .prefix("dig-node-test-")
+            .tempdir()
+            .expect("create the test base dir");
+        let cache = base.path().join("cache");
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
@@ -155,7 +165,7 @@ async fn start_companion_full_inner(
         // DigNode`, …) the server + this test would resolve THAT shared dir instead of the temp
         // one, losing isolation and clobbering across concurrent tests. DIG_NODE_STATE_DIR (the
         // designed test/deploy override) pins it to this test's base dir, identity-independently.
-        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        std::env::set_var("DIG_NODE_STATE_DIR", base.path());
         let state = dig_node_service::server::build_state(&config).await;
         let state = match chia_peers {
             Some(n) => state.with_chia_peer_count_for_tests(n),
@@ -164,7 +174,7 @@ async fn start_companion_full_inner(
         // The token the server wrote (read from disk, exactly as a real controller
         // would). config_path() resolves under the temp DIG_NODE_CACHE we just set.
         let token = dig_node_service::control::load_or_create_token().unwrap();
-        (state, token)
+        (state, token, base)
     };
     // `into_make_service_with_connect_info` — not the plain `app` — is what makes
     // `ConnectInfo<SocketAddr>` extractable in the real `rpc()` handler (#1619 follow-up): a bare
@@ -177,7 +187,7 @@ async fn start_companion_full_inner(
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, token, EnvHold(hold))
+    (addr, token, EnvHold(hold, Some(base)))
 }
 
 /// Like [`start_companion_full`], but with the wallet's Chia peer count pinned to `peers`. No
@@ -200,18 +210,19 @@ async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
-    let (state, probe) = {
-        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
-        let cache = base.join("cache");
+    let (state, probe, base) = {
+        let base = tempfile::Builder::new()
+            .prefix("dig-node-test-")
+            .tempdir()
+            .expect("create the test base dir");
+        let cache = base.path().join("cache");
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
-        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        std::env::set_var("DIG_NODE_STATE_DIR", base.path());
         let state = dig_node_service::server::build_state(&config).await;
         let probe = state.loop_probe_request();
-        (state, probe)
+        (state, probe, base)
     };
     let app =
         dig_node_service::server::router(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -220,7 +231,7 @@ async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, probe, EnvHold(hold))
+    (addr, probe, EnvHold(hold, Some(base)))
 }
 
 /// Like [`start_companion_probe`] but ALSO returns the built [`AppState`], so a test can observe
@@ -240,18 +251,19 @@ async fn start_companion_probe_state(
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
-    let (state, probe) = {
-        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
-        let cache = base.join("cache");
+    let (state, probe, base) = {
+        let base = tempfile::Builder::new()
+            .prefix("dig-node-test-")
+            .tempdir()
+            .expect("create the test base dir");
+        let cache = base.path().join("cache");
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
-        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        std::env::set_var("DIG_NODE_STATE_DIR", base.path());
         let state = dig_node_service::server::build_state(&config).await;
         let probe = state.loop_probe_request();
-        (state, probe)
+        (state, probe, base)
     };
     let app = dig_node_service::server::router(state.clone())
         .into_make_service_with_connect_info::<SocketAddr>();
@@ -260,7 +272,7 @@ async fn start_companion_probe_state(
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, probe, state, EnvHold(hold))
+    (addr, probe, state, EnvHold(hold, Some(base)))
 }
 
 /// Like [`start_companion_full`] but ALSO returns the served wallet backend (#368/#369) so a WS
@@ -276,11 +288,12 @@ async fn start_companion_wallet(
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
-    let (state, token, backend) = {
-        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
-        let cache = base.join("cache");
+    let (state, token, backend, base) = {
+        let base = tempfile::Builder::new()
+            .prefix("dig-node-test-")
+            .tempdir()
+            .expect("create the test base dir");
+        let cache = base.path().join("cache");
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
@@ -289,11 +302,11 @@ async fn start_companion_wallet(
         // DigNode`, …) the server + this test would resolve THAT shared dir instead of the temp
         // one, losing isolation and clobbering across concurrent tests. DIG_NODE_STATE_DIR (the
         // designed test/deploy override) pins it to this test's base dir, identity-independently.
-        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        std::env::set_var("DIG_NODE_STATE_DIR", base.path());
         let state = dig_node_service::server::build_state(&config).await;
         let token = dig_node_service::control::load_or_create_token().unwrap();
         let backend = state.wallet_backend();
-        (state, token, backend)
+        (state, token, backend, base)
     };
     let app =
         dig_node_service::server::router(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -302,7 +315,7 @@ async fn start_companion_wallet(
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, token, backend, EnvHold(hold))
+    (addr, token, backend, EnvHold(hold, Some(base)))
 }
 
 fn client() -> reqwest::Client {
@@ -711,11 +724,15 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
     // Drive serve under the env lock, held for the whole test (the server reads
     // DIG_NODE_CACHE/config live per request — see EnvHold). Bound to `_hold` so it
     // outlives the spawned server below.
-    let _hold = EnvHold(env_guard().lock_owned().await);
+    let _hold = EnvHold(env_guard().lock_owned().await, None);
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_for_server = stop.clone();
     let server = {
-        let tmp = std::env::temp_dir().join(format!("dig-node-dual-{}", std::process::id()));
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let tmp = tempfile::Builder::new()
+            .prefix("dig-node-dual-")
+            .tempdir()
+            .expect("a scratch dir");
         std::env::set_var("DIG_NODE_CACHE", &tmp);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
         // Isolate the #501 control-token/paired-token state dir per test (see the note above).
@@ -777,11 +794,15 @@ async fn dual_stack_loopback_serves_both_ipv4_and_ipv6_on_the_same_port() {
         ..dig_node_service::Config::default()  // host: None → dual-stack default
     };
 
-    let _hold = EnvHold(env_guard().lock_owned().await);
+    let _hold = EnvHold(env_guard().lock_owned().await, None);
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_for_server = stop.clone();
     let server = {
-        let tmp = std::env::temp_dir().join(format!("dig-node-dualstack-{}", std::process::id()));
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let tmp = tempfile::Builder::new()
+            .prefix("dig-node-dualstack-")
+            .tempdir()
+            .expect("a scratch dir");
         std::env::set_var("DIG_NODE_CACHE", &tmp);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
         // Isolate the #501 control-token/paired-token state dir per test (see the note above).
@@ -2948,13 +2969,13 @@ async fn control_updater_status_and_mutation_wired_over_http() {
     let (addr, token, _hold) = start_companion_full(&upstream).await;
 
     // -- status: absent (no beacon installed on this runner) is a normal, non-error result.
-    let status_dir = std::env::temp_dir().join(format!(
-        "dig-node-updater-e2e-status-{}-{}",
-        std::process::id(),
-        line!()
-    ));
-    let _ = std::fs::remove_dir_all(&status_dir);
-    std::env::set_var("DIG_UPDATER_STATUS_DIR", &status_dir);
+    // Owned by the guard: removed on drop and on an unwind (dig-node#370). The node reads
+    // this path live, so the binding must outlive every assertion below.
+    let status_dir = tempfile::Builder::new()
+        .prefix("dig-node-updater-e2e-status-")
+        .tempdir()
+        .expect("a status dir");
+    std::env::set_var("DIG_UPDATER_STATUS_DIR", status_dir.path());
 
     let absent = post_rpc(
         &addr,
@@ -3219,14 +3240,12 @@ async fn start_serving_node(
         ..dig_node_service::Config::default()
     };
 
-    let hold = EnvHold(env_guard().lock_owned().await);
-    let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!(
-        "dig-node-peernet-{}-{}",
-        std::process::id(),
-        unique
-    ));
-    let cache = base.join("cache");
+    let hold = env_guard().lock_owned().await;
+    let base = tempfile::Builder::new()
+        .prefix("dig-node-peernet-")
+        .tempdir()
+        .expect("create the peer-network base dir");
+    let cache = base.path().join("cache");
     std::fs::create_dir_all(&cache).expect("create test cache dir");
     std::env::set_var("DIG_NODE_CACHE", &cache);
     std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
@@ -3260,7 +3279,7 @@ async fn start_serving_node(
     }
     assert!(served, "the node must serve /health after bring-up");
 
-    (port, stop, server, token, hold)
+    (port, stop, server, token, EnvHold(hold, Some(base)))
 }
 
 /// Call `control.peerStatus` with the control token and return the JSON-RPC response.

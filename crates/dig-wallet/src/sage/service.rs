@@ -469,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn build_assembles_a_served_backend() {
         let dir = scratch();
-        let svc = build_offline(&dir).await;
+        let svc = build_offline(dir.path()).await;
 
         let (status, body) = svc.backend.dispatch("get_version", "{}").await;
         assert_eq!(status, 200, "{body}");
@@ -503,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn build_serves_the_tipping_subsystem() {
         let dir = scratch();
-        let svc = build_offline(&dir).await;
+        let svc = build_offline(dir.path()).await;
 
         let (status, body) = svc.backend.dispatch("tip.get_config", "{}").await;
         assert_eq!(status, 200, "{body}");
@@ -547,7 +547,7 @@ mod tests {
             chia_bls::SecretKey::from_seed(&seed).public_key()
         };
         {
-            let svc = build_offline(&dir).await;
+            let svc = build_offline(dir.path()).await;
             assert!(
                 svc.watchlist.is_empty(),
                 "a fresh dir must start with nothing registered, or persistence proves nothing"
@@ -558,7 +558,7 @@ mod tests {
                 "the registration must go through the single enrolment door"
             );
         }
-        let svc2 = build_offline(&dir).await;
+        let svc2 = build_offline(dir.path()).await;
         assert_eq!(
             svc2.watchlist.registered(),
             vec![key],

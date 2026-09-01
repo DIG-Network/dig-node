@@ -35,20 +35,18 @@ use dig_node_core::seams::dig_peer::profile_sync::{
 ///
 /// Mirrors the bring-up `peer.rs`'s own tests use: an OS-assigned loopback port, self-generated
 /// certs under a per-process temp dir, no introducer and no relay.
+/// The guard is returned with the transport: the running service reads its cert, key and peers
+/// files for its whole lifetime, so the tree must outlive this function (dig-node#370).
 async fn transport_with_one_peer() -> (
     dig_gossip::GossipService,
     dig_gossip::GossipHandle,
     GossipProfileTransport,
+    tempfile::TempDir,
 ) {
-    let dir = std::env::temp_dir().join(format!(
-        "dig-node-3061-{}-{:?}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = tempfile::Builder::new()
+        .prefix("dig-node-3061-")
+        .tempdir()
+        .expect("temp dir");
 
     let cfg = dig_gossip::GossipConfig {
         network_id: chia_protocol::Bytes32::new([7u8; 32]),
@@ -75,7 +73,7 @@ async fn transport_with_one_peer() -> (
         .expect("stub peer registers");
 
     let transport = GossipProfileTransport::new(handle.clone());
-    (service, handle, transport)
+    (service, handle, transport, dir)
 }
 
 /// **Proves #3061 end to end at the node's own transport:** the periodic re-announce of an unchanged
@@ -86,7 +84,7 @@ async fn transport_with_one_peer() -> (
 /// `announce_held_root` to `announce_root` and this test fails on the second iteration.
 #[tokio::test]
 async fn a_repeat_announce_of_an_unchanged_root_still_reaches_the_peer() {
-    let (_service, _handle, transport) = transport_with_one_peer().await;
+    let (_service, _handle, transport, _dir) = transport_with_one_peer().await;
     let store_id = [3u8; 32];
     let root = [9u8; 32];
 
@@ -110,7 +108,7 @@ async fn a_repeat_announce_of_an_unchanged_root_still_reaches_the_peer() {
 /// same frame offered twice to `announce_root` must reach the peer once and then be suppressed.
 #[tokio::test]
 async fn the_forwarding_path_still_suppresses_its_own_repeat() {
-    let (_service, _handle, transport) = transport_with_one_peer().await;
+    let (_service, _handle, transport, _dir) = transport_with_one_peer().await;
     let root_ref = dig_gossip::service::profile_sync::ProfileRootRef {
         store_id: chia_protocol::Bytes32::new([4u8; 32]),
         root: chia_protocol::Bytes32::new([5u8; 32]),
@@ -135,7 +133,7 @@ async fn the_forwarding_path_still_suppresses_its_own_repeat() {
 /// node's own echo returning from a neighbour.
 #[tokio::test]
 async fn a_local_announce_still_arms_the_loop_guard_against_its_own_echo() {
-    let (_service, _handle, transport) = transport_with_one_peer().await;
+    let (_service, _handle, transport, _dir) = transport_with_one_peer().await;
     let store_id = [1u8; 32];
     let root = [2u8; 32];
 

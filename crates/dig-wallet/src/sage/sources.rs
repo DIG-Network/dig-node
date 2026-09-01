@@ -1068,7 +1068,7 @@ mod sole_owner_tests {
         )
         .expect("write the fixture");
 
-        let roots = vec![("dig-node-core".to_string(), root.clone())];
+        let roots = vec![("dig-node-core".to_string(), root.path().to_path_buf())];
         let (sites, unread) = production_call_sites_in(&roots);
         std::fs::remove_dir_all(&root).expect("clean up the temporary root");
 

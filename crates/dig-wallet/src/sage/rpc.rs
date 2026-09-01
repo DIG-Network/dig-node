@@ -5182,8 +5182,8 @@ mod tests {
     #[tokio::test]
     async fn an_enrolled_wallet_refuses_the_tip_as_an_unopenable_seed() {
         let dir = refusal_scratch_dir("enrolled");
-        WalletCustody::enroll_for_tests(&dir, "tip-refusal-fixture", &[BlsPair::new(410).pk]);
-        let custody = WalletCustody::open(dir.clone());
+        WalletCustody::enroll_for_tests(dir.path(), "tip-refusal-fixture", &[BlsPair::new(410).pk]);
+        let custody = WalletCustody::open(dir.path().to_path_buf());
         assert!(
             custody.any_wallet(),
             "the fixture must really enrol a wallet, or it is the empty-custody case in disguise"
@@ -5205,7 +5205,7 @@ mod tests {
     async fn custody_holding_no_wallet_refuses_the_tip_as_nothing_enrolled() {
         let dir = refusal_scratch_dir("empty");
         std::fs::create_dir_all(&dir).expect("create the scratch dir");
-        let custody = WalletCustody::open(dir.clone());
+        let custody = WalletCustody::open(dir.path().to_path_buf());
         assert!(
             !custody.any_wallet(),
             "the fixture must really be empty, or it is the enrolled case in disguise"
@@ -8343,7 +8343,7 @@ mod tests {
             p2_hash(secondary.pk),
             "the fixture needs two DISTINCT keys, or it cannot tell the two guards apart"
         );
-        WalletCustody::enroll_for_tests(&dir, "restart-fixture", &[primary.pk, secondary.pk]);
+        WalletCustody::enroll_for_tests(dir.path(), "restart-fixture", &[primary.pk, secondary.pk]);
 
         let pusher = FakePusher::accepting();
         let cfg = WalletConfig {
@@ -8360,7 +8360,7 @@ mod tests {
 
         // Restart: a fresh custody over the SAME directory and a fresh backend whose memo of
         // loaded signers is empty.
-        let restarted = WalletCustody::open(dir.clone());
+        let restarted = WalletCustody::open(dir.path().to_path_buf());
         let db2 = WalletDb::open_in_memory().await.unwrap();
         db2.set_initial_sync_complete(true).await.unwrap();
         let after = WalletBackend::new(db2, Arc::new(MockFallback::default()), cfg)

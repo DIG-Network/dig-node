@@ -10,7 +10,6 @@
 //! Only the socket is fake.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -772,7 +771,8 @@ fn peak_message(height: u32) -> Message {
 #[tokio::test]
 async fn supervisor_with_no_derivations_never_marks_initial_sync_complete() {
     let db = WalletDb::open_in_memory().await.unwrap();
-    let custody = WalletCustody::open(scratch());
+    let dir = scratch();
+    let custody = WalletCustody::open(dir.path().to_path_buf());
     assert!(
         custody.puzzle_hashes().is_empty(),
         "a fresh custody dir must yield no puzzle hashes"
@@ -903,7 +903,7 @@ async fn a_default_install_with_no_wallet_settles_on_nothing_to_watch() {
 async fn supervisor_runs_catch_up_once_custody_has_keys() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let dir = scratch();
-    let custody = enrolled_custody(&dir);
+    let custody = enrolled_custody(dir.path());
 
     let mut expected: Vec<Bytes32> = custody
         .custodied_public_keys()
@@ -1339,11 +1339,11 @@ async fn an_enrolled_wallet_with_no_derivable_addresses_is_not_an_all_clear() {
 #[test]
 fn production_any_wallet_reads_the_manifest_not_the_derivable_keys() {
     let dir = scratch();
-    enrolled_custody(&dir);
+    enrolled_custody(dir.path());
 
     // Drop the manifest so the next construction must rebuild it from the seed files alone. No
     // seed is read, written, or inspected here — only the index beside them is removed.
-    let manifest = dir.join("wallets").join("index.json");
+    let manifest = dir.path().join("wallets").join("index.json");
     assert!(
         manifest.exists(),
         "the fixture must have written a manifest"
@@ -1351,7 +1351,7 @@ fn production_any_wallet_reads_the_manifest_not_the_derivable_keys() {
     std::fs::remove_file(&manifest).expect("remove the manifest");
 
     // A fresh custody over the same directory: seeds present, manifest rebuilt without keys.
-    let healed = WalletCustody::open(dir);
+    let healed = WalletCustody::open(dir.path().to_path_buf());
 
     assert!(
         PuzzleHashSource::puzzle_hashes(&healed).is_empty(),
@@ -3686,8 +3686,8 @@ fn registered_key(tag: u8) -> chia_bls::PublicKey {
 fn a_node_with_no_custody_follows_registered_keys() {
     let dir = scratch();
     std::fs::create_dir_all(&dir).unwrap();
-    let custody = WalletCustody::open(dir.clone());
-    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    let custody = WalletCustody::open(dir.path().to_path_buf());
+    let registry = crate::sage::watchlist::WatchRegistry::new(dir.path());
     assert!(
         PuzzleHashSource::puzzle_hashes(&custody).is_empty(),
         "the premise: the node custodies nothing"
@@ -3716,11 +3716,11 @@ fn a_node_with_no_custody_follows_registered_keys() {
 #[test]
 fn the_union_follows_custody_and_registered_keys_together() {
     let dir = scratch();
-    let custody = enrolled_custody(&dir);
+    let custody = enrolled_custody(dir.path());
     let custodied: Vec<Bytes32> = PuzzleHashSource::puzzle_hashes(&custody);
     assert!(!custodied.is_empty(), "an enrolled wallet has public keys");
 
-    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    let registry = crate::sage::watchlist::WatchRegistry::new(dir.path());
     registry.watch(&[registered_key(2)]);
     let registered = puzzle_hash_for(&registered_key(2));
     assert!(
@@ -3753,9 +3753,9 @@ fn the_union_follows_custody_and_registered_keys_together() {
 fn unwatch_removes_the_address_from_the_subscription_set() {
     let dir = scratch();
     std::fs::create_dir_all(&dir).unwrap();
-    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    let registry = crate::sage::watchlist::WatchRegistry::new(dir.path());
     registry.watch(&[registered_key(3), registered_key(4)]);
-    let union = UnionPuzzleHashSource::new(WalletCustody::open(dir.clone()), registry.clone());
+    let union = UnionPuzzleHashSource::new(WalletCustody::open(dir.path().to_path_buf()), registry.clone());
     assert_eq!(union.puzzle_hashes().len(), 2);
 
     registry.unwatch(&[registered_key(3)]);
@@ -3766,8 +3766,8 @@ fn unwatch_removes_the_address_from_the_subscription_set() {
         "the deregistered address must leave the set the supervisor re-reads, and only it"
     );
     let after_restart = UnionPuzzleHashSource::new(
-        WalletCustody::open(dir.clone()),
-        crate::sage::watchlist::WatchRegistry::new(&dir),
+        WalletCustody::open(dir.path().to_path_buf()),
+        crate::sage::watchlist::WatchRegistry::new(dir.path()),
     );
     assert_eq!(
         after_restart.puzzle_hashes(),
@@ -3783,14 +3783,14 @@ fn unwatch_removes_the_address_from_the_subscription_set() {
 #[test]
 fn a_key_held_by_both_sides_is_watched_once() {
     let dir = scratch();
-    let custody = enrolled_custody(&dir);
+    let custody = enrolled_custody(dir.path());
     let shared = *custody
         .custodied_public_keys()
         .iter()
         .next()
         .expect("an enrolled wallet has public keys");
 
-    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    let registry = crate::sage::watchlist::WatchRegistry::new(dir.path());
     registry.watch(&[shared]);
 
     let watched = UnionPuzzleHashSource::new(custody.clone(), registry).puzzle_hashes();
@@ -3811,8 +3811,8 @@ fn an_empty_union_still_reports_the_honest_no_wallet_state() {
     let dir = scratch();
     std::fs::create_dir_all(&dir).unwrap();
     let union = UnionPuzzleHashSource::new(
-        WalletCustody::open(dir.clone()),
-        crate::sage::watchlist::WatchRegistry::new(&dir),
+        WalletCustody::open(dir.path().to_path_buf()),
+        crate::sage::watchlist::WatchRegistry::new(dir.path()),
     );
 
     assert!(union.puzzle_hashes().is_empty());
@@ -3831,14 +3831,14 @@ fn an_empty_union_still_reports_the_honest_no_wallet_state() {
 #[test]
 fn an_enrolled_but_unreachable_custody_is_not_an_all_clear_through_the_union() {
     let dir = scratch();
-    enrolled_custody(&dir);
+    enrolled_custody(dir.path());
     // Drop the manifest so it is rebuilt from the seed file alone, without public keys — one of the
     // four reachable states where an enrolled wallet derives no address.
-    std::fs::remove_file(dir.join("wallets").join("index.json")).expect("remove the manifest");
-    let healed = WalletCustody::open(dir.clone());
+    std::fs::remove_file(dir.path().join("wallets").join("index.json")).expect("remove the manifest");
+    let healed = WalletCustody::open(dir.path().to_path_buf());
 
     let union =
-        UnionPuzzleHashSource::new(healed, crate::sage::watchlist::WatchRegistry::new(&dir));
+        UnionPuzzleHashSource::new(healed, crate::sage::watchlist::WatchRegistry::new(dir.path()));
 
     assert!(
         union.puzzle_hashes().is_empty(),

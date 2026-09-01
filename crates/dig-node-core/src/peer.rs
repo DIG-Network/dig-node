@@ -3618,8 +3618,11 @@ pub(crate) mod tests {
         let peer_port = peer_rpc.local_addr().unwrap().port();
 
         // The gossip pool on its OWN OS-assigned ephemeral port (a different socket).
-        let dir = std::env::temp_dir().join(format!("dig-node-wuc-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        // Owned by the guard: the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-wuc-")
+            .tempdir()
+            .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new([1u8; 32]),
             cert_path: dir.join("node.cert").display().to_string(),
@@ -3660,8 +3663,11 @@ pub(crate) mod tests {
     /// authority parses; the ONLY thing wrong with this anchor is that nothing answers there.
     #[tokio::test]
     async fn a_node_survives_every_bootstrap_anchor_being_unreachable() {
-        let dir = std::env::temp_dir().join(format!("dig-node-bootstrap-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        // Owned by the guard: the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-bootstrap-")
+            .tempdir()
+            .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new([3u8; 32]),
             cert_path: dir.join("node.cert").display().to_string(),
@@ -3716,8 +3722,11 @@ pub(crate) mod tests {
     // same reservation the node drives.
     #[tokio::test]
     async fn wire_relay_reservation_shares_one_status_with_the_pool() {
-        let dir = std::env::temp_dir().join(format!("dig-node-wuc-share-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        // Owned by the guard: the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-wuc-share-")
+            .tempdir()
+            .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new([2u8; 32]),
             cert_path: dir.join("node.cert").display().to_string(),
@@ -3801,7 +3810,7 @@ pub(crate) mod tests {
     /// than a log line, which prints on the broken path too.
     #[tokio::test]
     async fn a_stale_relayed_slot_does_not_refuse_the_direct_adoption() {
-        let handle = fresh_pool_handle("readopt-supersede", [11u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("readopt-supersede", [11u8; 32]).await;
         let peer = [0xAB; 32];
 
         // A relayed adoption lands first, then its session DIES (the server half is dropped) — the
@@ -3924,7 +3933,7 @@ pub(crate) mod tests {
     /// the CLI renderer, or a helper written and never called, leaves this red.
     #[tokio::test]
     async fn a_relay_peer_with_a_wildcard_pool_address_reports_no_address() {
-        let handle = fresh_pool_handle("wildcard-address", [23u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("wildcard-address", [23u8; 32]).await;
 
         // The peer seen in the wild: relayed, with dig-nat's unspecified remote.
         let (wildcard, _wildcard_server) = loopback_nat_conn(
@@ -4014,7 +4023,7 @@ pub(crate) mod tests {
     /// state before any peer connects). Uses a real `GossipHandle` — the same type the node retains.
     #[tokio::test]
     async fn connected_peers_json_is_empty_for_a_fresh_pool() {
-        let handle = fresh_pool_handle("cpjson-empty", [3u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("cpjson-empty", [3u8; 32]).await;
         assert!(connected_peers_json(&handle).is_empty());
     }
 
@@ -4023,7 +4032,7 @@ pub(crate) mod tests {
     /// path the RPC arm returns as a control error.
     #[tokio::test]
     async fn connect_peer_rejects_a_non_address_non_peer_id_argument() {
-        let handle = fresh_pool_handle("connect-bad-arg", [4u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("connect-bad-arg", [4u8; 32]).await;
         let err = connect_peer(&handle, "not-an-address").await.unwrap_err();
         assert!(err.contains("dialable address"), "got: {err}");
     }
@@ -4108,8 +4117,8 @@ pub(crate) mod tests {
         // Same network_id on both — a mismatch would be rejected at handshake. B binds a concrete
         // IPv6 loopback (§5.2 IPv6-first) so the inbound accept registers on every platform.
         let loopback_v6 = "[::1]:0".parse().expect("parse [::1]:0");
-        let node_a = fresh_pool_handle("loopback-a", [0x5au8; 32]).await;
-        let node_b = fresh_pool_handle_on("loopback-b", [0x5au8; 32], loopback_v6).await;
+        let (node_a, _node_a_dir) = fresh_pool_handle("loopback-a", [0x5au8; 32]).await;
+        let (node_b, _node_b_dir) = fresh_pool_handle_on("loopback-b", [0x5au8; 32], loopback_v6).await;
 
         let a_peer_id = hex::encode(node_a.local_peer_id().expect("node A local_peer_id"));
         let b_port = node_b
@@ -4172,7 +4181,7 @@ pub(crate) mod tests {
     /// mirroring the connect arg-validation path — no network touch, no hang.
     #[tokio::test]
     async fn disconnect_peer_rejects_a_malformed_peer_id() {
-        let handle = fresh_pool_handle("disconnect-bad-arg", [7u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("disconnect-bad-arg", [7u8; 32]).await;
         let err = disconnect_peer(&handle, "not-hex").await.unwrap_err();
         assert!(err.contains("64-hex peer_id"), "got: {err}");
     }
@@ -4185,7 +4194,7 @@ pub(crate) mod tests {
     /// variant, a cross-family contract release, so this PR extends the existing peerStatus surface).
     #[tokio::test]
     async fn pool_stats_json_reports_the_pool_posture() {
-        let handle = fresh_pool_handle("pool-stats", [9u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("pool-stats", [9u8; 32]).await;
         let stats = pool_stats_json(&handle);
         assert_eq!(stats["connected"], 0, "a fresh pool has no connected peers");
         assert_eq!(stats["in_flight"], 0, "no dials are in flight yet");
@@ -4221,13 +4230,19 @@ pub(crate) mod tests {
     /// inbound loopback connections into the pool (the native-tls dual-stack accept quirk — the same
     /// family of `[::]`-v6only issue tracked for the extension-offline path), whereas a concrete
     /// loopback bind does, on every platform. Production still binds dual-stack `[::]` (`run_peer_network`).
+    /// Returns the guard alongside the handle: the started pool reads its cert, key and
+    /// peers files for its whole lifetime, so the directory must outlive the handle rather
+    /// than this function. The caller holds both, and `TempDir`'s `Drop` removes the tree
+    /// when the test ends — including on an unwind (dig-node#370).
     pub(crate) async fn fresh_pool_handle_on(
         tag: &str,
         network: [u8; 32],
         listen_addr: std::net::SocketAddr,
-    ) -> dig_gossip::GossipHandle {
-        let dir = std::env::temp_dir().join(format!("dig-node-{tag}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+    ) -> (dig_gossip::GossipHandle, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("dig-node-{tag}-"))
+            .tempdir()
+            .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new(network),
             cert_path: dir.join("node.cert").display().to_string(),
@@ -4237,11 +4252,12 @@ pub(crate) mod tests {
             listen_addr,
             ..Default::default()
         };
-        dig_gossip::GossipService::new(cfg)
+        let handle = dig_gossip::GossipService::new(cfg)
             .expect("gossip config")
             .start()
             .await
-            .expect("gossip start")
+            .expect("gossip start");
+        (handle, dir)
     }
 
     #[test]

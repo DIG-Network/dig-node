@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn registers_and_reports_what_was_registered() {
         let d = dir("register");
-        let r = WatchRegistry::new(&d);
+        let r = WatchRegistry::new(d.path());
         assert!(r.is_empty(), "a fresh node registers nothing");
 
         assert_eq!(r.watch(&[key(1), key(2)]), 2);
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn watch_is_idempotent() {
         let d = dir("idempotent");
-        let r = WatchRegistry::new(&d);
+        let r = WatchRegistry::new(d.path());
         r.watch(&[key(1)]);
 
         assert_eq!(r.watch(&[key(1)]), 0, "a known key adds nothing");
@@ -298,9 +298,9 @@ mod tests {
     #[test]
     fn survives_a_restart() {
         let d = dir("persist");
-        WatchRegistry::new(&d).watch(&[key(1), key(2)]);
+        WatchRegistry::new(d.path()).watch(&[key(1), key(2)]);
 
-        let reopened = WatchRegistry::new(&d);
+        let reopened = WatchRegistry::new(d.path());
         assert_eq!(reopened.registered(), vec_sorted(&[key(1), key(2)]));
     }
 
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn unwatch_stops_following_live_and_after_restart() {
         let d = dir("unwatch");
-        let r = WatchRegistry::new(&d);
+        let r = WatchRegistry::new(d.path());
         r.watch(&[key(1), key(2)]);
 
         assert_eq!(r.unwatch(&[key(1)]), 1);
@@ -320,7 +320,7 @@ mod tests {
             "the live set drops only key 1"
         );
         assert_eq!(
-            WatchRegistry::new(&d).registered(),
+            WatchRegistry::new(d.path()).registered(),
             vec![key(2)],
             "and a restart does not resurrect it"
         );
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn unwatch_of_an_unregistered_key_removes_nothing() {
         let d = dir("unwatch-unknown");
-        let r = WatchRegistry::new(&d);
+        let r = WatchRegistry::new(d.path());
         r.watch(&[key(1)]);
 
         assert_eq!(r.unwatch(&[key(9)]), 0);
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn a_clone_sees_a_registration_made_through_another_handle() {
         let d = dir("clone");
-        let handler = WatchRegistry::new(&d);
+        let handler = WatchRegistry::new(d.path());
         let supervisor = handler.clone();
         assert!(supervisor.is_empty());
 
@@ -366,9 +366,9 @@ mod tests {
     #[test]
     fn a_corrupt_file_yields_an_empty_registry() {
         let d = dir("corrupt");
-        std::fs::write(d.join(WATCHLIST_FILE), b"{not json").unwrap();
+        std::fs::write(d.path().join(WATCHLIST_FILE), b"{not json").unwrap();
 
-        assert!(WatchRegistry::new(&d).is_empty());
+        assert!(WatchRegistry::new(d.path()).is_empty());
     }
 
     /// The given keys in the registry's own stable (G1 byte) order.
