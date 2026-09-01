@@ -3067,7 +3067,18 @@ async fn bring_up_dht(
         initial_ids.len()
     );
 
-    let dht = crate::dht::DhtHandle::new(service, initial_ids);
+    // The untrusted mirror-coin pointer source (dig-node#435), when the service shell installed
+    // one. Until it did, `DhtHandle::new` hard-coded `None` here and EVERY live announce published
+    // `unverified_mirror_coin_id = None` — the whole collateral-pointer mechanism was built, unit
+    // tested, and fed by nothing but a test double.
+    //
+    // `None` remains fully supported: the FFI path and any node without a mirror lifecycle announce
+    // exactly as before, and a verifier falls back to the hint scan.
+    let dht = crate::dht::DhtHandle::with_mirror_pointers(
+        service,
+        initial_ids,
+        node.mirror_coin_pointers(),
+    );
 
     // The real-time holdings layer (#1429): flood a signed opcode-222 announcement whenever this
     // node's inventory changes, and fold every peer's verified announcement into our provider set.

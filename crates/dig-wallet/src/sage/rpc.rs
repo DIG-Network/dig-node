@@ -105,6 +105,23 @@ impl BalanceAsset {
         self.cat_asset_id().map(hex::encode)
     }
 
+    /// The asset an `asset_id` wire argument names: `None` is native XCH, `Some(hex)` a CAT.
+    ///
+    /// The INVERSE of [`Self::asset_id_hex`], and the reason it exists is dig-node#306: the
+    /// Sage-parity coin reads take an `Option<&str>` while the scoping helpers take a
+    /// [`BalanceAsset`], and without this bridge the fallback tier had no way to scope a CAT read
+    /// and simply answered with nothing.
+    ///
+    /// An UNPARSEABLE asset id is an `Err`, never a silent `Xch`. Defaulting a mistyped id to
+    /// native XCH is how a caller asking about one token gets a confident answer about a
+    /// different one — the same rule `parse_asset_param` states on the control surface.
+    fn from_asset_id_hex(asset_id: Option<&str>) -> Result<Self> {
+        let Some(id) = asset_id else {
+            return Ok(Self::Xch);
+        };
+        Ok(Self::Cat(parse_puzzle_hash(id)?))
+    }
+
     /// The puzzle hash this asset's coins sit at when owned by `owner_puzzle_hash`, or `None`
     /// for native XCH (whose coins sit at the owner hash itself).
     ///
@@ -1098,6 +1115,19 @@ impl WalletBackend {
     /// unbounded egress path (dig_ecosystem#1957) that also discloses `{IP, timestamp, coin id}`
     /// to that third party.
     ///
+    /// Drop the chain-derived cache and force a re-sync from chain (dig-node#384).
+    ///
+    /// A thin pass-through to [`WalletDb::reset_chain_cache`], which holds the whole contract:
+    /// the authoritative flag is cleared in the same transaction as the coins, an in-flight spend
+    /// refuses, and no key material is reachable. Exposed here because the control plane holds a
+    /// backend, not a database.
+    pub async fn reset_coin_db(
+        &self,
+        now_ms: i64,
+    ) -> sqlx::Result<std::result::Result<super::db::ResetReport, super::db::ResetRefusal>> {
+        self.db.reset_chain_cache(now_ms).await
+    }
+
     /// With no supervisor the peer count is reported UNOBSERVABLE (`None`), never zero — zero
     /// would claim an observation nobody made.
     pub async fn wallet_sync_status(
@@ -2313,16 +2343,20 @@ impl WalletBackend {
                     .collect())
             }
             Source::Fallback => {
-                // XCH coins are at our puzzle hashes; CAT coins are hinted to them. CAT
-                // asset attribution while syncing needs puzzle uncurrying (follow-on), so
-                // the syncing-fallback CAT set is empty until the DB converges.
-                if asset_id.is_some() {
-                    return Ok(Vec::new());
-                }
-                let coins = self
-                    .fallback
-                    .coin_records_by_puzzle_hashes(&identity)
-                    .await?;
+                // dig-node#306. This arm used to `return Ok(Vec::new())` for ANY CAT, so a real
+                // $DIG holder on an unsynced replica read as holding NONE — the mirror image of
+                // dig_ecosystem#2879's over-report, and money-class for the same reason: a caller
+                // cannot tell "you hold nothing" from "this tier declined to look."
+                //
+                // The blocker its comment named — *"CAT asset attribution while syncing needs
+                // puzzle uncurrying"* — does not exist. A CAT coin is identified by WHERE IT
+                // SITS, not by uncurrying it, so `asset_scoped_fallback_coins` scopes a hint read
+                // to one asset with no uncurrying at all. It is the SAME helper
+                // `balance_for_address` and `coins_for_address` already use, called here rather
+                // than re-derived: the balance and the coin list behind it must not be able to
+                // scope to different assets (§2.0 — one behaviour, one implementation).
+                let asset = BalanceAsset::from_asset_id_hex(asset_id)?;
+                let coins = self.asset_scoped_fallback_coins(asset, &identity).await?;
                 Ok(coins
                     .iter()
                     .map(|c| self.fallback_coin_to_record(c))
@@ -3231,6 +3265,10 @@ impl WalletBackend {
         if phs.is_empty() {
             return Ok(0);
         }
+        // Observed BEFORE this refresh writes anything, so a reset landing while it runs makes
+        // its latch below a no-op rather than a re-declaration of the emptied replica as
+        // authoritative (dig-node#454). Same guard, same counter, as the catch-up path.
+        let epoch_at_start = self.db.reset_epoch().await?;
         // XCH coins sitting at our puzzle hashes + CAT coins hinted to them (unspent + recent).
         let mut fetched = self.fallback.coin_records_by_puzzle_hashes(&phs).await?;
         fetched.extend(self.fallback.coin_records_by_hints(&phs).await?);
@@ -3351,8 +3389,17 @@ impl WalletBackend {
             // `phs` is what this pass actually fetched, so recording it is the honest claim: it
             // covers custody's own addresses, and `watchlist_is_covered_by` above has already
             // established that it covers every enrolled one too.
-            self.db.record_coverage(&CoveredSet::from_hex(&phs)).await?;
-            self.db.set_initial_sync_complete(true).await?;
+            if !self
+                .db
+                .latch_synced_over_unless_reset(&CoveredSet::from_hex(&phs), epoch_at_start)
+                .await?
+            {
+                tracing::info!(concat!(
+                    "wallet sync: the coin database was reset while this refresh ran, ",
+                    "so its result was discarded rather than used to mark the emptied ",
+                    "replica synced"
+                ));
+            }
         } else {
             tracing::info!(
                 "wallet sync: a point-read refresh covered only this node's own custody, so the \
@@ -4213,13 +4260,15 @@ impl WalletBackend {
         Ok(ActionResponse {})
     }
 
+    /// Raise the HD derivation floor, reporting the floors in force afterwards (dig-node#256).
+    ///
+    /// The one action method that does NOT return the shared empty response, because its no-op is
+    /// reachable and costs money: see [`IncreaseDerivationIndexResponse`].
     async fn increase_derivation_index(
         &self,
         req: &IncreaseDerivationIndex,
-    ) -> Result<ActionResponse> {
-        actions::increase_derivation_index(&self.db, req.hardened, req.unhardened, req.index)
-            .await?;
-        Ok(ActionResponse {})
+    ) -> Result<IncreaseDerivationIndexResponse> {
+        actions::increase_derivation_index(&self.db, req.hardened, req.unhardened, req.index).await
     }
 
     // ---- themes (#205 PR4) --------------------------------------------------
@@ -5596,6 +5645,146 @@ mod tests {
             ["pending-dig", "real-dig"],
             "the $DIG coins only — a spend built on the others would be built on foreign inputs"
         );
+    }
+
+    /// A backend scoped to the fixture's owner address with an EMPTY, unsynced in-memory DB —
+    /// so every wallet-data read routes to [`Source::Fallback`] (dig-node#306).
+    async fn unsynced_backend_scoped_to_owner(fb: Arc<dyn ChainFallback>) -> WalletBackend {
+        WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb,
+            WalletConfig {
+                puzzle_hashes: vec![owned_ph()],
+                ..WalletConfig::default()
+            },
+        )
+    }
+
+    /// **dig-node#306 — a $DIG holder on an unsynced replica must not read as holding none.**
+    ///
+    /// The Sage-parity coin read `return`ed an empty vector for ANY CAT while unsynced, so this
+    /// wallet's two real $DIG coins were reported as zero coins. That is not a smaller answer, it
+    /// is a different claim: the caller is told the holding does not exist.
+    ///
+    /// Asserting the coin IDS rather than a count, and asserting the CONTENTS of the set rather
+    /// than its non-emptiness, because the nearest wrong implementation is the unfiltered hint
+    /// read — which is also non-empty, and which reports the foreign CAT and a hinted XCH coin as
+    /// $DIG (dig_ecosystem#2879, the over-report this must not trade itself for).
+    #[tokio::test]
+    async fn an_unsynced_cat_coin_read_returns_the_holders_coins_not_an_empty_set() {
+        let (fb, _address) = hinted_multi_asset_fixture();
+        let be = unsynced_backend_scoped_to_owner(fb).await;
+
+        let dig_hex = hex::encode(digstore_chain::dig::DIG_ASSET_ID);
+        let r = be
+            .get_coins(&GetCoins {
+                asset_id: Some(dig_hex),
+                offset: 0,
+                limit: TEST_PAGE,
+                sort_mode: CoinSortMode::default(),
+                filter_mode: CoinFilterMode::default(),
+                ascending: true,
+            })
+            .await
+            .unwrap();
+
+        let mut ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["real-dig"],
+            concat!(
+                "the confirmed $DIG coin: not an empty set (the #306 under-report), and not ",
+                "the hinted XCH or foreign CAT (the #2879 over-report)"
+            )
+        );
+        // `pending-dig` has no created height and the default filter mode excludes unconfirmed
+        // coins — pinned here so a later widening of that filter is a deliberate change rather
+        // than an accident that starts offering unconfirmed value to a caller.
+        assert!(!ids.contains(&"pending-dig"));
+    }
+
+    /// The control that makes the test above load-bearing in the OTHER direction: asking for a
+    /// DIFFERENT CAT on the same unsynced replica returns that CAT's coin — not $DIG's.
+    ///
+    /// Without this, an implementation that ignored `asset_id` entirely and returned every hinted
+    /// coin would still have to be caught by the assertion above; with it, one that hard-codes
+    /// $DIG's scoping (the obvious partial fix) fails here.
+    #[tokio::test]
+    async fn an_unsynced_read_for_a_different_cat_is_scoped_to_that_cat() {
+        let (fb, _address) = hinted_multi_asset_fixture();
+        let be = unsynced_backend_scoped_to_owner(fb).await;
+
+        let r = be
+            .get_coins(&GetCoins {
+                asset_id: Some(hex::encode(foreign_asset_id())),
+                offset: 0,
+                limit: TEST_PAGE,
+                sort_mode: CoinSortMode::default(),
+                filter_mode: CoinFilterMode::default(),
+                ascending: true,
+            })
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
+        assert_eq!(ids, ["foreign-cat"]);
+    }
+
+    /// **A spendable-coin COUNT is the same read reduced, and it lied the same way (#306).**
+    ///
+    /// `get_spendable_coin_count` shares `wallet_coins`, so it answered `0` for a wallet holding
+    /// $DIG — and a zero count is what a spend builder consults before refusing. The XCH control
+    /// in the same test proves the count was never simply suppressed for every asset.
+    #[tokio::test]
+    async fn an_unsynced_spendable_count_sees_the_holders_cat_coins() {
+        let (fb, _address) = hinted_multi_asset_fixture();
+        let be = unsynced_backend_scoped_to_owner(fb).await;
+
+        let dig = be
+            .get_spendable_coin_count(&GetSpendableCoinCount {
+                asset_id: Some(hex::encode(digstore_chain::dig::DIG_ASSET_ID)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            dig.count, 1,
+            concat!(
+                "the ONE confirmed $DIG coin — `pending-dig` has no created height and is ",
+                "not spendable, so a count of 2 would mean unconfirmed value was offered ",
+                "to a spend"
+            )
+        );
+
+        let xch = be
+            .get_spendable_coin_count(&GetSpendableCoinCount { asset_id: None })
+            .await
+            .unwrap();
+        assert_eq!(xch.count, 1, "control: the XCH arm is unchanged");
+    }
+
+    /// An UNPARSEABLE `asset_id` fails the read rather than silently answering about XCH
+    /// (dig-node#306).
+    ///
+    /// The tempting implementation of `from_asset_id_hex` treats a bad id as "no CAT", which
+    /// hands a caller who asked about one token a confident, non-empty answer about a different
+    /// one. That is worse than the empty set this ticket removed.
+    #[tokio::test]
+    async fn an_unparseable_asset_id_fails_rather_than_answering_about_xch() {
+        let (fb, _address) = hinted_multi_asset_fixture();
+        let be = unsynced_backend_scoped_to_owner(fb).await;
+
+        let r = be
+            .get_coins(&GetCoins {
+                asset_id: Some("not-hex".to_string()),
+                offset: 0,
+                limit: TEST_PAGE,
+                sort_mode: CoinSortMode::default(),
+                filter_mode: CoinFilterMode::default(),
+                ascending: true,
+            })
+            .await;
+        assert!(r.is_err(), "a mistyped asset id must not resolve to XCH");
     }
 
     /// The asset id of the fixture's non-$DIG CAT — the "foreign-cat" coin's TAIL.

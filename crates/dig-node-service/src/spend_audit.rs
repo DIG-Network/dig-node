@@ -298,6 +298,27 @@ impl SpendStatus {
     /// a `Failed` entry whose stage [may have moved money](FailureStage::money_may_have_moved) — it
     /// is an unknown wearing a failure's name, and calling it settled is how a spend that actually
     /// landed stops being chased.
+    /// May this spend's bundle have REACHED THE NETWORK — i.e. is it worth asking the chain about?
+    ///
+    /// Distinct from [`is_terminal`](Self::is_terminal), and the distinction is the whole point.
+    /// `Pending` is NOT terminal (nothing has settled it) but also never left this node, so no coin
+    /// can be attributed to it; resolving one would confirm a spend that was never broadcast.
+    /// `Failed { stage: Broadcast }` is the mirror case — a failure by name, but the bundle may
+    /// already sit in a mempool, so it MUST stay chaseable.
+    ///
+    /// Written as an exhaustive `match`, like
+    /// [`FailureStage::money_may_have_moved`](FailureStage::money_may_have_moved) and for the same
+    /// reason: a new variant must be a compile error here, forcing whoever adds it to decide which
+    /// side it falls on. A `matches!` at a call site routes around that, which is exactly how
+    /// `Failed { stage: Broadcast }` came to be dropped from the resolver's open set.
+    pub fn may_have_reached_the_network(&self) -> bool {
+        match self {
+            SpendStatus::Submitted | SpendStatus::Unresolved { .. } => true,
+            SpendStatus::Failed { stage, .. } => stage.money_may_have_moved(),
+            SpendStatus::Pending | SpendStatus::Confirmed { .. } => false,
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         match self {
             SpendStatus::Confirmed { .. } => true,
@@ -873,6 +894,90 @@ impl SpendJournal {
             (self.clock)(),
             |_| {},
         );
+    }
+}
+
+/// What an id-keyed resolution attempt did.
+///
+/// Four outcomes rather than a `bool`, because three of them are "nothing was written" for reasons
+/// that call for different responses: a missing id is a bug in the caller, an already-terminal
+/// record is the ordinary case on a second pass, and a record that never reached the network is a
+/// refusal. Collapsing them would make the one that matters — a resolver silently writing nothing,
+/// forever — indistinguishable from the healthy case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// A `Confirmed` revision was appended.
+    Recorded,
+    /// No record in the ledger carries that id.
+    NoSuchSpend,
+    /// The record is settled already, or never left this node. Nothing was written.
+    NotOpen,
+}
+
+impl SpendJournal {
+    /// Resolve a spend recorded in an EARLIER pass to [`SpendStatus::Confirmed`], keyed by its
+    /// audit id.
+    ///
+    /// # Why this exists AT ALL, and why it is here rather than in the producer
+    ///
+    /// [`RecordedSpend`] is the only handle [`Self::confirmed`] accepts, and a mirror pass drops
+    /// every handle it opened when the pass ends. A mirror spend is broadcast in one pass and
+    /// confirms during the NEXT one, so by the time the chain can answer, the handle that could
+    /// have recorded the answer no longer exists — which is why `confirmed` had zero production
+    /// callers and every successfully broadcast mirror spend settled as
+    /// [`SpendStatus::Unresolved`] on drop (dig-node#412). This is the id-keyed entry point that a
+    /// later pass can use.
+    ///
+    /// It is INSIDE this module by necessity, not by preference. [`SpendLog::append`] is
+    /// module-private, and `Confirmed` is producible only through this type — so a resolver living
+    /// anywhere else could not write the file at all, and making the write path public to let it
+    /// would be a second producer of `Confirmed`, which is the one status the module's honesty
+    /// rules are built around.
+    ///
+    /// # What it will NOT do
+    ///
+    /// `height` and `coin_id` are the caller's OBSERVATION of the chain, exactly as they are for
+    /// [`Self::confirmed`], and this method adds no inference of its own. It refuses:
+    ///
+    /// - an id it cannot find — [`Resolution::NoSuchSpend`], never an append that invents a record;
+    /// - a record that is already `Confirmed` or `Failed`, so a terminal outcome is never rewritten;
+    /// - a record still `Pending` — nothing was handed to the network, so no coin of this spend can
+    ///   be on chain, and a confirmation against one would be attributing a stranger's coin.
+    ///
+    /// That leaves exactly [`SpendStatus::Submitted`] and [`SpendStatus::Unresolved`]: the two
+    /// states in which a signed bundle exists and its fate is genuinely unknown.
+    ///
+    /// An `Err` is an I/O failure reading or appending. It resolves nothing, which is the direction
+    /// that costs a retry rather than a false confirmation.
+    pub fn resolve_landed(
+        &self,
+        id: &str,
+        coin_id: TargetCoinId,
+        height: u32,
+    ) -> std::io::Result<Resolution> {
+        let ledger = self.log.ledger()?;
+        let Some(current) = ledger.records.iter().find(|r| r.id == id) else {
+            return Ok(Resolution::NoSuchSpend);
+        };
+        // OPEN here means "the bundle may have reached the network", which is NOT the same question
+        // as `is_terminal`. See `SpendStatus::may_have_reached_the_network`.
+        if !current.status.may_have_reached_the_network() {
+            return Ok(Resolution::NotOpen);
+        }
+
+        // A full snapshot at the next revision, carried forward from the record on disk — the same
+        // rule `RecordedSpend::write` follows. Rebuilding it from anything narrower would drop the
+        // funding coin ids this spend consumed, and those are what the next pass reserves against.
+        let mut next = current.clone();
+        next.revision += 1;
+        next.updated_ms = (self.clock)();
+        next.status = SpendStatus::Confirmed {
+            height,
+            coin_id: coin_id.clone(),
+        };
+        next.intended_coin_id = Some(coin_id);
+        self.log.append(&next)?;
+        Ok(Resolution::Recorded)
     }
 }
 
