@@ -5,6 +5,20 @@
 //! at no cost, bonding nothing. Until this module existed nothing anywhere read that field against a
 //! chain, so the collateral economy's one economic guarantee was unenforced end to end.
 //!
+//! # This layer is INERT today, and that is the safe posture
+//!
+//! No [`MirrorBondVerifier`] this node can build returns `Bonded` yet, because a coin proves that
+//! *a* bond exists and never that the *claimant* holds it, and nothing here can yet bind a mirror
+//! coin's owner to a DHT peer id. So every holder receives the same verdict and the ranking below is
+//! a no-op on every slate: no reordering, and the host's implementation declines the chain read
+//! rather than paying for an answer this module would discard.
+//!
+//! Promoting on the chain half alone is the alternative, and it is an attack: coin ids travel the
+//! DHT in cleartext by design, so a stranger republishing an honest holder's id would rank first at
+//! zero collateral. Withholding credit from everyone is the only posture that is neither exploitable
+//! nor expensive. The binding is <https://github.com/DIG-Network/dig-node/issues/473>; when it lands
+//! this module needs no change.
+//!
 //! # What lives here, and what deliberately does not
 //!
 //! This module owns the **decision**: a three-state verdict, and what a holder set does with it. It
@@ -43,7 +57,12 @@
 //! Verification is chain I/O, and a stranger answering one lookup chooses how many records the slate
 //! carries. At most [`MAX_VERIFIED_PER_LOCATE`] records are verified per locate, in source order;
 //! the rest keep their place at baseline. Promotion is a bonus, so declining to compute it for the
-//! tail costs a holder nothing it was owed.
+//! tail costs a holder nothing it was owed — but note that where a caller later TRUNCATES the ranked
+//! slate, a denied promotion can become a denied disclosure. Skipping is never a demotion; it can
+//! still be a credit-denial, and a budget sized to the truncation point is what keeps the two apart.
+//!
+//! "Costs nothing" is about I/O, not about zero work: a locate still allocates per record and sorts
+//! the slate. What it does not do while inert is read the chain or the disk, or change any order.
 
 use std::sync::{Arc, OnceLock};
 

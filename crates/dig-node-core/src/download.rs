@@ -4450,7 +4450,7 @@ pub(crate) mod tests {
     /// The slate's input order is neither the expected answer nor its reverse, so an engine that
     /// ignored the verdicts entirely cannot pass by coincidence.
     #[tokio::test]
-    async fn the_engine_ranks_a_disproven_bond_last_on_its_own_discovery_path() {
+    async fn the_engine_promotes_a_proven_bond_without_sinking_a_disproven_one() {
         use crate::mirror_bond::{BondVerdict, MirrorBondVerifier};
 
         struct ByFirstByte;
@@ -4483,9 +4483,14 @@ pub(crate) mod tests {
 
         let pc = NodeContent::new(
             Arc::new(MockProviderLocator::fixed(vec![
-                claimed(7, None),             // claims nothing      -> Unverified
-                claimed(8, Some([0x02; 32])), // claims a coin bonding something else
-                claimed(9, Some([0x01; 32])), // claims a coin that really bonds this
+                // The DISPROVEN record is placed ahead of the merely-unverified one on purpose.
+                // Credit-only keeps 8 before 7 (one baseline tier, stable sort); a three-tier
+                // lattice that sank `Unbonded` would answer 9,7,8. Without this ordering the two
+                // lattices give the identical answer and the assertion below proves nothing about
+                // which one is implemented.
+                claimed(8, Some([0x02; 32])), // a coin bonding something else -> Unbonded
+                claimed(7, None),             // claims nothing                -> Unverified
+                claimed(9, Some([0x01; 32])), // a coin that really bonds this -> Bonded
             ])),
             Arc::new(MockRangeTransport::new(anchored_mock_content(30, 3))),
             MissMode::Redirect,
@@ -4507,16 +4512,18 @@ pub(crate) mod tests {
             peers,
             vec![
                 mock_peer_hex(9)[..2].to_string(),
-                mock_peer_hex(7)[..2].to_string(),
                 mock_peer_hex(8)[..2].to_string(),
+                mock_peer_hex(7)[..2].to_string(),
             ],
-            "the provable holder is promoted; the other two keep their located order, because a \
-             disproven pointer withholds credit rather than demoting (dig-node#466)"
+            "the provable holder is promoted and the other two keep their located order, so the \
+             disproven holder STAYS AHEAD of the merely-unverified one. A three-tier lattice \
+             would answer 9,7,8 here; credit-only answers 9,8,7, because a disproven pointer \
+             withholds credit rather than demoting (dig-node#466)"
         );
         assert_eq!(
             located.len(),
             3,
-            "a disproven claim is demoted on the redirect path, never withheld from it"
+            "a disproven claim is still offered on the redirect path, never dropped from it"
         );
     }
 

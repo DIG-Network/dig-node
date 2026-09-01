@@ -8281,11 +8281,17 @@ itself (SYSTEM.md §4.1).
 >   by name BEFORE any chain read (dig-node#426). **RECLAIMS are implemented** and are supported at `fee = 0` with
 >   no fee coins, which is §25.4.4 — and are never gated on any funding read, including the
 >   committed-coin read.
-> * **§25.10's verification of OTHER peers' claims is implemented** — `dig-node-core`'s
->   `mirror_bond` (the three verdicts and the ranking locator, installed inside `NodeContent::new`)
->   and `dig-node-service`'s `mirror/bond_verify.rs` (the chain read, installed on the running node
->   by `spawn_bond_verifier_install`). What is verified is a peer's claim; this node still attaches
->   no pointer of its own, per the next bullet.
+> * **§25.10's verification of OTHER peers' claims is BUILT BUT INERT — no claim is verified on a
+>   running node today.** The mechanism is present and wired: `dig-node-core`'s `mirror_bond` (the
+>   three verdicts and the ranking locator, installed inside `NodeContent::new`) and
+>   `dig-node-service`'s `mirror/bond_verify.rs` (the chain read, installed on the running node by
+>   `spawn_bond_verifier_install`). But this node has no sound source for the coin-to-peer binding
+>   §25.6a requires, so `bonded` is unreachable for every input, the chain read is short-circuited
+>   before it is paid, and every holder receives the same verdict — the ranking is a no-op on every
+>   slate. **A reader must not take this bullet as saying collateral is enforced; it is not.** The
+>   binding is tracked as <https://github.com/DIG-Network/dig-node/issues/473>, and promotion
+>   becomes reachable the moment it lands, with no further change here. What is verified once it does
+>   is a peer's claim; this node still attaches no pointer of its own, per the next bullet.
 > * **§25.6's DHT pointer is not attached.** `ProviderRecord::unverified_mirror_coin_id` lives in
 >   dig-dht 0.15, and `dig-download` 0.21.0 and `dig-peer-selector` 0.10.0 both require
 >   `dig-dht ^0.13` — semver-incompatible on a `0.x` line, so taking 0.15 here would resolve two
@@ -8699,11 +8705,25 @@ stranger at no cost. Withholding credit has no such abuse: the most a liar achie
 that would have existed had it said nothing.
 
 **A coin id proves the bond, never the bearer.** A coin id is a public fact, so a coin that bonds the
-content says nothing about WHO is offering it; a record may carry an honest holder's peer id, that
-holder's real coin id, and the attacker's addresses. Promotion therefore additionally requires the
-coin's own owner-written declaration of the claiming `peer_id`, and a node that cannot read such a
-declaration MUST NOT promote. A dialler is not a backstop for this: peer ids are derived from the
-presented certificate rather than pinned against the dialled identity.
+content says nothing about WHO is offering it. Promotion therefore additionally requires the coin's
+own owner-written declaration of the claiming `peer_id`, and a node that cannot read such a
+declaration MUST NOT promote.
+
+That declaration closes coin substitution — a stranger republishing another's coin id under its OWN
+peer id earns nothing, because the coin does not name it. **It does NOT close address substitution,
+and a node MUST NOT treat it as though it did.** A record may carry an honest holder's peer id, that
+holder's real coin id, and the ATTACKER's addresses: the coin binds coin to `peer_id`, never `peer_id`
+to an address, and a provider record's `peer_id`-to-address association is unauthenticated hearsay
+that no chain read can settle. Such a record satisfies the declaration check and would be promoted on
+the strength of somebody else's bond.
+
+Closing that requires a separate restriction, which a node performing promotion MUST apply: promote
+only from a record whose `peer_id`-to-address association is itself authoritative — a first-hand
+announce from the peer being ranked, not a slate forwarded by a third party — or defer the credit
+until the dialled identity has been checked against the claimed `peer_id`. A dialler is not by itself
+a backstop, because peer ids are derived from the presented certificate rather than pinned against
+the dialled identity; the residual an unrestricted implementation carries is traffic redirection, not
+a stolen bond.
 
 **One locate is bounded work.** The size of a located set is chosen by whoever answered the lookup,
 so a node MUST bound the number of bonds it reads against a chain per locate, verifying in source
