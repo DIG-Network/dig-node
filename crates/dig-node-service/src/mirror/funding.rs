@@ -232,8 +232,23 @@ pub const MAX_SELECTED_FUNDING_COINS: usize = 32;
 ///
 /// # Why a constant, and why this one
 ///
-/// A constant is the property that matters: whatever a stranger pays into the address, one pass
-/// costs at most this many reads. 128 is four times the input bound, so a wallet fragmented right
+/// A constant is the property that matters: whatever a stranger pays into the address, one
+/// SELECTION costs at most this many reads.
+///
+/// **Per selection, not per pass, and the difference is not cosmetic (dig-node#469).** `create` is
+/// called once per bond (`lifecycle::NodeMirrorEffects::create`), each with its own budget, so a
+/// pass planning K creates costs up to K x this many reads. The create loop breaks on the first
+/// FAILURE, which bounds a pass that cannot fund itself to one selection — but it does not bound
+/// the case that matters here: a stranger who plants `MAX_AUTHENTICATION_ATTEMPTS - 1` coins
+/// ranked above the honest ones leaves every create still SUCCEEDING, so nothing breaks, while each
+/// one pays the full wasted walk, on the pass timer, indefinitely, from a one-time dust spend.
+///
+/// That is amplification of a bounded factor rather than an unbounded one — K is the node's own
+/// bond count, not an attacker's choice — so it is recorded here rather than silently untrue, and a
+/// per-PASS budget shared across the create loop is filed as follow-up rather than taken inside
+/// this change.
+///
+/// 128 is four times the input bound, so a wallet fragmented right
 /// up to the point where [`FundingError::TooManyInputs`] is the correct answer still reaches that
 /// answer with room for noise, while a wallet with nothing planted in it never comes close — the
 /// walk stops the moment the requirement is covered, so a healthy pass pays for the coins it
@@ -241,13 +256,15 @@ pub const MAX_SELECTED_FUNDING_COINS: usize = 32;
 ///
 /// # Which direction it fails in
 ///
-/// CLOSED, and silently about money. Exhausting the budget yields
+/// CLOSED, and silently about the AMOUNT but not about the condition. Exhausting the budget yields
 /// [`FundingError::CandidatesUnverifiable`], which states no total and maps to
-/// [`FundingObservation::Unknown`] — so the pass raises no alert and clears none. That is the
-/// honest reading: the walk was truncated, so the wallet was not measured. An attacker who buries
-/// the honest coins under 128 larger unauthenticatable ones can stop this node bonding, which is a
-/// denial of service and is recorded as one; what they cannot do is make the node tell its operator
-/// something false about their money.
+/// [`FundingObservation::Unmeasured`] — so the pass quotes no figure and clears no live shortfall,
+/// and it does tell the operator once that the walk was truncated. That is the honest reading: the
+/// walk stopped early, so the wallet was not measured, and an operator whose node has stopped
+/// bonding needs to hear that even when no number can be attached to it. An attacker who buries the
+/// honest coins under 128 larger unauthenticatable ones can stop this node bonding, which is a
+/// denial of service and is reported as one; what they cannot do is make the node tell its operator
+/// something false about their money, or keep it quiet about the stoppage (dig-node#469).
 pub const MAX_AUTHENTICATION_ATTEMPTS: usize = 128;
 
 /// The puzzle hash the operator's ordinary $DIG coins sit at.
@@ -559,16 +576,58 @@ pub struct FundingAlert {
     pub title: String,
     /// The body: what happened, in what amounts, and what to do about it.
     pub body: String,
-    /// The action this alert is asking for, or `None` when it reports a recovery.
+    /// The action this alert is asking for, or `None` when no single action is being claimed —
+    /// a recovery, or a blocked pass whose remedy is not established (see [`unmeasured_alert`]).
     pub remedy: Option<FundingRemedy>,
+}
+
+/// Why a pass knows bonding is blocked but cannot say by how much (dig-node#469).
+///
+/// # Why this is a shape of its own rather than an amount of zero, or silence
+///
+/// Two conditions stop this node bonding without ever producing an AUTHENTICATED total, and each
+/// used to resolve to one of the two available lies:
+///
+/// * quoting the figure that WAS available — the unauthenticated address total, which a stranger
+///   chooses by paying a coin into the publicly derivable scan address, understating the deficit
+///   and then having [`FundingAlertGate`] suppress the correction as immaterial; or
+/// * saying nothing at all, which leaves an operator whose node has silently stopped bonding with
+///   no message on any pass, forever.
+///
+/// The truthful third answer is to name the condition and NOT the amount. So an `Unmeasured`
+/// observation alerts once on entry, quotes no spendable total, and — like
+/// [`FundingObservation::Unknown`] — never clears a live shortfall, because a pass that could not
+/// measure the wallet is not evidence that the wallet recovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmeasuredFunding {
+    /// The pass priced a create and could afford none of them, so no candidate was ever
+    /// authenticated.
+    ///
+    /// The SHORT classification is sound even though the amount is not: authentication can only
+    /// ever REMOVE candidates, so the authenticated total is at most the reported one, and a
+    /// reported total below one create's cost proves the real one is too. What it does not prove
+    /// is the size of the gap — which is the figure an operator would act on.
+    NoCreateAffordable {
+        /// What one create needs, in $DIG base units. Derived from the epoch requirement and the
+        /// plan, never from the wallet, so it is a figure no stranger can move.
+        need_dig_base_units: u64,
+    },
+    /// The authentication walk hit [`MAX_AUTHENTICATION_ATTEMPTS`] before covering the requirement.
+    AuthenticationTruncated {
+        /// How many candidates were authenticated before the budget ran out.
+        attempted: usize,
+        /// How many of those could not be proven spendable.
+        skipped: usize,
+    },
 }
 
 /// What one mirror pass observed about funding — the input the alert gate decides on.
 ///
-/// Deliberately only three shapes. A pass that could not READ the balance is not a pass that found
-/// it short, and is not represented here at all: reporting a shortfall on no evidence is precisely
-/// the money lie this crate refuses elsewhere, so the caller maps an unreadable balance to
-/// [`FundingObservation::Unknown`], which never alerts and never clears the state either.
+/// A pass that could not READ the balance is not a pass that found it short: reporting a shortfall
+/// on no evidence is precisely the money lie this crate refuses elsewhere, so the caller maps an
+/// unreadable balance to [`FundingObservation::Unknown`], which never alerts and never clears the
+/// state either. [`FundingObservation::Unmeasured`] sits between the two — bonding is known to be
+/// blocked, and by how much is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FundingObservation {
     /// A create was funded, or none was needed. The operator wallet is not blocking anything.
@@ -582,6 +641,8 @@ pub enum FundingObservation {
         /// The action that would clear it.
         remedy: FundingRemedy,
     },
+    /// Bonding is blocked and the amount is not established. See [`UnmeasuredFunding`].
+    Unmeasured(UnmeasuredFunding),
     /// The funding state could not be established this pass.
     Unknown,
 }
@@ -633,8 +694,25 @@ impl FundingObservation {
             // total, and the only total available is the one from the coins that happened to be
             // walked -- understated by however many the budget did not reach. Reporting it would
             // send an operator to buy $DIG they already hold, and `grew_materially` would then
-            // suppress the correction. So this says nothing, and clears nothing either.
-            FundingError::CandidatesUnverifiable { .. } => FundingObservation::Unknown,
+            // suppress the correction.
+            //
+            // But saying nothing about the AMOUNT and saying nothing AT ALL are different, and the
+            // second is its own money lie by omission (dig-node#469): a stranger who buries the
+            // honest coins under `MAX_AUTHENTICATION_ATTEMPTS` larger unauthenticatable ones stops
+            // this node bonding on every pass, indefinitely, and the operator is never told. Worse,
+            // it is the state a latched understated shortfall would never be corrected out of. So
+            // this speaks -- once, naming the truncation and quoting no total -- and still clears
+            // nothing.
+            FundingError::CandidatesUnverifiable {
+                attempted,
+                skipped,
+                ..
+            } => {
+                FundingObservation::Unmeasured(UnmeasuredFunding::AuthenticationTruncated {
+                    attempted: *attempted,
+                    skipped: *skipped,
+                })
+            }
         }
     }
 }
@@ -654,6 +732,9 @@ impl FundingObservation {
 ///   alerted on. Growth by a fixed proportion is self-limiting — each further alert needs a deficit
 ///   half again as large as the last — so a steadily worsening shortfall cannot become a stream.
 /// * **Once on RECOVERY**, so an operator who acted learns it worked without having to watch for it.
+/// * **Once on entering an [`FundingObservation::Unmeasured`] state**, which names the condition
+///   and no amount. It is latched separately from the short state and CLEARS neither it nor
+///   itself, because a pass that could not measure the wallet is not evidence of recovery.
 /// * **Never on [`FundingObservation::Unknown`]**, which also does not CLEAR the state: an
 ///   unreadable pass is not evidence of recovery, and treating it as one would re-alert on the next
 ///   short pass for a shortfall that never went away.
@@ -664,6 +745,13 @@ impl FundingObservation {
 pub struct FundingAlertGate {
     /// The shortfall the last alert was raised for, or `None` while not in the short state.
     alerted: Option<(FundingRemedy, u64)>,
+    /// The unmeasured condition last alerted on, or `None` while not in one.
+    ///
+    /// Separate from `alerted` because the two are not alternatives: a wallet can be latched short
+    /// on an authenticated figure AND then become unmeasurable, and that transition is exactly the
+    /// one an operator must hear about — it is the pass on which the correction they were waiting
+    /// for stops being possible.
+    unmeasured: Option<UnmeasuredFunding>,
 }
 
 /// How much a deficit must grow, in percent of the last alerted deficit, to speak again.
@@ -675,19 +763,41 @@ pub struct FundingAlertGate {
 pub const MATERIAL_DEFICIT_GROWTH_PERCENT: u64 = 50;
 
 impl FundingAlertGate {
+    /// Drop every blocked state and announce the recovery, if the node was in one.
+    ///
+    /// Both latches clear together because a funded pass is evidence about the wallet as a whole:
+    /// the walk completed and the money was there, which is the answer to a truncated walk as much
+    /// as to a plain shortfall.
+    fn clear_and_announce_recovery(&mut self) -> Option<FundingAlert> {
+        // Both takes run before the test: `||` would short-circuit and leave the second latch set,
+        // which would swallow the next alert about a condition that has in fact just ended.
+        let was_short = self.alerted.take().is_some();
+        let was_unmeasured = self.unmeasured.take().is_some();
+        (was_short || was_unmeasured).then(|| FundingAlert {
+            title: "DIG mirror collateral resumed".into(),
+            body: concat!(
+                "The operator wallet can fund mirror collateral again. Your content is being ",
+                "bonded on the next pass."
+            )
+            .into(),
+            remedy: None,
+        })
+    }
+
     /// Feed one pass's observation, and get back the alert to raise — or nothing.
     pub fn observe(&mut self, observation: &FundingObservation) -> Option<FundingAlert> {
         match observation {
             FundingObservation::Unknown => None,
-            FundingObservation::Healthy => self.alerted.take().map(|_| FundingAlert {
-                title: "DIG mirror collateral resumed".into(),
-                body: concat!(
-                    "The operator wallet can fund mirror collateral again. Your content is being ",
-                    "bonded on the next pass."
-                )
-                .into(),
-                remedy: None,
-            }),
+            // Once per entry. Consecutive unmeasured passes are the attacker's steady state, so a
+            // per-pass message would be 144 a day; a single one that stays true is the signal.
+            FundingObservation::Unmeasured(reason) => {
+                if self.unmeasured == Some(*reason) {
+                    return None;
+                }
+                self.unmeasured = Some(*reason);
+                Some(unmeasured_alert(*reason))
+            }
+            FundingObservation::Healthy => self.clear_and_announce_recovery(),
             FundingObservation::Short {
                 have_dig_base_units,
                 need_dig_base_units,
@@ -724,6 +834,60 @@ fn grew_materially(last_deficit: u64, deficit: u64) -> bool {
     let threshold = last_deficit
         .saturating_add(last_deficit.saturating_mul(MATERIAL_DEFICIT_GROWTH_PERCENT) / 100);
     deficit > threshold
+}
+
+/// The operator-facing text for a blocked pass whose amount is not established (dig-node#469).
+///
+/// # The one rule this text obeys
+///
+/// It states no spendable total and no deficit, because neither is known — and it says so, rather
+/// than leaving an operator to infer an amount from a message that mentions none. A figure here
+/// would be the address total or a truncated walk's total, both of which a stranger chooses.
+///
+/// It still names an action, because "your node has stopped bonding and we cannot tell you why in
+/// numbers" is not something an operator can do anything with. Both conditions are cleared by the
+/// same thing — enough of the operator's OWN, spendable $DIG at the operator wallet — so both ask
+/// for that, and the truncated case adds the fact that the address is carrying coins that are not
+/// theirs, which is what a consolidation into a fresh wallet would resolve.
+fn unmeasured_alert(reason: UnmeasuredFunding) -> FundingAlert {
+    let body = match reason {
+        UnmeasuredFunding::NoCreateAffordable {
+            need_dig_base_units,
+        } => format!(
+            concat!(
+                "Your node cannot bond content: it needs {} DIG of collateral for this epoch and ",
+                "the operator wallet could not fund one. How much of the wallet's $DIG is ",
+                "actually spendable has not been established this pass, so no figure for the ",
+                "shortfall is given. Add $DIG to the operator wallet. Until then no new content ",
+                "is collateralised and it earns nothing."
+            ),
+            whole_dig(need_dig_base_units)
+        ),
+        UnmeasuredFunding::AuthenticationTruncated { attempted, skipped } => format!(
+            concat!(
+                "Your node cannot bond content: the operator address holds more coins than one ",
+                "pass may check, and {attempted} were checked with {skipped} of them not ",
+                "provably yours before the budget ran out. How much the wallet can spend is ",
+                "UNKNOWN, not low, so no figure is given — and adding $DIG may not clear it. ",
+                "Consolidate the operator wallet's own $DIG into fewer coins. Until then no new ",
+                "content is collateralised and it earns nothing."
+            ),
+            attempted = attempted,
+            skipped = skipped
+        ),
+    };
+    FundingAlert {
+        title: "DIG node cannot bond content".into(),
+        body,
+        // No remedy is claimed for the truncated case beyond the body's own words: `TopUp` would be
+        // the wrong instruction (adding money need not help) and `Consolidate` asserts the wallet
+        // holds enough, which is exactly what was not established. `NoCreateAffordable` does know
+        // the direction — the wallet could not fund one create — so it names `TopUp`.
+        remedy: match reason {
+            UnmeasuredFunding::NoCreateAffordable { .. } => Some(FundingRemedy::TopUp),
+            UnmeasuredFunding::AuthenticationTruncated { .. } => None,
+        },
+    }
 }
 
 /// The operator-facing text for a shortfall.
@@ -1372,9 +1536,11 @@ mod tests {
     /// what distinguishes a bound from a fixture that merely did not reach one.
     ///
     /// The refusal is asserted too. Exhausting the budget leaves the wallet unmeasured, so it must
-    /// state no total and must classify as [`FundingObservation::Unknown`] — an amount taken from a
-    /// truncated walk is the understated total this whole ordering exists to remove, and it would
-    /// raise a wrong alert AND suppress the right one.
+    /// state no total and must classify as [`FundingObservation::Unmeasured`] — an amount taken
+    /// from a truncated walk is the understated total this whole ordering exists to remove, and it
+    /// would raise a wrong alert AND suppress the right one. It must NOT classify as
+    /// [`FundingObservation::Unknown`] either, which alerts on nothing: that left an operator whose
+    /// node had permanently stopped bonding with no message on any surface.
     #[test]
     fn authentication_is_bounded_by_a_constant_however_many_coins_a_stranger_sends() {
         let owner = owner(0x66);
@@ -1414,10 +1580,14 @@ mod tests {
         );
         assert_eq!(
             FundingObservation::from_error(&refusal),
-            FundingObservation::Unknown,
+            FundingObservation::Unmeasured(UnmeasuredFunding::AuthenticationTruncated {
+                attempted: MAX_AUTHENTICATION_ATTEMPTS,
+                skipped: MAX_AUTHENTICATION_ATTEMPTS,
+            }),
             concat!(
-                "an unmeasured wallet must not alert and must not clear a live shortfall; ",
-                "quoting the total of the coins that happened to be walked would understate it"
+                "an unmeasured wallet must not quote a total and must not clear a live shortfall ",
+                "-- and must not be SILENT either, which is what `Unknown` here meant: a node ",
+                "stopped from bonding indefinitely, with no message on any surface"
             )
         );
     }

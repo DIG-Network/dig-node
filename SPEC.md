@@ -8753,15 +8753,37 @@ not depend on how many candidates exist. Without such a bound the reads one auto
 are chosen by whoever paid coins into the address, on the pass timer, indefinitely.
 
 **A walk truncated by that bound leaves the wallet UNMEASURED.** The node MUST refuse with a
-condition of its own that states NO total, and that classifies as §25.12's *unknown* — it MUST NOT
-report the total of the candidates that happened to be walked, and MUST NOT clear a live shortfall.
+condition of its own that states NO total — it MUST NOT report the total of the candidates that
+happened to be walked, and MUST NOT clear a live shortfall. It MUST classify as §25.12's
+*unmeasured*, and MUST therefore be reported to the operator without an amount: an operator whose
+node has stopped bonding because a stranger filled the scan address is otherwise never told
+anything, on any pass, indefinitely.
+
+**A pass that authenticated no candidate at all has no spendable total either.** The commonest such
+pass is one that priced a create and could afford none, so the selection was never invoked. It is
+still SHORT — authentication only ever removes candidates, so a reported balance below one create's
+cost proves the authenticated one is below it too — but the SIZE of the gap is not established, and
+the node MUST NOT quote the address total, or any figure derived from it, as the spendable one. It
+MUST classify as §25.12's *unmeasured*.
 
 ### 25.12. Reporting a funding shortfall to the operator
 
-The node MUST distinguish three funding observations per pass — *healthy*, *short* (with the amount
-and the remedy), and *unknown* — and MUST raise an operator-facing message only on a CHANGE: once on
-entering the short state, again only when the remedy changes or the deficit grows materially, and
-once on recovery. An *unknown* observation MUST raise nothing and MUST NOT clear a live shortfall.
+The node MUST distinguish four funding observations per pass — *healthy*, *short* (with the amount
+and the remedy), *unmeasured* (blocked, with no amount), and *unknown* — and MUST raise an
+operator-facing message only on a CHANGE: once on entering the short state, again only when the
+remedy changes or the deficit grows materially, and once on recovery. An *unknown* observation MUST
+raise nothing and MUST NOT clear a live shortfall.
+
+An *unmeasured* observation MUST raise a message once on entering it, MUST state NO spendable total
+and NO deficit, and MUST NOT clear a live shortfall. Saying nothing about the AMOUNT and saying
+nothing AT ALL are different: the second leaves a node that has silently stopped bonding
+unreported, and leaves a shortfall already alerted on latched at a figure that can never be
+corrected. The message MUST name the condition and an action the operator can take, and MUST NOT
+assert a remedy the observation does not establish — in particular a truncated walk MUST NOT tell
+an operator to add $DIG, since adding it need not help.
+
+A *short* observation's spendable total MUST be authenticated (§25.11). A pass that has no
+authenticated total is *unmeasured*, never *short with the address total*.
 
 **A pass that planned no create because it could afford none is SHORT, not healthy.** The two
 conditions that produce an empty create list are opposites — nothing to bond, and nothing
@@ -8770,6 +8792,9 @@ with no producer for the commonest real case (a wallet holding less than one cre
 which never attempts a create and so never produces a funding refusal), and worse, CLEARS a live
 shortfall and announces a recovery that has not happened.
 
-The figures a shortfall reports MUST be the money that must actually be ADDED: the $DIG remaining
-after the affordable creates were funded, against the cost of those that were not. The wallet
-balance alone overstates what is available towards the unmade creates.
+The figures a shortfall reports MUST be the money that must actually be ADDED: the authenticated
+$DIG remaining after the affordable creates were funded, against the cost of those that were not.
+The wallet balance alone overstates what is available towards the unmade creates, and an
+unauthenticated balance is in addition a figure a stranger chooses (§25.11) — so where the
+remaining $DIG has not been authenticated, the cost of the unmade creates is reported alone, as an
+*unmeasured* observation.

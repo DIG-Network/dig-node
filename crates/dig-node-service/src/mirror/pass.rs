@@ -67,19 +67,24 @@ pub struct PassDecision {
     pub funding_shortfall: Option<FundingShortfall>,
 }
 
-/// A pass that could not afford every create it planned, in the two figures an operator needs.
+/// A pass that could not afford every create it planned.
 ///
-/// Both are stated from the SAME funds split that caused the refusal, so the message cannot
-/// disagree with the decision it describes.
+/// # Why this carries the requirement and NOT the balance (dig-node#469)
+///
+/// It once carried a `have_dig_base_units` too — the $DIG left over after the affordable creates
+/// were funded, `balance % per_coin`. That figure is derived from `dig_balance_base_units`, the raw
+/// sum over `dig_cat_puzzle_hash(owner)`, and NEITHER balance tier authenticates CAT lineage. The
+/// address is publicly derivable, so the figure is one a stranger can move by paying a coin into
+/// it: planting just under one create's cost has the operator told they are a hair short when they
+/// are half a create short, and the alert gate then suppresses the correction as immaterial.
+///
+/// So the field is GONE rather than merely unused. An unauthenticated money figure that no caller
+/// currently renders is one refactor away from being rendered again; a struct that cannot hold it
+/// cannot regress. What survives is the requirement, which is derived from the epoch and the plan
+/// and which no stranger can move — see SPEC §25.11.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FundingShortfall {
-    /// The $DIG left over after the affordable creates were funded — what is still spendable
-    /// towards the ones that were not, in base units.
-    ///
-    /// Not the wallet balance: a balance that funded three of five creates is not money available
-    /// for the remaining two, and quoting it would overstate what the operator has to work with.
-    pub have_dig_base_units: u64,
-    /// What the creates left uncreated would cost together, in the same units.
+    /// What the creates left uncreated would cost together, in $DIG base units.
     pub need_dig_base_units: u64,
 }
 
@@ -247,16 +252,14 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
 
     // The shortfall is read off the split rather than off the states, because the split is what
     // decided it: `short` is non-empty exactly when a priced create went unmade for want of funds.
-    // `have` is the remainder after the affordable prefix was funded — `balance % per_coin` — so
-    // the deficit these two imply is the money that must actually be ADDED, not the whole cost of
-    // the unmade creates.
-    let funding_shortfall = match (per_coin, split.as_ref(), inputs.dig_balance_base_units) {
-        // `per_coin` of zero is refused as a create everywhere else in this crate, and would make
-        // the remainder below a division by zero. It reports no shortfall rather than panicking:
-        // a requirement of zero is a caller defect, not an empty wallet.
-        (Some(per_coin), Some(split), Some(balance)) if per_coin > 0 && !split.is_funded() => {
+    // What it reports is the COST of those unmade creates and nothing about the wallet — the
+    // balance that produced the split is unauthenticated, and no figure derived from it may reach
+    // an operator (SPEC §25.11, dig-node#469).
+    let funding_shortfall = match (per_coin, split.as_ref()) {
+        // `per_coin` of zero is refused as a create everywhere else in this crate; a requirement of
+        // zero is a caller defect, not an empty wallet, so it reports no shortfall.
+        (Some(per_coin), Some(split)) if per_coin > 0 && !split.is_funded() => {
             Some(FundingShortfall {
-                have_dig_base_units: balance % per_coin,
                 need_dig_base_units: split.shortfall_dig_base_units,
             })
         }
@@ -494,12 +497,11 @@ mod tests {
         assert_eq!(
             decision.funding_shortfall,
             Some(FundingShortfall {
-                have_dig_base_units: 400,
                 need_dig_base_units: REQUIRED,
             }),
             concat!(
-                "the leftover $DIG and the cost of the unmade create are what an operator needs; ",
-                "quoting the whole balance understates the deficit and quoting zero overstates it"
+                "the cost of the unmade create is the one figure here no stranger can move; the ",
+                "leftover balance is an unauthenticated sum over a public address (SPEC 25.11)"
             )
         );
     }

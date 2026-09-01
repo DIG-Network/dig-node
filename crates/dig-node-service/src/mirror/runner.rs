@@ -452,13 +452,32 @@ impl<E: MirrorEffects> PassRunner<E> {
             // commonest real case, and worse: a pass that could afford nothing CLEARED a live
             // shortfall and announced a recovery that had not happened. A pass that never asked the
             // wallet for money is not evidence that the wallet has any.
+            //
+            // It is `Unmeasured`, NOT `Short`, and the difference is the whole of dig-node#469 one
+            // surface along. A `Short` quotes a spendable total, and the only total this arm has is
+            // `dig_balance_base_units` -- the raw sum over `dig_cat_puzzle_hash(owner)`, which
+            // neither balance tier authenticates. That address is publicly derivable, so a stranger
+            // who plants one coin just large enough to push the reported balance to a hair under
+            // one create's cost has the operator told they are 0.001 DIG short when they are 0.500
+            // short; they top up the 0.001, and `grew_materially` then suppresses the correction as
+            // immaterial. SPEC 25.11 -- authentication precedes every figure the operator is told.
+            //
+            // The SHORT classification itself is sound and is kept: authentication only ever
+            // REMOVES candidates, so the authenticated total is at most the reported one, and a
+            // reported total that cannot fund a create proves the real one cannot either. It is the
+            // AMOUNT that no honest figure exists for on this path, because no candidate here was
+            // ever authenticated -- the create loop is handed an empty affordable prefix and never
+            // iterates, so `authenticate` is never called at all.
             None if decision_shortfall.is_some() => {
                 let shortfall = decision_shortfall.expect("matched Some directly above");
-                super::funding::FundingObservation::Short {
-                    have_dig_base_units: shortfall.have_dig_base_units,
-                    need_dig_base_units: shortfall.need_dig_base_units,
-                    remedy: super::funding::FundingRemedy::TopUp,
-                }
+                super::funding::FundingObservation::Unmeasured(
+                    super::funding::UnmeasuredFunding::NoCreateAffordable {
+                        // The requirement, never the wallet. `need` is derived from the epoch
+                        // collateral and the plan, so it is the one figure in this arm that no
+                        // stranger can move.
+                        need_dig_base_units: shortfall.need_dig_base_units,
+                    },
+                )
             }
             // Nothing stopped and nothing was unaffordable. `per_coin` is `Some` exactly when the
             // requirement was known, so this is a pass that funded every create it planned --
@@ -928,6 +947,220 @@ mod tests {
             recovery.remedy, None,
             "a recovery asks for nothing; reporting one only when the wallet really recovered is \
              the half of this that keeps the fix from silencing recoveries altogether"
+        );
+    }
+
+    /// **A pass that authenticated nothing never quotes a spendable total to the operator.**
+    ///
+    /// **Proves** SPEC §25.11 on the path §25.12 calls the commonest real case. The pass that can
+    /// afford no create never invokes selection at all, so no candidate is ever authenticated —
+    /// and the only total available to it is `dig_balance_base_units`, the raw sum over
+    /// `dig_cat_puzzle_hash(owner)`, which neither balance tier proves lineage for.
+    ///
+    /// **Catches** the nearest wrong implementation exactly: classifying this pass as `Short` and
+    /// rendering `balance % per_coin` as *"the operator wallet holds X DIG that it can spend"*. It
+    /// is the same defect this PR fixes inside selection, one surface along.
+    ///
+    /// # The fixture is the attack, not merely an empty wallet
+    ///
+    /// The operator holds NOTHING. A stranger pays `REQUIRED - 1` into the publicly derivable scan
+    /// address — 999 base units, well under a cent — and the coin has no valid $DIG lineage, so
+    /// nobody can ever spend it. The reported balance is now 999 against a requirement of 1,000.
+    ///
+    /// The wrong version tells the operator they are **0.001 DIG short** when they are **1.000
+    /// short**, and the attacker chose that figure. They top up the 0.001, the shortfall persists,
+    /// and `grew_materially` suppresses the correction as immaterial — so the lie is not merely
+    /// told once, it is latched.
+    ///
+    /// An empty wallet would NOT catch this: at a balance of zero the wrong version renders *"holds
+    /// 0.000 DIG"*, which is true, and the test would pass under the defect. Varying the one thing
+    /// a stranger controls is what makes this fixture load-bearing.
+    ///
+    /// # The control, without which this test is satisfied by saying nothing anywhere
+    ///
+    /// The second half drives the AUTHENTICATED shortfall — `FundingError::Insufficient`, whose
+    /// figures come from `authenticate` — and asserts it DOES quote the spendable total. An
+    /// implementation that simply stripped every amount from every funding message passes the first
+    /// half and fails this one.
+    #[test]
+    fn a_pass_that_authenticated_nothing_quotes_no_spendable_total() {
+        use super::super::funding::{FundingAlertGate, FundingError, FundingRemedy};
+
+        const PLANTED: u64 = REQUIRED - 1;
+        /// The clause that asserts a spendable total. Its presence IS the defect.
+        const SPENDABLE_CLAIM: &str = "that it can spend";
+
+        let capsule = bond("aa", "11");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+
+        // The attacked pass: the operator's own $DIG is zero, and every base unit the balance
+        // oracle reports was put there by somebody else.
+        let mut pass = runner(
+            FakeEffects {
+                disk: held(std::slice::from_ref(&capsule)),
+                balance: PLANTED,
+                ..FakeEffects::default()
+            },
+            log.clone(),
+        )
+        .with_funding_gate(FundingAlertGate::default());
+        let report = pass.run(&ctx()).expect("the pass observes");
+
+        assert!(
+            report.created.is_empty(),
+            "the fixture must afford no create, or the path under test is not the one taken"
+        );
+        let alert = report.funding_alert.expect(concat!(
+            "a node blocked from bonding raised nothing at all; refusing to quote an ",
+            "unauthenticated figure must not become refusing to speak"
+        ));
+        assert!(
+            !alert.body.contains(SPENDABLE_CLAIM),
+            "the operator was told what their wallet can spend, off a total no candidate was \
+             authenticated for; a stranger paying 999 base units into a public address chose it. \
+             Body was: {}",
+            alert.body
+        );
+        assert!(
+            !alert.body.contains("0.001"),
+            "the deficit quoted is the attacker's arithmetic, not the operator's: they are 1.000 \
+             DIG short and were told 0.001. Body was: {}",
+            alert.body
+        );
+        assert!(
+            alert.body.contains("1.000"),
+            "the requirement is the one figure here no stranger can move, and dropping it leaves \
+             an operator with nothing to act on. Body was: {}",
+            alert.body
+        );
+        assert_eq!(
+            alert.remedy,
+            Some(FundingRemedy::TopUp),
+            "the direction IS established even where the amount is not: this wallet could not fund \
+             a single create"
+        );
+
+        // The control: an AUTHENTICATED shortfall still states its figures. `Insufficient` is
+        // produced by `authenticate` over proven candidates, so its total is the operator's own.
+        let mut authenticated = runner(
+            FakeEffects {
+                disk: held(std::slice::from_ref(&capsule)),
+                balance: REQUIRED * 10,
+                create_fails: vec![capsule.clone()],
+                create_funding_failure: Some(FundingError::Insufficient {
+                    have_dig_base_units: PLANTED,
+                    need_dig_base_units: REQUIRED,
+                }),
+                ..FakeEffects::default()
+            },
+            log,
+        )
+        .with_funding_gate(FundingAlertGate::default());
+        let control = authenticated.run(&ctx()).expect("the pass observes");
+        let control_alert = control
+            .funding_alert
+            .expect("an authenticated shortfall must still alert");
+        assert!(
+            control_alert.body.contains(SPENDABLE_CLAIM),
+            "an authenticated total is exactly the figure an operator SHOULD be given; silencing \
+             every amount is not the fix. Body was: {}",
+            control_alert.body
+        );
+    }
+
+    /// **Exhausting the authentication budget TELLS the operator, and still clears nothing.**
+    ///
+    /// **Proves** the second half of SPEC §25.11's truncated-walk rule. Refusing to quote a total
+    /// from a truncated walk is right; refusing to say anything is a different thing, and it is the
+    /// steady state a stranger drives this node into: bury the honest coins under
+    /// `MAX_AUTHENTICATION_ATTEMPTS` larger unauthenticatable ones and every pass, forever, ends in
+    /// `CandidatesUnverifiable`.
+    ///
+    /// **Catches** the mapping that sent that condition to `Unknown` — where `observe` returns
+    /// `None`, so even the `tracing::warn!` in `execute`, gated on the alert being `Some`, never
+    /// fired. The alert channel said nothing, ever, about a node that had stopped bonding.
+    ///
+    /// # Why the sequence, and not one pass
+    ///
+    /// Pass 1 latches a real, authenticated shortfall. Pass 2 is the truncated walk. This composes
+    /// the two findings: without the fix the operator's last word is the pass-1 figure, the
+    /// correction can never arrive because a truncated pass is silent, and the gate stays latched
+    /// on it. So the test asserts pass 2 SPEAKS and that its message quotes no total — and pass 3,
+    /// a repeat of the same truncation, is silent, because once per entry is the policy and 144
+    /// messages a day is how an operator learns to ignore them.
+    #[test]
+    fn a_truncated_authentication_walk_tells_the_operator_without_quoting_a_total() {
+        use super::super::funding::{FundingAlertGate, FundingError};
+
+        let capsule = bond("aa", "11");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+        let run = |gate, failure: FundingError| {
+            let mut pass = runner(
+                FakeEffects {
+                    disk: held(std::slice::from_ref(&capsule)),
+                    balance: REQUIRED * 10,
+                    create_fails: vec![capsule.clone()],
+                    create_funding_failure: Some(failure),
+                    ..FakeEffects::default()
+                },
+                log.clone(),
+            )
+            .with_funding_gate(gate);
+            let report = pass.run(&ctx()).expect("the pass observes");
+            (report.funding_alert, pass.take_funding_gate())
+        };
+
+        let truncated = || FundingError::CandidatesUnverifiable {
+            attempted: super::super::funding::MAX_AUTHENTICATION_ATTEMPTS,
+            skipped: super::super::funding::MAX_AUTHENTICATION_ATTEMPTS,
+            need_dig_base_units: REQUIRED,
+        };
+
+        // Pass 1: a genuine, authenticated shortfall. The operator is told a figure.
+        let (first, gate) = run(
+            FundingAlertGate::default(),
+            FundingError::Insufficient {
+                have_dig_base_units: REQUIRED - 1,
+                need_dig_base_units: REQUIRED,
+            },
+        );
+        assert!(first.is_some(), "the control shortfall must latch the gate");
+
+        // Pass 2: the walk is truncated. This is the pass that was silent.
+        let (second, gate) = run(gate, truncated());
+        let alert = second.expect(concat!(
+            "the authentication budget was exhausted and the operator was told NOTHING -- not by ",
+            "the alert, and not by the log line the alert gates. A node that has stopped bonding ",
+            "because a stranger filled its scan address must say so"
+        ));
+        assert!(
+            !alert.body.contains("short"),
+            "a truncated walk measured nothing, so it must not describe the wallet as short by \
+             any amount. Body was: {}",
+            alert.body
+        );
+        assert!(
+            alert.body.contains("UNKNOWN"),
+            "the operator must be told the figure is unknown rather than low, or they will buy \
+             $DIG that cannot help. Body was: {}",
+            alert.body
+        );
+        assert_eq!(
+            alert.remedy, None,
+            concat!(
+                "a truncated walk establishes no remedy: TopUp is the wrong instruction because ",
+                "adding money need not help, and Consolidate asserts the wallet holds enough, ",
+                "which is exactly what was not established"
+            )
+        );
+
+        // Pass 3: the same truncation persists. Silence -- the operator has been told.
+        let (third, _) = run(gate, truncated());
+        assert_eq!(
+            third, None,
+            "the attacker's steady state must not become 144 identical messages a day"
         );
     }
 
