@@ -245,8 +245,9 @@ pub const MAX_SELECTED_FUNDING_COINS: usize = 32;
 ///
 /// That is amplification of a bounded factor rather than an unbounded one — K is the node's own
 /// bond count, not an attacker's choice — so it is recorded here rather than silently untrue, and a
-/// per-PASS budget shared across the create loop is filed as follow-up rather than taken inside
-/// this change.
+/// per-PASS budget shared across the create loop is filed as dig-node#481 rather than taken inside
+/// this change — it is not a counter change, because exhausting a shared budget part-way turns
+/// later bonds into [`FundingError::CandidatesUnverifiable`], which now SPEAKS to the operator.
 ///
 /// 128 is four times the input bound, so a wallet fragmented right
 /// up to the point where [`FundingError::TooManyInputs`] is the correct answer still reaches that
