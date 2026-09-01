@@ -3313,6 +3313,7 @@ async fn bring_up_dht(
                 tokio::spawn(
                     crate::seams::dig_peer::profile_sync::run_profile_announce_loop(
                         ctx.store.clone(),
+                        ctx.resolver.clone(),
                         ctx.transport.clone(),
                         crate::seams::dig_peer::profile_sync::ANNOUNCE_INTERVAL,
                     ),

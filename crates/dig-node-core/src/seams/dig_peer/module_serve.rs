@@ -35,6 +35,11 @@ use serde_json::{json, Value};
 
 use crate::capsule_key::CapsuleKey;
 
+// The descriptor's digests now come from `module_stream`, which hashes incrementally (#302). The
+// one-shot helper survives only as the INDEPENDENT answer the tests below check the streamed digests
+// against, so it is test-only here — a test that recomputed the digest with the same code path it is
+// verifying would assert nothing.
+#[cfg(test)]
 use super::module_anchor::sha256;
 
 /// The smallest chunk a descriptor will declare (1 MiB).
@@ -128,16 +133,34 @@ pub fn describe_module(cache_dir: &Path, store_hex: &str, root_hex: &str) -> Opt
         }
     }
 
-    let bytes = std::fs::read(&path).ok()?;
-    if bytes.is_empty() {
+    // Digest the capsule in ONE streaming pass over a fixed buffer instead of `fs::read`-ing it
+    // (#302, #1615/G2). The descriptor needs every byte hashed, but never every byte resident: a
+    // ~100-byte `dig.getModuleInfo` from a peer used to commit a whole ~135 MB capsule to RAM here,
+    // which is the same amplification `read_module_window` below already removed for windows (G1).
+    //
+    // The answer is unchanged. Incremental SHA-256 agrees with the one-shot call over the same byte
+    // sequence, and the chunk boundaries are absolute file offsets, so this produces a bit-identical
+    // `ModuleInfo` to the whole-buffer version — which is exactly why the guard for it has to measure
+    // allocation rather than output (`tests/capsule_serve_peak_memory.rs`).
+    let chunk = chunk_size_for(len) as usize;
+    let digested = super::module_stream::digest_with_chunks(&path, chunk).ok()?;
+    if digested.total == 0 {
         return None;
     }
-    let chunk = chunk_size_for(bytes.len() as u64) as usize;
+    // The chunk size was derived from the STAT'd length, so a file that changed between the stat and
+    // the read would be chunked on a size that no other reader would reproduce — its chunk hashes
+    // would be unmatchable by the puller that asked. Refuse rather than describe an artifact whose
+    // boundaries are already known to be wrong, exactly as the 0-byte case above refuses at the
+    // source. Modules are written whole via write-then-rename and never edited in place, so this is a
+    // fail-closed guard on a state the write path does not produce, not a routine branch.
+    if digested.total != len {
+        return None;
+    }
     let info = ModuleInfo {
-        total_size: bytes.len() as u64,
-        module_hash: hex32(&sha256(&bytes)),
-        chunk_hashes: bytes.chunks(chunk).map(|c| hex32(&sha256(c))).collect(),
-        chunk_lens: bytes.chunks(chunk).map(|c| c.len() as u64).collect(),
+        total_size: digested.total,
+        module_hash: hex32(&digested.whole),
+        chunk_hashes: digested.chunk_digests.iter().map(hex32).collect(),
+        chunk_lens: digested.chunk_lens,
     };
 
     descriptor_memo()

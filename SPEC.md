@@ -1662,7 +1662,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
 | `control.cache.get` | — | `cap_bytes`, `used_bytes`, `capsule_bytes`, `response_bytes`, `dir`, `shared` |
 | `control.profile.putBody` | `store_id`, `root` (64-hex), `body_b64` (standard padded base64 of the DPB bytes) | `stored: true`, `store_id`, `root`, `body_bytes`, `announced_to_peers`, `unreachable_peers`. `announced_to_peers` is a TRUE delivery count — peers the 223 announce was actually sent to, excluding lazy and NAT-bound peers that are connected but cannot be pushed to — so `0` does NOT mean failure and MUST NOT be treated as one: the body is persisted either way and the periodic re-announce reaches whoever connects later. `unreachable_peers` reports that connected-but-unreachable remainder, so a caller can distinguish "no peers exist" from "peers exist and none could be reached". The node MUST independently resolve the root on chain and refuse unless the chain confirms exactly that root AND the bytes hash to it (§22.3). A refusal is an ERROR, never an `Ok` carrying `stored: false`. A decoded body above `MAX_BODY_BYTES` (4 MiB) is `INVALID_PARAMS` before anything is persisted. |
-| `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. |
+| `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`, `standing`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. `standing` is `{state, chain_root, held_roots, detail}` and carries §22.5c's reconciliation: `state` is one of `current` / `superseded` / `nothing_held` / `no_generation` / `chain_unreadable`, and it is what distinguishes an un-published store from an empty one — `body_b64: null` alone is the same answer for at least four different situations. `chain_root` is `null` (NEVER an all-zero root, which the body format rejects outright) whenever the chain named none or could not be read. The chain read is ADDITIVE: `body_b64` keeps its exact meaning as the disk read at the REQUESTED root, a failed disk read is still `CONTROL_ERROR`, and a chain read that RETURNS an error degrades to `state: "chain_unreadable"` rather than failing the call — a node whose chain access is down MUST still be able to answer what it holds. Named limitation: a chain source that is UNRESPONSIVE rather than failing returns no error to degrade on, so it blocks this call for as long as it blocks — exactly as it already does for `control.profile.putBody`, which resolves the same root through the same resolver as its FIRST action. Bounding that read is one change across both methods, not a bound on this one alone. |
 | `control.cache.setCap` | `cap_bytes` (number) | `cap_bytes` (floored at 64 MiB) |
 | `control.cache.clear` | — | `cleared: true` |
 | `control.hostedStores.list` | — | `stores[]`: `store_id`, `pinned`, `capsule_count`, `total_bytes`, `capsules[]` (capsule, root, size_bytes, last_used_unix_ms) — cached stores ∪ pinned stores |
@@ -7138,6 +7138,16 @@ stream is closed, so that its descriptor memo is populated and the re-ask is ans
 total a requestor spends on one holder MUST be bounded; an ask that is ANSWERED negatively MUST NOT be
 re-asked, since re-asking cannot change a refusal and would delay trying the next holder.
 
+**Descriptor MEMORY, unlike descriptor latency, MUST NOT scale with the capsule (MUST,
+dig-node#302).** A server MUST compute the descriptor's digests incrementally, over a buffer whose size
+is independent of the module, and MUST NOT make the whole module resident to answer. The two costs are
+separable and only one of them is inherent: every byte must be READ to be hashed, but no byte needs to
+still be held once it has been. A whole-module read lets one ~100-byte unauthenticated ask commit the
+capsule's full size in RAM, which multiplies by concurrent askers and is the same amplification the
+4 MiB `fetchModuleRange` clamp exists to prevent on the window path. Incremental SHA-256 yields the
+identical digest over the identical byte sequence, so this bounds the server's memory without changing
+the descriptor a requestor receives by a single bit.
+
 **A hop that is RELAYING MUST acknowledge, not block (MUST, dig-node#333).** A node asked with
 `proxy: true` for a capsule it does not hold pulls that capsule from a holder on the requestor's
 behalf. That pull is a whole-capsule transfer and takes arbitrarily long — minutes for a 135 MB
@@ -7551,9 +7561,9 @@ quiesces.
 
 ### 22.5b. Originating an announce (MUST)
 
-A node MUST announce (opcode 223) every profile body it holds, both **immediately** when it accepts
-one from a local caller (`control.profile.putBody`) and **periodically** thereafter, to every peer
-with no exclusion.
+A node MUST announce (opcode 223) every profile body it holds **whose root the chain has not
+retired** (§22.5c), both **immediately** when it accepts one from a local caller
+(`control.profile.putBody`) and **periodically** thereafter, to every peer with no exclusion.
 
 The follow-on announce of §22.5 step 5 fires only for a body ingested FROM a peer, so a node whose
 only announces were re-announces could never START the exchange: a body handed to it locally, or
@@ -7563,6 +7573,47 @@ replayed to it.
 
 An announce carries no authority, so originating one is safe unconditionally: a receiver ignores a
 store it is not subscribed to and resolves the root on chain itself before requesting anything.
+
+### 22.5c. A retired root MUST NOT be announced, and the drift MUST be reported (MUST)
+
+A store's on-chain root can advance while the body a node holds stays where it was. A DPB's root is
+a hash of its own bytes, so a body **cannot** be re-anchored under the new root: a root that
+advanced means the content changed, and only the publisher can produce bytes hashing to it. A node
+therefore MUST NOT attempt any repair, and MUST instead do two things.
+
+**1. Withhold the announce for a root the chain positively contradicts.** Each periodic sweep MUST
+resolve the store's current on-chain root — **once per store**, not once per held root, so the two
+bodies current-plus-one retention keeps are never judged against two different chain reads — and
+MUST NOT announce a held root the chain names as superseded. Retention keeps one predecessor beside
+every current body, so this obligation binds healthy stores too.
+
+The withholding condition is a **positive contradiction only**. A chain that cannot be read, and a
+store the chain reports as having no confirmed generation, both leave the announce standing. This
+direction is deliberately the OPPOSITE of the accept gate's (§22.3), and the asymmetry is the
+point: acceptance is irreversible and so fails closed, while an announce carries no authority —
+every receiver resolves the root itself before asking for anything — so an unconfirmable announce
+costs one ignored frame, whereas silence would take a healthy node off the air for the duration of
+a chain outage.
+
+The **immediate** announce of §22.5b needs no check of its own: `control.profile.putBody` has just
+required the chain to confirm exactly that root (§22.3), so the root it announces cannot be retired
+at that moment. Only the periodic sweep can outlive a root.
+
+**2. Report the drift.** The failure is the ABSENCE of a later write, so it produces no error
+anywhere and is invisible to the publisher, who is the only party that can fix it. A node MUST
+therefore surface a store whose held bodies are all superseded — in its own log on each sweep, and
+in `control.profile.getBody`'s `standing` (§10) — naming the chain's current root and the remedy.
+
+A node MUST distinguish these five standings, because each needs a different remedy and a caller
+shown a merged answer cannot choose between them:
+
+| `state` | Means | Remedy |
+|---|---|---|
+| `current` | the chain's root is held | none |
+| `superseded` | bodies held, none at the chain's root | the publisher re-publishes at the chain's root |
+| `nothing_held` | the chain names a root, this node holds nothing for the store | publish here |
+| `no_generation` | the chain reports no confirmed generation | an unconfirmed mint, or a store id naming nothing |
+| `chain_unreadable` | the chain could not be read | the standing is UNKNOWN, not absent; fix chain access |
 
 ### 22.6. Penalization is narrow (MUST NOT widen)
 
@@ -8234,8 +8285,9 @@ itself (SYSTEM.md §4.1).
 >   (`mirror::runner::split_by_provenance`) and expressed in the types thereafter: `PassInputs::held`
 >   and `::relayed` are separate fields, so no relayed capsule can reach the create path.
 > * §25.8's **vocabulary**, as `mirror::pass::BondState`: `disabled` (the node-wide switch),
->   `withheld` (`Relayed` provenance) and `reclaiming` are three distinct states, agreeing with
->   `dig-node-control-interface` 0.27.0's tokens, which the node now ADOPTS. `withheld` has a real
+>   `unadvertised` (that switch ON with nothing publishable to advertise), `withheld` (`Relayed`
+>   provenance) and `reclaiming` are four distinct states, agreeing with
+>   `dig-node-control-interface` 0.28.0's tokens, which the node now ADOPTS. `withheld` has a real
 >   producer, the relayed set, rather than being unreachable from a `Held`-keyed derivation.
 > * §25.8's **method and verb**: `control.mirror.bondStates` is served (`control.rs`) and
 >   `dign mirror bond-states` is the verb. The wire mapping, the whole-set locked total, the
@@ -8718,11 +8770,42 @@ one setting to turn off** (§6.0/#207).
 The lifecycle exposes, per `(store, root)`, over the control plane and with a `dign` verb (§8.6
 CLI parity): the bond state — `bonded { coin_id, epoch, amount }`, `pending` (in-flight create),
 `unfunded { short_dig_base_units }`, `deferred { requirement reason }` (§25.3), `withheld`
-(`Relayed` provenance — deliberately not advertised), `disabled` (the node-wide switch, §25.7), or
+(`Relayed` provenance — deliberately not advertised), `disabled` (the node-wide switch, §25.7),
+`unadvertised` (that switch ON, but no entry in `DIG_MIRROR_ADVERTISE_URLS` is publishable, so this
+node advertises nothing and a coin would bond nothing — §25.10), or
 `reclaiming { coin_id, epoch, amount }` — so a client can distinguish "out of funds" from "withheld
 on purpose" without guessing from the store list. Conflating those two produces hourly alarms about
 a healthy node (dig-app#300). The method is declared in `dig-node-control-interface` (release-first)
 before the node serves it.
+
+**The mirror wallet is the node's OWN, and `control.wallet.operatorAddress` names it.** The wallet
+that pays mirror collateral is the §16.4 machine-custody operator wallet, derived from the autoseed
+— never the user's. Every figure in this section is about that wallet, and until it could be named
+an operator reading `unfunded, short 1010` had no way to learn which wallet was short, nor where to
+send money to fix it: one node reported exactly that while its operator's own wallet held 1,015,000
+base units of $DIG, both statements true and each about a different wallet. The method answers
+`{state:"known", address, puzzle_hash}` for this node's own wallet, or
+`{state:"unavailable", reason}` — `not_initialized` for a node that has never run autoseed setup,
+which is not a fault, and `unreadable` for one whose seed will not open, which is, and which also
+means the node cannot pay collateral. It is TOKEN-GATED, because the caller does not name the
+address and the node therefore volunteers its own node-to-address association; it is OWNED rather
+than delegated, because forwarding it upstream would answer with another machine's wallet; and it
+returns a DESTINATION only — no seed, key or derivation material, in any encoding. The
+implementation reaches the address through `dig_wallet::operator_wallet::operator_address`, which is
+built on `operator_puzzle_hash` and constructs no `WalletSigner` at all, so §908 holds by the types
+rather than by discipline. The address is encoded with the wallet backend's own network prefix,
+never a constant, so a node reading testnet coins cannot render a mainnet address beside them.
+
+**`disabled` and `unadvertised` are both node-wide, and only ONE of them is a fault.** Both make every
+row read the same token together and neither has a coin. They differ in whether the operator already
+knows: `disabled` is that operator's own switch (§25.7) and MUST NOT be presented as a fault, while
+`unadvertised` is the switch ON and the node silently unable to honour it because
+`mirror::advertise::configured_urls` accepted no entry — the list is empty, or every entry was rejected
+as non-absolute or reachable only from this machine, which is the same condition `MirrorEffects::create`
+refuses every bond on (§25.10). The node MUST report `unadvertised` for that condition and MUST NOT
+report it as `disabled`, which would oblige a conforming client to stay silent about the only reason
+this node bonds nothing, nor as `unfunded`, which would name a figure and demand $DIG that would create
+no coin.
 
 The surface MUST hold four properties, each of which is a money statement:
 

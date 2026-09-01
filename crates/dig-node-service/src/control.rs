@@ -65,7 +65,8 @@ use dig_node_control_interface::params::{
 };
 use dig_node_control_interface::results::{
     AutomatedSpend, SpendAsset, SpendAuthority, SpendChainReference, SpendFailureStage,
-    SpendOutcome, SpendsListResult,
+    SpendOutcome, SpendsListResult, WalletOperatorAddressResult,
+    WalletOperatorAddressUnavailableReason,
 };
 use dig_node_control_interface::ControlMethod;
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
@@ -195,6 +196,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.operatorAddress",
     "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
@@ -261,6 +263,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.operatorAddress",
     "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
@@ -1032,6 +1035,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.coinsByParent" => wallet_coins_by_parent(ctx, id, params).await,
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
+        "control.wallet.operatorAddress" => wallet_operator_address(ctx, id),
         "control.wallet.resetCoinDb" => wallet_reset_coin_db(ctx, id, params).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
         "control.wallet.watch" => wallet_watch(ctx, id, params).await,
@@ -1056,7 +1060,12 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         // The mirror-coin bond surface (dig-node#412, SPEC.md §25.8) -- one page of this
         // node's OWN bonds. Shell-owned because the bonds are the SERVICE's money, not the
         // embedded engine's.
-        "control.mirror.bondStates" => mirror_bond_states(mirror_bond_observation(ctx), id, params),
+        "control.mirror.bondStates" => mirror_bond_states(
+            mirror_bond_observation(ctx),
+            id,
+            params,
+            operator_wallet_answer(ctx),
+        ),
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
@@ -2314,6 +2323,77 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
     }
 }
 
+/// `control.wallet.operatorAddress` — where is this node's OWN machine wallet?
+///
+/// # Two wallets, and nothing used to name which
+///
+/// The node holds a machine-custody operator wallet, autoseed-derived, and it is the wallet that
+/// pays mirror-coin collateral. It is not the user's. A node reported three mirror bonds
+/// `unfunded, short 1010` while the operator's own wallet held 1,015,000 base units of $DIG: both
+/// statements were true, each was about a different wallet, and no surface let a person tell which
+/// — nor find the address to fund. This method is that address.
+///
+/// # It cannot reach a signing capability, by construction
+///
+/// It goes through `dig_wallet::operator_wallet::operator_address`, which is built on
+/// `operator_puzzle_hash`. No `WalletSigner` is constructed anywhere on this path, so there is no
+/// signing capability for a control-plane read to reach even in principle. That is a property of
+/// the types rather than of this function's discipline (§908).
+///
+/// # The prefix comes from the wallet backend, not from a constant
+///
+/// Encoding with a hardcoded `xch` would render a MAINNET address on a node reading testnet coins
+/// — one wallet in appearance and two in fact, on a surface whose whole purpose is to end exactly
+/// that confusion.
+fn wallet_operator_address(ctx: &ControlCtx, id: Value) -> Value {
+    match serde_json::to_value(operator_wallet_answer(ctx)) {
+        Ok(v) => control_ok(id, v),
+        Err(e) => control_error(id, ErrorCode::ControlError, e.to_string()),
+    }
+}
+
+/// The node's answer to *which wallet is mine* -- computed ONCE, for every surface that states it.
+///
+/// `control.wallet.operatorAddress` returns it, and `control.mirror.bondStates` carries it beside
+/// the amounts it is about. Two producers would be two answers to one question, and they would
+/// drift in the direction nobody tests: a bond page naming one wallet while the dedicated method
+/// named another is the original defect with an extra layer of confidence on top.
+fn operator_wallet_answer(ctx: &ControlCtx) -> WalletOperatorAddressResult {
+    use dig_wallet::operator_wallet::{operator_address, OperatorAddressUnavailable};
+
+    let paths = dig_wallet::autoseed::default_paths();
+    match operator_address(&paths, ctx.wallet.address_prefix()) {
+        Ok(address) => {
+            // The puzzle hash is re-read rather than decoded back out of the address: decoding an
+            // address to prove what it encodes asserts only that bech32m round-trips.
+            let puzzle_hash = dig_wallet::operator_wallet::operator_puzzle_hash(&paths)
+                .map(|ph| hex::encode(ph.to_bytes()));
+            match puzzle_hash {
+                Some(puzzle_hash) => WalletOperatorAddressResult::Known {
+                    address,
+                    puzzle_hash,
+                },
+                // Unreachable in practice -- the address derived from that same hash a moment ago
+                // -- but reported rather than papered over with a placeholder, because a partial
+                // answer on a funding surface is the failure this method exists to prevent.
+                None => WalletOperatorAddressResult::Unavailable {
+                    reason: WalletOperatorAddressUnavailableReason::Unreadable,
+                },
+            }
+        }
+        Err(reason) => WalletOperatorAddressResult::Unavailable {
+            reason: match reason {
+                OperatorAddressUnavailable::NotInitialized => {
+                    WalletOperatorAddressUnavailableReason::NotInitialized
+                }
+                OperatorAddressUnavailable::Unreadable => {
+                    WalletOperatorAddressUnavailableReason::Unreadable
+                }
+            },
+        },
+    }
+}
+
 /// `control.wallet.syncStatus` (dig_ecosystem#2501) — is the wallet's chain replica being kept
 /// current, how far has it got, and how many Chia peers is it using?
 ///
@@ -3309,7 +3389,7 @@ fn distinct_store_count(cached: &[dig_node_core::CachedCapsule]) -> usize {
 /// The maximum DECODED body size, taken from the control interface rather than restated, so this
 /// node and every client agree on the bound by construction.
 use base64::Engine as _;
-use dig_node_core::seams::dig_peer::profile_sync::MAX_PROFILE_BODY_BYTES;
+use dig_node_core::seams::dig_peer::profile_sync::{root_standing, MAX_PROFILE_BODY_BYTES};
 
 /// Parse a lowercase, unprefixed 64-hex field into its 32 raw bytes.
 ///
@@ -3466,7 +3546,8 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
     }
 }
 
-/// `control.profile.getBody` — the body this node holds at `(store_id, root)`, if it holds one.
+/// `control.profile.getBody` — the body this node holds at `(store_id, root)`, if it holds one,
+/// and how this node's held bodies stand against the root the chain currently anchors.
 ///
 /// `body_b64: null` means "consulted, holds nothing". A read that FAILED is an error instead: a
 /// caller that cannot tell the two apart renders an existing profile as an empty one, and the
@@ -3474,6 +3555,32 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
 ///
 /// The echoed `root` is always the root the caller asked for — this node never substitutes a newer
 /// body it happens to hold.
+///
+/// # Why `standing` exists (dig-node#294)
+///
+/// `body_b64: null` is one answer for at least four different situations: the store never
+/// published here, the store's on-chain root advanced past everything this node holds, the store
+/// has no confirmed generation at all, and this node cannot read the chain to tell. A publisher
+/// debugging "nobody can see my profile" gets the same `null` in every case, so it cannot tell an
+/// un-published store from an empty one. `standing` names which it is, and names the remedy.
+///
+/// # The chain read is ADDITIVE and never fatal
+///
+/// Every pre-existing field keeps its exact meaning: `body_b64` is still the disk read at the
+/// REQUESTED root, and a failed disk read is still `CONTROL_ERROR`. A chain read that RETURNS an
+/// error degrades to `state: "chain_unreadable"` rather than failing the call, because a node whose
+/// coinset access is down must still be able to answer what it holds. Turning a working disk read
+/// into an error on a chain outage would break every existing caller to add a diagnosis.
+///
+/// # The limitation, named rather than implied
+///
+/// A chain source that is UNRESPONSIVE rather than failing produces no error to degrade on, so it
+/// blocks this call for as long as it blocks. That is not a property this method invented: the
+/// chain read follows the precedent `control.profile.putBody` already sets — same
+/// [`AnchoredRootResolver`], no timeout of its own, and `putBody` performs it as its FIRST action,
+/// before any body validation. Bounding it is therefore one change across both methods; bounding
+/// only this one would make two callers of the same resolver disagree about what a slow chain
+/// means, which is the kind of split that later reads as a bug in whichever one was not touched.
 async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     const METHOD: &str = "control.profile.getBody";
     let store_id = match parse_hex32_param(METHOD, "store_id", &id, params) {
@@ -3484,24 +3591,40 @@ async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
         Ok(v) => v,
         Err(e) => return e,
     };
-    match profile_body_store(ctx).get(&store_id, &root) {
-        Ok(held) => control_ok(
-            id,
-            json!({
-                "store_id": hex::encode(store_id),
-                "root": hex::encode(root),
-                "body_b64": held.as_ref().map(|b| {
-                    base64::engine::general_purpose::STANDARD.encode(b)
-                }),
-                "body_bytes": held.map_or(0u64, |b| b.len() as u64),
+    let store = profile_body_store(ctx);
+    // The disk read FIRST, and its failure still ends the call: a chain read must never be able to
+    // mask a broken disk, which is the one condition whose remedy is on this machine.
+    let held = match store.get(&store_id, &root) {
+        Ok(held) => held,
+        Err(e) => {
+            return control_error(
+                id,
+                ErrorCode::ControlError,
+                format!("{METHOD}: the profile body could not be read from disk: {e}"),
+            )
+        }
+    };
+    let standing = root_standing(&store, &*ctx.node.anchored_root_resolver_arc(), &store_id).await;
+    control_ok(
+        id,
+        json!({
+            "store_id": hex::encode(store_id),
+            "root": hex::encode(root),
+            "body_b64": held.as_ref().map(|b| {
+                base64::engine::general_purpose::STANDARD.encode(b)
             }),
-        ),
-        Err(e) => control_error(
-            id,
-            ErrorCode::ControlError,
-            format!("{METHOD}: the profile body could not be read from disk: {e}"),
-        ),
-    }
+            "body_bytes": held.map_or(0u64, |b| b.len() as u64),
+            "standing": {
+                "state": standing.state(),
+                // `null`, never an all-zero root: a zero root is a value `VerifiedBody::open`
+                // rejects outright, so emitting one would hand a caller a refused sentinel dressed
+                // as an answer.
+                "chain_root": standing.chain_root().map(hex::encode),
+                "held_roots": standing.held().iter().map(hex::encode).collect::<Vec<_>>(),
+                "detail": standing.detail(),
+            },
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3842,6 +3965,7 @@ fn mirror_bond_states(
     >,
     id: Value,
     params: &Value,
+    funding_wallet: WalletOperatorAddressResult,
 ) -> Value {
     use dig_node_control_interface::params::MirrorBondStatesParams;
     use dig_node_control_interface::results::MirrorBondStatesResult;
@@ -3860,6 +3984,7 @@ fn mirror_bond_states(
             &observation,
             params.after.as_ref(),
             params.effective_limit(),
+            funding_wallet,
         ),
         Err(reason) => MirrorBondStatesResult::Unknown { reason },
     };
@@ -3960,6 +4085,19 @@ mod tests {
     /// **Catches:** the empty-page fabrication — a node that cannot read its own mirror coins
     /// returning `{entries: [], complete: true}`, which tells an operator this node holds no bonds
     /// and locks no money. Both halves are asserted, because a producer that emitted the right
+    /// The funding wallet these dispatch tests hand the bond surface.
+    ///
+    /// A fixed KNOWN answer: these tests are about paging, refusal and the unknown reason, so
+    /// varying the wallet would test something else. That the wallet a page names is the wallet
+    /// the lifecycle SPENDS from is pinned in `dig-wallet`, over a real sealed wallet, where the
+    /// two derivations can actually be compared.
+    fn test_funding_wallet() -> WalletOperatorAddressResult {
+        WalletOperatorAddressResult::Known {
+            address: "xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsjqfwvy".into(),
+            puzzle_hash: "7c".repeat(32),
+        }
+    }
+
     /// `state` beside an `entries` key would still hand a lenient client a zero to render.
     #[test]
     fn mirror_bond_states_says_which_fact_it_is_missing_rather_than_returning_an_empty_page() {
@@ -3969,6 +4107,7 @@ mod tests {
             ),
             json!(1),
             &json!({}),
+            test_funding_wallet(),
         );
         let result = &answer["result"];
         assert_eq!(result["state"], "unknown");
@@ -4011,7 +4150,8 @@ mod tests {
             epoch: 4,
         };
 
-        let answer = mirror_bond_states(Ok(observation), json!(1), &json!({}));
+        let answer =
+            mirror_bond_states(Ok(observation), json!(1), &json!({}), test_funding_wallet());
         let result = &answer["result"];
 
         assert_eq!(
@@ -4185,6 +4325,7 @@ mod tests {
                 Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
                 json!(1),
                 &json!({ "limit": limit }),
+                test_funding_wallet(),
             );
             assert_eq!(
                 answer["error"]["code"],
@@ -4200,6 +4341,7 @@ mod tests {
             ),
             json!(1),
             &json!({ "limit": 1000 }),
+            test_funding_wallet(),
         );
         assert!(ok.get("error").is_none(), "1000 is in range: {ok}");
     }
@@ -4219,6 +4361,7 @@ mod tests {
             ),
             json!(1),
             &json!({ "after": { "store_id": "not-hex", "root": hex } }),
+            test_funding_wallet(),
         );
         assert_eq!(
             malformed["error"]["code"],
@@ -4232,6 +4375,7 @@ mod tests {
             ),
             json!(1),
             &json!({ "after": { "store_id": format!("0x{hex}"), "root": hex } }),
+            test_funding_wallet(),
         );
         assert!(
             prefixed.get("error").is_none(),

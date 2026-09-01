@@ -170,6 +170,12 @@ pub struct PassContext {
     pub margin_bp: u64,
     /// §25.7's switch. Gates creates only; reclaims ignore it.
     pub creates_enabled: bool,
+    /// Whether this node has anywhere to advertise FROM (SPEC.md §25.10, dig-node#426).
+    ///
+    /// `false` makes `MirrorEffects::create` refuse every bond by name before any chain read, so
+    /// the pass must not plan or price creates it cannot attempt. Read once at bring-up beside the
+    /// advertised URL list itself, because a coin's URLs are fixed at create for the whole epoch.
+    pub can_advertise: bool,
 }
 
 /// What one pass actually did.
@@ -365,6 +371,7 @@ impl<E: MirrorEffects> PassRunner<E> {
             margin_bp: ctx.margin_bp,
             dig_balance_base_units,
             creates_enabled: ctx.creates_enabled,
+            can_advertise: ctx.can_advertise,
         });
 
         Ok(self.execute(decision, ctx.current_epoch, locked_dig_base_units))
@@ -762,6 +769,7 @@ mod tests {
             requirement: known(),
             margin_bp: 0,
             creates_enabled: true,
+            can_advertise: true,
         }
     }
 

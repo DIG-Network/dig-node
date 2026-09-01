@@ -28,7 +28,7 @@
 
 use dig_node_control_interface::results::{
     CollateralUnknownReason, MirrorBondEntry, MirrorBondKey, MirrorBondState,
-    MirrorBondStatesResult,
+    MirrorBondStatesResult, WalletOperatorAddressResult,
 };
 
 use super::pass::BondState;
@@ -62,6 +62,7 @@ pub fn page(
     observation: &BondObservation,
     after: Option<&MirrorBondKey>,
     limit: u32,
+    funding_wallet: WalletOperatorAddressResult,
 ) -> MirrorBondStatesResult {
     let mut rows: Vec<(MirrorBondKey, MirrorBondState)> = observation
         .states
@@ -97,6 +98,10 @@ pub fn page(
     });
 
     MirrorBondStatesResult::Known {
+        // WHICH WALLET every amount on this page is about. Passed in rather than read here: this
+        // function is a pure translation of one observation, and a read of its own would make the
+        // page's wallet a different observation from the page's figures.
+        funding_wallet,
         entries,
         complete,
         cursor,
@@ -157,6 +162,13 @@ pub fn wire_state(state: &BondState) -> MirrorBondState {
             reason: CollateralUnknownReason::BalanceUnreadable,
         },
         BondState::Deferred { reason } => MirrorBondState::Deferred { reason: *reason },
+        // Two node-wide states, kept apart because only ONE of them is a fault. `Unadvertised` is
+        // the node's own collateralisation switch ON while nothing in its advertise-URL list is
+        // publishable: no coin can be created, the operator did not ask for that, and the remedy
+        // is a URL. `Disabled` is that switch OFF — the operator's own earlier decision, which the
+        // contract says a client MUST NOT present as a fault. Serving the first under the second
+        // would oblige a conforming client to stay silent about the one thing actually wrong.
+        BondState::Unadvertised => MirrorBondState::Unadvertised,
         BondState::Disabled => MirrorBondState::Disabled,
         BondState::Withheld => MirrorBondState::Withheld,
         BondState::Reclaiming {
@@ -184,6 +196,19 @@ mod tests {
         format!("{n:02x}").repeat(32)
     }
 
+    /// The funding wallet a page names in tests.
+    ///
+    /// A fixed KNOWN answer, because these tests are about paging, ordering and state mapping --
+    /// varying the wallet here would test the wrong thing. The property that the wallet a page
+    /// names is the wallet the lifecycle SPENDS from is pinned in `dig-wallet`, over a real sealed
+    /// wallet, where it can actually be checked.
+    fn test_funding_wallet() -> WalletOperatorAddressResult {
+        WalletOperatorAddressResult::Known {
+            address: "xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsjqfwvy".into(),
+            puzzle_hash: "7c".repeat(32),
+        }
+    }
+
     fn observation(states: Vec<(Bond, BondState)>, locked: u64) -> BondObservation {
         BondObservation {
             states,
@@ -205,6 +230,48 @@ mod tests {
             } => (entries, complete, cursor, locked_dig_base_units),
             other => panic!("expected a Known page, got {other:?}"),
         }
+    }
+
+    /// **An unadvertised node says `unadvertised` on the wire, beside a genuinely disabled row.**
+    ///
+    /// These two states are the pair this mapping exists to keep apart. Both are node-wide, both
+    /// mean no coin is created, and they differ in the only thing an operator acts on: `disabled`
+    /// is that operator's own switch, which the contract says a client MUST NOT present as a
+    /// fault, while `unadvertised` is that switch ON and the node silently unable to honour it.
+    ///
+    /// The fixture is what makes this load-bearing. The nearest wrong implementation is the
+    /// interim this replaces — `Unadvertised => Disabled` — and a page containing only an
+    /// unadvertised row could not tell it apart from a correct mapping by any assertion on the
+    /// row's own token alone. So the page carries BOTH, in a stated order, and asserts the two
+    /// wire values DIFFER. A collapse in either direction fails here.
+    #[test]
+    fn an_unadvertised_bond_is_not_reported_as_the_operators_own_switch() {
+        let page = page(
+            &observation(
+                vec![
+                    (bond(&hex(0x11), &hex(0xaa)), BondState::Unadvertised),
+                    (bond(&hex(0x22), &hex(0xbb)), BondState::Disabled),
+                ],
+                0,
+            ),
+            None,
+            10,
+            test_funding_wallet(),
+        );
+        let (entries, ..) = known(page);
+
+        assert_eq!(entries.len(), 2, "both rows must survive the page");
+        assert_eq!(
+            entries[0].state,
+            MirrorBondState::Unadvertised,
+            "a node whose switch is ON must not be reported under the switch's own token"
+        );
+        assert_eq!(entries[1].state, MirrorBondState::Disabled);
+        assert_ne!(
+            entries[0].state, entries[1].state,
+            "collapsing these two is the defect: it obliges a conforming client to stay silent \
+             about the one thing that is wrong"
+        );
     }
 
     /// A `Relayed` capsule is genuinely reported as `withheld` — the variant the contract calls
@@ -232,6 +299,7 @@ mod tests {
             ),
             None,
             100,
+            test_funding_wallet(),
         );
         let (entries, ..) = known(page);
         assert_eq!(entries.len(), 2);
@@ -264,7 +332,12 @@ mod tests {
                 )
             })
             .collect();
-        let (entries, complete, _, locked) = known(page(&observation(states, 4_000), None, 2));
+        let (entries, complete, _, locked) = known(page(
+            &observation(states, 4_000),
+            None,
+            2,
+            test_funding_wallet(),
+        ));
 
         assert_eq!(entries.len(), 2, "the page is truncated");
         assert!(!complete);
@@ -303,7 +376,8 @@ mod tests {
         let mut seen: Vec<(String, String)> = Vec::new();
         let mut after: Option<MirrorBondKey> = None;
         loop {
-            let (entries, complete, cursor, _) = known(page(&observed, after.as_ref(), 2));
+            let (entries, complete, cursor, _) =
+                known(page(&observed, after.as_ref(), 2, test_funding_wallet()));
             seen.extend(entries.iter().map(|e| (e.store_id.clone(), e.root.clone())));
             if complete {
                 break;
@@ -347,6 +421,7 @@ mod tests {
             ),
             None,
             100,
+            test_funding_wallet(),
         ));
         assert_eq!(
             entries[0].state,
@@ -395,6 +470,7 @@ mod tests {
             ),
             None,
             100,
+            test_funding_wallet(),
         ));
         assert_eq!(
             entries
@@ -410,7 +486,12 @@ mod tests {
     /// cursor pointing at a row nobody was handed.
     #[test]
     fn an_empty_set_is_a_complete_page_with_no_cursor() {
-        let (entries, complete, cursor, locked) = known(page(&observation(vec![], 0), None, 100));
+        let (entries, complete, cursor, locked) = known(page(
+            &observation(vec![], 0),
+            None,
+            100,
+            test_funding_wallet(),
+        ));
         assert!(entries.is_empty());
         assert!(complete);
         assert_eq!(cursor, None);
@@ -425,7 +506,12 @@ mod tests {
             (bond(&hex(0x11), &hex(0xaa)), BondState::Pending),
             (bond(&hex(0x22), &hex(0xaa)), BondState::Pending),
         ];
-        let (entries, complete, ..) = known(page(&observation(states, 0), None, 2));
+        let (entries, complete, ..) = known(page(
+            &observation(states, 0),
+            None,
+            2,
+            test_funding_wallet(),
+        ));
         assert_eq!(entries.len(), 2);
         assert!(complete, "an exactly-full page is still the whole set");
     }
