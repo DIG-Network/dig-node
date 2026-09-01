@@ -18,13 +18,51 @@
 //! without the device key". A fallback would quietly become the real design on exactly the
 //! constrained hosts this is meant to serve.
 
+use dig_node_core::shared::at_rest::{presence, Presence};
 use dig_wallet::autoseed::{self, BootstrapState, WalletPaths};
+
+use crate::wallet_env::{self, MintDecision};
 
 /// Ensure a wallet seed exists at the node's real per-user location, logging the outcome.
 ///
 /// Returns the state so a caller can surface it; callers must not treat any outcome as fatal.
+///
+/// Minting is REFUSED when the wallet's per-user root and the node's disagree and there is no seed
+/// yet (dig-node#392): the new seed would land under one root while the `wallet.sqlite` coin
+/// replica opens under the other, and the operator would be told only that a wallet was minted. A
+/// host that ALREADY has a seed proceeds unchanged - it is running, and refusing would break a
+/// working install to enforce a layout rule.
 pub fn ensure_wallet_seed() -> Option<BootstrapState> {
-    ensure_wallet_seed_at(&autoseed::default_paths())
+    ensure_wallet_seed_unless_split(&autoseed::default_paths(), wallet_env::wallet_root_split())
+}
+
+/// [`ensure_wallet_seed`] against an explicit layout and an explicit split verdict.
+///
+/// The split is a PARAMETER for the same reason `ensure_wallet_seed_at` takes its paths: proving
+/// that the refusal writes nothing means running it with a split present and no seed on disk, and a
+/// test that produced that state by setting the real `LOCALAPPDATA` would be exercising the
+/// developer's own wallet directory to assert a property about a refusal.
+pub fn ensure_wallet_seed_unless_split(
+    paths: &WalletPaths,
+    split: Option<wallet_env::WalletRootSplit>,
+) -> Option<BootstrapState> {
+    if let MintDecision::RefuseSplitRoot =
+        wallet_env::mint_decision(split.as_ref(), seed_present(paths))
+    {
+        tracing::error!("{}", wallet_env::REFUSED_SPLIT_MINT);
+        return None;
+    }
+    ensure_wallet_seed_at(paths)
+}
+
+/// Whether a seed is on disk, taking "the question could not be answered" as PRESENT.
+///
+/// An unreadable seed file - a locked file, an AV scanner, an ACL an OS update changed - must never
+/// read as "there is no wallet here", because the only thing that follows from "no wallet" is
+/// minting one. [`dig_wallet::autoseed`]'s own `wallet_exists` takes the same unknown-means-present
+/// direction, and it is the direction that cannot lose a wallet.
+fn seed_present(paths: &WalletPaths) -> bool {
+    !matches!(presence(&paths.seed), Ok(Presence::Absent))
 }
 
 /// [`ensure_wallet_seed`] against an explicit layout.
@@ -83,5 +121,33 @@ pub fn ensure_wallet_seed_at(paths: &WalletPaths) -> Option<BootstrapState> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The refusal must leave the disk exactly as it found it. Asserted on the seed file itself,
+    /// not on the returned state: a decision that returned `None` while still minting would satisfy
+    /// any assertion about the return value alone.
+    #[test]
+    fn a_split_root_with_no_seed_mints_nothing() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let paths = WalletPaths {
+            seed: td.path().join("DigWallet").join("seed.bin"),
+            device_key: td.path().join("DigNode").join("device").join("device.key"),
+            meta: td.path().join("DigWallet").join("wallet.meta.json"),
+        };
+        let split = wallet_env::split_of(Path::new("/wallet-root"), Path::new("/node-root"));
+        assert!(split.is_some(), "the fixture must actually be split");
+
+        let state = ensure_wallet_seed_unless_split(&paths, split);
+
+        assert!(state.is_none(), "a refused mint reports no wallet state");
+        assert!(!paths.seed.exists(), "the seed file was NOT created");
+        assert!(!paths.meta.exists(), "no metadata was written either");
+        assert!(!paths.device_key.exists(), "no device key was written");
     }
 }
