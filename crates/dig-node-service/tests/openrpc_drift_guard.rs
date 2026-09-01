@@ -142,27 +142,35 @@ fn get_content_is_catalogued_local() {
     assert!(!m.requires_auth);
 }
 
-/// The reconciled error catalogue carries the upstream `-32004` ("resource not
-/// available at the requested root") that the read path's §21 remote client recognizes
-/// and this service relays — previously undocumented — with the right origin and a
-/// stable symbolic name, and it surfaces in the machine-readable catalogue JSON.
+/// The error catalogue carries `-32004` ("resource not available at the requested root")
+/// under the name the shared contract assigns and the node actually emits, with the origin
+/// of the layer this node itself mints it from, and it surfaces in the catalogue JSON.
+///
+/// This assertion previously pinned `RESOURCE_NOT_AVAILABLE_AT_ROOT`/`upstream` — a name no
+/// frame has ever carried and an origin that ignored the local mint — so it held the defect
+/// in place instead of catching it (#478).
 #[test]
 fn reconciled_error_codes_are_catalogued_with_correct_origin() {
-    assert_eq!(ErrorCode::ResourceNotAvailableAtRoot.code(), -32004);
+    assert_eq!(ErrorCode::ResourceUnavailable.code(), -32004);
     assert_eq!(
-        ErrorCode::ResourceNotAvailableAtRoot.name(),
-        "RESOURCE_NOT_AVAILABLE_AT_ROOT"
+        ErrorCode::ResourceUnavailable.name(),
+        "RESOURCE_UNAVAILABLE"
     );
-    assert_eq!(ErrorCode::ResourceNotAvailableAtRoot.origin(), "upstream");
+    assert_eq!(ErrorCode::ResourceUnavailable.origin(), "node");
 
     let catalogue = meta::error_catalogue();
     let arr = catalogue.as_array().expect("error catalogue array");
     assert!(
         arr.iter()
-            .any(|e| e["name"] == json!("RESOURCE_NOT_AVAILABLE_AT_ROOT")
+            .any(|e| e["name"] == json!("RESOURCE_UNAVAILABLE")
                 && e["code"] == json!(-32004)
-                && e["origin"] == json!("upstream")),
-        "error catalogue missing the reconciled -32004 RESOURCE_NOT_AVAILABLE_AT_ROOT"
+                && e["origin"] == json!("node")),
+        "error catalogue missing the reconciled -32004 RESOURCE_UNAVAILABLE"
+    );
+    assert!(
+        !arr.iter()
+            .any(|e| e["name"] == json!("RESOURCE_NOT_AVAILABLE_AT_ROOT")),
+        "the catalogue still publishes a name no frame carries"
     );
 }
 
@@ -363,7 +371,8 @@ async fn the_catalogued_name_for_32004_is_the_name_the_node_emits() {
         .find(|e| e["code"] == json!(-32004))
         .expect("the catalogue declares -32004");
     assert_eq!(
-        entry["name"], json!(emitted),
+        entry["name"],
+        json!(emitted),
         "the discovery document names -32004 differently from the frame the node emits"
     );
 }

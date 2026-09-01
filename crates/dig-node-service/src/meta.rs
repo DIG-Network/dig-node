@@ -669,11 +669,13 @@ pub enum ErrorCode {
     DispatchFailed,
     /// `-32004` — the requested resource is not available at the requested root (a
     /// genuine content miss for that capsule, distinct from a transport failure).
-    /// Returned by the upstream DIG RPC (`rpc.dig.net`) for the content/proof read
-    /// methods and recognized by the read path's §21 remote client; relayed through
-    /// this service on a passthrough. Catalogued so a client can branch on "not at
-    /// this root" rather than scraping the message.
-    ResourceNotAvailableAtRoot,
+    ///
+    /// ONE condition covering BOTH mints, which is why it carries one name: the node
+    /// library mints it for a LOCAL miss (`dig.fetchRange`, `dig.getManifest`), and the
+    /// upstream DIG RPC (`rpc.dig.net`) returns it for a relayed miss that this service
+    /// passes through. Which layer answered is carried by `data.origin`, never by the
+    /// name — so the name is taken from the shared catalogue rather than restated.
+    ResourceUnavailable,
     /// `-32010` — the blind-passthrough relay to the upstream DIG RPC failed
     /// (unreachable / non-JSON). Dig-node-shell error distinguishing a local
     /// proxy failure from an upstream-returned JSON-RPC error.
@@ -773,20 +775,33 @@ pub enum ErrorCode {
     ControlIngressLimited,
 }
 
+/// The numeric code the shared wire contract assigns, widened to the `i64` the JSON-RPC
+/// envelope carries. One place performs the widening so no call site restates a number.
+const fn shared(code: dig_rpc_protocol::ErrorCode) -> i64 {
+    code.code() as i64
+}
+
 impl ErrorCode {
     /// The numeric JSON-RPC error code.
     pub const fn code(self) -> i64 {
         match self {
-            ErrorCode::ParseError => -32700,
-            ErrorCode::InvalidRequest => -32600,
-            ErrorCode::MethodNotFound => -32601,
-            ErrorCode::InvalidParams => -32602,
+            // Taken from the shared wire contract rather than restated, so this crate cannot
+            // drift from the catalogue it speaks. See `shell_error_names_match_the_shared_catalogue`.
+            ErrorCode::ParseError => shared(dig_rpc_protocol::ErrorCode::ParseError),
+            ErrorCode::InvalidRequest => shared(dig_rpc_protocol::ErrorCode::InvalidRequest),
+            ErrorCode::MethodNotFound => shared(dig_rpc_protocol::ErrorCode::MethodNotFound),
+            ErrorCode::InvalidParams => shared(dig_rpc_protocol::ErrorCode::InvalidParams),
+            // NOT sourced: the shell mints -32000 under its own `DISPATCH_FAILED`, which the
+            // crate calls `SERVER_ERROR`. That name IS on the wire, so reconciling it is a
+            // shipped-name change of a different kind — tracked separately, never silently.
             ErrorCode::DispatchFailed => -32000,
-            ErrorCode::ResourceNotAvailableAtRoot => -32004,
-            ErrorCode::UpstreamError => -32010,
-            ErrorCode::Unauthorized => -32030,
-            ErrorCode::NotSupported => -32031,
-            ErrorCode::ControlError => -32032,
+            ErrorCode::ResourceUnavailable => {
+                shared(dig_rpc_protocol::ErrorCode::ResourceUnavailable)
+            }
+            ErrorCode::UpstreamError => shared(dig_rpc_protocol::ErrorCode::UpstreamError),
+            ErrorCode::Unauthorized => shared(dig_rpc_protocol::ErrorCode::Unauthorized),
+            ErrorCode::NotSupported => shared(dig_rpc_protocol::ErrorCode::NotSupported),
+            ErrorCode::ControlError => shared(dig_rpc_protocol::ErrorCode::ControlError),
             ErrorCode::WalletNoChainSource => -32040,
             ErrorCode::WalletNotSynced => -32041,
             ErrorCode::WalletReadFailed => -32042,
@@ -813,16 +828,22 @@ impl ErrorCode {
     /// from the human message.
     pub fn name(self) -> &'static str {
         match self {
-            ErrorCode::ParseError => "PARSE_ERROR",
-            ErrorCode::InvalidRequest => "INVALID_REQUEST",
-            ErrorCode::MethodNotFound => "METHOD_NOT_FOUND",
-            ErrorCode::InvalidParams => "INVALID_PARAMS",
+            // The branch key a client matches on, taken from the shared catalogue rather than
+            // restated: a second copy of a name is what drifts, and a WRONG name defeats a
+            // client's `match` where an absent one merely fails it (#478).
+            ErrorCode::ParseError => dig_rpc_protocol::ErrorCode::ParseError.machine_code(),
+            ErrorCode::InvalidRequest => dig_rpc_protocol::ErrorCode::InvalidRequest.machine_code(),
+            ErrorCode::MethodNotFound => dig_rpc_protocol::ErrorCode::MethodNotFound.machine_code(),
+            ErrorCode::InvalidParams => dig_rpc_protocol::ErrorCode::InvalidParams.machine_code(),
+            // See `code()` for why -32000 is deliberately not sourced.
             ErrorCode::DispatchFailed => "DISPATCH_FAILED",
-            ErrorCode::ResourceNotAvailableAtRoot => "RESOURCE_NOT_AVAILABLE_AT_ROOT",
-            ErrorCode::UpstreamError => "UPSTREAM_ERROR",
-            ErrorCode::Unauthorized => "UNAUTHORIZED",
-            ErrorCode::NotSupported => "NOT_SUPPORTED",
-            ErrorCode::ControlError => "CONTROL_ERROR",
+            ErrorCode::ResourceUnavailable => {
+                dig_rpc_protocol::ErrorCode::ResourceUnavailable.machine_code()
+            }
+            ErrorCode::UpstreamError => dig_rpc_protocol::ErrorCode::UpstreamError.machine_code(),
+            ErrorCode::Unauthorized => dig_rpc_protocol::ErrorCode::Unauthorized.machine_code(),
+            ErrorCode::NotSupported => dig_rpc_protocol::ErrorCode::NotSupported.machine_code(),
+            ErrorCode::ControlError => dig_rpc_protocol::ErrorCode::ControlError.machine_code(),
             ErrorCode::WalletNoChainSource => "WALLET_NO_CHAIN_SOURCE",
             ErrorCode::WalletNotSynced => "WALLET_NOT_SYNCED",
             ErrorCode::WalletReadFailed => "WALLET_READ_FAILED",
@@ -870,9 +891,13 @@ impl ErrorCode {
             // INVALID_PARAMS is returned by the embedded read path's locally-served
             // read methods (bad store_id / retrieval_key) before any I/O.
             ErrorCode::InvalidParams => "node",
-            // The upstream DIG RPC returns -32004 for a genuine content miss at the
-            // requested root; this service relays it on a passthrough.
-            ErrorCode::ResourceNotAvailableAtRoot => "upstream",
+            // -32004 has TWO minters — the node library on a local miss (`dig.fetchRange`,
+            // `dig.getManifest`) and the upstream DIG RPC on a relayed one — so the catalogue
+            // declares the one this node itself produces. A frame's OWN `data.origin` is derived
+            // per-frame by its minter and stays authoritative; the catalogue value is the default
+            // a client should expect from this node, and it may not claim `upstream` for a code
+            // this node mints locally on an ordinary miss.
+            ErrorCode::ResourceUnavailable => "node",
         }
     }
 
@@ -886,8 +911,8 @@ impl ErrorCode {
             ErrorCode::MethodNotFound => "Method is not resolved locally or by the upstream.",
             ErrorCode::InvalidParams => "Invalid or missing method parameters.",
             ErrorCode::DispatchFailed => "The node failed to dispatch the request.",
-            ErrorCode::ResourceNotAvailableAtRoot => {
-                "The requested resource is not available at the requested root."
+            ErrorCode::ResourceUnavailable => {
+                "The requested resource is not available at the requested root — a genuine \n                 content miss, whether this node missed locally or a relayed upstream did."
             }
             ErrorCode::UpstreamError => {
                 "The blind-passthrough relay to the upstream DIG RPC failed."
@@ -945,7 +970,7 @@ impl ErrorCode {
             ErrorCode::MethodNotFound,
             ErrorCode::InvalidParams,
             ErrorCode::DispatchFailed,
-            ErrorCode::ResourceNotAvailableAtRoot,
+            ErrorCode::ResourceUnavailable,
             ErrorCode::UpstreamError,
             ErrorCode::Unauthorized,
             ErrorCode::NotSupported,
