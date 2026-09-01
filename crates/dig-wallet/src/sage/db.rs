@@ -4851,6 +4851,77 @@ mod tests {
         assert_eq!(a.amount, "300");
     }
 
+    /// dig-node#479 — **a $DIG arrival must survive the staging detour that XCH never takes.**
+    ///
+    /// A CAT lands at a DERIVED outer hash, so `apply_coin_states` STAGES it and does not write it
+    /// to `coins`. `record_arrivals` then runs on that same frame — sees nothing, and advances the
+    /// watermark to the frame's height. Only afterwards does the attribution pass promote the coin
+    /// into `coins`, at a `created_height` the watermark has already passed, with no hold to exempt
+    /// it. Every candidate predicate then misses it for ever and the user is never told they were
+    /// paid. An XCH coin is written by `apply_coin_states` BEFORE the same watermark advance, which
+    /// is exactly why the two assets behave differently.
+    ///
+    /// The ordering IS the defect, so the fixture must reproduce it: a coin attributed from the
+    /// start, or one already sitting in `coins` when the first pass runs, cannot see this bug.
+    /// The XCH coin beside it is the positive control — a recorder that announced nothing at all
+    /// would satisfy the first assertion and fail the last.
+    #[tokio::test]
+    async fn a_cat_promoted_after_the_watermark_advanced_is_still_announced() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
+            .await
+            .unwrap();
+
+        // The frame: an ordinary XCH coin at our own address, and a $DIG CAT that lands at a
+        // derived outer hash and is therefore only STAGED.
+        db.upsert_coin(&incoming("xchcoin", 500, 101)).await.unwrap();
+        let staged = StagedCatRow {
+            coin_id: "digcoin".into(),
+            parent_coin_info: "foreign_parent_of_digcoin".into(),
+            puzzle_hash: "curried_cat_hash".into(),
+            amount: "300".into(),
+            created_height: Some(101),
+            spent_height: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+            derived_asset_id: "a406d3a9".into(),
+            derived_owner_p2: "ph".into(),
+        };
+        db.stage_cat_admissions(std::slice::from_ref(&staged))
+            .await
+            .unwrap();
+
+        // Pass one, on the frame itself: only the XCH coin is in `coins`, and the watermark
+        // advances past the CAT's height while the CAT is still staged.
+        assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 1);
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(101));
+
+        // The attribution pass promotes the proven CAT into `coins`, after the fact.
+        assert!(db
+            .promote_cat_admission(&staged, "a406d3a9", "ph")
+            .await
+            .unwrap());
+
+        // The next pass must announce it. Without the fix this records 0 for ever: the coin is
+        // confirmed at or below the baseline and was never held.
+        assert_eq!(db.record_arrivals(&watched(), 102).await.unwrap(), 1);
+        let ids: Vec<(String, Option<String>)> = db
+            .arrivals_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.coin_id, a.asset_id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("xchcoin".to_string(), None),
+                ("digcoin".to_string(), Some("a406d3a9".to_string())),
+            ],
+            "the $DIG arrival must reach the ledger carrying its asset id, beside the XCH control"
+        );
+    }
+
     /// A reorg unmakes the coins above the fork, so it must unmake their arrivals with them and
     /// walk the baseline back — otherwise the ledger asserts a receipt the chain no longer has.
     #[tokio::test]
