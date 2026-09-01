@@ -74,6 +74,19 @@ pub enum SyncError {
     /// A catch-up was attempted over a peer this node merely DISCOVERED. Refused: only an
     /// operator-chosen peer may make the local replica authoritative (see [`PeerTrust`]).
     UntrustedPeer,
+    /// The coin database was RESET while this catch-up was in flight, so everything the
+    /// catch-up replayed was discarded before it could finish.
+    ///
+    /// Refused rather than completed. The reset empties `coins` and clears
+    /// `initial_sync_complete` in one transaction, but the catch-up's own writes are separate
+    /// transactions that are not serialised against it — so a terminal statement arriving
+    /// afterwards would re-declare the emptied (or partially refilled) replica authoritative,
+    /// and `routing::route` would answer money reads out of it: `balance 0, synced true` on a
+    /// funded wallet, or the likelier understated balance from a partial set.
+    ///
+    /// The session is dropped and the supervisor runs a fresh catch-up, which is the only thing
+    /// that can honestly re-establish the flag.
+    ResetDuringCatchUp,
     /// A catch-up ran past [`MAX_CATCH_UP_BATCHES`] without the peer reporting `is_finished`.
     CatchUpTooLong {
         /// The bound that was exceeded.
@@ -399,6 +412,13 @@ impl std::fmt::Display for SyncError {
                 f,
                 "refusing to catch up over a discovered peer (only an operator-chosen peer may \
                  make the local replica authoritative)"
+            ),
+            SyncError::ResetDuringCatchUp => write!(
+                f,
+                concat!(
+                    "the coin database was reset while this catch-up was in flight; its ",
+                    "result was discarded rather than used to mark the emptied replica synced"
+                )
             ),
             SyncError::CatchUpTooLong { max } => {
                 write!(f, "catch-up exceeded {max} batches without finishing")
@@ -1095,6 +1115,18 @@ pub async fn initial_sync_with_authority(
         all.dedup();
         all
     };
+    // Observed before this catch-up's FIRST WRITE and presented again in its terminal
+    // statement, so a reset landing at any point during the replay moves the counter away
+    // from this value and the completion cannot land (dig-node#454). Reading it at the END
+    // would defeat the guard entirely: the value would already include the reset.
+    //
+    // Taken lazily, at the first write rather than before the first REQUEST, for two
+    // reasons. It is equally sound — nothing has been written yet either way, so a reset
+    // that lands before this point leaves a replay that runs wholly after it, which is
+    // exactly the catch-up entitled to re-establish the flag. And it keeps this function
+    // free of database work before its first peer round trip, where the only armed timer
+    // is a caller's outer bound.
+    let mut epoch_at_first_write: Option<crate::sage::db::ResetEpoch> = None;
     let mut previous_height: Option<u32> = None;
     let mut header_hash = genesis_challenge;
     events.publish(SyncEvent::Start {
@@ -1149,6 +1181,9 @@ pub async fn initial_sync_with_authority(
             }
         }
 
+        if epoch_at_first_write.is_none() {
+            epoch_at_first_write = Some(db.reset_epoch().await?);
+        }
         apply_coin_states(db, &respond.coin_states, &subscribed, derived).await?;
         events.publish(SyncEvent::PuzzleBatchSynced);
 
@@ -1157,17 +1192,29 @@ pub async fn initial_sync_with_authority(
             // baseline are armed together from this response's own values. Splitting them is how
             // the baseline came to be armable by a caller that had replayed nothing
             // (dig_ecosystem#2548) -- see `WalletDb::complete_catch_up`.
-            db.complete_catch_up(&CatchUpReplay::finished_at(
-                authority.ceiling(),
-                respond.height,
-                hex::encode(respond.header_hash),
-                // Coverage recorded as ADDRESSES, matching every reader of
-                // `covered_puzzle_hashes` (`covers` is a containment test over the wallet's own
-                // hashes). Recording the union here would make the replica claim coverage of a
-                // set it does not answer for.
-                &addresses,
-            )?)
-            .await?;
+            let recorded = db
+                .complete_catch_up_unless_reset(
+                    &CatchUpReplay::finished_at(
+                        authority.ceiling(),
+                        respond.height,
+                        hex::encode(respond.header_hash),
+                        // Coverage recorded as ADDRESSES, matching every reader of
+                        // `covered_puzzle_hashes` (`covers` is a containment test over the wallet's own
+                        // hashes). Recording the union here would make the replica claim coverage of a
+                        // set it does not answer for.
+                        &addresses,
+                    )?,
+                    epoch_at_first_write.expect(
+                        "the epoch is read before the first write, which precedes any terminal",
+                    ),
+                )
+                .await?;
+            if !recorded {
+                // The coin database was reset while this replay was in flight, so everything
+                // it wrote was discarded. Reporting success here would be the money lie: the
+                // flag would declare an emptied or partially refilled table authoritative.
+                return Err(SyncError::ResetDuringCatchUp);
+            }
             return Ok(());
         }
         // Continue from where this batch ended.
@@ -2995,12 +3042,159 @@ mod tests {
         assert_eq!(
             reads_for_one_empty_frame(true).await,
             1,
-            "control: an APPLIED frame runs the pass, so the fixture really does present a              candidate row that costs a read"
+            concat!(
+                "control: an APPLIED frame runs the pass, so the fixture really does ",
+                "present a candidate row that costs a read"
+            )
         );
         assert_eq!(
             reads_for_one_empty_frame(false).await,
             0,
-            "a frame dropped before any database write must schedule no work at all; running the              pass after it lets a peer buy a whole-replica scan for an empty frame it already              knows will be refused"
+            concat!(
+                "a frame dropped before any database write must schedule no work at all; ",
+                "running the pass after it lets a peer buy a whole-replica scan for an ",
+                "empty frame it already knows will be refused"
+            )
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A reset that lands MID-CATCH-UP must not be overwritten by the catch-up it interrupted
+    // (dig-node#454). The reset transaction is atomic; the catch-up's two writes are not
+    // serialised against it, so the in-flight catch-up's terminal statement used to re-set
+    // `initial_sync_complete` over the table the reset had just emptied.
+    // ---------------------------------------------------------------------------------------
+
+    /// A peer that answers one ordinary batch, then — standing in for the user pressing reset
+    /// while that batch is being applied — RESETS the coin database before answering the
+    /// terminal batch.
+    ///
+    /// The reset is driven from inside the peer double because that is the only place in this
+    /// test that runs BETWEEN the catch-up's two writes. `carries_coins` selects which variant
+    /// the terminal answer produces: an empty one (the zero-balance lie) or a single coin (the
+    /// partial-set lie, which reads as a plausible understated balance and is the one a user
+    /// would actually hit).
+    struct ResetsBeforeFinishing {
+        db: WalletDb,
+        calls: std::sync::atomic::AtomicUsize,
+        carries_coins: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl PuzzleStateSource for ResetsBeforeFinishing {
+        async fn request_puzzle_state(
+            &self,
+            puzzle_hashes: Vec<Bytes32>,
+            _previous_height: Option<u32>,
+            _header_hash: Bytes32,
+        ) -> Result<RespondPuzzleState, SyncError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // An ordinary, non-terminal batch that really transfers state: the coin below is
+                // what the reset then deletes, so the fixture has something to lose.
+                return Ok(RespondPuzzleState {
+                    puzzle_hashes,
+                    coin_states: vec![state(coin(1, OWNED, 700), Some(50), None)],
+                    height: 100,
+                    header_hash: Bytes32::new([9; 32]),
+                    is_finished: false,
+                });
+            }
+            self.db
+                .reset_chain_cache(0)
+                .await
+                .expect("the reset itself succeeds")
+                .expect("no spend is in flight, so it cannot refuse");
+            Ok(RespondPuzzleState {
+                puzzle_hashes,
+                coin_states: if self.carries_coins {
+                    vec![state(coin(2, OWNED, 300), Some(60), None)]
+                } else {
+                    vec![]
+                },
+                height: 6_000_000,
+                header_hash: Bytes32::new([9; 32]),
+                is_finished: true,
+            })
+        }
+    }
+
+    async fn catch_up_interrupted_by_a_reset(
+        carries_coins: bool,
+    ) -> (WalletDb, Result<(), SyncError>) {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let events = EventBus::default();
+        let outcome = initial_sync_with_authority(
+            &ResetsBeforeFinishing {
+                db: db.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                carries_coins,
+            },
+            &db,
+            vec![Bytes32::new([OWNED; 32])],
+            Bytes32::new([1; 32]),
+            "1.2.3.4",
+            &events,
+            WriteAuthority::Operator,
+            &DerivedCats::default(),
+        )
+        .await;
+        (db, outcome)
+    }
+
+    /// **Proves (the money lie, zero variant):** a reset landing mid-catch-up leaves the coin
+    /// table EMPTY, and the catch-up that was already running must not then declare that empty
+    /// table authoritative — `balance 0, synced true` on a funded wallet.
+    ///
+    /// Asserted on the OBSERVABLE PAIR a caller reads, not on an internal counter: the pair is
+    /// what lies, and a guard that moved elsewhere would still have to keep this pair honest.
+    #[tokio::test]
+    async fn a_reset_mid_catch_up_is_not_overwritten_into_an_empty_authoritative_replica() {
+        let (db, outcome) = catch_up_interrupted_by_a_reset(false).await;
+
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            0,
+            "the reset emptied the coins"
+        );
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "an emptied replica reported as synced answers `balance 0, synced true` on a funded \
+             wallet: reads route to the DB tier and find nothing"
+        );
+        assert!(
+            matches!(outcome, Err(SyncError::ResetDuringCatchUp)),
+            "the catch-up must report that its work was discarded so the supervisor runs a fresh \
+             one, not return Ok over a replica it did not establish; got {outcome:?}"
+        );
+    }
+
+    /// **Proves (the money lie, PARTIAL variant — the likelier one):** the reset lands after some
+    /// of the replay has been applied, so the table holds a plausible-looking SUBSET. Reported as
+    /// synced, that is an understated balance rather than an obvious zero, and far harder to
+    /// notice.
+    ///
+    /// This second case exists because the zero variant alone cannot distinguish "the flag is
+    /// refused" from "the flag happens to be false because nothing was written".
+    #[tokio::test]
+    async fn a_reset_mid_catch_up_is_not_overwritten_into_a_partial_authoritative_replica() {
+        let (db, outcome) = catch_up_interrupted_by_a_reset(true).await;
+
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            300,
+            "control: the post-reset batch really did land, so the table holds a SUBSET of the \
+             wallet's coins rather than nothing — this is the state that would read as an \
+             understated balance"
+        );
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "a partial coin set reported as synced is an understated balance presented as \
+             complete"
+        );
+        assert!(
+            matches!(outcome, Err(SyncError::ResetDuringCatchUp)),
+            "got {outcome:?}"
         );
     }
 

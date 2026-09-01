@@ -2155,6 +2155,19 @@ where
     // path (`dig-runtime`) never routes through `serve_with_shutdown`, so the browser's
     // node keeps installing no P2P content — its in-process trust boundary is unchanged.
     if dig_node_core::peer::peer_network_enabled() {
+        // The untrusted mirror-coin pointers every DHT announce attaches (dig-node#435), installed
+        // BEFORE the bring-up reads them. The DHT lives in dig-node-core and the mirror lifecycle
+        // that knows which coin bonds which capsule lives here, so this shell is the one place that
+        // can join them. Until it did, the pointer mechanism was built, unit tested, and fed only by
+        // a test double: every live announce published no coin id at all.
+        //
+        // Installed unconditionally rather than behind the broadcast switch. The pointer is read
+        // from the observation a pass publishes, so a node that creates no coins simply has no
+        // `Bonded` row and answers `None` — the ordinary, fully supported case — while a node whose
+        // coins were created before the switch was turned off still points at them correctly.
+        state.node.set_mirror_coin_pointers(std::sync::Arc::new(
+            crate::mirror::pointers::SnapshotMirrorPointers::new(state.mirror_bonds.clone()),
+        ));
         dig_node_core::peer::spawn_peer_network(state.node.clone());
     }
 
@@ -2769,12 +2782,46 @@ fn spawn_mirror_passes(
             // synchronous and sees one disk state and one balance throughout.
             let capsules = lifecycle::observe_disk(&node).await;
             let dig_balance = lifecycle::observe_dig_balance(&wallet, owner_puzzle_hash).await;
+
+            // dig-node#286: the ONLY caller of the funded latch. `latch_ever_funded` was written,
+            // persisted and tested, and nothing invoked it — so in the shipped build a funded
+            // auto-created wallet was still described as disposable, for ever.
+            //
+            // This pass is the observation point because it already reads the operator wallet's
+            // own balance on a timer, so the latch costs no extra chain read and cannot drift from
+            // the figure the node acts on. `synced` gates ONLY the zero case (see
+            // `FundingObservation::should_latch`), so a stale or fallback answer showing money
+            // still latches immediately.
+            {
+                use crate::wallet_funded::FundingObservation;
+                let synced = wallet
+                    .wallet_sync_status()
+                    .await
+                    .is_ok_and(|s| s.phase == dig_wallet::sage::sync_supervisor::SyncPhase::Synced);
+                let observation = match &dig_balance {
+                    Ok(base_units) => {
+                        FundingObservation::classify(u128::from(*base_units), 0, synced)
+                    }
+                    // An unreadable balance is not a zero balance. It says nothing, and the latch
+                    // is monotonic, so the next pass that CAN read decides.
+                    Err(_) => FundingObservation::CannotSay,
+                };
+                crate::wallet_funded::observe(&paths, observation);
+            }
             // ONE reading of what is already committed, for the whole pass — the analogue of the
             // wallet selector's reservation prune (dig_ecosystem#2763), which the chain cannot
             // offer: a broadcast coin stays unspent in the chain's view for the entire confirmation
             // window, and this loop runs inside it. An `Err` defers creates and never reclaims.
-            let committed = crate::mirror::funding::committed_funding_coin_ids(
+            //
+            // BOUNDED, not merely computed (dig-node#471). The reservation is a time box read from
+            // the audit record, so a spend that never lands releases its coins after
+            // `FUNDING_RESERVATION_WINDOW_MS` instead of withholding them forever. The record itself
+            // is untouched and stays chaseable; only the hold lapses.
+            //
+            // One clock reading for the whole pass, alongside the one disk and one balance reading.
+            let committed = crate::spend_audit::committed_funding_coin_ids(
                 &crate::spend_audit::SpendLog::in_state_dir(),
+                lifecycle::now_unix_ms(),
             )
             .map_err(|e| crate::mirror::runner::PassError::Wallet(e.to_string()));
 

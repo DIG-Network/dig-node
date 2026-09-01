@@ -108,6 +108,22 @@ pub trait MirrorEffects {
     /// The mirror coins this wallet owns — `dig_mirror_coin::list(source, owner_puzzle_hash)`.
     fn observe_chain(&self) -> Result<Vec<HeldMirror>, PassError>;
 
+    /// What the chain says about `coin_id`, for resolving a spend this node broadcast in an
+    /// EARLIER pass (dig-node#412 step 6).
+    ///
+    /// **Three answers, and they must stay three.** `Ok(Some(height))` is the chain showing the
+    /// coin in a block — the only answer that may confirm anything. `Ok(None)` is the chain not
+    /// showing it, or showing it with no height yet, which are the same instruction: wait. `Err` is
+    /// the chain failing to ANSWER, which is not a verdict about the coin at all — folding it into
+    /// `Ok(None)` would turn an outage into a fleet-wide "nothing confirmed", and folding it the
+    /// other way would confirm spends on no evidence.
+    ///
+    /// Deliberately keyed on a coin id rather than shaped as "did my spend land": the caller
+    /// derives the coin id positively (see [`super::resolve`]), and an implementation that decided
+    /// landedness for itself would be a second answer to the one question this record exists to
+    /// answer honestly.
+    fn coin_confirmation(&self, coin_id: &str) -> Result<Option<u32>, PassError>;
+
     /// Spendable $DIG, in base units.
     fn dig_balance_base_units(&self) -> Result<u64, PassError>;
 
@@ -189,6 +205,12 @@ pub struct PassRunner<E> {
     effects: E,
     presence: super::presence::PresenceTracker,
     log: SpendLog,
+    /// The one writer of the audit record, for resolving spends an earlier pass broadcast.
+    ///
+    /// Held beside `log` rather than replacing it: the in-flight suppression READS the ledger and
+    /// wants nothing else, while resolution WRITES it, and keeping the reader unable to write is
+    /// what stops a future change to the suppression rule from acquiring a write path by accident.
+    journal: crate::spend_audit::SpendJournal,
     settling_window_ms: u64,
 }
 
@@ -198,6 +220,7 @@ impl<E: MirrorEffects> PassRunner<E> {
         Self {
             effects,
             presence: super::presence::PresenceTracker::new(),
+            journal: crate::spend_audit::SpendJournal::new(log.clone()),
             log,
             settling_window_ms: super::presence::SETTLING_WINDOW_MS,
         }
@@ -219,6 +242,15 @@ impl<E: MirrorEffects> PassRunner<E> {
     /// Hand the presence tracker back, for the next round's runner.
     pub fn into_presence(self) -> super::presence::PresenceTracker {
         self.presence
+    }
+
+    /// Write the audit record through `journal` instead of the default one over this runner's log.
+    ///
+    /// Exists so a test can pin the clock. A journal over a DIFFERENT log would make the runner
+    /// read one record and write another, so callers pass a journal over the same path.
+    pub fn with_journal(mut self, journal: crate::spend_audit::SpendJournal) -> Self {
+        self.journal = journal;
+        self
     }
 
     /// Use a non-default settling window (§25.5).
@@ -245,6 +277,13 @@ impl<E: MirrorEffects> PassRunner<E> {
             .observe(&on_disk_held, ctx.now_unix_ms, self.settling_window_ms);
 
         let on_chain = self.effects.observe_chain()?;
+
+        // BEFORE the in-flight set is derived, so a create this sweep confirms stops suppressing
+        // itself in the same pass rather than one pass later. Never `?`: resolution is bookkeeping
+        // about spends that have already happened, and a sweep that could not complete must not
+        // stop the pass from reclaiming money that is sitting on chain.
+        super::resolve::resolve_landed_spends(&self.journal, &self.effects, &on_chain);
+
         let in_flight = in_flight_creates(&self.log, ctx.current_epoch);
         // NOT `?`. The balance prices creates and nothing else, so a wallet that cannot report its
         // $DIG must degrade the create half rather than abort the pass — aborting here would leave a
@@ -503,6 +542,10 @@ mod tests {
         /// balance observation is unreachable from any fixture, and an error path no double can
         /// take reads as covered while never having been run once.
         balance_fails: bool,
+        /// Heights the chain reports per coin id, for the landed-spend resolver.
+        confirmations: std::collections::HashMap<String, u32>,
+        /// Coin ids the chain cannot be ASKED about, kept apart from ones it reports absent.
+        confirmation_fails: Vec<String>,
     }
 
     impl MirrorEffects for FakeEffects {
@@ -512,6 +555,13 @@ mod tests {
 
         fn observe_chain(&self) -> Result<Vec<HeldMirror>, PassError> {
             Ok(self.chain.clone())
+        }
+
+        fn coin_confirmation(&self, coin_id: &str) -> Result<Option<u32>, PassError> {
+            if self.confirmation_fails.iter().any(|c| c == coin_id) {
+                return Err(PassError::Chain("the chain could not be asked".to_string()));
+            }
+            Ok(self.confirmations.get(coin_id).copied())
         }
 
         fn dig_balance_base_units(&self) -> Result<u64, PassError> {
@@ -1192,6 +1242,9 @@ mod tests {
             }
             fn observe_chain(&self) -> Result<Vec<HeldMirror>, PassError> {
                 Err(PassError::Chain("no source".to_string()))
+            }
+            fn coin_confirmation(&self, _: &str) -> Result<Option<u32>, PassError> {
+                panic!("a pass that cannot see the chain resolves nothing")
             }
             fn dig_balance_base_units(&self) -> Result<u64, PassError> {
                 Ok(u64::MAX)

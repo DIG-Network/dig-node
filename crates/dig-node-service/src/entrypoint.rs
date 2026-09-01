@@ -384,6 +384,21 @@ enum WalletCommand {
     },
     /// Print the chain peak this node reads against (READ-ONLY).
     Peak,
+    /// DESTRUCTIVE: discard this node's cached coin database and re-sync it from chain.
+    ///
+    /// Use when a coin's asset never resolves — a parent spend that could not be fetched is
+    /// skipped and never retried, so its value stays missing from asset-scoped balances for the
+    /// life of the database. An ordinary stale cache repairs itself and needs no reset.
+    ///
+    /// Discards CHAIN-DERIVED rows only; they come back by syncing. It never touches your seed,
+    /// your device key, or any other key material. It refuses while a spend is in flight.
+    ///
+    /// Requires `--confirm`.
+    ResetCoinDb {
+        /// Acknowledge that this discards the cached coin database.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Print the wallet's chain-sync phase, replica height and Chia peer count (READ-ONLY).
     ///
     /// Distinct from `dig-node sync status`, which is about DIG stores, not the chain.
@@ -1063,6 +1078,7 @@ fn wallet_action(cmd: WalletCommand) -> Option<ControlAction> {
             ControlAction::WalletArrivals { after_seq, limit }
         }
         WalletCommand::Peak => ControlAction::WalletPeak,
+        WalletCommand::ResetCoinDb { confirm } => ControlAction::WalletResetCoinDb { confirm },
         WalletCommand::SyncStatus => ControlAction::WalletSyncStatus,
         WalletCommand::Broadcast { signed_bundle_hex } => {
             ControlAction::WalletBroadcast { signed_bundle_hex }
@@ -1791,6 +1807,10 @@ mod tests {
                 "control.wallet.arrivals",
             ),
             (vec!["dig-node", "wallet", "peak"], "control.wallet.peak"),
+            (
+                vec!["dig-node", "wallet", "reset-coin-db", "--confirm"],
+                "control.wallet.resetCoinDb",
+            ),
             (
                 vec!["dig-node", "wallet", "broadcast", "deadbeef"],
                 "control.wallet.broadcast",

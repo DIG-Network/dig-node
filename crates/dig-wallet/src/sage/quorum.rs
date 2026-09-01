@@ -1001,7 +1001,12 @@ mod settled_peak_tests {
         let settled = settled_peak(&sample).expect("two agreeing honest claims settle a height");
         assert!(
             settled <= true_tip,
-            "the settled height {settled} LEADS the true tip {true_tip}; every confirmation count              derived from it would treat an unburied coin as buried"
+            concat!(
+                "the settled height {settled} LEADS the true tip {true_tip}; every ",
+                "confirmation count derived from it would treat an unburied coin as buried"
+            ),
+            settled = settled,
+            true_tip = true_tip
         );
     }
 
@@ -1024,7 +1029,12 @@ mod settled_peak_tests {
         assert_eq!(
             settled_peak(&sample),
             Some(true_tip + lead - SETTLED_LAG),
-            "a colluding majority of the CLAIMANTS sets the median and places the settled height              where it likes; if this ever refuses instead, the bound got stronger and              `settled_peak`'s doc must be re-read rather than this test relaxed"
+            concat!(
+                "a colluding majority of the CLAIMANTS sets the median and places the ",
+                "settled height where it likes; if this ever refuses instead, the bound got ",
+                "stronger and `settled_peak`'s doc must be re-read rather than this test ",
+                "relaxed"
+            )
         );
     }
 

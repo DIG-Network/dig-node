@@ -1001,7 +1001,10 @@ mod tests {
         // any number above one means the defect is back.
         assert_eq!(
             second, 1,
-            "a second pass may read only the row that has never been read, and must re-read none              of the rows it already tried"
+            concat!(
+                "a second pass may read only the row that has never been read, and must ",
+                "re-read none of the rows it already tried"
+            )
         );
         assert!(
             !db.all_coins()
