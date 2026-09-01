@@ -961,9 +961,25 @@ truth shared with `rpc.dig.net`. This node MUST NOT diverge from it.
 - All JSON-RPC responses (success and error) are returned with HTTP **200**. The error taxonomy
   lives in the JSON-RPC `error` object (§10), not in HTTP status codes (the sole exception is the
   421 Host rejection, §4.2).
-- Error envelopes minted by the shell MUST carry the numeric JSON-RPC `code` plus
-  `data.code` (stable UPPER_SNAKE symbolic name) and `data.origin` (§10). Agents branch on the
-  symbolic name, never on message prose.
+- Error envelopes minted by the shell OR by the node engine MUST carry the numeric JSON-RPC `code`
+  plus `data.code` (stable UPPER_SNAKE symbolic name) and `data.origin` (§10). Agents branch on the
+  symbolic name, never on message prose. Within the node ENGINE (`dig-node-core`) both fields are
+  derived from `dig-rpc-protocol`'s `ErrorCode` at every call site rather than restated, so an
+  engine-minted number and its name cannot disagree.
+- **The shell (`dig-node-service`) still keeps its own copy of the taxonomy, and one entry disagrees
+  with the contract crate today:** `-32004` is `RESOURCE_UNAVAILABLE` in `dig-rpc-protocol` and
+  `RESOURCE_NOT_AVAILABLE_AT_ROOT` in the shell, so a client can receive that number under either
+  name depending on which layer minted the frame. Both names are already published, so neither may be
+  changed here — a renamed code breaks a client's `match` exactly as a renumbered one does. Clients
+  MUST therefore treat the two names as the same condition until the shell is pointed at the shared
+  catalogue (release-first work in `dig-rpc-protocol`, tracked as dig-node#478, a child of #340).
+- **The ONE exception, stated rather than left silent:** a code this node emits that
+  `dig-rpc-protocol` does not declare carries NO `data` object at all. Today that is `-32001`
+  alone (the push-authority refusal, §21.9), which `SYSTEM.md` records as reserved-by-occupancy.
+  An absent `data.code` is a truthful gap; an invented one would publish a branch key that no
+  contract defines and that the owning crate may later assign a different meaning. Declaring
+  `-32001` canonically is release-first work in `dig-rpc-protocol`, after which it gains `data`
+  with no change to its number and no break for existing readers.
 - The response `id` echoes the request `id`, defaulting to `null` when absent.
 
 ### 5.2. Dispatch order
