@@ -323,14 +323,14 @@ fn promote_into_cache(
     // `CacheWriteFailed` (this node could not take a perfectly good artifact). Preserved deliberately:
     // collapsing them would re-map an outcome the caller branches on, which is a behaviour change
     // wearing a refactor's clothes.
-    let promoted = super::module_stream::copy_verifying(staged, &tmp, &admitted).map_err(|e| match e
-    {
-        super::module_stream::StreamCopyError::ReadFailed
-        | super::module_stream::StreamCopyError::DigestMismatch => {
-            WarmFailure::PromotedArtifactMismatch
-        }
-        super::module_stream::StreamCopyError::WriteFailed => WarmFailure::CacheWriteFailed,
-    })?;
+    let promoted =
+        super::module_stream::copy_verifying(staged, &tmp, &admitted).map_err(|e| match e {
+            super::module_stream::StreamCopyError::ReadFailed
+            | super::module_stream::StreamCopyError::DigestMismatch => {
+                WarmFailure::PromotedArtifactMismatch
+            }
+            super::module_stream::StreamCopyError::WriteFailed => WarmFailure::CacheWriteFailed,
+        })?;
     // The holder claim is persisted BEFORE the capsule becomes visible at the cache path, because the
     // cache path is the inventory (dig-node#276). Between the rename and a later marker write there
     // would be a window in which an unrelated reconcile — a chain-watch gap-fill, a peer-presence

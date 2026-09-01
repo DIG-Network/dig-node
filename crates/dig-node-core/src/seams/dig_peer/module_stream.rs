@@ -169,11 +169,7 @@ pub enum StreamCopyError {
 /// [`StreamCopyError::ReadFailed`] or [`StreamCopyError::WriteFailed`] on I/O, and
 /// [`StreamCopyError::DigestMismatch`] when the copied bytes do not match `expected`. In every case
 /// `dst` has been removed on a best-effort basis.
-pub fn copy_verifying(
-    src: &Path,
-    dst: &Path,
-    expected: &[u8; 32],
-) -> Result<u64, StreamCopyError> {
+pub fn copy_verifying(src: &Path, dst: &Path, expected: &[u8; 32]) -> Result<u64, StreamCopyError> {
     let copied = copy_hashing(src, dst, expected);
     if copied.is_err() {
         // Best-effort: an unverified or partial artifact must not survive this call. If the removal
@@ -195,7 +191,9 @@ fn copy_hashing(src: &Path, dst: &Path, expected: &[u8; 32]) -> Result<u64, Stre
     let mut total: u64 = 0;
 
     loop {
-        let n = input.read(&mut buf).map_err(|_| StreamCopyError::ReadFailed)?;
+        let n = input
+            .read(&mut buf)
+            .map_err(|_| StreamCopyError::ReadFailed)?;
         if n == 0 {
             break;
         }
@@ -283,7 +281,11 @@ mod tests {
         let path = write_fixture(dir.path(), "c.dig", &bytes);
 
         let got = digest_with_chunks(&path, 1024).expect("digest");
-        assert_eq!(got.chunk_digests.len(), 4, "4096 / 1024 is exactly four chunks");
+        assert_eq!(
+            got.chunk_digests.len(),
+            4,
+            "4096 / 1024 is exactly four chunks"
+        );
         assert_eq!(got.chunk_lens, vec![1024; 4]);
         assert_eq!(
             got.chunk_lens.iter().sum::<u64>(),
@@ -323,7 +325,11 @@ mod tests {
 
         let n = copy_verifying(&src, &dst, &sha(&bytes)).expect("digest matches");
         assert_eq!(n, bytes.len() as u64);
-        assert_eq!(std::fs::read(&dst).expect("dst"), bytes, "the copy is byte-identical");
+        assert_eq!(
+            std::fs::read(&dst).expect("dst"),
+            bytes,
+            "the copy is byte-identical"
+        );
     }
 
     /// The failure mode streaming INTRODUCES: the destination is written before the digest is known,
