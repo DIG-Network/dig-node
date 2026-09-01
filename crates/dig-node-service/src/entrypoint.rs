@@ -384,6 +384,16 @@ enum WalletCommand {
     },
     /// Print the chain peak this node reads against (READ-ONLY).
     Peak,
+    /// Print the address of this node's OWN machine wallet — where to send $DIG so it can pay
+    /// mirror collateral (READ-ONLY).
+    ///
+    /// This is NOT your wallet. The node holds a machine-custody wallet of its own, and it is the
+    /// one that funds mirror coins; a mirror bond reported as unfunded is a statement about THIS
+    /// address, not about the balance you watch in a wallet app.
+    ///
+    /// Prints an address and a puzzle hash and nothing else. No key, seed or phrase is read,
+    /// derived into a signer, or printed by this command.
+    OperatorAddress,
     /// DESTRUCTIVE: discard this node's cached coin database and re-sync it from chain.
     ///
     /// Use when a coin's asset never resolves — a parent spend that could not be fetched is
@@ -1078,6 +1088,7 @@ fn wallet_action(cmd: WalletCommand) -> Option<ControlAction> {
             ControlAction::WalletArrivals { after_seq, limit }
         }
         WalletCommand::Peak => ControlAction::WalletPeak,
+        WalletCommand::OperatorAddress => ControlAction::WalletOperatorAddress,
         WalletCommand::ResetCoinDb { confirm } => ControlAction::WalletResetCoinDb { confirm },
         WalletCommand::SyncStatus => ControlAction::WalletSyncStatus,
         WalletCommand::Broadcast { signed_bundle_hex } => {
@@ -1807,6 +1818,10 @@ mod tests {
                 "control.wallet.arrivals",
             ),
             (vec!["dig-node", "wallet", "peak"], "control.wallet.peak"),
+            (
+                vec!["dig-node", "wallet", "operator-address"],
+                "control.wallet.operatorAddress",
+            ),
             (
                 vec!["dig-node", "wallet", "reset-coin-db", "--confirm"],
                 "control.wallet.resetCoinDb",

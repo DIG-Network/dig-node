@@ -2871,6 +2871,13 @@ fn spawn_mirror_passes(
                         requirement,
                         margin_bp: config.margin_bp,
                         creates_enabled: config.mirror_enabled,
+                        // The SAME list `create` refuses on (SPEC.md §25.10), read once at
+                        // bring-up above. Passing it here is what lets the STATE surface say what
+                        // the lifecycle log has always said: a node with no publishable URL creates
+                        // no mirror coin. Until this reached the pass, that node's bonds were
+                        // priced against its operator wallet and reported `unfunded` with a base-unit
+                        // figure — a demand for money that would have bonded nothing.
+                        can_advertise: !advertised_urls.is_empty(),
                     };
                     // `block_in_place` rather than `spawn_blocking`: the runner borrows the signer,
                     // the journal and the chain source, none of which is `'static`, and moving them

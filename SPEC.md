@@ -8234,8 +8234,9 @@ itself (SYSTEM.md §4.1).
 >   (`mirror::runner::split_by_provenance`) and expressed in the types thereafter: `PassInputs::held`
 >   and `::relayed` are separate fields, so no relayed capsule can reach the create path.
 > * §25.8's **vocabulary**, as `mirror::pass::BondState`: `disabled` (the node-wide switch),
->   `withheld` (`Relayed` provenance) and `reclaiming` are three distinct states, agreeing with
->   `dig-node-control-interface` 0.27.0's tokens, which the node now ADOPTS. `withheld` has a real
+>   `unadvertised` (that switch ON with nothing publishable to advertise), `withheld` (`Relayed`
+>   provenance) and `reclaiming` are four distinct states, agreeing with
+>   `dig-node-control-interface` 0.28.0's tokens, which the node now ADOPTS. `withheld` has a real
 >   producer, the relayed set, rather than being unreachable from a `Held`-keyed derivation.
 > * §25.8's **method and verb**: `control.mirror.bondStates` is served (`control.rs`) and
 >   `dign mirror bond-states` is the verb. The wire mapping, the whole-set locked total, the
@@ -8718,11 +8719,42 @@ one setting to turn off** (§6.0/#207).
 The lifecycle exposes, per `(store, root)`, over the control plane and with a `dign` verb (§8.6
 CLI parity): the bond state — `bonded { coin_id, epoch, amount }`, `pending` (in-flight create),
 `unfunded { short_dig_base_units }`, `deferred { requirement reason }` (§25.3), `withheld`
-(`Relayed` provenance — deliberately not advertised), `disabled` (the node-wide switch, §25.7), or
+(`Relayed` provenance — deliberately not advertised), `disabled` (the node-wide switch, §25.7),
+`unadvertised` (that switch ON, but no entry in `DIG_MIRROR_ADVERTISE_URLS` is publishable, so this
+node advertises nothing and a coin would bond nothing — §25.10), or
 `reclaiming { coin_id, epoch, amount }` — so a client can distinguish "out of funds" from "withheld
 on purpose" without guessing from the store list. Conflating those two produces hourly alarms about
 a healthy node (dig-app#300). The method is declared in `dig-node-control-interface` (release-first)
 before the node serves it.
+
+**The mirror wallet is the node's OWN, and `control.wallet.operatorAddress` names it.** The wallet
+that pays mirror collateral is the §16.4 machine-custody operator wallet, derived from the autoseed
+— never the user's. Every figure in this section is about that wallet, and until it could be named
+an operator reading `unfunded, short 1010` had no way to learn which wallet was short, nor where to
+send money to fix it: one node reported exactly that while its operator's own wallet held 1,015,000
+base units of $DIG, both statements true and each about a different wallet. The method answers
+`{state:"known", address, puzzle_hash}` for this node's own wallet, or
+`{state:"unavailable", reason}` — `not_initialized` for a node that has never run autoseed setup,
+which is not a fault, and `unreadable` for one whose seed will not open, which is, and which also
+means the node cannot pay collateral. It is TOKEN-GATED, because the caller does not name the
+address and the node therefore volunteers its own node-to-address association; it is OWNED rather
+than delegated, because forwarding it upstream would answer with another machine's wallet; and it
+returns a DESTINATION only — no seed, key or derivation material, in any encoding. The
+implementation reaches the address through `dig_wallet::operator_wallet::operator_address`, which is
+built on `operator_puzzle_hash` and constructs no `WalletSigner` at all, so §908 holds by the types
+rather than by discipline. The address is encoded with the wallet backend's own network prefix,
+never a constant, so a node reading testnet coins cannot render a mainnet address beside them.
+
+**`disabled` and `unadvertised` are both node-wide, and only ONE of them is a fault.** Both make every
+row read the same token together and neither has a coin. They differ in whether the operator already
+knows: `disabled` is that operator's own switch (§25.7) and MUST NOT be presented as a fault, while
+`unadvertised` is the switch ON and the node silently unable to honour it because
+`mirror::advertise::configured_urls` accepted no entry — the list is empty, or every entry was rejected
+as non-absolute or reachable only from this machine, which is the same condition `MirrorEffects::create`
+refuses every bond on (§25.10). The node MUST report `unadvertised` for that condition and MUST NOT
+report it as `disabled`, which would oblige a conforming client to stay silent about the only reason
+this node bonds nothing, nor as `unfunded`, which would name a figure and demand $DIG that would create
+no coin.
 
 The surface MUST hold four properties, each of which is a money statement:
 
