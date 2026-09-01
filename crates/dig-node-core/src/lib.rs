@@ -4496,11 +4496,7 @@ fn relay_pending_err(id: &Value, staged_bytes: u64) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": {
-            "code": download::content_miss_inconclusive(),
-            "message": "relaying the requested capsule on your behalf; not yet complete",
-            "data": { RELAY_PROGRESS_FIELD: staged_bytes },
-        }
+        "error": crate::seams::dig_rpc::errors::relay_pending_object(staged_bytes),
     })
 }
 

@@ -9,7 +9,7 @@
 //! parsing a human message that may be reworded in any release.
 //!
 //! This crate used to frame errors as a bare `{code, message}`. That is not a narrower envelope,
-//! it is a DIFFERENT one — a consumer written against the published types finds neither
+//! it is a DIFFERENT one: a consumer written against the published types finds neither
 //! discriminator and is forced back to prose, which is exactly what the taxonomy exists to
 //! prevent (dig-node#340).
 //!
@@ -17,17 +17,17 @@
 //!
 //! [`taxonomy_code`] resolves a numeric code by scanning [`ErrorCode::ALL`], so the machine code
 //! and the origin are DERIVED from the contract crate at every call. A local `match` from integer
-//! to `"UPPER_SNAKE"` would be a second copy of the taxonomy, and a second copy is what drifts —
-//! the same failure this repo has already paid for twice in code-number collisions.
+//! to `"UPPER_SNAKE"` would be a second copy of the taxonomy, and a second copy is what drifts.
+//! This repo has already paid for that twice in error-number collisions.
 //!
 //! # The codes this crate emits that the taxonomy does not declare
 //!
 //! `-32001` (an authorization refusal on the push surface, `seams::capsule::push_capsule`) is
 //! occupied here and undeclared upstream; `SYSTEM.md` records it as reserved-by-occupancy. A
 //! frame carrying it therefore gets NO `data` rather than an invented machine name: a fabricated
-//! `data.code` is worse than an absent one, because a client would branch on a name that no
-//! contract defines and that the owning crate may later assign a different meaning. Declaring it
-//! is release-first work in `dig-rpc-protocol`, not a decision this consumer may take.
+//! `data.code` is worse than an absent one, because a client would branch on a name no contract
+//! defines and that the owning crate may later assign a different meaning. Declaring it is
+//! release-first work in `dig-rpc-protocol`, not a decision this consumer may take.
 
 use dig_rpc_protocol::{ErrorCode, RpcError};
 use serde_json::{json, Value};
@@ -41,10 +41,10 @@ pub(crate) fn taxonomy_code(code: i64) -> Option<ErrorCode> {
         .find(|c| i64::from(c.code()) == code)
 }
 
-/// The `error` OBJECT of a JSON-RPC failure — `{code, message, data:{code, origin}}` for any
+/// The `error` OBJECT of a JSON-RPC failure: `{code, message, data:{code, origin}}` for any
 /// declared code, and a bare `{code, message}` for one the taxonomy does not declare.
 ///
-/// Both `data` fields come from `dig-rpc-protocol`'s own serialization of [`RpcError`], never
+/// Both `data` fields come from the contract crate's own serialization of [`RpcError`], never
 /// from a literal here, so they cannot drift from the contract.
 pub(crate) fn error_object(code: i64, message: &str) -> Value {
     match taxonomy_code(code) {
@@ -59,6 +59,27 @@ pub(crate) fn error_frame(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": error_object(code, message)})
 }
 
+/// The `error` object a hop answers with while it is STILL RELAYING the requested capsule
+/// (dig-node#333): the inconclusive-miss code plus this hop's staged byte count.
+///
+/// Centralised here because the frame had TWO independent constructions (the crate-root
+/// `relay_pending_err` and `seams::dig_peer::module_serve`), and both had drifted the same way:
+/// each carried the progress field in `data` while omitting the `data.code` a requestor needs to
+/// recognise the refusal in the first place. Two producers of one wire shape are one edit away
+/// from disagreeing, so there is now one.
+///
+/// The byte count is this node's claim about its OWN staging file. A requestor uses it only to
+/// tell a progressing relay from a stalled one; the bytes it describes still pass merkle
+/// verification against the chain-anchored root like any other peer's (NC-12).
+pub(crate) fn relay_pending_object(staged_bytes: u64) -> Value {
+    let mut error = error_object(
+        crate::download::content_miss_inconclusive(),
+        "relaying the requested capsule on your behalf; not yet complete",
+    );
+    error["data"][crate::RELAY_PROGRESS_FIELD] = json!(staged_bytes);
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,12 +88,12 @@ mod tests {
     /// reading the numeric code and without parsing the message.
     ///
     /// The two chosen codes are the pair a client most needs to separate: a settled
-    /// `RESOURCE_UNAVAILABLE` ("it is not here") against `CONTENT_MISS_INCONCLUSIVE` ("nobody
-    /// established that it is not here"). Collapsing those is what turns one slow peer into proof
+    /// `RESOURCE_UNAVAILABLE` (it is not here) against `CONTENT_MISS_INCONCLUSIVE` (nobody
+    /// established that it is not here). Collapsing those is what turns one slow peer into proof
     /// that content is gone.
     ///
     /// Asserting merely that `data.code` is PRESENT would pass on any constant, so the assertion
-    /// that carries the weight is the inequality plus the two exact names.
+    /// carrying the weight is the inequality plus the two exact names.
     #[test]
     fn two_failures_are_distinguishable_by_machine_code_alone() {
         let id = json!(1);
@@ -105,7 +126,7 @@ mod tests {
         assert_eq!(peer["error"]["data"]["origin"], json!("peer"));
     }
 
-    /// **Proves:** the NEGATIVE the ticket asks for — a frame built the old way fails the new
+    /// **Proves:** the NEGATIVE the ticket asks for. A frame built the old way fails the new
     /// assertion, so the assertion is load-bearing rather than trivially true.
     ///
     /// This is the exact shape `rpc_err` emitted before this change.
@@ -117,7 +138,7 @@ mod tests {
     }
 
     /// **Proves:** an UNDECLARED code yields no `data` at all rather than a fabricated machine
-    /// name — the honest gap, not an invented one.
+    /// name: the honest gap, not an invented one.
     ///
     /// `-32001` is emitted by the push surface and is not in `ErrorCode::ALL`. Inventing a name
     /// for it here would publish a branch key no contract defines.
@@ -132,8 +153,33 @@ mod tests {
         );
     }
 
+    /// **Proves:** the relay-pending refusal carries the taxonomy discriminators AND its own
+    /// progress field. Adding `data.code` did not displace the extra, and the extra did not
+    /// displace `data.code`.
+    ///
+    /// Both rival constructions of this frame previously carried the progress field ALONE, which
+    /// is why this assertion is three-part rather than one.
+    #[test]
+    fn the_relay_pending_refusal_carries_both_the_branch_key_and_its_progress() {
+        let error = relay_pending_object(4096);
+
+        assert_eq!(error["data"]["code"], json!("CONTENT_MISS_INCONCLUSIVE"));
+        assert_eq!(error["data"]["origin"], json!("peer"));
+        assert_eq!(error["data"][crate::RELAY_PROGRESS_FIELD], json!(4096));
+    }
+
+    /// **Proves:** the crate-root frame and the peer-serve frame emit the SAME error object, so
+    /// the two producers of this one wire shape cannot drift apart again.
+    #[test]
+    fn both_relay_pending_producers_agree_byte_for_byte() {
+        let root = crate::relay_pending_err(&json!(7), 4096);
+        let serve = crate::seams::dig_peer::module_serve::module_relay_pending_frame(4096);
+
+        assert_eq!(root["error"], serve["error"]);
+    }
+
     /// **Proves:** the numeric code and the machine code cannot disagree, for EVERY declared
-    /// code — the drift this module exists to make unrepresentable.
+    /// code. This is the drift the module exists to make unrepresentable.
     #[test]
     fn every_declared_code_round_trips_to_its_own_machine_name() {
         for known in ErrorCode::ALL {
