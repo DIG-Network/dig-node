@@ -4,6 +4,7 @@
 //! shared contract crate's dispatcher) is W3 — out of scope here.
 
 mod dispatch;
+pub(crate) mod errors;
 
 /// The shared landing-provenance rule, used by BOTH the read path and the push path so the two
 /// cannot drift into disagreeing about who is entitled to this operator's money (dig-node#436).
