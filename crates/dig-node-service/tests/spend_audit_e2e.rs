@@ -24,12 +24,13 @@ fn dign() -> PathBuf {
 }
 
 /// A private state dir, standing in for the machine-wide one the daemon and the CLI share.
-fn state_dir(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("dig-node-spend-e2e-{}-{}", std::process::id(), tag));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("state dir");
-    dir
+/// The tree is OWNED by the returned guard: `TempDir`'s `Drop` removes it, including on an
+/// unwind, so a failing assertion cannot leak it (dig-node#370).
+fn state_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("dig-node-spend-e2e-{tag}-"))
+        .tempdir()
+        .expect("state dir")
 }
 
 fn intent(store: &str) -> SpendIntent {

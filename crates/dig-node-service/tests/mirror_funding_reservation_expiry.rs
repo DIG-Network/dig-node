@@ -150,15 +150,15 @@ impl ChainSource for Chain {
 /// probes deriving the same path append to one file -- and the failure that produces is a ledger
 /// with a foreign record in it, which reads as the code under test having written something it
 /// never wrote. Measured here on the first run.
-fn tmp_log(name: &str) -> SpendLog {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "dig-node-471-{}-{NOW}-{name}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("a temp dir");
-    SpendLog::at(dir.join("spend-audit.jsonl"))
+/// The guard comes back with the log, which writes into the tree for as long as the caller
+/// holds it; `TempDir`'s `Drop` then removes it, including on an unwind (dig-node#370).
+fn tmp_log(name: &str) -> (SpendLog, tempfile::TempDir) {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("dig-node-471-{name}-"))
+        .tempdir()
+        .expect("a temp dir");
+    let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+    (log, dir)
 }
 
 fn intent() -> SpendIntent {

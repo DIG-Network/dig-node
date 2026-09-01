@@ -34,12 +34,16 @@ fn env_guard() -> &'static Mutex<()> {
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A unique-per-call scratch path for the fixture's `FAKE_UPDATER_ARGS_FILE` capture.
-fn unique_path(label: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "dig-node-updater-cli-test-{label}-{}-{n}",
-        std::process::id()
-    ))
+///
+/// The guard owns the directory the file lands in, so the capture is removed on drop and on
+/// an unwind (dig-node#370) — this harness used to leak one file per call, forever.
+fn unique_path(label: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("dig-node-updater-cli-test-")
+        .tempdir()
+        .expect("a scratch dir");
+    let path = dir.path().join(label);
+    (dir, path)
 }
 
 fn fake_cli_path() -> PathBuf {
@@ -66,7 +70,7 @@ async fn set_channel_runs_the_cli_and_returns_its_json_verbatim() {
         "FAKE_UPDATER_STDOUT",
         r#"{"command":"channel","channel":"alpha"}"#,
     );
-    let args_file = unique_path("args-setchannel");
+    let (_scratch, args_file) = unique_path("args-setchannel");
     std::env::set_var("FAKE_UPDATER_ARGS_FILE", &args_file);
 
     let resp = set_channel(json!(1), &json!({ "channel": "alpha" })).await;
@@ -97,7 +101,7 @@ async fn set_channel_forwards_every_channel_token_verbatim() {
             "FAKE_UPDATER_STDOUT",
             format!(r#"{{"command":"channel","channel":"{channel}"}}"#),
         );
-        let args_file = unique_path(&format!("args-setchannel-{channel}"));
+        let (_scratch, args_file) = unique_path(&format!("args-setchannel-{channel}"));
         std::env::set_var("FAKE_UPDATER_ARGS_FILE", &args_file);
 
         let resp = set_channel(json!(1), &json!({ "channel": channel })).await;
@@ -123,7 +127,7 @@ async fn pause_with_until_passes_the_flag_through() {
         "FAKE_UPDATER_STDOUT",
         r#"{"command":"pause","paused":true,"paused_until":500}"#,
     );
-    let args_file = unique_path("args-pause");
+    let (_scratch, args_file) = unique_path("args-pause");
     std::env::set_var("FAKE_UPDATER_ARGS_FILE", &args_file);
 
     let resp = pause(json!(1), &json!({ "until": 500 })).await;
@@ -148,7 +152,7 @@ async fn resume_runs_with_no_extra_flags() {
         "FAKE_UPDATER_STDOUT",
         r#"{"command":"pause","paused":false,"paused_until":null}"#,
     );
-    let args_file = unique_path("args-resume");
+    let (_scratch, args_file) = unique_path("args-resume");
     std::env::set_var("FAKE_UPDATER_ARGS_FILE", &args_file);
 
     let resp = resume(json!(1)).await;
@@ -172,7 +176,7 @@ async fn check_now_forwards_the_pass_report_on_success() {
         "FAKE_UPDATER_STDOUT",
         r#"{"applied":false,"reason":"paused","detail":null,"components":[],"state_advanced":false}"#,
     );
-    let args_file = unique_path("args-checknow");
+    let (_scratch, args_file) = unique_path("args-checknow");
     std::env::set_var("FAKE_UPDATER_ARGS_FILE", &args_file);
 
     let resp = check_now(json!(1)).await;

@@ -344,12 +344,18 @@ mod tests {
 
     /// A unique-per-call scratch path, so concurrent test RUNS (across `cargo test`
     /// invocations) never collide even though tests within this file are serialized.
-    fn unique_path(label: &str) -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "dig-node-updater-test-{label}-{}-{n}",
-            std::process::id()
-        ))
+    ///
+    /// The returned guard owns the path's PARENT rather than the path itself, because one
+    /// caller's whole point is that the status dir is ABSENT — a guard over the directory
+    /// would create it and quietly retire that test. The parent still removes the tree on
+    /// drop and on an unwind (dig-node#370).
+    fn unique_path(label: &str) -> (tempfile::TempDir, PathBuf) {
+        let parent = tempfile::Builder::new()
+            .prefix("dig-node-updater-test-")
+            .tempdir()
+            .expect("a scratch parent");
+        let path = parent.path().join(label);
+        (parent, path)
     }
 
     // -- status: read directly off disk --------------------------------------------------
@@ -357,8 +363,7 @@ mod tests {
     #[test]
     fn status_reports_not_installed_when_status_json_is_absent() {
         let _guard = env_guard().blocking_lock();
-        let dir = unique_path("absent");
-        let _ = std::fs::remove_dir_all(&dir);
+        let (_scratch, dir) = unique_path("absent");
         std::env::set_var(STATUS_DIR_ENV, &dir);
 
         let resp = status(json!(1));
@@ -371,7 +376,7 @@ mod tests {
     #[test]
     fn status_returns_the_file_verbatim_when_present() {
         let _guard = env_guard().blocking_lock();
-        let dir = unique_path("present");
+        let (_scratch, dir) = unique_path("present");
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var(STATUS_DIR_ENV, &dir);
         let body = json!({ "schema": 1, "version": "0.6.0", "channel": "alpha" });
@@ -381,14 +386,13 @@ mod tests {
 
         assert_eq!(resp["result"]["installed"], json!(true));
         assert_eq!(resp["result"]["status"], body);
-        let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var(STATUS_DIR_ENV);
     }
 
     #[test]
     fn status_reports_a_control_error_on_corrupt_json_not_not_installed() {
         let _guard = env_guard().blocking_lock();
-        let dir = unique_path("corrupt");
+        let (_scratch, dir) = unique_path("corrupt");
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var(STATUS_DIR_ENV, &dir);
         std::fs::write(dir.join("status.json"), b"{ not json").unwrap();
@@ -396,7 +400,6 @@ mod tests {
         let resp = status(json!(1));
 
         assert_eq!(resp["error"]["data"]["code"], json!("CONTROL_ERROR"));
-        let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var(STATUS_DIR_ENV);
     }
 
@@ -449,7 +452,7 @@ mod tests {
         // Force an empty resolution dir so the test is hermetic: no real dig-updater will ever
         // be found, even if one is installed on the machine. This ensures the test reliably
         // passes by failing binary resolution, not by assuming it doesn't exist locally.
-        let empty_dir = unique_path("empty-resolution");
+        let (_scratch, empty_dir) = unique_path("empty-resolution");
         let _ = std::fs::create_dir_all(&empty_dir);
         std::env::set_var(CLI_BIN_ENV, empty_dir.join("dig-updater")); // Override to a path that
                                                                        // won't exist
@@ -475,7 +478,6 @@ mod tests {
             );
         }
 
-        let _ = std::fs::remove_dir_all(&empty_dir);
         std::env::remove_var(CLI_BIN_ENV);
         std::env::remove_var(CLI_BIN_RESOLUTION_DIRS_ENV);
     }
