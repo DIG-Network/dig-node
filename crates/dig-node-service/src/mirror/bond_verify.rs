@@ -115,8 +115,11 @@ pub(crate) fn peer_declaration(
     PeerDeclaration::NotReadable
 }
 
-/// Whether `claimed_coin_id` genuinely bonds `store_launcher_id` at `root_hash` for `epoch`
-/// **on behalf of `claiming_peer_id`**.
+/// Whether `claimed_coin_id` genuinely bonds `store_launcher_id` at `root_hash` for `epoch`.
+///
+/// This is the CHAIN half only. `Bonded` here means a real coin bonds this content — it does NOT
+/// mean the peer offering the record is that coin's holder. [`verdict_for`] adds that question, and
+/// it is the one that decides promotion.
 ///
 /// `required_collateral` is this node's censused per-store requirement, or `None` when it has no
 /// record for the epoch. Pure over the source, so a test can drive every branch with real coins
@@ -128,13 +131,12 @@ pub(crate) fn peer_declaration(
 /// `claiming_peer_id` is the peer id off the same untrusted record as `claimed_coin_id`. A coin id
 /// is a public fact, so a coin that bonds the content proves nothing about WHO is offering it; the
 /// last step asks the coin whether it declares this claimant, and only that answer promotes.
-pub fn verdict_for<S: ChainSource>(
+pub fn chain_bond_verdict<S: ChainSource>(
     source: &S,
     store_launcher_id: Bytes32,
     root_hash: Bytes32,
     epoch: &BigInt,
     required_collateral: Option<u64>,
-    claiming_peer_id: &str,
     claimed_coin_id: Bytes32,
 ) -> BondVerdict {
     let record = match source.coin_record(claimed_coin_id) {
@@ -190,17 +192,65 @@ pub fn verdict_for<S: ChainSource>(
         None => return BondVerdict::Unverified,
     }
 
-    // Step 5 — WHOSE bond is it? A valid, fully-collateralised coin bonding exactly this content
-    // still says nothing about the peer offering the record; every field of that record, including
-    // the coin id, was chosen by whoever answered the lookup. Only the coin's own declaration of a
-    // peer can close that, and this node cannot read one yet (see `peer_declaration`), so no claim
-    // is promoted today.
-    match peer_declaration(mirror.urls(), claiming_peer_id) {
+    // The chain half is satisfied. WHOSE bond it is is a separate question -- see `verdict_for`.
+    BondVerdict::Bonded
+}
+
+/// The full verdict: the chain half, then **whose bond it is**.
+///
+/// A valid, fully-collateralised coin bonding exactly this content still says nothing about the
+/// peer offering the record — every field of that record, the coin id included, was chosen by
+/// whoever answered the lookup. Only the coin's own owner-written declaration of a peer closes that,
+/// and this node cannot read one yet (see [`peer_declaration`]), so nothing is promoted today.
+///
+/// Credit is withheld, never subtracted: a record naming this coin may be a stranger's lie ABOUT the
+/// coin's real holder, and demoting on it is what would make that lie pay.
+pub fn verdict_for<S: ChainSource>(
+    source: &S,
+    store_launcher_id: Bytes32,
+    root_hash: Bytes32,
+    epoch: &BigInt,
+    required_collateral: Option<u64>,
+    claiming_peer_id: &str,
+    claimed_coin_id: Bytes32,
+) -> BondVerdict {
+    let chain = chain_bond_verdict(
+        source,
+        store_launcher_id,
+        root_hash,
+        epoch,
+        required_collateral,
+        claimed_coin_id,
+    );
+    if chain != BondVerdict::Bonded {
+        return chain;
+    }
+    match declared_peer(source, claimed_coin_id, claiming_peer_id) {
         PeerDeclaration::DeclaresThisPeer => BondVerdict::Bonded,
-        // Credit withheld, never subtracted: this record may be a stranger's lie about an honest
-        // holder's coin, and demoting on it is what would make that lie pay.
         PeerDeclaration::Silent | PeerDeclaration::NotReadable => BondVerdict::Unverified,
     }
+}
+
+/// Re-reads the coin whose chain checks already passed and asks whether it declares the claimant.
+///
+/// A second read rather than a returned `MirrorCoin` so [`chain_bond_verdict`] keeps the exact
+/// signature its conformance tests drive, and because the read is memoised one layer up: in
+/// production this path is unreachable until the declaration has a typed source.
+fn declared_peer<S: ChainSource>(
+    source: &S,
+    claimed_coin_id: Bytes32,
+    claiming_peer_id: &str,
+) -> PeerDeclaration {
+    let Ok(Some(record)) = source.coin_record(claimed_coin_id) else {
+        return PeerDeclaration::NotReadable;
+    };
+    let Ok(Some(spend)) = source.coin_spend(record.coin.parent_coin_info) else {
+        return PeerDeclaration::NotReadable;
+    };
+    let Ok(Some(mirror)) = MirrorCoin::from_creating_spend(&spend, claimed_coin_id) else {
+        return PeerDeclaration::NotReadable;
+    };
+    peer_declaration(mirror.urls(), claiming_peer_id)
 }
 
 /// The production [`MirrorBondVerifier`]: one bounded chain read per distinct claim, memoised.

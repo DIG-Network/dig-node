@@ -16,7 +16,7 @@ mod support;
 use chia_protocol::{Bytes32, CoinSpend};
 use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
 use dig_node_core::mirror_bond::BondVerdict;
-use dig_node_service::mirror::bond_verify::verdict_for;
+use dig_node_service::mirror::bond_verify::{chain_bond_verdict, verdict_for};
 use num_bigint::BigInt;
 use std::collections::HashMap;
 
@@ -159,13 +159,21 @@ fn two_honest_bonds() -> (Chain, Bytes32, Bytes32) {
     (chain, coin_1.coin_id(), coin_2.coin_id())
 }
 
+/// The CHAIN half of the verdict: does this coin bond this content, for this epoch?
+///
+/// Deliberately not the whole answer. `verdict_for` asks a second question — does the coin declare
+/// the peer claiming it — which nothing can answer affirmatively until `dig-mirror-coin` exposes a
+/// typed accessor for the declaration. Driving these conformance tests through the chain half keeps
+/// their `Bonded` control MEANINGFUL: if they went through `verdict_for`, the honest coin and a coin
+/// nobody could look up would both answer `Unverified`, and every negative case here would be
+/// equally explained by a fixture too broken to verify at all.
 fn verdict(
     chain: &impl ChainSource,
     root: Bytes32,
     coin: Bytes32,
     required: Option<u64>,
 ) -> BondVerdict {
-    verdict_for(chain, store_a(), root, &epoch(), required, coin)
+    chain_bond_verdict(chain, store_a(), root, &epoch(), required, coin)
 }
 
 /// **Proves:** a coin that bonds a DIFFERENT generation of the same store does not bond this one —
@@ -356,5 +364,50 @@ fn a_declaration_that_disagrees_with_its_own_hint_is_unbonded() {
         verdict(&chain, root_1(), coin.coin_id(), Some(COLLATERAL)),
         BondVerdict::Unbonded,
         "the declared tuple is right and the hint it sits under is not"
+    );
+}
+
+/// **Proves (dig-node#466, HIGH finding 2):** a coin that passes EVERY chain check is still not
+/// promoted, because nothing yet binds the coin to the peer claiming it.
+///
+/// **Catches:** the attack the chain half cannot see. This fixture is a real, fully collateralised
+/// mirror coin bonding exactly this `(store, root, epoch)` — the control above proves the chain half
+/// says `Bonded` for it. A coin id is a public fact, so ANY peer can publish a record carrying this
+/// coin id, this coin's honest holder's peer id, and its own addresses; every check that looks only
+/// at the coin passes, and the record is promoted to first while pointing at the publisher. Until
+/// the coin itself names its holder, the only sound answer is to promote nobody.
+///
+/// The two halves are asserted together on ONE fixture so the second cannot be satisfied by a
+/// broken chain: the same coin, same store, same root, same epoch, differing only in which question
+/// is asked.
+#[test]
+fn a_coin_that_passes_every_chain_check_is_still_not_promoted_to_a_claimant() {
+    let (chain, bonds_root_1, _bonds_root_2) = two_honest_bonds();
+    let claimant = "aa".repeat(32);
+
+    assert_eq!(
+        chain_bond_verdict(
+            &chain,
+            store_a(),
+            root_1(),
+            &epoch(),
+            Some(COLLATERAL),
+            bonds_root_1
+        ),
+        BondVerdict::Bonded,
+        "control: the chain half genuinely establishes this bond"
+    );
+    assert_eq!(
+        verdict_for(
+            &chain,
+            store_a(),
+            root_1(),
+            &epoch(),
+            Some(COLLATERAL),
+            &claimant,
+            bonds_root_1
+        ),
+        BondVerdict::Unverified,
+        "a bond proven on chain must not promote a peer the coin does not name"
     );
 }
