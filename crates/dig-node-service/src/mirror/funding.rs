@@ -532,7 +532,10 @@ fn select_within_input_bound<T>(
         });
     }
 
-    Ok(selected.into_iter().map(|(_, _, payload)| payload).collect())
+    Ok(selected
+        .into_iter()
+        .map(|(_, _, payload)| payload)
+        .collect())
 }
 
 /// What an operator must actually DO about a funding shortfall.
@@ -1204,9 +1207,8 @@ mod tests {
         let over_bound = at_bound + 1;
 
         // One base unit each, so covering N base units takes exactly N coins.
-        let coins = |n: usize| -> Vec<(u64, Bytes32, u64)> {
-            (0..n).map(|i| proven(1, i as u8)).collect()
-        };
+        let coins =
+            |n: usize| -> Vec<(u64, Bytes32, u64)> { (0..n).map(|i| proven(1, i as u8)).collect() };
 
         let at = select_within_input_bound(coins(at_bound), at_bound as u64);
         assert_eq!(

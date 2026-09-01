@@ -8654,3 +8654,54 @@ Changing the value affects only coins created after the change. Bringing an exis
 means reclaiming and re-creating it — a round trip and a fee — and the node MUST NOT reclaim in
 response to a configuration edit.
 
+
+### 25.11. Funding a create — authentication precedes every figure the operator is told
+
+The $DIG that funds a create is selected from ONE address: `dig_cat_puzzle_hash(owner)`, the CAT
+curry of the operator's own puzzle hash. That address is **publicly derivable** — the owner puzzle
+hash is public and the curry is canonical — and anyone may pay any coin to any puzzle hash. So a row
+returned by the scan is a CANDIDATE, never a coin, and the number and declared amounts of those rows
+are chosen by whoever last paid into the address.
+
+A candidate becomes one of this operator's coins only by AUTHENTICATION: its creating spend is read
+from chain and executed, and a CAT child matching the candidate is produced, of the $DIG asset and
+at this operator's puzzle hash. The node MUST NOT treat an unauthenticated candidate as money.
+
+**The node MUST authenticate before it computes any figure it reports.** In particular:
+
+* The spendable total in a shortfall MUST be the total of AUTHENTICATED candidates. It MUST NOT be
+  the address total. An understated total sends an operator to buy $DIG they already hold, and the
+  §25.12 gate then suppresses the correction as immaterial.
+* The input bound MUST be applied to a selection drawn from AUTHENTICATED candidates only. Applied
+  to the raw scan it is a bound a stranger sets, and the refusal it produces is the operator-facing
+  claim *the wallet holds enough $DIG, in too many pieces* — so a stranger paying enough small coins
+  into the address chooses which of two OPPOSITE instructions the operator is given, and an operator
+  holding nothing is told that adding more will not help.
+* A candidate that fails authentication MUST be passed over rather than aborting the selection, MUST
+  be counted and reported, and MUST NOT occupy an input slot.
+
+**Authentication costs one chain read per candidate, so it MUST be bounded by a constant** that does
+not depend on how many candidates exist. Without such a bound the reads one automated pass performs
+are chosen by whoever paid coins into the address, on the pass timer, indefinitely.
+
+**A walk truncated by that bound leaves the wallet UNMEASURED.** The node MUST refuse with a
+condition of its own that states NO total, and that classifies as §25.12's *unknown* — it MUST NOT
+report the total of the candidates that happened to be walked, and MUST NOT clear a live shortfall.
+
+### 25.12. Reporting a funding shortfall to the operator
+
+The node MUST distinguish three funding observations per pass — *healthy*, *short* (with the amount
+and the remedy), and *unknown* — and MUST raise an operator-facing message only on a CHANGE: once on
+entering the short state, again only when the remedy changes or the deficit grows materially, and
+once on recovery. An *unknown* observation MUST raise nothing and MUST NOT clear a live shortfall.
+
+**A pass that planned no create because it could afford none is SHORT, not healthy.** The two
+conditions that produce an empty create list are opposites — nothing to bond, and nothing
+affordable — and only the first is healthy. Classifying the second as healthy leaves the shortfall
+with no producer for the commonest real case (a wallet holding less than one create's collateral,
+which never attempts a create and so never produces a funding refusal), and worse, CLEARS a live
+shortfall and announces a recovery that has not happened.
+
+The figures a shortfall reports MUST be the money that must actually be ADDED: the $DIG remaining
+after the affordable creates were funded, against the cost of those that were not. The wallet
+balance alone overstates what is available towards the unmade creates.
