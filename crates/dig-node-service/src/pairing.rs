@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(pend["result"]["status"], json!("pending"));
 
         // Approve (master path) → the token is minted + persisted.
-        let ap = approve(&p, &config, json!(4), &json!({ "pairing_id": pid }));
+        let ap = approve(&p, config, json!(4), &json!({ "pairing_id": pid }));
         assert_eq!(ap["result"]["approved"], json!(true));
         let token_id = ap["result"]["token_id"].as_str().unwrap().to_string();
 
@@ -574,20 +574,17 @@ mod tests {
         assert_eq!(token.len(), 64, "64-hex scoped token");
 
         // The token is a valid paired token; a wrong one is not.
-        assert!(is_paired_token(&paired_tokens_path(&config), &token));
-        assert!(!is_paired_token(
-            &paired_tokens_path(&config),
-            "not-a-token"
-        ));
+        assert!(is_paired_token(&paired_tokens_path(config), &token));
+        assert!(!is_paired_token(&paired_tokens_path(config), "not-a-token"));
 
         // Delivered ONCE: a second poll no longer knows the id.
         let again = poll(&p, json!(6), &json!({ "pairing_id": pid }));
         assert_eq!(again["result"]["status"], json!("unknown"));
 
         // Revoke → the token stops authorizing.
-        let rv = revoke(&config, json!(7), &json!({ "token_id": token_id }));
+        let rv = revoke(config, json!(7), &json!({ "token_id": token_id }));
         assert_eq!(rv["result"]["revoked"], json!(true));
-        assert!(!is_paired_token(&paired_tokens_path(&config), &token));
+        assert!(!is_paired_token(&paired_tokens_path(config), &token));
     }
 
     #[test]
@@ -595,7 +592,7 @@ mod tests {
         let scratch = tmp_config();
         let config = scratch.path();
         let p = pending();
-        let resp = approve(&p, &config, json!(1), &json!({ "pairing_id": "nope" }));
+        let resp = approve(&p, config, json!(1), &json!({ "pairing_id": "nope" }));
         assert_eq!(
             resp["error"]["code"],
             json!(ErrorCode::InvalidParams.code())
@@ -611,17 +608,17 @@ mod tests {
         let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
 
         // Before approval: one pending, no tokens.
-        let l1 = list(&p, &config, json!(2));
+        let l1 = list(&p, config, json!(2));
         assert_eq!(l1["result"]["pending"].as_array().unwrap().len(), 1);
         assert_eq!(l1["result"]["pending"][0]["client_name"], json!("ext-A"));
         assert_eq!(l1["result"]["tokens"].as_array().unwrap().len(), 0);
 
-        approve(&p, &config, json!(3), &json!({ "pairing_id": pid.clone() }));
+        approve(&p, config, json!(3), &json!({ "pairing_id": pid.clone() }));
         // consume the pending via poll
         poll(&p, json!(4), &json!({ "pairing_id": pid }));
 
         // After: no pending, one issued token (value never listed).
-        let l2 = list(&p, &config, json!(5));
+        let l2 = list(&p, config, json!(5));
         assert_eq!(l2["result"]["pending"].as_array().unwrap().len(), 0);
         let tokens = l2["result"]["tokens"].as_array().unwrap();
         assert_eq!(tokens.len(), 1);
@@ -660,7 +657,7 @@ mod tests {
     fn load_paired_tokens_tolerates_missing_and_malformed() {
         let scratch = tmp_config();
         let config = scratch.path();
-        let path = paired_tokens_path(&config);
+        let path = paired_tokens_path(config);
         assert!(load_paired_tokens(&path).is_empty(), "missing file → empty");
         std::fs::write(&path, b"not json").unwrap();
         assert!(load_paired_tokens(&path).is_empty(), "malformed → empty");

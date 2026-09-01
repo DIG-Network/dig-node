@@ -6076,7 +6076,7 @@ mod tests {
             .prefix("dig-node-token-untrusted-")
             .tempdir()
             .expect("a scratch dir");
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         std::fs::create_dir_all(&dir).unwrap();
         let planted = "planted0".repeat(8); // a KNOWN 64-char attacker value (non-empty)
         std::fs::write(&path, &planted).unwrap();
@@ -6097,7 +6097,7 @@ mod tests {
             // The real second case. Only root can hand a file to another uid, which is exactly
             // the planting an unprivileged attacker would have to achieve — and it is what the
             // guard exists to refuse.
-            let foreign = dir.join("foreign").join(CONTROL_TOKEN_FILE);
+            let foreign = dir.path().join("foreign").join(CONTROL_TOKEN_FILE);
             std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
             std::fs::write(&foreign, &planted).unwrap();
             std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -6192,7 +6192,7 @@ mod tests {
             .prefix("dig-node-token-trusted-")
             .tempdir()
             .expect("a scratch dir");
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         std::fs::create_dir_all(&dir).unwrap();
         let existing = "a".repeat(64);
         std::fs::write(&path, &existing).unwrap();
@@ -6218,7 +6218,7 @@ mod tests {
             .prefix("dig-node-token-perms-")
             .tempdir()
             .expect("a scratch dir");
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         load_or_create_token_at(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -6378,7 +6378,7 @@ mod tests {
             .prefix("dig-node-token-denied-")
             .tempdir()
             .expect("a scratch dir");
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "a".repeat(64)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
