@@ -549,10 +549,11 @@ pub fn store_melt_enabled() -> bool {
 /// Pure core of [`store_melt_enabled`], so the policy is unit-tested without touching process-global
 /// env. Default ON; only an explicit falsy value disables it.
 fn resolve_store_melt_enabled(value: Option<&str>) -> bool {
-    !matches!(
-        value.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("off") | Some("0") | Some("false") | Some("no")
-    )
+    // The SHARED off-vocabulary (dig-node#459). This knob stops the node's ONLY irreversible-delete
+    // path, so the cost of an off-token it does not recognise is content deleted by a node whose
+    // operator believed they had stopped it — the widest gap of the five, and the reason the
+    // vocabulary is centralized rather than restated.
+    !crate::is_capability_off_token(value.unwrap_or_default())
 }
 
 /// The production [`MeltChain`] — [`confirm_melt_via_chain`] over the live coinset view, using the
