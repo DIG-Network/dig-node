@@ -1269,13 +1269,13 @@ mod tests {
     const DAY0: u64 = 1_700_000_000; // 2023-11-14 (a stable day)
     const DAY1: u64 = DAY0 + 86_400; // the next day
 
-    fn scratch() -> PathBuf {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("dig-tip-{}-{}", std::process::id(), n));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn scratch() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dig-tip-")
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     /// Build an engine over `dir` and seed its config (persisted).

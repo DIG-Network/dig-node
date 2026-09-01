@@ -125,11 +125,13 @@ mod tests {
     }
 
     /// A directory unique to one test, so tests never share a fixture path.
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("dig-seed-export-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn scratch(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("dig-seed-export-{tag}-"))
+            .tempdir()
+            .expect("scratch dir")
     }
 
     /// Write a seed file in the LEGACY on-disk layout — the one every real custodied file

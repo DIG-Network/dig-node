@@ -1035,17 +1035,13 @@ mod tests {
         ])
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "dig-node-warm-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("dig-node-warm-{tag}-"))
+            .tempdir()
+            .expect("a temp dir")
     }
 
     /// Counts announces, so "no announce happened" is an assertable property.

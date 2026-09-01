@@ -263,11 +263,13 @@ mod tests {
         SecretKey::from_seed(&seed).public_key()
     }
 
-    fn dir(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("dig-watchlist-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("dig-watchlist-{tag}-"))
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     #[test]

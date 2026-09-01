@@ -37,17 +37,13 @@ fn hex32(bytes: [u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "dig-node-warmloc-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("tempdir");
-    dir
+/// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+/// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+fn temp_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("dig-node-warmloc-{tag}-"))
+        .tempdir()
+        .expect("tempdir")
 }
 
 /// Confirms the fixture generation, so the warm passes its chain gate and reaches the locate step

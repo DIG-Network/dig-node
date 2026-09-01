@@ -5109,14 +5109,13 @@ mod tests {
 
     /// A scratch config dir unique to this process AND thread, so parallel tests never share a
     /// custody manifest.
-    fn refusal_scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-wallet-tip-refusal-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn refusal_scratch_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("dig-wallet-tip-refusal-{tag}-"))
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     /// Ask `be` for a tip and return the `NotExecutable` reason, asserting on the way that the
@@ -8328,12 +8327,11 @@ mod tests {
     /// address fallback too, so it could not tell the two implementations apart.
     #[tokio::test]
     async fn a_restarted_locked_node_still_refuses_a_bundle_over_its_non_primary_key() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-wallet-restart-guard-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard, so the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-wallet-restart-guard-")
+            .tempdir()
+            .expect("a scratch dir");
 
         // The wallet as a pre-#1701 install left it: two HD keys persisted in the manifest, the
         // seed unreadable. `primary` stands for the receive address the old fallback covered;

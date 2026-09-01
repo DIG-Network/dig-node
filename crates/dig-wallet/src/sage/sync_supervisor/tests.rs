@@ -721,12 +721,13 @@ impl Harness {
 }
 
 /// A unique temp config dir per test.
-fn scratch() -> PathBuf {
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("dig-wallet-sup-{}-{}", std::process::id(), n));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+/// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+fn scratch() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("dig-wallet-sup-")
+        .tempdir()
+        .expect("a scratch dir")
 }
 
 /// A custody with ONE wallet enrolled under `dir`, standing in for a pre-#1701 install.

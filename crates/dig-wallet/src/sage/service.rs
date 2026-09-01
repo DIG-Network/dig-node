@@ -448,12 +448,13 @@ mod tests {
     }
 
     /// A unique temp config dir per test.
-    fn scratch() -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("dig-wallet-svc-{}-{}", std::process::id(), n));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn scratch() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dig-wallet-svc-")
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     /// **Proves (#368):** the production assembler builds a served backend that answers

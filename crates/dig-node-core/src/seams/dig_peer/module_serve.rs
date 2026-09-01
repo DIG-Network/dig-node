@@ -381,16 +381,14 @@ mod tests {
     }
 
     /// Write `bytes` as the cached module for `(store, root)` under a fresh temp cache dir.
-    fn cache_with(bytes: &[u8], store: &str, root: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-modserve-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = module_path(&dir, store, root);
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn cache_with(bytes: &[u8], store: &str, root: &str) -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-modserve-")
+            .tempdir()
+            .expect("a cache dir");
+        let path = module_path(dir.path(), store, root);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
         dir
@@ -570,15 +568,11 @@ mod tests {
     /// it), however many extra entries other tests happen to interleave in.
     #[test]
     fn the_descriptor_memo_is_capped_and_evicts_stale_entries() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-modserve-memocap-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Owned by the guard, so the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-modserve-memocap-")
+            .tempdir()
+            .expect("a cache dir");
 
         // DESCRIPTOR_MEMO_CAP + 1 distinct (store, root) keys, none shared with any other test in
         // this file (those use small repeated-byte ids; these are sequential integers padded to
