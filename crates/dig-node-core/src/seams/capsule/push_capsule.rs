@@ -253,7 +253,7 @@ impl Node {
         provenance: RequestProvenance,
         requestor: RequestorId,
     ) -> Value {
-        let err = |code: i64, msg: &str| json!({"jsonrpc":"2.0","id":id.clone(),"error":{"code":code,"message":msg}});
+        let err = |code: i64, msg: &str| crate::seams::dig_rpc::errors::error_frame(&id, code, msg);
 
         let store_hex = params.get("store_id").and_then(Value::as_str).unwrap_or("");
         let root_hex = params.get("root").and_then(Value::as_str).unwrap_or("");
