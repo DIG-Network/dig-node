@@ -2910,17 +2910,17 @@ impl Node {
     /// `result.root` (64-hex) on success, or a `-32602`/`-32000` error.
     async fn anchored_root(&self, params: &Value, id: Value) -> Value {
         let Ok(store_id) = parse_store_id_arg(params) else {
-            return json!({"jsonrpc":"2.0","id":id,"error":{
-                "code":-32602,
-                "message":"params.store_id must be a 32-byte (64-hex) launcher id"}});
+            return rpc_err(
+                &id,
+                -32602,
+                "params.store_id must be a 32-byte (64-hex) launcher id",
+            );
         };
         match sync_datastore(&resolution_coinset(), store_id).await {
             Ok(store) => json!({"jsonrpc":"2.0","id":id,"result":{
                 "store_id": hex::encode(store_id),
                 "root": hex::encode(store.info.metadata.root_hash)}}),
-            Err(e) => json!({"jsonrpc":"2.0","id":id,"error":{
-                "code":-32000,
-                "message":format!("resolve anchored root: {e}")}}),
+            Err(e) => rpc_err(&id, -32000, &format!("resolve anchored root: {e}")),
         }
     }
 
@@ -3592,9 +3592,7 @@ impl Node {
     /// `-32011` dir not a readable directory, `-32012` no files staged,
     /// `-32013` over the store size cap, `-32014` compile/IO failure.
     fn stage(&self, params: &Value, id: Value) -> Value {
-        let err = |code: i64, msg: String| -> Value {
-            json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":msg}})
-        };
+        let err = |code: i64, msg: String| -> Value { rpc_err(&id, code, &msg) };
 
         // 1. The folder to publish (required, must be a readable directory).
         let Some(dir) = params
@@ -3829,9 +3827,7 @@ impl Node {
     async fn get_collection(params: &Value, id: Value) -> Value {
         let launcher_ids = match Self::parse_launcher_ids(params) {
             Ok(v) => v,
-            Err(msg) => {
-                return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":msg}})
-            }
+            Err(msg) => return rpc_err(&id, -32602, &msg),
         };
         // Optional declared creator DID (echoed back; the source of truth is the
         // items' on-chain attribution).
@@ -3846,10 +3842,7 @@ impl Node {
                 .await
             {
                 Ok(items) => items,
-                Err(e) => {
-                    return json!({"jsonrpc":"2.0","id":id,"error":{
-                    "code":-32000,"message":format!("read collection: {e}")}})
-                }
+                Err(e) => return rpc_err(&id, -32000, &format!("read collection: {e}")),
             };
         let summary = digstore_chain::collection_index::summarize_collection(&items);
         json!({"jsonrpc":"2.0","id":id,"result":{
@@ -3879,9 +3872,7 @@ impl Node {
     async fn list_collection_items(params: &Value, id: Value) -> Value {
         let launcher_ids = match Self::parse_launcher_ids(params) {
             Ok(v) => v,
-            Err(msg) => {
-                return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":msg}})
-            }
+            Err(msg) => return rpc_err(&id, -32602, &msg),
         };
         let total = launcher_ids.len();
         let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -3904,8 +3895,7 @@ impl Node {
             match digstore_chain::collection_index::index_collection_items(&chain, &page).await {
                 Ok(items) => items,
                 Err(e) => {
-                    return json!({"jsonrpc":"2.0","id":id,"error":{
-                    "code":-32000,"message":format!("list collection items: {e}")}})
+                    return rpc_err(&id, -32000, &format!("list collection items: {e}"))
                 }
             };
         let items: Vec<Value> = resolved.iter().map(Self::item_json).collect();
@@ -4450,9 +4440,7 @@ pub async fn handle_rpc_json(
     let req: Value = match serde_json::from_str(req_json) {
         Ok(v) => v,
         Err(e) => {
-            return json!({"jsonrpc":"2.0","id":null,
-                "error":{"code":-32700,"message":format!("parse error: {e}")}})
-            .to_string()
+            return rpc_err(&Value::Null, -32700, &format!("parse error: {e}")).to_string()
         }
     };
     handle_rpc(node, req, origin, provenance).await.to_string()
@@ -9127,6 +9115,141 @@ mod tests {
         assert_eq!(resp["error"]["code"], -32011, "bad dir ⇒ -32011: {resp}");
     }
 
+    /// **Proves:** no hand-built `{"error":{code,message}}` frame survives anywhere in this file.
+    ///
+    /// # Why this is a source scan rather than N behavioural assertions
+    ///
+    /// The eight sites this guards are spread across four RPC methods and the FFI entry point, and
+    /// three of them are reachable only on a chain-read failure — so a behavioural test for each
+    /// would need a chain double per arm, and the arms with no double would stay unguarded. That is
+    /// the shape that let the first sweep read as complete: a check whose denominator was smaller
+    /// than the defect. Scanning the file makes the denominator the file.
+    ///
+    /// **Catches:** any future edit that mints a frame inline instead of routing it through
+    /// [`crate::seams::dig_rpc::errors::error_frame`], which is the single place the taxonomy
+    /// discriminators are attached. A site added by hand carries neither `data.code` nor
+    /// `data.origin`, so a client is pushed back to parsing prose — the exact regression #340 closes.
+    ///
+    /// The two permitted shapes are stated positively rather than by line number: a frame that
+    /// carries `data` itself, and a fixture explicitly marked as the OLD shape (the negative control
+    /// a discriminator test needs in order to be load-bearing at all).
+    #[test]
+    fn no_hand_built_error_frame_remains_in_this_file() {
+        const SOURCE: &str = include_str!("lib.rs");
+        const MARKER: &str = "OLD-SHAPE FIXTURE";
+
+        // Assembled rather than written out, so the needle does not match its own definition.
+        let needle = ["\"error\"", ":{"].concat();
+
+        let mut offenders: Vec<usize> = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(found) = SOURCE[cursor..].find(&needle) {
+            let at = cursor + found;
+            cursor = at + 1;
+
+            // PROSE IS NOT CODE. A comment that describes the forbidden shape contains the needle
+            // by necessity - including this test's own doc comment. Excluding comments structurally
+            // means the next author can write an honest comment about a bare frame without
+            // breaking the build, which rewording one doc comment would not have bought.
+            let line_start = SOURCE[..at].rfind('\n').map_or(0, |n| n + 1);
+            if SOURCE[line_start..at].trim_start().starts_with("//") {
+                continue;
+            }
+            // A conforming frame attaches the discriminators inside the object it opens.
+            let tail = &SOURCE[at..SOURCE.len().min(at + 240)];
+            if tail.contains("\"data\"") {
+                continue;
+            }
+            // A deliberate negative control says so, next to itself.
+            let head = &SOURCE[at.saturating_sub(400)..at];
+            if head.contains(MARKER) {
+                continue;
+            }
+            offenders.push(SOURCE[..at].lines().count());
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these lines mint a bare error frame instead of calling errors::error_frame: {offenders:?}"
+        );
+    }
+
+    /// **Proves:** `dig.stage`'s refusal is branchable by machine name, not just by number.
+    ///
+    /// `dig.stage` had a local frame-building closure serving four declared codes
+    /// (`-32011`/`-32012`/`-32013`/`-32014`), so ONE unrouted closure blinded every stage failure at
+    /// once. Asserting the exact name rather than mere presence is what makes this fail on the
+    /// pre-fix tree instead of on any constant.
+    #[tokio::test]
+    async fn dig_stage_refusal_carries_its_machine_code() {
+        let (node, _td) = test_node(None);
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.stage",
+                "params":{"dir":"/no/such/folder/xyzzy"}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+
+        assert_eq!(resp["error"]["code"], -32011, "{resp}");
+        assert_eq!(
+            resp["error"]["data"]["code"],
+            json!("STAGE_INVALID_INPUT"),
+            "{resp}"
+        );
+    }
+
+    /// **Proves:** the FIRST frame a malformed client ever sees is branchable.
+    ///
+    /// A parse error is answered before any method is resolved, so it is the one frame a client
+    /// cannot have negotiated anything about. If it lacks the discriminators, a client's error
+    /// handling starts by parsing prose and never recovers.
+    #[tokio::test]
+    async fn a_parse_error_carries_its_machine_code() {
+        let (node, _td) = test_node(None);
+        let out = handle_rpc_json(
+            &node,
+            "{ this is not json",
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let resp: Value = serde_json::from_str(&out).expect("the refusal is itself valid JSON");
+
+        assert_eq!(resp["error"]["code"], json!(-32700), "{resp}");
+        assert_eq!(resp["error"]["data"]["code"], json!("PARSE_ERROR"), "{resp}");
+    }
+
+    /// **Proves:** the collection readers and `dig.anchoredRoot` reject bad params with the shared
+    /// machine name, so a client branches identically across all three surfaces.
+    ///
+    /// Three methods are asserted together because each had its OWN hand-built `-32602` frame; a
+    /// test covering one would have passed while the other two stayed blind.
+    #[tokio::test]
+    async fn invalid_params_refusals_share_one_machine_code() {
+        let (node, _td) = test_node(None);
+        for method in [
+            "dig.getAnchoredRoot",
+            "dig.getCollection",
+            "dig.listCollectionItems",
+        ] {
+            let resp = handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            )
+            .await;
+            assert_eq!(resp["error"]["code"], json!(-32602), "{method}: {resp}");
+            assert_eq!(
+                resp["error"]["data"]["code"],
+                json!("INVALID_PARAMS"),
+                "{method}: {resp}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dig_stage_empty_folder_is_catalogued_error() {
         let (node, _td) = test_node(None);
@@ -11896,7 +12019,9 @@ mod tests {
             "no whole-module read is paid for on an anonymous proof request: {ok}"
         );
 
-        // An inner ERROR passes through, re-tagged, so the caller learns why.
+        // An inner ERROR passes through, re-tagged, so the caller learns why. This is an
+        // OLD-SHAPE FIXTURE: a bare frame with no `data`, standing in for a peer still on the
+        // pre-#340 envelope, which this node must keep forwarding rather than reject.
         let failed = json!({"jsonrpc":"2.0","id":1,
             "error":{"code": -32004, "message":"resource not available"}});
         let through = proof_from_content_answer(failed, json!(7));
