@@ -50,9 +50,9 @@ async fn transport_with_one_peer() -> (
 
     let cfg = dig_gossip::GossipConfig {
         network_id: chia_protocol::Bytes32::new([7u8; 32]),
-        cert_path: dir.join("node.cert").display().to_string(),
-        key_path: dir.join("node.key").display().to_string(),
-        peers_file_path: dir.join("peers.json"),
+        cert_path: dir.path().join("node.cert").display().to_string(),
+        key_path: dir.path().join("node.key").display().to_string(),
+        peers_file_path: dir.path().join("peers.json"),
         peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
         listen_addr: std::net::SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
