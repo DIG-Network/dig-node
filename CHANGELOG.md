@@ -4,26 +4,13 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.190.0] - 2026-08-31
+## [0.206.0] - 2026-09-01
 
 ### Bug Fixes
-- **peers:** Withhold a non-destination address from `dig.getPeers` at the type boundary rather than serving `[::]:0` to remote peers as a dial candidate (#349)
-- **relay:** Fail closed on a relay endpoint that cannot be read, instead of accepting any scheme and silently dialling 443 on a malformed port (#285)
-- **config:** Read one shared off-token across `DIG_PEER_NETWORK`, `DIG_RELAY_URL` and `DIG_BOOTSTRAP_PEERS`, so `DIG_PEER_NETWORK=OFF` no longer leaves the peer network running (#282)
-- **config:** Treat `DIG_RELAY_URL=` as "no relay" rather than the compiled-in public relay, and log which bootstrap branch was taken (#352)
-- **wallet:** Hold a possibly-in-flight bundle's inputs to the TTL unless the mempool definitively refused it, closing the under-claim fail-open into the double-select window (#348)
+- **mirror:** Sign mirror spends under the Chia L1 genesis, not the DIG L2 one (#448)- **mirror,capsule,wallet:** Adopt chia-query 0.20.0, resolve landed spends, mark relayed backfills (#451)- **cli:** The CLI/service/updater batch — six user-visible dead ends (#458)- **security:** Correct the failure direction on five peer/network-facing input surfaces (#453)- **security:** Gate the wallet transport and make the no-mint rule structural (#452)- **wallet:** Distinguish unknown from zero across the wallet surface (#454)- **mirror:** Resolve landed spends, feed the DHT collateral pointer, bound funding inputs (#457)- **mirror:** Release the funding coins of a spend that never lands (#475)
 
-## [0.189.0] - 2026-08-31
-
-### Features
-- **wallet:** Surface the full node's own refusal reason on a rejected push (chia-query#48)
-
-### Bug Fixes
-- **capsule:** Require a holder claim to land a capsule, so an inbound-demand backfill cannot land a stranger's content bondable (#446)
-- **test:** Point the two mirror wallet fixtures at the Chia L1 signing domain (#449)
-
-### Miscellaneous
-- **deps:** chia-query 0.19.0 -> 0.20.0; read mempool ADMISSION rather than the conflated `success` flag
+### Testing
+- **wallet:** Make the TxStatus fixture actually call chia_query's ack_to_tx_status (#444)- **capsule:** Prove every remote-triggered cache-fill records Relayed provenance (#442)
 
 ## [0.183.0] - 2026-08-31
 
