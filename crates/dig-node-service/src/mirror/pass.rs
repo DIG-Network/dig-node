@@ -53,6 +53,39 @@ pub struct PassDecision {
     pub per_coin_dig_base_units: Option<u64>,
     /// One state per bond the node holds, for the §25.8 surface.
     pub states: Vec<(Bond, BondState)>,
+    /// What this pass could NOT afford to create, when the wallet was readable and came up short.
+    ///
+    /// `Some` exactly when at least one create was priced and left uncreated for want of funds —
+    /// [`BondState::Unfunded`]'s condition, carried in a shape the alert gate can decide on. `None`
+    /// means every planned create was affordable, which includes the ordinary case of a node with
+    /// nothing new to bond.
+    ///
+    /// It exists because "this pass created nothing" has two opposite causes, and the pass that
+    /// created nothing because it could afford nothing is precisely the shortfall dig-node#463 was
+    /// built to report. Reading it off the create loop cannot tell them apart; reading it off the
+    /// funds split can (dig-node#469).
+    pub funding_shortfall: Option<FundingShortfall>,
+}
+
+/// A pass that could not afford every create it planned.
+///
+/// # Why this carries the requirement and NOT the balance (dig-node#469)
+///
+/// It once carried a `have_dig_base_units` too — the $DIG left over after the affordable creates
+/// were funded, `balance % per_coin`. That figure is derived from `dig_balance_base_units`, the raw
+/// sum over `dig_cat_puzzle_hash(owner)`, and NEITHER balance tier authenticates CAT lineage. The
+/// address is publicly derivable, so the figure is one a stranger can move by paying a coin into
+/// it: planting just under one create's cost has the operator told they are a hair short when they
+/// are half a create short, and the alert gate then suppresses the correction as immaterial.
+///
+/// So the field is GONE rather than merely unused. An unauthenticated money figure that no caller
+/// currently renders is one refactor away from being rendered again; a struct that cannot hold it
+/// cannot regress. What survives is the requirement, which is derived from the epoch and the plan
+/// and which no stranger can move — see SPEC §25.11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingShortfall {
+    /// What the creates left uncreated would cost together, in $DIG base units.
+    pub need_dig_base_units: u64,
 }
 
 /// What the node can say about one bond right now.
@@ -217,11 +250,28 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
 
     let states = bond_states(inputs, &affordable, split.as_ref(), per_coin, &reclaim);
 
+    // The shortfall is read off the split rather than off the states, because the split is what
+    // decided it: `short` is non-empty exactly when a priced create went unmade for want of funds.
+    // What it reports is the COST of those unmade creates and nothing about the wallet — the
+    // balance that produced the split is unauthenticated, and no figure derived from it may reach
+    // an operator (SPEC §25.11, dig-node#469).
+    let funding_shortfall = match (per_coin, split.as_ref()) {
+        // `per_coin` of zero is refused as a create everywhere else in this crate; a requirement of
+        // zero is a caller defect, not an empty wallet, so it reports no shortfall.
+        (Some(per_coin), Some(split)) if per_coin > 0 && !split.is_funded() => {
+            Some(FundingShortfall {
+                need_dig_base_units: split.shortfall_dig_base_units,
+            })
+        }
+        _ => None,
+    };
+
     PassDecision {
         reclaim,
         create: affordable,
         per_coin_dig_base_units: per_coin,
         states,
+        funding_shortfall,
     }
 }
 
@@ -410,6 +460,71 @@ mod tests {
             dig_balance_base_units: Some(1_000_000),
             creates_enabled: true,
         }
+    }
+
+    /// **Proves:** a partially funded pass reports the money that must actually be ADDED, not the
+    /// whole cost of the creates it could not make.
+    ///
+    /// **Catches:** the two plausible wrong figures, each of which is a false money statement to an
+    /// operator (dig-node#469):
+    ///
+    /// * quoting the WALLET BALANCE as what is available — money that has already been spent on the
+    ///   affordable creates, so the deficit reads as smaller than it is and an operator who adds
+    ///   that much is still short;
+    /// * quoting zero as available — the deficit then reads as the full cost of every unmade create,
+    ///   sending them to buy $DIG they already hold.
+    ///
+    /// # The fixture is chosen so the three candidate figures all DIFFER
+    ///
+    /// Three bonds at 1,000 each against a balance of 2,400: two are affordable, one is not, and
+    /// 400 is left over. So the honest answer is *400 towards the 1,000 still needed*. A balance of
+    /// 2,000 or 3,000 would make the remainder zero and let a wrong implementation agree by
+    /// accident; the deliberate 400 is what separates them.
+    #[test]
+    fn a_partially_funded_pass_reports_the_leftover_against_what_is_still_needed() {
+        let held = [bond("aa", "11"), bond("bb", "22"), bond("cc", "33")];
+        let requirement = known();
+        let mut inputs = inputs(&held, &[], &requirement);
+        inputs.dig_balance_base_units = Some(REQUIRED * 2 + 400);
+
+        let decision = decide(&inputs);
+
+        assert_eq!(
+            decision.create.len(),
+            2,
+            "the fixture must genuinely fund some and not others, or it tests nothing"
+        );
+        assert_eq!(
+            decision.funding_shortfall,
+            Some(FundingShortfall {
+                need_dig_base_units: REQUIRED,
+            }),
+            concat!(
+                "the cost of the unmade create is the one figure here no stranger can move; the ",
+                "leftover balance is an unauthenticated sum over a public address (SPEC 25.11)"
+            )
+        );
+    }
+
+    /// **Proves:** a pass that funded everything it planned reports NO shortfall.
+    ///
+    /// The other half of the pair above, and the reason it is a separate test: without it, an
+    /// implementation that reports a shortfall on every pass satisfies the partial case and turns
+    /// the funding alert into the per-pass stream `FundingAlertGate` exists to prevent. A node with
+    /// nothing new to bond is the ordinary state and must be silent.
+    #[test]
+    fn a_pass_that_afforded_everything_reports_no_shortfall() {
+        let held = [bond("aa", "11")];
+        let requirement = known();
+        let inputs = inputs(&held, &[], &requirement);
+
+        let decision = decide(&inputs);
+
+        assert_eq!(decision.create.len(), 1, "the create is affordable");
+        assert_eq!(
+            decision.funding_shortfall, None,
+            "a funded pass must not report a shortfall, or every pass alerts"
+        );
     }
 
     #[test]
