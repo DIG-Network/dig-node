@@ -1116,7 +1116,7 @@ async fn a_wallet_created_after_boot_is_subscribed_without_waiting_for_a_disconn
 #[tokio::test]
 async fn phase_is_syncing_when_caught_up_but_no_peer() {
     let db = WalletDb::open_in_memory().await.unwrap();
-    db.set_initial_sync_complete(true).await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
     db.set_peak(6_000_000, "aa").await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
@@ -1173,7 +1173,7 @@ async fn phase_ladder_not_started_syncing_synced() {
         SyncPhase::Syncing
     );
 
-    db.set_initial_sync_complete(true).await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
     assert_eq!(
         handle
             .status(&db, ChainPeerTier::UNOBSERVABLE)
@@ -1389,7 +1389,7 @@ async fn a_previously_synced_wallet_restarted_locked_is_not_reported_as_synced()
     let db = WalletDb::open_in_memory().await.unwrap();
     db.set_peak(9_131_403, "aa").await.unwrap();
     // The catch-up genuinely completed in an earlier run, and the flag persists across restarts.
-    db.set_initial_sync_complete(true).await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
@@ -1420,7 +1420,7 @@ async fn a_previously_synced_wallet_restarted_locked_is_not_reported_as_synced()
 #[tokio::test]
 async fn a_completed_catch_up_still_reports_synced_while_watching_addresses() {
     let db = WalletDb::open_in_memory().await.unwrap();
-    db.set_initial_sync_complete(true).await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
@@ -3190,7 +3190,7 @@ fn tier_at(peak: u32) -> ChainPeerTier {
 #[tokio::test]
 async fn a_replica_behind_its_peers_is_not_reported_as_synced() {
     let db = WalletDb::open_in_memory().await.unwrap();
-    db.set_initial_sync_complete(true).await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
     db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
@@ -3217,7 +3217,7 @@ async fn a_replica_behind_its_peers_is_not_reported_as_synced() {
 #[tokio::test]
 async fn the_following_tolerance_holds_at_the_bound_and_fails_one_beyond_it() {
     let db = WalletDb::open_in_memory().await.unwrap();
-    db.set_initial_sync_complete(true).await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
     db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
@@ -3251,7 +3251,7 @@ async fn the_following_tolerance_holds_at_the_bound_and_fails_one_beyond_it() {
 #[tokio::test]
 async fn an_unmeasured_height_leaves_the_phase_unchanged() {
     let db = WalletDb::open_in_memory().await.unwrap();
-    db.set_initial_sync_complete(true).await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
@@ -4296,7 +4296,7 @@ async fn one_host_is_one_voice_however_many_ports_it_answers_on() {
 async fn a_refused_writer_is_not_reported_as_synced() {
     let db = WalletDb::open_in_memory().await.unwrap();
     // The catch-up genuinely completed in an earlier run; the flag is persistent.
-    db.set_initial_sync_complete(true).await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
