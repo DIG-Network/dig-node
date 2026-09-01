@@ -479,7 +479,7 @@ mod tests {
 
     async fn test_backend() -> Arc<WalletBackend> {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         Arc::new(WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
