@@ -16,7 +16,6 @@
 //! [`crate::download::NodeContent::warm_provider_locator`], which is the handle production uses.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
