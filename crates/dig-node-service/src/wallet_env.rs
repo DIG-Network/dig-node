@@ -62,9 +62,10 @@ pub const SPLIT_ROOTS: &str = concat!(
     "the wallet's per-user root and the node's per-user root DISAGREE in this process. ",
     "LOCALAPPDATA relocated the seed, its metadata and the device key, but NOT the node's ",
     "cache, config.json, or the wallet.sqlite coin replica - those resolve through the OS ",
-    "known-folder API, which does not read that variable. Set DIG_NODE_CACHE to move the ",
-    "replica and cache alongside the seed, or unset LOCALAPPDATA to leave both at the ",
-    "machine default."
+    "known-folder API, which does not read that variable. The replica this run will open is ",
+    "logged as `replica` below; note it sits BESIDE the cache directory, not inside it. To put ",
+    "both halves in one place set DIG_NODE_CACHE as well, or unset LOCALAPPDATA to leave both ",
+    "at the machine default."
 );
 
 /// The prose for the refusal. It must leave no doubt that the disk was not touched: an operator who
@@ -73,7 +74,7 @@ pub const SPLIT_ROOTS: &str = concat!(
 pub const REFUSED_SPLIT_MINT: &str = concat!(
     "no wallet exists yet and the wallet and node roots disagree, so NOTHING was minted and ",
     "NOTHING was written. Minting here would put the seed under one root and the wallet.sqlite ",
-    "replica under another. Set DIG_NODE_CACHE alongside LOCALAPPDATA so both halves land in ",
+    "replica under another. Set DIG_NODE_CACHE as well as LOCALAPPDATA so both halves land in ",
     "one place, or unset LOCALAPPDATA, then start the node again."
 );
 
@@ -125,6 +126,24 @@ pub fn inert_wallet_port(raw: Option<&str>) -> Option<&str> {
     raw.filter(|p| !p.is_empty())
 }
 
+/// The coin replica that hangs off the node's config, given that config's path.
+///
+/// A SIBLING of the config file, which is itself a sibling of the cache directory - so an operator
+/// who sets `DIG_NODE_CACHE` and then looks for `wallet.sqlite` INSIDE that directory does not find
+/// it, and concludes the second lever failed too. Naming the resolved file is worth more than
+/// naming the variable. Pure, so the derivation is checkable without resolving anything.
+pub fn replica_beside(config: &Path) -> PathBuf {
+    config
+        .parent()
+        .map(|p| p.join("wallet.sqlite"))
+        .unwrap_or_else(|| PathBuf::from("wallet.sqlite"))
+}
+
+/// [`replica_beside`] against the config path this process resolves.
+pub fn replica_path() -> PathBuf {
+    replica_beside(&dig_node_core::config_path())
+}
+
 /// Emitted once per process; a serve entrypoint that runs twice must not say it twice.
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
@@ -132,7 +151,7 @@ static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 ///
 /// Called from the serve entrypoints BEFORE the bootstrap, so an operator reads why a wallet was
 /// refused before - not after - the line that would have said one was minted.
-pub fn announce(split: Option<&WalletRootSplit>, wallet_port: Option<&str>) {
+pub fn announce(split: Option<&WalletRootSplit>, replica: &Path, wallet_port: Option<&str>) {
     if ANNOUNCED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -140,6 +159,7 @@ pub fn announce(split: Option<&WalletRootSplit>, wallet_port: Option<&str>) {
         tracing::warn!(
             wallet_base = %split.wallet_base.display(),
             node_base = %split.node_base.display(),
+            replica = %replica.display(),
             "{SPLIT_ROOTS}"
         );
     }
@@ -153,7 +173,11 @@ pub fn announce(split: Option<&WalletRootSplit>, wallet_port: Option<&str>) {
 pub fn announce_from_env() {
     let split = wallet_root_split();
     let raw = std::env::var("DIG_WALLET_PORT").ok();
-    announce(split.as_ref(), inert_wallet_port(raw.as_deref()));
+    announce(
+        split.as_ref(),
+        &replica_path(),
+        inert_wallet_port(raw.as_deref()),
+    );
 }
 
 #[cfg(test)]
@@ -197,6 +221,15 @@ mod tests {
         assert_eq!(inert_wallet_port(Some("9877")), Some("9877"));
         assert_eq!(inert_wallet_port(None), None);
         assert_eq!(inert_wallet_port(Some("")), None);
+    }
+
+    /// The replica is a SIBLING of the config file, never a child of the cache directory.
+    #[test]
+    fn the_replica_sits_beside_the_config_not_inside_the_cache() {
+        assert_eq!(
+            replica_beside(Path::new("/iso/config.json")),
+            PathBuf::from("/iso/wallet.sqlite")
+        );
     }
 
     #[test]
