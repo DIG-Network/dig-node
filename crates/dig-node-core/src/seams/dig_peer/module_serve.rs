@@ -404,7 +404,7 @@ mod tests {
         let bytes: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         let dir = cache_with(&bytes, &store, &root);
 
-        let info = describe_module(&dir, &store, &root).expect("held");
+        let info = describe_module(dir.path(), &store, &root).expect("held");
         assert_eq!(info.total_size, bytes.len() as u64);
         assert_eq!(info.module_hash, hex32(&sha256(&bytes)));
         assert_eq!(info.chunk_lens.iter().sum::<u64>(), info.total_size);
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn an_unheld_module_is_not_described() {
         let dir = cache_with(b"x", &hex_id(1), &hex_id(2));
-        assert!(describe_module(&dir, &hex_id(9), &hex_id(9)).is_none());
+        assert!(describe_module(dir.path(), &hex_id(9), &hex_id(9)).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -429,7 +429,7 @@ mod tests {
     fn an_empty_module_file_is_not_described() {
         let (store, root) = (hex_id(3), hex_id(4));
         let dir = cache_with(b"", &store, &root);
-        assert!(describe_module(&dir, &store, &root).is_none());
+        assert!(describe_module(dir.path(), &store, &root).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -438,8 +438,8 @@ mod tests {
     #[test]
     fn a_non_canonical_id_never_reaches_the_filesystem() {
         let dir = cache_with(b"x", &hex_id(1), &hex_id(2));
-        assert!(describe_module(&dir, "../../etc", &hex_id(2)).is_none());
-        assert!(read_module_window(&dir, "../../etc", &hex_id(2), 0, 16).is_none());
+        assert!(describe_module(dir.path(), "../../etc", &hex_id(2)).is_none());
+        assert!(read_module_window(dir.path(), "../../etc", &hex_id(2), 0, 16).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -471,7 +471,7 @@ mod tests {
         let bytes: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
         let dir = cache_with(&bytes, &store, &root);
         assert_eq!(
-            read_module_window(&dir, &store, &root, 100, 50).expect("held"),
+            read_module_window(dir.path(), &store, &root, 100, 50).expect("held"),
             bytes[100..150]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -486,12 +486,12 @@ mod tests {
         let dir = cache_with(&bytes, &store, &root);
 
         // Past the end: an empty window, not an error and not a wrapped read.
-        assert!(read_module_window(&dir, &store, &root, 1_000, 10)
+        assert!(read_module_window(dir.path(), &store, &root, 1_000, 10)
             .expect("held")
             .is_empty());
         // Absurd length: clamped to what exists.
         assert_eq!(
-            read_module_window(&dir, &store, &root, 0, u64::MAX)
+            read_module_window(dir.path(), &store, &root, 0, u64::MAX)
                 .expect("held")
                 .len(),
             100
@@ -513,7 +513,7 @@ mod tests {
 
         let offset = MAX_MODULE_WINDOW * 2 + 17;
         let want = 4096u64;
-        let window = read_module_window(&dir, &store, &root, offset, want).expect("held");
+        let window = read_module_window(dir.path(), &store, &root, offset, want).expect("held");
 
         assert_eq!(window.len(), want as usize);
         assert_eq!(window, bytes[offset as usize..(offset + want) as usize]);
@@ -532,8 +532,8 @@ mod tests {
         let bytes: Vec<u8> = (0..2000u32).map(|i| (i % 200) as u8).collect();
         let dir = cache_with(&bytes, &store, &root);
 
-        let real = describe_module(&dir, &store, &root).expect("held");
-        let metadata = std::fs::metadata(module_path(&dir, &store, &root)).unwrap();
+        let real = describe_module(dir.path(), &store, &root).expect("held");
+        let metadata = std::fs::metadata(module_path(dir.path(), &store, &root)).unwrap();
         let sentinel = ModuleInfo {
             module_hash: "0".repeat(64),
             ..real.clone()
@@ -547,7 +547,7 @@ mod tests {
             },
         );
 
-        let second = describe_module(&dir, &store, &root).expect("held");
+        let second = describe_module(dir.path(), &store, &root).expect("held");
         assert_eq!(
             second.module_hash, sentinel.module_hash,
             "the unchanged file's second describe_module call is answered from the memo"
@@ -581,10 +581,10 @@ mod tests {
             .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 10_000_000)))
             .collect();
         for (store, root) in &keys {
-            let path = module_path(&dir, store, root);
+            let path = module_path(dir.path(), store, root);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, b"x").unwrap();
-            describe_module(&dir, store, root).expect("held");
+            describe_module(dir.path(), store, root).expect("held");
         }
 
         let first = keys[0].clone();

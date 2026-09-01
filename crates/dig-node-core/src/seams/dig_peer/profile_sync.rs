@@ -1493,7 +1493,7 @@ mod tests {
         // A PLACEMENT property, asserted on the path relationship rather than on an outcome a
         // differently-placed store would satisfy identically.
         let cache = tempdir();
-        let store = ProfileBodyStore::under_cache_dir(&cache);
+        let store = ProfileBodyStore::under_cache_dir(cache.path());
         let path = store.path(&store_id(1), &[2u8; 32]);
         assert!(path.starts_with(cache.path().join(PROFILES_DIR)));
         assert!(
@@ -2112,10 +2112,10 @@ mod tests {
 
         // A short name, an uppercase-hex name of the right length, and a loose file at the top of
         // the tree — each is 64-hex-adjacent and none of them is a store id.
-        std::fs::create_dir_all(root_dir.join("not-a-store-id")).expect("dir");
-        std::fs::create_dir_all(root_dir.join(hex::encode(store_id(9)).to_uppercase()))
+        std::fs::create_dir_all(root_dir.path().join("not-a-store-id")).expect("dir");
+        std::fs::create_dir_all(root_dir.path().join(hex::encode(store_id(9)).to_uppercase()))
             .expect("dir");
-        std::fs::write(root_dir.join("README.txt"), b"not a store").expect("file");
+        std::fs::write(root_dir.path().join("README.txt"), b"not a store").expect("file");
 
         assert_eq!(store.held_pairs(), vec![(store_id(1), root)]);
     }

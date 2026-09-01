@@ -4216,10 +4216,13 @@ pub(crate) mod tests {
 
     /// Build a real, freshly-started `GossipHandle` on the production-shaped dual-stack unspecified
     /// bind (`[::]:0`, §5.2) for the pool-handle tests.
+    /// The scratch guard rides along with the handle, for the reason
+    /// [`fresh_pool_handle_on`] documents: the started pool reads its cert files for its
+    /// whole lifetime, so the caller holds both.
     pub(crate) async fn fresh_pool_handle(
         tag: &str,
         network: [u8; 32],
-    ) -> dig_gossip::GossipHandle {
+    ) -> (dig_gossip::GossipHandle, tempfile::TempDir) {
         fresh_pool_handle_on(tag, network, fresh_pool_listen_addr().await).await
     }
 
