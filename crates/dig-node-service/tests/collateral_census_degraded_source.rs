@@ -178,16 +178,15 @@ impl ChainSource for Chain {
 }
 
 /// A store in a fresh temp dir holding only the epoch-1 record the bring-up writes.
-fn seeded_store(name: &str) -> (EpochRecordStore, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
-        "dig-node-405-{name}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let store = EpochRecordStore::at(dir.join("collateral-epochs.jsonl"));
+/// The guard is returned with the store, which writes into the tree for as long as
+/// the caller holds it; `TempDir`'s `Drop` then removes it, including on an unwind
+/// (dig-node#370).
+fn seeded_store(name: &str) -> (EpochRecordStore, tempfile::TempDir) {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("dig-node-405-{name}-"))
+        .tempdir()
+        .expect("temp dir");
+    let store = EpochRecordStore::at(dir.path().join("collateral-epochs.jsonl"));
     store
         .put(&StoredRecord::bootstrap())
         .expect("seed the genesis record");
