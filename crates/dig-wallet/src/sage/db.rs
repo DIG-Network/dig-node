@@ -2052,6 +2052,27 @@ impl WalletDb {
         .bind(row.spent_timestamp)
         .execute(&mut *tx)
         .await?;
+        // dig-node#479 — HOLD the promoted coin for the arrivals recorder, in this same
+        // transaction.
+        //
+        // A CAT never passes through `apply_coin_states` into `coins` the way an XCH coin does: it
+        // lands at a derived outer hash, is staged, and reaches `coins` only HERE, after
+        // `record_arrivals` has already run on its frame and advanced the baseline past its
+        // height. Without a hold, the next pass's candidate query misses it on all three
+        // predicates — confirmed, at or below the baseline, not pending — and the user is never
+        // told they were paid. That is precisely the asymmetry #479 reports: XCH notifies, $DIG
+        // does not.
+        //
+        // The hold says only "seen, not yet judged". It does not announce anything:
+        // [`crate::sage::arrivals::classify`] remains the sole authority and still answers
+        // `OwnChange` for the wallet's own change and `Backfill` once the coin is settled, so this
+        // cannot manufacture an arrival that the ordinary path would have refused. It restores the
+        // examination a staged coin was skipped for, nothing more.
+        sqlx::query("INSERT OR IGNORE INTO arrival_pending (coin_id, created_height) VALUES (?, ?)")
+            .bind(Self::normalise_hex(&row.coin_id))
+            .bind(row.created_height.unwrap_or(0))
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(true)
     }
