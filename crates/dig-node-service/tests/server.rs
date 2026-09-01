@@ -733,10 +733,10 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
             .prefix("dig-node-dual-")
             .tempdir()
             .expect("a scratch dir");
-        std::env::set_var("DIG_NODE_CACHE", &tmp);
+        std::env::set_var("DIG_NODE_CACHE", tmp.path());
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
         // Isolate the #501 control-token/paired-token state dir per test (see the note above).
-        std::env::set_var("DIG_NODE_STATE_DIR", &tmp);
+        std::env::set_var("DIG_NODE_STATE_DIR", tmp.path());
         // This test exercises the LISTENER bind fallback, not the peer network. Opt out of the
         // §14 peer-network bring-up (#213) so `serve_with_shutdown` stays hermetic here (no gossip
         // pool / DHT / relay reach). A dedicated test covers the peer-network wiring.
@@ -803,10 +803,10 @@ async fn dual_stack_loopback_serves_both_ipv4_and_ipv6_on_the_same_port() {
             .prefix("dig-node-dualstack-")
             .tempdir()
             .expect("a scratch dir");
-        std::env::set_var("DIG_NODE_CACHE", &tmp);
+        std::env::set_var("DIG_NODE_CACHE", tmp.path());
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
         // Isolate the #501 control-token/paired-token state dir per test (see the note above).
-        std::env::set_var("DIG_NODE_STATE_DIR", &tmp);
+        std::env::set_var("DIG_NODE_STATE_DIR", tmp.path());
         std::env::set_var("DIG_PEER_NETWORK", "off");
         tokio::spawn(async move {
             dig_node_service::server::serve_with_shutdown(config, async move {
@@ -2989,7 +2989,7 @@ async fn control_updater_status_and_mutation_wired_over_http() {
     std::fs::create_dir_all(&status_dir).unwrap();
     let body = json!({ "schema": 1, "version": "0.6.0", "channel": "alpha", "paused": false });
     std::fs::write(
-        status_dir.join("status.json"),
+        status_dir.path().join("status.json"),
         serde_json::to_vec(&body).unwrap(),
     )
     .unwrap();
