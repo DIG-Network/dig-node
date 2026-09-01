@@ -3755,7 +3755,10 @@ fn unwatch_removes_the_address_from_the_subscription_set() {
     std::fs::create_dir_all(&dir).unwrap();
     let registry = crate::sage::watchlist::WatchRegistry::new(dir.path());
     registry.watch(&[registered_key(3), registered_key(4)]);
-    let union = UnionPuzzleHashSource::new(WalletCustody::open(dir.path().to_path_buf()), registry.clone());
+    let union = UnionPuzzleHashSource::new(
+        WalletCustody::open(dir.path().to_path_buf()),
+        registry.clone(),
+    );
     assert_eq!(union.puzzle_hashes().len(), 2);
 
     registry.unwatch(&[registered_key(3)]);
@@ -3834,11 +3837,14 @@ fn an_enrolled_but_unreachable_custody_is_not_an_all_clear_through_the_union() {
     enrolled_custody(dir.path());
     // Drop the manifest so it is rebuilt from the seed file alone, without public keys — one of the
     // four reachable states where an enrolled wallet derives no address.
-    std::fs::remove_file(dir.path().join("wallets").join("index.json")).expect("remove the manifest");
+    std::fs::remove_file(dir.path().join("wallets").join("index.json"))
+        .expect("remove the manifest");
     let healed = WalletCustody::open(dir.path().to_path_buf());
 
-    let union =
-        UnionPuzzleHashSource::new(healed, crate::sage::watchlist::WatchRegistry::new(dir.path()));
+    let union = UnionPuzzleHashSource::new(
+        healed,
+        crate::sage::watchlist::WatchRegistry::new(dir.path()),
+    );
 
     assert!(
         union.puzzle_hashes().is_empty(),

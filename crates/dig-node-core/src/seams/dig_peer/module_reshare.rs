@@ -2268,9 +2268,14 @@ mod tests {
         // Both capsules land in the SAME cache, which is what a node that both relays and reshares
         // actually looks like on disk.
         let spy = Arc::new(AnnounceSpy::default());
-        let relayed = serving_warmer_for(dir.path(), &spy, STORE, module_committing(STORE, chain_root()))
-            .warm_relayed(&relay_store_hex, &root_hex)
-            .await;
+        let relayed = serving_warmer_for(
+            dir.path(),
+            &spy,
+            STORE,
+            module_committing(STORE, chain_root()),
+        )
+        .warm_relayed(&relay_store_hex, &root_hex)
+        .await;
         let local = serving_warmer_for(
             dir.path(),
             &spy,
@@ -2296,7 +2301,8 @@ mod tests {
         );
         assert!(
             std::fs::read(
-                dir.path().join("cache")
+                dir.path()
+                    .join("cache")
                     .join("modules")
                     .join(&relay_store_hex)
                     .join(format!("{root_hex}.dig"))

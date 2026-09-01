@@ -4118,7 +4118,8 @@ pub(crate) mod tests {
         // IPv6 loopback (§5.2 IPv6-first) so the inbound accept registers on every platform.
         let loopback_v6 = "[::1]:0".parse().expect("parse [::1]:0");
         let (node_a, _node_a_dir) = fresh_pool_handle("loopback-a", [0x5au8; 32]).await;
-        let (node_b, _node_b_dir) = fresh_pool_handle_on("loopback-b", [0x5au8; 32], loopback_v6).await;
+        let (node_b, _node_b_dir) =
+            fresh_pool_handle_on("loopback-b", [0x5au8; 32], loopback_v6).await;
 
         let a_peer_id = hex::encode(node_a.local_peer_id().expect("node A local_peer_id"));
         let b_port = node_b

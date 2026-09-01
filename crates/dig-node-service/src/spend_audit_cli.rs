@@ -468,8 +468,7 @@ mod tests {
     #[test]
     fn an_empty_record_says_no_money_moved_unattended() {
         let (log, _scratch) = tmp_log();
-        let out =
-            run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
+        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         assert_eq!(out.result["count"], 0);
         assert!(
             out.summary.contains("no money unattended"),

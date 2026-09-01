@@ -1348,7 +1348,14 @@ mod tests {
         let dir = scratch();
         let owner = MockOwner::some(&owner_hex());
         let sp = MockSpender::new();
-        let eng = make(dir.path(), owner.clone(), sp, FixedClock::at(DAY0), test_config()).await;
+        let eng = make(
+            dir.path(),
+            owner.clone(),
+            sp,
+            FixedClock::at(DAY0),
+            test_config(),
+        )
+        .await;
 
         // Two auto-tips for the same store on the same day: the first tips, the second is an
         // idempotent skip — but the owner is resolved only ONCE (cached).
@@ -1525,7 +1532,14 @@ mod tests {
         cfg.daily_total_cap = 10_000; // not the binding constraint here
         let sp = MockSpender::new();
         let clock = FixedClock::at(DAY0);
-        let eng = make(dir.path(), MockOwner::some(&owner_hex()), sp.clone(), clock, cfg).await;
+        let eng = make(
+            dir.path(),
+            MockOwner::some(&owner_hex()),
+            sp.clone(),
+            clock,
+            cfg,
+        )
+        .await;
 
         // First store → owner tipped. A DIFFERENT store with the SAME owner the same day would
         // exceed the per-site cap (idempotency already blocks the same store; force a manual-style
@@ -1875,7 +1889,11 @@ mod tests {
     #[tokio::test]
     async fn present_but_corrupt_ledger_fails_closed_no_retip() {
         let dir = scratch();
-        std::fs::write(dir.path().join("tip-ledger.json"), b"{ this is not valid json ]").unwrap();
+        std::fs::write(
+            dir.path().join("tip-ledger.json"),
+            b"{ this is not valid json ]",
+        )
+        .unwrap();
         let sp = MockSpender::new();
         let eng = load_only(
             dir.path(),
