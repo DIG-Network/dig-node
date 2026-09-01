@@ -277,3 +277,93 @@ fn served_classes_are_well_formed() {
         }
     }
 }
+
+/// THE INVARIANT, not a list: for every code the shell catalogues that the shared
+/// `dig-rpc-protocol` contract also declares, the shell's machine name MUST equal the
+/// crate's. A hard-coded assertion on one number only ever checks that number; this is
+/// the test that catches the NEXT drift, wherever it appears.
+///
+/// `DispatchFailed`/-32000 is the one deliberate exclusion: the shell mints it and
+/// publishes it under its own name, so shell and wire AGREE there. Reconciling it with
+/// the crate's generic `SERVER_ERROR` is a genuine shipped-name change with a different
+/// risk profile, tracked separately.
+#[test]
+fn shell_error_names_match_the_shared_catalogue() {
+    let mut checked = 0usize;
+    let mut drifted: Vec<String> = Vec::new();
+
+    for shell in ErrorCode::all() {
+        if *shell == ErrorCode::DispatchFailed {
+            continue;
+        }
+        let Some(shared) = dig_rpc_protocol::ErrorCode::ALL
+            .iter()
+            .find(|c| i64::from(c.code()) == shell.code())
+        else {
+            continue;
+        };
+        checked += 1;
+        if shell.name() != shared.machine_code() {
+            drifted.push(format!(
+                "{}: shell says {:?}, dig-rpc-protocol says {:?}",
+                shell.code(),
+                shell.name(),
+                shared.machine_code()
+            ));
+        }
+    }
+
+    assert!(
+        checked >= 7,
+        "the shell shares fewer codes with dig-rpc-protocol than expected ({checked}) — \
+         this guard may be checking nothing"
+    );
+    assert!(
+        drifted.is_empty(),
+        "shell error names drifted from the shared catalogue: {drifted:#?}"
+    );
+}
+
+/// THE EMITTED FRAME, not the catalogue: drive a real `-32004` out of the node and assert
+/// the catalogue entry for `-32004` carries the SAME `data.code` string the frame does.
+/// Comparing the two artefacts is what makes this a decision test rather than a presence
+/// test — a catalogue that agrees with itself proves nothing about the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_catalogued_name_for_32004_is_the_name_the_node_emits() {
+    let (node, _scratch) = ephemeral_node();
+
+    // An empty ephemeral node holds nothing, so any well-formed capsule read misses
+    // locally and mints -32004 without touching the network.
+    let resp = handle_rpc(
+        &node,
+        json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{
+            "store_id": "11".repeat(32), "root": "22".repeat(32),
+        }}),
+        dig_node_core::download::ReadOrigin::Local,
+        dig_node_core::download::RequestProvenance::FirstParty,
+    )
+    .await;
+
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32004),
+        "expected a local capsule miss to mint -32004, got: {resp}"
+    );
+    let emitted = resp["error"]["data"]["code"]
+        .as_str()
+        .expect("the emitted frame carries a machine name in data.code")
+        .to_string();
+    assert_eq!(emitted, "RESOURCE_UNAVAILABLE");
+
+    let catalogue = meta::error_catalogue();
+    let entry = catalogue
+        .as_array()
+        .expect("error catalogue array")
+        .iter()
+        .find(|e| e["code"] == json!(-32004))
+        .expect("the catalogue declares -32004");
+    assert_eq!(
+        entry["name"], json!(emitted),
+        "the discovery document names -32004 differently from the frame the node emits"
+    );
+}

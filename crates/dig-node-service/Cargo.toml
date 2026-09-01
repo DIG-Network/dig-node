@@ -298,6 +298,11 @@ windows-sys = { version = "0.61", features = [
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
 [dev-dependencies]
+# `openrpc_drift_guard.rs` compares the shell's error catalogue against the shared contract
+# crate name-for-name. Already a normal dependency above; restated here only so the
+# integration-test crate can name it, and pinned to the SAME "0.10" line so the guard can
+# never compare against a different catalogue than the shell compiles against.
+dig-rpc-protocol = "0.10"
 # The `never_log` battery (#277) drives the real seed bootstrap against a temp layout so its
 # sentinels are the ACTUAL minted phrase and device key rather than invented strings. Already a
 # normal dependency above; restated here only so the integration-test crate can name it.
