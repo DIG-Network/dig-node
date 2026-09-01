@@ -7138,6 +7138,16 @@ stream is closed, so that its descriptor memo is populated and the re-ask is ans
 total a requestor spends on one holder MUST be bounded; an ask that is ANSWERED negatively MUST NOT be
 re-asked, since re-asking cannot change a refusal and would delay trying the next holder.
 
+**Descriptor MEMORY, unlike descriptor latency, MUST NOT scale with the capsule (MUST,
+dig-node#302).** A server MUST compute the descriptor's digests incrementally, over a buffer whose size
+is independent of the module, and MUST NOT make the whole module resident to answer. The two costs are
+separable and only one of them is inherent: every byte must be READ to be hashed, but no byte needs to
+still be held once it has been. A whole-module read lets one ~100-byte unauthenticated ask commit the
+capsule's full size in RAM, which multiplies by concurrent askers and is the same amplification the
+4 MiB `fetchModuleRange` clamp exists to prevent on the window path. Incremental SHA-256 yields the
+identical digest over the identical byte sequence, so this bounds the server's memory without changing
+the descriptor a requestor receives by a single bit.
+
 **A hop that is RELAYING MUST acknowledge, not block (MUST, dig-node#333).** A node asked with
 `proxy: true` for a capsule it does not hold pulls that capsule from a holder on the requestor's
 behalf. That pull is a whole-capsule transfer and takes arbitrarily long — minutes for a 135 MB
