@@ -37,18 +37,17 @@ use std::sync::Arc;
 /// Build a read-path Node whose cache + §21 identity live in a throwaway tempdir, so
 /// the test never reads or writes the real user cache / identity key. Env is read by
 /// `Node::from_env` at construction; set it immediately before building.
-fn ephemeral_node() -> Arc<Node> {
-    let base = std::env::temp_dir().join(format!(
-        "dig-node-drift-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::env::set_var("DIG_NODE_CACHE", base.join("cache"));
-    std::env::set_var("DIG_IDENTITY_DIR", base.join("identity"));
-    Node::from_env()
+/// The guard comes back with the node: the node reads its cache and identity paths for as
+/// long as it lives, so the tree must outlive this function. `TempDir`'s `Drop` then removes
+/// it when the caller drops both, including on an unwind (dig-node#370).
+fn ephemeral_node() -> (Arc<Node>, tempfile::TempDir) {
+    let base = tempfile::Builder::new()
+        .prefix("dig-node-drift-")
+        .tempdir()
+        .expect("a scratch dir");
+    std::env::set_var("DIG_NODE_CACHE", base.path().join("cache"));
+    std::env::set_var("DIG_IDENTITY_DIR", base.path().join("identity"));
+    (Node::from_env(), base)
 }
 
 /// Dispatch one method with empty params through the real read path and return the
@@ -83,7 +82,7 @@ fn is_shell_only(name: &str) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn local_methods_are_resolved_by_dig_node() {
     const METHOD_NOT_FOUND: i64 = -32601;
-    let node = ephemeral_node();
+    let (node, _scratch) = ephemeral_node();
 
     for m in meta::methods() {
         if is_shell_only(m.name) || m.served != "local" {
@@ -112,7 +111,7 @@ async fn local_methods_are_resolved_by_dig_node() {
 #[tokio::test(flavor = "multi_thread")]
 async fn passthrough_methods_are_not_resolved_by_dig_node() {
     const METHOD_NOT_FOUND: i64 = -32601;
-    let node = ephemeral_node();
+    let (node, _scratch) = ephemeral_node();
 
     for m in meta::methods() {
         if is_shell_only(m.name) || m.served != "passthrough" {

@@ -355,16 +355,48 @@ impl Config {
     }
 }
 
-/// Parse the `DIG_NODE_DIGLOCAL` toggle. Truthy (`1`/`true`/`yes`/`on`) ⇒ enable
-/// the bare-dig.local listener; falsy (`0`/`false`/`no`/`off`) ⇒ disable; **unset
-/// or unrecognised ⇒ the default `true`** (auto-attempt with graceful fallback).
-/// Case/whitespace-insensitive. PURE so the toggle policy is unit-testable.
+/// Parse the `DIG_NODE_DIGLOCAL` toggle. On-token ⇒ enable the bare-dig.local listener; off-token
+/// ⇒ disable; **unset, empty, or unrecognised ⇒ the default `true`** (auto-attempt with graceful
+/// fallback) — and an UNRECOGNISED value is WARNED about rather than silently swallowed (#459).
+///
+/// Reads the shared vocabulary via [`dig_node_core::classify_flag`], so `disabled` and `enabled`
+/// work here exactly as they do on the three isolation knobs.
+///
+/// # Why an unrecognised value keeps the default instead of failing closed (#459)
+///
+/// This flag binds `127.0.0.2:80`, `127.0.0.2:443` and `[::1]:443` — LOOPBACK only. It cannot reach
+/// the network and cannot change what a remote party may do, so the isolation knobs' fail-closed
+/// rule buys nothing here while a typo would cost the operator a local feature they asked for.
+///
+/// The residue fail-open leaves is not the direction but the SILENCE, and that is what changed: the
+/// node now says the value was not understood and names the default it applied.
 pub fn parse_dig_local_flag(raw: Option<String>) -> bool {
-    match raw.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
-        Some(ref v) if matches!(v.as_str(), "0" | "false" | "no" | "off") => false,
-        Some(ref v) if matches!(v.as_str(), "1" | "true" | "yes" | "on") => true,
-        // Unset, blank, or anything unrecognised → the default-on behaviour.
-        _ => true,
+    resolve_capability_flag("DIG_NODE_DIGLOCAL", raw.as_deref(), true)
+}
+
+/// Apply a default-ON capability flag's policy and, when the value was not understood, SAY SO.
+///
+/// One function for both knobs because they take the same answer for the same reason, and because
+/// two copies of a disclosure rule is how the vocabulary diverged in the first place.
+///
+/// The classification is pure ([`dig_node_core::classify_flag`]); only the disclosure is a side
+/// effect, so a test can assert the decision and the emitted line separately.
+fn resolve_capability_flag(var: &str, raw: Option<&str>, default: bool) -> bool {
+    match dig_node_core::classify_flag(raw) {
+        dig_node_core::FlagWord::Off => false,
+        dig_node_core::FlagWord::On => true,
+        dig_node_core::FlagWord::Absent => default,
+        dig_node_core::FlagWord::Unrecognised => {
+            tracing::warn!(
+                "{}",
+                dig_node_core::describe_unrecognised_flag(
+                    var,
+                    raw.unwrap_or_default().trim(),
+                    default
+                )
+            );
+            default
+        }
     }
 }
 
@@ -410,20 +442,31 @@ pub fn live_broadcast_disclosure() -> &'static str {
      To disable both, unset DIG_WALLET_ENABLE_LIVE_BROADCAST."
 }
 
-/// Parse the `DIG_WALLET_ENABLE_CHAIN_SYNC` toggle (§18.6, #2501). Falsy
-/// (`0`/`false`/`no`/`off`) ⇒ do NOT start the background chain-sync supervisor; **anything else
-/// — including unset, blank, or unrecognised — ⇒ the default `true`**. Default-ON, unlike
-/// [`parse_live_broadcast_flag`]: syncing reads the chain into the node's own replica and moves
-/// no money, so the money-safe reasoning does not apply. Case/whitespace-insensitive. PURE so the
-/// policy is unit-testable without process env.
+/// Parse the `DIG_WALLET_ENABLE_CHAIN_SYNC` toggle (§18.6, #2501). Off-token ⇒ do NOT start the
+/// background chain-sync supervisor; **unset, empty, or unrecognised ⇒ the default `true`**, with an
+/// unrecognised value WARNED about rather than silently swallowed (#459). Default-ON, unlike
+/// [`parse_live_broadcast_flag`]: syncing reads the chain into the node's own replica and moves no
+/// money, so the money-safe reasoning does not apply.
+///
+/// # Why this one does NOT fail closed, although it DOES reach the network (#459)
+///
+/// #459 proposed the discriminator "can the flag's behaviour reach the network?", on the model of
+/// #282/#352. This flag does — it dials chia peers and reads the chain — so that test says fail
+/// closed. **Applied here it would produce a defect**, and the reason is worth keeping:
+///
+/// Failing closed on an unrecognised value silently stops the replica advancing. dig-node#416
+/// records that a stale replica's zero balance is INDISTINGUISHABLE from an empty wallet at the
+/// balance surface — so a typo would be converted into a surface asserting a falsehood about the
+/// operator's money. Failing open converts the same typo into "the flag you set had no effect",
+/// which is recoverable and, now, stated out loud.
+///
+/// The generalisation that survives, and which the network-reach test was a proxy for: **fail in
+/// whichever direction cannot make a surface assert a falsehood.** For an isolation knob that is
+/// closed, because fail-open leaves a node dialling a network its operator asked it to leave. For a
+/// default-ON read path it is open, because fail-closed manufactures a false zero. Same principle,
+/// opposite outcome — which is why the proxy must not be applied mechanically.
 pub fn parse_chain_sync_flag(raw: Option<String>) -> bool {
-    !matches!(
-        raw.as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("0" | "false" | "no" | "off")
-    )
+    resolve_capability_flag("DIG_WALLET_ENABLE_CHAIN_SYNC", raw.as_deref(), true)
 }
 
 /// Parse the `DIG_NODE_HOST` override (#288): `Some(ip)` when the raw value is a
@@ -575,6 +618,83 @@ pub fn normalize_upstream(raw: &str) -> String {
     }
 }
 
+/// Reject an upstream that is not a well-formed, honestly-readable URL (dig-node#255 item 3).
+///
+/// The only pre-existing check was for control characters, and it exists for an unrelated reason
+/// (#526/B2 — a control character would be baked verbatim into a root-owned systemd unit line).
+/// So every other malformed value persisted silently and became the passthrough target for every
+/// method this node does not implement.
+///
+/// Three rules, each closing something an operator reading `control.config.get` back could be
+/// fooled by:
+///
+/// 1. **A scheme, and only the two we speak.** [`normalize_upstream`] prepends `https://` to a
+///    bare host, so anything still lacking a scheme here carries one we do not speak.
+/// 2. **A non-empty host with no whitespace.** An empty host means "use the default" and must be
+///    said that way rather than smuggled in as `https://`.
+/// 3. **No userinfo (`@`).** `https://rpc.dig.net@evil.example` READS as the legitimate host to a
+///    person and RESOLVES to the attacker's. That is the same forgery class as an unmarked
+///    truncation: the display is honest about the bytes and dishonest about the meaning.
+///
+/// Plain `http://` is permitted ONLY for loopback, so a developer's local upstream keeps working
+/// while a remote cleartext upstream — which any on-path party could answer — does not.
+pub fn validate_upstream(normalized: &str) -> Result<(), String> {
+    let rest = if let Some(r) = normalized.strip_prefix("https://") {
+        r
+    } else if let Some(r) = normalized.strip_prefix("http://") {
+        let host = host_of(r);
+        if !is_loopback_host(host) {
+            return Err(format!(
+                "an http:// upstream is only allowed for loopback (got host {host:?}); any \
+                 on-path party can answer cleartext, and this node forwards every unimplemented \
+                 method to it"
+            ));
+        }
+        r
+    } else {
+        return Err("upstream must be an http:// or https:// URL".to_string());
+    };
+
+    let host = host_of(rest);
+    if host.is_empty() {
+        return Err(
+            "upstream has no host; pass an empty string to restore the default".to_string(),
+        );
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err(format!("upstream host {host:?} contains whitespace"));
+    }
+    if rest.contains('@') {
+        return Err(
+            "upstream must not carry userinfo (`user@host`): such a URL reads as one host and \
+             resolves to another"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The authority portion of a URL remainder (everything before the first `/`, `?` or `#`), with
+/// any `host:port` left intact.
+fn host_of(rest: &str) -> &str {
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Whether an authority names the local machine, for the cleartext carve-out above.
+fn is_loopback_host(authority: &str) -> bool {
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.eq_ignore_ascii_case("dig.local")
+}
+
 /// Split a normalised upstream into `(host, port)`, defaulting the port from the scheme.
 ///
 /// Pure, and deliberately tolerant: anything it cannot parse yields `None`, which the caller
@@ -717,6 +837,67 @@ mod tests {
     }
 
     use super::*;
+
+    /// **Proves (dig-node#255 item 3):** a userinfo URL is refused.
+    ///
+    /// `https://rpc.dig.net@evil.example` READS as the legitimate host to an operator checking
+    /// `control.config.get` and RESOLVES to the attacker's. Only the control-character check
+    /// existed before, and it exists for an unrelated reason, so this value persisted silently and
+    /// became the passthrough target for every unimplemented method.
+    #[test]
+    fn a_userinfo_upstream_is_refused_while_the_host_it_impersonates_is_accepted() {
+        assert!(
+            validate_upstream("https://rpc.dig.net@evil.example").is_err(),
+            "a userinfo URL reads as one host and resolves to another"
+        );
+        assert!(
+            validate_upstream("https://rpc.dig.net").is_ok(),
+            "the host it impersonates must still be accepted, or this proves nothing"
+        );
+    }
+
+    /// **Proves:** cleartext is confined to loopback.
+    ///
+    /// A remote `http://` upstream can be answered by any on-path party, and this node forwards
+    /// every method it does not implement to whatever answers. A developer's local upstream keeps
+    /// working, which is the control that stops the rule collapsing into "refuse all http".
+    #[test]
+    fn cleartext_upstream_is_loopback_only() {
+        for ok in [
+            "http://localhost:9779",
+            "http://127.0.0.1:8080",
+            "http://dig.local",
+        ] {
+            assert!(validate_upstream(ok).is_ok(), "{ok} is local cleartext");
+        }
+        for bad in ["http://rpc.dig.net", "http://evil.example:80"] {
+            assert!(validate_upstream(bad).is_err(), "{bad} is remote cleartext");
+        }
+    }
+
+    /// **Proves:** a scheme we do not speak, and a scheme-less-after-normalisation value, are
+    /// refused rather than persisted.
+    #[test]
+    fn only_http_and_https_upstreams_are_accepted() {
+        for bad in [
+            "ftp://rpc.dig.net",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://",
+            "https:// rpc.dig.net",
+        ] {
+            assert!(validate_upstream(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    /// **Proves:** normalisation and validation compose the way the control method uses them — a
+    /// bare host becomes a valid `https://` URL rather than being refused for lacking a scheme.
+    #[test]
+    fn a_bare_host_normalises_into_an_accepted_https_upstream() {
+        let normalized = normalize_upstream("rpc.dig.net/");
+        assert_eq!(normalized, "https://rpc.dig.net");
+        assert!(validate_upstream(&normalized).is_ok());
+    }
 
     #[test]
     fn normalize_upstream_trims_and_strips_trailing_slash() {
@@ -1093,6 +1274,190 @@ mod tests {
         assert!(parse_dig_local_flag(None));
         assert!(parse_dig_local_flag(Some(String::new())));
         assert!(parse_dig_local_flag(Some("maybe".to_string())));
+    }
+
+    // ---- #459: failure direction and off-vocabulary, decided separately -----------------------
+    //
+    // Every assertion below names the alternative it rules out. The ticket warns that the existing
+    // `peer_network_enabled` test passed under BOTH the old and new parsers because it listed only
+    // lowercase exact tokens and never a value the two disagree about — so a test here that only
+    // re-listed `on`/`off` would prove nothing about either decision.
+
+    /// An in-memory sink for the disclosure assertions.
+    #[derive(Clone, Default)]
+    struct FlagLogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for FlagLogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FlagLogCapture {
+        type Writer = FlagLogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` under a scoped capturing subscriber and return what it logged.
+    fn capture_flag_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+        let buffer = FlagLogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(buffer.clone())
+            .finish();
+        let outcome = tracing::subscriber::with_default(subscriber, body);
+        let captured = buffer.0.lock().unwrap().clone();
+        (outcome, String::from_utf8_lossy(&captured).into_owned())
+    }
+
+    /// **DECISION 1 (#459) — an unrecognised value keeps the default AND is said out loud.**
+    ///
+    /// This is the assertion that distinguishes the chosen answer from BOTH alternatives, which is
+    /// why the value and the log are asserted together rather than in two tests:
+    ///
+    /// | alternative | how it fails here |
+    /// |---|---|
+    /// | fail CLOSED on unrecognised | returns `false`; the value assertion fails |
+    /// | fail OPEN **silently** (shipped behaviour) | returns `true` but logs nothing; the disclosure assertion fails |
+    ///
+    /// `"fasle"` is a real typo of `false` — the case where the two candidate failure directions
+    /// give opposite answers — not a token neither implementation would accept.
+    #[test]
+    fn an_unrecognised_capability_flag_keeps_its_default_and_says_so() {
+        for (var, parse) in [
+            (
+                "DIG_WALLET_ENABLE_CHAIN_SYNC",
+                parse_chain_sync_flag as fn(Option<String>) -> bool,
+            ),
+            (
+                "DIG_NODE_DIGLOCAL",
+                parse_dig_local_flag as fn(Option<String>) -> bool,
+            ),
+        ] {
+            let (enabled, logs) = capture_flag_logs(|| parse(Some("fasle".to_string())));
+
+            assert!(
+                enabled,
+                "{var}: a typo must not silently disable a default-ON capability — failing closed \
+                 here converts a typo into a stale replica, which dig-node#416 records as \
+                 indistinguishable from an empty wallet"
+            );
+            assert!(
+                logs.contains(var),
+                "{var}: the disclosure must name the VARIABLE, or the operator cannot find it; \
+                 log was:\n{logs}"
+            );
+            assert!(
+                logs.contains("fasle"),
+                "{var}: the disclosure must echo the REJECTED VALUE, or the operator cannot see \
+                 their typo; log was:\n{logs}"
+            );
+            assert!(
+                logs.contains("NO effect"),
+                "{var}: the disclosure must say the setting did nothing — a line that merely \
+                 mentions the flag reads as confirmation that it was applied; log was:\n{logs}"
+            );
+        }
+    }
+
+    /// **The control for the test above.** A RECOGNISED value must produce no disclosure at all.
+    ///
+    /// Without this, warning unconditionally would satisfy every assertion above while burying the
+    /// real one in noise on every start-up — the standard way a disclosure stops being read.
+    #[test]
+    fn a_recognised_capability_flag_says_nothing() {
+        for raw in ["off", "on", "DISABLED", " enabled ", ""] {
+            let (_, logs) = capture_flag_logs(|| parse_chain_sync_flag(Some(raw.to_string())));
+            assert!(
+                logs.is_empty(),
+                "{raw:?} is understood, so it must not warn; log was:\n{logs}"
+            );
+        }
+        let (_, logs) = capture_flag_logs(|| parse_chain_sync_flag(None));
+        assert!(
+            logs.is_empty(),
+            "an unset flag is not a mistake; log was:\n{logs}"
+        );
+    }
+
+    /// **DECISION 2 (#459) — the two flags adopt the shared off-TOKENS.**
+    ///
+    /// `disabled` and `enabled` are the whole content of this test: they are exactly the values the
+    /// old and new parsers disagree about. Under the shipped parsers `disabled` fell through to the
+    /// default and left the capability RUNNING — the same shape as `DIG_PEER_NETWORK=OFF` leaving
+    /// the peer network running, which is the defect #282/#352 exists to close.
+    ///
+    /// The lowercase exact tokens are re-listed only as a regression floor; on their own they would
+    /// pass under both implementations, which the ticket names as the trap.
+    #[test]
+    fn the_capability_flags_read_the_shared_off_vocabulary() {
+        for off in [
+            "disabled",
+            "DISABLED",
+            " Disabled ",
+            "off",
+            "OFF",
+            "0",
+            "false",
+            "no",
+        ] {
+            assert!(
+                !parse_chain_sync_flag(Some(off.to_string())),
+                "{off:?} must stop chain sync"
+            );
+            assert!(
+                !parse_dig_local_flag(Some(off.to_string())),
+                "{off:?} must disable dig.local"
+            );
+        }
+        for on in ["enabled", "ENABLED", "on", "1", "true", "yes"] {
+            assert!(parse_chain_sync_flag(Some(on.to_string())));
+            assert!(parse_dig_local_flag(Some(on.to_string())));
+        }
+    }
+
+    /// **DECISION 2, the SUBTRACTION — an empty value is NOT an off for a capability knob.**
+    ///
+    /// `peer::is_off_token` treats an explicitly-empty value as OFF, and that is correct for the
+    /// three isolation knobs: `DIG_BOOTSTRAP_PEERS=` names the empty LIST (dig-node#312). Adopting
+    /// the vocabulary wholesale would import that rule here, where the variable holds no list and an
+    /// empty value is what `export X="$UNSET_VAR"` produces — stopping chain sync, and arriving at
+    /// dig-node#416's false zero through the vocabulary having just been refused through the failure
+    /// direction.
+    ///
+    /// **Catches:** a future "simplification" that routes these knobs straight at `is_off_token`.
+    /// That change passes every other test in this file.
+    #[test]
+    fn an_empty_capability_flag_is_absent_not_off() {
+        assert!(
+            parse_chain_sync_flag(Some(String::new())),
+            "an empty value must not stop chain sync"
+        );
+        assert!(
+            parse_chain_sync_flag(Some("   ".to_string())),
+            "whitespace is empty, and must not stop chain sync either"
+        );
+        assert!(parse_dig_local_flag(Some(String::new())));
+
+        // Asserted at the shared helper too, because that is where the subtraction lives: the two
+        // vocabularies agree on every TOKEN and differ only here, deliberately. `is_off_token`
+        // (crate-private to dig-node-core) still answers `true` for an empty value, which is what
+        // keeps dig-node#312 intact for the isolation knobs.
+        assert!(
+            !dig_node_core::is_capability_off_token(""),
+            "the capability vocabulary must not inherit the isolation knobs' empty-is-off rule"
+        );
+        assert!(
+            dig_node_core::is_capability_off_token("disabled"),
+            "it must still inherit every off TOKEN"
+        );
     }
 
     #[test]

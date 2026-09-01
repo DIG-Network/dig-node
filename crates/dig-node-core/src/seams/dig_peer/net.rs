@@ -105,6 +105,60 @@ pub fn is_usable_contact(addr: &SocketAddr) -> bool {
     !addr.ip().is_unspecified() && addr.port() != 0
 }
 
+/// A peer address that HAS been checked against [`is_usable_contact`] — a real destination, not a
+/// bind wildcard or a port-0 sentinel.
+///
+/// # Why a type rather than a fifth `if` (#349)
+///
+/// [`is_usable_contact`] was adopted call site by call site, and each adoption fixed the site
+/// somebody happened to be looking at. Four sites were guarded; the fifth — `pool_peers`, answering
+/// `dig.getPeers` — was not, so this node served `{"host":"::","port":0}` to REMOTE PEERS as a dial
+/// candidate. That is worse than the display falsehood the earlier fixes addressed: a peer that
+/// dials it wastes one of its few dial slots, and a peer that caches it caches a hole.
+///
+/// A guard adopted one call site at a time will keep missing one, and the count reached five before
+/// anyone looked at the site that faced other nodes. So the question moves into the type: a
+/// `ContactAddr` cannot be constructed without answering "is this a destination?", and
+/// [`ContactAddr::address_json`] is the only way to render the shipped `{host, port, kind}` entry
+/// ON THIS PATH.
+///
+/// It is NOT the only way this node emits a peer address to a stranger, and saying so would be
+/// false: `provider_json` (`download.rs`) serialises remote-supplied `CandidateAddr`s into the
+/// peer-facing `providers` array unchecked, and `parse_candidate_addr` (`forwarded_ask.rs`) accepts
+/// `{"host":"::","port":0}` -- so a stranger can inject the very wildcard removed here and have this
+/// node relay it onward. That path is pre-existing and is tracked separately; this type closes the
+/// `dig.getPeers` emitter, not the class.
+/// A new emitter reaches for the renderer, and the renderer is only reachable through the check.
+///
+/// This does not make the raw `SocketAddr` unreachable — that would require changing what
+/// `dig_gossip::GossipHandle::connected_pool_peers` returns, in another crate. It makes the
+/// *rendering* path go through the check, which is where the five leaks occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContactAddr(SocketAddr);
+
+impl ContactAddr {
+    /// The ONLY constructor: `Some` when `addr` is a real destination, `None` when it is not.
+    pub fn new(addr: SocketAddr) -> Option<Self> {
+        is_usable_contact(&addr).then_some(Self(addr))
+    }
+
+    /// The checked address.
+    pub fn addr(&self) -> SocketAddr {
+        self.0
+    }
+
+    /// This contact as the shipped `{host, port, kind}` peer-address entry — the one shape
+    /// `dig.getPeers`, the DHT answer and the forwarded-ask provider list all speak, so no second
+    /// address encoding enters the ecosystem.
+    pub fn address_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "host": self.0.ip().to_string(),
+            "port": self.0.port(),
+            "kind": "direct",
+        })
+    }
+}
+
 /// Discover a routable local IPv6 address, if the host has one. Uses the connect-a-UDP-socket trick:
 /// "connecting" a UDP socket to an off-host address forces the OS to select the local address it
 /// would route from, WITHOUT sending any packet. Returns the local IPv6 address only when it is
@@ -299,25 +353,88 @@ fn nat_config_builder(
     builder
 }
 
+/// A relay endpoint parsed into the two pieces every dial off it needs: the host to resolve and the
+/// TCP port the scheme or an explicit `:port` selects.
+///
+/// Byte-for-byte the shape of `dig_nat::relay`'s private `RelayEndpoint`, because this is a
+/// transcription of that parser and not a second opinion about relay URLs — see
+/// [`parse_relay_endpoint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayEndpoint {
+    /// The host to resolve: a DNS name, or an IPv6 literal with its brackets already stripped.
+    pub host: String,
+    /// The TCP port: an explicit `:port` when the URL carries one, else the scheme's default.
+    pub port: u16,
+}
+
+/// Parse a relay endpoint URL (`ws://host[:port][/path]`, `wss://…`, IPv6 hosts bracketed) into its
+/// host and port, or `None` when the operator's intent cannot be read.
+///
+/// # This FAILS CLOSED, and that is the whole point (#285)
+///
+/// A relay endpoint is operator configuration for a component that sees traffic. The predecessor of
+/// this function accepted **any** scheme and turned an unparsable port into `None`, which
+/// `relay_socket_addr` then resolved with `.unwrap_or(443)` — so a single malformed string made the
+/// node **silently dial port 443 at whatever host survived the looser parse**, which was not
+/// necessarily the host the operator wrote (`user@host` kept its userinfo; `host#frag` kept its
+/// fragment). A value that does not parse means the intent is unknown, and the safe reading of an
+/// unknown intent is to refuse the dial, not to invent a destination for it.
+///
+/// # Why this is transcribed rather than called
+///
+/// The authoritative implementation is `dig_nat::relay::parse_relay_endpoint`, which already fails
+/// closed in exactly these four ways and is the designated survivor of this rival pair. It is
+/// **private** in the published `dig-nat 0.21.0`, so dig-node cannot call it until dig-nat exports
+/// it. Every rule below is transcribed from that function, and the test vectors are taken from its
+/// own assertions, so that adopting the export later is a deletion rather than a re-derivation.
+///
+/// The rules, all four of which the predecessor got wrong:
+///
+/// - **Scheme is required and must be `ws` or `wss`** (case-insensitive). It selects the default
+///   port — 80 and 443 respectively — and nothing else.
+/// - **A port that will not parse is an ERROR**, never a default.
+/// - **Userinfo is stripped** from the authority, so `wss://user@host` resolves `host`.
+/// - **Path, query AND fragment are dropped** before the authority is read.
+pub fn parse_relay_endpoint(endpoint: &str) -> Option<RelayEndpoint> {
+    let (scheme, rest) = endpoint.trim().split_once("://")?;
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "ws" => 80,
+        "wss" => 443,
+        // An unknown scheme is an unreadable intent, not a `wss` with a typo.
+        _ => return None,
+    };
+    // Authority only: drop any path/query/fragment, then any `userinfo@`.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[addr]` or `[addr]:port`.
+        let (h, after) = stripped.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None if after.is_empty() => default_port,
+            // Trailing junk after `]` that is not a port.
+            None => return None,
+        };
+        (h.to_string(), port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        (h.to_string(), p.parse().ok()?)
+    } else {
+        (authority.to_string(), default_port)
+    };
+
+    (!host.is_empty()).then_some(RelayEndpoint { host, port })
+}
+
 /// Extract the host from a relay endpoint URL so the node can derive the co-located STUN server
-/// (`<host>:STUN_PORT`). Pure: strips the scheme (`wss://`), any `:port`, and any trailing path/query.
-/// A bracketed IPv6 literal (`wss://[2001:db8::1]:9450`) yields the literal without brackets. Returns
-/// `None` for an empty/unparseable host.
+/// (`<host>:STUN_PORT`). Thin projection of [`parse_relay_endpoint`], so it inherits that function's
+/// fail-closed reading of a malformed endpoint (#285): an unknown scheme or an unparsable port
+/// yields `None` here too, rather than a host salvaged from a string nobody could read.
 pub fn parse_relay_host(endpoint: &str) -> Option<String> {
-    let s = endpoint.trim();
-    let s = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
-    // Drop any path / query.
-    let s = s.split(['/', '?']).next().unwrap_or(s);
-    if s.is_empty() {
-        return None;
-    }
-    // Bracketed IPv6 literal: [addr]:port
-    if let Some(rest) = s.strip_prefix('[') {
-        let host = rest.split(']').next().unwrap_or("");
-        return (!host.is_empty()).then(|| host.to_string());
-    }
-    let host = s.split(':').next().unwrap_or("");
-    (!host.is_empty()).then(|| host.to_string())
+    parse_relay_endpoint(endpoint).map(|e| e.host)
 }
 
 /// Resolve the DIG STUN servers (`<relay-host>:STUN_PORT`) from the relay endpoint URL across BOTH
@@ -420,31 +537,16 @@ pub async fn reflexive_via_stun(
 
 /// Resolve the relay's data endpoint (`<relay-host>:<port>`) to a [`SocketAddr`], IPv6-first. Used
 /// only as the observability endpoint of the relayed traversal tier — the actual byte tunnel rides
-/// the node's live reservation ([`dig_nat::relay::RelayStatus`]), not this address. Port comes from
-/// the URL when present, else 443 (the `wss://` default). Best-effort blocking DNS; call off the
-/// async runtime.
+/// the node's live reservation ([`dig_nat::relay::RelayStatus`]), not this address. Host AND port
+/// both come from [`parse_relay_endpoint`], so a malformed endpoint yields `None` — no dial — rather
+/// than the pre-#285 behaviour of defaulting the port to 443 and connecting anyway. Best-effort
+/// blocking DNS; call off the async runtime.
 pub fn relay_socket_addr(relay_endpoint: &str) -> Option<SocketAddr> {
     use std::net::ToSocketAddrs;
-    let host = parse_relay_host(relay_endpoint)?;
-    let port = relay_port(relay_endpoint).unwrap_or(443);
+    let RelayEndpoint { host, port } = parse_relay_endpoint(relay_endpoint)?;
     let mut addrs: Vec<SocketAddr> = (host.as_str(), port).to_socket_addrs().ok()?.collect();
     addrs.sort_by_key(dig_ip::Family::of);
     addrs.into_iter().next()
-}
-
-/// Parse an explicit `:port` out of a relay endpoint URL (`wss://host:9450/path` → `9450`). `None`
-/// when no port is present. Handles a bracketed IPv6 literal (`wss://[::1]:9450`).
-fn relay_port(endpoint: &str) -> Option<u16> {
-    let s = endpoint.trim();
-    let s = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
-    let s = s.split(['/', '?']).next().unwrap_or(s);
-    let after_host = match s.strip_prefix('[') {
-        Some(rest) => rest.split_once(']').map(|(_, tail)| tail).unwrap_or(""),
-        None => s,
-    };
-    after_host
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
 }
 
 /// Build the shared [`dig_nat::NatRuntime`] carrying this node's LIVE traversal handles, so every node
@@ -761,10 +863,6 @@ mod tests {
             Some("relay.dig.net")
         );
         assert_eq!(
-            parse_relay_host("relay.dig.net").as_deref(),
-            Some("relay.dig.net")
-        );
-        assert_eq!(
             parse_relay_host("wss://relay.dig.net/introducer?x=1").as_deref(),
             Some("relay.dig.net")
         );
@@ -775,6 +873,107 @@ mod tests {
         );
         assert_eq!(parse_relay_host(""), None);
         assert_eq!(parse_relay_host("wss://"), None);
+        // A scheme-less endpoint is now REFUSED rather than salvaged (#285). The pre-fix parser
+        // returned `Some("relay.dig.net")` here, and this line is the one that changed.
+        assert_eq!(parse_relay_host("relay.dig.net"), None);
+    }
+
+    /// **Proves:** a relay endpoint the node cannot read yields NO destination, in each of the four
+    /// ways the pre-#285 parser invented one — an unknown scheme, an unparsable port, embedded
+    /// userinfo, and a fragment. Each malformed input is paired with the well-formed endpoint it is
+    /// one character away from, so the assertion is that the two are told APART.
+    ///
+    /// **Catches:** any relaxation back toward the old parser. Every `None` line below returned
+    /// `Some(...)` before the fix, and three of them returned a host that was not the host in the
+    /// string. A test that only listed well-formed endpoints would pass under BOTH parsers — the
+    /// property lives entirely in the malformed column, which is why each row is a pair.
+    #[test]
+    fn a_relay_endpoint_that_cannot_be_read_yields_no_destination() {
+        // (malformed → refused) paired with (well-formed → the stated host and port).
+        let pairs: &[(&str, &str, &str, u16)] = &[
+            // Unknown scheme. Was: accepted, host salvaged, port defaulted to 443.
+            (
+                "http://relay.dig.net",
+                "wss://relay.dig.net",
+                "relay.dig.net",
+                443,
+            ),
+            // No scheme at all. Was: accepted.
+            (
+                "relay.dig.net:9450",
+                "ws://relay.dig.net:9450",
+                "relay.dig.net",
+                9450,
+            ),
+            // Unparsable port. Was: port -> None -> `.unwrap_or(443)`, so it DIALLED 443.
+            (
+                "wss://relay.dig.net:notaport",
+                "wss://relay.dig.net:9450",
+                "relay.dig.net",
+                9450,
+            ),
+            // Port out of range. Same fail-open path as the non-numeric one.
+            (
+                "wss://relay.dig.net:99999",
+                "wss://relay.dig.net:65535",
+                "relay.dig.net",
+                65535,
+            ),
+            // Empty host behind userinfo.
+            (
+                "wss://user@",
+                "wss://user@relay.dig.net",
+                "relay.dig.net",
+                443,
+            ),
+            // Malformed IPv6 authority — no closing bracket.
+            (
+                "wss://[2001:db8::1",
+                "wss://[2001:db8::1]",
+                "2001:db8::1",
+                443,
+            ),
+        ];
+        for (bad, good, host, port) in pairs {
+            assert_eq!(
+                parse_relay_endpoint(bad),
+                None,
+                "malformed relay endpoint {bad} must yield NO destination"
+            );
+            assert_eq!(
+                parse_relay_endpoint(good),
+                Some(RelayEndpoint {
+                    host: (*host).to_string(),
+                    port: *port
+                }),
+                "well-formed relay endpoint {good} must still parse"
+            );
+        }
+
+        // Userinfo is STRIPPED and a fragment is DROPPED, rather than being carried into the host —
+        // the pre-fix parser returned `user@relay.dig.net` and `relay.dig.net#frag` respectively,
+        // which would have been resolved as DNS names and dialled at a host nobody wrote.
+        assert_eq!(
+            parse_relay_endpoint("wss://user:pw@relay.dig.net:9450/ws?x=1#frag"),
+            Some(RelayEndpoint {
+                host: "relay.dig.net".to_string(),
+                port: 9450
+            })
+        );
+
+        // The scheme selects the default port and nothing else, case-insensitively.
+        assert_eq!(parse_relay_endpoint("ws://relay.dig.net").unwrap().port, 80);
+        assert_eq!(
+            parse_relay_endpoint("WSS://relay.dig.net").unwrap().port,
+            443
+        );
+
+        // And the shipped default endpoint must survive the stricter parser — a fail-closed parse
+        // that refuses the compiled-in relay would take the whole relay tier down.
+        assert!(
+            parse_relay_endpoint(crate::peer::DEFAULT_RELAY_URL).is_some(),
+            "the compiled-in DEFAULT_RELAY_URL must still parse"
+        );
     }
 
     #[test]
@@ -801,21 +1000,29 @@ mod tests {
         );
     }
 
+    /// **Proves:** the port a relay dial uses comes from the endpoint the operator wrote — an
+    /// explicit `:port` when present, else the SCHEME's default — and never from a fallback applied
+    /// after a failed parse.
+    ///
+    /// **Catches:** the reintroduction of `relay_port(...).unwrap_or(443)`. The two `ws://` rows are
+    /// what make this test load-bearing: under the old code every defaulted port was 443, so a test
+    /// using only `wss://` could not tell "the scheme's default" from "the hardcoded 443".
     #[test]
-    fn relay_port_parses_explicit_port_else_none() {
-        // Explicit port after the host.
-        assert_eq!(relay_port("wss://relay.dig.net:9450"), Some(9450));
-        assert_eq!(relay_port("relay.dig.net:9450/path?x=1"), Some(9450));
-        // Bracketed IPv6 literal: only the port after `]` counts, never a colon inside the address.
-        assert_eq!(relay_port("wss://[2001:db8::1]:9450"), Some(9450));
-        assert_eq!(relay_port("wss://[2001:db8::1]"), None);
-        // No port present.
-        assert_eq!(relay_port("wss://relay.dig.net"), None);
-        assert_eq!(relay_port("relay.dig.net/introducer"), None);
-        // Garbage / non-numeric port → None, never a panic.
-        assert_eq!(relay_port("wss://relay.dig.net:notaport"), None);
-        assert_eq!(relay_port(""), None);
-        assert_eq!(relay_port("::::"), None);
+    fn relay_port_comes_from_the_endpoint_or_its_scheme_never_a_post_failure_default() {
+        let port_of = |ep: &str| parse_relay_endpoint(ep).map(|e| e.port);
+        // Explicit port wins over the scheme default, in both schemes.
+        assert_eq!(port_of("wss://relay.dig.net:9450"), Some(9450));
+        assert_eq!(port_of("ws://relay.dig.net:9450"), Some(9450));
+        // Bracketed IPv6: only the port after `]` counts, never a colon inside the address.
+        assert_eq!(port_of("wss://[2001:db8::1]:9450"), Some(9450));
+        assert_eq!(port_of("wss://[2001:db8::1]"), Some(443));
+        // No explicit port → the SCHEME's default, which differs between the two schemes.
+        assert_eq!(port_of("wss://relay.dig.net"), Some(443));
+        assert_eq!(port_of("ws://relay.dig.net"), Some(80));
+        // A port that will not parse is refused outright — it does NOT become 443.
+        assert_eq!(port_of("wss://relay.dig.net:notaport"), None);
+        assert_eq!(port_of(""), None);
+        assert_eq!(port_of("::::"), None);
     }
 
     #[test]

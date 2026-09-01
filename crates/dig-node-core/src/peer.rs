@@ -448,14 +448,15 @@ pub fn relay_enabled() -> bool {
 }
 
 /// Pure: is the relay enabled given an optional `DIG_RELAY_URL` value?
+///
+/// Reads the off-token through the shared [`is_off_token`], so `DIG_RELAY_URL=` (explicitly empty)
+/// now means NO RELAY rather than the compiled-in public relay (#352). An operator who set the
+/// variable to nothing said "none"; resolving that to the default endpoint made a node believed to
+/// be isolated dial production infrastructure, which is the same defect `DIG_BOOTSTRAP_PEERS`
+/// already fixed in dig-node#312. An UNSET variable still takes [`DEFAULT_RELAY_URL`] — #923's
+/// no-configuration anchor is untouched.
 fn is_relay_enabled(env: Option<&str>) -> bool {
-    match env {
-        Some(v) => {
-            let v = v.trim();
-            !(v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disabled"))
-        }
-        None => true,
-    }
+    !env.is_some_and(is_off_token)
 }
 
 /// Whether the peer network (pool + peer-RPC server) is enabled. Disabled with `DIG_PEER_NETWORK=off`
@@ -466,8 +467,50 @@ pub fn peer_network_enabled() -> bool {
 }
 
 /// Pure: is the peer network enabled given an optional `DIG_PEER_NETWORK` value?
+///
+/// Delegates to [`is_off_token`] so this knob reads `off` the same way `DIG_RELAY_URL` and
+/// `DIG_BOOTSTRAP_PEERS` do. It previously matched three exact byte strings, so `OFF` and `off `
+/// left the peer network RUNNING on a node whose operator had asked for it to stop (#282/#352).
 fn is_peer_network_enabled(env: Option<&str>) -> bool {
-    !matches!(env, Some("off") | Some("0") | Some("false"))
+    !env.is_some_and(is_off_token)
+}
+
+/// The ONE reading of "the operator turned this off", shared by the three ISOLATION knobs --
+/// `DIG_BOOTSTRAP_PEERS`, `DIG_RELAY_URL`, `DIG_PEER_NETWORK`.
+///
+/// NOT by every network-reaching `DIG_*` knob, which an earlier version of this comment claimed.
+/// At least four others read a narrower vocabulary and accept neither `disabled` nor an empty
+/// value: `DIG_WALLET_ENABLE_CHAIN_SYNC` (`config.rs`), `DIG_NODE_DIGLOCAL` (`config.rs`),
+/// `DIG_HOLDINGS_INGEST` (`holdings.rs`), `DIG_NODE_STORE_MELT` (`store_melted.rs`). Tracked as
+/// dig-node#459. An operator who learns `off` works for three switches will reasonably try it on a
+/// fourth, so the divergence is a real trap and not a tidiness point.
+///
+/// `off`, `disabled`, `0`, `false`, `no`, or an explicitly EMPTY value — trimmed and
+/// case-insensitive. An empty value counts because a variable that is *set* to nothing is an
+/// operator saying "none", which is exactly what `DIG_BOOTSTRAP_PEERS=` has meant since dig-node#312.
+///
+/// # Why this is one function rather than three (#282)
+///
+/// The three isolation knobs each carried their own off-token predicate and each read a different
+/// vocabulary: relay accepted `off`/`disabled` trimmed and case-insensitively, bootstrap accepted
+/// `off`/`disabled` plus empty, and the peer network matched the exact bytes `off`/`0`/`false` with
+/// no trim and no case folding. So `DIG_PEER_NETWORK=OFF` left the peer network **running** while
+/// the identically-spelled `DIG_RELAY_URL=OFF` correctly disabled the relay — two switches in one
+/// subsystem disagreeing about what the same string means, which is the divergence #282 exists to
+/// close. Every widening here moves a knob toward refusing to reach the network, never away.
+///
+/// **This is deliberately NOT the general boolean parser.** It answers only "did the operator
+/// explicitly disable this?", so an UNRECOGNISED value is not an "off" — for `DIG_RELAY_URL` an
+/// unrecognised value is a relay URL, and mistaking one for a disable would silently unplug a
+/// configured relay.
+pub(crate) fn is_off_token(value: &str) -> bool {
+    let v = value.trim();
+    v.is_empty()
+        || v.eq_ignore_ascii_case("off")
+        || v.eq_ignore_ascii_case("disabled")
+        || v.eq_ignore_ascii_case("0")
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("no")
 }
 
 /// The EFFECTIVE network label a node registers + discovers under — the string namespace shared by
@@ -1324,6 +1367,19 @@ impl NodeResponder {
 
     /// The live pool's peers as L7 `PeerRecord`s (peer_id + candidate addresses), or an empty list
     /// when no pool is wired. `network_id` is echoed onto each record.
+    ///
+    /// # The ADDRESS is withheld, never the PEER (#349)
+    ///
+    /// A pool entry whose address is not a destination — a relay-reached peer carries the wildcard
+    /// `[::]:0` — keeps its row with an EMPTY `addresses` array. It is still a real peer and still
+    /// reachable via the relay, so dropping the row would be a worse regression than the wildcard it
+    /// fixes: the asking node would not learn the peer exists at all.
+    ///
+    /// An empty array rather than an omitted field or an explicit null, because `dig.getPeers` is a
+    /// peer-facing wire surface and an empty array is a shape its consumers ALREADY handle:
+    /// `parse_forwarded_providers` drops an addressless provider by design (tested), and
+    /// `dig.announce` requires only that `addresses` BE an array. Omitting the field would break the
+    /// first of those and fail the second.
     fn pool_peers(&self, network_id: &str, limit: Option<usize>) -> Vec<Value> {
         let Some(handle) = &self.handle else {
             return Vec::new();
@@ -1331,24 +1387,34 @@ impl NodeResponder {
         let mut peers: Vec<Value> = handle
             .connected_pool_peers()
             .into_iter()
-            .map(|(peer_id, addr, _outbound)| {
-                json!({
-                    "peer_id": hex::encode(peer_id),
-                    "addresses": [{
-                        "host": addr.ip().to_string(),
-                        "port": addr.port(),
-                        "kind": "direct",
-                    }],
-                    "network_id": network_id,
-                    "via": "direct",
-                })
-            })
+            .map(|(peer_id, addr, _outbound)| pool_peer_row(peer_id, addr, network_id))
             .collect();
         if let Some(n) = limit {
             peers.truncate(n);
         }
         peers
     }
+}
+
+/// One `dig.getPeers` peer row: the peer's identity, its network, and the addresses a remote node
+/// may DIAL — which is where the `ContactAddr` check applies (#349).
+///
+/// Pure, and separate from [`NodeResponder::pool_peers`], so the decision "does this address go on
+/// the wire?" is testable without a live `GossipHandle`. The plumbing beneath it (reading the pool,
+/// truncating to `limit`) is not the property under test; which addresses survive is.
+fn pool_peer_row(peer_id: impl AsRef<[u8]>, addr: std::net::SocketAddr, network_id: &str) -> Value {
+    // The type boundary: an address reaches the wire only through `ContactAddr`, whose construction
+    // IS the "is this a destination?" question. A wildcard yields no entry, so the row keeps the
+    // peer and withholds the address.
+    let addresses: Vec<Value> = crate::net::ContactAddr::new(addr)
+        .map(|c| vec![c.address_json()])
+        .unwrap_or_default();
+    json!({
+        "peer_id": hex::encode(peer_id),
+        "addresses": addresses,
+        "network_id": network_id,
+        "via": "direct",
+    })
 }
 
 #[async_trait::async_trait]
@@ -3057,7 +3123,18 @@ async fn bring_up_dht(
         initial_ids.len()
     );
 
-    let dht = crate::dht::DhtHandle::new(service, initial_ids);
+    // The untrusted mirror-coin pointer source (dig-node#435), when the service shell installed
+    // one. Until it did, `DhtHandle::new` hard-coded `None` here and EVERY live announce published
+    // `unverified_mirror_coin_id = None` — the whole collateral-pointer mechanism was built, unit
+    // tested, and fed by nothing but a test double.
+    //
+    // `None` remains fully supported: the FFI path and any node without a mirror lifecycle announce
+    // exactly as before, and a verifier falls back to the hint scan.
+    let dht = crate::dht::DhtHandle::with_mirror_pointers(
+        service,
+        initial_ids,
+        node.mirror_coin_pointers(),
+    );
 
     // The real-time holdings layer (#1429): flood a signed opcode-222 announcement whenever this
     // node's inventory changes, and fold every peer's verified announcement into our provider set.
@@ -3597,13 +3674,16 @@ pub(crate) mod tests {
         let peer_port = peer_rpc.local_addr().unwrap().port();
 
         // The gossip pool on its OWN OS-assigned ephemeral port (a different socket).
-        let dir = std::env::temp_dir().join(format!("dig-node-wuc-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        // Owned by the guard: the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-wuc-")
+            .tempdir()
+            .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new([1u8; 32]),
-            cert_path: dir.join("node.cert").display().to_string(),
-            key_path: dir.join("node.key").display().to_string(),
-            peers_file_path: dir.join("peers.json"),
+            cert_path: dir.path().join("node.cert").display().to_string(),
+            key_path: dir.path().join("node.key").display().to_string(),
+            peers_file_path: dir.path().join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
             listen_addr: fresh_pool_listen_addr().await,
             ..Default::default()
@@ -3639,13 +3719,16 @@ pub(crate) mod tests {
     /// authority parses; the ONLY thing wrong with this anchor is that nothing answers there.
     #[tokio::test]
     async fn a_node_survives_every_bootstrap_anchor_being_unreachable() {
-        let dir = std::env::temp_dir().join(format!("dig-node-bootstrap-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        // Owned by the guard: the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-bootstrap-")
+            .tempdir()
+            .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new([3u8; 32]),
-            cert_path: dir.join("node.cert").display().to_string(),
-            key_path: dir.join("node.key").display().to_string(),
-            peers_file_path: dir.join("peers.json"),
+            cert_path: dir.path().join("node.cert").display().to_string(),
+            key_path: dir.path().join("node.key").display().to_string(),
+            peers_file_path: dir.path().join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
             listen_addr: fresh_pool_listen_addr().await,
             ..Default::default()
@@ -3695,13 +3778,16 @@ pub(crate) mod tests {
     // same reservation the node drives.
     #[tokio::test]
     async fn wire_relay_reservation_shares_one_status_with_the_pool() {
-        let dir = std::env::temp_dir().join(format!("dig-node-wuc-share-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        // Owned by the guard: the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-wuc-share-")
+            .tempdir()
+            .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new([2u8; 32]),
-            cert_path: dir.join("node.cert").display().to_string(),
-            key_path: dir.join("node.key").display().to_string(),
-            peers_file_path: dir.join("peers.json"),
+            cert_path: dir.path().join("node.cert").display().to_string(),
+            key_path: dir.path().join("node.key").display().to_string(),
+            peers_file_path: dir.path().join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
             listen_addr: fresh_pool_listen_addr().await,
             ..Default::default()
@@ -3780,7 +3866,7 @@ pub(crate) mod tests {
     /// than a log line, which prints on the broken path too.
     #[tokio::test]
     async fn a_stale_relayed_slot_does_not_refuse_the_direct_adoption() {
-        let handle = fresh_pool_handle("readopt-supersede", [11u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("readopt-supersede", [11u8; 32]).await;
         let peer = [0xAB; 32];
 
         // A relayed adoption lands first, then its session DIES (the server half is dropped) — the
@@ -3903,7 +3989,7 @@ pub(crate) mod tests {
     /// the CLI renderer, or a helper written and never called, leaves this red.
     #[tokio::test]
     async fn a_relay_peer_with_a_wildcard_pool_address_reports_no_address() {
-        let handle = fresh_pool_handle("wildcard-address", [23u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("wildcard-address", [23u8; 32]).await;
 
         // The peer seen in the wild: relayed, with dig-nat's unspecified remote.
         let (wildcard, _wildcard_server) = loopback_nat_conn(
@@ -3993,7 +4079,7 @@ pub(crate) mod tests {
     /// state before any peer connects). Uses a real `GossipHandle` — the same type the node retains.
     #[tokio::test]
     async fn connected_peers_json_is_empty_for_a_fresh_pool() {
-        let handle = fresh_pool_handle("cpjson-empty", [3u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("cpjson-empty", [3u8; 32]).await;
         assert!(connected_peers_json(&handle).is_empty());
     }
 
@@ -4002,7 +4088,7 @@ pub(crate) mod tests {
     /// path the RPC arm returns as a control error.
     #[tokio::test]
     async fn connect_peer_rejects_a_non_address_non_peer_id_argument() {
-        let handle = fresh_pool_handle("connect-bad-arg", [4u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("connect-bad-arg", [4u8; 32]).await;
         let err = connect_peer(&handle, "not-an-address").await.unwrap_err();
         assert!(err.contains("dialable address"), "got: {err}");
     }
@@ -4087,8 +4173,9 @@ pub(crate) mod tests {
         // Same network_id on both — a mismatch would be rejected at handshake. B binds a concrete
         // IPv6 loopback (§5.2 IPv6-first) so the inbound accept registers on every platform.
         let loopback_v6 = "[::1]:0".parse().expect("parse [::1]:0");
-        let node_a = fresh_pool_handle("loopback-a", [0x5au8; 32]).await;
-        let node_b = fresh_pool_handle_on("loopback-b", [0x5au8; 32], loopback_v6).await;
+        let (node_a, _node_a_dir) = fresh_pool_handle("loopback-a", [0x5au8; 32]).await;
+        let (node_b, _node_b_dir) =
+            fresh_pool_handle_on("loopback-b", [0x5au8; 32], loopback_v6).await;
 
         let a_peer_id = hex::encode(node_a.local_peer_id().expect("node A local_peer_id"));
         let b_port = node_b
@@ -4151,7 +4238,7 @@ pub(crate) mod tests {
     /// mirroring the connect arg-validation path — no network touch, no hang.
     #[tokio::test]
     async fn disconnect_peer_rejects_a_malformed_peer_id() {
-        let handle = fresh_pool_handle("disconnect-bad-arg", [7u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("disconnect-bad-arg", [7u8; 32]).await;
         let err = disconnect_peer(&handle, "not-hex").await.unwrap_err();
         assert!(err.contains("64-hex peer_id"), "got: {err}");
     }
@@ -4164,7 +4251,7 @@ pub(crate) mod tests {
     /// variant, a cross-family contract release, so this PR extends the existing peerStatus surface).
     #[tokio::test]
     async fn pool_stats_json_reports_the_pool_posture() {
-        let handle = fresh_pool_handle("pool-stats", [9u8; 32]).await;
+        let (handle, _handle_dir) = fresh_pool_handle("pool-stats", [9u8; 32]).await;
         let stats = pool_stats_json(&handle);
         assert_eq!(stats["connected"], 0, "a fresh pool has no connected peers");
         assert_eq!(stats["in_flight"], 0, "no dials are in flight yet");
@@ -4186,10 +4273,13 @@ pub(crate) mod tests {
 
     /// Build a real, freshly-started `GossipHandle` on the production-shaped dual-stack unspecified
     /// bind (`[::]:0`, §5.2) for the pool-handle tests.
+    /// The scratch guard rides along with the handle, for the reason
+    /// [`fresh_pool_handle_on`] documents: the started pool reads its cert files for its
+    /// whole lifetime, so the caller holds both.
     pub(crate) async fn fresh_pool_handle(
         tag: &str,
         network: [u8; 32],
-    ) -> dig_gossip::GossipHandle {
+    ) -> (dig_gossip::GossipHandle, tempfile::TempDir) {
         fresh_pool_handle_on(tag, network, fresh_pool_listen_addr().await).await
     }
 
@@ -4200,27 +4290,34 @@ pub(crate) mod tests {
     /// inbound loopback connections into the pool (the native-tls dual-stack accept quirk — the same
     /// family of `[::]`-v6only issue tracked for the extension-offline path), whereas a concrete
     /// loopback bind does, on every platform. Production still binds dual-stack `[::]` (`run_peer_network`).
+    /// Returns the guard alongside the handle: the started pool reads its cert, key and
+    /// peers files for its whole lifetime, so the directory must outlive the handle rather
+    /// than this function. The caller holds both, and `TempDir`'s `Drop` removes the tree
+    /// when the test ends — including on an unwind (dig-node#370).
     pub(crate) async fn fresh_pool_handle_on(
         tag: &str,
         network: [u8; 32],
         listen_addr: std::net::SocketAddr,
-    ) -> dig_gossip::GossipHandle {
-        let dir = std::env::temp_dir().join(format!("dig-node-{tag}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+    ) -> (dig_gossip::GossipHandle, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("dig-node-{tag}-"))
+            .tempdir()
+            .expect("a pool cert dir");
         let cfg = dig_gossip::GossipConfig {
             network_id: chia_protocol::Bytes32::new(network),
-            cert_path: dir.join("node.cert").display().to_string(),
-            key_path: dir.join("node.key").display().to_string(),
-            peers_file_path: dir.join("peers.json"),
+            cert_path: dir.path().join("node.cert").display().to_string(),
+            key_path: dir.path().join("node.key").display().to_string(),
+            peers_file_path: dir.path().join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
             listen_addr,
             ..Default::default()
         };
-        dig_gossip::GossipService::new(cfg)
+        let handle = dig_gossip::GossipService::new(cfg)
             .expect("gossip config")
             .start()
             .await
-            .expect("gossip start")
+            .expect("gossip start");
+        (handle, dir)
     }
 
     #[test]
@@ -4243,6 +4340,15 @@ pub(crate) mod tests {
             "case-insensitive opt-out"
         );
         assert!(is_relay_enabled(Some("wss://my-relay:9450")));
+
+        // A BLANK value still resolves to the default URL string, but the relay is DISABLED, so
+        // that string is never dialled (#352). The two assertions are kept adjacent on purpose:
+        // `resolve_relay_url` alone reads as "blank reaches the public relay", and that reading was
+        // true before this fix. Enablement, not the URL, is what isolates the node.
+        assert!(
+            !is_relay_enabled(Some("")),
+            "DIG_RELAY_URL= (explicitly empty) means NO relay, not the compiled-in public one"
+        );
     }
 
     #[test]
@@ -4375,19 +4481,147 @@ pub(crate) mod tests {
         );
     }
 
+    /// **Proves:** `dig.getPeers` never serves a non-destination to a remote peer as a dial
+    /// candidate, and withholds only the ADDRESS — the peer's row survives (#349).
+    ///
+    /// **Catches:** the shipped defect, in which a relay-reached peer was served to other nodes as
+    /// `{"host":"::","port":0}`. It also catches the two over-corrections: dropping the row entirely
+    /// (the asking node would never learn the peer exists) and blanking every row.
+    ///
+    /// The fixture is what makes this load-bearing. It carries a TRUTHFUL control peer at a real
+    /// destination alongside each non-destination, so "emit everything" and "emit nothing" both
+    /// fail. A fixture of wildcards alone — the one that reads as the harshest case — would pass
+    /// against an implementation that returned an empty list for every peer.
     #[test]
-    fn peer_network_enabled_default_on_off_only_for_opt_out() {
-        assert!(is_peer_network_enabled(None), "unset → enabled");
-        for off in ["off", "0", "false"] {
+    fn get_peers_withholds_a_non_destination_address_but_keeps_the_peer() {
+        let good_id = [7u8; 32];
+        let bad_id = [9u8; 32];
+        let real: std::net::SocketAddr = "203.0.113.7:9444".parse().unwrap();
+
+        // The truthful control renders its address in full, every time.
+        let control = pool_peer_row(good_id, real, "DIG_MAINNET");
+        assert_eq!(control["addresses"][0]["host"], json!("203.0.113.7"));
+        assert_eq!(control["addresses"][0]["port"], json!(9444));
+        assert_eq!(control["addresses"][0]["kind"], json!("direct"));
+
+        // Every shape of non-destination: the two wildcards, and port 0 on a real IP.
+        for junk in ["[::]:0", "0.0.0.0:0", "[::]:9444", "203.0.113.7:0"] {
+            let addr: std::net::SocketAddr = junk.parse().unwrap();
+            let row = pool_peer_row(bad_id, addr, "DIG_MAINNET");
+
+            // The PEER survives — it is still reachable via the relay, and dropping it would deny
+            // the asking node the knowledge that it exists.
+            assert_eq!(
+                row["peer_id"],
+                json!(hex::encode(bad_id)),
+                "{junk}: the peer row must survive"
+            );
+            assert_eq!(row["network_id"], json!("DIG_MAINNET"));
+
+            // The ADDRESS does not — as an empty array, the shape consumers already handle.
+            assert_eq!(
+                row["addresses"],
+                json!([]),
+                "{junk} is not a destination and must never be served as a dial candidate"
+            );
             assert!(
-                !is_peer_network_enabled(Some(off)),
-                "DIG_PEER_NETWORK={off} disables"
+                row["addresses"].is_array(),
+                "{junk}: addresses must stay an ARRAY — dig.announce validates `is_array`, and \
+                 omitting the field or emitting null would fail that check"
             );
         }
+    }
+
+    /// **Proves:** the wire-address renderer is reachable ONLY through the destination check — the
+    /// type boundary #349 asked for, rather than a fifth call-site `if`.
+    ///
+    /// **Catches:** a sixth emitter re-deriving `{host, port}` from a raw `SocketAddr`. It cannot
+    /// mint a `ContactAddr` for a non-destination, so there is no renderer to reach.
+    #[test]
+    fn a_wire_address_can_only_be_rendered_from_a_checked_contact() {
+        use crate::net::ContactAddr;
+        let real: std::net::SocketAddr = "203.0.113.7:9444".parse().unwrap();
+        let loopback: std::net::SocketAddr = "127.0.0.1:9444".parse().unwrap();
+
+        // Loopback is deliberately a destination — single-host multi-node runs depend on it — so
+        // this control also pins the guard against being tightened into "public addresses only".
+        for good in [real, loopback] {
+            let contact = ContactAddr::new(good).expect("a real destination must be constructible");
+            assert_eq!(contact.addr(), good);
+            assert_eq!(contact.address_json()["host"], json!(good.ip().to_string()));
+            assert_eq!(contact.address_json()["port"], json!(good.port()));
+        }
+        for bad in ["[::]:0", "0.0.0.0:9444", "203.0.113.7:0"] {
+            assert!(
+                ContactAddr::new(bad.parse().unwrap()).is_none(),
+                "{bad} must not be constructible as a contact, so it has no renderer"
+            );
+        }
+    }
+
+    /// **Proves:** the three network-reaching isolation knobs read ONE off-vocabulary — an operator
+    /// who disables one with a given spelling disables all three with it (#282/#352).
+    ///
+    /// **Catches:** the divergence as it actually shipped. `is_peer_network_enabled` matched the
+    /// exact bytes `off`/`0`/`false`, so `DIG_PEER_NETWORK=OFF` left the peer network RUNNING while
+    /// the identically-spelled `DIG_RELAY_URL=OFF` disabled the relay.
+    ///
+    /// The table is what makes this load-bearing. Every token is asserted against BOTH knobs, and
+    /// the case-and-whitespace variants (`OFF`, ` off `, `No`) are the only rows the old and new
+    /// predicates disagree about — a test listing only lowercase `off`/`0`/`false`, which is what
+    /// this replaced, passes under both implementations and could never have caught the defect.
+    #[test]
+    fn the_three_isolation_knobs_share_one_off_vocabulary() {
+        // Unset is NOT a disable on either knob — #923's no-configuration anchor depends on it.
+        assert!(is_relay_enabled(None), "unset relay → enabled");
         assert!(
-            is_peer_network_enabled(Some("on")),
-            "any other value → enabled"
+            is_peer_network_enabled(None),
+            "unset peer network → enabled"
         );
+
+        for off in [
+            "off", "OFF", " off ", "Off", "disabled", "DISABLED", "0", "false", "False", "no",
+            "No", "", "   ",
+        ] {
+            assert!(
+                is_off_token(off),
+                "{off:?} must be read as an explicit disable"
+            );
+            assert!(
+                !is_relay_enabled(Some(off)),
+                "DIG_RELAY_URL={off:?} must disable the relay"
+            );
+            assert!(
+                !is_peer_network_enabled(Some(off)),
+                "DIG_PEER_NETWORK={off:?} must disable the peer network"
+            );
+        }
+
+        // An UNRECOGNISED value is not a disable. For the relay it is a URL, so reading it as an
+        // off-token would silently unplug a configured relay — the opposite failure to #282's.
+        for on in [
+            "on",
+            "1",
+            "true",
+            "yes",
+            "wss://my-relay:9450",
+            "offline",
+            "no-thanks",
+        ] {
+            assert!(
+                !is_off_token(on),
+                "{on:?} must NOT be read as an explicit disable"
+            );
+            assert!(is_relay_enabled(Some(on)), "DIG_RELAY_URL={on:?} → enabled");
+            assert!(
+                is_peer_network_enabled(Some(on)),
+                "DIG_PEER_NETWORK={on:?} → enabled"
+            );
+        }
+
+        // `offline` and `no-thanks` above are the discriminating negatives: a predicate written with
+        // `starts_with` rather than equality would disable the relay on both, so they pin the
+        // boundary from the other side.
     }
 
     #[test]

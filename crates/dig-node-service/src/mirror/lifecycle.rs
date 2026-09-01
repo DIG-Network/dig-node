@@ -360,6 +360,31 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         Ok(held_mirrors(&inventory))
     }
 
+    fn coin_confirmation(&self, coin_id: &str) -> Result<Option<u32>, PassError> {
+        // A malformed id is this node's own bookkeeping being wrong, not the chain being
+        // unreachable, so it is NOT an `Err`: reporting it as one would count a permanent local
+        // defect as a transient outage and hide it behind a retry forever.
+        let Ok(id) = parse_id(coin_id, "coin id") else {
+            tracing::error!(
+                target: "mirror",
+                coin_id = %coin_id,
+                "an audit record names a coin id this node cannot parse; it is not resolved"
+            );
+            return Ok(None);
+        };
+
+        // `Err` stays `Err`: the source failing to answer is not evidence about the coin.
+        let record = self
+            .source
+            .coin_record(id)
+            .map_err(|e| PassError::Chain(e.to_string()))?;
+
+        // `confirmed_height` is itself optional — a coin the source knows about but has not seen in
+        // a block yet. That is not a confirmation, and it folds into the same `None` as absence
+        // because both call for exactly one action: wait for the next pass.
+        Ok(record.and_then(|r| r.confirmed_height))
+    }
+
     fn dig_balance_base_units(&self) -> Result<u64, PassError> {
         self.dig_balance.clone()
     }

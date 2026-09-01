@@ -2969,7 +2969,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.65.0"
+version = "0.67.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.194.0"
+version = "0.220.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3080,6 +3080,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.2",
  "url",
  "windows-service",
  "windows-sys 0.61.2",
@@ -3335,7 +3336,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.43.0"
+version = "0.45.0"
 dependencies = [
  "async-trait",
  "axum",

@@ -37,13 +37,6 @@ fn env_guard() -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// Monotonic sequence giving each `start_companion_full` call a UNIQUE cache/config
-/// dir, so the per-server control-token file + pin registry (and pinned-store list a
-/// test asserts on) are never shared between tests. This + the [`EnvHold`] lock
-/// together remove the flaky UNAUTHORIZED: the lock makes the global-env reads
-/// consistent, the unique dir keeps each server's on-disk state isolated.
-static TEST_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Start a mock upstream DIG RPC on a random loopback port. It records every
 /// request and answers `dig.getAnchoredRoot` / `dig.listCapsules` / echoes the
 /// rest — enough to assert delegation + passthrough. Returns (base_url, calls).
@@ -90,11 +83,20 @@ async fn start_mock_upstream() -> (String, Arc<Mutex<Vec<Value>>>) {
 /// global env stays pinned to ITS dir for the whole test, then releases it on drop.
 /// (Per-test unique dirs alone are not enough precisely because the reads are live
 /// and global — the lock is what makes them consistent.)
+///
+/// It also carries the harness's scratch tree, when there is one (dig-node#370). The tree
+/// must outlive the spawned server rather than the builder that made it, and this guard is
+/// already the value every caller keeps alive for exactly that span — so hanging the
+/// `TempDir` here removes the directory at the same instant the test ends, on an unwind as
+/// well as on success. `Drop` cannot reclaim what a still-open handle pins, so on Windows a
+/// tree whose `wallet.sqlite` the detached serve task still holds may survive; the residue
+/// is bounded by that and is not pretended away.
 #[must_use]
 struct EnvHold(
     // Held purely for its Drop (RAII release of the serialization lock). The field is
     // never read — the value's lifetime IS its purpose — so silence dead_code.
     #[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>,
+    #[allow(dead_code)] Option<tempfile::TempDir>,
 );
 
 /// Start the companion app on a random loopback port pointed at the given upstream
@@ -129,7 +131,7 @@ async fn start_companion_full_inner(
     // node, but the server then reads DIG_NODE_CACHE/config_path LIVE per request, so
     // the lock must outlive construction to keep those reads consistent (see EnvHold).
     let hold = env_guard().lock_owned().await;
-    let (state, token) = {
+    let (state, token, base) = {
         // Isolate dig-node's on-disk state PER CALL so the test never touches the
         // real cache AND no two concurrent tests share state.
         //
@@ -141,12 +143,13 @@ async fn start_companion_full_inner(
         // and on Windows a concurrent reader could hit that file mid-write, error,
         // and fall back to a random in-memory token → intermittent UNAUTHORIZED on a
         // token-gated control.* call (the flaky failure this guards). Give each call
-        // its own PARENT dir (`<temp>/dig-node-test-<pid>-<seq>/cache`) so the
+        // its own PARENT dir (`<temp>/dig-node-test-<random>/cache`, owned by a TempDir) so
         // token + config.json are unique per server. (Set before from_env reads it.)
-        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
-        let cache = base.join("cache");
+        let base = tempfile::Builder::new()
+            .prefix("dig-node-test-")
+            .tempdir()
+            .expect("create the test base dir");
+        let cache = base.path().join("cache");
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
@@ -155,7 +158,7 @@ async fn start_companion_full_inner(
         // DigNode`, …) the server + this test would resolve THAT shared dir instead of the temp
         // one, losing isolation and clobbering across concurrent tests. DIG_NODE_STATE_DIR (the
         // designed test/deploy override) pins it to this test's base dir, identity-independently.
-        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        std::env::set_var("DIG_NODE_STATE_DIR", base.path());
         let state = dig_node_service::server::build_state(&config).await;
         let state = match chia_peers {
             Some(n) => state.with_chia_peer_count_for_tests(n),
@@ -164,7 +167,7 @@ async fn start_companion_full_inner(
         // The token the server wrote (read from disk, exactly as a real controller
         // would). config_path() resolves under the temp DIG_NODE_CACHE we just set.
         let token = dig_node_service::control::load_or_create_token().unwrap();
-        (state, token)
+        (state, token, base)
     };
     // `into_make_service_with_connect_info` — not the plain `app` — is what makes
     // `ConnectInfo<SocketAddr>` extractable in the real `rpc()` handler (#1619 follow-up): a bare
@@ -177,7 +180,7 @@ async fn start_companion_full_inner(
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, token, EnvHold(hold))
+    (addr, token, EnvHold(hold, Some(base)))
 }
 
 /// Like [`start_companion_full`], but with the wallet's Chia peer count pinned to `peers`. No
@@ -200,18 +203,19 @@ async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
-    let (state, probe) = {
-        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
-        let cache = base.join("cache");
+    let (state, probe, base) = {
+        let base = tempfile::Builder::new()
+            .prefix("dig-node-test-")
+            .tempdir()
+            .expect("create the test base dir");
+        let cache = base.path().join("cache");
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
-        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        std::env::set_var("DIG_NODE_STATE_DIR", base.path());
         let state = dig_node_service::server::build_state(&config).await;
         let probe = state.loop_probe_request();
-        (state, probe)
+        (state, probe, base)
     };
     let app =
         dig_node_service::server::router(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -220,7 +224,7 @@ async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, probe, EnvHold(hold))
+    (addr, probe, EnvHold(hold, Some(base)))
 }
 
 /// Like [`start_companion_probe`] but ALSO returns the built [`AppState`], so a test can observe
@@ -240,18 +244,19 @@ async fn start_companion_probe_state(
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
-    let (state, probe) = {
-        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
-        let cache = base.join("cache");
+    let (state, probe, base) = {
+        let base = tempfile::Builder::new()
+            .prefix("dig-node-test-")
+            .tempdir()
+            .expect("create the test base dir");
+        let cache = base.path().join("cache");
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
-        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        std::env::set_var("DIG_NODE_STATE_DIR", base.path());
         let state = dig_node_service::server::build_state(&config).await;
         let probe = state.loop_probe_request();
-        (state, probe)
+        (state, probe, base)
     };
     let app = dig_node_service::server::router(state.clone())
         .into_make_service_with_connect_info::<SocketAddr>();
@@ -260,7 +265,7 @@ async fn start_companion_probe_state(
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, probe, state, EnvHold(hold))
+    (addr, probe, state, EnvHold(hold, Some(base)))
 }
 
 /// Like [`start_companion_full`] but ALSO returns the served wallet backend (#368/#369) so a WS
@@ -276,11 +281,12 @@ async fn start_companion_wallet(
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
-    let (state, token, backend) = {
-        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
-        let cache = base.join("cache");
+    let (state, token, backend, base) = {
+        let base = tempfile::Builder::new()
+            .prefix("dig-node-test-")
+            .tempdir()
+            .expect("create the test base dir");
+        let cache = base.path().join("cache");
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
@@ -289,11 +295,11 @@ async fn start_companion_wallet(
         // DigNode`, …) the server + this test would resolve THAT shared dir instead of the temp
         // one, losing isolation and clobbering across concurrent tests. DIG_NODE_STATE_DIR (the
         // designed test/deploy override) pins it to this test's base dir, identity-independently.
-        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        std::env::set_var("DIG_NODE_STATE_DIR", base.path());
         let state = dig_node_service::server::build_state(&config).await;
         let token = dig_node_service::control::load_or_create_token().unwrap();
         let backend = state.wallet_backend();
-        (state, token, backend)
+        (state, token, backend, base)
     };
     let app =
         dig_node_service::server::router(state).into_make_service_with_connect_info::<SocketAddr>();
@@ -302,7 +308,7 @@ async fn start_companion_wallet(
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, token, backend, EnvHold(hold))
+    (addr, token, backend, EnvHold(hold, Some(base)))
 }
 
 fn client() -> reqwest::Client {
@@ -711,15 +717,19 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
     // Drive serve under the env lock, held for the whole test (the server reads
     // DIG_NODE_CACHE/config live per request — see EnvHold). Bound to `_hold` so it
     // outlives the spawned server below.
-    let _hold = EnvHold(env_guard().lock_owned().await);
+    let _hold = EnvHold(env_guard().lock_owned().await, None);
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_for_server = stop.clone();
     let server = {
-        let tmp = std::env::temp_dir().join(format!("dig-node-dual-{}", std::process::id()));
-        std::env::set_var("DIG_NODE_CACHE", &tmp);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let tmp = tempfile::Builder::new()
+            .prefix("dig-node-dual-")
+            .tempdir()
+            .expect("a scratch dir");
+        std::env::set_var("DIG_NODE_CACHE", tmp.path());
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
         // Isolate the #501 control-token/paired-token state dir per test (see the note above).
-        std::env::set_var("DIG_NODE_STATE_DIR", &tmp);
+        std::env::set_var("DIG_NODE_STATE_DIR", tmp.path());
         // This test exercises the LISTENER bind fallback, not the peer network. Opt out of the
         // §14 peer-network bring-up (#213) so `serve_with_shutdown` stays hermetic here (no gossip
         // pool / DHT / relay reach). A dedicated test covers the peer-network wiring.
@@ -777,15 +787,19 @@ async fn dual_stack_loopback_serves_both_ipv4_and_ipv6_on_the_same_port() {
         ..dig_node_service::Config::default()  // host: None → dual-stack default
     };
 
-    let _hold = EnvHold(env_guard().lock_owned().await);
+    let _hold = EnvHold(env_guard().lock_owned().await, None);
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_for_server = stop.clone();
     let server = {
-        let tmp = std::env::temp_dir().join(format!("dig-node-dualstack-{}", std::process::id()));
-        std::env::set_var("DIG_NODE_CACHE", &tmp);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let tmp = tempfile::Builder::new()
+            .prefix("dig-node-dualstack-")
+            .tempdir()
+            .expect("a scratch dir");
+        std::env::set_var("DIG_NODE_CACHE", tmp.path());
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
         // Isolate the #501 control-token/paired-token state dir per test (see the note above).
-        std::env::set_var("DIG_NODE_STATE_DIR", &tmp);
+        std::env::set_var("DIG_NODE_STATE_DIR", tmp.path());
         std::env::set_var("DIG_PEER_NETWORK", "off");
         tokio::spawn(async move {
             dig_node_service::server::serve_with_shutdown(config, async move {
@@ -2518,12 +2532,36 @@ async fn control_method_with_wrong_token_is_rejected() {
 // revoke immediately un-authorizes it.
 
 /// A control MUTATION probe (`control.config.setUpstream`) for the pairing test —
-/// reusable across the un-paired / paired / revoked assertions.
+/// reusable across the un-paired / revoked assertions.
+///
+/// This method is MASTER tier (`LOCALLY_MASTER_TIER_CONTROL_METHODS`, dig-node#255): the upstream
+/// it persists is the third party every unimplemented method is forwarded to, and `pairing.revoke`
+/// does not take it back. So it proves a token is REJECTED; it can never prove a PAIRED token is
+/// live — use [`paired_tier_mutation`] for that.
 async fn setupstream_mutation(addr: &SocketAddr, token: Option<&str>) -> Value {
     post_rpc(
         addr,
         json!({ "jsonrpc": "2.0", "id": 1, "method": "control.config.setUpstream",
                 "params": { "upstream": "https://paired.example" } }),
+        token,
+    )
+    .await
+}
+
+/// A control MUTATION probe on the ORDINARY tier (`control.cache.setCap`), for asserting that a
+/// PAIRED token is genuinely live.
+///
+/// `cache.setCap` is the method dig-app already drives with a paired token, and
+/// [`requires_master_token`]'s stated rule places it on the ordinary tier deliberately: it moves a
+/// local resource budget, names no principal, and confers no authority that survives the token.
+/// It therefore mutates for a paired token and is refused without one — exactly the discrimination
+/// a liveness precondition needs. `cap_bytes` is echoed from the request, so the assertion reads
+/// the call's own answer rather than process-global cache state a sibling test also writes.
+async fn paired_tier_mutation(addr: &SocketAddr, token: Option<&str>) -> Value {
+    post_rpc(
+        addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.cache.setCap",
+                "params": { "cap_bytes": 128 * 1024 * 1024u64 } }),
         token,
     )
     .await
@@ -2545,9 +2583,15 @@ async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
     let (upstream, _calls) = start_mock_upstream().await;
     let (addr, master, _hold) = start_companion_full(&upstream).await;
 
-    // A control MUTATION with no token is rejected (the extension can't read the file).
+    // A control MUTATION with no token is rejected (the extension can't read the file) — on the
+    // ordinary tier too, so the rejection is about the missing token and not about the tier.
     let denied = setupstream_mutation(&addr, None).await;
     assert_eq!(denied["error"]["data"]["code"], json!("UNAUTHORIZED"));
+    let denied_ordinary = paired_tier_mutation(&addr, None).await;
+    assert_eq!(
+        denied_ordinary["error"]["data"]["code"],
+        json!("UNAUTHORIZED")
+    );
 
     // 1. OPEN pairing.request → a pairing_id + a compare-codes value.
     let req = post_rpc(
@@ -2583,9 +2627,9 @@ async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
     let scoped = approved["result"]["token"].as_str().unwrap().to_string();
     assert_eq!(scoped.len(), 64);
 
-    // 5. The scoped token AUTHORIZES a control mutation.
-    let ok = setupstream_mutation(&addr, Some(&scoped)).await;
-    assert_eq!(ok["result"]["upstream"], json!("https://paired.example"));
+    // 5. The scoped token AUTHORIZES an ordinary-tier control mutation.
+    let ok = paired_tier_mutation(&addr, Some(&scoped)).await;
+    assert_eq!(ok["result"]["cap_bytes"], json!(128 * 1024 * 1024u64));
 
     // 6. But the scoped token CANNOT administer pairings (master-only).
     let admin = post_rpc(
@@ -2606,7 +2650,7 @@ async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
     .await;
     assert_eq!(revoke["result"]["revoked"], json!(true));
 
-    let after_revoke = setupstream_mutation(&addr, Some(&scoped)).await;
+    let after_revoke = paired_tier_mutation(&addr, Some(&scoped)).await;
     assert_eq!(after_revoke["error"]["data"]["code"], json!("UNAUTHORIZED"));
 }
 
@@ -2650,11 +2694,11 @@ async fn a_paired_token_cannot_grant_itself_a_trusted_chia_peer() {
         .unwrap()
         .to_string();
 
-    // The scoped token is genuinely live: it drives an ordinary control mutation.
-    let live = setupstream_mutation(&addr, Some(&scoped)).await;
+    // The scoped token is genuinely live: it drives an ordinary-tier control mutation.
+    let live = paired_tier_mutation(&addr, Some(&scoped)).await;
     assert_eq!(
-        live["result"]["upstream"],
-        json!("https://paired.example"),
+        live["result"]["cap_bytes"],
+        json!(128 * 1024 * 1024u64),
         "the token must be VALID, or the refusals below prove nothing"
     );
 
@@ -2918,13 +2962,13 @@ async fn control_updater_status_and_mutation_wired_over_http() {
     let (addr, token, _hold) = start_companion_full(&upstream).await;
 
     // -- status: absent (no beacon installed on this runner) is a normal, non-error result.
-    let status_dir = std::env::temp_dir().join(format!(
-        "dig-node-updater-e2e-status-{}-{}",
-        std::process::id(),
-        line!()
-    ));
-    let _ = std::fs::remove_dir_all(&status_dir);
-    std::env::set_var("DIG_UPDATER_STATUS_DIR", &status_dir);
+    // Owned by the guard: removed on drop and on an unwind (dig-node#370). The node reads
+    // this path live, so the binding must outlive every assertion below.
+    let status_dir = tempfile::Builder::new()
+        .prefix("dig-node-updater-e2e-status-")
+        .tempdir()
+        .expect("a status dir");
+    std::env::set_var("DIG_UPDATER_STATUS_DIR", status_dir.path());
 
     let absent = post_rpc(
         &addr,
@@ -2938,7 +2982,7 @@ async fn control_updater_status_and_mutation_wired_over_http() {
     std::fs::create_dir_all(&status_dir).unwrap();
     let body = json!({ "schema": 1, "version": "0.6.0", "channel": "alpha", "paused": false });
     std::fs::write(
-        status_dir.join("status.json"),
+        status_dir.path().join("status.json"),
         serde_json::to_vec(&body).unwrap(),
     )
     .unwrap();
@@ -3189,14 +3233,12 @@ async fn start_serving_node(
         ..dig_node_service::Config::default()
     };
 
-    let hold = EnvHold(env_guard().lock_owned().await);
-    let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!(
-        "dig-node-peernet-{}-{}",
-        std::process::id(),
-        unique
-    ));
-    let cache = base.join("cache");
+    let hold = env_guard().lock_owned().await;
+    let base = tempfile::Builder::new()
+        .prefix("dig-node-peernet-")
+        .tempdir()
+        .expect("create the peer-network base dir");
+    let cache = base.path().join("cache");
     std::fs::create_dir_all(&cache).expect("create test cache dir");
     std::env::set_var("DIG_NODE_CACHE", &cache);
     std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
@@ -3230,7 +3272,7 @@ async fn start_serving_node(
     }
     assert!(served, "the node must serve /health after bring-up");
 
-    (port, stop, server, token, hold)
+    (port, stop, server, token, EnvHold(hold, Some(base)))
 }
 
 /// Call `control.peerStatus` with the control token and return the JSON-RPC response.

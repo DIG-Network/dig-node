@@ -105,6 +105,23 @@ impl BalanceAsset {
         self.cat_asset_id().map(hex::encode)
     }
 
+    /// The asset an `asset_id` wire argument names: `None` is native XCH, `Some(hex)` a CAT.
+    ///
+    /// The INVERSE of [`Self::asset_id_hex`], and the reason it exists is dig-node#306: the
+    /// Sage-parity coin reads take an `Option<&str>` while the scoping helpers take a
+    /// [`BalanceAsset`], and without this bridge the fallback tier had no way to scope a CAT read
+    /// and simply answered with nothing.
+    ///
+    /// An UNPARSEABLE asset id is an `Err`, never a silent `Xch`. Defaulting a mistyped id to
+    /// native XCH is how a caller asking about one token gets a confident answer about a
+    /// different one — the same rule `parse_asset_param` states on the control surface.
+    fn from_asset_id_hex(asset_id: Option<&str>) -> Result<Self> {
+        let Some(id) = asset_id else {
+            return Ok(Self::Xch);
+        };
+        Ok(Self::Cat(parse_puzzle_hash(id)?))
+    }
+
     /// The puzzle hash this asset's coins sit at when owned by `owner_puzzle_hash`, or `None`
     /// for native XCH (whose coins sit at the owner hash itself).
     ///
@@ -1098,6 +1115,19 @@ impl WalletBackend {
     /// unbounded egress path (dig_ecosystem#1957) that also discloses `{IP, timestamp, coin id}`
     /// to that third party.
     ///
+    /// Drop the chain-derived cache and force a re-sync from chain (dig-node#384).
+    ///
+    /// A thin pass-through to [`WalletDb::reset_chain_cache`], which holds the whole contract:
+    /// the authoritative flag is cleared in the same transaction as the coins, an in-flight spend
+    /// refuses, and no key material is reachable. Exposed here because the control plane holds a
+    /// backend, not a database.
+    pub async fn reset_coin_db(
+        &self,
+        now_ms: i64,
+    ) -> sqlx::Result<std::result::Result<super::db::ResetReport, super::db::ResetRefusal>> {
+        self.db.reset_chain_cache(now_ms).await
+    }
+
     /// With no supervisor the peer count is reported UNOBSERVABLE (`None`), never zero — zero
     /// would claim an observation nobody made.
     pub async fn wallet_sync_status(
@@ -2095,28 +2125,61 @@ impl WalletBackend {
             return Err(PushError::NodeCustodiedSpend);
         }
         let pusher = self.pusher.as_ref().ok_or(PushError::NoChainSource)?;
-        let outcome = pusher
-            .push(&bundle)
-            .await
-            .map_err(|e| PushError::Unreachable(e.to_string()))?;
+        let pushed = pusher.push(&bundle).await;
 
-        // Reserve the bundle's inputs ONLY once the mempool has accepted it
-        // (dig_ecosystem#2763). A refusal reserves nothing: those coins were never committed, and
-        // holding them would strand the user's money over a spend that will never happen.
+        // Reserve unless the bundle was DEFINITIVELY rejected — see [`Self::is_definitive_rejection`].
         //
-        // A reservation failure does not fail the push. The bundle is already in a public mempool
-        // by this point, and reporting a push that did happen as an error would be a worse lie
-        // than the double-selection this guards against.
-        if outcome.accepted {
+        // A reservation failure does not fail the push. The bundle may already be in a public
+        // mempool by this point, and reporting a push that did happen as an error would be a worse
+        // lie than the double-selection this guards against.
+        if !matches!(&pushed, Ok(o) if Self::is_definitive_rejection(o)) {
             if let Err(e) = self.reserve_pushed_bundle(&bundle).await {
                 tracing::warn!(
                     error = %e,
-                    "pushed bundle accepted but its coins could not be reserved; a second send \
-                     inside the confirmation window may reselect them"
+                    "pushed bundle may be in flight but its coins could not be reserved; a second \
+                     send inside the confirmation window may reselect them"
                 );
             }
         }
-        Ok(outcome)
+        pushed.map_err(|e| PushError::Unreachable(e.to_string()))
+    }
+
+    /// Whether `outcome` is the network DEFINITIVELY refusing this bundle — the only case in which
+    /// its inputs stay selectable (#348).
+    ///
+    /// # The asymmetry this exists to correct
+    ///
+    /// Reservation used to be gated on `outcome.accepted` alone, so the two directions failed
+    /// OPPOSITE ways and **the cheap-to-lie direction was the unsafe one**:
+    ///
+    /// - **Under-claim** — a source denying it relayed what it did relay, or a transport that failed
+    ///   AFTER transmitting — reserved nothing, so the coins returned to the selectable set while a
+    ///   bundle carrying them was in flight. A second send inside the confirmation window could
+    ///   reselect the same inputs: exactly the double-select window this family exists to close.
+    /// - **Over-claim** reserved for the bounded `RESERVATION_TTL_MS`, which self-heals.
+    ///
+    /// A source that wants a coin reselected only has to say "not accepted". Under NC-12 every
+    /// dialled peer is untrusted, so that is not an exotic failure — it is the assumed case. So an
+    /// unconfirmed relay is now treated as POSSIBLY IN FLIGHT and held to the TTL, which is the
+    /// discipline dig-account settled on for the in-process race.
+    ///
+    /// # What counts as definitive, and what this does NOT claim
+    ///
+    /// A refusal is definitive only when the mempool STATED its reason (`accepted == false` with a
+    /// `rejection`). A bare `accepted: false` with no reason is an unexplained denial and is held.
+    ///
+    /// This does not make the flag trustworthy — a hostile source can fabricate a rejection string,
+    /// and nothing here can verify one without an independent chain read. What it does is make the
+    /// CHEAPEST lie, and the accidental case, land on the safe side: a silent denial and a
+    /// post-transmit transport failure now hold the coins instead of freeing them.
+    ///
+    /// The TTL is deliberately NOT shortened to compensate for the wider hold. That would trade a
+    /// double-select for a lockout, and a lockout is the worse failure — measured on dig-account as
+    /// `available=4000000 selectable=0`, renewable indefinitely. Requiring a STATED reason is what
+    /// keeps a genuine mempool rejection (a bad signature, say) from locking the user's coins for
+    /// the full TTL.
+    fn is_definitive_rejection(outcome: &PushOutcome) -> bool {
+        !outcome.accepted && outcome.rejection.is_some()
     }
 
     /// Record an accepted bundle as in-flight and hold its inputs out of further selection.
@@ -2280,16 +2343,20 @@ impl WalletBackend {
                     .collect())
             }
             Source::Fallback => {
-                // XCH coins are at our puzzle hashes; CAT coins are hinted to them. CAT
-                // asset attribution while syncing needs puzzle uncurrying (follow-on), so
-                // the syncing-fallback CAT set is empty until the DB converges.
-                if asset_id.is_some() {
-                    return Ok(Vec::new());
-                }
-                let coins = self
-                    .fallback
-                    .coin_records_by_puzzle_hashes(&identity)
-                    .await?;
+                // dig-node#306. This arm used to `return Ok(Vec::new())` for ANY CAT, so a real
+                // $DIG holder on an unsynced replica read as holding NONE — the mirror image of
+                // dig_ecosystem#2879's over-report, and money-class for the same reason: a caller
+                // cannot tell "you hold nothing" from "this tier declined to look."
+                //
+                // The blocker its comment named — *"CAT asset attribution while syncing needs
+                // puzzle uncurrying"* — does not exist. A CAT coin is identified by WHERE IT
+                // SITS, not by uncurrying it, so `asset_scoped_fallback_coins` scopes a hint read
+                // to one asset with no uncurrying at all. It is the SAME helper
+                // `balance_for_address` and `coins_for_address` already use, called here rather
+                // than re-derived: the balance and the coin list behind it must not be able to
+                // scope to different assets (§2.0 — one behaviour, one implementation).
+                let asset = BalanceAsset::from_asset_id_hex(asset_id)?;
+                let coins = self.asset_scoped_fallback_coins(asset, &identity).await?;
                 Ok(coins
                     .iter()
                     .map(|c| self.fallback_coin_to_record(c))
@@ -3198,6 +3265,10 @@ impl WalletBackend {
         if phs.is_empty() {
             return Ok(0);
         }
+        // Observed BEFORE this refresh writes anything, so a reset landing while it runs makes
+        // its latch below a no-op rather than a re-declaration of the emptied replica as
+        // authoritative (dig-node#454). Same guard, same counter, as the catch-up path.
+        let epoch_at_start = self.db.reset_epoch().await?;
         // XCH coins sitting at our puzzle hashes + CAT coins hinted to them (unspent + recent).
         let mut fetched = self.fallback.coin_records_by_puzzle_hashes(&phs).await?;
         fetched.extend(self.fallback.coin_records_by_hints(&phs).await?);
@@ -3318,8 +3389,17 @@ impl WalletBackend {
             // `phs` is what this pass actually fetched, so recording it is the honest claim: it
             // covers custody's own addresses, and `watchlist_is_covered_by` above has already
             // established that it covers every enrolled one too.
-            self.db.record_coverage(&CoveredSet::from_hex(&phs)).await?;
-            self.db.set_initial_sync_complete(true).await?;
+            if !self
+                .db
+                .latch_synced_over_unless_reset(&CoveredSet::from_hex(&phs), epoch_at_start)
+                .await?
+            {
+                tracing::info!(concat!(
+                    "wallet sync: the coin database was reset while this refresh ran, ",
+                    "so its result was discarded rather than used to mark the emptied ",
+                    "replica synced"
+                ));
+            }
         } else {
             tracing::info!(
                 "wallet sync: a point-read refresh covered only this node's own custody, so the \
@@ -4180,13 +4260,15 @@ impl WalletBackend {
         Ok(ActionResponse {})
     }
 
+    /// Raise the HD derivation floor, reporting the floors in force afterwards (dig-node#256).
+    ///
+    /// The one action method that does NOT return the shared empty response, because its no-op is
+    /// reachable and costs money: see [`IncreaseDerivationIndexResponse`].
     async fn increase_derivation_index(
         &self,
         req: &IncreaseDerivationIndex,
-    ) -> Result<ActionResponse> {
-        actions::increase_derivation_index(&self.db, req.hardened, req.unhardened, req.index)
-            .await?;
-        Ok(ActionResponse {})
+    ) -> Result<IncreaseDerivationIndexResponse> {
+        actions::increase_derivation_index(&self.db, req.hardened, req.unhardened, req.index).await
     }
 
     // ---- themes (#205 PR4) --------------------------------------------------
@@ -5027,14 +5109,13 @@ mod tests {
 
     /// A scratch config dir unique to this process AND thread, so parallel tests never share a
     /// custody manifest.
-    fn refusal_scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-wallet-tip-refusal-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn refusal_scratch_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("dig-wallet-tip-refusal-{tag}-"))
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     /// Ask `be` for a tip and return the `NotExecutable` reason, asserting on the way that the
@@ -5101,8 +5182,8 @@ mod tests {
     #[tokio::test]
     async fn an_enrolled_wallet_refuses_the_tip_as_an_unopenable_seed() {
         let dir = refusal_scratch_dir("enrolled");
-        WalletCustody::enroll_for_tests(&dir, "tip-refusal-fixture", &[BlsPair::new(410).pk]);
-        let custody = WalletCustody::open(dir.clone());
+        WalletCustody::enroll_for_tests(dir.path(), "tip-refusal-fixture", &[BlsPair::new(410).pk]);
+        let custody = WalletCustody::open(dir.path().to_path_buf());
         assert!(
             custody.any_wallet(),
             "the fixture must really enrol a wallet, or it is the empty-custody case in disguise"
@@ -5124,7 +5205,7 @@ mod tests {
     async fn custody_holding_no_wallet_refuses_the_tip_as_nothing_enrolled() {
         let dir = refusal_scratch_dir("empty");
         std::fs::create_dir_all(&dir).expect("create the scratch dir");
-        let custody = WalletCustody::open(dir.clone());
+        let custody = WalletCustody::open(dir.path().to_path_buf());
         assert!(
             !custody.any_wallet(),
             "the fixture must really be empty, or it is the enrolled case in disguise"
@@ -5169,7 +5250,9 @@ mod tests {
     async fn backend_with(coins: Vec<CoinRow>, synced: bool) -> WalletBackend {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coins(&coins).await.unwrap();
-        db.set_initial_sync_complete(synced).await.unwrap();
+        db.force_initial_sync_complete_for_test(synced)
+            .await
+            .unwrap();
         let fb = Arc::new(MockFallback::default());
         // Scope reads (#407) to the test coins' puzzle hash so identity-scoped reads see
         // them — mirrors a client `login` declaring its public puzzle hash.
@@ -5259,7 +5342,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        db.set_initial_sync_complete(synced).await.unwrap();
+        db.force_initial_sync_complete_for_test(synced)
+            .await
+            .unwrap();
         if let Some(h) = peak {
             db.set_peak(h, &"cc".repeat(32)).await.unwrap();
         }
@@ -5565,6 +5650,146 @@ mod tests {
         );
     }
 
+    /// A backend scoped to the fixture's owner address with an EMPTY, unsynced in-memory DB —
+    /// so every wallet-data read routes to [`Source::Fallback`] (dig-node#306).
+    async fn unsynced_backend_scoped_to_owner(fb: Arc<dyn ChainFallback>) -> WalletBackend {
+        WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb,
+            WalletConfig {
+                puzzle_hashes: vec![owned_ph()],
+                ..WalletConfig::default()
+            },
+        )
+    }
+
+    /// **dig-node#306 — a $DIG holder on an unsynced replica must not read as holding none.**
+    ///
+    /// The Sage-parity coin read `return`ed an empty vector for ANY CAT while unsynced, so this
+    /// wallet's two real $DIG coins were reported as zero coins. That is not a smaller answer, it
+    /// is a different claim: the caller is told the holding does not exist.
+    ///
+    /// Asserting the coin IDS rather than a count, and asserting the CONTENTS of the set rather
+    /// than its non-emptiness, because the nearest wrong implementation is the unfiltered hint
+    /// read — which is also non-empty, and which reports the foreign CAT and a hinted XCH coin as
+    /// $DIG (dig_ecosystem#2879, the over-report this must not trade itself for).
+    #[tokio::test]
+    async fn an_unsynced_cat_coin_read_returns_the_holders_coins_not_an_empty_set() {
+        let (fb, _address) = hinted_multi_asset_fixture();
+        let be = unsynced_backend_scoped_to_owner(fb).await;
+
+        let dig_hex = hex::encode(digstore_chain::dig::DIG_ASSET_ID);
+        let r = be
+            .get_coins(&GetCoins {
+                asset_id: Some(dig_hex),
+                offset: 0,
+                limit: TEST_PAGE,
+                sort_mode: CoinSortMode::default(),
+                filter_mode: CoinFilterMode::default(),
+                ascending: true,
+            })
+            .await
+            .unwrap();
+
+        let mut ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["real-dig"],
+            concat!(
+                "the confirmed $DIG coin: not an empty set (the #306 under-report), and not ",
+                "the hinted XCH or foreign CAT (the #2879 over-report)"
+            )
+        );
+        // `pending-dig` has no created height and the default filter mode excludes unconfirmed
+        // coins — pinned here so a later widening of that filter is a deliberate change rather
+        // than an accident that starts offering unconfirmed value to a caller.
+        assert!(!ids.contains(&"pending-dig"));
+    }
+
+    /// The control that makes the test above load-bearing in the OTHER direction: asking for a
+    /// DIFFERENT CAT on the same unsynced replica returns that CAT's coin — not $DIG's.
+    ///
+    /// Without this, an implementation that ignored `asset_id` entirely and returned every hinted
+    /// coin would still have to be caught by the assertion above; with it, one that hard-codes
+    /// $DIG's scoping (the obvious partial fix) fails here.
+    #[tokio::test]
+    async fn an_unsynced_read_for_a_different_cat_is_scoped_to_that_cat() {
+        let (fb, _address) = hinted_multi_asset_fixture();
+        let be = unsynced_backend_scoped_to_owner(fb).await;
+
+        let r = be
+            .get_coins(&GetCoins {
+                asset_id: Some(hex::encode(foreign_asset_id())),
+                offset: 0,
+                limit: TEST_PAGE,
+                sort_mode: CoinSortMode::default(),
+                filter_mode: CoinFilterMode::default(),
+                ascending: true,
+            })
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
+        assert_eq!(ids, ["foreign-cat"]);
+    }
+
+    /// **A spendable-coin COUNT is the same read reduced, and it lied the same way (#306).**
+    ///
+    /// `get_spendable_coin_count` shares `wallet_coins`, so it answered `0` for a wallet holding
+    /// $DIG — and a zero count is what a spend builder consults before refusing. The XCH control
+    /// in the same test proves the count was never simply suppressed for every asset.
+    #[tokio::test]
+    async fn an_unsynced_spendable_count_sees_the_holders_cat_coins() {
+        let (fb, _address) = hinted_multi_asset_fixture();
+        let be = unsynced_backend_scoped_to_owner(fb).await;
+
+        let dig = be
+            .get_spendable_coin_count(&GetSpendableCoinCount {
+                asset_id: Some(hex::encode(digstore_chain::dig::DIG_ASSET_ID)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            dig.count, 1,
+            concat!(
+                "the ONE confirmed $DIG coin — `pending-dig` has no created height and is ",
+                "not spendable, so a count of 2 would mean unconfirmed value was offered ",
+                "to a spend"
+            )
+        );
+
+        let xch = be
+            .get_spendable_coin_count(&GetSpendableCoinCount { asset_id: None })
+            .await
+            .unwrap();
+        assert_eq!(xch.count, 1, "control: the XCH arm is unchanged");
+    }
+
+    /// An UNPARSEABLE `asset_id` fails the read rather than silently answering about XCH
+    /// (dig-node#306).
+    ///
+    /// The tempting implementation of `from_asset_id_hex` treats a bad id as "no CAT", which
+    /// hands a caller who asked about one token a confident, non-empty answer about a different
+    /// one. That is worse than the empty set this ticket removed.
+    #[tokio::test]
+    async fn an_unparseable_asset_id_fails_rather_than_answering_about_xch() {
+        let (fb, _address) = hinted_multi_asset_fixture();
+        let be = unsynced_backend_scoped_to_owner(fb).await;
+
+        let r = be
+            .get_coins(&GetCoins {
+                asset_id: Some("not-hex".to_string()),
+                offset: 0,
+                limit: TEST_PAGE,
+                sort_mode: CoinSortMode::default(),
+                filter_mode: CoinFilterMode::default(),
+                ascending: true,
+            })
+            .await;
+        assert!(r.is_err(), "a mistyped asset id must not resolve to XCH");
+    }
+
     /// The asset id of the fixture's non-$DIG CAT — the "foreign-cat" coin's TAIL.
     ///
     /// Named rather than inlined because the point of the widening test below is that a caller can
@@ -5670,7 +5895,7 @@ mod tests {
     /// reports NOTHING about the local replica — even when that replica is fully caught up.
     ///
     /// The fixture is chosen to distinguish the fix from the nearest wrong implementation:
-    /// the DB here is `set_initial_sync_complete(true)` with peak `9_000_000`, while the
+    /// the DB here is `force_initial_sync_complete_for_test(true)` with peak `9_000_000`, while the
     /// queried address is unscoped, so routing still picks `Fallback`. The pre-fix code read
     /// `synced` / `peak_height` OUTSIDE the tier decision and would answer
     /// `synced: true, peak_height: Some(9_000_000)` on this input — a third-party oracle read
@@ -5682,7 +5907,7 @@ mod tests {
         let arb_ph = "22".repeat(32);
         let arbitrary = encode_address(&arb_ph, "xch").unwrap();
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         db.set_peak(9_000_000, &"cc".repeat(32)).await.unwrap();
         let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
             "c1",
@@ -6121,7 +6346,7 @@ mod tests {
         let (registry, _dir) = registry_with_key(&enrolled_key());
 
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         db.set_peak(500, &"cc".repeat(32)).await.unwrap();
 
         let be = WalletBackend::new(
@@ -6190,7 +6415,7 @@ mod tests {
 
         // No chain source: arbitrary address, DB synced, EmptyFallback (not live).
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
         let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
         assert_eq!(
@@ -6209,7 +6434,7 @@ mod tests {
 
         // Read failed: arbitrary address routes to a LIVE fallback that errors.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(ErringFallback), WalletConfig::default());
         assert!(matches!(
             be.balance_for_address(&arbitrary, BalanceAsset::Xch).await,
@@ -6942,6 +7167,7 @@ mod tests {
                 accepted: true,
                 transaction_id: Some("tx".repeat(32)),
                 rejection: None,
+                verdict: "SUCCESS".into(),
             }))
         }
     }
@@ -7020,7 +7246,7 @@ mod tests {
     #[tokio::test]
     async fn an_arbitrary_address_reads_its_coins_from_the_chain_tier() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let fb = Arc::new(MockFallback::with_coins(vec![
             fallback_coin("live", &"33".repeat(32), 1_750, Some(9), None),
             fallback_coin("already-spent", &"33".repeat(32), 5, Some(9), Some(11)),
@@ -7056,7 +7282,7 @@ mod tests {
     async fn a_chain_it_could_not_reach_is_an_error_never_an_empty_coin_list() {
         // No chain source: an arbitrary address, synced replica, a tier that is not live.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
         let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
         assert_eq!(
@@ -7076,7 +7302,7 @@ mod tests {
 
         // A live tier that errors: the answer is unknown, not empty.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, Arc::new(ErringFallback), WalletConfig::default());
         assert!(matches!(
             be.coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
@@ -7333,7 +7559,7 @@ mod tests {
     /// and only the money reads, still paired `synced: true` with `peak_height: null`.
     ///
     /// The state is production-reachable rather than hypothetical: `refresh_tracked_coins` latches
-    /// the replica authoritative (`record_coverage` + `set_initial_sync_complete(true)`) WITHOUT
+    /// the replica authoritative (`record_coverage` + `force_initial_sync_complete_for_test(true)`) WITHOUT
     /// ever writing a peak, which is exactly what `db_with_owned_derivation(true, None)` builds.
     ///
     /// FIXTURE DESIGN. The peer tier is deliberately HONEST and OBSERVABLE — level with the
@@ -7714,7 +7940,7 @@ mod tests {
 
         // A single token in the bucket, no refill: the first outbound read spends it.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -7736,7 +7962,7 @@ mod tests {
 
         // The peak read reaches the tier only when the replica has no height of its own.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -7929,7 +8155,7 @@ mod tests {
             TESTNET11_CONSTANTS.agg_sig_me_additional_data,
         ));
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let cfg = WalletConfig {
             network_id: "testnet11".into(),
             address_prefix: "txch".into(),
@@ -8105,12 +8331,11 @@ mod tests {
     /// address fallback too, so it could not tell the two implementations apart.
     #[tokio::test]
     async fn a_restarted_locked_node_still_refuses_a_bundle_over_its_non_primary_key() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-wallet-restart-guard-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard, so the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-wallet-restart-guard-")
+            .tempdir()
+            .expect("a scratch dir");
 
         // The wallet as a pre-#1701 install left it: two HD keys persisted in the manifest, the
         // seed unreadable. `primary` stands for the receive address the old fallback covered;
@@ -8122,7 +8347,7 @@ mod tests {
             p2_hash(secondary.pk),
             "the fixture needs two DISTINCT keys, or it cannot tell the two guards apart"
         );
-        WalletCustody::enroll_for_tests(&dir, "restart-fixture", &[primary.pk, secondary.pk]);
+        WalletCustody::enroll_for_tests(dir.path(), "restart-fixture", &[primary.pk, secondary.pk]);
 
         let pusher = FakePusher::accepting();
         let cfg = WalletConfig {
@@ -8139,9 +8364,11 @@ mod tests {
 
         // Restart: a fresh custody over the SAME directory and a fresh backend whose memo of
         // loaded signers is empty.
-        let restarted = WalletCustody::open(dir.clone());
+        let restarted = WalletCustody::open(dir.path().to_path_buf());
         let db2 = WalletDb::open_in_memory().await.unwrap();
-        db2.set_initial_sync_complete(true).await.unwrap();
+        db2.force_initial_sync_complete_for_test(true)
+            .await
+            .unwrap();
         let after = WalletBackend::new(db2, Arc::new(MockFallback::default()), cfg)
             .with_custody(restarted)
             .with_pusher(pusher.clone());
@@ -8244,6 +8471,7 @@ mod tests {
                 accepted: false,
                 transaction_id: None,
                 rejection: Some("DOUBLE_SPEND".into()),
+                verdict: "FAILED".into(),
             })));
         let outcome = refused
             .push_signed_bundle(&a_signed_bundle_hex())
@@ -8305,7 +8533,7 @@ mod tests {
     async fn wallet_balance_fallback_is_rate_limited_after_a_burst() {
         const POOL: usize = 4;
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -8333,7 +8561,7 @@ mod tests {
     async fn a_single_legitimate_balance_read_is_unaffected() {
         let arb_ph = "44".repeat(32);
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
             "c1",
             &arb_ph,
@@ -8676,7 +8904,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([test_ph()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         // Reads scope to the wallet's identity (#407); the test coins sit at `test_ph()`.
         let cfg = WalletConfig {
             puzzle_hashes: vec![test_ph()],
@@ -8711,7 +8939,9 @@ mod tests {
             spent_timestamp: None,
         }]));
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(false).await.unwrap(); // still syncing
+        db.force_initial_sync_complete_for_test(false)
+            .await
+            .unwrap(); // still syncing
         let cfg = WalletConfig {
             puzzle_hashes: vec![ph],
             ..Default::default()
@@ -8745,7 +8975,7 @@ mod tests {
         db.upsert_coins(&[xch_coin("inwallet", 1, Some(1), None)])
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
 
         let (status, body) = be
@@ -8833,7 +9063,7 @@ mod tests {
         })
         .await
         .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let bc = Arc::new(MockBroadcaster::default());
         let cfg = WalletConfig {
             puzzle_hashes: vec![hex::encode(ph)],
@@ -8924,7 +9154,10 @@ mod tests {
         );
 
         // The control: the ONLY thing that changes is the authority flag.
-        be.db.set_initial_sync_complete(true).await.unwrap();
+        be.db
+            .force_initial_sync_complete_for_test(true)
+            .await
+            .unwrap();
         let coins = be
             .spendable_coins(None)
             .await
@@ -9016,7 +9249,10 @@ mod tests {
         // The control: the ONLY thing that changes is the authority flag. Both calls now get
         // PAST the tier gate and fail on the missing lineage source underneath, which is a
         // different failure — so the refusals above were the gate, not the empty backend.
-        be.db.set_initial_sync_complete(true).await.unwrap();
+        be.db
+            .force_initial_sync_complete_for_test(true)
+            .await
+            .unwrap();
         for e in [
             be.select_cats(&asset, 1_000, 0).await.unwrap_err(),
             be.singleton_parent_child("c0").await.unwrap_err(),
@@ -9425,7 +9661,7 @@ mod tests {
     #[tokio::test]
     async fn get_nfts_and_get_dids_return_reconstructed_rows() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let nft = NftRecord {
             launcher_id: "aa".repeat(32),
             collection_id: None,
@@ -9516,7 +9752,7 @@ mod tests {
             .await
             .unwrap();
         }
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let cfg = WalletConfig {
             puzzle_hashes: vec![hex::encode(ph)],
             address_prefix: "txch".into(),
@@ -9659,7 +9895,7 @@ mod tests {
 
         let shared = std::sync::Arc::new(super::super::events::EventBus::with_capacity(4));
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be2 = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -9718,7 +9954,9 @@ mod tests {
         // Even with the DB marked caught up, a wallet the node is NOT tracking (no login,
         // no config) still reads NOT synced — never a silent synced-0.
         let db2 = WalletDb::open_in_memory().await.unwrap();
-        db2.set_initial_sync_complete(true).await.unwrap();
+        db2.force_initial_sync_complete_for_test(true)
+            .await
+            .unwrap();
         let be2 = WalletBackend::new(
             db2,
             Arc::new(MockFallback::default()),
@@ -9756,7 +9994,7 @@ mod tests {
         ]))
         .await
         .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         // Identity comes ONLY from the client's login — the node has no own wallet config.
         let be = WalletBackend::new(
             db,
@@ -9809,7 +10047,7 @@ mod tests {
         let addr = encode_address(&ph, "xch").unwrap();
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coins(&[coin_at("c1", &ph, 4_200)]).await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -9899,7 +10137,7 @@ mod tests {
         );
         row.parent_coin_info = hex::encode(child_cat.coin.parent_coin_info);
         db.upsert_coin(&row).await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
 
         // Attribute CATs by uncurrying the parent spend (the sync attribution step).
         let parent = ParentSpend {
@@ -9939,7 +10177,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([owner_ph.as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -10199,7 +10437,9 @@ mod tests {
     #[tokio::test]
     async fn sync_status_reports_tristate_from_db() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(false).await.unwrap();
+        db.force_initial_sync_complete_for_test(false)
+            .await
+            .unwrap();
         let be = WalletBackend::new(
             db.clone(),
             Arc::new(MockFallback::default()),
@@ -10209,7 +10449,7 @@ mod tests {
         assert_eq!(s.state, SyncLifecycle::Syncing);
 
         db.set_peak(123, "aa").await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let s = be.sync_status().await.unwrap();
         assert_eq!(s.state, SyncLifecycle::Synced);
         assert_eq!(s.peak_height, Some(123));
@@ -10245,7 +10485,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([covered_ph.as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         db.set_peak(REPLICA_PEAK, &"cc".repeat(32)).await.unwrap();
         assert!(
             db.is_synced().await.unwrap(),
@@ -10327,7 +10567,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([client_ph.as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -10439,7 +10679,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex(["bb".repeat(32).as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default().offline()),
@@ -10480,7 +10720,7 @@ mod tests {
         db.record_coverage(&CoveredSet::from_hex([client_ph.as_str()]))
             .await
             .unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -10672,11 +10912,127 @@ mod tests {
         );
     }
 
-    /// **The control:** a mempool REFUSAL reserves nothing.
+    /// **Proves:** a bundle denied WITHOUT a stated reason is held to the TTL, not returned to the
+    /// selectable set (#348).
     ///
-    /// Without it, reserving unconditionally — dropping the `outcome.accepted` guard rather than
-    /// the call — satisfies the test above while stranding a user's coins over a spend that will
-    /// never happen. It pins the guard, not just the wiring.
+    /// **Catches:** the shipped fail-open. Reservation was gated on `outcome.accepted` alone, so a
+    /// source that denied relaying what it actually relayed left the coins reselectable while a
+    /// bundle carrying them was in flight — a second send inside the confirmation window could
+    /// reselect the same inputs. Under NC-12 every dialled peer is untrusted, so a false denial is
+    /// the assumed case rather than an exotic one, and it was the CHEAP direction to lie in.
+    ///
+    /// FIXTURE DESIGN. This differs from `a_refused_bundle_reserves_nothing` in EXACTLY one field —
+    /// `rejection` is `None` rather than `Some(...)` — and the two tests demand OPPOSITE outcomes.
+    /// That pairing is the whole property: it is what distinguishes "held because the denial was
+    /// unexplained" from "holds on every refusal", which would be the lockout regression. Two
+    /// coins, one spent by the bundle, so a mis-scoped reservation that empties selection cannot
+    /// pass for a correct one.
+    #[tokio::test]
+    async fn a_bundle_denied_without_a_reason_is_held_rather_than_freed() {
+        let mut spent_by_the_bundle = spendable_row(0xa1, 100);
+        let (bundle_hex, transaction_id) = a_bundle_spending(&mut spent_by_the_bundle);
+        let untouched = spendable_row(0xb2, 500);
+        // A bare denial: the source says "no" and does not say why. Indistinguishable, from here,
+        // from a source denying a relay it performed.
+        let silently_denying = FakePusher::answering(Ok(PushOutcome {
+            accepted: false,
+            transaction_id: None,
+            // A refusal that states NO reason -- the shape the #348 hold keys on.
+            rejection: None,
+            verdict: "PENDING".into(),
+        }));
+        let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
+            .await
+            .with_pusher(silently_denying);
+
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            2,
+            "the fixture must start with BOTH coins selectable, or the assertion below is vacuous"
+        );
+
+        let outcome = be.push_signed_bundle(&bundle_hex).await.unwrap();
+        assert!(
+            !outcome.accepted,
+            "the outcome is reported honestly — the fix changes what is RESERVED, not what is said"
+        );
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending.len(),
+            1,
+            "an unexplained denial left the bundle unrecorded; its inputs are reselectable while it \
+             may be in flight"
+        );
+        assert_eq!(pending[0].transaction_id, transaction_id);
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(
+            selectable.len(),
+            1,
+            "the possibly-in-flight bundle's input is still offered to a second spend"
+        );
+        assert_eq!(
+            selectable[0].amount, 500,
+            "the wrong coin was held: the untouched control left selection"
+        );
+    }
+
+    /// **Proves:** a transport failure is treated as POSSIBLY IN FLIGHT — the inputs are held —
+    /// while the caller still receives the honest error (#348).
+    ///
+    /// **Catches:** the other half of the fail-open. `push()` returning `Err` propagated with `?`
+    /// BEFORE any reservation, so a transport that failed after transmitting freed the coins. The
+    /// node cannot tell "never sent" from "sent, and the acknowledgement was lost", and only one of
+    /// those is safe to free.
+    ///
+    /// The error assertion is load-bearing in the other direction: a fix that swallowed the failure
+    /// to reach the reserve call would report a push that never happened as a success, which is the
+    /// money-lie this contract refuses. Both must hold at once.
+    #[tokio::test]
+    async fn a_transport_failure_holds_the_inputs_and_still_reports_the_failure() {
+        let mut spent_by_the_bundle = spendable_row(0xa1, 100);
+        let (bundle_hex, transaction_id) = a_bundle_spending(&mut spent_by_the_bundle);
+        let untouched = spendable_row(0xb2, 500);
+        let unreachable = FakePusher::answering(Err("connection reset".into()));
+        let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
+            .await
+            .with_pusher(unreachable);
+
+        assert_eq!(be.spendable_coins(None).await.unwrap().len(), 2);
+
+        let err = be
+            .push_signed_bundle(&bundle_hex)
+            .await
+            .expect_err("a transport failure must still be reported as a failure");
+        assert!(
+            matches!(err, PushError::Unreachable(_)),
+            "the caller must learn the network was not reached, got {err:?}"
+        );
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending.len(),
+            1,
+            "a post-transmit transport failure freed the inputs of a bundle that may be in flight"
+        );
+        assert_eq!(pending[0].transaction_id, transaction_id);
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(selectable.len(), 1);
+        assert_eq!(selectable[0].amount, 500, "the wrong coin was held");
+    }
+
+    /// **The control:** a mempool refusal that STATES ITS REASON reserves nothing.
+    ///
+    /// Without it, reserving unconditionally satisfies the tests above while stranding a user's
+    /// coins over a spend that will never happen — the lockout that is the worse of the two
+    /// failures. It pins the guard, not just the wiring.
+    ///
+    /// Since #348 this is the ONLY path that frees the inputs, and it is the sibling of
+    /// `a_bundle_denied_without_a_reason_is_held_rather_than_freed`: the two fixtures differ in the
+    /// `rejection` field alone and demand opposite outcomes, so together they pin the bound from
+    /// both sides. Neither is meaningful without the other.
     #[tokio::test]
     async fn a_refused_bundle_reserves_nothing() {
         let mut refused = spendable_row(0xa1, 100);
@@ -10685,6 +11041,7 @@ mod tests {
             accepted: false,
             transaction_id: None,
             rejection: Some("mempool said no".into()),
+            verdict: "FAILED".into(),
         }));
         let be = backend_with(vec![refused.clone()], true)
             .await

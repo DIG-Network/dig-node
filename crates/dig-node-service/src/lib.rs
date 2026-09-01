@@ -133,6 +133,10 @@ pub mod state;
 /// reloadable rustls config (fail-soft when no CA/leaf yet) and drive dig-cert's leaf
 /// renewal so the running listener hot-reloads a rotated leaf. See [`tls`].
 pub mod tls;
+/// Rendering ATTACKER-SUPPLIED text into an operator-facing sentence (dig-node#346): the clip mark
+/// is in-band, the budget is charged on rendered width, and only the display is neutralised — the
+/// stored value stays byte-verbatim. See [`untrusted_text`].
+pub mod untrusted_text;
 /// The beacon (`dig-updater`) RPC proxy (#515): `control.updater.*` reads the DIG auto-update
 /// beacon's world-readable status and shells its elevation-gated CLI for channel/pause/resume/
 /// check-now — never a second implementation of the beacon's own trust logic. See [`updater`].
@@ -146,6 +150,10 @@ pub mod wallet_authz;
 /// The start-up check that a wallet seed exists, minting one if it does not (dig-node#277).
 /// Never fatal, never a fallback. See [`wallet_bootstrap`].
 pub mod wallet_bootstrap;
+
+/// Latching the fact that the node's own wallet has held funds, so no surface calls a funded
+/// auto-created wallet disposable (dig-node#286). See [`wallet_funded`].
+pub mod wallet_funded;
 
 /// The Sage-parity wallet mTLS listener: its bring-up and the state `dign info` reports
 /// when it could not take its port (dig-node#260). See [`wallet_mtls`].
