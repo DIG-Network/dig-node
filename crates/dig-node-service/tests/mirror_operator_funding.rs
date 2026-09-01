@@ -29,6 +29,7 @@ use chia_sha2::Sha256;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_node_service::mirror::funding::{
     dig_cat_puzzle_hash, select_operator_dig_cats, select_operator_dig_cats_detailed, FundingError,
+    FundingObservation, FundingRemedy,
 };
 use support::{ordinary_dig_coins, wallet, Wallet};
 
@@ -508,5 +509,101 @@ fn the_fixture_coins_land_on_the_puzzle_hash_the_selector_scans() {
         coins[0].puzzle_hash,
         dig_cat_puzzle_hash(operator.puzzle_hash),
         "the selector must scan the address the operator's $DIG actually sits at"
+    );
+}
+
+/// **Probe B — the spendable total is the operator's, not the address's** (dig-node#469).
+///
+/// The fixture is the one that matters and the one the unit tests cannot build: the operator has
+/// **genuine** $DIG on chain, with real creating spends, AND a stranger has paid a coin into the
+/// same publicly derivable address. Varying only the stranger's coin is what makes the assertion
+/// about authentication rather than about arithmetic.
+///
+/// Before the fix the shortfall was computed from the pool at the top of the iteration, before
+/// anything in it was authenticated — so it summed the ADDRESS. An operator who can genuinely spend
+/// 20.000 DIG, needing 40.000, was told they held 30.000 and were 10.000 short. They add 10.000,
+/// are still short, and the re-alert is then suppressed as immaterial growth: the node goes quiet
+/// and stops bonding while they believe they fixed it.
+#[test]
+fn the_shortfall_counts_only_coins_whose_lineage_the_chain_proved() {
+    let operator = wallet(1);
+    let mut chain = Chain::default();
+
+    // Genuinely the operator's: real CAT spends, so these authenticate.
+    chain.fund(&operator, &[12_000, 8_000], salt(70));
+    // A stranger's coin at the same address: no creating spend, so it never authenticates.
+    chain.fund_without_lineage(&operator, &[10_000], salt(71));
+
+    assert_eq!(
+        select_operator_dig_cats(&chain, operator.puzzle_hash, REQUIRED, &HashSet::new()).err(),
+        Some(FundingError::Insufficient {
+            have_dig_base_units: 20_000,
+            need_dig_base_units: REQUIRED,
+        }),
+        concat!(
+            "the address total was reported as the operator's spendable total; they are 20.000 ",
+            "short and would be told 10.000, and the correction is then suppressed"
+        )
+    );
+}
+
+/// **Probe C — a stranger cannot choose which instruction the operator is given** (dig-node#469).
+///
+/// The input bound used to be applied to the raw selection, before authentication began, and the
+/// refusal it produced is the operator-facing claim *the wallet holds enough $DIG, in too many
+/// pieces — adding more will not help*. The scan address is `dig_cat_puzzle_hash(owner)`, derivable
+/// by anyone from a public value, so a stranger paying enough small coins into it chose which of
+/// two OPPOSITE remedies an operator was sent to. It did not converge either: no planted coin was
+/// ever authenticated, so none was ever removed, and the same wrong message was the answer on every
+/// pass.
+///
+/// # The honest coin is the control
+///
+/// The operator holds one real coin here, far too small to cover the requirement. It is what
+/// separates "authenticated coins are counted" from "everything is refused": the answer must be a
+/// TOP-UP quoting the operator's own 1.000, not a consolidation, and not a zero.
+#[test]
+fn coins_a_stranger_paid_in_cannot_turn_a_top_up_into_a_consolidation() {
+    let operator = wallet(1);
+    let mut chain = Chain::default();
+
+    // The operator's own money: real, authenticatable, and nowhere near enough.
+    chain.fund(&operator, &[1_000], salt(72));
+
+    // Forty coins a stranger paid in, each distinct and each small enough that covering the
+    // requirement from them alone takes more inputs than a bundle may draw. That is the shape --
+    // and the ONLY shape -- that produced `Consolidate`.
+    let planted: Vec<u64> = (0..40).map(|i| 1_100 + i).collect();
+    assert!(
+        planted.iter().sum::<u64>() > REQUIRED,
+        "the planted coins must appear to cover the requirement, or the old bound never fires"
+    );
+    chain.fund_without_lineage(&operator, &planted, salt(73));
+
+    let refusal = select_operator_dig_cats(&chain, operator.puzzle_hash, REQUIRED, &HashSet::new())
+        .expect_err("the operator cannot cover the requirement from their own coins");
+
+    assert_eq!(
+        refusal,
+        FundingError::Insufficient {
+            have_dig_base_units: 1_000,
+            need_dig_base_units: REQUIRED,
+        },
+        concat!(
+            "the operator must be told they hold their OWN 1.000 and are short; a stranger's coins ",
+            "are not their money, and quoting zero would ignore the coin they really have"
+        )
+    );
+    assert_eq!(
+        FundingObservation::from_error(&refusal),
+        FundingObservation::Short {
+            have_dig_base_units: 1_000,
+            need_dig_base_units: REQUIRED,
+            remedy: FundingRemedy::TopUp,
+        },
+        concat!(
+            "an attacker chose the remedy: `Consolidate` tells an operator who is genuinely short ",
+            "that adding more $DIG will not help, which is the exact opposite of what they must do"
+        )
     );
 }
