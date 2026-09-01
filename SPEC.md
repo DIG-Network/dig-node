@@ -8445,6 +8445,55 @@ A pass runs: at start-up (once the wallet and a chain source are available), on 
    the plan's create set until that entry resolves. The audit record is the in-flight ledger; the
    disk and the chain remain the only steady-state truths.
 
+   **A funding-coin reservation is a BOUNDED hold.** The audit record also reserves the funding
+   coins a non-terminal entry consumed, so a second create in the same confirmation window cannot
+   re-select them. That reservation MUST expire: it holds a coin for
+   `FUNDING_RESERVATION_WINDOW_MS` = `2 x MIRROR_ROUND_LENGTH_MS` (20 minutes) measured from the
+   entry's LAST revision, after which the coin returns to the selectable set. An unbounded hold is a
+   lockout — a spend that never lands would strand its inputs forever and a genuinely funded
+   operator wallet would report `Insufficient` permanently. The window is derived: the chain-side
+   figure is the wallet's own post-broadcast reservation lifetime (10 minutes, roughly a dozen Chia
+   blocks), and one further round is added because this hold is re-evaluated only once per
+   `MIRROR_ROUND_LENGTH_MS`, so a threshold equal to the poll interval would release an entry on the
+   first pass at which its confirmation could even have been observed. A record whose `updated_ms`
+   is in the FUTURE keeps its hold.
+
+   **Expiry MUST NOT change the record.** The entry stays exactly the `submitted` or `unresolved` it
+   was, and stays resolvable by step 7 and by §23.5's reconcile indefinitely. Releasing a coin is
+   not a claim that the spend failed: `unresolved` means "this node signed and does not know what
+   happened", which remains true afterwards. Writing a `failed` entry to settle the bookkeeping is
+   forbidden, for the same reason a `confirmed` entry carries its height and coin id inside the
+   variant.
+
+7. **Resolves spends an EARLIER pass broadcast.** A mirror spend is broadcast in one pass and
+   confirms during a later one, so the outcome MUST be recorded by an id-keyed resolution over the
+   audit record rather than by the handle that opened it. Before the observation of step 2 is
+   planned against, every mirror-coin entry that is `submitted` or `unresolved` is resolved as
+   follows, and only as follows:
+
+   | operation | its positive key | how the height is obtained |
+   |---|---|---|
+   | reclaim | the `intended_coin_id` the submission recorded | a coin read on that id |
+   | create | the coin in step 2's observation matching `(store, root, epoch)` | a coin read on THAT coin's id |
+
+   A create records no `intended_coin_id` — the created coin's parent is whichever funding input the
+   builder drew from — so its key MUST be the coin's appearance in the chain observation. A coin id
+   MUST NOT be derived, guessed, or otherwise invented for this purpose.
+
+   The coin read has THREE outcomes and they MUST stay three: a height (resolve to `confirmed`); the
+   coin absent, or present with no height (resolve nothing); the source unable to answer (resolve
+   nothing, and NOT as an absence). A source that cannot be reached is not evidence about a coin in
+   either direction.
+
+   Disappearance MUST NOT be used as a key. The mirror puzzle hash is shared by every mirror coin,
+   so a coin leaving the owned set proves only that SOMEONE spent it, and a short scan is
+   indistinguishable from a spend.
+
+   Where more than one open entry claims one coin — two reclaim attempts of the same coin derive the
+   same child id, and step 6 deliberately does not suppress on `unresolved` — NONE of them is
+   resolved. At most one of those bundles created the coin, and this node cannot tell which; the
+   entries remain `unresolved`, which is what they are.
+
 A confirmed create is `Confirmed { height, coin_id }` in the audit record, observed on the created
 coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile accounts for it.
 
@@ -8478,16 +8527,24 @@ cannot observe a half-written file the node produced itself.
 
 ### 25.6. The DHT pointer, and epoch rollover
 
-> **PENDING — not yet implemented.** This subsection is normative and is NOT satisfied by
-> code as of this section's introduction. Tracked as dig-node#377 step 7 (the dig-dht 0.12.1 → 0.15 bump and the
-> announce-seam attach). Until it lands, a reader MUST NOT
-> rely on the behaviour described here.
+> **IMPLEMENTED.** The announce seam attaches the pointer
+> (`dig_node_core::dht::announce_inventory_ids_with_pointers`), the rollover re-announce is
+> `DhtHandle::reannounce_on_epoch_rollover`, and the node's production pointer source is
+> `dig_node_service::mirror::pointers::SnapshotMirrorPointers`, which reads the observation the last
+> pass published. A node with no observation, or with no coin for a capsule, publishes no pointer;
+> that is an ordinary configuration and not a fault.
 
 After a create confirms, the node attaches the coin id to its DHT provider record
 (`dig_dht::ProviderRecord::unverified_mirror_coin_id`) for that content, and it MUST re-announce on
 epoch rollover once the new epoch's coin confirms — dig-dht has no clock and republish re-attaches
 whatever was recorded at announce time, so an un-refreshed pointer goes stale one epoch after
 publication and a correctly-collateralised node reads as uncollateralised.
+
+Only a coin bonding the CURRENT epoch may be published. A coin from a previous epoch advertises
+nothing, and pointing at it makes a correctly-collateralised node read as uncollateralised — the
+same failure the rollover re-announce exists to prevent, reached without any rollover. A whole-store
+announce carries no pointer at all: a coin bonds one `(store, root, epoch)` tuple and cannot speak
+for every generation of a store.
 
 The pointer is an UNTRUSTED convenience (NC-12): it tells a verifier where to look, never what the
 coin is. Its absence MUST NOT degrade discovery or be treated as a fault. A verifier — this node
