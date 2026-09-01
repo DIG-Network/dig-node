@@ -157,15 +157,13 @@ pub fn wire_state(state: &BondState) -> MirrorBondState {
             reason: CollateralUnknownReason::BalanceUnreadable,
         },
         BondState::Deferred { reason } => MirrorBondState::Deferred { reason: *reason },
-        // INTERIM (dig-node-control-interface has no `unadvertised` value yet, and adding one is
-        // a release-first change in that repo). `Disabled` is the least-wrong existing value: it
-        // and `Unadvertised` agree on the only fact a person acts on at once — this node will
-        // create no bonds — and differ only in which knob clears it. It is chosen over the two
-        // alternatives deliberately: `Unfunded` would name a figure and send the operator to buy
-        // $DIG that would bond nothing, and a `Deferred` reason would blame the census or the
-        // wallet, both of which are working. Understating the remedy is recoverable; a false money
-        // statement is the class this whole enum exists to prevent.
-        BondState::Unadvertised => MirrorBondState::Disabled,
+        // Two node-wide states, kept apart because only ONE of them is a fault. `Unadvertised` is
+        // the node's own collateralisation switch ON while nothing in its advertise-URL list is
+        // publishable: no coin can be created, the operator did not ask for that, and the remedy
+        // is a URL. `Disabled` is that switch OFF — the operator's own earlier decision, which the
+        // contract says a client MUST NOT present as a fault. Serving the first under the second
+        // would oblige a conforming client to stay silent about the one thing actually wrong.
+        BondState::Unadvertised => MirrorBondState::Unadvertised,
         BondState::Disabled => MirrorBondState::Disabled,
         BondState::Withheld => MirrorBondState::Withheld,
         BondState::Reclaiming {
@@ -214,6 +212,47 @@ mod tests {
             } => (entries, complete, cursor, locked_dig_base_units),
             other => panic!("expected a Known page, got {other:?}"),
         }
+    }
+
+    /// **An unadvertised node says `unadvertised` on the wire, beside a genuinely disabled row.**
+    ///
+    /// These two states are the pair this mapping exists to keep apart. Both are node-wide, both
+    /// mean no coin is created, and they differ in the only thing an operator acts on: `disabled`
+    /// is that operator's own switch, which the contract says a client MUST NOT present as a
+    /// fault, while `unadvertised` is that switch ON and the node silently unable to honour it.
+    ///
+    /// The fixture is what makes this load-bearing. The nearest wrong implementation is the
+    /// interim this replaces — `Unadvertised => Disabled` — and a page containing only an
+    /// unadvertised row could not tell it apart from a correct mapping by any assertion on the
+    /// row's own token alone. So the page carries BOTH, in a stated order, and asserts the two
+    /// wire values DIFFER. A collapse in either direction fails here.
+    #[test]
+    fn an_unadvertised_bond_is_not_reported_as_the_operators_own_switch() {
+        let page = page(
+            &observation(
+                vec![
+                    (bond(&hex(0x11), &hex(0xaa)), BondState::Unadvertised),
+                    (bond(&hex(0x22), &hex(0xbb)), BondState::Disabled),
+                ],
+                0,
+            ),
+            None,
+            10,
+        );
+        let (entries, ..) = known(page);
+
+        assert_eq!(entries.len(), 2, "both rows must survive the page");
+        assert_eq!(
+            entries[0].state,
+            MirrorBondState::Unadvertised,
+            "a node whose switch is ON must not be reported under the switch's own token"
+        );
+        assert_eq!(entries[1].state, MirrorBondState::Disabled);
+        assert_ne!(
+            entries[0].state, entries[1].state,
+            "collapsing these two is the defect: it obliges a conforming client to stay silent \
+             about the one thing that is wrong"
+        );
     }
 
     /// A `Relayed` capsule is genuinely reported as `withheld` — the variant the contract calls
