@@ -518,21 +518,14 @@ mod tests {
     /// A unique temp STATE dir (#501: the paired-token store now lives in the state
     /// dir, not beside a `config.json`). Returns `(state_dir, state_dir)` so both
     /// tuple bindings point at the dir a test seeds + cleans.
-    fn tmp_config() -> (PathBuf, PathBuf) {
-        // A process-wide counter makes the dir unique even when two tests build it in
-        // the same millisecond (parallel test threads) — otherwise one test's
-        // remove_dir_all could nuke another's dir mid-run.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-pairing-{}-{}-{}",
-            std::process::id(),
-            now_ms(),
-            n
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        (dir.clone(), dir)
+    /// The tree is OWNED by the returned guard: `TempDir`'s `Drop` removes it, including on
+    /// an unwind, so a failing assertion cannot leak it (dig-node#370). `tempfile`'s random
+    /// component also subsumes the hand-rolled pid + counter name, which repeated across runs.
+    fn tmp_config() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dig-node-pairing-")
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     fn pending() -> Mutex<PendingPairings> {
@@ -555,7 +548,8 @@ mod tests {
 
     #[test]
     fn poll_unknown_then_pending_then_approved_delivers_token_once() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let p = pending();
 
         // Unknown id → status unknown.
@@ -569,7 +563,7 @@ mod tests {
         assert_eq!(pend["result"]["status"], json!("pending"));
 
         // Approve (master path) → the token is minted + persisted.
-        let ap = approve(&p, &config, json!(4), &json!({ "pairing_id": pid }));
+        let ap = approve(&p, config, json!(4), &json!({ "pairing_id": pid }));
         assert_eq!(ap["result"]["approved"], json!(true));
         let token_id = ap["result"]["token_id"].as_str().unwrap().to_string();
 
@@ -580,27 +574,25 @@ mod tests {
         assert_eq!(token.len(), 64, "64-hex scoped token");
 
         // The token is a valid paired token; a wrong one is not.
-        assert!(is_paired_token(&paired_tokens_path(&config), &token));
-        assert!(!is_paired_token(
-            &paired_tokens_path(&config),
-            "not-a-token"
-        ));
+        assert!(is_paired_token(&paired_tokens_path(config), &token));
+        assert!(!is_paired_token(&paired_tokens_path(config), "not-a-token"));
 
         // Delivered ONCE: a second poll no longer knows the id.
         let again = poll(&p, json!(6), &json!({ "pairing_id": pid }));
         assert_eq!(again["result"]["status"], json!("unknown"));
 
         // Revoke → the token stops authorizing.
-        let rv = revoke(&config, json!(7), &json!({ "token_id": token_id }));
+        let rv = revoke(config, json!(7), &json!({ "token_id": token_id }));
         assert_eq!(rv["result"]["revoked"], json!(true));
-        assert!(!is_paired_token(&paired_tokens_path(&config), &token));
+        assert!(!is_paired_token(&paired_tokens_path(config), &token));
     }
 
     #[test]
     fn approve_unknown_pairing_is_invalid_params() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let p = pending();
-        let resp = approve(&p, &config, json!(1), &json!({ "pairing_id": "nope" }));
+        let resp = approve(&p, config, json!(1), &json!({ "pairing_id": "nope" }));
         assert_eq!(
             resp["error"]["code"],
             json!(ErrorCode::InvalidParams.code())
@@ -609,23 +601,24 @@ mod tests {
 
     #[test]
     fn list_shows_pending_and_issued_tokens() {
-        let (config, _d) = tmp_config();
+        let scratch = tmp_config();
+        let config = scratch.path();
         let p = pending();
         let req = request(&p, json!(1), &json!({ "client_name": "ext-A" }));
         let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
 
         // Before approval: one pending, no tokens.
-        let l1 = list(&p, &config, json!(2));
+        let l1 = list(&p, config, json!(2));
         assert_eq!(l1["result"]["pending"].as_array().unwrap().len(), 1);
         assert_eq!(l1["result"]["pending"][0]["client_name"], json!("ext-A"));
         assert_eq!(l1["result"]["tokens"].as_array().unwrap().len(), 0);
 
-        approve(&p, &config, json!(3), &json!({ "pairing_id": pid.clone() }));
+        approve(&p, config, json!(3), &json!({ "pairing_id": pid.clone() }));
         // consume the pending via poll
         poll(&p, json!(4), &json!({ "pairing_id": pid }));
 
         // After: no pending, one issued token (value never listed).
-        let l2 = list(&p, &config, json!(5));
+        let l2 = list(&p, config, json!(5));
         assert_eq!(l2["result"]["pending"].as_array().unwrap().len(), 0);
         let tokens = l2["result"]["tokens"].as_array().unwrap();
         assert_eq!(tokens.len(), 1);
@@ -662,8 +655,9 @@ mod tests {
 
     #[test]
     fn load_paired_tokens_tolerates_missing_and_malformed() {
-        let (config, _d) = tmp_config();
-        let path = paired_tokens_path(&config);
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let path = paired_tokens_path(config);
         assert!(load_paired_tokens(&path).is_empty(), "missing file → empty");
         std::fs::write(&path, b"not json").unwrap();
         assert!(load_paired_tokens(&path).is_empty(), "malformed → empty");

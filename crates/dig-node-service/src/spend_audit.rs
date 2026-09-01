@@ -1276,17 +1276,18 @@ mod tests {
         NOW
     }
 
-    fn tmp_log() -> SpendLog {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-spend-audit-{}-{}-{}",
-            std::process::id(),
-            now_ms(),
-            n
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        SpendLog::at(dir.join(SPEND_AUDIT_FILE))
+    /// A scratch log plus the guard that owns its directory.
+    ///
+    /// The guard travels with the log. Binding it locally inside this helper would drop the
+    /// tree at the end of THIS function, leaving the caller holding a `SpendLog` that points
+    /// at a directory which no longer exists — so every caller must bind it for the whole test.
+    fn tmp_log() -> (SpendLog, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-spend-audit-")
+            .tempdir()
+            .expect("temp dir");
+        let log = SpendLog::at(dir.path().join(SPEND_AUDIT_FILE));
+        (log, dir)
     }
 
     fn intent() -> SpendIntent {
@@ -1313,7 +1314,8 @@ mod tests {
     /// as it signs" apart from "recorded once it finished".
     #[test]
     fn the_entry_is_on_disk_before_the_producer_signs() {
-        let journal = SpendJournal::with_clock(tmp_log(), clock);
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log, clock);
         let recorded = journal.begin(intent());
 
         // This is the producer's signing step.
@@ -1330,7 +1332,8 @@ mod tests {
     /// A node blocked on funds must not read as an idle node.
     #[test]
     fn a_failed_spend_is_recorded_with_its_stage_and_reason() {
-        let journal = SpendJournal::with_clock(tmp_log(), clock);
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log, clock);
         let recorded = journal.begin(intent());
         journal.failed(&recorded, FailureStage::Signing, "insufficient funds");
         drop(recorded);
@@ -1354,7 +1357,8 @@ mod tests {
     /// where nothing lands cannot tell a correct confirmation apart from a broken one.
     #[test]
     fn a_competing_spend_of_the_funding_coin_never_confirms_this_spend() {
-        let journal = SpendJournal::with_clock(tmp_log(), clock);
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log, clock);
         let recorded = journal.begin(intent());
         journal.submitted(
             &recorded,
@@ -1389,7 +1393,8 @@ mod tests {
     /// and its chain reference is marked observed.
     #[test]
     fn observing_the_created_coin_confirms_the_spend() {
-        let journal = SpendJournal::with_clock(tmp_log(), clock);
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log, clock);
         let recorded = journal.begin(intent());
         journal.submitted(
             &recorded,
@@ -1426,7 +1431,8 @@ mod tests {
     /// entry to `unresolved` — not `pending` (which reads as still in flight) and never `confirmed`.
     #[test]
     fn a_dropped_spend_settles_itself_as_unresolved() {
-        let journal = SpendJournal::with_clock(tmp_log(), clock);
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log, clock);
         {
             let recorded = journal.begin(intent());
             journal.submitted(
@@ -1456,7 +1462,8 @@ mod tests {
     /// silence wearing an entry's clothes.
     #[test]
     fn a_producer_that_panics_still_leaves_an_unresolved_entry_with_its_coin() {
-        let journal = SpendJournal::with_clock(tmp_log(), clock);
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log, clock);
 
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let recorded = journal.begin(intent());
@@ -1499,7 +1506,8 @@ mod tests {
     /// A settled entry is not overwritten by the drop guard.
     #[test]
     fn dropping_a_settled_spend_does_not_overwrite_its_outcome() {
-        let journal = SpendJournal::with_clock(tmp_log(), clock);
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log, clock);
         {
             let recorded = journal.begin(intent());
             journal.confirmed(&recorded, TargetCoinId("c".to_string()), 5);
@@ -1512,7 +1520,7 @@ mod tests {
     /// The file is append-only: every revision survives, and the fold reports the newest.
     #[test]
     fn the_file_keeps_every_revision_and_the_fold_reports_the_newest() {
-        let log = tmp_log();
+        let (log, _scratch) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
         let recorded = journal.begin(intent());
         journal.submitted(
@@ -1536,7 +1544,7 @@ mod tests {
     /// read as a tidy shorter one.
     #[test]
     fn an_unparseable_line_is_counted_rather_than_hidden() {
-        let log = tmp_log();
+        let (log, _scratch) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
         let recorded = journal.begin(intent());
         journal.failed(&recorded, FailureStage::Broadcast, "rejected");
@@ -1557,7 +1565,8 @@ mod tests {
     /// would fold into one and the record would quietly lose money movement.
     #[test]
     fn two_spends_in_the_same_millisecond_are_two_records() {
-        let journal = SpendJournal::with_clock(tmp_log(), clock);
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log, clock);
         let a = journal.begin(intent());
         let b = journal.begin(intent());
         journal.failed(&a, FailureStage::Signing, "a");
@@ -2148,7 +2157,7 @@ mod tests {
     /// long ago they were observed, cannot be satisfied that way.
     #[test]
     fn a_stuck_spend_releases_its_funding_coins_once_the_hold_lapses() {
-        let log = tmp_log();
+        let (log, _scratch) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
 
         let stuck = journal.begin(intent());
@@ -2217,7 +2226,7 @@ mod tests {
     /// long-lapsed and release a coin that was committed moments ago. The closed direction.
     #[test]
     fn a_record_dated_in_the_future_keeps_its_hold() {
-        let log = tmp_log();
+        let (log, _scratch) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
 
         let spend = journal.begin(intent());
@@ -2244,7 +2253,7 @@ mod tests {
     /// `Failed { stage: Signing }` spend never moved money.
     #[test]
     fn the_window_never_extends_a_hold_a_terminal_status_already_released() {
-        let log = tmp_log();
+        let (log, _scratch) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
 
         let confirmed = journal.begin(intent());
@@ -2296,7 +2305,7 @@ mod tests {
     /// indistinguishable from one that refused.
     #[test]
     fn a_lost_line_refuses_the_committed_set() {
-        let log = tmp_log();
+        let (log, _scratch) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
 
         let spend = journal.begin(intent());

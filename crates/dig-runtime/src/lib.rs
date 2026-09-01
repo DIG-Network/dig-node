@@ -627,6 +627,11 @@ mod tests {
     // The full runtime still constructs the node engine (other consumers keep it).
     #[test]
     fn build_runtime_full_has_node_engine() {
+        // Deliberately a FIXED name rather than a `TempDir` (dig-node#370): these tests
+        // start the process-global runtime, which keeps reading this cache for the rest
+        // of the process, so a guard dropped at the end of the test would pull the tree
+        // out from under it. The residue is bounded at one directory per name — four in
+        // total, reused every run — rather than one per run.
         let tmp = std::env::temp_dir().join("dig-runtime-buildfull");
         std::env::set_var("DIG_IDENTITY_DIR", tmp.join("id"));
         std::env::set_var("DIG_NODE_CACHE", tmp.join("cache"));
@@ -917,6 +922,11 @@ mod tests {
     #[test]
     fn ffi_roundtrip_unknown_method() {
         // Isolate the identity + cache the node creates so the test is hermetic.
+        // Deliberately a FIXED name rather than a `TempDir` (dig-node#370): these tests
+        // start the process-global runtime, which keeps reading this cache for the rest
+        // of the process, so a guard dropped at the end of the test would pull the tree
+        // out from under it. The residue is bounded at one directory per name — four in
+        // total, reused every run — rather than one per run.
         let tmp = std::env::temp_dir().join("dig-runtime-test");
         std::env::set_var("DIG_IDENTITY_DIR", tmp.join("id"));
         std::env::set_var("DIG_NODE_CACHE", tmp.join("cache"));
@@ -941,6 +951,11 @@ mod tests {
     #[test]
     fn wallet_ffi_roundtrip_chain_id_envelope() {
         // Isolate the identity + cache (the runtime brings up the node + wallet).
+        // Deliberately a FIXED name rather than a `TempDir` (dig-node#370): these tests
+        // start the process-global runtime, which keeps reading this cache for the rest
+        // of the process, so a guard dropped at the end of the test would pull the tree
+        // out from under it. The residue is bounded at one directory per name — four in
+        // total, reused every run — rather than one per run.
         let tmp = std::env::temp_dir().join("dig-runtime-wallet-test");
         std::env::set_var("DIG_IDENTITY_DIR", tmp.join("id"));
         std::env::set_var("DIG_NODE_CACHE", tmp.join("cache"));
@@ -967,6 +982,11 @@ mod tests {
     // request is an empty body → the dispatch's malformed-JSON 400 error envelope.)
     #[test]
     fn wallet_ffi_null_pointers_yield_error_envelope_not_ub() {
+        // Deliberately a FIXED name rather than a `TempDir` (dig-node#370): these tests
+        // start the process-global runtime, which keeps reading this cache for the rest
+        // of the process, so a guard dropped at the end of the test would pull the tree
+        // out from under it. The residue is bounded at one directory per name — four in
+        // total, reused every run — rather than one per run.
         let tmp = std::env::temp_dir().join("dig-runtime-wallet-null-test");
         std::env::set_var("DIG_IDENTITY_DIR", tmp.join("id"));
         std::env::set_var("DIG_NODE_CACHE", tmp.join("cache"));

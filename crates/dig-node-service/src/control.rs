@@ -5948,18 +5948,19 @@ mod tests {
     fn token_mint_fails_closed_when_it_cannot_be_persisted() {
         // A path whose parent is a FILE, so `ensure_dir_restricted` / write cannot
         // create the token → `generate_token()?` / `write` returns Err, never a token.
-        let file = std::env::temp_dir().join(format!(
-            "dig-node-failclosed-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        // The scratch tree is owned by the guard (dig-node#370); the fixture the test needs
+        // is a regular FILE inside it, standing in for the non-directory parent.
+        let scratch = tempfile::Builder::new()
+            .prefix("dig-node-failclosed-")
+            .tempdir()
+            .expect("a scratch dir");
+        let file = scratch.path().join("not-a-dir");
         std::fs::write(&file, b"not a dir").unwrap();
         let bogus = file.join("sub").join(CONTROL_TOKEN_FILE);
         assert!(
             load_or_create_token_at(&bogus).is_err(),
             "must fail closed (propagate), never return a usable token when it cannot mint+persist"
         );
-        let _ = std::fs::remove_file(&file);
     }
 
     /// **Proves (dig-node#255):** a PAIRED token cannot reach `control.config.setUpstream`, while
@@ -6036,18 +6037,16 @@ mod tests {
 
     #[test]
     fn load_or_create_token_persists_and_is_stable() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         let first = load_or_create_token_at(&path).unwrap();
         let second = load_or_create_token_at(&path).unwrap();
         assert_eq!(first, second, "token must be stable across reads");
         assert_eq!(first.len(), 64);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SECURITY (#501 residual, dig-node#355): a pre-existing control-token file that is NOT
@@ -6072,13 +6071,12 @@ mod tests {
     fn foreign_owned_token_file_is_regenerated_not_trusted() {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-untrusted-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-untrusted-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         std::fs::create_dir_all(&dir).unwrap();
         let planted = "planted0".repeat(8); // a KNOWN 64-char attacker value (non-empty)
         std::fs::write(&path, &planted).unwrap();
@@ -6099,7 +6097,7 @@ mod tests {
             // The real second case. Only root can hand a file to another uid, which is exactly
             // the planting an unprivileged attacker would have to achieve — and it is what the
             // guard exists to refuse.
-            let foreign = dir.join("foreign").join(CONTROL_TOKEN_FILE);
+            let foreign = dir.path().join("foreign").join(CONTROL_TOKEN_FILE);
             std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
             std::fs::write(&foreign, &planted).unwrap();
             std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -6141,7 +6139,6 @@ mod tests {
                 "the regenerated token must be owner-only 0600 (got {mode:o})"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The trust RULE itself, asserted independently of whichever uid the suite happens to run
@@ -6190,13 +6187,12 @@ mod tests {
     #[test]
     fn trusted_owner_only_token_file_is_kept() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-trusted-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-trusted-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         std::fs::create_dir_all(&dir).unwrap();
         let existing = "a".repeat(64);
         std::fs::write(&path, &existing).unwrap();
@@ -6206,7 +6202,6 @@ mod tests {
             got, existing,
             "a trusted owner-only token must be loaded as-is, not regenerated"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SECURITY (#501): the control token grants full local control, so the created
@@ -6218,13 +6213,12 @@ mod tests {
     #[test]
     fn created_token_file_is_not_world_or_group_readable() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-perms-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-perms-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         load_or_create_token_at(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -6232,7 +6226,6 @@ mod tests {
             0,
             "token must have NO group/other permission bits (got {mode:o})"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The remedy hint names the concrete token path and, when the token is absent from
@@ -6311,20 +6304,18 @@ mod tests {
     /// the token); a fresh mint must always be readable at its own path.
     #[test]
     fn service_mint_then_cli_read_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-roundtrip-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-roundtrip-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         let minted = load_or_create_token_at(&path).unwrap();
         let read_back = read_token_readonly_at(&path).unwrap();
         assert_eq!(
             minted, read_back,
             "the CLI read must return the exact token the service minted"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #856 mint-on-startup guarantee: minting on a PRE-EXISTING (already-created, tokenless)
@@ -6333,15 +6324,14 @@ mod tests {
     /// half-hardened/recreated dir in place and always converging to a minted token.
     #[test]
     fn mint_on_a_pre_existing_dir_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-mint-idempotent-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-mint-idempotent-")
+            .tempdir()
+            .expect("a scratch dir");
         // The dir pre-exists but holds NO token (a freshly (re)created state dir).
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         assert!(!path.exists(), "precondition: the dir starts tokenless");
 
         let first = load_or_create_token_at(&path).unwrap();
@@ -6353,20 +6343,18 @@ mod tests {
             first, second,
             "mint-on-startup must be idempotent — a re-secure of an existing dir keeps the token"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A genuinely-absent token reads as `NotFound` with the "no control token found" remedy that
     /// now ALSO names the stale-service reinstall recovery (#772).
     #[test]
     fn read_readonly_reports_absent_token_as_not_found() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-absent-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-absent-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         let err = read_token_readonly_at(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         let msg = err.to_string();
@@ -6385,13 +6373,12 @@ mod tests {
     #[test]
     fn unreadable_token_maps_to_permission_denied_not_not_found() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-denied-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-denied-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "a".repeat(64)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -6417,7 +6404,6 @@ mod tests {
             );
         }
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6435,13 +6421,12 @@ mod tests {
 
     #[test]
     fn pin_registry_roundtrips_and_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-pins-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let config_path = dir.join("config.json");
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-pins-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let config_path = dir.path().join("config.json");
         let store = "c".repeat(64);
         let root = "d".repeat(64);
 
@@ -6458,20 +6443,18 @@ mod tests {
         assert!(read_pins_from(&config_path).is_empty());
         // Removing an absent pin is a no-op false.
         assert!(!remove_pin(&config_path, &store).unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn update_config_preserves_dig_node_keys() {
         // This service's pin/upstream writes must NOT clobber dig-node's own keys
         // in the shared config.json (cache_cap_bytes, wc_project_id).
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-config-merge-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let config_path = dir.join("config.json");
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-config-merge-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let config_path = dir.path().join("config.json");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             &config_path,
@@ -6490,18 +6473,16 @@ mod tests {
         assert_eq!(v["wc_project_id"], json!("abc"), "dig-node key preserved");
         assert_eq!(v["pinned_stores"][0]["store_id"], json!(store));
         assert_eq!(v["upstream_override"], json!("https://example.test"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn upstream_override_roundtrips_and_clears() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-upstream-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let config_path = dir.join("config.json");
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-upstream-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let config_path = dir.path().join("config.json");
         assert_eq!(read_upstream_override_from(&config_path), None);
         set_upstream_override(&config_path, "https://up.test").unwrap();
         assert_eq!(
@@ -6511,7 +6492,6 @@ mod tests {
         // Blank clears it.
         set_upstream_override(&config_path, "  ").unwrap();
         assert_eq!(read_upstream_override_from(&config_path), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (#1851 leg-2) `control.wallet.balance` MUST emit `balance`/`pending` as JSON **numbers**,
