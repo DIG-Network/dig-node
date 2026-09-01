@@ -385,7 +385,7 @@ pub enum RequestProvenance {
     ///
     /// Any HTML served on this origin is either explicitly from `/s/*` (store content, decrypted
     /// and served plaintext on loopback), or from the SPA fallback (landing on `index.html` of
-    /// the same store when a route is not found in the store's manifest) — both authored by store
+    /// the same store when a route is not found in the store's manifest) â€” both authored by store
     /// content or the node itself. No HTML on this origin originates from an untrusted external
     /// page. The read still serves; landing does not.
     StoreServed,
