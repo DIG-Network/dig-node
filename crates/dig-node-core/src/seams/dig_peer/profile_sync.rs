@@ -1266,6 +1266,20 @@ mod tests {
     /// nearest wrong one: a helper that called `TempDir::keep` (or handed back an unowned
     /// `PathBuf`) would satisfy nothing here, while a merely-tidier manual cleanup would pass
     /// the success case and fail this one.
+    ///
+    /// # Each half is independently load-bearing, and each was proved by a SEPARATE mutation
+    ///
+    /// One mutation cannot demonstrate both, because `TempDir`'s cleanup is a single `Drop` on
+    /// both paths: breaking it fails the success assertion first, and the unwind assertion never
+    /// gets to speak. So the halves were mutated separately.
+    ///
+    /// - **Success half:** `tempfile::Builder::disable_cleanup(true)` in [`tempdir`] — the first
+    ///   assertion fails and the unwind half is never reached.
+    /// - **Unwind half:** both blocks rewritten to the pre-fix idiom this ticket removes — a raw
+    ///   `create_dir_all` with a manual `remove_dir_all` at the end of the block. The success half
+    ///   REACHES that line and passes; the panicking closure skips it, and the run fails at the
+    ///   unwind assertion alone. That is the nearest wrong implementation — a merely tidier manual
+    ///   cleanup — and this assertion is the only thing in the suite that rejects it.
     #[test]
     fn the_scratch_tree_is_removed_on_drop_and_on_an_unwind() {
         let on_success = {
