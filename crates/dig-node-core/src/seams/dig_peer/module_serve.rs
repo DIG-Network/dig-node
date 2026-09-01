@@ -380,16 +380,14 @@ mod tests {
     }
 
     /// Write `bytes` as the cached module for `(store, root)` under a fresh temp cache dir.
-    fn cache_with(bytes: &[u8], store: &str, root: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-modserve-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = module_path(&dir, store, root);
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn cache_with(bytes: &[u8], store: &str, root: &str) -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-modserve-")
+            .tempdir()
+            .expect("a cache dir");
+        let path = module_path(dir.path(), store, root);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
         dir
@@ -405,7 +403,7 @@ mod tests {
         let bytes: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         let dir = cache_with(&bytes, &store, &root);
 
-        let info = describe_module(&dir, &store, &root).expect("held");
+        let info = describe_module(dir.path(), &store, &root).expect("held");
         assert_eq!(info.total_size, bytes.len() as u64);
         assert_eq!(info.module_hash, hex32(&sha256(&bytes)));
         assert_eq!(info.chunk_lens.iter().sum::<u64>(), info.total_size);
@@ -418,7 +416,7 @@ mod tests {
     #[test]
     fn an_unheld_module_is_not_described() {
         let dir = cache_with(b"x", &hex_id(1), &hex_id(2));
-        assert!(describe_module(&dir, &hex_id(9), &hex_id(9)).is_none());
+        assert!(describe_module(dir.path(), &hex_id(9), &hex_id(9)).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -430,7 +428,7 @@ mod tests {
     fn an_empty_module_file_is_not_described() {
         let (store, root) = (hex_id(3), hex_id(4));
         let dir = cache_with(b"", &store, &root);
-        assert!(describe_module(&dir, &store, &root).is_none());
+        assert!(describe_module(dir.path(), &store, &root).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -439,8 +437,8 @@ mod tests {
     #[test]
     fn a_non_canonical_id_never_reaches_the_filesystem() {
         let dir = cache_with(b"x", &hex_id(1), &hex_id(2));
-        assert!(describe_module(&dir, "../../etc", &hex_id(2)).is_none());
-        assert!(read_module_window(&dir, "../../etc", &hex_id(2), 0, 16).is_none());
+        assert!(describe_module(dir.path(), "../../etc", &hex_id(2)).is_none());
+        assert!(read_module_window(dir.path(), "../../etc", &hex_id(2), 0, 16).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -472,7 +470,7 @@ mod tests {
         let bytes: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
         let dir = cache_with(&bytes, &store, &root);
         assert_eq!(
-            read_module_window(&dir, &store, &root, 100, 50).expect("held"),
+            read_module_window(dir.path(), &store, &root, 100, 50).expect("held"),
             bytes[100..150]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -487,12 +485,12 @@ mod tests {
         let dir = cache_with(&bytes, &store, &root);
 
         // Past the end: an empty window, not an error and not a wrapped read.
-        assert!(read_module_window(&dir, &store, &root, 1_000, 10)
+        assert!(read_module_window(dir.path(), &store, &root, 1_000, 10)
             .expect("held")
             .is_empty());
         // Absurd length: clamped to what exists.
         assert_eq!(
-            read_module_window(&dir, &store, &root, 0, u64::MAX)
+            read_module_window(dir.path(), &store, &root, 0, u64::MAX)
                 .expect("held")
                 .len(),
             100
@@ -514,7 +512,7 @@ mod tests {
 
         let offset = MAX_MODULE_WINDOW * 2 + 17;
         let want = 4096u64;
-        let window = read_module_window(&dir, &store, &root, offset, want).expect("held");
+        let window = read_module_window(dir.path(), &store, &root, offset, want).expect("held");
 
         assert_eq!(window.len(), want as usize);
         assert_eq!(window, bytes[offset as usize..(offset + want) as usize]);
@@ -533,8 +531,8 @@ mod tests {
         let bytes: Vec<u8> = (0..2000u32).map(|i| (i % 200) as u8).collect();
         let dir = cache_with(&bytes, &store, &root);
 
-        let real = describe_module(&dir, &store, &root).expect("held");
-        let metadata = std::fs::metadata(module_path(&dir, &store, &root)).unwrap();
+        let real = describe_module(dir.path(), &store, &root).expect("held");
+        let metadata = std::fs::metadata(module_path(dir.path(), &store, &root)).unwrap();
         let sentinel = ModuleInfo {
             module_hash: "0".repeat(64),
             ..real.clone()
@@ -548,7 +546,7 @@ mod tests {
             },
         );
 
-        let second = describe_module(&dir, &store, &root).expect("held");
+        let second = describe_module(dir.path(), &store, &root).expect("held");
         assert_eq!(
             second.module_hash, sentinel.module_hash,
             "the unchanged file's second describe_module call is answered from the memo"
@@ -569,15 +567,11 @@ mod tests {
     /// it), however many extra entries other tests happen to interleave in.
     #[test]
     fn the_descriptor_memo_is_capped_and_evicts_stale_entries() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-modserve-memocap-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Owned by the guard, so the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-modserve-memocap-")
+            .tempdir()
+            .expect("a cache dir");
 
         // DESCRIPTOR_MEMO_CAP + 1 distinct (store, root) keys, none shared with any other test in
         // this file (those use small repeated-byte ids; these are sequential integers padded to
@@ -586,10 +580,10 @@ mod tests {
             .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 10_000_000)))
             .collect();
         for (store, root) in &keys {
-            let path = module_path(&dir, store, root);
+            let path = module_path(dir.path(), store, root);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, b"x").unwrap();
-            describe_module(&dir, store, root).expect("held");
+            describe_module(dir.path(), store, root).expect("held");
         }
 
         let first = keys[0].clone();

@@ -24,12 +24,13 @@ fn dign() -> PathBuf {
 }
 
 /// A private state dir, standing in for the machine-wide one the daemon and the CLI share.
-fn state_dir(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("dig-node-spend-e2e-{}-{}", std::process::id(), tag));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("state dir");
-    dir
+/// The tree is OWNED by the returned guard: `TempDir`'s `Drop` removes it, including on an
+/// unwind, so a failing assertion cannot leak it (dig-node#370).
+fn state_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("dig-node-spend-e2e-{tag}-"))
+        .tempdir()
+        .expect("state dir")
 }
 
 fn intent(store: &str) -> SpendIntent {
@@ -58,7 +59,7 @@ fn intent(store: &str) -> SpendIntent {
 #[test]
 fn an_automated_spend_is_written_by_the_node_and_read_back_by_dign() {
     let dir = state_dir("roundtrip");
-    let log = SpendLog::at(dir.join(SPEND_AUDIT_FILE));
+    let log = SpendLog::at(dir.path().join(SPEND_AUDIT_FILE));
     let journal = SpendJournal::new(log);
 
     let ok = journal.begin(intent("store-alpha"));
@@ -80,7 +81,7 @@ fn an_automated_spend_is_written_by_the_node_and_read_back_by_dign() {
     // The operator's command. A separate process, resolving the state dir on its own.
     let out = Command::new(dign())
         .args(["spends", "list", "--json"])
-        .env("DIG_NODE_STATE_DIR", &dir)
+        .env("DIG_NODE_STATE_DIR", dir.path())
         .output()
         .expect("run dign");
     assert!(
@@ -127,14 +128,14 @@ fn an_automated_spend_is_written_by_the_node_and_read_back_by_dign() {
 #[test]
 fn the_human_output_answers_what_and_on_whose_authority() {
     let dir = state_dir("human");
-    let journal = SpendJournal::new(SpendLog::at(dir.join(SPEND_AUDIT_FILE)));
+    let journal = SpendJournal::new(SpendLog::at(dir.path().join(SPEND_AUDIT_FILE)));
     let s = journal.begin(intent("store-gamma"));
     journal.failed(&s, FailureStage::Signing, "insufficient funds");
     drop(s);
 
     let out = Command::new(dign())
         .args(["spends", "list"])
-        .env("DIG_NODE_STATE_DIR", &dir)
+        .env("DIG_NODE_STATE_DIR", dir.path())
         .output()
         .expect("run dign");
     assert!(
@@ -159,7 +160,7 @@ fn a_node_that_never_spent_unattended_reports_an_empty_record() {
     let dir = state_dir("empty");
     let out = Command::new(dign())
         .args(["spends", "list", "--json"])
-        .env("DIG_NODE_STATE_DIR", &dir)
+        .env("DIG_NODE_STATE_DIR", dir.path())
         .output()
         .expect("run dign");
     assert!(out.status.success());
@@ -174,7 +175,7 @@ fn a_node_that_never_spent_unattended_reports_an_empty_record() {
 #[test]
 fn a_status_filter_passed_on_the_command_line_actually_narrows() {
     let dir = state_dir("filter");
-    let journal = SpendJournal::new(SpendLog::at(dir.join(SPEND_AUDIT_FILE)));
+    let journal = SpendJournal::new(SpendLog::at(dir.path().join(SPEND_AUDIT_FILE)));
 
     let ok = journal.begin(intent("store-one"));
     journal.confirmed(&ok, TargetCoinId("b".repeat(64)), 10);
@@ -185,7 +186,7 @@ fn a_status_filter_passed_on_the_command_line_actually_narrows() {
 
     let out = Command::new(dign())
         .args(["spends", "list", "--status", "failed", "--json"])
-        .env("DIG_NODE_STATE_DIR", &dir)
+        .env("DIG_NODE_STATE_DIR", dir.path())
         .output()
         .expect("run dign");
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
@@ -197,7 +198,7 @@ fn a_status_filter_passed_on_the_command_line_actually_narrows() {
 #[test]
 fn show_reaches_one_entry_by_the_id_list_printed() {
     let dir = state_dir("show");
-    let journal = SpendJournal::new(SpendLog::at(dir.join(SPEND_AUDIT_FILE)));
+    let journal = SpendJournal::new(SpendLog::at(dir.path().join(SPEND_AUDIT_FILE)));
     let s = journal.begin(intent("store-delta"));
     journal.confirmed(&s, TargetCoinId("c".repeat(64)), 77);
     let id = s.id().to_string();
@@ -205,7 +206,7 @@ fn show_reaches_one_entry_by_the_id_list_printed() {
 
     let out = Command::new(dign())
         .args(["spends", "show", &id, "--json"])
-        .env("DIG_NODE_STATE_DIR", &dir)
+        .env("DIG_NODE_STATE_DIR", dir.path())
         .output()
         .expect("run dign");
     assert!(out.status.success());
@@ -221,7 +222,7 @@ fn an_unknown_id_exits_non_zero() {
     let dir = state_dir("unknown");
     let out = Command::new(dign())
         .args(["spends", "show", "sp_does_not_exist", "--json"])
-        .env("DIG_NODE_STATE_DIR", &dir)
+        .env("DIG_NODE_STATE_DIR", dir.path())
         .output()
         .expect("run dign");
     assert!(!out.status.success());
@@ -237,14 +238,14 @@ fn an_unknown_id_exits_non_zero() {
 #[test]
 fn reconcile_without_a_chain_source_refuses_rather_than_claiming_agreement() {
     let dir = state_dir("reconcile");
-    let journal = SpendJournal::new(SpendLog::at(dir.join(SPEND_AUDIT_FILE)));
+    let journal = SpendJournal::new(SpendLog::at(dir.path().join(SPEND_AUDIT_FILE)));
     let s = journal.begin(intent("store-eps"));
     journal.confirmed(&s, TargetCoinId("d".repeat(64)), 5);
     drop(s);
 
     let out = Command::new(dign())
         .args(["spends", "reconcile", &"e".repeat(64), "--json"])
-        .env("DIG_NODE_STATE_DIR", &dir)
+        .env("DIG_NODE_STATE_DIR", dir.path())
         .output()
         .expect("run dign");
     assert!(!out.status.success(), "an unperformed check is not a pass");

@@ -5109,14 +5109,13 @@ mod tests {
 
     /// A scratch config dir unique to this process AND thread, so parallel tests never share a
     /// custody manifest.
-    fn refusal_scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-wallet-tip-refusal-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn refusal_scratch_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("dig-wallet-tip-refusal-{tag}-"))
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     /// Ask `be` for a tip and return the `NotExecutable` reason, asserting on the way that the
@@ -5183,8 +5182,8 @@ mod tests {
     #[tokio::test]
     async fn an_enrolled_wallet_refuses_the_tip_as_an_unopenable_seed() {
         let dir = refusal_scratch_dir("enrolled");
-        WalletCustody::enroll_for_tests(&dir, "tip-refusal-fixture", &[BlsPair::new(410).pk]);
-        let custody = WalletCustody::open(dir.clone());
+        WalletCustody::enroll_for_tests(dir.path(), "tip-refusal-fixture", &[BlsPair::new(410).pk]);
+        let custody = WalletCustody::open(dir.path().to_path_buf());
         assert!(
             custody.any_wallet(),
             "the fixture must really enrol a wallet, or it is the empty-custody case in disguise"
@@ -5206,7 +5205,7 @@ mod tests {
     async fn custody_holding_no_wallet_refuses_the_tip_as_nothing_enrolled() {
         let dir = refusal_scratch_dir("empty");
         std::fs::create_dir_all(&dir).expect("create the scratch dir");
-        let custody = WalletCustody::open(dir.clone());
+        let custody = WalletCustody::open(dir.path().to_path_buf());
         assert!(
             !custody.any_wallet(),
             "the fixture must really be empty, or it is the enrolled case in disguise"
@@ -8332,12 +8331,11 @@ mod tests {
     /// address fallback too, so it could not tell the two implementations apart.
     #[tokio::test]
     async fn a_restarted_locked_node_still_refuses_a_bundle_over_its_non_primary_key() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-wallet-restart-guard-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard, so the tree goes away on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-wallet-restart-guard-")
+            .tempdir()
+            .expect("a scratch dir");
 
         // The wallet as a pre-#1701 install left it: two HD keys persisted in the manifest, the
         // seed unreadable. `primary` stands for the receive address the old fallback covered;
@@ -8349,7 +8347,7 @@ mod tests {
             p2_hash(secondary.pk),
             "the fixture needs two DISTINCT keys, or it cannot tell the two guards apart"
         );
-        WalletCustody::enroll_for_tests(&dir, "restart-fixture", &[primary.pk, secondary.pk]);
+        WalletCustody::enroll_for_tests(dir.path(), "restart-fixture", &[primary.pk, secondary.pk]);
 
         let pusher = FakePusher::accepting();
         let cfg = WalletConfig {
@@ -8366,7 +8364,7 @@ mod tests {
 
         // Restart: a fresh custody over the SAME directory and a fresh backend whose memo of
         // loaded signers is empty.
-        let restarted = WalletCustody::open(dir.clone());
+        let restarted = WalletCustody::open(dir.path().to_path_buf());
         let db2 = WalletDb::open_in_memory().await.unwrap();
         db2.force_initial_sync_complete_for_test(true)
             .await

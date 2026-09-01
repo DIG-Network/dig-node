@@ -448,12 +448,13 @@ mod tests {
     }
 
     /// A unique temp config dir per test.
-    fn scratch() -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("dig-wallet-svc-{}-{}", std::process::id(), n));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn scratch() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dig-wallet-svc-")
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     /// **Proves (#368):** the production assembler builds a served backend that answers
@@ -468,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn build_assembles_a_served_backend() {
         let dir = scratch();
-        let svc = build_offline(&dir).await;
+        let svc = build_offline(dir.path()).await;
 
         let (status, body) = svc.backend.dispatch("get_version", "{}").await;
         assert_eq!(status, 200, "{body}");
@@ -502,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn build_serves_the_tipping_subsystem() {
         let dir = scratch();
-        let svc = build_offline(&dir).await;
+        let svc = build_offline(dir.path()).await;
 
         let (status, body) = svc.backend.dispatch("tip.get_config", "{}").await;
         assert_eq!(status, 200, "{body}");
@@ -546,7 +547,7 @@ mod tests {
             chia_bls::SecretKey::from_seed(&seed).public_key()
         };
         {
-            let svc = build_offline(&dir).await;
+            let svc = build_offline(dir.path()).await;
             assert!(
                 svc.watchlist.is_empty(),
                 "a fresh dir must start with nothing registered, or persistence proves nothing"
@@ -557,7 +558,7 @@ mod tests {
                 "the registration must go through the single enrolment door"
             );
         }
-        let svc2 = build_offline(&dir).await;
+        let svc2 = build_offline(dir.path()).await;
         assert_eq!(
             svc2.watchlist.registered(),
             vec![key],

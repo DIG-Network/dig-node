@@ -26,16 +26,24 @@ use dig_node_service::logging;
 use tracing::level_filters::LevelFilter;
 
 /// A log-dir root that cannot be created: a path nested inside a regular file.
-fn unopenable_log_root() -> std::path::PathBuf {
-    let base = std::env::temp_dir().join(format!("dig-node-logtest-{}", std::process::id()));
+///
+/// The guard owns the scratch tree the blocking file sits in, so it is removed on drop and
+/// on an unwind (dig-node#370); the caller holds it for the test's duration.
+fn unopenable_log_root() -> (tempfile::TempDir, std::path::PathBuf) {
+    let scratch = tempfile::Builder::new()
+        .prefix("dig-node-logtest-")
+        .tempdir()
+        .expect("a scratch dir");
+    let base = scratch.path().join("blocking-file");
     let mut file = std::fs::File::create(&base).expect("create the blocking regular file");
     file.write_all(b"not a directory").unwrap();
-    base.join("root")
+    let root = base.join("root");
+    (scratch, root)
 }
 
 #[test]
 fn unwritable_log_dir_leaves_console_logging_live_and_the_file_sink_reported_off() {
-    let root = unopenable_log_root();
+    let (_scratch, root) = unopenable_log_root();
     // SAFETY: single-threaded test body, set before the process's only `init`.
     unsafe { std::env::set_var("DIG_LOG_DIR", &root) };
 
