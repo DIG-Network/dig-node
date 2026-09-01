@@ -7585,6 +7585,10 @@ every receiver resolves the root itself before asking for anything — so an unc
 costs one ignored frame, whereas silence would take a healthy node off the air for the duration of
 a chain outage.
 
+The **immediate** announce of §22.5b needs no check of its own: `control.profile.putBody` has just
+required the chain to confirm exactly that root (§22.3), so the root it announces cannot be retired
+at that moment. Only the periodic sweep can outlive a root.
+
 **2. Report the drift.** The failure is the ABSENCE of a later write, so it produces no error
 anywhere and is invisible to the publisher, who is the only party that can fix it. A node MUST
 therefore surface a store whose held bodies are all superseded — in its own log on each sweep, and
