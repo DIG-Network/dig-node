@@ -28,6 +28,7 @@ pub mod module_anchor;
 pub mod module_relay;
 pub mod module_reshare;
 pub mod module_serve;
+pub mod module_stream;
 pub mod module_transport;
 pub mod neighbourhood_probe;
 pub mod net;
