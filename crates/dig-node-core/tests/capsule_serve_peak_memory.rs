@@ -290,12 +290,7 @@ fn promotion_does_not_slurp_the_staged_artifact() {
     );
 
     // Then the ban list, for the specific slurps that were actually here.
-    for banned in [
-        "fs::read(",
-        "fs::write(",
-        "read_to_end(",
-        "read_to_string(",
-    ] {
+    for banned in ["fs::read(", "fs::write(", "read_to_end(", "read_to_string("] {
         assert!(
             !body.contains(banned),
             "`promote_into_cache` contains `{banned}`, which makes the whole staged capsule resident. \
