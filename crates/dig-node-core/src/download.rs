@@ -383,10 +383,11 @@ pub enum RequestProvenance {
     /// content published by a stranger (`Sec-Fetch-Site: same-origin`/`same-site`, or any value the
     /// browser reports that is neither `none` nor `cross-site`).
     ///
-    /// `/s/*` is the ONLY HTML surface this router serves (`server.rs` â€” `/`, `/health`,
-    /// `/version`, `/openrpc.json`, `/.well-known/*`, `/ws*`, `/verify/*` are all non-HTML), so a
-    /// page-driven request arriving on this origin was, by construction, authored by store content.
-    /// The read still serves; landing does not.
+    /// Any HTML served on this origin is either explicitly from `/s/*` (store content, decrypted
+    /// and served plaintext on loopback), or from the SPA fallback (landing on `index.html` of
+    /// the same store when a route is not found in the store's manifest) — both authored by store
+    /// content or the node itself. No HTML on this origin originates from an untrusted external
+    /// page. The read still serves; landing does not.
     StoreServed,
     /// A cross-site subresource: the browser explicitly reported `Sec-Fetch-Site: cross-site`,
     /// meaning some OTHER origin's page drove this request. The read still serves; landing does not.
