@@ -26,7 +26,10 @@ use serde_json::{json, Value};
 use crate::cli::Outcome;
 use crate::config::Config;
 use crate::control_client::call_control;
-use dig_node_control_interface::results::{CollateralBufferResult, CollateralFundingState};
+use dig_node_control_interface::results::{
+    CollateralBufferResult, CollateralFundingState, WalletOperatorAddressResult,
+    WalletOperatorAddressUnavailableReason,
+};
 
 /// One control-parity CLI action, clap-agnostic (mapped from the subcommand in `entrypoint.rs`).
 /// Each variant names the single `control.*` method it dispatches — see [`ControlAction::method`].
@@ -876,7 +879,7 @@ fn summarize_mirror_bond_states(result: &Value) -> String {
         Err(e) => return format!("mirror bonds: unreadable answer from the node ({e})"),
     };
 
-    let (entries, complete, cursor, locked_dig_base_units, epoch) = match answer {
+    let (entries, complete, cursor, locked_dig_base_units, epoch, funding_wallet) = match answer {
         MirrorBondStatesResult::Unknown { reason } => {
             let (missing, remedy) = match reason {
                 MirrorBondStatesUnknownReason::ServedSetUnknown => (
@@ -904,11 +907,40 @@ fn summarize_mirror_bond_states(result: &Value) -> String {
             cursor,
             locked_dig_base_units,
             epoch,
-        } => (entries, complete, cursor, locked_dig_base_units, epoch),
+            funding_wallet,
+        } => (
+            entries,
+            complete,
+            cursor,
+            locked_dig_base_units,
+            epoch,
+            funding_wallet,
+        ),
+    };
+
+    // WHICH WALLET these figures are about, printed BEFORE them.
+    //
+    // Every number below is about the node's own machine-custody wallet, not the reader's. An
+    // operator who read `unfunded, short 1010` and checked their own balance found 1,015,000 base
+    // units of $DIG and concluded the node was broken; both figures were right and they were about
+    // two different wallets. The line goes first because a shortfall read before its wallet is
+    // named has already been misread.
+    let wallet_line = match &funding_wallet {
+        WalletOperatorAddressResult::Known { address, .. } => {
+            format!("these figures are about THIS NODE's wallet {address}")
+        }
+        WalletOperatorAddressResult::Unavailable { reason } => match reason {
+            WalletOperatorAddressUnavailableReason::NotInitialized => {
+                "this node has no wallet yet, so it can bond nothing".to_string()
+            }
+            WalletOperatorAddressUnavailableReason::Unreadable => {
+                "this node cannot read its own wallet, so it can pay no collateral".to_string()
+            }
+        },
     };
 
     // Counted by state, because the counts are what an operator acts on: only `unfunded` is a
-    // shortfall, and the other six mean "no coin yet" for reasons that need entirely different
+    // shortfall, and the other seven mean "no coin yet" for reasons that need entirely different
     // responses. A bare row count would flatten them back together.
     let mut bonded = 0usize;
     let mut unfunded = 0usize;
@@ -924,7 +956,7 @@ fn summarize_mirror_bond_states(result: &Value) -> String {
     // The locked figure is the node's WHOLE-SET total and is labelled as such, so a page is never
     // read as the whole of this operator's locked money.
     let page = format!(
-        "epoch {epoch}: {} bond(s) on this page — {bonded} bonded, {unfunded} unfunded, {other} other · {} locked across ALL bonds",
+        "{wallet_line}\nepoch {epoch}: {} bond(s) on this page — {bonded} bonded, {unfunded} unfunded, {other} other · {} locked across ALL bonds",
         entries.len(),
         format_dig(locked_dig_base_units),
     );
@@ -1605,6 +1637,85 @@ fn render_record(record: &crate::collateral::StoredRecord) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// **`dign mirror bond-states` names the wallet BEFORE it prints a shortfall.**
+    ///
+    /// The whole defect, at the surface a person actually reads: an operator saw
+    /// `unfunded, short 1010`, checked the balance they knew about, found 1,015,000 base units of
+    /// $DIG, and concluded the node was broken. Both figures were right and each was about a
+    /// different wallet.
+    ///
+    /// Two assertions, and the ORDER one is the point. That the address appears at all is weak --
+    /// a renderer appending it after the counts would satisfy it while a reader who has already
+    /// misread the shortfall never gets there. So this pins that the wallet line comes FIRST, which
+    /// the nearest wrong implementation does not.
+    ///
+    /// The fixture carries an `unfunded` row deliberately: on a page with nothing to fund, naming
+    /// the wrong wallet costs nobody anything, and the test would pass without proving the case
+    /// that matters.
+    #[test]
+    fn a_bond_page_names_its_wallet_before_it_reports_a_shortfall() {
+        const ADDRESS: &str =
+            "xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsjqfwvy";
+        let rendered = summarize_mirror_bond_states(&serde_json::json!({
+            "state": "known",
+            "entries": [{
+                "store_id": "11".repeat(32),
+                "root": "aa".repeat(32),
+                "bond_state": "unfunded",
+                "short_dig_base_units": 1_010u64,
+            }],
+            "complete": true,
+            "cursor": {"store_id": "11".repeat(32), "root": "aa".repeat(32)},
+            "locked_dig_base_units": 0u64,
+            "epoch": 7u64,
+            "funding_wallet": {
+                "state": "known",
+                "address": ADDRESS,
+                "puzzle_hash": "7c".repeat(32),
+            },
+        }));
+
+        assert!(
+            rendered.contains(ADDRESS),
+            "a shortfall printed without its wallet is the defect: {rendered}"
+        );
+        assert!(
+            rendered.find(ADDRESS).unwrap() < rendered.find("unfunded").unwrap(),
+            "the wallet must be named BEFORE the shortfall, or it is read too late: {rendered}"
+        );
+    }
+
+    /// **A node with no wallet says so, instead of printing a page of figures about nothing.**
+    ///
+    /// The `unavailable` arm rendered as an empty string, or omitted, would leave the counts
+    /// looking like an ordinary answer about the reader's own money. Asserted on the REMEDY
+    /// wording rather than on a token, because that is what an operator acts on, and the two
+    /// reasons are asserted apart: a node that has never been set up is new, and one whose wallet
+    /// will not open is broken and cannot pay collateral either.
+    #[test]
+    fn a_bond_page_from_a_walletless_node_says_which_kind_of_walletless() {
+        let page = |reason: &str| {
+            summarize_mirror_bond_states(&serde_json::json!({
+                "state": "known",
+                "entries": [],
+                "complete": true,
+                "cursor": serde_json::Value::Null,
+                "locked_dig_base_units": 0u64,
+                "epoch": 7u64,
+                "funding_wallet": {"state": "unavailable", "reason": reason},
+            }))
+        };
+
+        let fresh = page("not_initialized");
+        assert!(fresh.contains("no wallet yet"), "{fresh}");
+        let broken = page("unreadable");
+        assert!(broken.contains("cannot read its own wallet"), "{broken}");
+        assert_ne!(
+            fresh, broken,
+            "a new node and a broken one must not print the same thing"
+        );
+    }
 
     /// #407 -- `dign updater check-now` probing inside the restart window reported IO_ERROR,
     /// which reads to an operator exactly like an update that broke the node. It is the opposite:

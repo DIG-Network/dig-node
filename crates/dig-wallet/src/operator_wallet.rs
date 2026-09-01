@@ -244,6 +244,60 @@ abandon abandon abandon art";
         );
     }
 
+    /// **The address this node PUBLISHES is derived from the same puzzle hash the mirror
+    /// lifecycle SPENDS from.**
+    ///
+    /// `server.rs` picks the owner puzzle hash from the SIGNER when one is open and falls back to
+    /// [`operator_puzzle_hash`] when none is; `control.wallet.operatorAddress` reaches it through
+    /// the fallback. If those two could ever disagree, dig-app would show a funded address while
+    /// collateral failed from an empty one -- today's defect rebuilt one layer up, and harder to
+    /// diagnose the second time because the app would now be SHOWING an address and it would be
+    /// the wrong one.
+    ///
+    /// They cannot disagree, and this pins that rather than asserting it in prose: both reduce to
+    /// `derive_wallet_keys(open_operator_phrase(paths)).owner_puzzle_hash`. The test opens ONE real
+    /// sealed wallet on disk and takes both routes over it, so a future change that gave either
+    /// route its own derivation, its own phrase source, or its own key slot fails here.
+    ///
+    /// `agg_sig_data` is varied across the two signer opens deliberately: it is the one input that
+    /// differs between call sites, and a derivation that folded it in would give a node two
+    /// addresses for one wallet. That property has its own test above; this one keeps it true
+    /// through the seam a client actually reads.
+    #[test]
+    fn the_published_address_derives_from_the_hash_the_mirror_lifecycle_spends_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = WalletPaths {
+            seed: dir.path().join("seed.bin"),
+            device_key: dir.path().join("device.key"),
+            meta: dir.path().join("meta.json"),
+        };
+        autoseed::ensure_wallet(&paths).expect("the bootstrap mints a sealed operator wallet");
+
+        let spent_from = OperatorWallet::open(&paths, Bytes32::from([9u8; 32]))
+            .expect("the sealed wallet opens")
+            .owner_puzzle_hash();
+        let published = operator_puzzle_hash(&paths).expect("the same wallet derives its own hash");
+        assert_eq!(
+            published, spent_from,
+            "the address a client is shown must be the wallet collateral is paid from"
+        );
+
+        let other_domain = OperatorWallet::open(&paths, Bytes32::from([4u8; 32]))
+            .expect("the sealed wallet opens")
+            .owner_puzzle_hash();
+        assert_eq!(
+            other_domain, spent_from,
+            "one wallet must not have two addresses because two call sites signed for two networks"
+        );
+
+        // And the rendered address is that hash, not a neighbouring one: decode-free, by
+        // constructing the expected encoding from the hash the lifecycle spends from.
+        let expected = chia_wallet_sdk::utils::Address::new(spent_from, "xch".to_string())
+            .encode()
+            .unwrap();
+        assert_eq!(operator_address(&paths, "xch").unwrap(), expected);
+    }
+
     /// **An address is produced for the network the caller names, and a node with no seed says so
     /// rather than producing anything.**
     ///

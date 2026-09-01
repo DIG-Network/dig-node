@@ -65,7 +65,8 @@ use dig_node_control_interface::params::{
 };
 use dig_node_control_interface::results::{
     AutomatedSpend, SpendAsset, SpendAuthority, SpendChainReference, SpendFailureStage,
-    SpendOutcome, SpendsListResult,
+    SpendOutcome, SpendsListResult, WalletOperatorAddressResult,
+    WalletOperatorAddressUnavailableReason,
 };
 use dig_node_control_interface::ControlMethod;
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
@@ -1059,7 +1060,12 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         // The mirror-coin bond surface (dig-node#412, SPEC.md §25.8) -- one page of this
         // node's OWN bonds. Shell-owned because the bonds are the SERVICE's money, not the
         // embedded engine's.
-        "control.mirror.bondStates" => mirror_bond_states(mirror_bond_observation(ctx), id, params),
+        "control.mirror.bondStates" => mirror_bond_states(
+            mirror_bond_observation(ctx),
+            id,
+            params,
+            operator_wallet_answer(ctx),
+        ),
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
@@ -2340,6 +2346,19 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 /// — one wallet in appearance and two in fact, on a surface whose whole purpose is to end exactly
 /// that confusion.
 fn wallet_operator_address(ctx: &ControlCtx, id: Value) -> Value {
+    match serde_json::to_value(operator_wallet_answer(ctx)) {
+        Ok(v) => control_ok(id, v),
+        Err(e) => control_error(id, ErrorCode::ControlError, e.to_string()),
+    }
+}
+
+/// The node's answer to *which wallet is mine* -- computed ONCE, for every surface that states it.
+///
+/// `control.wallet.operatorAddress` returns it, and `control.mirror.bondStates` carries it beside
+/// the amounts it is about. Two producers would be two answers to one question, and they would
+/// drift in the direction nobody tests: a bond page naming one wallet while the dedicated method
+/// named another is the original defect with an extra layer of confidence on top.
+fn operator_wallet_answer(ctx: &ControlCtx) -> WalletOperatorAddressResult {
     use dig_wallet::operator_wallet::{operator_address, OperatorAddressUnavailable};
 
     let paths = dig_wallet::autoseed::default_paths();
@@ -2350,29 +2369,28 @@ fn wallet_operator_address(ctx: &ControlCtx, id: Value) -> Value {
             let puzzle_hash = dig_wallet::operator_wallet::operator_puzzle_hash(&paths)
                 .map(|ph| hex::encode(ph.to_bytes()));
             match puzzle_hash {
-                Some(puzzle_hash) => control_ok(
-                    id,
-                    json!({ "state": "known", "address": address, "puzzle_hash": puzzle_hash }),
-                ),
+                Some(puzzle_hash) => WalletOperatorAddressResult::Known {
+                    address,
+                    puzzle_hash,
+                },
                 // Unreachable in practice -- the address derived from that same hash a moment ago
                 // -- but reported rather than papered over with a placeholder, because a partial
                 // answer on a funding surface is the failure this method exists to prevent.
-                None => control_ok(
-                    id,
-                    json!({ "state": "unavailable", "reason": "unreadable" }),
-                ),
+                None => WalletOperatorAddressResult::Unavailable {
+                    reason: WalletOperatorAddressUnavailableReason::Unreadable,
+                },
             }
         }
-        Err(reason) => control_ok(
-            id,
-            json!({
-                "state": "unavailable",
-                "reason": match reason {
-                    OperatorAddressUnavailable::NotInitialized => "not_initialized",
-                    OperatorAddressUnavailable::Unreadable => "unreadable",
-                },
-            }),
-        ),
+        Err(reason) => WalletOperatorAddressResult::Unavailable {
+            reason: match reason {
+                OperatorAddressUnavailable::NotInitialized => {
+                    WalletOperatorAddressUnavailableReason::NotInitialized
+                }
+                OperatorAddressUnavailable::Unreadable => {
+                    WalletOperatorAddressUnavailableReason::Unreadable
+                }
+            },
+        },
     }
 }
 
@@ -3904,6 +3922,7 @@ fn mirror_bond_states(
     >,
     id: Value,
     params: &Value,
+    funding_wallet: WalletOperatorAddressResult,
 ) -> Value {
     use dig_node_control_interface::params::MirrorBondStatesParams;
     use dig_node_control_interface::results::MirrorBondStatesResult;
@@ -3922,6 +3941,7 @@ fn mirror_bond_states(
             &observation,
             params.after.as_ref(),
             params.effective_limit(),
+            funding_wallet,
         ),
         Err(reason) => MirrorBondStatesResult::Unknown { reason },
     };
@@ -4022,6 +4042,19 @@ mod tests {
     /// **Catches:** the empty-page fabrication — a node that cannot read its own mirror coins
     /// returning `{entries: [], complete: true}`, which tells an operator this node holds no bonds
     /// and locks no money. Both halves are asserted, because a producer that emitted the right
+    /// The funding wallet these dispatch tests hand the bond surface.
+    ///
+    /// A fixed KNOWN answer: these tests are about paging, refusal and the unknown reason, so
+    /// varying the wallet would test something else. That the wallet a page names is the wallet
+    /// the lifecycle SPENDS from is pinned in `dig-wallet`, over a real sealed wallet, where the
+    /// two derivations can actually be compared.
+    fn test_funding_wallet() -> WalletOperatorAddressResult {
+        WalletOperatorAddressResult::Known {
+            address: "xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsjqfwvy".into(),
+            puzzle_hash: "7c".repeat(32),
+        }
+    }
+
     /// `state` beside an `entries` key would still hand a lenient client a zero to render.
     #[test]
     fn mirror_bond_states_says_which_fact_it_is_missing_rather_than_returning_an_empty_page() {
@@ -4031,6 +4064,7 @@ mod tests {
             ),
             json!(1),
             &json!({}),
+            test_funding_wallet(),
         );
         let result = &answer["result"];
         assert_eq!(result["state"], "unknown");
@@ -4073,7 +4107,8 @@ mod tests {
             epoch: 4,
         };
 
-        let answer = mirror_bond_states(Ok(observation), json!(1), &json!({}));
+        let answer =
+            mirror_bond_states(Ok(observation), json!(1), &json!({}), test_funding_wallet());
         let result = &answer["result"];
 
         assert_eq!(
@@ -4247,6 +4282,7 @@ mod tests {
                 Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
                 json!(1),
                 &json!({ "limit": limit }),
+                test_funding_wallet(),
             );
             assert_eq!(
                 answer["error"]["code"],
@@ -4262,6 +4298,7 @@ mod tests {
             ),
             json!(1),
             &json!({ "limit": 1000 }),
+            test_funding_wallet(),
         );
         assert!(ok.get("error").is_none(), "1000 is in range: {ok}");
     }
@@ -4281,6 +4318,7 @@ mod tests {
             ),
             json!(1),
             &json!({ "after": { "store_id": "not-hex", "root": hex } }),
+            test_funding_wallet(),
         );
         assert_eq!(
             malformed["error"]["code"],
@@ -4294,6 +4332,7 @@ mod tests {
             ),
             json!(1),
             &json!({ "after": { "store_id": format!("0x{hex}"), "root": hex } }),
+            test_funding_wallet(),
         );
         assert!(
             prefixed.get("error").is_none(),
