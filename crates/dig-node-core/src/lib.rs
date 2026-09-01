@@ -9135,13 +9135,32 @@ mod tests {
         const MARKER: &str = "OLD-SHAPE FIXTURE";
 
         // Assembled rather than written out, so the needle does not match its own definition.
-        let needle = ["\"error\"", ":{"].concat();
+        let needle = ["\"err", "or\""].concat();
 
         let mut offenders: Vec<usize> = Vec::new();
         let mut cursor = 0usize;
         while let Some(found) = SOURCE[cursor..].find(&needle) {
             let at = cursor + found;
             cursor = at + 1;
+
+            // SPACING IS NOT MEANING. `"error" : {` mints the same frame as `"error":{`, and a
+            // needle blind to the spaced form is precisely what made the first sweep of this file
+            // report itself complete while eight producers were still standing. So match the KEY
+            // and then walk whitespace to the colon and the brace, rather than pinning one layout.
+            //
+            // This also separates a MINT from a READ: `resp["error"]["code"]` in an assertion is
+            // followed by `]`, never `:`, so the thousand-odd test reads in this file cost one
+            // character of lookahead each and are not offenders.
+            let mut after = SOURCE[at + needle.len()..].chars();
+            let mut next_significant = || loop {
+                match after.next() {
+                    Some(c) if c.is_whitespace() => continue,
+                    other => return other,
+                }
+            };
+            if next_significant() != Some(':') || next_significant() != Some('{') {
+                continue;
+            }
 
             // PROSE IS NOT CODE. A comment that describes the forbidden shape contains the needle
             // by necessity - including this test's own doc comment. Excluding comments structurally
