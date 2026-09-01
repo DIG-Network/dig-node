@@ -3567,14 +3567,20 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
 /// # The chain read is ADDITIVE and never fatal
 ///
 /// Every pre-existing field keeps its exact meaning: `body_b64` is still the disk read at the
-/// REQUESTED root, and a failed disk read is still `CONTROL_ERROR`. A chain that cannot be read
-/// degrades to `state: "chain_unreadable"` rather than failing the call, because a node whose
+/// REQUESTED root, and a failed disk read is still `CONTROL_ERROR`. A chain read that RETURNS an
+/// error degrades to `state: "chain_unreadable"` rather than failing the call, because a node whose
 /// coinset access is down must still be able to answer what it holds. Turning a working disk read
 /// into an error on a chain outage would break every existing caller to add a diagnosis.
 ///
-/// The chain read follows the precedent `control.profile.putBody` already sets — it resolves the
-/// root through the same [`AnchoredRootResolver`] with no timeout of its own — rather than
-/// inventing a different bound for the same call.
+/// # The limitation, named rather than implied
+///
+/// A chain source that is UNRESPONSIVE rather than failing produces no error to degrade on, so it
+/// blocks this call for as long as it blocks. That is not a property this method invented: the
+/// chain read follows the precedent `control.profile.putBody` already sets — same
+/// [`AnchoredRootResolver`], no timeout of its own, and `putBody` performs it as its FIRST action,
+/// before any body validation. Bounding it is therefore one change across both methods; bounding
+/// only this one would make two callers of the same resolver disagree about what a slow chain
+/// means, which is the kind of split that later reads as a bug in whichever one was not touched.
 async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     const METHOD: &str = "control.profile.getBody";
     let store_id = match parse_hex32_param(METHOD, "store_id", &id, params) {
