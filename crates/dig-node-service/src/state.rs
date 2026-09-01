@@ -1375,13 +1375,17 @@ mod tests {
     #[test]
     fn ensure_dir_restricted_is_0700_and_not_group_or_world_accessible() {
         use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("dig-state-dir-{}-{}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // The property under test is what `ensure_dir_restricted` does when it CREATES the directory,
+        // so the path handed to it must not exist yet. The guard owns the PARENT, which keeps
+        // that intact while still removing the tree on drop and on an unwind (dig-node#370).
+        let parent = tempfile::Builder::new()
+            .prefix("dig-state-dir-")
+            .tempdir()
+            .expect("a scratch parent");
+        let dir = parent.path().join("state");
         ensure_dir_restricted(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "state dir must be owner-only (got {mode:o})");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- control-token FILE owner verification (#501 residual) ------------------
@@ -1433,14 +1437,12 @@ mod tests {
     fn token_file_is_trusted_rejects_a_service_run_on_a_user_owned_file() {
         // A file THIS (interactive-user) process creates is owned by the current user. A
         // NON-service run trusts it; a SERVICE run does NOT (it requires SYSTEM/Administrators).
-        let dir = std::env::temp_dir().join(format!(
-            "dig-token-owner-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("control-token");
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-token-owner-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join("control-token");
         std::fs::write(&path, b"deadbeef").unwrap();
         assert!(
             token_file_is_trusted(&path, false),
@@ -1450,7 +1452,6 @@ mod tests {
             !token_file_is_trusted(&path, true),
             "a service run must NOT trust a user-owned token"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1458,14 +1459,12 @@ mod tests {
     fn token_file_is_trusted_accepts_0600_rejects_group_readable() {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "dig-token-owner-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("control-token");
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-token-owner-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join("control-token");
         std::fs::write(&path, b"deadbeef").unwrap();
         // A 0600 file owned by the test user (== current euid) is trusted.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1479,25 +1478,51 @@ mod tests {
         let running_as_root = std::fs::metadata(&path)
             .map(|m| m.uid() == 0)
             .unwrap_or(false);
-        if !running_as_root {
+        if running_as_root {
+            // Under root the MODE is not the discriminator, so asserting nothing here would make
+            // the whole branch a silent pass on the CI runners that are root (dig-node#355).
+            // Assert the carve-out itself, then the observable that IS still discriminating:
+            // ownership. Only root can hand the fixture to another uid, which is precisely the
+            // planting the guard refuses.
+            assert!(
+                token_file_is_trusted(&path, false),
+                "a root-owned token is trusted regardless of mode"
+            );
+            const FOREIGN_UID: u32 = 65534; // `nobody`
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::os::unix::fs::chown(&path, Some(FOREIGN_UID), None)
+                .expect("root must be able to chown; without it this branch proves nothing");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().uid(),
+                FOREIGN_UID,
+                "the fixture must actually be foreign-owned"
+            );
+            assert!(
+                !token_file_is_trusted(&path, false),
+                "a foreign-uid token is never trusted, even by root"
+            );
+        } else {
             assert!(
                 !token_file_is_trusted(&path, false),
                 "a group/other-readable token is not trusted"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn harden_state_dir_sets_0700_on_unix() {
         use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("dig-harden-dir-{}-{}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // The property under test is what `harden_state_dir` does when it CREATES the directory,
+        // so the path handed to it must not exist yet. The guard owns the PARENT, which keeps
+        // that intact while still removing the tree on drop and on an unwind (dig-node#370).
+        let parent = tempfile::Builder::new()
+            .prefix("dig-harden-dir-")
+            .tempdir()
+            .expect("a scratch parent");
+        let dir = parent.path().join("state");
         harden_state_dir(&dir, None).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "harden must leave the dir 0700 (got {mode:o})");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

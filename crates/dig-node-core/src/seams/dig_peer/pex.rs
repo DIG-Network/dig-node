@@ -733,8 +733,9 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let network = [0x7bu8; 32];
-        let node_a = crate::peer::tests::fresh_pool_handle("pex-adopt-a", network).await;
-        let node_b = crate::peer::tests::fresh_pool_handle_on(
+        let (node_a, _node_a_dir) =
+            crate::peer::tests::fresh_pool_handle("pex-adopt-a", network).await;
+        let (node_b, _node_b_dir) = crate::peer::tests::fresh_pool_handle_on(
             "pex-adopt-b",
             network,
             "[::1]:0".parse().expect("parse [::1]:0"),

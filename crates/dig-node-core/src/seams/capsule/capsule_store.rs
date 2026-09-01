@@ -117,10 +117,20 @@ pub trait CapsuleStore: Send + Sync {
     /// `sync_module_from`, which already serializes via the module path; this also
     /// holds the `cache_lock` around the call so concurrent on-demand fetches of
     /// the same capsule don't race each other.
+    ///
+    /// `claim` is REQUIRED, and that is the fix for dig-node#446 rather than a style preference.
+    /// The provenance marker's only writer used to sit on the staging path, so EVERY non-staging
+    /// route inherited the bondable `Held` default by omission -- including the inbound-demand
+    /// backfill, which a remote peer triggers. A parameter closes the class; a check at each call
+    /// site closes one instance and waits for the next route to be added without it. Derive it from
+    /// the request's origin with
+    /// [`holder_claim_for_landing`](crate::seams::dig_rpc::holder_claim_for_landing) -- never
+    /// hard-code `Announce`, which is what staked this operator's $DIG on a stranger's content.
     async fn cache_fetch_and_cache(
         &self,
         store_id_hex: &str,
         root_hex: &str,
+        claim: crate::seams::dig_peer::HolderClaim,
     ) -> Result<(u64, String), String>;
 
     /// Sync a whole store BY STORE ID, with no caller-supplied root: resolve the store's
@@ -165,7 +175,16 @@ pub trait CapsuleStore: Send + Sync {
     /// a possibly-OLD generation (#1623) — never fabricated, junk, or out-of-neighbourhood content. The
     /// inbound-demand path additionally confines the caller to this node's keyspace neighbourhood (the
     /// XOR-proximity admission, §7.10d) before it ever passes a peer-supplied root in.
-    async fn gap_fill_generation(&self, store_id: [u8; 32], root: Bytes32) -> Result<(), String>;
+    ///
+    /// `claim` is required and threaded to the land, for the reason given on
+    /// [`cache_fetch_and_cache`](CapsuleStore::cache_fetch_and_cache): this function is on the
+    /// remote-triggerable inbound-demand path, so it may not assume its capsule is the operator's.
+    async fn gap_fill_generation(
+        &self,
+        store_id: [u8; 32],
+        root: Bytes32,
+        claim: crate::seams::dig_peer::HolderClaim,
+    ) -> Result<(), String>;
 
     /// Background CAPSULE BACKFILL (SPEC §5.6): when a resource read for `(store_hex, root_hex)` is
     /// being satisfied FROM ANOTHER NODE (a redirect or a fetch-through miss), also pull the WHOLE
@@ -258,6 +277,7 @@ impl CapsuleStore for Node {
         &self,
         store_id_hex: &str,
         root_hex: &str,
+        claim: crate::seams::dig_peer::HolderClaim,
     ) -> Result<(u64, String), String> {
         // Validated once, up front: a non-canonical key can name no capsule to report and no capsule to
         // fetch, so it is refused before either the stat or the network hop (#1599).
@@ -274,7 +294,22 @@ impl CapsuleStore for Node {
         // the remote head advanced mid-sync, so we read the file back to report size + confirm
         // THIS capsule is now present.
         let sync = self
-            .sync_module_from(&self.upstream, store_id_hex, root_hex)
+            // The claim is the CALLER's to supply, and it is a required argument so no route can
+            // reach this land without deciding (dig-node#446). It used to be hard-coded `Announce`
+            // here, on the reasoning that `cache.fetchAndCache` is an operator control-plane method
+            // -- true of the control-plane call sites, and false of this function, which the
+            // inbound-demand backfill reaches from a REMOTE request (`peer.rs` ->
+            // `note_inbound_demand` -> the backfill task). A remote peer's demand therefore landed a
+            // stranger's capsule ANNOUNCED, i.e. bondable, i.e. with this operator's $DIG staked on
+            // it. That path is gated behind the default-OFF `DIG_NODE_INBOUND_DEMAND_CACHE`, so it
+            // was never reachable in a default install -- but "behind a flag" is a different claim
+            // from "not reachable", and an operator who enables a documented feature is not
+            // consenting to bond content a stranger chose.
+            //
+            // Threaded per call site rather than suppressed here: suppressing every land through
+            // this shared choke point would satisfy the remote case while silently disabling the
+            // reshare flywheel for the operator's own content.
+            .sync_module_from(&self.upstream, store_id_hex, root_hex, claim)
             .await;
         // A fresh land is written as `.dig`; resolve tolerates a legacy `.module` already on disk.
         let path = capsule.resolve_cached_path(&self.cache_dir);
@@ -315,11 +350,22 @@ impl CapsuleStore for Node {
             .await
             .map_err(|e| format!("could not resolve the chain-anchored root: {e}"))?
             .ok_or_else(|| "the store has no chain-confirmed generation to sync".to_string())?;
-        self.cache_fetch_and_cache(store_id_hex, &root.to_hex())
-            .await
+        // A whole-store sync is reached only from the operator's `cache.syncStore` control verb,
+        // so its land is this operator's own content and stays bondable.
+        self.cache_fetch_and_cache(
+            store_id_hex,
+            &root.to_hex(),
+            crate::seams::dig_peer::HolderClaim::Announce,
+        )
+        .await
     }
 
-    async fn gap_fill_generation(&self, store_id: [u8; 32], root: Bytes32) -> Result<(), String> {
+    async fn gap_fill_generation(
+        &self,
+        store_id: [u8; 32],
+        root: Bytes32,
+        claim: crate::seams::dig_peer::HolderClaim,
+    ) -> Result<(), String> {
         let store_hex = hex::encode(store_id);
         let root_hex = root.to_hex();
         // Already held → nothing to pull (idempotent).
@@ -329,7 +375,8 @@ impl CapsuleStore for Node {
         // Pull + cache the whole module under (store, root) via the authenticated §21 whole-store sync.
         // `cache_fetch_and_cache` serializes concurrent pulls of the same capsule and reports the
         // failure reason (no identity / not authorized / served root differs) on error.
-        self.cache_fetch_and_cache(&store_hex, &root_hex).await?;
+        self.cache_fetch_and_cache(&store_hex, &root_hex, claim)
+            .await?;
 
         // Confirm the generation actually landed (a sync whose served root differed leaves it absent).
         // The DHT re-announce that makes this node a discoverable holder (§14.1) already fired inside
@@ -357,7 +404,17 @@ impl CapsuleStore for Node {
         if origin != crate::download::ReadOrigin::Local {
             return;
         }
-        self.spawn_capsule_backfill(store_hex, root_hex);
+        // Derived from the origin that just passed the gate, not restated as `Announce`. The gate
+        // and the claim would then be two answers to one question, free to drift apart -- which is
+        // the shape that produced dig-node#446 in the first place.
+        self.spawn_capsule_backfill(
+            store_hex,
+            root_hex,
+            crate::seams::dig_rpc::holder_claim_for_landing(
+                origin,
+                crate::download::RequestProvenance::FirstParty,
+            ),
+        );
     }
 
     fn set_self_ref(&self, weak: Weak<Node>) {
@@ -386,18 +443,64 @@ impl Node {
     ///
     /// The caller MUST hold `cache_lock` so a concurrent pull-land of the same capsule cannot race the
     /// write (matching `cache_fetch_and_cache`, which lands under the same lock).
+    ///
+    /// # `claim` is required, and that is the point (dig-node#436)
+    ///
+    /// Provenance is not carried in a capsule's bytes — they are content-addressed and identical
+    /// whether this node pulled them for itself or for a stranger — so it lives in a `<root>.relay`
+    /// sidecar that the inventory scan reads. Its ABSENCE means `Held`, and `Held` is the bondable
+    /// state a mirror coin is minted against. A land route that simply forgot to write the marker
+    /// therefore failed OPEN, spending the operator's $DIG on a stranger's content.
+    ///
+    /// Naming the claim is a required ARGUMENT rather than a step a caller performs afterwards, so a
+    /// future land route cannot inherit `Held` by omission: there is no signature to call incorrectly.
+    /// The same reasoning that made [`crate::CapsuleProvenance`] an enum with no `Default`, extended
+    /// to the filesystem that was quietly supplying one.
     pub(crate) async fn land_capsule_bytes(
         &self,
         key: &crate::CapsuleKey,
         bytes: &[u8],
+        claim: crate::seams::dig_peer::HolderClaim,
     ) -> Result<(u64, bool), String> {
         let path = key.module_path(&self.cache_dir);
         if let Ok(md) = std::fs::metadata(&path) {
-            // Already a holder — do not re-write, do not re-announce (no double-announce).
+            // Already a holder — do not re-write, do not re-announce (no double-announce). The claim
+            // already recorded beside it stands: a re-push cannot silently PROMOTE a relayed capsule
+            // into a bondable one, which is the same fail-closed direction the rest of this path takes.
+            //
+            // DELIBERATE, and it has a cost worth naming: a genuinely LOCAL re-push of a capsule this
+            // node previously relayed stays `Relayed` until the capsule is evicted, so the operator
+            // forgoes a bond they were entitled to. That is the direction to err in — it costs a bond
+            // that could have been had, never a bond staked on a stranger's content. Changing it is a
+            // decision that gets a ticket, not a quiet relaxation of this early return.
             return Ok((md.len(), false));
         }
-        crate::write_atomic(&path, bytes)
-            .map_err(|e| format!("could not write the capsule: {e}"))?;
+        // PROVENANCE FIRST, and it is not optional (dig-node#436). The `<root>.relay` sidecar decides
+        // whether this node later announces the capsule and stakes the operator's $DIG on it, and it
+        // is recorded BEFORE the bytes become visible — so there is no window in which a capsule is
+        // discoverable while its provenance is still unwritten. A marker that cannot be written fails
+        // the land outright rather than landing unmarked, because unmarked reads as `Held`, and `Held`
+        // is the bondable state: a silent failure here spends money.
+        // The store directory must exist before the marker can be written into it. `write_atomic`
+        // creates it for the capsule, but the marker is deliberately written FIRST, so it has to
+        // create it too — otherwise a first-ever capsule for a store fails its land on a missing
+        // directory. (It failed exactly that way when this guard was introduced, which is the correct
+        // direction: refusing to land beats landing unmarked, because unmarked is bondable.)
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create the capsule's store directory: {e}"))?;
+        }
+        crate::seams::dig_peer::persist_holder_claim(&path, claim)
+            .map_err(|_| "could not record the capsule's provenance".to_string())?;
+        crate::write_atomic(&path, bytes).map_err(|e| {
+            // The land failed, so the marker must not outlive it and mis-describe a later capsule that
+            // arrives at the same path by a different route.
+            let _ = crate::seams::dig_peer::persist_holder_claim(
+                &path,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            );
+            format!("could not write the capsule: {e}")
+        })?;
         self.announce_and_bound_after_land(key.identity()).await;
         Ok((bytes.len() as u64, true))
     }
@@ -439,7 +542,25 @@ impl Node {
     /// - **already-held** — a held capsule needs no warm-up;
     /// - **single-flight** — the SHARED `(store, root)` acquisition gate (#1614) both this leg and the
     ///   #1576 reshare warm claim, so a burst of reads across either leg starts exactly ONE pull.
-    pub(crate) fn spawn_capsule_backfill(&self, store_hex: &str, root_hex: &str) {
+    pub(crate) fn spawn_capsule_backfill(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        // Named `holder_claim`, not `claim`, because the single-flight acquisition guard below is
+        // also called a claim and the two are unrelated: one records whose content this is, the
+        // other records that a pull is running.
+        holder_claim: crate::seams::dig_peer::HolderClaim,
+    ) {
+        // Record the claim the CALLER derived, before any gate can decline the pull.
+        //
+        // The land itself happens on a detached task, so asserting the on-disk provenance marker
+        // would race it; recording here makes the WIRING observable synchronously. That distinction
+        // is the whole point of dig-node#446: `holder_claim_for_landing` was already correct and
+        // already tested, and the capsule still landed bondable, because nothing proved which claim
+        // each trigger actually passes.
+        #[cfg(test)]
+        backfill_claim_probe::record(holder_claim);
+
         // Only where a peer network / upstream exists to pull from. This is a CAPABILITY check, not a
         // policy one — there is nothing to decide about on a node with no way to fetch.
         if self.p2p_content().is_none() {
@@ -502,7 +623,7 @@ impl Node {
             // the moment this node becomes a holder and the content-replication flywheel turns,
             // and failing to land one is the moment it silently does not. At `debug!` a broken
             // flywheel looked exactly like a working one from any log a user would run.
-            match node.gap_fill_generation(store_id, root).await {
+            match node.gap_fill_generation(store_id, root, holder_claim).await {
                 Ok(()) => tracing::info!(
                     capsule = %key,
                     "backfill: cached the whole capsule after a resource read from another node"
@@ -514,5 +635,32 @@ impl Node {
                 ),
             }
         });
+    }
+}
+
+/// A test-only record of the holder claim the most recent backfill was STARTED with.
+///
+/// Deliberately captured before the pull's own gates, so a test can assert what a trigger DECIDED
+/// even when the pull is then declined -- the decision and the pull are separate questions, and
+/// dig-node#446 was a wrong decision reaching a pull that worked perfectly.
+#[cfg(test)]
+pub(crate) mod backfill_claim_probe {
+    use crate::seams::dig_peer::HolderClaim;
+    use std::sync::Mutex;
+
+    static LAST: Mutex<Option<HolderClaim>> = Mutex::new(None);
+
+    pub(crate) fn record(claim: HolderClaim) {
+        *LAST.lock().unwrap_or_else(|p| p.into_inner()) = Some(claim);
+    }
+
+    /// Clear the record, so a later `take` cannot read a claim left by an earlier test.
+    pub(crate) fn reset() {
+        *LAST.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// The claim the last backfill was started with, or `None` if no backfill was started.
+    pub(crate) fn take() -> Option<HolderClaim> {
+        LAST.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 }

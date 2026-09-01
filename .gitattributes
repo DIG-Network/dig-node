@@ -1,0 +1,20 @@
+# Normalize line endings so a Windows lane cannot silently commit CRLF.
+#
+# This is not cosmetic. A CRLF flip in `crates/dig-node-core/src/lib.rs` disabled
+# the §908 blind-serve custody guard: it splits on "\n#[cfg(test)]\nmod tests {",
+# a needle with an INTERIOR newline, which cannot match under CRLF. The .expect()
+# panicked, the guard scanned nothing, and the only signal was one failing test.
+#
+# A needle with only a LEADING newline still matches CRLF, which is why the
+# neighbouring dig-wallet guard survived the same flip -- so the failure is
+# selective and reads as unrelated.
+* text=auto eol=lf
+
+# Binary and fixture files that must never be touched.
+*.png binary
+*.jpg binary
+*.ico binary
+*.wasm binary
+*.dig binary
+*.der binary
+*.crx binary

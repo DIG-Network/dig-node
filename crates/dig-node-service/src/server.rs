@@ -2155,6 +2155,19 @@ where
     // path (`dig-runtime`) never routes through `serve_with_shutdown`, so the browser's
     // node keeps installing no P2P content — its in-process trust boundary is unchanged.
     if dig_node_core::peer::peer_network_enabled() {
+        // The untrusted mirror-coin pointers every DHT announce attaches (dig-node#435), installed
+        // BEFORE the bring-up reads them. The DHT lives in dig-node-core and the mirror lifecycle
+        // that knows which coin bonds which capsule lives here, so this shell is the one place that
+        // can join them. Until it did, the pointer mechanism was built, unit tested, and fed only by
+        // a test double: every live announce published no coin id at all.
+        //
+        // Installed unconditionally rather than behind the broadcast switch. The pointer is read
+        // from the observation a pass publishes, so a node that creates no coins simply has no
+        // `Bonded` row and answers `None` — the ordinary, fully supported case — while a node whose
+        // coins were created before the switch was turned off still points at them correctly.
+        state.node.set_mirror_coin_pointers(std::sync::Arc::new(
+            crate::mirror::pointers::SnapshotMirrorPointers::new(state.mirror_bonds.clone()),
+        ));
         dig_node_core::peer::spawn_peer_network(state.node.clone());
     }
 
@@ -2185,10 +2198,18 @@ where
     // `POST /{method}` surface + the `/ws` transport, which is what the extension uses — but it is
     // no longer SILENT: `crate::wallet_mtls` logs it and publishes it on `control.status`. The
     // listener stops when the process exits with the rest of the node.
+    //
+    // The listener is GATED by the same `wallet_authz` policy the HTTP and `/ws` planes use
+    // (dig-node#257): the shared client certificate authenticates the transport, it does not
+    // authorize a capability.
     crate::wallet_mtls::spawn(
         DEFAULT_MTLS_PORT,
         wallet_backend.clone(),
         wallet_cert.clone(),
+        std::sync::Arc::new(crate::wallet_mtls::NodeWalletGate::new(
+            state.control_token.clone(),
+            &state.state_dir,
+        )),
     );
 
     let app = router(state);
@@ -2761,12 +2782,46 @@ fn spawn_mirror_passes(
             // synchronous and sees one disk state and one balance throughout.
             let capsules = lifecycle::observe_disk(&node).await;
             let dig_balance = lifecycle::observe_dig_balance(&wallet, owner_puzzle_hash).await;
+
+            // dig-node#286: the ONLY caller of the funded latch. `latch_ever_funded` was written,
+            // persisted and tested, and nothing invoked it — so in the shipped build a funded
+            // auto-created wallet was still described as disposable, for ever.
+            //
+            // This pass is the observation point because it already reads the operator wallet's
+            // own balance on a timer, so the latch costs no extra chain read and cannot drift from
+            // the figure the node acts on. `synced` gates ONLY the zero case (see
+            // `FundingObservation::should_latch`), so a stale or fallback answer showing money
+            // still latches immediately.
+            {
+                use crate::wallet_funded::FundingObservation;
+                let synced = wallet
+                    .wallet_sync_status()
+                    .await
+                    .is_ok_and(|s| s.phase == dig_wallet::sage::sync_supervisor::SyncPhase::Synced);
+                let observation = match &dig_balance {
+                    Ok(base_units) => {
+                        FundingObservation::classify(u128::from(*base_units), 0, synced)
+                    }
+                    // An unreadable balance is not a zero balance. It says nothing, and the latch
+                    // is monotonic, so the next pass that CAN read decides.
+                    Err(_) => FundingObservation::CannotSay,
+                };
+                crate::wallet_funded::observe(&paths, observation);
+            }
             // ONE reading of what is already committed, for the whole pass — the analogue of the
             // wallet selector's reservation prune (dig_ecosystem#2763), which the chain cannot
             // offer: a broadcast coin stays unspent in the chain's view for the entire confirmation
             // window, and this loop runs inside it. An `Err` defers creates and never reclaims.
-            let committed = crate::mirror::funding::committed_funding_coin_ids(
+            //
+            // BOUNDED, not merely computed (dig-node#471). The reservation is a time box read from
+            // the audit record, so a spend that never lands releases its coins after
+            // `FUNDING_RESERVATION_WINDOW_MS` instead of withholding them forever. The record itself
+            // is untouched and stays chaseable; only the hold lapses.
+            //
+            // One clock reading for the whole pass, alongside the one disk and one balance reading.
+            let committed = crate::spend_audit::committed_funding_coin_ids(
                 &crate::spend_audit::SpendLog::in_state_dir(),
+                lifecycle::now_unix_ms(),
             )
             .map_err(|e| crate::mirror::runner::PassError::Wallet(e.to_string()));
 
@@ -2823,15 +2878,7 @@ fn spawn_mirror_passes(
                     match outcome {
                         Ok(report) => {
                             lifecycle::publish(&snapshot, &report, epoch);
-                            tracing::debug!(
-                                target: "mirror",
-                                epoch,
-                                bonds = report.states.len(),
-                                locked_dig_base_units = report.locked_dig_base_units,
-                                reclaimed = report.reclaimed.len(),
-                                created = report.created.len(),
-                                "mirror pass complete"
-                            );
+                            log_mirror_pass(&report, epoch);
                         }
                         // NOT published. An observation that failed is not a smaller observation:
                         // publishing an empty one would tell an operator this node holds no bonds
@@ -2855,6 +2902,55 @@ fn spawn_mirror_passes(
             tokio::time::sleep(MIRROR_PASS_INTERVAL).await;
         }
     });
+}
+
+/// Report what one mirror pass did, to whoever is reading the node's log.
+///
+/// A free function so the lines an operator actually reads can be asserted against, rather than
+/// living only inside the timer loop where nothing can reach them.
+fn log_mirror_pass(report: &crate::mirror::runner::PassReport, epoch: i64) {
+    tracing::debug!(
+        target: "mirror",
+        epoch,
+        bonds = report.states.len(),
+        locked_dig_base_units = report.locked_dig_base_units,
+        reclaimed = report.reclaimed.len(),
+        created = report.created.len(),
+        "mirror pass complete"
+    );
+
+    // At `warn!`, and naming the cause, because the DURABLE copy of a failed create's reason goes
+    // to the spend-audit log under the state dir -- which a non-elevated node cannot write. This
+    // line goes to stderr, so it survives exactly the case where the audit copy does not
+    // (dig-node#440). Without it a create that failed reports nothing at any level: the line above
+    // counts what SUCCEEDED, so a pass that created nothing and a pass that stopped on an error
+    // render identically.
+    if let Some((bond, cause)) = &report.stopped_at {
+        tracing::warn!(
+            target: "mirror",
+            epoch,
+            store_id = %bond.store_id,
+            root = %bond.root,
+            error = %cause,
+            "the mirror pass stopped at a create that failed; later creates were not attempted"
+        );
+    }
+
+    // Separate from the stop above because they are separate outcomes: a reclaim failure does not
+    // end the pass, so a report can carry several of them alongside a perfectly successful set of
+    // creates. One line each -- an aggregate count would name no coin, and the coin id is what a
+    // person needs to look the spend up on chain.
+    for (mirror, cause) in &report.reclaim_failures {
+        tracing::warn!(
+            target: "mirror",
+            epoch,
+            coin_id = %mirror.coin_id,
+            store_id = %mirror.store_id,
+            root = %mirror.root,
+            error = %cause,
+            "a mirror reclaim could not be made; its collateral stays locked"
+        );
+    }
 }
 
 /// Run the collateral census on a timer, against the node's own chain transport.
@@ -3387,5 +3483,157 @@ mod tests {
         ] {
             assert!(!is_local_origin(bad), "{bad:?} must NOT be reflected");
         }
+    }
+
+    // ---- what a mirror pass SAYS when a create fails (dig-node#440) ---------------------
+
+    /// Render one pass report through a real subscriber at its DEFAULT level, and return the text.
+    ///
+    /// Default level deliberately: the durable copy of a failure cause goes to the spend-audit log,
+    /// which a non-elevated node cannot write — so the property under test is that the cause reaches
+    /// an operator running an ordinary node, not that it exists somewhere at `debug`.
+    fn rendered_mirror_pass_log(report: &crate::mirror::runner::PassReport) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("the capture buffer")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Captured(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_mirror_pass(report, 104);
+        });
+
+        let bytes = buffer.0.lock().expect("the capture buffer").clone();
+        String::from_utf8(bytes).expect("the rendered lines are utf-8")
+    }
+
+    /// A report carrying nothing but what each test varies.
+    fn empty_report() -> crate::mirror::runner::PassReport {
+        crate::mirror::runner::PassReport {
+            reclaimed: Vec::new(),
+            created: Vec::new(),
+            reclaim_failures: Vec::new(),
+            stopped_at: None,
+            states: Vec::new(),
+            per_coin_dig_base_units: None,
+            locked_dig_base_units: 0,
+        }
+    }
+
+    /// **The store, the root and the cause of a failed create all reach the log.**
+    ///
+    /// The fixture carries a SUCCESSFUL create beside the failed one, with different ids, so a line
+    /// that names "a store" cannot pass by naming the wrong one — which is what an implementation
+    /// logging `report.created` instead of `report.stopped_at` would do.
+    #[test]
+    fn a_create_that_failed_is_logged_with_its_store_root_and_cause() {
+        use crate::mirror::plan::Bond;
+        use crate::mirror::runner::PassError;
+
+        let mut report = empty_report();
+        report.created = vec![Bond::new("aaaa1111", "bbbb2222")];
+        report.stopped_at = Some((
+            Bond::new("4e904b3f", "6b420246"),
+            PassError::Wallet("Access is denied. (os error 5)".to_string()),
+        ));
+
+        let line = rendered_mirror_pass_log(&report);
+        println!("{line}");
+
+        for field in [
+            "WARN",
+            "4e904b3f",
+            "6b420246",
+            "the operator wallet could not act: Access is denied. (os error 5)",
+        ] {
+            assert!(
+                line.contains(field),
+                "a failed create is silent about {field}: {line:?}"
+            );
+        }
+    }
+
+    /// **A reclaim that could not be made is logged with its coin, its bond and its cause.**
+    ///
+    /// Separate from the create above because they are separate fields: an implementation that logs
+    /// only `stopped_at` satisfies the previous test and drops every reclaim failure on the floor.
+    #[test]
+    fn a_reclaim_that_failed_is_logged_with_its_coin_and_cause() {
+        use crate::mirror::plan::HeldMirror;
+        use crate::mirror::runner::PassError;
+
+        let mut report = empty_report();
+        report.reclaim_failures = vec![(
+            HeldMirror {
+                coin_id: "c0117777".to_string(),
+                store_id: "5e5e5e5e".to_string(),
+                root: "7a7a7a7a".to_string(),
+                epoch: 103,
+                collateral_dig_base_units: 1010,
+            },
+            PassError::Chain("no peer answered".to_string()),
+        )];
+
+        let line = rendered_mirror_pass_log(&report);
+        println!("{line}");
+
+        for field in [
+            "WARN",
+            "c0117777",
+            "5e5e5e5e",
+            "7a7a7a7a",
+            "the chain source could not be read: no peer answered",
+        ] {
+            assert!(
+                line.contains(field),
+                "a failed reclaim is silent about {field}: {line:?}"
+            );
+        }
+    }
+
+    /// **A pass that failed nothing warns about nothing.**
+    ///
+    /// The truthful control. Without it, an implementation that warns on every pass — including the
+    /// ordinary one where the wallet is simply short, which §25.8 is explicit is NOT a failure —
+    /// passes both tests above while training an operator to ignore the line.
+    #[test]
+    fn a_pass_with_no_failures_emits_no_warning() {
+        use crate::mirror::plan::Bond;
+
+        let mut report = empty_report();
+        report.created = vec![Bond::new("aaaa1111", "bbbb2222")];
+
+        let line = rendered_mirror_pass_log(&report);
+
+        assert!(
+            !line.contains("WARN"),
+            "a clean pass warned, so the warning carries no information: {line:?}"
+        );
     }
 }

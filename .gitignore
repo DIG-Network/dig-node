@@ -17,3 +17,6 @@ control-token
 config.json
 .gitnexus/
 
+
+# lane-local scratch (never committed)
+.lane/

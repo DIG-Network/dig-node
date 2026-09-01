@@ -342,7 +342,7 @@ fn promote_into_cache(
 /// A marker that cannot be written is a hard [`WarmFailure::CacheWriteFailed`], never a warning: a
 /// relayed capsule promoted without its marker is exactly the advertised-stranger-content state this
 /// mechanism exists to prevent, so the promotion is abandoned instead.
-fn persist_holder_claim(cached: &Path, claim: HolderClaim) -> Result<(), WarmFailure> {
+pub(crate) fn persist_holder_claim(cached: &Path, claim: HolderClaim) -> Result<(), WarmFailure> {
     let Some(marker) = crate::capsule_key::relay_marker_beside(cached) else {
         return Err(WarmFailure::CacheWriteFailed);
     };
@@ -1035,17 +1035,13 @@ mod tests {
         ])
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "dig-node-warm-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn temp_dir(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("dig-node-warm-{tag}-"))
+            .tempdir()
+            .expect("a temp dir")
     }
 
     /// Counts announces, so "no announce happened" is an assertable property.
@@ -1088,7 +1084,7 @@ mod tests {
     fn promotes_the_artifact_the_gate_admitted() {
         let dir = temp_dir("promote-ok");
         let module = module_committing(STORE, chain_root());
-        let staged = dir.join("staged.dig");
+        let staged = dir.path().join("staged.dig");
         std::fs::write(&staged, &module).unwrap();
 
         let verifier =
@@ -1103,7 +1099,7 @@ mod tests {
             dig_download::ModuleAnchor::Anchored
         );
 
-        let cached = dir.join("cached.module");
+        let cached = dir.path().join("cached.module");
         assert_eq!(
             promote_into_cache(&staged, &cached, &verifier, HolderClaim::Announce),
             Ok(module.len() as u64)
@@ -1119,7 +1115,7 @@ mod tests {
     fn promoting_an_admitted_artifact_bumps_the_refetch_counter() {
         let dir = temp_dir("promote-refetch-counter");
         let module = module_committing(STORE, chain_root());
-        let staged = dir.join("staged.dig");
+        let staged = dir.path().join("staged.dig");
         std::fs::write(&staged, &module).unwrap();
         let verifier =
             ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(chain_root()));
@@ -1136,7 +1132,7 @@ mod tests {
         // never smaller, so `>= before + 1` is the strongest claim that stays deterministic under
         // full-suite parallelism while still proving THIS promotion contributed at least one bump.
         let before = crate::CACHE_REFETCH_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        let cached = dir.join("cached.module");
+        let cached = dir.path().join("cached.module");
         assert!(promote_into_cache(&staged, &cached, &verifier, HolderClaim::Announce).is_ok());
         let after = crate::CACHE_REFETCH_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
@@ -1169,12 +1165,12 @@ mod tests {
 
         // The gate admitted `module`; what is on disk is something else (one flipped byte, and a
         // trailing tail — both invisible to a caller that only checks the Ok).
-        let staged = dir.join("staged.dig");
+        let staged = dir.path().join("staged.dig");
         let mut tampered = module.clone();
         tampered.extend_from_slice(b"trailing garbage");
         std::fs::write(&staged, &tampered).unwrap();
 
-        let cached = dir.join("cached.module");
+        let cached = dir.path().join("cached.module");
         assert_eq!(
             promote_into_cache(&staged, &cached, &verifier, HolderClaim::Announce),
             Err(WarmFailure::PromotedArtifactMismatch)
@@ -1191,12 +1187,12 @@ mod tests {
     #[test]
     fn refuses_to_promote_an_artifact_no_gate_admitted() {
         let dir = temp_dir("promote-ungated");
-        let staged = dir.join("staged.dig");
+        let staged = dir.path().join("staged.dig");
         std::fs::write(&staged, module_committing(STORE, chain_root())).unwrap();
         let verifier =
             ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(chain_root()));
 
-        let cached = dir.join("cached.module");
+        let cached = dir.path().join("cached.module");
         assert_eq!(
             promote_into_cache(&staged, &cached, &verifier, HolderClaim::Announce),
             Err(WarmFailure::PromotedArtifactMismatch)
@@ -1301,11 +1297,11 @@ mod tests {
             Arc::new(NoHolders),
             Arc::new(UnusedTransport),
             Arc::new(crate::seams::dig_peer::NoPullState),
-            Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
+            Arc::new(dig_download::FileStateStore::new(dir.path().join("state"))),
             Arc::new(ConfirmingResolver),
             WarmPaths {
-                staging_dir: dir.join("staging"),
-                cache_dir: dir.join("cache"),
+                staging_dir: dir.path().join("staging"),
+                cache_dir: dir.path().join("cache"),
             },
             Arc::new(AnnounceSpy::default()),
             Arc::clone(&shared),
@@ -1395,11 +1391,11 @@ mod tests {
             Arc::new(OneHolder),
             Arc::new(RefusingHolder),
             Arc::new(crate::seams::dig_peer::NoPullState),
-            Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
+            Arc::new(dig_download::FileStateStore::new(dir.path().join("state"))),
             Arc::new(ConfirmingResolver),
             WarmPaths {
-                staging_dir: dir.join("staging"),
-                cache_dir: dir.join("cache"),
+                staging_dir: dir.path().join("staging"),
+                cache_dir: dir.path().join("cache"),
             },
             Arc::new(AnnounceSpy::default()),
             Arc::new(WarmRegistry::new()),
@@ -1428,7 +1424,7 @@ mod tests {
     async fn a_failed_pull_announces_nothing() {
         let dir = temp_dir("failed-pull");
         let spy = Arc::new(AnnounceSpy::default());
-        let warmer = warmer_with(Arc::new(ConfirmingResolver), Arc::clone(&spy), &dir);
+        let warmer = warmer_with(Arc::new(ConfirmingResolver), Arc::clone(&spy), dir.path());
 
         let outcome = warmer.warm(&hex32(STORE), &hex32(chain_root())).await;
 
@@ -1442,7 +1438,7 @@ mod tests {
             "a failed pull must never announce this node as a holder"
         );
         assert!(
-            !dir.join("cache").join("modules").exists(),
+            !dir.path().join("cache").join("modules").exists(),
             "no module may appear at the cache path"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1490,8 +1486,8 @@ mod tests {
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
-                staging_dir: dir.join("staging"),
-                cache_dir: dir.join("cache"),
+                staging_dir: dir.path().join("staging"),
+                cache_dir: dir.path().join("cache"),
             },
             Arc::clone(&spy) as Arc<dyn AnnounceHolder>,
             Arc::new(WarmRegistry::new()),
@@ -1515,6 +1511,7 @@ mod tests {
         );
 
         let cached_path = dir
+            .path()
             .join("cache")
             .join("modules")
             .join(&store_hex)
@@ -1526,6 +1523,7 @@ mod tests {
         );
 
         let staged_path = dir
+            .path()
             .join("staging")
             .join("modules")
             .join(format!("{store_hex}-{root_hex}.dig"));
@@ -1705,7 +1703,7 @@ mod tests {
         ));
         let state: Arc<dyn dig_download::StateStore> =
             Arc::new(dig_download::InMemoryStateStore::new());
-        let warmer = severing_warmer(&dir, &transport, &state);
+        let warmer = severing_warmer(dir.path(), &transport, &state);
 
         // ATTEMPT 1 — the link dies half way through the capsule.
         let severed = warmer.warm(&store_hex, &root_hex).await;
@@ -1723,7 +1721,7 @@ mod tests {
             "the control: attempt 1 must stage a genuine PARTIAL ({staged_in_attempt_1} of \
              {capsule_bytes} bytes)"
         );
-        let partial = dig_download::staging_path_for(&staged_module_path(&dir));
+        let partial = dig_download::staging_path_for(&staged_module_path(dir.path()));
         assert_eq!(
             std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0),
             staged_in_attempt_1,
@@ -1758,7 +1756,7 @@ mod tests {
             "attempt 2 must fetch the missing bytes and ONLY the missing bytes"
         );
         assert_eq!(
-            std::fs::read(cached_module_path(&dir)).expect("the capsule is cached"),
+            std::fs::read(cached_module_path(dir.path())).expect("the capsule is cached"),
             module,
             "the capsule assembled from a partial plus a resume is byte-identical to the real one"
         );
@@ -1805,8 +1803,8 @@ mod tests {
             Arc::clone(&state),
             Arc::new(ConfirmingResolver),
             WarmPaths {
-                staging_dir: dir.join("staging"),
-                cache_dir: dir.join("cache"),
+                staging_dir: dir.path().join("staging"),
+                cache_dir: dir.path().join("cache"),
             },
             Arc::new(AnnounceSpy::default()),
             Arc::new(WarmRegistry::new()),
@@ -1823,13 +1821,13 @@ mod tests {
             ),
             "a blob that fails the whole-module hash gate must be refused: {outcome:?}"
         );
-        let staged = staged_module_path(&dir);
+        let staged = staged_module_path(dir.path());
         assert!(
             !staged.exists() && !dig_download::staging_path_for(&staged).exists(),
             "bytes attributable only to a proven-false descriptor must not survive the failure"
         );
         assert!(
-            !cached_module_path(&dir).exists(),
+            !cached_module_path(dir.path()).exists(),
             "nothing may reach the cache path"
         );
         // dig-node#332: the checkpoint is the OTHER half of the same partial. Left behind, it claims
@@ -1964,8 +1962,8 @@ mod tests {
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
-                staging_dir: failed_dir.join("staging"),
-                cache_dir: failed_dir.join("cache"),
+                staging_dir: failed_dir.path().join("staging"),
+                cache_dir: failed_dir.path().join("cache"),
             },
             Arc::new(AnnounceSpy::default()),
             Arc::new(WarmRegistry::new()),
@@ -2005,8 +2003,8 @@ mod tests {
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
-                staging_dir: ok_dir.join("staging"),
-                cache_dir: ok_dir.join("cache"),
+                staging_dir: ok_dir.path().join("staging"),
+                cache_dir: ok_dir.path().join("cache"),
             },
             Arc::new(AnnounceSpy::default()),
             Arc::new(WarmRegistry::new()),
@@ -2089,8 +2087,8 @@ mod tests {
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
-                staging_dir: dir.join("staging"),
-                cache_dir: dir.join("cache"),
+                staging_dir: dir.path().join("staging"),
+                cache_dir: dir.path().join("cache"),
             },
             Arc::new(AnnounceSpy::default()),
             Arc::new(WarmRegistry::new()),
@@ -2144,14 +2142,14 @@ mod tests {
         // RELAYED — pulled for a stranger.
         let relay_dir = temp_dir("relayed-warm");
         let relay_spy = Arc::new(AnnounceSpy::default());
-        let relayed = serving_warmer(&relay_dir, &relay_spy, module.clone())
+        let relayed = serving_warmer(relay_dir.path(), &relay_spy, module.clone())
             .warm_relayed(&store_hex, &root_hex)
             .await;
 
         // LOCAL — the identical pull, for this node's own sake. The control.
         let local_dir = temp_dir("local-warm");
         let local_spy = Arc::new(AnnounceSpy::default());
-        let local = serving_warmer(&local_dir, &local_spy, module.clone())
+        let local = serving_warmer(local_dir.path(), &local_spy, module.clone())
             .warm(&store_hex, &root_hex)
             .await;
 
@@ -2182,7 +2180,7 @@ mod tests {
         // artifact a holder serves from, byte-identically, so the requestor needs no second code path.
         for dir in [&relay_dir, &local_dir] {
             assert_eq!(
-                std::fs::read(cached_module_path(dir)).expect("module is at the cache path"),
+                std::fs::read(cached_module_path(dir.path())).expect("module is at the cache path"),
                 module,
                 "the verified capsule is cached whether or not it was announced"
             );
@@ -2270,11 +2268,16 @@ mod tests {
         // Both capsules land in the SAME cache, which is what a node that both relays and reshares
         // actually looks like on disk.
         let spy = Arc::new(AnnounceSpy::default());
-        let relayed = serving_warmer_for(&dir, &spy, STORE, module_committing(STORE, chain_root()))
-            .warm_relayed(&relay_store_hex, &root_hex)
-            .await;
+        let relayed = serving_warmer_for(
+            dir.path(),
+            &spy,
+            STORE,
+            module_committing(STORE, chain_root()),
+        )
+        .warm_relayed(&relay_store_hex, &root_hex)
+        .await;
         let local = serving_warmer_for(
-            &dir,
+            dir.path(),
             &spy,
             LOCAL_STORE,
             module_committing(LOCAL_STORE, chain_root()),
@@ -2287,7 +2290,7 @@ mod tests {
             "both pulls must genuinely succeed, or the announce set proves nothing"
         );
 
-        let (inventory, announced) = announce_set_from_disk(&dir);
+        let (inventory, announced) = announce_set_from_disk(dir.path());
 
         // The relayed capsule is still CACHED and servable. Suppression withholds the advertisement,
         // never the bytes — serving them is the whole point of relaying.
@@ -2298,7 +2301,8 @@ mod tests {
         );
         assert!(
             std::fs::read(
-                dir.join("cache")
+                dir.path()
+                    .join("cache")
                     .join("modules")
                     .join(&relay_store_hex)
                     .join(format!("{root_hex}.dig"))
@@ -2341,10 +2345,10 @@ mod tests {
         let module = module_committing(STORE, chain_root());
         let spy = Arc::new(AnnounceSpy::default());
 
-        serving_warmer_for(&dir, &spy, STORE, module.clone())
+        serving_warmer_for(dir.path(), &spy, STORE, module.clone())
             .warm_relayed(&store_hex, &root_hex)
             .await;
-        let (_, suppressed) = announce_set_from_disk(&dir);
+        let (_, suppressed) = announce_set_from_disk(dir.path());
         assert!(
             suppressed.is_empty(),
             "the relayed capsule is not announceable before this node claims it"
@@ -2352,12 +2356,12 @@ mod tests {
 
         // The node now reads that generation for its own sake. The capsule is already on disk, so this
         // is the `AlreadyHeld` path — the one that has to promote provenance rather than shrug.
-        let outcome = serving_warmer_for(&dir, &spy, STORE, module)
+        let outcome = serving_warmer_for(dir.path(), &spy, STORE, module)
             .warm(&store_hex, &root_hex)
             .await;
         assert_eq!(outcome, WarmOutcome::AlreadyHeld);
 
-        let (_, announced) = announce_set_from_disk(&dir);
+        let (_, announced) = announce_set_from_disk(dir.path());
         assert!(
             announced.contains(&dig_dht::ContentId::capsule(STORE, chain_root())),
             "a capsule this node now holds for itself must become announceable"
@@ -2418,8 +2422,8 @@ mod tests {
             Arc::new(dig_download::InMemoryStateStore::new()),
             Arc::new(ConfirmingResolver),
             WarmPaths {
-                staging_dir: dir.join("staging"),
-                cache_dir: dir.join("cache"),
+                staging_dir: dir.path().join("staging"),
+                cache_dir: dir.path().join("cache"),
             },
             Arc::new(AnnounceSpy::default()),
             Arc::new(WarmRegistry::new()),
@@ -2451,11 +2455,11 @@ mod tests {
             Arc::new(NoHolders),
             Arc::new(UnusedTransport),
             Arc::new(crate::seams::dig_peer::NoPullState),
-            Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
+            Arc::new(dig_download::FileStateStore::new(dir.path().join("state"))),
             Arc::new(ConfirmingResolver),
             WarmPaths {
-                staging_dir: dir.join("staging"),
-                cache_dir: dir.join("cache"),
+                staging_dir: dir.path().join("staging"),
+                cache_dir: dir.path().join("cache"),
             },
             Arc::new(AnnounceSpy::default()),
             Arc::new(WarmRegistry::new()),
@@ -2485,7 +2489,7 @@ mod tests {
     async fn without_a_chain_anchor_the_pull_never_starts() {
         let dir = temp_dir("no-anchor");
         let spy = Arc::new(AnnounceSpy::default());
-        let warmer = warmer_with(Arc::new(UnreachableChain), Arc::clone(&spy), &dir);
+        let warmer = warmer_with(Arc::new(UnreachableChain), Arc::clone(&spy), dir.path());
 
         let outcome = warmer.warm(&hex32(STORE), &hex32(chain_root())).await;
 
@@ -2500,7 +2504,7 @@ mod tests {
     async fn a_generation_the_chain_does_not_confirm_is_refused() {
         let dir = temp_dir("wrong-gen");
         let spy = Arc::new(AnnounceSpy::default());
-        let warmer = warmer_with(Arc::new(ConfirmingResolver), Arc::clone(&spy), &dir);
+        let warmer = warmer_with(Arc::new(ConfirmingResolver), Arc::clone(&spy), dir.path());
 
         // The chain says CHAIN_ROOT; this asks to warm a different generation.
         let outcome = warmer.warm(&hex32(STORE), &hex32([0xc3; 32])).await;
@@ -2515,7 +2519,7 @@ mod tests {
     async fn a_non_canonical_id_is_refused() {
         let dir = temp_dir("bad-id");
         let spy = Arc::new(AnnounceSpy::default());
-        let warmer = warmer_with(Arc::new(ConfirmingResolver), Arc::clone(&spy), &dir);
+        let warmer = warmer_with(Arc::new(ConfirmingResolver), Arc::clone(&spy), dir.path());
         assert_eq!(
             warmer.warm("not-an-id", &hex32(chain_root())).await,
             WarmOutcome::Refused(WarmFailure::NoChainAnchor)

@@ -297,13 +297,16 @@ mod tests {
         NOW
     }
 
-    fn tmp_log() -> SpendLog {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("dig-node-spends-cli-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        SpendLog::at(dir.join("spend-audit.jsonl"))
+    /// The guard comes back with the log: the `SpendLog` writes into the directory for as
+    /// long as the caller holds it, so the tree must outlive this function. `TempDir`'s `Drop`
+    /// then removes it when the test ends, including on an unwind (dig-node#370).
+    fn tmp_log() -> (SpendLog, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-spends-cli-")
+            .tempdir()
+            .expect("temp dir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+        (log, dir)
     }
 
     fn intent(kind: &str, store: Option<&str>) -> SpendIntent {
@@ -323,8 +326,11 @@ mod tests {
     }
 
     /// A log holding one confirmed mirror-coin spend and one failed one.
-    fn seeded_log() -> SpendLog {
-        let log = tmp_log();
+    /// The guard travels with the log. Binding it locally here would drop the tree at the
+    /// end of THIS function, leaving every caller holding a `SpendLog` that points at a
+    /// directory which no longer exists.
+    fn seeded_log() -> (SpendLog, tempfile::TempDir) {
+        let (log, scratch) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
 
         let ok = journal.begin(intent(kinds::MIRROR_COIN, Some("store-a")));
@@ -342,7 +348,7 @@ mod tests {
         journal.failed(&bad, FailureStage::Signing, "insufficient funds");
         drop(bad);
 
-        log
+        (log, scratch)
     }
 
     /// **A blocked node does not read as an idle one.** The failed spend appears in the default
@@ -350,7 +356,7 @@ mod tests {
     /// failure cannot tell "failures are listed" apart from "everything is listed".
     #[test]
     fn the_default_listing_shows_failures_beside_successes() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         assert_eq!(out.result["count"], 2);
         let tokens: Vec<&str> = out.result["spends"]
@@ -367,7 +373,7 @@ mod tests {
     /// The status filter narrows to one row, and the row it keeps is the right one.
     #[test]
     fn the_status_filter_narrows_the_listing() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let out = run_against(
             &log,
             SpendsAction::List(SpendQuery {
@@ -384,7 +390,7 @@ mod tests {
     /// The store filter narrows to the named store, and does NOT match the other one.
     #[test]
     fn the_store_filter_narrows_the_listing() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let out = run_against(
             &log,
             SpendsAction::List(SpendQuery {
@@ -403,7 +409,7 @@ mod tests {
     /// marker fails instead of matching by luck.
     #[test]
     fn an_expected_coin_is_marked_differently_from_a_confirmed_one() {
-        let log = tmp_log();
+        let (log, _dir) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
 
         let pending = journal.begin(intent(kinds::MIRROR_COIN, Some("s1")));
@@ -446,7 +452,7 @@ mod tests {
     #[test]
     fn an_incomplete_record_is_reported_as_incomplete() {
         use std::io::Write as _;
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(log.path())
@@ -461,8 +467,8 @@ mod tests {
     /// An empty record says so plainly rather than printing nothing at all.
     #[test]
     fn an_empty_record_says_no_money_moved_unattended() {
-        let out =
-            run_against(&tmp_log(), SpendsAction::List(SpendQuery::default()), None).expect("list");
+        let (log, _scratch) = tmp_log();
+        let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         assert_eq!(out.result["count"], 0);
         assert!(
             out.summary.contains("no money unattended"),
@@ -474,7 +480,7 @@ mod tests {
     /// `show` renders one entry, and an unknown id is a usage error rather than an empty success.
     #[test]
     fn show_finds_an_entry_and_refuses_an_unknown_id() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let ledger = log.ledger().expect("ledger");
         let id = ledger.records[0].id.clone();
 
@@ -505,7 +511,7 @@ mod tests {
     /// confirmed coin, making that wrong version produce a visibly different answer.
     #[test]
     fn reconcile_without_a_chain_source_refuses_rather_than_reporting_clean() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let err = run_against(
             &log,
             SpendsAction::Reconcile {
@@ -521,7 +527,7 @@ mod tests {
     /// With a chain source, a coin the chain shows and the record does not is reported as the alarm.
     #[test]
     fn reconcile_reports_a_coin_the_record_does_not_account_for() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let chain = FakeChain(vec!["coin-ok".to_string(), "coin-orphan".to_string()]);
         let out = run_against(
             &log,
@@ -540,7 +546,7 @@ mod tests {
     /// The clean case reads as clean — the honest control for the test above.
     #[test]
     fn reconcile_reports_agreement_when_the_chain_matches() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let chain = FakeChain(vec!["coin-ok".to_string()]);
         let out = run_against(
             &log,
@@ -561,7 +567,7 @@ mod tests {
     /// The `--json` envelope keys are a contract the app and scripts read. Pinned.
     #[test]
     fn the_json_listing_keys_are_stable() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         for key in ["path", "count", "unreadable_lines", "spends"] {
             assert!(out.result.get(key).is_some(), "missing {key}");
@@ -583,7 +589,7 @@ mod tests {
     /// the person reading the terminal.
     #[test]
     fn the_human_output_states_on_whose_authority_the_node_spent() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let out = run_against(&log, SpendsAction::List(SpendQuery::default()), None).expect("list");
         assert!(out.summary.contains("by node"), "{}", out.summary);
         assert!(
@@ -597,7 +603,7 @@ mod tests {
     /// silently fall back to showing everything.
     #[test]
     fn a_filter_matching_nothing_returns_nothing_rather_than_everything() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let out = run_against(
             &log,
             SpendsAction::List(SpendQuery {
@@ -614,7 +620,7 @@ mod tests {
     /// the spends a person opened the command to see.
     #[test]
     fn a_limit_keeps_the_newest_rows() {
-        let log = tmp_log();
+        let (log, _dir) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
         // Distinct initiated_ms so "newest" is well defined rather than a tiebreak.
         for (i, store) in ["old", "new"].iter().enumerate() {
@@ -646,7 +652,7 @@ mod tests {
     /// as expected.
     #[test]
     fn show_marks_a_confirmed_coin_as_observed() {
-        let log = seeded_log();
+        let (log, _scratch) = seeded_log();
         let ledger = log.ledger().expect("ledger");
         let confirmed = ledger
             .records

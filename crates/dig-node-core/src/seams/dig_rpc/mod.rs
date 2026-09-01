@@ -5,4 +5,7 @@
 
 mod dispatch;
 
+/// The shared landing-provenance rule, used by BOTH the read path and the push path so the two
+/// cannot drift into disagreeing about who is entitled to this operator's money (dig-node#436).
+pub(crate) use dispatch::holder_claim_for_landing;
 pub use dispatch::RpcDispatch;

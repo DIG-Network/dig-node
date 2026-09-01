@@ -282,14 +282,22 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
                 // strand a coin every time a broadcast failed, and the failure path below already
                 // records that the money stayed put.
                 //
-                // That sentence is load-bearing and was FALSE until the broadcaster stopped reading
-                // `TxStatus::success`, which is true for a PENDING ack — a bundle the full node
-                // explicitly did not admit. `Ok` here therefore meant "reached the mempool OR was
-                // held for an unknown parent", and the held case took this branch: it extended the
-                // reservation, wrote a durable `Submitted` entry below, and every later pass then
-                // excluded those funding coins forever via `committed_funding_coin_ids`. Nothing
-                // reconciles that, so the coins were stranded against a spend nobody was holding.
-                // `dig_wallet::sage::spend::accepted_by_mempool` is what makes the sentence true.
+                // That sentence is load-bearing and was FALSE until the broadcaster stopped
+                // reading a flag that conflated admission with refusal. `chia_query` used to set
+                // `TxStatus::success` for a PENDING ack -- a bundle the full node explicitly did
+                // not admit -- so `Ok` here meant "reached the mempool OR was held for an unknown
+                // parent", and the held case took this branch: it extended the reservation, wrote a
+                // durable `Submitted` entry below, and every later pass then excluded those funding
+                // coins forever via `committed_funding_coin_ids`. Nothing reconciles that, so the
+                // coins were stranded against a spend nobody was holding.
+                //
+                // Two independent things now make the sentence true, and BOTH are deliberate.
+                // `dig_wallet::sage::spend::accepted_by_mempool` reads `MempoolInclusion`, so this
+                // node decides on admission rather than on a boolean; and `chia_query` 0.20 itself
+                // narrowed `success` to ack status 1 (DIG-Network/chia-query#48), so the flag no
+                // longer lies to any consumer. The local reading is not redundant: it is what keeps
+                // this branch correct without depending on a lower crate's flag continuing to mean
+                // what it means today.
                 //
                 // Reclaims feed it too, and that is deliberate: `funding_coin_ids` is read from the
                 // bundle, so this set holds exactly what the journal holds, and a set that
@@ -350,6 +358,31 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         drop(resolved);
 
         Ok(held_mirrors(&inventory))
+    }
+
+    fn coin_confirmation(&self, coin_id: &str) -> Result<Option<u32>, PassError> {
+        // A malformed id is this node's own bookkeeping being wrong, not the chain being
+        // unreachable, so it is NOT an `Err`: reporting it as one would count a permanent local
+        // defect as a transient outage and hide it behind a retry forever.
+        let Ok(id) = parse_id(coin_id, "coin id") else {
+            tracing::error!(
+                target: "mirror",
+                coin_id = %coin_id,
+                "an audit record names a coin id this node cannot parse; it is not resolved"
+            );
+            return Ok(None);
+        };
+
+        // `Err` stays `Err`: the source failing to answer is not evidence about the coin.
+        let record = self
+            .source
+            .coin_record(id)
+            .map_err(|e| PassError::Chain(e.to_string()))?;
+
+        // `confirmed_height` is itself optional — a coin the source knows about but has not seen in
+        // a block yet. That is not a confirmation, and it folds into the same `None` as absence
+        // because both call for exactly one action: wait for the next pass.
+        Ok(record.and_then(|r| r.confirmed_height))
     }
 
     fn dig_balance_base_units(&self) -> Result<u64, PassError> {
@@ -656,6 +689,25 @@ pub async fn production_broadcaster(
     }
 }
 
+/// The `AGG_SIG_ME` domain every mirror-coin spend must be signed under: **Chia mainnet's**.
+///
+/// A mirror coin is an ordinary Chia L1 CAT, so the consensus that validates its spend appends
+/// Chia mainnet's genesis challenge to every `AGG_SIG_ME` message. Signing under any other domain
+/// produces a signature over a different message, and Chia's mempool answers
+/// `BAD_AGGREGATE_SIGNATURE` -- deterministically, from every peer, on every retry.
+///
+/// **`dig-constants` is the DIG L2 chain's constants crate and has no business in an L1 CAT spend.**
+/// `DIG_MAINNET.genesis_challenge()` is the L2 genesis anchor; it is the right value for the DIG
+/// peer network id (`peer::genesis_challenge_from_env`) and the wrong one here. Passing it locked
+/// 1010 $DIG base units in an unspendable mirror coin on mainnet (dig-node#447), and the failure is
+/// invisible locally: the bundle builds, signs, and broadcasts, and only the network disagrees.
+///
+/// This is a function rather than an inline constant so the choice has a name a test can assert on,
+/// and so the reason above lives beside the value instead of at one call site.
+pub fn mirror_agg_sig_data() -> chia_protocol::Bytes32 {
+    chia_sdk_types::MAINNET_CONSTANTS.genesis_challenge
+}
+
 /// Open the operator wallet, or say why the lifecycle cannot spend.
 ///
 /// [`OperatorWallet::open`] returns `None` for BOTH §16.4 `Locked` and `Orphaned`, which is the
@@ -666,8 +718,7 @@ pub async fn open_signer(
     live_broadcast: bool,
     chain: &ChainTransport,
 ) -> (Option<MirrorSigner>, SpendCapability) {
-    let Some(wallet) = OperatorWallet::open(paths, dig_constants::DIG_MAINNET.genesis_challenge())
-    else {
+    let Some(wallet) = OperatorWallet::open(paths, mirror_agg_sig_data()) else {
         return (None, SpendCapability::WalletUnavailable);
     };
     if !live_broadcast {

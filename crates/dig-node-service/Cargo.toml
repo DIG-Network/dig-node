@@ -124,6 +124,11 @@ dig-chainsource-interface = "0.3"
 chia-bls = "0.36.1"
 chia-protocol = "0.36.1"
 chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+# `MAINNET_CONSTANTS` -- the Chia L1 `AGG_SIG_ME` domain every mirror-coin spend is signed under
+# (`mirror::lifecycle::mirror_agg_sig_data`, dig-node#447). This is the crate `chia_wallet_sdk::types`
+# re-exports, named directly so this crate does not pull the whole SDK for one constant. Already a
+# dev-dependency at this exact version, so no second line enters the tree.
+chia-sdk-types = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
 # The CAT puzzle-hash currying, for deriving the coin a mirror RECLAIM creates before it exists.
 # Same chia 0.36 set as the crates around it -- a mirror coin's collateral is $DIG, so the returned
 # coin sits at the CAT puzzle hash and never at the bare owner puzzle hash.
@@ -198,6 +203,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Charging an operator-facing budget on RENDERED WIDTH rather than code points
+# (`untrusted_text`, dig-node#346) needs the real Unicode width tables.
+unicode-width = "0.2"
 
 # Structured logging. The node's engine library (`dig_node_core`) and its transitive
 # P2P/TLS stack emit `tracing` events; WITHOUT a subscriber installed here every one is

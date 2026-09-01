@@ -74,6 +74,13 @@ mod forwarded_ask_tests;
 pub mod seams;
 pub mod tier0_live;
 pub mod tier0_prefetch;
+/// `dig-dht` itself, re-exported so a consumer implementing [`dht::MirrorCoinPointers`] names
+/// `ContentId` through THIS crate rather than declaring its own `dig-dht` dependency.
+///
+/// A second declaration is a second version constraint, and a consumer that resolved a different
+/// `dig-dht` minor would be handed a `ContentId` that is a different type with the same name — the
+/// split-line failure §2.4b exists to prevent, arriving through a trait nobody would think to check.
+pub use dig_dht;
 /// The `CapsuleStore` trait is seam 6's public surface (#1285 W1b-4) — bring it into scope to call
 /// `cache_list_cached`/`cache_remove_cached`/`cache_fetch_and_cache`/`gap_fill_generation`/
 /// `maybe_backfill_capsule`/`set_self_ref`/`arc_self` on a `Node`.
@@ -92,7 +99,9 @@ pub use seams::content::{bandwidth, verification_ledger, ContentServer};
 /// The `PeerNetwork` trait is seam 2's public surface (#1285 W1b-2) — bring it into scope to
 /// call `peer_status`/`set_inventory_refresher`/`set_gossip_handle`/`gossip_handle`/
 /// `refresh_dht_inventory` on a `Node`.
-pub use seams::dig_peer::{address_book, bootstrap, dht, net, pex, session, PeerNetwork};
+pub use seams::dig_peer::{
+    address_book, bootstrap, dht, net, pex, session, HolderClaim, PeerNetwork,
+};
 /// The `RpcDispatch` trait is seam 4's public surface (#1285 W1b-5) — the crate-root
 /// `handle_rpc`/`handle_rpc_json` free functions delegate to it; most callers keep using those
 /// stable entry points and never need this trait in scope directly.
@@ -105,6 +114,104 @@ pub use seams::key_mgmt::KeyManager;
 /// local-content, capsule, chain, key-management) are allowed to share; see the module doc.
 pub mod shared;
 pub mod subscription;
+
+// ---- The operator's flag vocabulary, shared across crates (dig-node#459) ---------------------
+//
+// `peer::is_off_token` is the ONE reading of "the operator turned this off" for the three ISOLATION
+// knobs (#282/#352). It is `pub(crate)`, so `dig-node-service`'s capability knobs could not reach it
+// and each grew its own narrower copy — which is how `disabled` came to work on three switches and
+// not on five. These two functions expose that vocabulary UP to the crate root rather than letting a
+// second copy exist (CLAUDE.md §2.0: centralize rival implementations; Appendix B: expose it up).
+
+/// Is `value` the operator saying "turn this capability OFF"?
+///
+/// The same tokens [`peer::is_off_token`] reads — `off`, `disabled`, `0`, `false`, `no`, trimmed and
+/// case-insensitive — with **one deliberate subtraction: an EMPTY value is NOT an off.**
+///
+/// # Why the empty rule is subtracted rather than inherited
+///
+/// For an ISOLATION knob an empty value is a coherent answer: `DIG_BOOTSTRAP_PEERS=` means "no
+/// bootstrap peers", and reading it as the compiled-in default made a node believed to be isolated
+/// dial production infrastructure (dig-node#312). The variable holds a LIST, so "set to nothing"
+/// names the empty list.
+///
+/// A capability knob holds no list. `DIG_WALLET_ENABLE_CHAIN_SYNC=` is what a shell produces from
+/// `export X="$UNSET_VAR"`, and reading that as OFF would stop the replica advancing — which
+/// dig-node#416 records as indistinguishable from an empty wallet at the balance surface. Inheriting
+/// the empty rule wholesale would therefore import a money lie through the vocabulary, having just
+/// refused to import one through the failure direction.
+///
+/// So: same tokens, different empty. Stated here because "adopt the shared vocabulary" reads like one
+/// decision and is two.
+#[must_use]
+pub fn is_capability_off_token(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && peer::is_off_token(trimmed)
+}
+
+/// Is `value` the operator saying "turn this capability ON"? `1`, `true`, `yes`, `on`, `enabled`,
+/// trimmed and case-insensitive.
+///
+/// `enabled` is present as the mirror of `disabled`: an operator who learns one word works will try
+/// its opposite, and a vocabulary that accepts only one direction of a pair is the same trap in
+/// reverse.
+#[must_use]
+pub fn is_capability_on_token(value: &str) -> bool {
+    let v = value.trim();
+    v.eq_ignore_ascii_case("1")
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("yes")
+        || v.eq_ignore_ascii_case("on")
+        || v.eq_ignore_ascii_case("enabled")
+}
+
+/// What a capability flag's raw value means, when "apply the default" and "the operator typed
+/// something we do not understand" must be told apart.
+///
+/// The third variant is the point. Every one of these knobs previously collapsed `Unrecognised` into
+/// the default and said nothing, so a typo and a deliberate omission produced identical behaviour and
+/// identical silence — see [`describe_unrecognised_flag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagWord {
+    /// An off-token: the operator asked for this capability to stop.
+    Off,
+    /// An on-token: the operator asked for this capability to run.
+    On,
+    /// Unset, or set to an empty value — the operator expressed no preference.
+    Absent,
+    /// Set to something that is neither. The caller applies its default AND says so.
+    Unrecognised,
+}
+
+/// Classify a capability flag's raw value. PURE — no process env, no logging — so a caller's policy
+/// and its disclosure are testable separately from its wiring.
+#[must_use]
+pub fn classify_flag(raw: Option<&str>) -> FlagWord {
+    match raw {
+        None => FlagWord::Absent,
+        Some(v) if v.trim().is_empty() => FlagWord::Absent,
+        Some(v) if is_capability_off_token(v) => FlagWord::Off,
+        Some(v) if is_capability_on_token(v) => FlagWord::On,
+        Some(_) => FlagWord::Unrecognised,
+    }
+}
+
+/// The line an operator sees when a flag's value was not understood.
+///
+/// A `String` rather than a log call at the classification site, for the reason
+/// `live_broadcast_disclosure` gives: the property under test is the TEXT. A test asserting only
+/// "a warning was emitted" passes on a message that omits the value, the variable, or the default
+/// actually applied — and a warning missing any of those three sends the operator looking in the
+/// wrong place, which is the failure this whole ticket is about.
+#[must_use]
+pub fn describe_unrecognised_flag(var: &str, raw: &str, applied_default: bool) -> String {
+    let applied = if applied_default { "ON" } else { "OFF" };
+    format!(
+        "{var} is set to {raw:?}, which is not a value this node understands. The default ({applied}) \
+         is being used and your setting has had NO effect. Accepted: on/1/true/yes/enabled, or \
+         off/0/false/no/disabled."
+    )
+}
 
 // The one place the per-range verification contract of a `dig.fetchRange` frame is built (#1577).
 use seams::content::range_frame;
@@ -439,6 +546,19 @@ pub struct Node {
     /// on the FFI/consumer path (no peer network, no inbound peer demand), where the gate reads `None`
     /// and fails CLOSED (no peer-driven pull without a known identity to anchor the neighbourhood to).
     node_peer_id: OnceLock<[u8; 32]>,
+    /// This node's UNTRUSTED mirror-coin pointer source (dig-node#422/#435), attached to every DHT
+    /// announce so a verifier is told WHERE TO LOOK instead of scanning the shared mirror puzzle
+    /// hash.
+    ///
+    /// Installed by the service shell before [`peer::spawn_peer_network`], because the mirror
+    /// lifecycle that knows which coin bonds which capsule lives in `dig-node-service` and the DHT
+    /// lives here. A slot rather than a constructor argument for the same reason
+    /// [`Node::node_peer_id`] is one: the FFI/browser path has no mirror lifecycle and no peer
+    /// network, and must keep constructing a `Node` without either.
+    ///
+    /// `None` is an ORDINARY configuration, never a degraded one — a node with no pointer source
+    /// announces exactly as it always did, and the verifier's fallback is the hint scan.
+    mirror_pointers: OnceLock<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>>,
 }
 
 /// A boxed async hook that reconciles the node's DHT provider records with its current cache
@@ -2399,10 +2519,32 @@ impl Node {
     /// request locally. The REASON for a `false` is available from
     /// [`Node::sync_module_from`] — this thin wrapper exists for the read path, which only
     /// needs to know whether it may now serve locally.
-    async fn sync_module(&self, store_hex: &str, root_hex: &str) -> bool {
-        self.sync_module_from(&self.upstream, store_hex, root_hex)
+    async fn sync_module(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        claim: crate::seams::dig_peer::HolderClaim,
+    ) -> bool {
+        // This wrapper is the BACKGROUND path: it has no caller that will surface the reason, unlike
+        // `control.sync.trigger`, which returns it to the operator verbatim. Collapsing the `Err` to a
+        // bare `false` here is what left a failed sync with no log line of its own — and therefore with
+        // the preceding "received a capsule's bytes" line as its only trace (#341). The wording follows
+        // the control verb's own (`control.rs`), so the two surfaces read alike.
+        match self
+            .sync_module_from(&self.upstream, store_hex, root_hex, claim)
             .await
-            .is_ok_and(|served| served.to_hex() == root_hex)
+        {
+            Ok(served) => served.to_hex() == root_hex,
+            Err(reason) => {
+                tracing::warn!(
+                    store = %store_hex,
+                    root = %root_hex,
+                    error = %reason,
+                    "whole-store sync failed"
+                );
+                false
+            }
+        }
     }
 
     /// [`Node::sync_module`] followed by the tier-aware size-cap sweep, for the read path.
@@ -2429,8 +2571,13 @@ impl Node {
     /// also funnels through it while holding `cache_lock`, so sweeping there would double-sweep and
     /// risk a lock inversion. Returns whatever [`Node::sync_module`] returned — whether the caller may
     /// now serve locally.
-    async fn sync_module_and_bound(&self, store_hex: &str, root_hex: &str) -> bool {
-        let may_serve_locally = self.sync_module(store_hex, root_hex).await;
+    async fn sync_module_and_bound(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        claim: crate::seams::dig_peer::HolderClaim,
+    ) -> bool {
+        let may_serve_locally = self.sync_module(store_hex, root_hex, claim).await;
         self.evict_modules_if_needed().await;
         may_serve_locally
     }
@@ -2471,6 +2618,7 @@ impl Node {
         base_url: &str,
         store_hex: &str,
         root_hex: &str,
+        claim: crate::seams::dig_peer::HolderClaim,
     ) -> Result<Bytes32, String> {
         if !sync_eligible(store_hex, root_hex) {
             return Err("store id and root must each be 64-hex".to_string());
@@ -2497,11 +2645,16 @@ impl Node {
             }
         };
 
+        // RECEIVED, not stored (dig-node#341). Three refusals still lie between here and a resident
+        // capsule — the chain-anchored verify, the provenance marker, and the atomic write — so the
+        // only fact this point has is that the bytes crossed the wire. On a headless node the log is
+        // the whole diagnostic surface, and an operator who reads a completed download here stops
+        // looking, having been told something the node does not yet know.
         tracing::info!(
             store = %store_hex,
             served_root = %served_root.to_hex(),
             bytes = bytes.len(),
-            "whole-store sync downloaded a capsule"
+            "whole-store sync received a capsule's bytes; verifying and storing"
         );
 
         // Chain-anchored verify BEFORE the module lands (#1623): landing is announcing (§14.1), so an
@@ -2528,13 +2681,53 @@ impl Node {
         let served_key = CapsuleKey::parse(store_hex, &served_hex)
             .ok_or("the upstream served a root that is not 64-hex")?;
         let path = served_key.module_path(&self.cache_dir);
-        write_atomic(&path, &bytes).map_err(|e| format!("could not write the capsule: {e}"))?;
+        // PROVENANCE FIRST (dig-node#436). This is the choke point EVERY on-demand landing funnels
+        // through, including the read path — where `dig.getContent` for a capsule this node does not
+        // hold lands one on a REMOTE peer's request, with no feature flag in front of it. An unmarked
+        // capsule reads as `Held`, and `Held` is the bondable state a mirror coin is minted against,
+        // so the claim is a required argument here for the same reason it is on `land_capsule_bytes`:
+        // a land route cannot inherit "this operator's own content" by omission.
+        //
+        // Written BEFORE the bytes become visible (`write_atomic` publishes at its rename), so no
+        // window exists in which a capsule is discoverable with its provenance unwritten, and the
+        // store directory is created first because the marker would otherwise be the first thing
+        // written into a directory that does not yet exist.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create the capsule's store directory: {e}"))?;
+        }
+        crate::seams::dig_peer::persist_holder_claim(&path, claim)
+            .map_err(|_| "could not record the capsule's provenance".to_string())?;
+        write_atomic(&path, &bytes).map_err(|e| {
+            // The land failed, so the marker must not outlive it and mis-describe a later capsule
+            // arriving at the same path by a different route. Mirrors `capsule_store.rs`'s land
+            // path, which already rolls back this way.
+            //
+            // `Announce` is the REMOVING claim, and removal is only safe because `write_atomic` is
+            // temp-in-the-same-directory then rename: on failure it unlinks the temp and leaves NO
+            // file at the capsule path, so there is no unmarked capsule for this to expose. If that
+            // ever stops being true, this rollback becomes a hole rather than a cleanup.
+            let _ = crate::seams::dig_peer::persist_holder_claim(
+                &path,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            );
+            format!("could not write the capsule: {e}")
+        })?;
         // #1991 telemetry: this is the choke-point every ON-DEMAND landing path funnels through —
         // `cache.fetchAndCache`, chain gap-fill, and fetch-side backfill all call down to here — so
         // counting here (rather than at any one caller) captures all three without double-counting.
         // The reshare-warm land is a SEPARATE write path (`module_reshare::promote_into_cache`,
         // never calls this function) and counts itself at its own successful write.
         CACHE_REFETCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The capsule is now RESIDENT, and this is the first point at which that is true (#341).
+        // Deleting this line rather than moving it would be the wrong fix: an operator with no line
+        // is better off than one with a false line, but a correct line is better than both.
+        tracing::info!(
+            store = %store_hex,
+            served_root = %served_hex,
+            bytes = bytes.len(),
+            "whole-store sync stored a capsule"
+        );
         Ok(served_root)
     }
 
@@ -4419,9 +4612,10 @@ impl Node {
                     // NOTE: this copies the seed out of its `Zeroizing` wrapper, because
                     // `Node::identity_seed` is a plain `Option<[u8; 32]>` that seam 7's
                     // `KeyManager::identity_seed_for_peer` returns by value. Narrowing that type
-                    // is a seam-wide change, tracked separately -- it is not made cheaper by
-                    // doing it here, and doing it here would widen this diff across the peer
-                    // seam. The copy lives as long as the node does either way.
+                    // is a seam-wide change, tracked at
+                    // https://github.com/DIG-Network/dig-node/issues/345 -- it is not made
+                    // cheaper by doing it here, and doing it here would widen this diff across
+                    // the peer seam. The copy lives as long as the node does either way.
                     Some(*seed)
                 }
                 Err(e) => {
@@ -4470,6 +4664,7 @@ impl Node {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         })
     }
 
@@ -4556,8 +4751,28 @@ impl Node {
             && self.inbound_demand_pull_admitted(store_hex, root_hex)
         {
             // Tier1Demand is asserted in the ledger above; the on-disk pull reuses the fetch-side
-            // machinery, which lands + announces the capsule exactly as every other cache path does.
-            self.spawn_capsule_backfill(store_hex, root_hex);
+            // machinery, which lands the capsule exactly as every other cache path does.
+            //
+            // The claim is DERIVED from this trigger's origin, and this trigger is a remote peer's
+            // serve request -- `ReadOrigin::Peer` -- so the land is `Suppress`: cached and served
+            // normally, never advertised and never bonded against (dig-node#446). It used to land
+            // ANNOUNCED, because the claim was hard-coded at the bottom of the chain where the
+            // control-plane call sites are; that made a stranger's chosen capsule this operator's
+            // own, with this operator's $DIG staked on it via the mirror broadcaster.
+            //
+            // `FirstParty` is correct on this axis and is not a shortcut: the cross-site axis
+            // exists to catch a LOCAL socket carrying a stranger's request, and there is no browser
+            // and no site here -- this is a peer connection, whose origin is already `Peer`. The
+            // fold is only ever restrictive, so the pair cannot resolve to anything weaker than
+            // `Peer` gives on its own.
+            self.spawn_capsule_backfill(
+                store_hex,
+                root_hex,
+                crate::seams::dig_rpc::holder_claim_for_landing(
+                    crate::download::ReadOrigin::Peer,
+                    crate::download::RequestProvenance::FirstParty,
+                ),
+            );
         }
     }
 
@@ -4596,6 +4811,27 @@ impl Node {
     /// is stable for the node's life.
     pub(crate) fn set_node_peer_id(&self, peer_id: [u8; 32]) {
         let _ = self.node_peer_id.set(peer_id);
+    }
+
+    /// Install the untrusted mirror-coin pointer source every DHT announce attaches
+    /// (dig-node#435). Called by the service shell BEFORE the peer network is spawned; a later call
+    /// is ignored, so the source a running node publishes from cannot be swapped underneath it.
+    ///
+    /// Installing one is optional. What it must never do is fail an announce: the pointer is a hint
+    /// about where to look, and a node that could not produce one still holds and serves its
+    /// content.
+    pub fn set_mirror_coin_pointers(
+        &self,
+        pointers: std::sync::Arc<dyn crate::dht::MirrorCoinPointers>,
+    ) {
+        let _ = self.mirror_pointers.set(pointers);
+    }
+
+    /// The installed pointer source, if any.
+    pub(crate) fn mirror_coin_pointers(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>> {
+        self.mirror_pointers.get().cloned()
     }
 }
 
@@ -4741,6 +4977,7 @@ pub(crate) mod test_support {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         };
         (Arc::new(node), td)
     }
@@ -5529,6 +5766,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         };
         (node, td)
     }
@@ -5574,7 +5812,12 @@ mod tests {
             test_node_with_resolver(Some([5u8; 32]), MockResolver::one(&store_hex, root));
         let root_hex = root.to_hex();
         let served = node
-            .sync_module_from(&base, &store_hex, &root_hex)
+            .sync_module_from(
+                &base,
+                &store_hex,
+                &root_hex,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("authed sync succeeds");
         assert_eq!(served.to_hex(), root_hex, "served root == requested root");
@@ -5656,13 +5899,22 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         };
 
         // Missing before the pull.
         assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
 
         // Gap-fill pulls + verifies + lands the module under (store, root).
-        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(
+                store_id,
+                root,
+                crate::seams::dig_peer::HolderClaim::Announce
+            )
+            .await,
+            Ok(())
+        );
         let cached =
             std::fs::read(module_path(&node.cache_dir, &store_hex, &root.to_hex())).unwrap();
         assert_eq!(
@@ -5671,7 +5923,15 @@ mod tests {
         );
 
         // A second gap-fill is an idempotent no-op (already held → cheap success).
-        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(
+                store_id,
+                root,
+                crate::seams::dig_peer::HolderClaim::Announce
+            )
+            .await,
+            Ok(())
+        );
     }
 
     /// **Proves:** the chain-watch loop's PRODUCTION seams (`NodeGapFiller` + `NodeHeldCheck`) wire the
@@ -5706,6 +5966,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -5797,6 +6058,7 @@ mod tests {
                 chat: chat::ChatState::new(),
                 inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
+                mirror_pointers: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -5870,6 +6132,7 @@ mod tests {
                 chat: chat::ChatState::new(),
                 inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
+                mirror_pointers: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -6148,8 +6411,12 @@ mod tests {
             node.upstream = base;
             // The read-path land: no tier-0 loop, no `cache.fetchAndCache` — only this sync runs.
             assert!(
-                node.sync_module_and_bound(&store_a.to_hex(), &root.to_hex())
-                    .await,
+                node.sync_module_and_bound(
+                    &store_a.to_hex(),
+                    &root.to_hex(),
+                    crate::seams::dig_peer::HolderClaim::Announce
+                )
+                .await,
                 "the read-path sync landed the chain-anchored capsule and may serve locally"
             );
         });
@@ -6218,7 +6485,11 @@ mod tests {
             // whole capsule DID land under the served root, so the sweep must still fire.
             assert!(
                 !node
-                    .sync_module_and_bound(&store.to_hex(), &requested.to_hex())
+                    .sync_module_and_bound(
+                        &store.to_hex(),
+                        &requested.to_hex(),
+                        crate::seams::dig_peer::HolderClaim::Announce
+                    )
                     .await,
                 "served (AA..) != requested (BB..), so the caller may NOT serve locally"
             );
@@ -6508,6 +6779,107 @@ mod tests {
         assert!(
             !node.capsule_acquisition.is_warming(&key),
             "inbound-demand pull must be OFF by default — no backfill without opt-in"
+        );
+    }
+
+    /// **Proves (dig-node#446):** a REMOTE peer's inbound demand starts its backfill with
+    /// `HolderClaim::Suppress`, so the capsule it causes to land is cached and served but never
+    /// advertised and never bonded against.
+    ///
+    /// **Why this is not covered by the existing tests.** `holder_claim_for_landing` was already
+    /// correct and already had four unit tests over its four input combinations, and
+    /// `inbound_demand_opt_in_spawns_a_backfill_for_an_uncached_store` already proved this trigger
+    /// reaches the pull. The capsule still landed ANNOUNCED, because the claim was hard-coded at the
+    /// bottom of the chain and no test asserted which claim this trigger PASSES. The capability was
+    /// tested; the wiring was not.
+    ///
+    /// **Catches:** the claim reverting to a hard-coded `Announce` anywhere on
+    /// `note_inbound_demand` -> `spawn_capsule_backfill` -> `gap_fill_generation` ->
+    /// `cache_fetch_and_cache`, which stakes this operator's $DIG on a stranger's chosen content.
+    ///
+    /// Reachable only with `DIG_NODE_INBOUND_DEMAND_CACHE` on, which is default OFF -- so this was
+    /// never exploitable in a default install. An operator who enables a documented feature is
+    /// still not consenting to bond a stranger's capsule.
+    #[test]
+    fn inbound_demand_backfill_is_started_as_relayed_not_as_this_nodes_own() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        std::env::set_var("DIG_NODE_INBOUND_DEMAND_CACHE", "on");
+        crate::seams::capsule::capsule_store::backfill_claim_probe::reset();
+        let rt = pin_test_rt();
+        let (store, tip, _rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        node.set_node_peer_id(capsule_neighbourhood_peer_id(store.0, tip.0));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        let (s, r) = (store.to_hex(), tip.to_hex());
+        rt.block_on(async { node.note_inbound_demand(&s, &r) });
+        let started = crate::seams::capsule::capsule_store::backfill_claim_probe::take();
+        std::env::remove_var("DIG_NODE_INBOUND_DEMAND_CACHE");
+
+        assert_eq!(
+            started,
+            Some(crate::seams::dig_peer::HolderClaim::Suppress),
+            "a remote peer's demand must start a RELAYED backfill; `Announce` here lands a \
+             stranger's capsule bondable, and `None` means the trigger never reached the pull at \
+             all, which would make this assertion vacuous"
+        );
+    }
+
+    /// **The control for the test above, and the one that catches an OVER-correction.**
+    ///
+    /// The operator's OWN read must still start its backfill as `Announce`, i.e. bondable. The
+    /// tempting wrong fix for dig-node#446 is to suppress every land at the shared choke point:
+    /// that satisfies the remote case exactly, and silently disables the reshare flywheel for the
+    /// operator's own content -- a failure this repo would not see until nobody's node advertised
+    /// anything.
+    ///
+    /// The two tests differ in ONE input: which trigger fires. Both reach the same
+    /// `spawn_capsule_backfill`, so a single observable telling them apart is the whole proof.
+    #[test]
+    fn a_local_origin_miss_still_starts_a_bondable_backfill() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        crate::seams::capsule::capsule_store::backfill_claim_probe::reset();
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let _resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":9,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                "length": 4096, "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            crate::seams::capsule::capsule_store::backfill_claim_probe::take(),
+            Some(crate::seams::dig_peer::HolderClaim::Announce),
+            "the operator's own read must still leave content more available than it found it; \
+             suppressing here would fix dig-node#446 by disabling the reshare flywheel"
         );
     }
 
@@ -6810,7 +7182,12 @@ mod tests {
         // the node holding a §21 identity key.
         let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
         let served = node
-            .sync_module_from(&base, &store.to_hex(), &root.to_hex())
+            .sync_module_from(
+                &base,
+                &store.to_hex(),
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("the chunked dig.getCapsule path syncs the capsule");
 
@@ -6824,6 +7201,245 @@ mod tests {
         assert_eq!(
             cached, capsule,
             "the WHOLE capsule is cached, byte for byte"
+        );
+    }
+
+    /// **Proves (dig-node#436, the eleventh path):** a land driven by a REMOTE read must not be
+    /// bondable.
+    ///
+    /// `dig.getContent` for a capsule this node does not hold funnels through
+    /// `sync_module_and_bound` -> `sync_module` -> `sync_module_from`, reaching `write_atomic`
+    /// WITHOUT passing `cache_fetch_and_cache` or `land_capsule_bytes` — the two functions the
+    /// original enumeration was organised around, which is precisely why this path was missed. It
+    /// is remote-triggerable and behind no feature flag, so before the fix a stranger requesting
+    /// content this node did not hold made it pull a whole capsule and land it `Held` — the
+    /// bondable state — in a default install.
+    ///
+    /// **Catches:** any future caller of `sync_module_from` that lands a stranger's content
+    /// without suppressing the holder claim.
+    #[tokio::test]
+    async fn a_remote_read_path_land_is_not_bondable() {
+        let store = Bytes32([0x36u8; 32]);
+        let root = Bytes32([0x11u8; 32]);
+        let window = 4096;
+        let (capsule, root) = chain_anchored_module_with_filler(store.0, root.0, 64);
+        let base = spawn_capsule_rpc_upstream(
+            capsule.clone(),
+            window,
+            axum::http::StatusCode::BAD_REQUEST,
+        )
+        .await;
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
+
+        let served = node
+            .sync_module_from(
+                &base,
+                &store.to_hex(),
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Suppress,
+            )
+            .await
+            .expect("the capsule syncs");
+        assert_eq!(served, root);
+
+        let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        let marker = crate::capsule_key::relay_marker_beside(&path)
+            .expect("a cached capsule has a marker path beside it");
+        assert!(
+            marker.exists(),
+            "a capsule pulled on a stranger's behalf must carry its relay marker, so it is \
+             never announced and never bonded against"
+        );
+    }
+
+    /// **The control for [`a_remote_read_path_land_is_not_bondable`].**
+    ///
+    /// The operator's OWN read must stay bondable. Suppressing every land through
+    /// `sync_module_from` would satisfy the remote assertion above while silently disabling the
+    /// reshare flywheel for this operator's own content — the whole reason the claim is threaded
+    /// per call site instead of defaulted at the shared choke point.
+    ///
+    /// **Catches:** a fix that blanket-suppresses the choke point.
+    #[tokio::test]
+    async fn a_local_read_path_land_stays_bondable() {
+        let store = Bytes32([0x37u8; 32]);
+        let root = Bytes32([0x12u8; 32]);
+        let window = 4096;
+        let (capsule, root) = chain_anchored_module_with_filler(store.0, root.0, 64);
+        let base = spawn_capsule_rpc_upstream(
+            capsule.clone(),
+            window,
+            axum::http::StatusCode::BAD_REQUEST,
+        )
+        .await;
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
+
+        node.sync_module_from(
+            &base,
+            &store.to_hex(),
+            &root.to_hex(),
+            crate::seams::dig_peer::HolderClaim::Announce,
+        )
+        .await
+        .expect("the capsule syncs");
+
+        let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        let marker = crate::capsule_key::relay_marker_beside(&path)
+            .expect("a cached capsule has a marker path beside it");
+        assert!(
+            !marker.exists(),
+            "the operator's own read is this node's own content and must stay bondable"
+        );
+    }
+
+    // ---- Whole-store sync log honesty (dig-node#341) -------------------------------------------
+    //
+    // A headless node's log IS its diagnostic surface, so a line there is a claim the same way a
+    // rendered balance is. These tests read the REAL emitted records rather than asserting that a
+    // failure path is reachable, because the defect was never that the path was unreachable — it was
+    // that the path emitted a sentence about a capsule that had not been stored.
+
+    /// An in-memory sink a `tracing_subscriber::fmt` layer writes formatted records into.
+    #[derive(Clone, Default)]
+    struct SyncLogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SyncLogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SyncLogCapture {
+        type Writer = SyncLogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` under a scoped capturing subscriber at `TRACE` and return everything it logged —
+    /// i.e. exactly what an operator tailing the node log would see, and nothing a different test's
+    /// concurrently-running subscriber emitted.
+    async fn capture_sync_logs<T, F: std::future::Future<Output = T>>(body: F) -> (T, String) {
+        let buffer = SyncLogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false) // plain text: the assertions read the fields as an operator would
+            .with_writer(buffer.clone())
+            .finish();
+        let outcome = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            body.await
+        };
+        let captured = buffer.0.lock().unwrap().clone();
+        (outcome, String::from_utf8_lossy(&captured).into_owned())
+    }
+
+    /// **Proves (dig-node#341):** a background whole-store sync that stores NOTHING never logs that
+    /// it downloaded or stored a capsule, and does name why it failed.
+    ///
+    /// The fixture serves the requested capsule successfully and then makes the CHAIN disagree: the
+    /// resolver anchors the store at a different root, so `verify_synced_capsule_is_chain_anchored`
+    /// refuses after the bytes have crossed the wire. That is the real observed shape — the download
+    /// genuinely succeeded, which is precisely why the old line read as true — rather than a wire
+    /// failure, which would never have reached the log statement at all.
+    ///
+    /// **Non-vacuous:** the assertions below are checked against a `false` return AND an empty cache
+    /// dir, so the run really did store nothing; and the reason assertion fails if the wrapper goes
+    /// back to swallowing the `Err`.
+    ///
+    /// **Catches:** the shipped defect verbatim — an `info!` claiming a completed download emitted
+    /// before the verify/marker/write can refuse. It also catches the wrong fix: silencing the path
+    /// leaves the operator with nothing, which the reason assertion rejects.
+    #[tokio::test]
+    async fn a_background_sync_that_stored_nothing_never_logs_a_download() {
+        let store = Bytes32([0x41u8; 32]);
+        let (capsule, root) = chain_anchored_module_with_filler(store.0, [0x13u8; 32], 64);
+        let base =
+            spawn_capsule_rpc_upstream(capsule, 4096, axum::http::StatusCode::BAD_REQUEST).await;
+
+        // The chain anchors this store at a DIFFERENT generation than the one served.
+        let chain_root = Bytes32([0x99u8; 32]);
+        let (mut node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store.to_hex(), chain_root));
+        node.upstream = base;
+
+        let (may_serve, logs) = capture_sync_logs(node.sync_module(
+            &store.to_hex(),
+            &root.to_hex(),
+            crate::seams::dig_peer::HolderClaim::Announce,
+        ))
+        .await;
+
+        assert!(
+            !may_serve,
+            "the sync must fail — the served root is not anchored"
+        );
+        let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        assert!(
+            !path.exists(),
+            "nothing was stored, so the assertions below are about a genuinely empty outcome"
+        );
+
+        assert!(
+            !logs.contains("downloaded a capsule"),
+            "a sync that stored nothing must not report a completed download; log was:\n{logs}"
+        );
+        assert!(
+            !logs.contains("stored a capsule"),
+            "a sync that stored nothing must not report a stored capsule; log was:\n{logs}"
+        );
+        assert!(
+            logs.contains("whole-store sync failed"),
+            "the background path must name its failure — it is the only surface a headless \
+             operator has; log was:\n{logs}"
+        );
+        assert!(
+            logs.contains("is not the store's chain-anchored root"),
+            "the reason must be the ACTUAL one, not a generic failure; log was:\n{logs}"
+        );
+    }
+
+    /// **The control for [`a_background_sync_that_stored_nothing_never_logs_a_download`].**
+    ///
+    /// Deleting the success line would satisfy every assertion above while removing the operator's
+    /// only confirmation that a capsule is resident — the fix the ticket explicitly rules out. A
+    /// stored capsule must still announce itself, and only AFTER it is on disk.
+    ///
+    /// **Catches:** a fix that silences the path instead of correcting it.
+    #[tokio::test]
+    async fn a_background_sync_that_stored_a_capsule_says_so() {
+        let store = Bytes32([0x42u8; 32]);
+        let (capsule, root) = chain_anchored_module_with_filler(store.0, [0x14u8; 32], 64);
+        let base =
+            spawn_capsule_rpc_upstream(capsule, 4096, axum::http::StatusCode::BAD_REQUEST).await;
+        let (mut node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
+        node.upstream = base;
+
+        let (may_serve, logs) = capture_sync_logs(node.sync_module(
+            &store.to_hex(),
+            &root.to_hex(),
+            crate::seams::dig_peer::HolderClaim::Announce,
+        ))
+        .await;
+
+        assert!(
+            may_serve,
+            "the served root is the anchored root, so the sync succeeds"
+        );
+        let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        assert!(path.exists(), "the capsule is resident");
+        assert!(
+            logs.contains("stored a capsule"),
+            "a stored capsule must be reported as stored; log was:\n{logs}"
+        );
+        assert!(
+            !logs.contains("whole-store sync failed"),
+            "a successful sync must not report a failure; log was:\n{logs}"
         );
     }
 
@@ -6858,7 +7474,11 @@ mod tests {
         let root_hex = Bytes32([0x32u8; 32]).to_hex();
 
         let err = node
-            .cache_fetch_and_cache(&store_hex, &root_hex)
+            .cache_fetch_and_cache(
+                &store_hex,
+                &root_hex,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect_err("both paths refused");
 
@@ -6885,7 +7505,12 @@ mod tests {
         let (node, _td) =
             test_node_with_resolver(Some(seed), MockResolver::one(&store.to_hex(), root));
         let served = node
-            .sync_module_from(&url, &store.to_hex(), &root.to_hex())
+            .sync_module_from(
+                &url,
+                &store.to_hex(),
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("authed sync succeeds");
         assert_eq!(served, root, "served root == requested root");
@@ -6940,7 +7565,12 @@ mod tests {
         let (node, _td) =
             test_node_with_resolver(Some(seed), MockResolver::one(&store.to_hex(), served));
         let served = node
-            .sync_module_from(&url, &store.to_hex(), &requested.to_hex())
+            .sync_module_from(
+                &url,
+                &store.to_hex(),
+                &requested.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("the sync itself succeeds — it just landed a different generation");
         assert_ne!(served, requested, "served (AA..) != requested (BB..)");
@@ -7045,7 +7675,11 @@ mod tests {
         install_announce_spy(&node, announced.clone());
 
         let outcome = node
-            .cache_fetch_and_cache(&store_hex, &served_root.to_hex())
+            .cache_fetch_and_cache(
+                &store_hex,
+                &served_root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await;
 
         assert!(
@@ -7079,7 +7713,11 @@ mod tests {
         install_announce_spy(&node, announced.clone());
 
         let (len, _root) = node
-            .cache_fetch_and_cache(&store_hex, &root.to_hex())
+            .cache_fetch_and_cache(
+                &store_hex,
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect("a chain-confirmed capsule is fetched and cached");
 
@@ -7632,7 +8270,12 @@ mod tests {
         // No identity → must short-circuit to false WITHOUT touching the network
         // (the URL is intentionally unroutable; the call returns immediately).
         let failure = node
-            .sync_module_from("http://127.0.0.1:1", &store.to_hex(), &root.to_hex())
+            .sync_module_from(
+                "http://127.0.0.1:1",
+                &store.to_hex(),
+                &root.to_hex(),
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .expect_err("no identity and an unroutable upstream cannot sync");
         assert!(
@@ -7925,7 +8568,11 @@ mod tests {
         seed_module(&node, &hex::encode(store), &root.to_hex(), b"already-here");
         // Upstream is unroutable in test_node, so a real pull would fail; an already-held
         // generation must succeed WITHOUT touching it.
-        assert_eq!(node.gap_fill_generation(store, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(store, root, crate::seams::dig_peer::HolderClaim::Announce)
+                .await,
+            Ok(())
+        );
     }
 
     // -- Cached-store management RPCs (the DIG-settings cache manager, task #32) -
@@ -8255,7 +8902,12 @@ mod tests {
         let store = "33".repeat(32);
         let root = "44".repeat(32);
         let result = node
-            .sync_module_from("http://unreachable.invalid", &store, &root)
+            .sync_module_from(
+                "http://unreachable.invalid",
+                &store,
+                &root,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await;
         assert!(result.is_err(), "no upstream reachable → the sync fails");
         assert!(
@@ -8307,6 +8959,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
         };
 
         let before = handle_rpc(
@@ -8319,7 +8972,15 @@ mod tests {
             .as_u64()
             .unwrap();
 
-        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(
+                store_id,
+                root,
+                crate::seams::dig_peer::HolderClaim::Announce
+            )
+            .await,
+            Ok(())
+        );
 
         let after = handle_rpc(
             &node,
@@ -8338,7 +8999,15 @@ mod tests {
         // A second gap-fill of the SAME (already-held) generation is a no-op — it must NOT perform
         // another network land. Proved directly (not via the shared counter, for the same reason as
         // above): the cached bytes are exactly the original module, unchanged by the repeat call.
-        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        assert_eq!(
+            node.gap_fill_generation(
+                store_id,
+                root,
+                crate::seams::dig_peer::HolderClaim::Announce
+            )
+            .await,
+            Ok(())
+        );
         let cached =
             std::fs::read(module_path(&node.cache_dir, &store_hex, &root.to_hex())).unwrap();
         assert_eq!(
@@ -8614,7 +9283,11 @@ mod tests {
         // A second fetch of the now-present capsule reports already_cached without
         // re-downloading.
         let again = node
-            .cache_fetch_and_cache(&store_hex, &root_hex)
+            .cache_fetch_and_cache(
+                &store_hex,
+                &root_hex,
+                crate::seams::dig_peer::HolderClaim::Announce,
+            )
             .await
             .unwrap();
         assert_eq!(again.0, module.len() as u64);
@@ -8658,9 +9331,13 @@ mod tests {
         }));
 
         // Fresh land → exactly one announce.
-        node.cache_fetch_and_cache(&store_hex, &root_hex)
-            .await
-            .unwrap();
+        node.cache_fetch_and_cache(
+            &store_hex,
+            &root_hex,
+            crate::seams::dig_peer::HolderClaim::Announce,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             announces.load(Ordering::SeqCst),
             1,
@@ -8668,9 +9345,13 @@ mod tests {
         );
 
         // Already cached → no re-announce (dedupe; inventory unchanged).
-        node.cache_fetch_and_cache(&store_hex, &root_hex)
-            .await
-            .unwrap();
+        node.cache_fetch_and_cache(
+            &store_hex,
+            &root_hex,
+            crate::seams::dig_peer::HolderClaim::Announce,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             announces.load(Ordering::SeqCst),
             1,
@@ -8703,7 +9384,13 @@ mod tests {
 
         let store_id: [u8; 32] = hex::decode(&store_hex).unwrap().try_into().unwrap();
         let root = digstore_core::Bytes32::from_hex(&root_hex).unwrap();
-        node.gap_fill_generation(store_id, root).await.unwrap();
+        node.gap_fill_generation(
+            store_id,
+            root,
+            crate::seams::dig_peer::HolderClaim::Announce,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             announces.load(Ordering::SeqCst),
             1,
@@ -8718,7 +9405,10 @@ mod tests {
         let (node, _td) = test_node(None);
         let store = "ee".repeat(32);
         let root = "55".repeat(32);
-        let err = node.cache_fetch_and_cache(&store, &root).await.unwrap_err();
+        let err = node
+            .cache_fetch_and_cache(&store, &root, crate::seams::dig_peer::HolderClaim::Announce)
+            .await
+            .unwrap_err();
         assert!(!err.is_empty(), "fetch without identity surfaces an error");
 
         let resp = handle_rpc(
@@ -15125,6 +15815,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         // A holder for this EXACT content is known via the DHT.
@@ -15175,6 +15866,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
@@ -15224,6 +15916,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
 
@@ -15255,6 +15948,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -15295,6 +15989,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -15337,6 +16032,7 @@ mod tests {
             chat: chat::ChatState::new(),
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
+            mirror_pointers: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);

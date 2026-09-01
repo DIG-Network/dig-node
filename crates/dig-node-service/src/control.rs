@@ -195,6 +195,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
     "control.wallet.unwatch",
@@ -260,6 +261,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
     "control.wallet.unwatch",
@@ -316,7 +318,18 @@ pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
 /// tests stayed green because a method absent from the contract is absent from both sides of every
 /// comparison they make. Granting the ordinary tier is now a reviewable one-line edit to this list
 /// instead of a side effect of editing an unrelated one.
-pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] = &["control.peers.ping"];
+/// `control.wallet.resetCoinDb` (dig-node#384) is listed because the contract has not published it
+/// yet, and BOTH consequences of listing it were weighed rather than inherited: the conformance
+/// gate tolerates the publish drift, and the method keeps the PAIRED tier. The second is the one
+/// that matters, and it is the intended answer — the DIG App drives this reset and holds a paired
+/// token, so master-tiering it would make the feature unreachable by its only consumer. It is
+/// destructive, and what bounds it is loopback-only + a token + `confirm: true` on the wire + a
+/// refusal while a spend is in flight, not tier alone.
+///
+/// **Remove this entry the moment `dig-node-control-interface` publishes the method** — the
+/// `the_unpublished_list_still_describes_real_drift` test fails until it is.
+pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] =
+    &["control.peers.ping", "control.wallet.resetCoinDb"];
 
 /// Does this control method require the MASTER control token, never a paired one? PURE.
 ///
@@ -354,6 +367,52 @@ pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] = &["control.peers.ping"];
 /// the latter widened silently: a newly served-but-unpublished method inherited the exemption the
 /// moment it was added to [`CONTROL_METHODS`], and no lockstep test could see it (a method the
 /// contract does not know is absent from both sides of every comparison they make).
+/// Capabilities dig-node enforces at MASTER tier AHEAD of the published contract (dig-node#255).
+///
+/// # Why an overlay exists at all, given #254 removed the last one
+///
+/// The tier of a capability belongs in `dig-node-control-interface`, and restating it here as a
+/// string match is the byte-drift bug that produced this whole family. This list is therefore NOT
+/// a second opinion about tiers — it is a strictly-stricter, self-retiring bridge for a capability
+/// the contract has not classified yet, and
+/// [`locally_master_tier_methods_are_still_unclassified_by_the_contract`] FAILS the moment the
+/// contract adopts one, so it cannot quietly outlive its reason.
+///
+/// # The one member, and the rule that puts it here
+///
+/// The contract's rule is *"master tier means the effect outlives the token that invoked it"*.
+/// `control.config.setUpstream` persists a CALLER-CHOSEN URL that `Config::from_env` reads on the
+/// next start as the RPC passthrough target, and `pairing.revoke` — the designated remedy for a
+/// compromised paired app — does not touch it. So the escalation delegates and is not revocable:
+/// after the call the attacker no longer needs the token.
+///
+/// The reach is wider than `chiaPeers.add`, which is already master tier for the same shape. The
+/// upstream is where every method this node does NOT implement is forwarded, and dig-node ships
+/// with it EMPTY precisely so an unimplemented method answers a truthful local `-32601` rather
+/// than something a third party made up. Pointing it at an attacker-controlled URL makes that
+/// whole surface answerable by the attacker.
+///
+/// # What is NOT here, judged rather than left unexamined (#255 item 2)
+///
+/// `control.cache.setCap` and `control.log.setLevel` also persist, and they also survive a
+/// revocation — so "outlives the token" alone would sweep them in. It is not the whole rule. The
+/// discriminating question is whether the surviving effect confers AUTHORITY: whether it installs
+/// a principal the node will thereafter believe, obey, or speak to.
+///
+/// - `chiaPeers.add` installs a peer believed WITHOUT corroboration — a principal. Master.
+/// - `config.setUpstream` installs a third party every unimplemented method is forwarded to — a
+///   principal. Master.
+/// - `cache.setCap` moves a local resource budget. It names nobody, is plainly visible on
+///   `control.cache.get`, and is reset through the same ordinary-tier door it was set through.
+///   Ordinary. (Promoting it would also break the cache-size control dig-app drives with a paired
+///   token, which is a real cost for no authority gained.)
+/// - `log.setLevel` changes local verbosity in a restricted-ACL log dir. It names nobody and
+///   confers nothing. Ordinary.
+///
+/// Stating the refinement as a rule — *outlives the token AND confers authority on a principal* —
+/// is what lets the NEXT method be judged instead of matched against these four by analogy.
+pub const LOCALLY_MASTER_TIER_CONTROL_METHODS: &[&str] = &["control.config.setUpstream"];
+
 pub fn requires_master_token(method: &str) -> bool {
     requires_master_token_given(method, KNOWN_UNPUBLISHED_CONTROL_METHODS)
 }
@@ -366,6 +425,13 @@ pub fn requires_master_token(method: &str) -> bool {
 /// this rule from the one it replaces, because both answer "master" there. Injecting the list is
 /// what makes the difference observable.
 fn requires_master_token_given(method: &str, exempt: &[&str]) -> bool {
+    // The overlay is applied FIRST and only ever widens the master set, so this predicate can
+    // never be looser than the contract's — a contract that later promotes the same method
+    // changes nothing here, and one that never does still cannot leave the capability reachable
+    // by a paired token.
+    if LOCALLY_MASTER_TIER_CONTROL_METHODS.contains(&method) {
+        return true;
+    }
     match ControlMethod::from_name(method) {
         Some(published) => published.requires_master_token(),
         None => !exempt.contains(&method),
@@ -429,11 +495,9 @@ pub fn control_token_remedy_for(path: &Path) -> String {
         Ok(_) => format!(
             "the presented control token was not accepted. Ensure the node and this command resolve the SAME state dir ({dir}) — if you set DIG_NODE_STATE_DIR it must match on both the node and this command."
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => format!(
-            "the node's control token at {} exists but is NOT readable by your account — the node runs as a service under a different account (Windows LocalSystem / a root daemon). Re-run this command elevated (Administrator on Windows, sudo on Unix), or reinstall the current dig-node so the service grants your account read access to {} (`dig-node uninstall` then an elevated `dig-node install`, then `dig-node start`).",
-            path.display(),
-            dir
-        ),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            permission_denied_remedy(path, &dir)
+        }
         // Absent (NotFound) — the node has not minted one here yet. Either it is not running,
         // or a STALE older build (installed before the machine-wide state dir) is running and
         // never mints the token at this path; reinstalling the current dig-node fixes the latter.
@@ -441,6 +505,56 @@ pub fn control_token_remedy_for(path: &Path) -> String {
             "no control token found at {}. Start the node so it mints one (`dig-node run`, or `dig-node start` for the installed service), then retry. If the service IS already running, it is likely a STALE older build — reinstall the current dig-node (`dig-node uninstall` then an elevated `dig-node install`, then `dig-node start`) so the running service mints the token here.",
             path.display()
         ),
+    }
+}
+
+/// The remedy for a control token that EXISTS but this account cannot read (dig-node#403).
+///
+/// The two platforms genuinely differ, and a single sentence covering both was false on one of
+/// them. On Windows the installer establishes an ACL that keeps an explicit read grant for the
+/// interactive install-user, so "reinstall and the service will grant your account read access"
+/// is accurate there. On Unix the `.deb` creates `/var/lib/dig-node` as `0700 root:root` with the
+/// token `0600 root:root`, and reinstalling changes NOTHING — an operator following that advice
+/// loops through an uninstall/install cycle and arrives back at the same denial.
+///
+/// # Why the fix is not to loosen the mode
+///
+/// The natural server shape — node as a system service, app as a user Agent — cannot read this
+/// file, and the tempting repairs both widen a privilege boundary. This token is the MASTER
+/// capability: it authorizes pairing administration (mint, list, revoke) and `chiaPeers.add`,
+/// which grants chain authority over the node's wallet replica. A `dig` group at `0640` hands
+/// that, permanently and to every future member, in exchange for a convenience; and it outlives
+/// the app that motivated it.
+///
+/// The node already has the right primitive for a client that cannot read a file: PAIRING
+/// ([`crate::pairing`]), built for exactly this and currently used by the MV3 extension. It
+/// yields a SCOPED, REVOCABLE per-client token that cannot mint or revoke pairings and cannot
+/// grant chain authority, gated on a local approval the operator performs once with the master
+/// token they already hold. The principal admitted is one approved client on this host, with
+/// mutation rights minus the master tier — strictly less than a group grant, and revocable
+/// without touching a file mode.
+fn permission_denied_remedy(path: &Path, dir: &str) -> String {
+    remedy_for_unreadable_token(path, dir, cfg!(unix))
+}
+
+/// The pure core of [`permission_denied_remedy`], with the platform as an ARGUMENT.
+///
+/// A `cfg!(unix)` branch is only ever exercised on the half of the fleet that compiles it, so the
+/// sentence shown to Ubuntu operators would be untested on the machine most likely to be running
+/// these tests. Passing the platform in makes both branches assertable everywhere.
+fn remedy_for_unreadable_token(path: &Path, dir: &str, unix: bool) -> String {
+    let elevated = format!(
+        "the node's control token at {} exists but is NOT readable by your account — the node runs as a service under a different account (Windows LocalSystem / a root daemon). Re-run this command elevated (Administrator on Windows, sudo on Unix)",
+        path.display()
+    );
+    if unix {
+        format!(
+            "{elevated}. For a program that must keep running as an ordinary user (the dig-app Agent on a server), do NOT widen the mode on this file — it is the master capability. Pair a scoped, revocable token for that client instead: `sudo dign pair` LISTS the pending requests and `sudo dign pair approve <pairing_id>` approves one -- the bare verb only lists, it approves nothing -- and the token the client receives cannot mint or revoke pairings and cannot grant chain authority. Revoke it any time with `sudo dign pair revoke <token_id>`."
+        )
+    } else {
+        format!(
+            "{elevated}, or reinstall the current dig-node so the service grants your account read access to {dir} (`dig-node uninstall` then an elevated `dig-node install`, then `dig-node start`)."
+        )
     }
 }
 
@@ -918,6 +1032,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.coinsByParent" => wallet_coins_by_parent(ctx, id, params).await,
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
+        "control.wallet.resetCoinDb" => wallet_reset_coin_db(ctx, id, params).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
         "control.wallet.watch" => wallet_watch(ctx, id, params).await,
         "control.wallet.unwatch" => wallet_unwatch(ctx, id, params),
@@ -1047,6 +1162,17 @@ fn config_set_upstream(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         );
     }
     let normalized = crate::config::normalize_upstream(upstream);
+    // An EMPTY normalized value is the documented "restore the default" request and is the one
+    // value that must not be validated as a URL.
+    if !normalized.is_empty() {
+        if let Err(why) = crate::config::validate_upstream(&normalized) {
+            return control_error(
+                id,
+                ErrorCode::InvalidParams,
+                format!("control.config.setUpstream: {why}"),
+            );
+        }
+    }
     match set_upstream_override(&ctx.config_path, &normalized) {
         Ok(()) => control_ok(
             id,
@@ -1203,7 +1329,13 @@ async fn hosted_pin(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 
     // Pre-fetch when we have a concrete root and §21 sync is available.
     let fetch = match (&root, ctx.sync_available) {
-        (Some(r), true) => match ctx.node.cache_fetch_and_cache(&store_id, r).await {
+        // `cache.pin` is an operator control verb, so its pre-fetch lands this operator's own
+        // content and stays bondable (dig-node#446 made the claim a required argument).
+        (Some(r), true) => match ctx
+            .node
+            .cache_fetch_and_cache(&store_id, r, dig_node_core::HolderClaim::Announce)
+            .await
+        {
             Ok((size_bytes, served_root)) => json!({
                 "status": "cached",
                 "size_bytes": size_bytes,
@@ -1453,7 +1585,12 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 
     // Rootless: the CHAIN picks the generation, never the serving upstream.
     let outcome = match &root {
-        Some(root) => ctx.node.cache_fetch_and_cache(&store_id, root).await,
+        // An operator-invoked control verb: this node's own capsule, bondable (dig-node#446).
+        Some(root) => {
+            ctx.node
+                .cache_fetch_and_cache(&store_id, root, dig_node_core::HolderClaim::Announce)
+                .await
+        }
         None => ctx.node.sync_whole_store(&store_id).await,
     };
 
@@ -1485,14 +1622,43 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 /// `pending` as JSON **numbers** fitting `u64` (a single address's balance can never exceed
 /// `u64::MAX` mojos, ~18.4M XCH), never JSON strings. Saturates rather than panicking on an
 /// implausible overflow, since a clamped-but-alive response beats a crashed RPC call.
-fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
+fn balance_wire(
+    r: &dig_wallet::sage::rpc::WalletBalanceResult,
+    network_peak: Option<u32>,
+) -> Value {
     json!({
         "balance": u64::try_from(r.balance).unwrap_or(u64::MAX),
         "pending": u64::try_from(r.pending).unwrap_or(u64::MAX),
         "source": r.source,
         "synced": r.synced,
         "peak_height": r.peak_height,
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
+}
+
+/// How many blocks behind the network THIS balance figure is, or `None` when that is UNKNOWN
+/// (dig-node#416).
+///
+/// # `None` is "cannot say", and it is NOT zero
+///
+/// A zero here is a positive claim — *this figure is as current as the network this node can
+/// see*. Absence is the opposite claim and a caller must render it differently, because the
+/// reading that motivated this field was `balance 0, synced false, peak_height null`: a figure
+/// with no freshness bound at all, which is indistinguishable from an empty wallet and was in
+/// fact produced by a replica ~8,380 blocks behind its own peers.
+///
+/// So both inputs must be present for a number to be produced. A missing answer height means
+/// nothing bounds the figure; a missing network peak means no held Chia peer has announced one,
+/// so the node has nothing to measure itself against.
+///
+/// # Saturating, because a replica AHEAD of its peers is not "very stale"
+///
+/// A replica momentarily past the peak its peers last announced would otherwise underflow into a
+/// huge gap and report a healthy node as catastrophically behind. Saturating to `0` says the
+/// truthful thing: nothing known puts this figure behind the network.
+fn stale_by(answer_height: Option<u32>, network_peak: Option<u32>) -> Option<u32> {
+    Some(network_peak?.saturating_sub(answer_height?))
 }
 
 /// `control.wallet.balance` (#1851) — the READ-ONLY balance of a PUBLIC address, for XCH or
@@ -1532,8 +1698,18 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         Err(e) => return e,
     };
 
+    // The peers' announced peak is read SEPARATELY and is allowed to fail: it makes the answer's
+    // staleness legible, and losing it must degrade the answer to "cannot say how stale" rather
+    // than failing a balance read that otherwise succeeded.
+    let network_peak = ctx
+        .wallet
+        .wallet_sync_status()
+        .await
+        .ok()
+        .and_then(|s| s.chia_peer_peak_height);
+
     match ctx.wallet.balance_for_address(address, asset).await {
-        Ok(r) => control_ok(id, balance_wire(&r)),
+        Ok(r) => control_ok(id, balance_wire(&r, network_peak)),
         Err(BalanceError::InvalidAddress) => control_error(
             id,
             ErrorCode::InvalidParams,
@@ -2220,6 +2396,89 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 /// rather than one field — the #2609 regression. A new phase is published in that crate FIRST and
 /// emitted here second; `every_phase_the_node_can_emit_is_declared_by_the_published_contract`
 /// enforces the ordering.
+/// `control.wallet.resetCoinDb` (dig-node#384) — **DESTRUCTIVE.** Drop the cached coin database
+/// and force a re-sync from chain.
+///
+/// # Why it exists, given that attribution self-repairs
+///
+/// `reconstruct_all` walks every coin and repairs unattributed ones on the next tick, so a merely
+/// STALE database needs no reset. The case that does is narrower and permanent: a coin whose
+/// parent spend could not be fetched — an unreachable source, a transient failure, a pruned
+/// response — is skipped silently and **never re-queued**. Its asset never resolves and its value
+/// never appears in an asset-scoped balance, for the life of the file. Until this method the only
+/// recovery was deleting the database by hand.
+///
+/// # Not an open read; PAIRED tier, and that is a deliberate choice
+///
+/// Absent from [`is_open_control_read`], so it takes a control-plane token, and the node binds
+/// loopback-only — a caller on another machine cannot reach it. **The one exception is an operator
+/// who sets `DIG_NODE_ALLOW_REMOTE=1`**, which widens every privileged method at once; not specific
+/// to this one, but stated here because this method destroys state.
+///
+/// It sits on the PAIRED tier rather than the master tier, via
+/// [`KNOWN_UNPUBLISHED_CONTROL_METHODS`]. The master tier is tempting for a destructive method and
+/// is the WRONG answer here: dig-node#384 exists to put a reset button in the DIG App, and the App
+/// holds a paired token. Master-tiering it would make the feature unreachable by the only consumer
+/// it was built for — a guard so tight it removes the capability is not a guard, it is a deletion.
+///
+/// What actually bounds the damage is the combination this method does enforce: loopback-only, a
+/// token, an explicit `confirm: true` on the wire, a refusal while any spend is in flight, and a
+/// blast radius that contains no key material and nothing a re-sync cannot rebuild.
+///
+/// # `confirm: true` is required
+///
+/// A destructive method that runs on an empty parameter object is one keystroke from a wiped
+/// cache. The flag travels on the WIRE rather than being asserted in the CLI, so every client
+/// faces the gate — a guard only the CLI applies is not a guard.
+///
+/// # What it never touches
+///
+/// Key material. Every table it clears is chain-derived and reproduced by syncing; a seed is not.
+/// See [`dig_wallet::sage::db::WalletDb::reset_chain_cache`] for the table list, for why the
+/// authoritative flag is cleared in the SAME transaction, and for the in-flight-spend refusal.
+async fn wallet_reset_coin_db(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    if params.get("confirm").and_then(Value::as_bool) != Some(true) {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            concat!(
+                "control.wallet.resetCoinDb is DESTRUCTIVE: it discards this node's cached ",
+                "coin database and re-syncs from chain. Pass params.confirm = true to ",
+                "proceed. No key material is affected."
+            ),
+        );
+    }
+
+    // The node's own clock. A caller-supplied instant would be a lapse oracle: a far-future value
+    // makes every live spend reservation read as expired, which is exactly the guard being asked
+    // to stand down.
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX);
+
+    match ctx.wallet.reset_coin_db(now_ms).await {
+        Ok(Ok(report)) => control_ok(
+            id,
+            json!({
+                "coins_dropped": report.coins_dropped,
+                "staged_dropped": report.staged_dropped,
+            }),
+        ),
+        // A refusal is an ERROR, not a success with a flag. A caller that ignored a
+        // `refused: true` field would read "your cache was reset" and act on it.
+        Ok(Err(refusal)) => control_error(id, ErrorCode::InvalidParams, refusal.to_string()),
+        Err(e) => control_error(
+            id,
+            ErrorCode::WalletReadFailed,
+            format!("control.wallet.resetCoinDb: the reset could not be applied: {e}"),
+        ),
+    }
+}
+
 async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
     match ctx.wallet.wallet_sync_status().await {
         Ok(s) => control_ok(
@@ -2515,9 +2774,15 @@ async fn dig_peer_status(ctx: &ControlCtx) -> Option<Value> {
 ///
 /// # A refusal is a RESULT
 ///
-/// A mempool that examined the bundle and refused it answers `{accepted:false, rejection}` with a
-/// `200`. Failing to REACH a mempool is an error. Collapsing the two turns "your wifi dropped" into
-/// "your mint failed", and the remedies are opposite.
+/// A mempool that examined the bundle and refused it answers `{accepted:false, verdict}` with a
+/// `200`, and `rejection` too WHEN IT STATED A REASON. Failing to REACH a mempool is an error.
+/// Collapsing the two turns "your wifi dropped" into "your mint failed", and the remedies are
+/// opposite.
+///
+/// `rejection` is deliberately absent for a bare verdict, because it is what dig-node#348's hold
+/// keys on: a refusal the mempool did not explain may still be in flight, so its inputs stay held.
+/// `verdict` carries the node's label (`PENDING`, `FAILED`) regardless, so an operator debugging a
+/// stuck broadcast is never left with three nulls and no label.
 async fn wallet_broadcast(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     use dig_wallet::sage::rpc::PushError;
 
@@ -2535,6 +2800,7 @@ async fn wallet_broadcast(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
             json!({
                 "accepted": outcome.accepted,
                 "transaction_id": outcome.transaction_id,
+                "verdict": outcome.verdict,
                 "rejection": outcome.rejection,
             }),
         ),
@@ -2706,7 +2972,13 @@ const _: () = assert!(
 fn reserve_batch_refusal(len: usize) -> Option<String> {
     (len > MAX_RESERVE_COIN_IDS).then(|| {
         format!(
-            "params.coin_ids holds {len} ids, above the {MAX_RESERVE_COIN_IDS} this node will              reserve in one call. Split the request; a bundle that legitimately needs more inputs              than this could not fit in a block anyway"
+            concat!(
+                "params.coin_ids holds {len} ids, above the {MAX_RESERVE_COIN_IDS} this ",
+                "node will reserve in one call. Split the request; a bundle that ",
+                "legitimately needs more inputs than this could not fit in a block anyway"
+            ),
+            len = len,
+            MAX_RESERVE_COIN_IDS = MAX_RESERVE_COIN_IDS
         )
     })
 }
@@ -3458,6 +3730,29 @@ fn collateral_requirement(id: Value) -> Value {
 /// `Withheld` is the one row that describes a capsule relayed on a stranger's behalf, deliberately
 /// never advertised and therefore never bonded, so it locks nothing.
 ///
+/// # `Disabled` IS counted, and `Reclaiming` is too (dig-node#429)
+///
+/// Both look excludable and neither is, for the same reason: this is FORWARD-LOOKING advice about
+/// $DIG the operator must keep available, not a report of $DIG currently locked.
+///
+/// `Withheld` is a property of the CAPSULE - held on a stranger's behalf - and no setting makes a
+/// relayed capsule bondable, so its pair will never consume collateral and advising for it is
+/// advising for a spend that cannot occur.
+///
+/// `Disabled` is a node-wide SWITCH (SPEC 25.7), and every row reads `Disabled` while it is off.
+/// Were it excluded, the buffer advice would fall to zero for the whole node the moment
+/// collateralisation is switched off and leap back the moment it is switched on - telling an
+/// operator who is about to enable it that they need nothing, and stranding them short on the very
+/// next pass. Under-stating money the operator must hold is the reassuring direction, and it is the
+/// one direction a figure like this must never be wrong in.
+///
+/// `Reclaiming` is money in motion whose capsule is still served: at an epoch rollover the coin
+/// comes home and the SAME pair is bonded again next epoch, so the buffer it needs is unchanged.
+///
+/// So the exclusion is not "states where no coin exists right now" - `Unfunded` and `Deferred` have
+/// no coin either and are plainly counted. It is "pairs this node will never bond", which today is
+/// exactly `Withheld`.
+///
 /// Named and separated from [`collateral_buffer`] so the distinction is testable without a state
 /// directory: the caller feeds this into an amount of money, and a count that quietly includes rows
 /// locking nothing is a wrong figure on a money surface rather than a wrong figure about rows.
@@ -3799,6 +4094,22 @@ mod tests {
                         amount_dig_base_units: 1_000,
                     },
                 ),
+                // dig-node#429: switched off node-wide, and STILL bondable. A switch is not a
+                // property of the capsule; flip it and this pair locks collateral on the next pass.
+                (
+                    Bond::new("ff".repeat(32), "55".repeat(32)),
+                    BondState::Disabled,
+                ),
+                // Money in motion on a pair that is still served: the coin comes home at rollover
+                // and the same pair is bonded again, so the buffer it needs is unchanged.
+                (
+                    Bond::new("ab".repeat(32), "66".repeat(32)),
+                    BondState::Reclaiming {
+                        coin_id: "cd".repeat(32),
+                        epoch: 4,
+                        amount_dig_base_units: 1_000,
+                    },
+                ),
             ],
             locked_dig_base_units: 1_000,
             epoch: 4,
@@ -3806,14 +4117,59 @@ mod tests {
 
         assert_eq!(
             observation.states.len(),
-            4,
+            6,
             "the fixture must carry a row the answer EXCLUDES, or it cannot tell the contract from \
              a plain row count"
         );
         assert_eq!(
             bondable_pairs(&observation),
-            3,
-            "a `Withheld` row locks nothing and is not bondable; the other three are"
+            5,
+            "only `Withheld` is excluded: `Disabled` is a reversible node-wide switch and `Reclaiming` is a served pair whose coin is coming home, and both bond again next pass"
+        );
+    }
+
+    /// **Proves:** dig-node#429's contract question from the side that fails dangerously - a node
+    /// with collateralisation switched OFF still advises the buffer its pairs will need.
+    ///
+    /// **Catches:** excluding `Disabled` alongside `Withheld`, which is the plausible reading of
+    /// the exclusion's own doc and the one this ticket was opened to settle. The mixed fixture
+    /// above does detect that mistake as a count, but it cannot show the CONSEQUENCE, which is why
+    /// this case exists separately: when the switch is off, EVERY row is `Disabled`, so excluding
+    /// the state answers **zero** and tells a funded operator who is about to re-enable that they
+    /// need no $DIG at all.
+    ///
+    /// A `Withheld` row rides along as the control. Without it this fixture would also pass under
+    /// "count every row", which is not the contract either.
+    #[test]
+    fn a_node_with_collateralisation_switched_off_still_advises_for_the_pairs_it_will_bond() {
+        use crate::mirror::pass::BondState;
+        use crate::mirror::plan::Bond;
+        use crate::mirror::states::BondObservation;
+
+        let observation = BondObservation {
+            states: vec![
+                (
+                    Bond::new("aa".repeat(32), "11".repeat(32)),
+                    BondState::Disabled,
+                ),
+                (
+                    Bond::new("bb".repeat(32), "22".repeat(32)),
+                    BondState::Disabled,
+                ),
+                // The control: a relayed capsule is not bondable whatever the switch says.
+                (
+                    Bond::new("cc".repeat(32), "33".repeat(32)),
+                    BondState::Withheld,
+                ),
+            ],
+            locked_dig_base_units: 0,
+            epoch: 4,
+        };
+
+        assert_eq!(
+            bondable_pairs(&observation),
+            2,
+            "switching collateralisation off must not advise a zero buffer: the switch is reversible and these pairs lock $DIG on the pass after it is switched back on"
         );
     }
 
@@ -3992,7 +4348,10 @@ mod tests {
         );
         assert!(
             !is_open_control_read("control.wallet.arrivals"),
-            "the arrival cursor names this node's own watched puzzle hashes to a caller that              supplied nothing, so it must stay behind the control token"
+            concat!(
+                "the arrival cursor names this node's own watched puzzle hashes to a caller ",
+                "that supplied nothing, so it must stay behind the control token"
+            )
         );
     }
 
@@ -5278,6 +5637,10 @@ mod tests {
             "control.pairing.revoke",
             "control.chiaPeers.add",
             "control.chiaPeers.remove",
+            // Master tier HERE ahead of the contract (dig-node#255): it persists a caller-chosen
+            // third party the node forwards every unimplemented method to, and it survives
+            // `pairing.revoke`. See LOCALLY_MASTER_TIER_CONTROL_METHODS.
+            "control.config.setUpstream",
         ]
         .into_iter()
         .collect();
@@ -5294,9 +5657,18 @@ mod tests {
             .map(|m| m.name())
             .filter(|n| CONTROL_METHODS.contains(n))
             .collect();
+        let overlay: BTreeSet<&str> = LOCALLY_MASTER_TIER_CONTROL_METHODS
+            .iter()
+            .copied()
+            .collect();
         assert_eq!(
-            actual, contract,
-            "this node's master tier disagrees with dig-node-control-interface"
+            actual,
+            contract.union(&overlay).copied().collect::<BTreeSet<_>>(),
+            "this node's master tier disagrees with dig-node-control-interface plus the declared              local overlay"
+        );
+        assert!(
+            contract.is_subset(&actual),
+            "the overlay may only WIDEN the contract's master set, never narrow it"
         );
     }
 
@@ -5576,54 +5948,135 @@ mod tests {
     fn token_mint_fails_closed_when_it_cannot_be_persisted() {
         // A path whose parent is a FILE, so `ensure_dir_restricted` / write cannot
         // create the token → `generate_token()?` / `write` returns Err, never a token.
-        let file = std::env::temp_dir().join(format!(
-            "dig-node-failclosed-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        // The scratch tree is owned by the guard (dig-node#370); the fixture the test needs
+        // is a regular FILE inside it, standing in for the non-directory parent.
+        let scratch = tempfile::Builder::new()
+            .prefix("dig-node-failclosed-")
+            .tempdir()
+            .expect("a scratch dir");
+        let file = scratch.path().join("not-a-dir");
         std::fs::write(&file, b"not a dir").unwrap();
         let bogus = file.join("sub").join(CONTROL_TOKEN_FILE);
         assert!(
             load_or_create_token_at(&bogus).is_err(),
             "must fail closed (propagate), never return a usable token when it cannot mint+persist"
         );
-        let _ = std::fs::remove_file(&file);
+    }
+
+    /// **Proves (dig-node#255):** a PAIRED token cannot reach `control.config.setUpstream`, while
+    /// the ordinary-tier methods it legitimately drives stay reachable.
+    ///
+    /// The escalation this closes delegates and is NOT revocable: the value persists into
+    /// `config.json`, `Config::from_env` reads it on the next start as the RPC passthrough target,
+    /// and `pairing.revoke` — the operator's designated remedy — does not touch it. So the
+    /// attacker stops needing the token the moment the call returns.
+    ///
+    /// The ordinary-tier half is the control. Without it, an implementation that answered "master"
+    /// for EVERY `control.*` method would pass the first assertion while breaking every paired
+    /// client, and the test could not tell the two apart.
+    #[test]
+    fn a_paired_token_cannot_set_the_rpc_upstream_but_still_drives_ordinary_config() {
+        assert!(
+            requires_master_token("control.config.setUpstream"),
+            "setUpstream persists a caller-chosen third party the node forwards to, and survives \
+             pairing.revoke"
+        );
+
+        for ordinary in [
+            "control.config.get",
+            "control.cache.setCap",
+            "control.log.setLevel",
+            "control.cache.get",
+            "control.status",
+        ] {
+            assert!(
+                !requires_master_token(ordinary),
+                "{ordinary} confers no authority over a principal and must stay paired-reachable"
+            );
+        }
+    }
+
+    /// **Proves:** the local master-tier overlay is a BRIDGE, not a second opinion — every member
+    /// is a capability the published contract has not classified yet.
+    ///
+    /// This is what makes the overlay self-retiring. When `dig-node-control-interface` promotes
+    /// `control.config.setUpstream`, this test fails and the entry must be deleted, so the repo
+    /// cannot end up with two disagreeing statements of the same tier — which is the byte-drift
+    /// bug that produced this whole family (#254 item 1).
+    #[test]
+    fn locally_master_tier_methods_are_still_unclassified_by_the_contract() {
+        for method in LOCALLY_MASTER_TIER_CONTROL_METHODS {
+            let published = ControlMethod::from_name(method)
+                .unwrap_or_else(|| panic!("{method} must be a published control method"));
+            assert!(
+                !published.requires_master_token(),
+                "the contract now puts {method} on the master tier; DELETE it from \
+                 LOCALLY_MASTER_TIER_CONTROL_METHODS so there is one rule rather than two"
+            );
+        }
+    }
+
+    /// **Proves:** the overlay can only WIDEN the master set — it never demotes a capability the
+    /// contract already protects.
+    ///
+    /// Asserted over the whole published method list rather than over the overlay, because the
+    /// failure being excluded is one the overlay's own contents cannot exhibit.
+    #[test]
+    fn the_overlay_never_demotes_a_contract_master_method() {
+        for method in CONTROL_METHODS {
+            if let Some(published) = ControlMethod::from_name(method) {
+                if published.requires_master_token() {
+                    assert!(
+                        requires_master_token(method),
+                        "{method} is master tier in the contract and must remain so here"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn load_or_create_token_persists_and_is_stable() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         let first = load_or_create_token_at(&path).unwrap();
         let second = load_or_create_token_at(&path).unwrap();
         assert_eq!(first, second, "token must be stable across reads");
         assert_eq!(first.len(), 64);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// SECURITY (#501 residual): a pre-existing control-token file that is NOT owned by a
-    /// trusted principal (here forced group/other-readable, so not owner-only) MUST be DELETED
-    /// and REGENERATED — never returned — so a planted/squatted token can never become the
-    /// trusted one (which would hand an attacker full local node control). Unix-gated: it
-    /// relies on mode bits (CI runs on Linux). Skipped when running as root, where a
-    /// root-owned file is legitimately trusted regardless of mode.
+    /// SECURITY (#501 residual, dig-node#355): a pre-existing control-token file that is NOT
+    /// owned by a trusted principal MUST be DELETED and REGENERATED — never returned — so a
+    /// planted/squatted token can never become the trusted one (which would hand an attacker
+    /// full local node control).
+    ///
+    /// # Why this test has two branches instead of one branch and a hole
+    ///
+    /// It used to put EVERY assertion inside `if !running_as_root`, so under root it built the
+    /// fixture, called the function, checked nothing, and printed `ok`. CI containers commonly
+    /// run as root, so the one test standing between a planted token and full local node control
+    /// had plausibly never executed an assertion.
+    ///
+    /// Under root the MODE is genuinely not the discriminator — `unix_token_owner_is_trusted`
+    /// trusts any root-owned file, whatever its bits — but OWNERSHIP still is. So the root branch
+    /// chowns a second fixture to a foreign uid (which only root can do) and asserts THAT one is
+    /// regenerated. Both branches therefore exercise the guard, and deleting the guard fails this
+    /// test whichever uid runs it.
     #[cfg(unix)]
     #[test]
     fn foreign_owned_token_file_is_regenerated_not_trusted() {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-untrusted-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-untrusted-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         std::fs::create_dir_all(&dir).unwrap();
         let planted = "planted0".repeat(8); // a KNOWN 64-char attacker value (non-empty)
         std::fs::write(&path, &planted).unwrap();
@@ -5632,7 +6085,44 @@ mod tests {
             .map(|m| m.uid() == 0)
             .unwrap_or(false);
         let got = load_or_create_token_at(&path).unwrap();
-        if !running_as_root {
+
+        if running_as_root {
+            // The carve-out, stated as an assertion rather than as a skip: a root-owned file is
+            // written by a trusted principal, so it is kept as-is even at 0644.
+            assert_eq!(
+                got, planted,
+                "a root-owned token is trusted regardless of mode; it must not be regenerated"
+            );
+
+            // The real second case. Only root can hand a file to another uid, which is exactly
+            // the planting an unprivileged attacker would have to achieve — and it is what the
+            // guard exists to refuse.
+            let foreign = dir.path().join("foreign").join(CONTROL_TOKEN_FILE);
+            std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+            std::fs::write(&foreign, &planted).unwrap();
+            std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o600)).unwrap();
+            const FOREIGN_UID: u32 = 65534; // `nobody` on every mainstream distro
+            std::os::unix::fs::chown(&foreign, Some(FOREIGN_UID), None).expect(
+                "root must be able to chown the fixture; without it this branch proves nothing",
+            );
+            assert_eq!(
+                std::fs::metadata(&foreign).unwrap().uid(),
+                FOREIGN_UID,
+                "the fixture must actually be foreign-owned before the assertion below means anything"
+            );
+
+            let from_foreign = load_or_create_token_at(&foreign).unwrap();
+            assert_ne!(
+                from_foreign, planted,
+                "a foreign-uid token must be regenerated, not returned — deleting the trust check \
+                 makes this equal the planted value"
+            );
+            assert_eq!(
+                from_foreign.len(),
+                64,
+                "the regenerated token is a fresh 64-hex value"
+            );
+        } else {
             assert_ne!(
                 got, planted,
                 "an untrusted (group-readable) token must be regenerated, not returned"
@@ -5649,7 +6139,46 @@ mod tests {
                 "the regenerated token must be owner-only 0600 (got {mode:o})"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The trust RULE itself, asserted independently of whichever uid the suite happens to run
+    /// as (dig-node#355).
+    ///
+    /// [`crate::state::unix_token_owner_is_trusted`] is pure, so it can be interrogated for the
+    /// foreign-owner case on a root runner and the root case on an unprivileged one. A
+    /// filesystem test can only ever see the cases its runner's privileges permit; this one sees
+    /// all of them, and it fails the moment the rule is relaxed.
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_token_trust_rule_refuses_a_foreign_owner_at_every_mode() {
+        use crate::state::unix_token_owner_is_trusted;
+
+        for mode in [0o600, 0o644, 0o666, 0o400] {
+            assert!(
+                !unix_token_owner_is_trusted(4242, mode, 1000),
+                "a token owned by uid 4242 must never be trusted by uid 1000 (mode {mode:o})"
+            );
+            assert!(
+                !unix_token_owner_is_trusted(4242, mode, 0),
+                "a foreign-owned token must not become trusted merely because WE are root \
+                 (mode {mode:o})"
+            );
+            assert!(
+                unix_token_owner_is_trusted(0, mode, 1000),
+                "a root-owned token is written by a trusted principal (mode {mode:o})"
+            );
+        }
+
+        assert!(
+            unix_token_owner_is_trusted(1000, 0o600, 1000),
+            "our own owner-only token is trusted"
+        );
+        for loose in [0o601, 0o640, 0o604, 0o660] {
+            assert!(
+                !unix_token_owner_is_trusted(1000, loose, 1000),
+                "our own token must be owner-only; {loose:o} lets another local user read it"
+            );
+        }
     }
 
     /// A trusted (owner-only `0600`, current-user-owned) pre-existing token is loaded AS-IS —
@@ -5658,13 +6187,12 @@ mod tests {
     #[test]
     fn trusted_owner_only_token_file_is_kept() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-trusted-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-trusted-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         std::fs::create_dir_all(&dir).unwrap();
         let existing = "a".repeat(64);
         std::fs::write(&path, &existing).unwrap();
@@ -5674,7 +6202,6 @@ mod tests {
             got, existing,
             "a trusted owner-only token must be loaded as-is, not regenerated"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SECURITY (#501): the control token grants full local control, so the created
@@ -5686,13 +6213,12 @@ mod tests {
     #[test]
     fn created_token_file_is_not_world_or_group_readable() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-perms-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-perms-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         load_or_create_token_at(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -5700,12 +6226,62 @@ mod tests {
             0,
             "token must have NO group/other permission bits (got {mode:o})"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The remedy hint names the concrete token path and, when the token is absent from
     /// the caller's perspective, tells them to start the node — never the old generic
     /// "<config_dir>" wording.
+    #[test]
+    /// dig-node#403 -- the unreadable-token remedy must not promise a grant the platform never
+    /// performs. On Unix the `.deb` leaves the token 0600 root:root and reinstalling changes
+    /// nothing, so the reinstall clause sent an operator round a loop that cannot succeed.
+    ///
+    /// Asserted BOTH ways rather than only on the presence of the new advice: a remedy that
+    /// appended the pairing sentence while keeping the false reinstall clause reads as fixed and
+    /// still contains the dead end.
+    fn the_unreadable_token_remedy_offers_a_scoped_credential_not_a_wider_file() {
+        let path = Path::new("/var/lib/dig-node/control-token");
+        let unix = remedy_for_unreadable_token(path, "/var/lib/dig-node", true);
+        let windows = remedy_for_unreadable_token(path, "/var/lib/dig-node", false);
+
+        assert!(unix.contains("elevated"), "{unix}");
+        // The APPROVING verb, in full. `contains("dign pair")` is satisfied by every WRONG
+        // string as its own substring -- including the one this row was rewritten to catch,
+        // which claimed a bare `sudo dign pair` "approves the client's pending request" while
+        // `entrypoint.rs` maps a bare `pair` to `PairAction::List`. A remedy that names a verb
+        // which does not approve is the same dead end the reinstall clause was.
+        assert!(
+            unix.contains("`sudo dign pair approve <pairing_id>`"),
+            "the remedy must name the verb that actually approves: {unix}"
+        );
+        // Fails if the verb reverts. The row above passes on any string containing the correct
+        // command, including one that ALSO reasserts the false claim beside it; this one is
+        // one-sided against the specific wrong attribution, so the two cannot both be vacuous.
+        assert!(
+            !unix.contains("`sudo dign pair` approves"),
+            "the bare verb only lists; attributing approval to it is the dead end: {unix}"
+        );
+        assert!(
+            unix.contains("revoke"),
+            "a grant with no stated revocation is a permanent one: {unix}"
+        );
+        assert!(
+            !unix.contains("uninstall"),
+            "reinstalling does not grant read access on Unix; advising it is the dead end: {unix}"
+        );
+
+        // Windows genuinely DOES keep an explicit read grant for the interactive install-user,
+        // so its reinstall clause is accurate and must survive. This is the truthful control: a
+        // fix that simply deleted the clause everywhere would pass the Unix assertions alone.
+        assert!(windows.contains("uninstall"), "{windows}");
+
+        // Never, on either platform, advise widening the mode of the master capability.
+        for r in [&unix, &windows] {
+            assert!(!r.contains("chmod"), "{r}");
+            assert!(!r.contains("0640"), "{r}");
+        }
+    }
+
     #[test]
     fn control_token_remedy_names_a_concrete_path() {
         let remedy = control_token_remedy();
@@ -5728,20 +6304,18 @@ mod tests {
     /// the token); a fresh mint must always be readable at its own path.
     #[test]
     fn service_mint_then_cli_read_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-roundtrip-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-roundtrip-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         let minted = load_or_create_token_at(&path).unwrap();
         let read_back = read_token_readonly_at(&path).unwrap();
         assert_eq!(
             minted, read_back,
             "the CLI read must return the exact token the service minted"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #856 mint-on-startup guarantee: minting on a PRE-EXISTING (already-created, tokenless)
@@ -5750,15 +6324,14 @@ mod tests {
     /// half-hardened/recreated dir in place and always converging to a minted token.
     #[test]
     fn mint_on_a_pre_existing_dir_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-mint-idempotent-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-mint-idempotent-")
+            .tempdir()
+            .expect("a scratch dir");
         // The dir pre-exists but holds NO token (a freshly (re)created state dir).
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(CONTROL_TOKEN_FILE);
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         assert!(!path.exists(), "precondition: the dir starts tokenless");
 
         let first = load_or_create_token_at(&path).unwrap();
@@ -5770,20 +6343,18 @@ mod tests {
             first, second,
             "mint-on-startup must be idempotent — a re-secure of an existing dir keeps the token"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A genuinely-absent token reads as `NotFound` with the "no control token found" remedy that
     /// now ALSO names the stale-service reinstall recovery (#772).
     #[test]
     fn read_readonly_reports_absent_token_as_not_found() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-absent-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-absent-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         let err = read_token_readonly_at(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         let msg = err.to_string();
@@ -5802,18 +6373,25 @@ mod tests {
     #[test]
     fn unreadable_token_maps_to_permission_denied_not_not_found() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-token-denied-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let path = dir.join(CONTROL_TOKEN_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-token-denied-")
+            .tempdir()
+            .expect("a scratch dir");
+        let path = dir.path().join(CONTROL_TOKEN_FILE);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "a".repeat(64)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let running_as_root = std::fs::read_to_string(&path).is_ok();
-        if !running_as_root {
+        if running_as_root {
+            // Root reads through mode `000`, so `PermissionDenied` is unreachable here. Assert
+            // the complementary observable instead of skipping (dig-node#355): the token is
+            // returned, and in particular the classifier does NOT invent the misleading
+            // `NotFound` for a file that is plainly present.
+            let got = read_token_readonly_at(&path)
+                .expect("root reads through mode 000; the reader must return the token");
+            assert_eq!(got, "a".repeat(64), "the token is returned verbatim");
+        } else {
             let err = read_token_readonly_at(&path).unwrap_err();
             assert_eq!(
                 err.kind(),
@@ -5826,7 +6404,6 @@ mod tests {
             );
         }
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5844,13 +6421,12 @@ mod tests {
 
     #[test]
     fn pin_registry_roundtrips_and_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-pins-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let config_path = dir.join("config.json");
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-pins-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let config_path = dir.path().join("config.json");
         let store = "c".repeat(64);
         let root = "d".repeat(64);
 
@@ -5867,20 +6443,18 @@ mod tests {
         assert!(read_pins_from(&config_path).is_empty());
         // Removing an absent pin is a no-op false.
         assert!(!remove_pin(&config_path, &store).unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn update_config_preserves_dig_node_keys() {
         // This service's pin/upstream writes must NOT clobber dig-node's own keys
         // in the shared config.json (cache_cap_bytes, wc_project_id).
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-config-merge-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let config_path = dir.join("config.json");
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-config-merge-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let config_path = dir.path().join("config.json");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             &config_path,
@@ -5899,18 +6473,16 @@ mod tests {
         assert_eq!(v["wc_project_id"], json!("abc"), "dig-node key preserved");
         assert_eq!(v["pinned_stores"][0]["store_id"], json!(store));
         assert_eq!(v["upstream_override"], json!("https://example.test"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn upstream_override_roundtrips_and_clears() {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-upstream-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let config_path = dir.join("config.json");
-        let _ = std::fs::remove_dir_all(&dir);
+        // Owned by the guard: removed on drop and on an unwind (dig-node#370).
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-upstream-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let config_path = dir.path().join("config.json");
         assert_eq!(read_upstream_override_from(&config_path), None);
         set_upstream_override(&config_path, "https://up.test").unwrap();
         assert_eq!(
@@ -5920,7 +6492,6 @@ mod tests {
         // Blank clears it.
         set_upstream_override(&config_path, "  ").unwrap();
         assert_eq!(read_upstream_override_from(&config_path), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (#1851 leg-2) `control.wallet.balance` MUST emit `balance`/`pending` as JSON **numbers**,
@@ -5947,13 +6518,14 @@ mod tests {
             synced: true,
             peak_height: Some(42),
         };
-        let emitted = balance_wire(&r);
+        let emitted = balance_wire(&r, None);
 
         // Golden shape: numeric, not string.
         assert_eq!(
             emitted,
             json!({
                 "balance": 12345u64, "pending": 6u64,
+                "network_peak_height": Value::Null, "stale_by": Value::Null,
                 "source": "db", "synced": true, "peak_height": 42
             }),
         );
@@ -5989,7 +6561,7 @@ mod tests {
             synced: false,
             peak_height: None,
         };
-        let emitted = balance_wire(&r);
+        let emitted = balance_wire(&r, None);
         assert_eq!(emitted["balance"], json!(u64::MAX));
     }
 
@@ -6011,19 +6583,106 @@ mod tests {
         }
 
         for (source, wire) in [(Source::Db, "db"), (Source::Fallback, "fallback")] {
-            let emitted = balance_wire(&WalletBalanceResult {
-                balance: 1,
-                pending: 0,
-                source,
-                synced: source == Source::Db,
-                peak_height: None,
-            });
+            let emitted = balance_wire(
+                &WalletBalanceResult {
+                    balance: 1,
+                    pending: 0,
+                    source,
+                    synced: source == Source::Db,
+                    peak_height: None,
+                },
+                None,
+            );
             assert_eq!(emitted["source"], json!(wire));
 
             let old: OldConsumer = serde_json::from_value(emitted)
                 .expect("a consumer unaware of `source` must still parse");
             assert_eq!(old.balance, 1);
             assert_eq!(old.synced, source == Source::Db);
+        }
+    }
+
+    /// dig-node#416: an UNKNOWN staleness and a staleness of ZERO must not emit the same wire
+    /// value, because they are opposite claims — "nothing bounds this figure" versus "this
+    /// figure is level with the network".
+    ///
+    /// The fixture is built from the measured reading that motivated the ticket (a replica
+    /// 8,380 blocks behind its peers) plus two CONTROLS in the same test: a level replica, and
+    /// a replica whose peers have announced nothing. A test asserting only the stale case would
+    /// pass against an implementation that reported every answer as stale.
+    #[test]
+    fn stale_by_distinguishes_an_unknown_gap_from_a_zero_gap() {
+        // Measured case: the replica named a height, the peers named a higher one.
+        assert_eq!(stale_by(Some(9_211_798), Some(9_220_177)), Some(8_379));
+        // Control 1 — level: a real claim of currency, spelled as a number.
+        assert_eq!(stale_by(Some(9_220_177), Some(9_220_177)), Some(0));
+        // Control 2 — no peer has announced a peak: the node cannot measure itself.
+        assert_eq!(stale_by(Some(9_211_798), None), None);
+        // Control 3 — the answer carries no height (the `peak_height: null` fallback answer
+        // from the ticket): nothing bounds the figure, whatever the network peak is.
+        assert_eq!(stale_by(None, Some(9_220_177)), None);
+        // A replica momentarily ahead reports "not behind", never an underflowed huge gap.
+        assert_eq!(stale_by(Some(9_220_178), Some(9_220_177)), Some(0));
+    }
+
+    /// dig-node#416: the wire carries the gap and the network peak, and both are ADDITIVE —
+    /// the exact reading from the ticket (`balance 0, synced false, peak_height null`) now
+    /// leaves a consumer able to tell "the wallet is empty" from "this node cannot see".
+    #[test]
+    fn balance_wire_carries_the_staleness_gap_additively() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::WalletBalanceResult;
+
+        #[derive(serde::Deserialize)]
+        struct OldConsumer {
+            balance: u64,
+        }
+
+        // The ticket's reading: a zero that is NOT an answer.
+        let unknown = balance_wire(
+            &WalletBalanceResult {
+                balance: 0,
+                pending: 0,
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            Some(9_220_177),
+        );
+        assert_eq!(unknown["stale_by"], json!(null));
+        assert_eq!(unknown["network_peak_height"], json!(9_220_177));
+
+        // A stale-but-bounded DB answer: a real figure as of a named height, 8,380 behind.
+        let stale = balance_wire(
+            &WalletBalanceResult {
+                balance: 0,
+                pending: 0,
+                source: Source::Db,
+                synced: false,
+                peak_height: Some(9_211_798),
+            },
+            Some(9_220_177),
+        );
+        assert_eq!(stale["stale_by"], json!(8_379));
+
+        // Control: a level, synced answer emits a zero gap — distinguishable from the null above.
+        let level = balance_wire(
+            &WalletBalanceResult {
+                balance: 0,
+                pending: 0,
+                source: Source::Db,
+                synced: true,
+                peak_height: Some(9_220_177),
+            },
+            Some(9_220_177),
+        );
+        assert_eq!(level["stale_by"], json!(0));
+        assert_ne!(level["stale_by"], unknown["stale_by"]);
+
+        for v in [&unknown, &stale, &level] {
+            let old: OldConsumer = serde_json::from_value(v.clone())
+                .expect("a consumer unaware of the new fields must still parse");
+            assert_eq!(old.balance, 0);
         }
     }
 }

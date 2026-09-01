@@ -78,6 +78,10 @@ pub mod meta;
 /// `(store, root, epoch)`, and its disappearance drives reclaim of the collateral. The node signs
 /// those spends itself with its own operator wallet, scoped by construction. See [`mirror`].
 pub mod mirror;
+/// `dign network-info` (#303): this node's OWN network posture -- peer id, network + genesis,
+/// advertised addresses (IPv6-first, §5.2), reachability and relay reservation. Reads the node's
+/// OPEN `dig.getNetworkInfo` surface, so it needs no control token. See [`network_info`].
+pub mod network_info;
 /// `dig-node open <chia://… | urn:dig:chia:…>` (#389): the OS scheme-handler target the
 /// installer registers for `chia://` + `urn:dig:chia:`. Strictly validates the untrusted
 /// handler argument, then opens the user's default browser at the resolving URL. See [`open`].
@@ -129,6 +133,10 @@ pub mod state;
 /// reloadable rustls config (fail-soft when no CA/leaf yet) and drive dig-cert's leaf
 /// renewal so the running listener hot-reloads a rotated leaf. See [`tls`].
 pub mod tls;
+/// Rendering ATTACKER-SUPPLIED text into an operator-facing sentence (dig-node#346): the clip mark
+/// is in-band, the budget is charged on rendered width, and only the display is neutralised — the
+/// stored value stays byte-verbatim. See [`untrusted_text`].
+pub mod untrusted_text;
 /// The beacon (`dig-updater`) RPC proxy (#515): `control.updater.*` reads the DIG auto-update
 /// beacon's world-readable status and shells its elevation-gated CLI for channel/pause/resume/
 /// check-now — never a second implementation of the beacon's own trust logic. See [`updater`].
@@ -142,6 +150,10 @@ pub mod wallet_authz;
 /// The start-up check that a wallet seed exists, minting one if it does not (dig-node#277).
 /// Never fatal, never a fallback. See [`wallet_bootstrap`].
 pub mod wallet_bootstrap;
+
+/// Latching the fact that the node's own wallet has held funds, so no surface calls a funded
+/// auto-created wallet disposable (dig-node#286). See [`wallet_funded`].
+pub mod wallet_funded;
 
 /// The Sage-parity wallet mTLS listener: its bring-up and the state `dign info` reports
 /// when it could not take its port (dig-node#260). See [`wallet_mtls`].

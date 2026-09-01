@@ -27,23 +27,34 @@ const POOL_REGISTERS_INBOUND_LOOPBACK: bool = cfg!(target_os = "linux");
 
 /// Start a fresh gossip pool bound on `listen_addr` with a fixed non-zero `network_id`. Certs are
 /// minted into a throwaway temp dir; the pool is otherwise a stock, discovery-free node.
-async fn start_pool(tag: &str, network: [u8; 32], listen_addr: SocketAddr) -> GossipHandle {
-    let dir = std::env::temp_dir().join(format!("dig-pool-connect-{tag}-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+///
+/// The guard comes back with the handle because the started pool reads its cert, key and peers
+/// files for its whole lifetime — so the tree must outlive this function, and `TempDir`'s `Drop`
+/// removes it when the test ends, including on an unwind (dig-node#370).
+async fn start_pool(
+    tag: &str,
+    network: [u8; 32],
+    listen_addr: SocketAddr,
+) -> (GossipHandle, tempfile::TempDir) {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("dig-pool-connect-{tag}-"))
+        .tempdir()
+        .expect("a pool cert dir");
     let cfg = GossipConfig {
         network_id: chia_protocol::Bytes32::new(network),
-        cert_path: dir.join("node.cert").display().to_string(),
-        key_path: dir.join("node.key").display().to_string(),
-        peers_file_path: dir.join("peers.json"),
+        cert_path: dir.path().join("node.cert").display().to_string(),
+        key_path: dir.path().join("node.key").display().to_string(),
+        peers_file_path: dir.path().join("peers.json"),
         peer_pool: Some(PeerPoolConfig::default()),
         listen_addr,
         ..Default::default()
     };
-    GossipService::new(cfg)
+    let handle = GossipService::new(cfg)
         .expect("gossip config is valid (non-zero network_id)")
         .start()
         .await
-        .expect("gossip pool starts")
+        .expect("gossip pool starts");
+    (handle, dir)
 }
 
 /// The `Via` this handle records for `peer_id`, if it lists it as a connected pool member.
@@ -76,8 +87,8 @@ async fn two_pools_connect_over_loopback_and_count_each_other() {
     // binds so the inbound accept registers on every platform that supports it (§5.2 IPv6-first).
     let network = [0x5au8; 32];
     let loopback: SocketAddr = "[::1]:0".parse().expect("parse [::1]:0");
-    let node_a = start_pool("a", network, loopback).await;
-    let node_b = start_pool("b", network, loopback).await;
+    let (node_a, _node_a_dir) = start_pool("a", network, loopback).await;
+    let (node_b, _node_b_dir) = start_pool("b", network, loopback).await;
 
     let a_peer_id = node_a.local_peer_id().expect("node A local_peer_id");
     let b_peer_id = node_b.local_peer_id().expect("node B local_peer_id");
@@ -138,7 +149,7 @@ async fn dialing_a_dead_port_never_counts_a_peer() {
     // here, B dials a port with no listener — the dial must FAIL and B must count ZERO peers. This is
     // the assertion that fails when connect is broken, proving the positive test above is real.
     dig_node_core::peer::install_crypto_provider();
-    let node_b = start_pool(
+    let (node_b, _node_b_dir) = start_pool(
         "dead",
         [0x5au8; 32],
         "[::1]:0".parse().expect("parse [::1]:0"),

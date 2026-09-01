@@ -4,6 +4,30 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.206.0] - 2026-09-01
+
+### Bug Fixes
+- **mirror:** Sign mirror spends under the Chia L1 genesis, not the DIG L2 one (#448)- **mirror,capsule,wallet:** Adopt chia-query 0.20.0, resolve landed spends, mark relayed backfills (#451)- **cli:** The CLI/service/updater batch — six user-visible dead ends (#458)- **security:** Correct the failure direction on five peer/network-facing input surfaces (#453)- **security:** Gate the wallet transport and make the no-mint rule structural (#452)- **wallet:** Distinguish unknown from zero across the wallet surface (#454)- **mirror:** Resolve landed spends, feed the DHT collateral pointer, bound funding inputs (#457)- **mirror:** Release the funding coins of a spend that never lands (#475)
+
+### Testing
+- **wallet:** Make the TxStatus fixture actually call chia_query's ack_to_tx_status (#444)- **capsule:** Prove every remote-triggered cache-fill records Relayed provenance (#442)
+
+## [0.183.0] - 2026-08-31
+
+### Bug Fixes
+- **mirror:** Log the cause when a mirror pass stops at a failed create (#443)
+
+### Documentation
+- **wallet:** Disclose that live broadcast also enables automatic collateral commitment (#445)
+
+## [0.179.0] - 2026-08-31
+
+### Features
+- **mirror:** Construct the bond-state observation (#412 step 7) (#419)- **mirror:** Operator-scoped $DIG CAT coin selector for mirror creates (#421) (#423)- **mirror:** Advertised URLs this node can be fetched at (#426) (#430)- **dht:** Attach the untrusted mirror-coin pointer to the provider announce (#431)- **mirror:** Wire a production broadcaster for the mirror lifecycle (#424) (#434)
+
+### Bug Fixes
+- **wallet:** Honest refusal reasons when no signer is configured (#410) (#432)
+
 ## [0.172.0] - 2026-08-30
 
 ### Features

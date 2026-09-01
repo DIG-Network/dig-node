@@ -410,7 +410,25 @@ impl Node {
         // LAND through the ONE shared site: write + announce-once + size-cap sweep, idempotent. Held
         // under `cache_lock` so a concurrent pull-land of the same capsule cannot race the write.
         let _guard = self.cache_lock.lock().await;
-        match self.land_capsule_bytes(&key, &bytes).await {
+        // PROVENANCE (dig-node#436). A push that arrived over the PEER surface is content a remote
+        // party asked this node to keep; it is not this operator's capsule, so it is cached and served
+        // but never announced and never bonded against.
+        //
+        // The authorized-writer signature checked above does NOT change that, and the distinction is
+        // easy to collapse: provenance does not answer "is this content legitimate" — authority
+        // already answered that — it answers "should THIS operator stake THEIR money on it". A third
+        // party who owns the store's key is entitled to push; they are not thereby entitled to spend
+        // the node operator's $DIG. Only a LOCAL push is the operator speaking for themselves.
+        //
+        // BOTH axes, via the shared `holder_claim_for_landing` — the same fold line 272 above
+        // already applies to the AUTHORITY check in this very function. Reading `origin` alone here
+        // while folding it there was a real hole: a cross-site page POSTing `cache.pushCapsule` to
+        // the loopback port arrives `origin = Local` (true, and un-spoofable) with
+        // `provenance = CrossSite`, so the authority check correctly demanded an authorized-writer
+        // signature while the provenance check handed the capsule `Announce`. Creating a store is
+        // permissionless, so "owns a store key" is not a trust boundary.
+        let claim = crate::seams::dig_rpc::holder_claim_for_landing(origin, provenance);
+        match self.land_capsule_bytes(&key, &bytes, claim).await {
             Ok((size, _fresh)) => json!({"jsonrpc":"2.0","id":id.clone(),"result":{
                 "offset": total_length,
                 "complete": true,
@@ -614,6 +632,11 @@ mod tests {
     }
     fn peer() -> (ReadOrigin, RequestProvenance) {
         (ReadOrigin::Peer, RequestProvenance::FirstParty)
+    }
+    /// A request over a genuinely LOCAL socket, made on a stranger's behalf: a cross-site page in
+    /// the operator's browser POSTing to the loopback port, which CORS admits.
+    fn cross_site_over_local_socket() -> (ReadOrigin, RequestProvenance) {
+        (ReadOrigin::Local, RequestProvenance::CrossSite)
     }
 
     /// Push a whole capsule single-shot (one window) as the local operator and return the response.
@@ -1283,5 +1306,169 @@ mod tests {
             admit(&mut t, &stale, "peer:aaaa", 10, now).is_ok(),
             "the reaped capsule's slot is free for a fresh push"
         );
+    }
+
+    // ---- dig-node#436: the PROVENANCE a land path records ----
+    //
+    // # The property
+    //
+    // A capsule this node accepted BECAUSE A STRANGER ASKED must be recorded `Relayed`; a capsule the
+    // operator asked for must be recorded `Held`. Only `Held` is bondable, so that distinction is the
+    // only barrier between a stranger's content and this operator's $DIG. Since dig-node#424 wired a
+    // real broadcaster, getting it wrong is no longer a wrong announce — it is a mainnet spend against
+    // content this node is merely relaying.
+    //
+    // # Why the fixture varies the ORIGIN and nothing else
+    //
+    // Provenance is not carried in the capsule. It is derived at READ time from the `<root>.relay`
+    // sidecar (`capsule_store::list_cached_capsules`), so "no marker" and "the operator's own capsule"
+    // are the SAME on-disk state. A test that landed only a remote capsule and asserted `Relayed`
+    // would be satisfied by an implementation that marked EVERY capsule relayed — which breaks the
+    // flywheel, and is the nearest wrong implementation in the other direction.
+    //
+    // So both tests land the same shape of capsule through the same handler, varying only
+    // `ReadOrigin`, and each asserts its own half. The truthful control (a local land stays `Held`) is
+    // what makes the remote assertion load-bearing rather than a restatement of a global default.
+
+    /// The provenance the INVENTORY reports for `(store_hex, root_hex)`, or `None` if absent.
+    ///
+    /// Read through `cache_list_cached` — the same scan every announce cause and every bonding
+    /// decision consumes — rather than by stat-ing the sidecar. Asserting on the sidecar would pin the
+    /// mechanism; asserting on the inventory pins the ANSWER, which is what a spend acts on.
+    async fn listed_provenance(
+        node: &Node,
+        store_hex: &str,
+        root_hex: &str,
+    ) -> Option<crate::CapsuleProvenance> {
+        crate::seams::capsule::CapsuleStore::cache_list_cached(node)
+            .await
+            .into_iter()
+            .find(|c| c.store_id == store_hex && c.root == root_hex)
+            .map(|c| c.provenance)
+    }
+
+    /// **Proves (dig-node#436):** the operator's OWN push lands bondable.
+    ///
+    /// This is the control for `a_peer_originated_push_must_land_relayed`, and it is the half that
+    /// must keep passing after any fix: marking every land `Relayed` would satisfy the remote
+    /// assertion while silently disabling the flywheel for the operator's own content.
+    ///
+    /// **Catches:** a fix that marks every land `Relayed` instead of only the remote-originated ones.
+    #[test]
+    fn a_local_push_lands_held_and_therefore_bondable() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_sk, pk, store) = store_keypair(0x36);
+            let (module, root) = push_module(store, &pk, 0x43, 0);
+            let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+            let (node, _td) = crate::test_support::test_node_for_peer_surface();
+            let node = node.as_ref();
+
+            let resp = push_one_shot(node, &store_hex, &root_hex, &module, None, local()).await;
+            assert_eq!(resp["result"]["complete"], json!(true), "resp={resp}");
+
+            assert_eq!(
+                listed_provenance(node, &store_hex, &root_hex).await,
+                Some(crate::CapsuleProvenance::Held),
+                "the operator's own push is this node's own capsule and must stay bondable"
+            );
+        });
+    }
+
+    /// **Proves (dig-node#436, defect B):** a push accepted over the PEER surface — which
+    /// `DIG_NODE_PUSH_OPEN=true` admits — must land `Relayed`.
+    ///
+    /// Was RED when this test was written: `land_capsule_bytes` wrote the module and announced
+    /// without ever writing a relay marker, so a remote authorized-writer's capsule landed
+    /// indistinguishable from the operator's own — announced, and bondable. It passes because
+    /// provenance is now a REQUIRED argument of landing rather than a property of the route.
+    ///
+    /// **Catches:** any future land route reaching `land_capsule_bytes` without recording its origin.
+    #[test]
+    fn a_peer_originated_push_must_land_relayed() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (sk, pk, store) = store_keypair(0x51);
+            let (module, root) = push_module(store, &pk, 0x52, 0);
+            let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+            let sig = digstore_crypto::sign_push(&sk, &Bytes32(root), &Bytes32(store));
+            let (node, _td) = crate::test_support::test_node_for_peer_surface();
+            let node = node.as_ref();
+
+            let resp = push_one_shot(
+                node,
+                &store_hex,
+                &root_hex,
+                &module,
+                Some(&sig.to_hex()),
+                peer(),
+            )
+            .await;
+            assert_eq!(resp["result"]["complete"], json!(true), "resp={resp}");
+
+            assert_eq!(
+                listed_provenance(node, &store_hex, &root_hex).await,
+                Some(crate::CapsuleProvenance::Relayed),
+                "a capsule pushed by a REMOTE writer is held on that writer's behalf, never this \
+                 operator's own content to bond against"
+            );
+        });
+    }
+    /// **Proves (dig-node#436, the confused deputy on the PUSH path):** a push arriving over a
+    /// genuinely local socket but made on a STRANGER's behalf lands `Relayed`.
+    ///
+    /// This site read the raw `origin` while line 272 of the SAME function already folded both axes
+    /// for its authority check — so the authority half correctly demanded an authorized-writer
+    /// signature for a cross-site push, and the provenance half handed that same push `Announce`.
+    /// Creating a store is permissionless, so holding a store key is not a trust boundary: a third
+    /// party entitled to push is not thereby entitled to spend this operator's $DIG.
+    ///
+    /// **Catches:** either landing decision in this file reverting to a single axis.
+    #[test]
+    fn a_cross_site_push_over_a_local_socket_lands_relayed() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (sk, pk, store) = store_keypair(0x63);
+            let (module, root) = push_module(store, &pk, 0x64, 0);
+            let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+            let sig = digstore_crypto::sign_push(&sk, &Bytes32(root), &Bytes32(store));
+            let (node, _td) = crate::test_support::test_node_for_peer_surface();
+            let node = node.as_ref();
+
+            let resp = push_one_shot(
+                node,
+                &store_hex,
+                &root_hex,
+                &module,
+                Some(&sig.to_hex()),
+                cross_site_over_local_socket(),
+            )
+            .await;
+            assert_eq!(resp["result"]["complete"], json!(true), "resp={resp}");
+
+            assert_eq!(
+                listed_provenance(node, &store_hex, &root_hex).await,
+                Some(crate::CapsuleProvenance::Relayed),
+                "a local socket driven by a stranger's page is a confused deputy, not the operator"
+            );
+        });
     }
 }

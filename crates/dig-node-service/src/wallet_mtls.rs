@@ -16,7 +16,41 @@ use std::sync::{Arc, RwLock};
 use serde_json::{json, Value};
 
 use dig_wallet::sage::rpc::WalletBackend;
-use dig_wallet::sage::transport::{serve_mtls, SharedCert};
+use dig_wallet::sage::transport::{serve_mtls, SharedCert, WalletCallGate};
+
+/// The node's authorization policy for the Sage-parity wallet transport (dig-node#257).
+///
+/// The transport crate owns the OBLIGATION to ask ([`WalletCallGate`]); this owns the ANSWER,
+/// because tier is a property of the capability and only `dig-node-service` holds the published
+/// contract that states it. Delegating to [`wallet_authz::authorize`] — the same function the
+/// HTTP and `/ws` planes call — is what stops a third plane drifting into its own opinion.
+///
+/// Possession of the shared wallet certificate authenticates the TRANSPORT. It is not a
+/// capability tier, and it must not act as one: the cert is generated per run today, but the
+/// moment it is persisted so a client can read it (which is the whole point of the parity
+/// surface) an ungated listener becomes a fully open custody plane.
+pub struct NodeWalletGate {
+    master: String,
+    paired_tokens_path: std::path::PathBuf,
+}
+
+impl NodeWalletGate {
+    /// Build the gate from the node's master control token and its paired-token store.
+    pub fn new(master: String, state_dir: &std::path::Path) -> Self {
+        Self {
+            master,
+            paired_tokens_path: crate::pairing::paired_tokens_path(state_dir),
+        }
+    }
+}
+
+impl WalletCallGate for NodeWalletGate {
+    fn authorize(&self, method: &str, presented: Option<&str>) -> bool {
+        crate::wallet_authz::authorize(method, presented, &self.master, |tok| {
+            crate::pairing::is_paired_token(&self.paired_tokens_path, tok)
+        })
+    }
+}
 
 /// What the last bring-up attempt did. `NotStarted` is the pre-serve state — a node that
 /// never reached the serve path (the in-process browser runtime, a CLI subcommand).
@@ -87,12 +121,17 @@ fn set_state(next: ListenerState) {
 /// Never fatal: a failure is logged at WARN and published on `control.status` so the
 /// operator learns about the contention from the node itself rather than from an opaque
 /// TLS `handshake_failure` in whatever else wanted the port.
-pub fn spawn(port: u16, backend: Arc<WalletBackend>, cert: SharedCert) {
+pub fn spawn(
+    port: u16,
+    backend: Arc<WalletBackend>,
+    cert: SharedCert,
+    gate: Arc<dyn WalletCallGate>,
+) {
     let Some(listener) = bind_and_record(port) else {
         return;
     };
     tokio::spawn(async move {
-        if let Err(e) = serve_mtls(backend, listener, &cert).await {
+        if let Err(e) = serve_mtls(backend, listener, &cert, gate).await {
             tracing::warn!(error = %e, "wallet mTLS listener exited");
         }
     });
