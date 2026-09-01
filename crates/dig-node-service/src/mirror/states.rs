@@ -157,6 +157,15 @@ pub fn wire_state(state: &BondState) -> MirrorBondState {
             reason: CollateralUnknownReason::BalanceUnreadable,
         },
         BondState::Deferred { reason } => MirrorBondState::Deferred { reason: *reason },
+        // INTERIM (dig-node-control-interface has no `unadvertised` value yet, and adding one is
+        // a release-first change in that repo). `Disabled` is the least-wrong existing value: it
+        // and `Unadvertised` agree on the only fact a person acts on at once — this node will
+        // create no bonds — and differ only in which knob clears it. It is chosen over the two
+        // alternatives deliberately: `Unfunded` would name a figure and send the operator to buy
+        // $DIG that would bond nothing, and a `Deferred` reason would blame the census or the
+        // wallet, both of which are working. Understating the remedy is recoverable; a false money
+        // statement is the class this whole enum exists to prevent.
+        BondState::Unadvertised => MirrorBondState::Disabled,
         BondState::Disabled => MirrorBondState::Disabled,
         BondState::Withheld => MirrorBondState::Withheld,
         BondState::Reclaiming {
