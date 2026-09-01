@@ -501,9 +501,22 @@ impl SpendRecord {
 /// Releasing too EARLY re-opens dig-node#348's double-select: a second create draws a coin the first
 /// bundle can still spend, and the mempool refuses one of them. Releasing too LATE strands spendable
 /// money in a wallet that reports `Insufficient`. Neither is free, which is why this is a window and
-/// not a flag — but note the two are not symmetric here, because §25.4.6 still suppresses a second
-/// create for the SAME `(store, root, epoch)` while the record is open. A released coin can only be
-/// re-drawn by a create for a DIFFERENT bond, and that collision fails CLOSED at the mempool.
+/// not a flag.
+///
+/// The asymmetry that makes the early direction survivable is NOT §25.4.6's suppression, and it is
+/// worth stating exactly, because a stuck record is precisely the case that suppression does not
+/// cover: `runner.rs` filters `Pending | Submitted` and excludes `Unresolved` deliberately, while
+/// `RecordedSpend`'s `Drop` writes `Unresolved` — so a record reaching this window is ALWAYS
+/// `Unresolved`, and its bond is NOT suppressed. `mirror/resolve.rs` states the same fact.
+///
+/// What actually holds is the mempool rule. A released coin re-drawn by any create collides with a
+/// bundle that may still be resident, and Chia's replace-by-fee requires the replacement to spend a
+/// SUPERSET of the conflicting coins — which two independent mirror creates never do. So the
+/// collision is a REFUSAL, not a double spend: one bundle is rejected, no funds move twice, and the
+/// refused create is retried on the next pass like any other.
+///
+/// This hold is also strictly MORE conservative than the ecosystem's shipped answer for the same
+/// phase: `dig-wallet`'s `RESERVATION_TTL_MS` already releases the same coin at 10 minutes.
 ///
 /// # What this must NOT be confused with
 ///
