@@ -447,7 +447,8 @@ CREATE TABLE IF NOT EXISTS cat_admission_pending (
     derived_asset_id TEXT NOT NULL,
     derived_owner_p2 TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
-    last_attempt_at INTEGER
+    last_attempt_at INTEGER,
+    staged_above_baseline INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_cat_admission_pending_created
     ON cat_admission_pending (created_height);
@@ -673,6 +674,12 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     // arrives at the `0` default, which is right: it has been reset zero times, and the first
     // reset moves it to 1 exactly as it would on a fresh install.
     "ALTER TABLE sync_state ADD COLUMN reset_epoch INTEGER NOT NULL DEFAULT 0",
+    // Whether this coin was NEWS at the moment it was staged -- confirmed strictly above the
+    // arrival baseline as it stood THEN (dig-node#479). Read at promotion to decide whether the
+    // coin is owed an arrivals examination it was skipped for. The `0` default is the honest
+    // reading for every row written before this column existed: the wallet does not know they
+    // were news, so it stays silent about them rather than announcing history.
+    "ALTER TABLE cat_admission_pending ADD COLUMN staged_above_baseline INTEGER NOT NULL DEFAULT 0",
 ];
 
 // ---- one-shot data-migration ladder ---------------------------------------
@@ -1864,18 +1871,40 @@ impl WalletDb {
     /// A re-pushed coin re-stages, so eviction is recoverable rather than terminal.
     pub async fn stage_cat_admissions(&self, rows: &[StagedCatRow]) -> sqlx::Result<()> {
         let mut tx = self.pool.begin().await?;
+        // dig-node#479 -- was this coin NEWS when we first saw it? Staging is the only moment that
+        // question can be answered, because the baseline has not yet advanced past this frame.
+        // Asking again at promotion is asking after the watermark has moved onto the coin's own
+        // height, where a genuine arrival and a replayed receipt are indistinguishable.
+        let baseline: Option<i64> =
+            sqlx::query("SELECT arrival_baseline_height FROM sync_state WHERE id = 0")
+                .fetch_one(&mut *tx)
+                .await?
+                .get("arrival_baseline_height");
         for r in rows {
+            // Mirrors the height window in [`crate::sage::arrivals::classify`]: with no baseline
+            // the wallet cannot tell history from news (a first catch-up), and a coin at or below
+            // an armed baseline is history. An as-yet-unconfirmed coin is news by construction --
+            // it is arriving now -- and is the case a plain height comparison would drop.
+            let staged_above_baseline = match baseline {
+                Some(b) => i64::from(r.created_height.is_none_or(|h| h > b)),
+                None => 0,
+            };
             sqlx::query(
                 "INSERT INTO cat_admission_pending
                     (coin_id, parent_coin_info, puzzle_hash, amount, created_height,
                      spent_height, created_timestamp, spent_timestamp,
-                     derived_asset_id, derived_owner_p2)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     derived_asset_id, derived_owner_p2, staged_above_baseline)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(coin_id) DO UPDATE SET
                     created_height = excluded.created_height,
                     spent_height = excluded.spent_height,
                     created_timestamp = excluded.created_timestamp,
-                    spent_timestamp = excluded.spent_timestamp",
+                    spent_timestamp = excluded.spent_timestamp,
+                    -- Sticky. A coin re-pushed inside a later replay must not have its own
+                    -- arrival downgraded to history by the replay that re-sighted it.
+                    staged_above_baseline =
+                        MAX(cat_admission_pending.staged_above_baseline,
+                            excluded.staged_above_baseline)",
             )
             .bind(Self::normalise_hex(&r.coin_id))
             .bind(Self::normalise_hex(&r.parent_coin_info))
@@ -1887,6 +1916,7 @@ impl WalletDb {
             .bind(r.spent_timestamp)
             .bind(Self::normalise_hex(&r.derived_asset_id))
             .bind(Self::normalise_hex(&r.derived_owner_p2))
+            .bind(staged_above_baseline)
             .execute(&mut *tx)
             .await?;
         }
@@ -2017,6 +2047,15 @@ impl WalletDb {
         hint: &str,
     ) -> sqlx::Result<bool> {
         let mut tx = self.pool.begin().await?;
+        // Read before the claiming DELETE consumes the row. Same transaction, so this is the
+        // value the row was staged with or nothing at all.
+        let staged_above_baseline: bool = sqlx::query(
+            "SELECT staged_above_baseline FROM cat_admission_pending WHERE coin_id = ?",
+        )
+        .bind(Self::normalise_hex(&row.coin_id))
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some_and(|r| r.get::<i64, _>("staged_above_baseline") != 0);
         let claimed = sqlx::query("DELETE FROM cat_admission_pending WHERE coin_id = ?")
             .bind(Self::normalise_hex(&row.coin_id))
             .execute(&mut *tx)
@@ -2053,7 +2092,7 @@ impl WalletDb {
         .execute(&mut *tx)
         .await?;
         // dig-node#479 — HOLD the promoted coin for the arrivals recorder, in this same
-        // transaction.
+        // transaction, but ONLY if it was news when it was staged.
         //
         // A CAT never passes through `apply_coin_states` into `coins` the way an XCH coin does: it
         // lands at a derived outer hash, is staged, and reaches `coins` only HERE, after
@@ -2063,16 +2102,35 @@ impl WalletDb {
         // told they were paid. That is precisely the asymmetry #479 reports: XCH notifies, $DIG
         // does not.
         //
-        // The hold says only "seen, not yet judged". It does not announce anything:
-        // [`crate::sage::arrivals::classify`] remains the sole authority and still answers
-        // `OwnChange` for the wallet's own change and `Backfill` once the coin is settled, so this
-        // cannot manufacture an arrival that the ordinary path would have refused. It restores the
-        // examination a staged coin was skipped for, nothing more.
-        sqlx::query("INSERT OR IGNORE INTO arrival_pending (coin_id, created_height) VALUES (?, ?)")
+        // # Why the flag, and not a height comparison here
+        //
+        // A held coin is EXEMPT from the baseline window (`already_deferred` in
+        // [`crate::sage::arrivals::classify`]), which is exactly what rescues a lagging arrival —
+        // and exactly what would announce a historical receipt if the hold were unconditional. A
+        // first catch-up requests the derived CAT hashes alongside the addresses, so a wallet's
+        // whole $DIG history stages during the replay and is promoted afterwards, over a network
+        // round trip, long after the baseline was armed at the peak. Holding those would turn a
+        // missing-notification bug into a burst of toasts for money received months ago — the
+        // module's own documented failure mode 1.
+        //
+        // Re-asking the height question HERE cannot separate the two: by now the watermark has
+        // advanced onto the live coin's own height, so a genuine arrival reads as backfill and
+        // #479 comes straight back. The distinguishing fact is not the height, it is whether the
+        // coin was news WHEN FIRST SEEN, and `stage_cat_admissions` is the only place that knows.
+        //
+        // The hold still says only "seen, not yet judged". `classify` remains the sole authority
+        // and still answers `OwnChange` for the wallet's own change, so this cannot manufacture an
+        // arrival the ordinary path would have refused; it restores an examination that a staged
+        // coin was skipped for, and nothing more.
+        if staged_above_baseline {
+            sqlx::query(
+                "INSERT OR IGNORE INTO arrival_pending (coin_id, created_height) VALUES (?, ?)",
+            )
             .bind(Self::normalise_hex(&row.coin_id))
             .bind(row.created_height.unwrap_or(0))
             .execute(&mut *tx)
             .await?;
+        }
         tx.commit().await?;
         Ok(true)
     }
@@ -4845,6 +4903,21 @@ mod tests {
 
     /// A CAT arrival carries its asset id, and an UNATTRIBUTED coin away from our p2 hashes is
     /// held rather than announced as XCH — then promoted once attribution names its asset.
+    ///
+    /// # This test's fixture is NOT the production path (dig-node#479)
+    ///
+    /// It writes the curried outer hash straight into `coins` with a NULL `asset_id`, so the
+    /// coin is present when the first `record_arrivals` pass runs and is DEFERRED by that pass —
+    /// which is what leaves the hold that the later promotion relies on. Production never reaches
+    /// that state: `apply_coin_states` does not write a coin at a derived hash into `coins` at
+    /// all, it STAGES it in `cat_admission_pending`, so the first pass sees nothing, defers
+    /// nothing, and leaves no hold. That gap is exactly how #479 shipped green — this test covers
+    /// the classifier's deferral/attribution contract, and cannot see the staging detour.
+    ///
+    /// The staged ordering is covered by
+    /// `a_cat_promoted_after_the_watermark_advanced_is_still_announced` and
+    /// `a_cat_staged_during_the_catch_up_replay_is_never_announced`. Do not read a green here as
+    /// evidence about a real $DIG receipt.
     #[tokio::test]
     async fn a_cat_arrival_carries_its_asset_id_and_waits_until_attributed() {
         let db = WalletDb::open_in_memory().await.unwrap();
@@ -4941,6 +5014,99 @@ mod tests {
             ],
             "the $DIG arrival must reach the ledger carrying its asset id, beside the XCH control"
         );
+    }
+
+    /// dig-node#479, THE OTHER DIRECTION — **a historical $DIG receipt must stay silent.**
+    ///
+    /// This is the probe that catches an over-broad fix, and it is reachable on any wallet that
+    /// has ever held $DIG. The first catch-up requests the derived CAT hashes alongside the
+    /// addresses, so the whole receive history STAGES during the replay; the baseline is then
+    /// armed at the peak; and only afterwards, across a network round trip, does the attribution
+    /// pass promote those coins into `coins`. A promotion that held every coin it promoted would
+    /// exempt each of them from the baseline window and announce the lot — the module's own
+    /// documented failure mode 1, and strictly worse than the missing notification #479 reports,
+    /// because it is a false claim about money rather than an absent true one.
+    ///
+    /// The ordering IS the test: the coin must be staged BEFORE the baseline is armed, exactly as
+    /// the replay does it. The live coin beside it is the negative control — a fix that simply
+    /// stopped holding anything would satisfy this test and fail
+    /// `a_cat_promoted_after_the_watermark_advanced_is_still_announced`. Both must pass together.
+    #[tokio::test]
+    async fn a_cat_staged_during_the_catch_up_replay_is_never_announced() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+
+        // During the replay: no baseline yet, and an old $DIG receipt from height 5 stages.
+        assert_eq!(db.arrival_baseline().await.unwrap(), None);
+        let old = StagedCatRow {
+            coin_id: "olddigcoin".into(),
+            parent_coin_info: "foreign_parent_of_olddigcoin".into(),
+            puzzle_hash: "curried_cat_hash_old".into(),
+            amount: "700".into(),
+            created_height: Some(5),
+            spent_height: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+            derived_asset_id: "a406d3a9".into(),
+            derived_owner_p2: "ph".into(),
+        };
+        db.stage_cat_admissions(std::slice::from_ref(&old))
+            .await
+            .unwrap();
+
+        // The replay finishes and arms the baseline at the peak, far above that coin.
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(100));
+
+        // The attribution pass promotes it afterwards, over a network round trip.
+        assert!(db.promote_cat_admission(&old, "a406d3a9", "ph").await.unwrap());
+
+        // It is history. The user was not just paid, and must not be told they were.
+        assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 0);
+        let ids: Vec<String> = db
+            .arrivals_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.coin_id)
+            .collect();
+        assert!(
+            ids.is_empty(),
+            "a $DIG receipt replayed by the catch-up is not an arrival, got {ids:?}"
+        );
+    }
+
+    /// The same silence on a wallet that ALREADY had a baseline when the old coin was staged — a
+    /// re-sync, or a subscription widened onto a hash whose history the wallet then replays. Here
+    /// the baseline is armed the whole time, so the coin is judged history by its own height at
+    /// the moment it is seen, rather than by the absence of a baseline.
+    #[tokio::test]
+    async fn a_cat_staged_below_an_already_armed_baseline_is_never_announced() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
+            .await
+            .unwrap();
+
+        let old = StagedCatRow {
+            coin_id: "olddigcoin".into(),
+            parent_coin_info: "foreign_parent_of_olddigcoin".into(),
+            puzzle_hash: "curried_cat_hash_old".into(),
+            amount: "700".into(),
+            created_height: Some(5),
+            spent_height: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+            derived_asset_id: "a406d3a9".into(),
+            derived_owner_p2: "ph".into(),
+        };
+        db.stage_cat_admissions(std::slice::from_ref(&old))
+            .await
+            .unwrap();
+        assert!(db.promote_cat_admission(&old, "a406d3a9", "ph").await.unwrap());
+
+        assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 0);
+        assert!(db.arrivals_since(0, 100).await.unwrap().is_empty());
     }
 
     /// A reorg unmakes the coins above the fork, so it must unmake their arrivals with them and
