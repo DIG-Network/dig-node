@@ -2817,8 +2817,16 @@ fn spawn_mirror_passes(
             // wallet selector's reservation prune (dig_ecosystem#2763), which the chain cannot
             // offer: a broadcast coin stays unspent in the chain's view for the entire confirmation
             // window, and this loop runs inside it. An `Err` defers creates and never reclaims.
-            let committed = crate::mirror::funding::committed_funding_coin_ids(
+            //
+            // BOUNDED, not merely computed (dig-node#471). The reservation is a time box read from
+            // the audit record, so a spend that never lands releases its coins after
+            // `FUNDING_RESERVATION_WINDOW_MS` instead of withholding them forever. The record itself
+            // is untouched and stays chaseable; only the hold lapses.
+            //
+            // One clock reading for the whole pass, alongside the one disk and one balance reading.
+            let committed = crate::spend_audit::committed_funding_coin_ids(
                 &crate::spend_audit::SpendLog::in_state_dir(),
+                lifecycle::now_unix_ms(),
             )
             .map_err(|e| crate::mirror::runner::PassError::Wallet(e.to_string()));
 
