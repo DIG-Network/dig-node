@@ -2951,7 +2951,8 @@ async fn wait_for_next_pass(
     events: Option<&crate::mirror::events::DiskEvents>,
     wake: &mut crate::mirror::events::WakeCoalescer,
 ) {
-    let deadline = tokio::time::Instant::now() + MIRROR_PASS_INTERVAL;
+    let entered = tokio::time::Instant::now();
+    let deadline = entered + MIRROR_PASS_INTERVAL;
 
     // No watcher: the behaviour that shipped before events existed, unchanged.
     let Some(events) = events else {
@@ -2959,8 +2960,20 @@ async fn wait_for_next_pass(
         return;
     };
 
+    // ONE clock for the whole wait. The deadline and every sleep are on tokio's monotonic clock,
+    // while the coalescer's windows are unix milliseconds — so reading the wall clock per turn
+    // would compare two quantities that are free to disagree. They do disagree in practice: a
+    // wall-clock step (NTP, a suspend/resume) would move the coalescer's idea of "now" without
+    // moving a single sleep, which either fires the owed wake early or strands it. Anchoring unix
+    // ms to elapsed monotonic time at entry makes the arithmetic coherent, and is what lets the
+    // seam be tested on a paused clock at all.
+    let clock = {
+        let base = crate::mirror::lifecycle::now_unix_ms();
+        move || base + entered.elapsed().as_millis() as u64
+    };
+
     loop {
-        let now_ms = crate::mirror::lifecycle::now_unix_ms();
+        let now_ms = clock();
         if wake.take_due(now_ms) {
             return;
         }
@@ -2981,7 +2994,7 @@ async fn wait_for_next_pass(
                 // Otherwise an event wake has come due; the next turn of the loop takes it.
             }
             // Cancel-safe, so an event arriving mid-sleep is never lost to the select.
-            _ = events.changed() => wake.record_event(crate::mirror::lifecycle::now_unix_ms()),
+            _ = events.changed() => wake.record_event(clock()),
         }
     }
 }
@@ -3716,6 +3729,128 @@ mod tests {
         assert!(
             !line.contains("WARN"),
             "a clean pass warned, so the warning carries no information: {line:?}"
+        );
+    }
+}
+
+/// The waiting seam itself — SPEC.md §25.5's four rules live here, not in the coalescer.
+///
+/// `WakeCoalescer` is a pure type and `DiskEvents` is a thin wrapper over `Notify`; both are
+/// already covered. Neither is the seam. Every property this module's change is ABOUT — the round
+/// deadline as a ceiling an event may only lower, the `None`-events path being the pre-event
+/// behaviour unchanged, and the `select!` turning a watcher signal into an early return — is a
+/// property of [`super::wait_for_next_pass`] composing the two, and is invisible to a test of
+/// either half.
+///
+/// Every case runs on a PAUSED clock, so the windows asserted are the ones written here rather
+/// than however long the test happened to take, and a ten-minute round costs no wall-clock time.
+#[cfg(test)]
+mod wait_for_next_pass_tests {
+    use super::MIRROR_PASS_INTERVAL;
+    use crate::mirror::events::{DiskEvents, WakeCoalescer, QUIET_PERIOD_MS};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+    use tokio::time::{Duration, Instant};
+
+    /// A `DiskEvents` whose signal the test drives, and the handle to drive it with.
+    fn driven_events() -> (DiskEvents, Arc<Notify>) {
+        let signal = Arc::new(Notify::new());
+        (DiskEvents::from_signal(Arc::clone(&signal)), signal)
+    }
+
+    /// With nothing to accelerate it, the wait IS the round timer — on both the no-watcher path
+    /// and the watcher-attached-but-silent path.
+    ///
+    /// The first is the behaviour that shipped before events existed and must be bit-for-bit the
+    /// old `sleep(MIRROR_PASS_INTERVAL)`; the second is the node whose watcher is live and whose
+    /// cache simply is not changing, which is the common case and must cost exactly the same.
+    #[tokio::test(start_paused = true)]
+    async fn with_no_events_the_wait_is_the_round_timer() {
+        let mut wake = WakeCoalescer::new();
+
+        let started = Instant::now();
+        super::wait_for_next_pass(None, &mut wake).await;
+        assert_eq!(
+            started.elapsed(),
+            MIRROR_PASS_INTERVAL,
+            "the no-watcher path must be the round sleep, unchanged"
+        );
+
+        let (events, _signal) = driven_events();
+        let started = Instant::now();
+        super::wait_for_next_pass(Some(&events), &mut wake).await;
+        assert_eq!(
+            started.elapsed(),
+            MIRROR_PASS_INTERVAL,
+            "a silent watcher must cost exactly the round, not a shorter or longer wait"
+        );
+    }
+
+    /// One capsule landing wakes the pass in seconds, not at the next round.
+    ///
+    /// This is the entire user-visible point of the change, and it is the one assertion that
+    /// fails outright if the `events.changed()` arm is never wired to the coalescer.
+    #[tokio::test(start_paused = true)]
+    async fn a_single_event_wakes_the_pass_a_quiet_period_later() {
+        let (events, signal) = driven_events();
+        let mut wake = WakeCoalescer::new();
+
+        let at = Duration::from_millis(100);
+        tokio::spawn(async move {
+            tokio::time::sleep(at).await;
+            signal.notify_one();
+        });
+
+        let started = Instant::now();
+        super::wait_for_next_pass(Some(&events), &mut wake).await;
+        let elapsed = started.elapsed();
+
+        let expected = at + Duration::from_millis(QUIET_PERIOD_MS);
+        assert!(
+            elapsed >= expected && elapsed < expected + Duration::from_secs(1),
+            "one event owes a wake one quiet period after it, not at the round: {elapsed:?}"
+        );
+        assert!(
+            elapsed < MIRROR_PASS_INTERVAL,
+            "the wake must be far inside the round or it accelerates nothing"
+        );
+    }
+
+    /// SPEC.md §25.5 rule 1, on the branch that can actually break it: a storm that OUTLASTS the
+    /// round.
+    ///
+    /// Every event resets the quiet period, so the owed wake recedes for as long as writes keep
+    /// arriving — and each event also wins the `select!`, so the arm that checks the deadline is
+    /// re-entered rather than reached. Without the ceiling the wait would end when the WRITER
+    /// stopped, which is an instant an attacker with write access to the cache directory chooses.
+    /// With it, the round deadline still ends the wait on its own schedule, which is what makes
+    /// the timer a backstop rather than a fallback.
+    ///
+    /// The storm deliberately ends AFTER the deadline: a storm that stopped first would return at
+    /// its own quiet period and pass whether or not any ceiling existed.
+    #[tokio::test(start_paused = true)]
+    async fn a_storm_outlasting_the_round_still_returns_by_the_deadline() {
+        let (events, signal) = driven_events();
+        let mut wake = WakeCoalescer::new();
+
+        let storm = MIRROR_PASS_INTERVAL + Duration::from_secs(100);
+        let storm_task = tokio::spawn(async move {
+            let until = Instant::now() + storm;
+            while Instant::now() < until {
+                signal.notify_one();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        let started = Instant::now();
+        super::wait_for_next_pass(Some(&events), &mut wake).await;
+        let elapsed = started.elapsed();
+        storm_task.abort();
+
+        assert!(
+            elapsed <= MIRROR_PASS_INTERVAL + Duration::from_secs(2),
+            "an unending stream of events may not push the pass past its round deadline: \
+             returned after {elapsed:?}, the round is {MIRROR_PASS_INTERVAL:?}"
         );
     }
 }

@@ -8579,9 +8579,29 @@ dropped, MUST still converge on the round timer alone.
    the tracker has not yet seen hold for a window, so anything closer is amplification on a path that
    spends money.
 
-**Chain events do NOT trigger a pass.** A create is decided from disk presence, a new peak arrives
-roughly every 18.75 seconds, and the epoch rollover a reclaim waits on is wall-clock rather than a
-chain event. Chain is observed inside the pass, on the round timer.
+**Chain events do NOT trigger a pass, and no mechanism exists by which they could.** Chain is
+observed inside the pass, on the round timer. This is a limitation of the interfaces available, not
+only a design preference, and the two are worth separating:
+
+- **There is no chain event to subscribe to.** `MirrorEffects::observe_chain` reads through
+  `ChainSource` (`dig-chainsource-interface`), whose entire surface is request/response —
+  `coin_record`, `coin_records_by_puzzle_hash`, `coin_records_by_parent`, `coin_spend`. It exposes
+  no subscription, no stream and no callback, so there is nothing for a waiting pass to select on.
+  The node's own §14.2 chain-watch is likewise a POLL loop, not a push source.
+- **The one push path in the node cannot say a mirror coin changed.** The wallet's direct-peer sync
+  (§18.6) does hold a real `request_puzzle_state(subscribe = true)` subscription and publishes to
+  the §18.14 `EventBus` — but `SyncEvent::CoinState` is fieldless. It names no coin, no puzzle hash
+  and no height, and it reports the WALLET DB rather than the mirror's chain view. Waking a pass on
+  it would wake a money-spending pass on any wallet coin activity whatsoever, with no evidence the
+  event was relevant, at up to the `SETTLING_WINDOW_MS` floor rather than the round.
+
+Independently of both, the two things a pass acts on are not chain-shaped: a CREATE is decided from
+disk presence, which IS event-driven; and the epoch rollover a RECLAIM waits on is wall-clock.
+
+What a chain event WOULD buy is freshness of the §25.8 observation — a mirror coin spent out from
+under this node is reported up to one round late. That is a staleness bound on a read-only surface,
+never a money-safety gap, and closing it needs a coin-state push carrying the coin it is about.
+Tracked as <https://github.com/DIG-Network/dig-node/issues/482>.
 
 The debounce is **presence-stable-for-a-window**, not a timer after an event: a bond must be
 observed in the SAME state across `SETTLING_WINDOW_MS` (default 30_000) before that state is acted

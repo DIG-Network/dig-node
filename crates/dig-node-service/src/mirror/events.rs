@@ -167,6 +167,21 @@ impl DiskEvents {
     pub async fn changed(&self) {
         self.signal.notified().await;
     }
+
+    /// Build a `DiskEvents` driven by `signal` instead of a filesystem watcher.
+    ///
+    /// The waiting seam in `server.rs` is the only place the four SPEC §25.5 rules are actually
+    /// enforced, and a real watcher cannot express the case that matters — a storm of events
+    /// arriving faster than the loop can retire them — reproducibly. Driving the same `Notify` the
+    /// watcher callback drives keeps the test on the production path: everything downstream of
+    /// this constructor is the shipped code.
+    #[cfg(test)]
+    pub(crate) fn from_signal(signal: Arc<Notify>) -> Self {
+        Self {
+            signal,
+            _watcher: Box::new(()),
+        }
+    }
 }
 
 /// Watch `cache_dir` for capsules appearing and disappearing.
