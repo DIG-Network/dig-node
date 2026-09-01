@@ -8579,7 +8579,9 @@ coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile acc
 > not.** The stability-across-a-window rule, in both directions, is satisfied by the pure tracker in
 > `mirror/presence.rs` and its `SETTLING_WINDOW_MS`, and `mirror::runner::PassRunner` debounces the
 > advertisable half of every observation through it. **Nothing feeds THAT**: there is no periodic
-> scan, no start-up scan and no watcher, because `MirrorEffects::observe_disk` has no implementation
+> scan, no start-up scan, because `MirrorEffects::observe_disk` has no implementation. The WATCHER half is
+> no longer pending: `mirror/events.rs` watches the capsule cache and accelerates the pass, bounded
+> by the four rules below
 > — so the scanning cadence described below, the un-debounced start-up exemption, and the claim that
 > the periodic pass is the correctness mechanism are all still pending, tracked as
 > <https://github.com/DIG-Network/dig-node/issues/412>.
@@ -8587,6 +8589,47 @@ coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile acc
 Presence changes are detected by SCANNING, with an optional watcher as an accelerator — never the
 reverse. A watcher event is exactly what a crash, an unmounted volume, or an uncovered path loses;
 the periodic pass (§25.4) is the correctness mechanism.
+
+The watcher is implemented (`mirror/events.rs`). It watches the capsule cache directory and MUST
+obey all four of the following; a node whose watcher cannot be established, or whose events are all
+dropped, MUST still converge on the round timer alone.
+
+1. **An event MAY only lower the instant of the next pass, never raise it.** The round deadline is
+   computed on entry to the wait and every return happens at or before it, so the timer is a
+   backstop rather than a fallback. The round length MUST NOT be lengthened to compensate for having
+   events.
+2. **Events are COALESCED, never queued.** The pending state is one instant, so N events in a window
+   — including events arriving while a pass is running or wedged — owe exactly ONE wake.
+3. **An observing wake fires after `QUIET_PERIOD_MS` (5_000) of quiet**, and schedules exactly one
+   **settling** wake `SETTLING_WINDOW_MS` later. That second wake MUST NOT re-arm, so a burst of any
+   size causes at most two passes.
+4. **No two event-driven passes are closer than `SETTLING_WINDOW_MS`.** A pass cannot act on a change
+   the tracker has not yet seen hold for a window, so anything closer is amplification on a path that
+   spends money.
+
+**Chain events do NOT trigger a pass, and no mechanism exists by which they could.** Chain is
+observed inside the pass, on the round timer. This is a limitation of the interfaces available, not
+only a design preference, and the two are worth separating:
+
+- **There is no chain event to subscribe to.** `MirrorEffects::observe_chain` reads through
+  `ChainSource` (`dig-chainsource-interface`), whose entire surface is request/response —
+  `coin_record`, `coin_records_by_puzzle_hash`, `coin_records_by_parent`, `coin_spend`. It exposes
+  no subscription, no stream and no callback, so there is nothing for a waiting pass to select on.
+  The node's own §14.2 chain-watch is likewise a POLL loop, not a push source.
+- **The one push path in the node cannot say a mirror coin changed.** The wallet's direct-peer sync
+  (§18.6) does hold a real `request_puzzle_state(subscribe = true)` subscription and publishes to
+  the §18.14 `EventBus` — but `SyncEvent::CoinState` is fieldless. It names no coin, no puzzle hash
+  and no height, and it reports the WALLET DB rather than the mirror's chain view. Waking a pass on
+  it would wake a money-spending pass on any wallet coin activity whatsoever, with no evidence the
+  event was relevant, at up to the `SETTLING_WINDOW_MS` floor rather than the round.
+
+Independently of both, the two things a pass acts on are not chain-shaped: a CREATE is decided from
+disk presence, which IS event-driven; and the epoch rollover a RECLAIM waits on is wall-clock.
+
+What a chain event WOULD buy is freshness of the §25.8 observation — a mirror coin spent out from
+under this node is reported up to one round late. That is a staleness bound on a read-only surface,
+never a money-safety gap, and closing it needs a coin-state push carrying the coin it is about.
+Tracked as <https://github.com/DIG-Network/dig-node/issues/482>.
 
 The debounce is **presence-stable-for-a-window**, not a timer after an event: a bond must be
 observed in the SAME state across `SETTLING_WINDOW_MS` (default 30_000) before that state is acted
@@ -8750,3 +8793,79 @@ Changing the value affects only coins created after the change. Bringing an exis
 means reclaiming and re-creating it — a round trip and a fee — and the node MUST NOT reclaim in
 response to a configuration edit.
 
+
+### 25.11. Funding a create — authentication precedes every figure the operator is told
+
+The $DIG that funds a create is selected from ONE address: `dig_cat_puzzle_hash(owner)`, the CAT
+curry of the operator's own puzzle hash. That address is **publicly derivable** — the owner puzzle
+hash is public and the curry is canonical — and anyone may pay any coin to any puzzle hash. So a row
+returned by the scan is a CANDIDATE, never a coin, and the number and declared amounts of those rows
+are chosen by whoever last paid into the address.
+
+A candidate becomes one of this operator's coins only by AUTHENTICATION: its creating spend is read
+from chain and executed, and a CAT child matching the candidate is produced, of the $DIG asset and
+at this operator's puzzle hash. The node MUST NOT treat an unauthenticated candidate as money.
+
+**The node MUST authenticate before it computes any figure it reports.** In particular:
+
+* The spendable total in a shortfall MUST be the total of AUTHENTICATED candidates. It MUST NOT be
+  the address total. An understated total sends an operator to buy $DIG they already hold, and the
+  §25.12 gate then suppresses the correction as immaterial.
+* The input bound MUST be applied to a selection drawn from AUTHENTICATED candidates only. Applied
+  to the raw scan it is a bound a stranger sets, and the refusal it produces is the operator-facing
+  claim *the wallet holds enough $DIG, in too many pieces* — so a stranger paying enough small coins
+  into the address chooses which of two OPPOSITE instructions the operator is given, and an operator
+  holding nothing is told that adding more will not help.
+* A candidate that fails authentication MUST be passed over rather than aborting the selection, MUST
+  be counted and reported, and MUST NOT occupy an input slot.
+
+**Authentication costs one chain read per candidate, so it MUST be bounded by a constant** that does
+not depend on how many candidates exist. Without such a bound the reads one automated pass performs
+are chosen by whoever paid coins into the address, on the pass timer, indefinitely.
+
+**A walk truncated by that bound leaves the wallet UNMEASURED.** The node MUST refuse with a
+condition of its own that states NO total — it MUST NOT report the total of the candidates that
+happened to be walked, and MUST NOT clear a live shortfall. It MUST classify as §25.12's
+*unmeasured*, and MUST therefore be reported to the operator without an amount: an operator whose
+node has stopped bonding because a stranger filled the scan address is otherwise never told
+anything, on any pass, indefinitely.
+
+**A pass that authenticated no candidate at all has no spendable total either.** The commonest such
+pass is one that priced a create and could afford none, so the selection was never invoked. It is
+still SHORT — authentication only ever removes candidates, so a reported balance below one create's
+cost proves the authenticated one is below it too — but the SIZE of the gap is not established, and
+the node MUST NOT quote the address total, or any figure derived from it, as the spendable one. It
+MUST classify as §25.12's *unmeasured*.
+
+### 25.12. Reporting a funding shortfall to the operator
+
+The node MUST distinguish four funding observations per pass — *healthy*, *short* (with the amount
+and the remedy), *unmeasured* (blocked, with no amount), and *unknown* — and MUST raise an
+operator-facing message only on a CHANGE: once on entering the short state, again only when the
+remedy changes or the deficit grows materially, and once on recovery. An *unknown* observation MUST
+raise nothing and MUST NOT clear a live shortfall.
+
+An *unmeasured* observation MUST raise a message once on entering it, MUST state NO spendable total
+and NO deficit, and MUST NOT clear a live shortfall. Saying nothing about the AMOUNT and saying
+nothing AT ALL are different: the second leaves a node that has silently stopped bonding
+unreported, and leaves a shortfall already alerted on latched at a figure that can never be
+corrected. The message MUST name the condition and an action the operator can take, and MUST NOT
+assert a remedy the observation does not establish — in particular a truncated walk MUST NOT tell
+an operator to add $DIG, since adding it need not help.
+
+A *short* observation's spendable total MUST be authenticated (§25.11). A pass that has no
+authenticated total is *unmeasured*, never *short with the address total*.
+
+**A pass that planned no create because it could afford none is SHORT, not healthy.** The two
+conditions that produce an empty create list are opposites — nothing to bond, and nothing
+affordable — and only the first is healthy. Classifying the second as healthy leaves the shortfall
+with no producer for the commonest real case (a wallet holding less than one create's collateral,
+which never attempts a create and so never produces a funding refusal), and worse, CLEARS a live
+shortfall and announces a recovery that has not happened.
+
+The figures a shortfall reports MUST be the money that must actually be ADDED: the authenticated
+$DIG remaining after the affordable creates were funded, against the cost of those that were not.
+The wallet balance alone overstates what is available towards the unmade creates, and an
+unauthenticated balance is in addition a figure a stranger chooses (§25.11) — so where the
+remaining $DIG has not been authenticated, the cost of the unmade creates is reported alone, as an
+*unmeasured* observation.
