@@ -2618,8 +2618,7 @@ mod tests {
             "the two states must not collapse onto one token -- that collapse IS #294"
         );
         assert!(
-            drifted.detail().contains(&hex::encode(r1))
-                && drifted.detail().contains("putBody"),
+            drifted.detail().contains(&hex::encode(r1)) && drifted.detail().contains("putBody"),
             "the superseded detail must name the chain's root and the remedy: {}",
             drifted.detail()
         );
