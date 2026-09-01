@@ -4461,8 +4461,12 @@ pub async fn handle_rpc_json(
 /// Build a JSON-RPC 2.0 error response envelope. A free function (not the local `err` closure inside
 /// [`handle_rpc`]'s getContent section) so the early peer-RPC handlers can report catalogued errors
 /// before that closure is in scope.
+///
+/// Every frame is minted through [`seams::dig_rpc::errors::error_frame`], so a declared code
+/// carries `data.code` + `data.origin` from `dig-rpc-protocol` by construction rather than by
+/// each call site remembering to add them (dig-node#340).
 fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
-    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+    crate::seams::dig_rpc::errors::error_frame(id, code, message)
 }
 
 /// The answer a hop gives while it is STILL RELAYING the capsule it was asked for (dig-node#333):
