@@ -125,11 +125,13 @@ mod tests {
     }
 
     /// A directory unique to one test, so tests never share a fixture path.
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("dig-seed-export-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    /// The directory is OWNED by the returned guard: `TempDir`'s `Drop` removes the tree,
+    /// including on an unwind, so a failing assertion cannot leak it (dig-node#370).
+    fn scratch(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("dig-seed-export-{tag}-"))
+            .tempdir()
+            .expect("scratch dir")
     }
 
     /// Write a seed file in the LEGACY on-disk layout — the one every real custodied file
@@ -154,7 +156,7 @@ mod tests {
     #[test]
     fn legacy_seed_file_exports() {
         let dir = scratch("legacy");
-        let path = write_legacy_fixture(&dir, &password("legacy"));
+        let path = write_legacy_fixture(dir.path(), &password("legacy"));
 
         let recovered =
             export_mnemonic(&path, &password("legacy")).expect("legacy blob must export");
@@ -168,7 +170,7 @@ mod tests {
     #[test]
     fn current_format_seed_file_also_exports() {
         let dir = scratch("current");
-        let path = dir.join("seed.bin");
+        let path = dir.path().join("seed.bin");
         let bytes =
             crate::seed_store::encrypt_seed(PHRASE, &password("current")).expect("current encrypt");
         assert_ne!(
@@ -191,7 +193,7 @@ mod tests {
     #[test]
     fn explicit_path_reaches_a_non_default_location() {
         let dir = scratch("override");
-        let path = write_legacy_fixture(&dir, &password("fixture"));
+        let path = write_legacy_fixture(dir.path(), &password("fixture"));
         assert_ne!(
             path,
             default_seed_path(),
@@ -211,7 +213,7 @@ mod tests {
     #[test]
     fn wrong_password_fails_without_leaking() {
         let dir = scratch("wrongpw");
-        let path = write_legacy_fixture(&dir, &password("right"));
+        let path = write_legacy_fixture(dir.path(), &password("right"));
 
         let err =
             export_mnemonic(&path, &password("wrong")).expect_err("a wrong password must fail");
@@ -231,7 +233,7 @@ mod tests {
     #[test]
     fn missing_file_is_reported_as_missing() {
         let dir = scratch("missing");
-        let path = dir.join("nothing-here.bin");
+        let path = dir.path().join("nothing-here.bin");
 
         let err =
             export_mnemonic(&path, &password("fixture")).expect_err("an absent file must fail");
@@ -245,7 +247,7 @@ mod tests {
     #[test]
     fn export_leaves_the_file_byte_identical() {
         let dir = scratch("readonly");
-        let path = write_legacy_fixture(&dir, &password("fixture"));
+        let path = write_legacy_fixture(dir.path(), &password("fixture"));
         let before = std::fs::read(&path).expect("read before");
 
         export_mnemonic(&path, &password("fixture")).expect("export");

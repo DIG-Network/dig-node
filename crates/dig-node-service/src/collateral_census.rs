@@ -651,16 +651,15 @@ mod tests {
     }
 
     /// A store in a fresh temp dir, holding only the genesis record the bring-up writes.
-    fn seeded_store(name: &str) -> (EpochRecordStore, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-census-{name}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("create the scratch dir");
-        let store = EpochRecordStore::at(dir.join("epochs.jsonl"));
+    /// The guard is returned with the store, which writes into the tree for as long as
+    /// the caller holds it; `TempDir`'s `Drop` then removes it, including on an unwind
+    /// (dig-node#370).
+    fn seeded_store(name: &str) -> (EpochRecordStore, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("dig-node-census-{name}-"))
+            .tempdir()
+            .expect("create the scratch dir");
+        let store = EpochRecordStore::at(dir.path().join("epochs.jsonl"));
         store
             .put(&StoredRecord::bootstrap())
             .expect("seed the genesis record");
@@ -999,7 +998,7 @@ mod tests {
             use std::io::Write as _;
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
-                .open(dir.join("epochs.jsonl"))
+                .open(dir.path().join("epochs.jsonl"))
                 .expect("open the store for the rotted append");
             writeln!(f, "{{\"epoch\":2}}").expect("append the rotted line");
         }
