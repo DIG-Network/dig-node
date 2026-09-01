@@ -705,15 +705,11 @@ impl FundingObservation {
             // this speaks -- once, naming the truncation and quoting no total -- and still clears
             // nothing.
             FundingError::CandidatesUnverifiable {
-                attempted,
-                skipped,
-                ..
-            } => {
-                FundingObservation::Unmeasured(UnmeasuredFunding::AuthenticationTruncated {
-                    attempted: *attempted,
-                    skipped: *skipped,
-                })
-            }
+                attempted, skipped, ..
+            } => FundingObservation::Unmeasured(UnmeasuredFunding::AuthenticationTruncated {
+                attempted: *attempted,
+                skipped: *skipped,
+            }),
         }
     }
 }
