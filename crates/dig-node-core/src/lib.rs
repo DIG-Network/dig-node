@@ -115,6 +115,104 @@ pub use seams::key_mgmt::KeyManager;
 pub mod shared;
 pub mod subscription;
 
+// ---- The operator's flag vocabulary, shared across crates (dig-node#459) ---------------------
+//
+// `peer::is_off_token` is the ONE reading of "the operator turned this off" for the three ISOLATION
+// knobs (#282/#352). It is `pub(crate)`, so `dig-node-service`'s capability knobs could not reach it
+// and each grew its own narrower copy — which is how `disabled` came to work on three switches and
+// not on five. These two functions expose that vocabulary UP to the crate root rather than letting a
+// second copy exist (CLAUDE.md §2.0: centralize rival implementations; Appendix B: expose it up).
+
+/// Is `value` the operator saying "turn this capability OFF"?
+///
+/// The same tokens [`peer::is_off_token`] reads — `off`, `disabled`, `0`, `false`, `no`, trimmed and
+/// case-insensitive — with **one deliberate subtraction: an EMPTY value is NOT an off.**
+///
+/// # Why the empty rule is subtracted rather than inherited
+///
+/// For an ISOLATION knob an empty value is a coherent answer: `DIG_BOOTSTRAP_PEERS=` means "no
+/// bootstrap peers", and reading it as the compiled-in default made a node believed to be isolated
+/// dial production infrastructure (dig-node#312). The variable holds a LIST, so "set to nothing"
+/// names the empty list.
+///
+/// A capability knob holds no list. `DIG_WALLET_ENABLE_CHAIN_SYNC=` is what a shell produces from
+/// `export X="$UNSET_VAR"`, and reading that as OFF would stop the replica advancing — which
+/// dig-node#416 records as indistinguishable from an empty wallet at the balance surface. Inheriting
+/// the empty rule wholesale would therefore import a money lie through the vocabulary, having just
+/// refused to import one through the failure direction.
+///
+/// So: same tokens, different empty. Stated here because "adopt the shared vocabulary" reads like one
+/// decision and is two.
+#[must_use]
+pub fn is_capability_off_token(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && peer::is_off_token(trimmed)
+}
+
+/// Is `value` the operator saying "turn this capability ON"? `1`, `true`, `yes`, `on`, `enabled`,
+/// trimmed and case-insensitive.
+///
+/// `enabled` is present as the mirror of `disabled`: an operator who learns one word works will try
+/// its opposite, and a vocabulary that accepts only one direction of a pair is the same trap in
+/// reverse.
+#[must_use]
+pub fn is_capability_on_token(value: &str) -> bool {
+    let v = value.trim();
+    v.eq_ignore_ascii_case("1")
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("yes")
+        || v.eq_ignore_ascii_case("on")
+        || v.eq_ignore_ascii_case("enabled")
+}
+
+/// What a capability flag's raw value means, when "apply the default" and "the operator typed
+/// something we do not understand" must be told apart.
+///
+/// The third variant is the point. Every one of these knobs previously collapsed `Unrecognised` into
+/// the default and said nothing, so a typo and a deliberate omission produced identical behaviour and
+/// identical silence — see [`describe_unrecognised_flag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagWord {
+    /// An off-token: the operator asked for this capability to stop.
+    Off,
+    /// An on-token: the operator asked for this capability to run.
+    On,
+    /// Unset, or set to an empty value — the operator expressed no preference.
+    Absent,
+    /// Set to something that is neither. The caller applies its default AND says so.
+    Unrecognised,
+}
+
+/// Classify a capability flag's raw value. PURE — no process env, no logging — so a caller's policy
+/// and its disclosure are testable separately from its wiring.
+#[must_use]
+pub fn classify_flag(raw: Option<&str>) -> FlagWord {
+    match raw {
+        None => FlagWord::Absent,
+        Some(v) if v.trim().is_empty() => FlagWord::Absent,
+        Some(v) if is_capability_off_token(v) => FlagWord::Off,
+        Some(v) if is_capability_on_token(v) => FlagWord::On,
+        Some(_) => FlagWord::Unrecognised,
+    }
+}
+
+/// The line an operator sees when a flag's value was not understood.
+///
+/// A `String` rather than a log call at the classification site, for the reason
+/// `live_broadcast_disclosure` gives: the property under test is the TEXT. A test asserting only
+/// "a warning was emitted" passes on a message that omits the value, the variable, or the default
+/// actually applied — and a warning missing any of those three sends the operator looking in the
+/// wrong place, which is the failure this whole ticket is about.
+#[must_use]
+pub fn describe_unrecognised_flag(var: &str, raw: &str, applied_default: bool) -> String {
+    let applied = if applied_default { "ON" } else { "OFF" };
+    format!(
+        "{var} is set to {raw:?}, which is not a value this node understands. The default ({applied}) \
+         is being used and your setting has had NO effect. Accepted: on/1/true/yes/enabled, or \
+         off/0/false/no/disabled."
+    )
+}
+
 // The one place the per-range verification contract of a `dig.fetchRange` frame is built (#1577).
 use seams::content::range_frame;
 // Serve-side observability vocabulary for the peer-facing read surface (#1595).
