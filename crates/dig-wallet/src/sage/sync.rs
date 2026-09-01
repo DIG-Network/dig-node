@@ -949,7 +949,7 @@ pub async fn handle_coin_state_update(
             "wallet sync: replica moved backwards; clearing initial-sync-complete so wallet \
              reads fall back until a fresh catch-up"
         );
-        db.set_initial_sync_complete(false).await?;
+        db.clear_initial_sync_complete().await?;
     }
     apply_coin_states(db, &update.items, session.subscribed, session.derived).await?;
     db.record_peak(admitted, &hex::encode(update.peak_hash))
@@ -1978,7 +1978,7 @@ mod tests {
         .await
         .unwrap();
         db.set_peak(6_000_000, "aa").await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         db
     }
 
@@ -2287,7 +2287,7 @@ mod tests {
     /// the DB is left un-synced.
     ///
     /// The peer double here would happily report `is_finished` on the first response, so
-    /// without the guard the function reaches `set_initial_sync_complete(true)` over a DB
+    /// without the guard the function reaches `force_initial_sync_complete_for_test(true)` over a DB
     /// that was never queried for a single coin — and `routing::route(true, true)` then
     /// answers every wallet-scoped read from it. This is the floor of that invariant.
     #[tokio::test]
@@ -3501,7 +3501,7 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
         let anchor = 1000u32;
         db.set_peak(anchor, "aa").await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let events = EventBus::default();
         let subscribed = subscribed_owned();
         let mut session = corroborated(&subscribed, anchor);
@@ -3693,7 +3693,7 @@ mod tests {
         .await
         .unwrap();
         db.set_peak(anchor, "aa").await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.force_initial_sync_complete_for_test(true).await.unwrap();
         let subscribed = subscribed_owned();
 
         push(

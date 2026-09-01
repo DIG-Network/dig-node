@@ -355,16 +355,48 @@ impl Config {
     }
 }
 
-/// Parse the `DIG_NODE_DIGLOCAL` toggle. Truthy (`1`/`true`/`yes`/`on`) ⇒ enable
-/// the bare-dig.local listener; falsy (`0`/`false`/`no`/`off`) ⇒ disable; **unset
-/// or unrecognised ⇒ the default `true`** (auto-attempt with graceful fallback).
-/// Case/whitespace-insensitive. PURE so the toggle policy is unit-testable.
+/// Parse the `DIG_NODE_DIGLOCAL` toggle. On-token ⇒ enable the bare-dig.local listener; off-token
+/// ⇒ disable; **unset, empty, or unrecognised ⇒ the default `true`** (auto-attempt with graceful
+/// fallback) — and an UNRECOGNISED value is WARNED about rather than silently swallowed (#459).
+///
+/// Reads the shared vocabulary via [`dig_node_core::classify_flag`], so `disabled` and `enabled`
+/// work here exactly as they do on the three isolation knobs.
+///
+/// # Why an unrecognised value keeps the default instead of failing closed (#459)
+///
+/// This flag binds `127.0.0.2:80`, `127.0.0.2:443` and `[::1]:443` — LOOPBACK only. It cannot reach
+/// the network and cannot change what a remote party may do, so the isolation knobs' fail-closed
+/// rule buys nothing here while a typo would cost the operator a local feature they asked for.
+///
+/// The residue fail-open leaves is not the direction but the SILENCE, and that is what changed: the
+/// node now says the value was not understood and names the default it applied.
 pub fn parse_dig_local_flag(raw: Option<String>) -> bool {
-    match raw.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
-        Some(ref v) if matches!(v.as_str(), "0" | "false" | "no" | "off") => false,
-        Some(ref v) if matches!(v.as_str(), "1" | "true" | "yes" | "on") => true,
-        // Unset, blank, or anything unrecognised → the default-on behaviour.
-        _ => true,
+    resolve_capability_flag("DIG_NODE_DIGLOCAL", raw.as_deref(), true)
+}
+
+/// Apply a default-ON capability flag's policy and, when the value was not understood, SAY SO.
+///
+/// One function for both knobs because they take the same answer for the same reason, and because
+/// two copies of a disclosure rule is how the vocabulary diverged in the first place.
+///
+/// The classification is pure ([`dig_node_core::classify_flag`]); only the disclosure is a side
+/// effect, so a test can assert the decision and the emitted line separately.
+fn resolve_capability_flag(var: &str, raw: Option<&str>, default: bool) -> bool {
+    match dig_node_core::classify_flag(raw) {
+        dig_node_core::FlagWord::Off => false,
+        dig_node_core::FlagWord::On => true,
+        dig_node_core::FlagWord::Absent => default,
+        dig_node_core::FlagWord::Unrecognised => {
+            tracing::warn!(
+                "{}",
+                dig_node_core::describe_unrecognised_flag(
+                    var,
+                    raw.unwrap_or_default().trim(),
+                    default
+                )
+            );
+            default
+        }
     }
 }
 
@@ -410,20 +442,31 @@ pub fn live_broadcast_disclosure() -> &'static str {
      To disable both, unset DIG_WALLET_ENABLE_LIVE_BROADCAST."
 }
 
-/// Parse the `DIG_WALLET_ENABLE_CHAIN_SYNC` toggle (§18.6, #2501). Falsy
-/// (`0`/`false`/`no`/`off`) ⇒ do NOT start the background chain-sync supervisor; **anything else
-/// — including unset, blank, or unrecognised — ⇒ the default `true`**. Default-ON, unlike
-/// [`parse_live_broadcast_flag`]: syncing reads the chain into the node's own replica and moves
-/// no money, so the money-safe reasoning does not apply. Case/whitespace-insensitive. PURE so the
-/// policy is unit-testable without process env.
+/// Parse the `DIG_WALLET_ENABLE_CHAIN_SYNC` toggle (§18.6, #2501). Off-token ⇒ do NOT start the
+/// background chain-sync supervisor; **unset, empty, or unrecognised ⇒ the default `true`**, with an
+/// unrecognised value WARNED about rather than silently swallowed (#459). Default-ON, unlike
+/// [`parse_live_broadcast_flag`]: syncing reads the chain into the node's own replica and moves no
+/// money, so the money-safe reasoning does not apply.
+///
+/// # Why this one does NOT fail closed, although it DOES reach the network (#459)
+///
+/// #459 proposed the discriminator "can the flag's behaviour reach the network?", on the model of
+/// #282/#352. This flag does — it dials chia peers and reads the chain — so that test says fail
+/// closed. **Applied here it would produce a defect**, and the reason is worth keeping:
+///
+/// Failing closed on an unrecognised value silently stops the replica advancing. dig-node#416
+/// records that a stale replica's zero balance is INDISTINGUISHABLE from an empty wallet at the
+/// balance surface — so a typo would be converted into a surface asserting a falsehood about the
+/// operator's money. Failing open converts the same typo into "the flag you set had no effect",
+/// which is recoverable and, now, stated out loud.
+///
+/// The generalisation that survives, and which the network-reach test was a proxy for: **fail in
+/// whichever direction cannot make a surface assert a falsehood.** For an isolation knob that is
+/// closed, because fail-open leaves a node dialling a network its operator asked it to leave. For a
+/// default-ON read path it is open, because fail-closed manufactures a false zero. Same principle,
+/// opposite outcome — which is why the proxy must not be applied mechanically.
 pub fn parse_chain_sync_flag(raw: Option<String>) -> bool {
-    !matches!(
-        raw.as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("0" | "false" | "no" | "off")
-    )
+    resolve_capability_flag("DIG_WALLET_ENABLE_CHAIN_SYNC", raw.as_deref(), true)
 }
 
 /// Parse the `DIG_NODE_HOST` override (#288): `Some(ip)` when the raw value is a
@@ -1231,6 +1274,190 @@ mod tests {
         assert!(parse_dig_local_flag(None));
         assert!(parse_dig_local_flag(Some(String::new())));
         assert!(parse_dig_local_flag(Some("maybe".to_string())));
+    }
+
+    // ---- #459: failure direction and off-vocabulary, decided separately -----------------------
+    //
+    // Every assertion below names the alternative it rules out. The ticket warns that the existing
+    // `peer_network_enabled` test passed under BOTH the old and new parsers because it listed only
+    // lowercase exact tokens and never a value the two disagree about — so a test here that only
+    // re-listed `on`/`off` would prove nothing about either decision.
+
+    /// An in-memory sink for the disclosure assertions.
+    #[derive(Clone, Default)]
+    struct FlagLogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for FlagLogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FlagLogCapture {
+        type Writer = FlagLogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` under a scoped capturing subscriber and return what it logged.
+    fn capture_flag_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+        let buffer = FlagLogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(buffer.clone())
+            .finish();
+        let outcome = tracing::subscriber::with_default(subscriber, body);
+        let captured = buffer.0.lock().unwrap().clone();
+        (outcome, String::from_utf8_lossy(&captured).into_owned())
+    }
+
+    /// **DECISION 1 (#459) — an unrecognised value keeps the default AND is said out loud.**
+    ///
+    /// This is the assertion that distinguishes the chosen answer from BOTH alternatives, which is
+    /// why the value and the log are asserted together rather than in two tests:
+    ///
+    /// | alternative | how it fails here |
+    /// |---|---|
+    /// | fail CLOSED on unrecognised | returns `false`; the value assertion fails |
+    /// | fail OPEN **silently** (shipped behaviour) | returns `true` but logs nothing; the disclosure assertion fails |
+    ///
+    /// `"fasle"` is a real typo of `false` — the case where the two candidate failure directions
+    /// give opposite answers — not a token neither implementation would accept.
+    #[test]
+    fn an_unrecognised_capability_flag_keeps_its_default_and_says_so() {
+        for (var, parse) in [
+            (
+                "DIG_WALLET_ENABLE_CHAIN_SYNC",
+                parse_chain_sync_flag as fn(Option<String>) -> bool,
+            ),
+            (
+                "DIG_NODE_DIGLOCAL",
+                parse_dig_local_flag as fn(Option<String>) -> bool,
+            ),
+        ] {
+            let (enabled, logs) = capture_flag_logs(|| parse(Some("fasle".to_string())));
+
+            assert!(
+                enabled,
+                "{var}: a typo must not silently disable a default-ON capability — failing closed \
+                 here converts a typo into a stale replica, which dig-node#416 records as \
+                 indistinguishable from an empty wallet"
+            );
+            assert!(
+                logs.contains(var),
+                "{var}: the disclosure must name the VARIABLE, or the operator cannot find it; \
+                 log was:\n{logs}"
+            );
+            assert!(
+                logs.contains("fasle"),
+                "{var}: the disclosure must echo the REJECTED VALUE, or the operator cannot see \
+                 their typo; log was:\n{logs}"
+            );
+            assert!(
+                logs.contains("NO effect"),
+                "{var}: the disclosure must say the setting did nothing — a line that merely \
+                 mentions the flag reads as confirmation that it was applied; log was:\n{logs}"
+            );
+        }
+    }
+
+    /// **The control for the test above.** A RECOGNISED value must produce no disclosure at all.
+    ///
+    /// Without this, warning unconditionally would satisfy every assertion above while burying the
+    /// real one in noise on every start-up — the standard way a disclosure stops being read.
+    #[test]
+    fn a_recognised_capability_flag_says_nothing() {
+        for raw in ["off", "on", "DISABLED", " enabled ", ""] {
+            let (_, logs) = capture_flag_logs(|| parse_chain_sync_flag(Some(raw.to_string())));
+            assert!(
+                logs.is_empty(),
+                "{raw:?} is understood, so it must not warn; log was:\n{logs}"
+            );
+        }
+        let (_, logs) = capture_flag_logs(|| parse_chain_sync_flag(None));
+        assert!(
+            logs.is_empty(),
+            "an unset flag is not a mistake; log was:\n{logs}"
+        );
+    }
+
+    /// **DECISION 2 (#459) — the two flags adopt the shared off-TOKENS.**
+    ///
+    /// `disabled` and `enabled` are the whole content of this test: they are exactly the values the
+    /// old and new parsers disagree about. Under the shipped parsers `disabled` fell through to the
+    /// default and left the capability RUNNING — the same shape as `DIG_PEER_NETWORK=OFF` leaving
+    /// the peer network running, which is the defect #282/#352 exists to close.
+    ///
+    /// The lowercase exact tokens are re-listed only as a regression floor; on their own they would
+    /// pass under both implementations, which the ticket names as the trap.
+    #[test]
+    fn the_capability_flags_read_the_shared_off_vocabulary() {
+        for off in [
+            "disabled",
+            "DISABLED",
+            " Disabled ",
+            "off",
+            "OFF",
+            "0",
+            "false",
+            "no",
+        ] {
+            assert!(
+                !parse_chain_sync_flag(Some(off.to_string())),
+                "{off:?} must stop chain sync"
+            );
+            assert!(
+                !parse_dig_local_flag(Some(off.to_string())),
+                "{off:?} must disable dig.local"
+            );
+        }
+        for on in ["enabled", "ENABLED", "on", "1", "true", "yes"] {
+            assert!(parse_chain_sync_flag(Some(on.to_string())));
+            assert!(parse_dig_local_flag(Some(on.to_string())));
+        }
+    }
+
+    /// **DECISION 2, the SUBTRACTION — an empty value is NOT an off for a capability knob.**
+    ///
+    /// `peer::is_off_token` treats an explicitly-empty value as OFF, and that is correct for the
+    /// three isolation knobs: `DIG_BOOTSTRAP_PEERS=` names the empty LIST (dig-node#312). Adopting
+    /// the vocabulary wholesale would import that rule here, where the variable holds no list and an
+    /// empty value is what `export X="$UNSET_VAR"` produces — stopping chain sync, and arriving at
+    /// dig-node#416's false zero through the vocabulary having just been refused through the failure
+    /// direction.
+    ///
+    /// **Catches:** a future "simplification" that routes these knobs straight at `is_off_token`.
+    /// That change passes every other test in this file.
+    #[test]
+    fn an_empty_capability_flag_is_absent_not_off() {
+        assert!(
+            parse_chain_sync_flag(Some(String::new())),
+            "an empty value must not stop chain sync"
+        );
+        assert!(
+            parse_chain_sync_flag(Some("   ".to_string())),
+            "whitespace is empty, and must not stop chain sync either"
+        );
+        assert!(parse_dig_local_flag(Some(String::new())));
+
+        // Asserted at the shared helper too, because that is where the subtraction lives: the two
+        // vocabularies agree on every TOKEN and differ only here, deliberately. `is_off_token`
+        // (crate-private to dig-node-core) still answers `true` for an empty value, which is what
+        // keeps dig-node#312 intact for the isolation knobs.
+        assert!(
+            !dig_node_core::is_capability_off_token(""),
+            "the capability vocabulary must not inherit the isolation knobs' empty-is-off rule"
+        );
+        assert!(
+            dig_node_core::is_capability_off_token("disabled"),
+            "it must still inherit every off TOKEN"
+        );
     }
 
     #[test]
