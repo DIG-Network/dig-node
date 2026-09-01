@@ -28,7 +28,6 @@
 mod support;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chia_protocol::{Bytes32, CoinSpend};
 use chia_sha2::Sha256;
@@ -183,12 +182,12 @@ fn intent() -> SpendIntent {
 /// The whole holding, deliberately: a wallet with an uncommitted coin to spare could satisfy the
 /// selector from that coin and would report success while the committed coin stayed stranded
 /// forever. Committing everything is what makes `Insufficient` the observable.
-fn wedged_wallet() -> (Chain, Wallet, SpendLog) {
+fn wedged_wallet() -> (Chain, Wallet, SpendLog, tempfile::TempDir) {
     let operator = wallet(0x21);
     let mut chain = Chain::default();
     let coins = chain.fund(&operator, &[REQUIRED], salt(1));
 
-    let log = tmp_log("wedged");
+    let (log, scratch) = tmp_log("wedged");
     let journal = SpendJournal::with_clock(log.clone(), clock);
     let spend = journal.begin(intent());
     journal.submitted(
@@ -208,7 +207,7 @@ fn wedged_wallet() -> (Chain, Wallet, SpendLog) {
     // test is the `Submitted` one written at `NOW`.
     std::mem::forget(spend);
 
-    (chain, operator, log)
+    (chain, operator, log, scratch)
 }
 
 /// **A coin committed to a spend still INSIDE the confirmation window is NOT released.**
@@ -222,7 +221,7 @@ fn wedged_wallet() -> (Chain, Wallet, SpendLog) {
 /// from well inside it can only confirm itself.
 #[test]
 fn a_coin_committed_to_a_spend_still_in_flight_is_not_selectable() {
-    let (chain, operator, log) = wedged_wallet();
+    let (chain, operator, log, _scratch) = wedged_wallet();
 
     let committed = committed_funding_coin_ids(&log, NOW + FUNDING_RESERVATION_WINDOW_MS - 1)
         .expect("the audit record is readable");
@@ -248,7 +247,7 @@ fn a_coin_committed_to_a_spend_still_in_flight_is_not_selectable() {
 /// Only the instant differs, so nothing but the elapsed time can explain the difference.
 #[test]
 fn a_coin_committed_to_a_spend_that_never_lands_is_selectable_two_passes_later() {
-    let (chain, operator, log) = wedged_wallet();
+    let (chain, operator, log, _scratch) = wedged_wallet();
 
     let n_passes = FUNDING_RESERVATION_WINDOW_MS / dig_constants::MIRROR_ROUND_LENGTH_MS as u64;
     assert_eq!(

@@ -15,7 +15,6 @@
 //! (The fixture is deliberately NOT named after "dig-updater" — see its own doc comment.)
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use dig_node_service::updater::{check_now, pause, resume, set_channel, CLI_BIN_ENV};
@@ -30,8 +29,6 @@ fn env_guard() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
-
-static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A unique-per-call scratch path for the fixture's `FAKE_UPDATER_ARGS_FILE` capture.
 ///
