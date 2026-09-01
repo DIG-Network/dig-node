@@ -53,7 +53,7 @@ use digstore_core::Bytes32;
 
 use crate::capsule_key::CapsuleKey;
 
-use super::module_anchor::{sha256, ChainAnchoredModuleVerifier};
+use super::module_anchor::ChainAnchoredModuleVerifier;
 
 /// The default cap on DISTINCT generations [`WarmRegistry`] admits at once.
 ///
@@ -294,15 +294,12 @@ fn promote_into_cache(
     // disk and compare it against the digest of the bytes the anchor gate ADMITTED. A mismatch means the
     // verified artifact and the promoted artifact are different objects — the promotion is abandoned
     // rather than "repaired", because there is no way to tell which of the two is the real one.
-    let bytes = std::fs::read(staged).map_err(|_| WarmFailure::PromotedArtifactMismatch)?;
     let Some(admitted) = verifier.admitted_digest() else {
         // The gate never admitted anything, yet a staged artifact exists. Refuse: promoting here would
-        // be promoting an artifact no gate ever saw.
+        // be promoting an artifact no gate ever saw. Checked BEFORE any byte is read or written, so a
+        // capsule no gate saw never costs this node a copy.
         return Err(WarmFailure::PromotedArtifactMismatch);
     };
-    if sha256(&bytes) != admitted {
-        return Err(WarmFailure::PromotedArtifactMismatch);
-    }
 
     if let Some(parent) = cached.parent() {
         std::fs::create_dir_all(parent).map_err(|_| WarmFailure::CacheWriteFailed)?;
@@ -310,7 +307,30 @@ fn promote_into_cache(
     // Write-then-rename INTO the cache, so a reader never observes a partial module at the cache path
     // (whose mere existence is this node's holder claim).
     let tmp = cached.with_extension("dig.warm.tmp");
-    std::fs::write(&tmp, &bytes).map_err(|_| WarmFailure::CacheWriteFailed)?;
+    // Stream staged -> tmp, hashing as the bytes pass (#302). The whole-file version read ~135 MB into
+    // a `Vec` and then wrote that same `Vec` out again, so one promotion cost a whole capsule resident
+    // PLUS a full in-memory copy. `copy_verifying` does it in one pass over a fixed buffer and yields
+    // the identical SHA-256, so the comparison against `admitted` is the same comparison as before.
+    //
+    // The ORDER changes and the invariant does not. Streaming cannot know the digest until the last
+    // byte, so `tmp` transiently holds unverified bytes — but `tmp` is a private temporary, never the
+    // cache path, and `copy_verifying` removes it on both failure paths. Nothing unverified is ever
+    // observable at the cache path, which is the property that matters: a file there IS this node's
+    // claim to hold the capsule.
+    // The mapping is the one the whole-file version had, variant for variant: an unreadable STAGED
+    // artifact and a digest mismatch were both `PromotedArtifactMismatch` (the artifact on disk is not
+    // the object the gate admitted, and no retry changes that), while a failed WRITE into the cache was
+    // `CacheWriteFailed` (this node could not take a perfectly good artifact). Preserved deliberately:
+    // collapsing them would re-map an outcome the caller branches on, which is a behaviour change
+    // wearing a refactor's clothes.
+    let promoted =
+        super::module_stream::copy_verifying(staged, &tmp, &admitted).map_err(|e| match e {
+            super::module_stream::StreamCopyError::ReadFailed
+            | super::module_stream::StreamCopyError::DigestMismatch => {
+                WarmFailure::PromotedArtifactMismatch
+            }
+            super::module_stream::StreamCopyError::WriteFailed => WarmFailure::CacheWriteFailed,
+        })?;
     // The holder claim is persisted BEFORE the capsule becomes visible at the cache path, because the
     // cache path is the inventory (dig-node#276). Between the rename and a later marker write there
     // would be a window in which an unrelated reconcile — a chain-watch gap-fill, a peer-presence
@@ -329,7 +349,7 @@ fn promote_into_cache(
     // complete over every landing path; the two sites are mutually exclusive, so a land is never
     // double-counted.
     crate::CACHE_REFETCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(bytes.len() as u64)
+    Ok(promoted)
 }
 
 /// Record `claim` durably beside the capsule about to appear at `cached`.
