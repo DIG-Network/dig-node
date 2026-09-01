@@ -37,13 +37,6 @@ fn env_guard() -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// Monotonic sequence giving each `start_companion_full` call a UNIQUE cache/config
-/// dir, so the per-server control-token file + pin registry (and pinned-store list a
-/// test asserts on) are never shared between tests. This + the [`EnvHold`] lock
-/// together remove the flaky UNAUTHORIZED: the lock makes the global-env reads
-/// consistent, the unique dir keeps each server's on-disk state isolated.
-static TEST_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Start a mock upstream DIG RPC on a random loopback port. It records every
 /// request and answers `dig.getAnchoredRoot` / `dig.listCapsules` / echoes the
 /// rest — enough to assert delegation + passthrough. Returns (base_url, calls).
@@ -150,7 +143,7 @@ async fn start_companion_full_inner(
         // and on Windows a concurrent reader could hit that file mid-write, error,
         // and fall back to a random in-memory token → intermittent UNAUTHORIZED on a
         // token-gated control.* call (the flaky failure this guards). Give each call
-        // its own PARENT dir (`<temp>/dig-node-test-<pid>-<seq>/cache`) so the
+        // its own PARENT dir (`<temp>/dig-node-test-<random>/cache`, owned by a TempDir) so
         // token + config.json are unique per server. (Set before from_env reads it.)
         let base = tempfile::Builder::new()
             .prefix("dig-node-test-")

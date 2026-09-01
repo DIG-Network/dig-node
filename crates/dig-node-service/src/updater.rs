@@ -327,7 +327,6 @@ pub async fn check_now(id: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     use tokio::sync::Mutex;
 
@@ -339,8 +338,6 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// A unique-per-call scratch path, so concurrent test RUNS (across `cargo test`
     /// invocations) never collide even though tests within this file are serialized.
