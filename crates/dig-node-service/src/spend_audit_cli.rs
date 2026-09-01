@@ -297,13 +297,16 @@ mod tests {
         NOW
     }
 
-    fn tmp_log() -> SpendLog {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("dig-node-spends-cli-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        SpendLog::at(dir.join("spend-audit.jsonl"))
+    /// The guard comes back with the log: the `SpendLog` writes into the directory for as
+    /// long as the caller holds it, so the tree must outlive this function. `TempDir`'s `Drop`
+    /// then removes it when the test ends, including on an unwind (dig-node#370).
+    fn tmp_log() -> (SpendLog, tempfile::TempDir) {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-spends-cli-")
+            .tempdir()
+            .expect("temp dir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+        (log, dir)
     }
 
     fn intent(kind: &str, store: Option<&str>) -> SpendIntent {
@@ -324,7 +327,7 @@ mod tests {
 
     /// A log holding one confirmed mirror-coin spend and one failed one.
     fn seeded_log() -> SpendLog {
-        let log = tmp_log();
+        let (log, _dir) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
 
         let ok = journal.begin(intent(kinds::MIRROR_COIN, Some("store-a")));
@@ -403,7 +406,7 @@ mod tests {
     /// marker fails instead of matching by luck.
     #[test]
     fn an_expected_coin_is_marked_differently_from_a_confirmed_one() {
-        let log = tmp_log();
+        let (log, _dir) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
 
         let pending = journal.begin(intent(kinds::MIRROR_COIN, Some("s1")));
@@ -614,7 +617,7 @@ mod tests {
     /// the spends a person opened the command to see.
     #[test]
     fn a_limit_keeps_the_newest_rows() {
-        let log = tmp_log();
+        let (log, _dir) = tmp_log();
         let journal = SpendJournal::with_clock(log.clone(), clock);
         // Distinct initiated_ms so "newest" is well defined rather than a tiebreak.
         for (i, store) in ["old", "new"].iter().enumerate() {

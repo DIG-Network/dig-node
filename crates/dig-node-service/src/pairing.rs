@@ -518,21 +518,14 @@ mod tests {
     /// A unique temp STATE dir (#501: the paired-token store now lives in the state
     /// dir, not beside a `config.json`). Returns `(state_dir, state_dir)` so both
     /// tuple bindings point at the dir a test seeds + cleans.
-    fn tmp_config() -> (PathBuf, PathBuf) {
-        // A process-wide counter makes the dir unique even when two tests build it in
-        // the same millisecond (parallel test threads) — otherwise one test's
-        // remove_dir_all could nuke another's dir mid-run.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-pairing-{}-{}-{}",
-            std::process::id(),
-            now_ms(),
-            n
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        (dir.clone(), dir)
+    /// The tree is OWNED by the returned guard: `TempDir`'s `Drop` removes it, including on
+    /// an unwind, so a failing assertion cannot leak it (dig-node#370). `tempfile`'s random
+    /// component also subsumes the hand-rolled pid + counter name, which repeated across runs.
+    fn tmp_config() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dig-node-pairing-")
+            .tempdir()
+            .expect("a scratch dir")
     }
 
     fn pending() -> Mutex<PendingPairings> {
