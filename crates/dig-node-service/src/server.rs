@@ -3438,19 +3438,51 @@ mod tests {
             "a cross-site POST must classify as CrossSite so its landing legs are denied"
         );
 
-        // No Sec-Fetch-Site header (a non-browser client, or a same-origin request) ⇒ first-party.
+        // No Sec-Fetch-Site header ⇒ a NON-BROWSER client (CLI, SDK, FFI). A browser always sends
+        // the header, so its absence is the one case that is genuinely not page-driven.
         assert_eq!(
             provenance_for(&HeaderMap::new()),
             RequestProvenance::FirstParty,
             "an absent header must be first-party — a CLI/SDK read must never be mistaken for cross-site"
         );
 
+        // `same-origin` is PAGE-DRIVEN, and on this node the only HTML surface is `/s/*` — so the
+        // page that sent it was authored by store content, not by the operator.
+        //
+        // This assertion previously read `FirstParty`, with the comment "a same-origin POST still
+        // lands". That was the dig-node#450 defect stated as a requirement: `/s/*path` and `POST /`
+        // share one router and port, and `STORE_CSP` grants `connect-src 'self'` — where `'self'`
+        // IS the RPC endpoint — so a store's own page reached `dig.getContent` as `same-origin`,
+        // landed its capsule `Held`, and staked this operator's $DIG on a stranger's content.
+        //
+        // The test asserted the behaviour the fix exists to remove, which is why it went red on the
+        // fix rather than on the defect.
         let mut same = HeaderMap::new();
         same.insert("sec-fetch-site", "same-origin".parse().unwrap());
         assert_eq!(
             provenance_for(&same),
+            RequestProvenance::StoreServed,
+            "a same-origin POST is page-driven, and every page this node serves is store content"
+        );
+
+        // `none` is a user-initiated navigation, which script can never produce — so it stays
+        // first-party and the reshare flywheel survives: the operator navigating to a store still
+        // lands it.
+        let mut nav = HeaderMap::new();
+        nav.insert("sec-fetch-site", "none".parse().unwrap());
+        assert_eq!(
+            provenance_for(&nav),
             RequestProvenance::FirstParty,
-            "a same-origin POST still lands — only an explicit cross-site value denies landing"
+            "a user-initiated navigation is the operator acting, not store content acting"
+        );
+
+        // An unrecognised value fails CLOSED. It failed open before.
+        let mut odd = HeaderMap::new();
+        odd.insert("sec-fetch-site", "future-value".parse().unwrap());
+        assert_eq!(
+            provenance_for(&odd),
+            RequestProvenance::StoreServed,
+            "an unknown Sec-Fetch-Site must not be treated as the operator"
         );
     }
 
