@@ -457,6 +457,43 @@ impl ChainTransport {
         ))
     }
 
+    /// This transport's chain reads served by the node's OWN peers and believed only on agreement
+    /// (dig-node#503).
+    ///
+    /// The counterpart to [`Self::chain_source`], and the difference is the whole point. That one
+    /// hands out `chia-query`'s router, which asks `api.coinset.org` first and consults this node's
+    /// peers only when that read fails; its own `ProviderInfo` says `trustless: false` for exactly
+    /// that reason. This one asks the peers, and returns nothing they did not agree on.
+    ///
+    /// Use it for any verdict a forged answer would PAY for — ranking a holder, crediting a bond —
+    /// where a single endpoint's word is the attack rather than a latency choice. The router
+    /// remains the right source for the reads whose worst case is a stale number.
+    ///
+    /// `handle` MUST belong to a **multi-thread** tokio runtime, as for [`Self::chain_source`].
+    ///
+    /// # Errors
+    ///
+    /// This transport holds no corroborated-read surface — a node built without one. **It does NOT
+    /// fall back to [`Self::chain_source`], deliberately.** Falling through to one endpoint exactly
+    /// when the peers are unavailable or failed to agree would let that endpoint overrule them,
+    /// which is the same rule this file already applies to the lineage-walk reads. A caller that
+    /// gets this error must fail closed.
+    pub fn corroborated_chain_source(
+        &self,
+        handle: tokio::runtime::Handle,
+    ) -> Result<super::corroborated_source::CorroboratedChainSource> {
+        let Some(reads) = &self.peer_reads else {
+            return Err(Error::internal(
+                "this node holds no corroborated peer reads, so no chain answer can be \
+                 corroborated; the single-source router is deliberately NOT used instead",
+            ));
+        };
+        Ok(super::corroborated_source::CorroboratedChainSource::new(
+            reads.clone(),
+            handle,
+        ))
+    }
+
     /// A transport that already HAS its client, so nothing in the test dials.
     ///
     /// Seeding the client is what makes pointer identity assertable: a consumer that quietly built
