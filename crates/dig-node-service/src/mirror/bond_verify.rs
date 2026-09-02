@@ -392,12 +392,23 @@ impl ChainBondVerifier {
         claiming_peer_id: &str,
         coin_id: [u8; 32],
     ) -> BondVerdict {
+        // Corroborated, never the router (dig-node#503). `chain_source` asks `api.coinset.org`
+        // first and consults this node's peers only when that read fails -- its own `ProviderInfo`
+        // says `trustless: false` -- so a `Bonded` verdict taken from it rests on ONE source's
+        // word. Every check below is internal consistency of a coin and its creating spend, and
+        // all of them pass on a coin curried around an invented parent that was never on mainnet.
+        // Only chain MEMBERSHIP disproves that, and membership is what a single endpoint cannot
+        // settle.
+        //
+        // No fallback here, deliberately: `corroborated_chain_source` errs rather than handing
+        // back the router, and this reads that as `Unverified`. Falling back would let one
+        // endpoint overrule the peers exactly when they failed to agree.
+        //
         // Re-read per call rather than held from bring-up, matching the mirror pass: a transport
         // built once would make a node that started offline one that never verifies again.
         let Ok(source) = self
             .chain
-            .chain_source(tokio::runtime::Handle::current())
-            .await
+            .corroborated_chain_source(tokio::runtime::Handle::current())
         else {
             return BondVerdict::Unverified;
         };
