@@ -1711,9 +1711,12 @@ async fn replica_tier(ctx: &ControlCtx) -> AnswerTier {
         // Only `Synced` licenses serving wallet-scoped reads from the replica, so only `Synced`
         // may claim a wallet-scoped answer is current. Every other phase — including the
         // all-clear `NoWalletEnrolled` — is making a different claim, or none.
-        synced: status
-            .as_ref()
-            .is_some_and(|s| matches!(s.phase, dig_wallet::sage::sync_supervisor::SyncPhase::Synced)),
+        synced: status.as_ref().is_some_and(|s| {
+            matches!(
+                s.phase,
+                dig_wallet::sage::sync_supervisor::SyncPhase::Synced
+            )
+        }),
         peak_height: status.as_ref().and_then(|s| s.peak_height),
         network_peak_height: status.and_then(|s| s.chia_peer_peak_height),
     }
@@ -4780,7 +4783,9 @@ mod tests {
                 synced: true,
                 peak_height: Some(5_000_000),
             },
-            BalanceAsset::DIG, None);
+            BalanceAsset::DIG,
+            None,
+        );
 
         assert_eq!(
             wire,
@@ -4842,7 +4847,9 @@ mod tests {
                 synced: false,
                 peak_height: None,
             },
-            asset, None);
+            asset,
+            None,
+        );
         assert_eq!(
             wire["coins"][0]["asset"],
             json!({ "cat": id }),
@@ -4903,7 +4910,9 @@ mod tests {
                 synced: false,
                 peak_height: None,
             },
-            BalanceAsset::Xch, None);
+            BalanceAsset::Xch,
+            None,
+        );
 
         assert_eq!(
             wire["coins"][0]["spent_height"],
@@ -5004,7 +5013,10 @@ mod tests {
         };
 
         for (name, read) in [
-            ("coins", &coins as &dyn Fn(Option<u32>, Option<u32>) -> Value),
+            (
+                "coins",
+                &coins as &dyn Fn(Option<u32>, Option<u32>) -> Value,
+            ),
             ("coinById", &by_id),
             ("coinsByParent", &by_parent),
             ("arrivals", &arrivals),
@@ -5059,7 +5071,13 @@ mod tests {
                     confirmed_height: 5_000_001,
                 },
             ],
-            8, AnswerTier { synced: true, peak_height: Some(9_220_177), network_peak_height: Some(9_220_177) });
+            8,
+            AnswerTier {
+                synced: true,
+                peak_height: Some(9_220_177),
+                network_peak_height: Some(9_220_177),
+            },
+        );
         assert_eq!(wire["arrivals"][0]["amount"], json!("18446744073709551615"));
         assert_eq!(wire["arrivals"][0]["asset_id"], Value::Null);
         assert_eq!(wire["arrivals"][0]["confirmed_height"], json!(5_000_000));
@@ -5085,7 +5103,16 @@ mod tests {
             confirmed_height: 100,
         };
         // The page ends at 8; the ledger has since reached 12.
-        let wire = arrivals_wire(0, &[row(7), row(8)], 12, AnswerTier { synced: true, peak_height: Some(9_220_177), network_peak_height: Some(9_220_177) });
+        let wire = arrivals_wire(
+            0,
+            &[row(7), row(8)],
+            12,
+            AnswerTier {
+                synced: true,
+                peak_height: Some(9_220_177),
+                network_peak_height: Some(9_220_177),
+            },
+        );
         assert_eq!(
             wire["cursor"],
             json!(8),
@@ -5098,7 +5125,16 @@ mod tests {
     /// first-run client can start from NOW instead of replaying the ledger as a burst of toasts.
     #[test]
     fn an_empty_arrivals_page_holds_the_cursor_and_still_reports_latest() {
-        let wire = arrivals_wire(30, &[], 42, AnswerTier { synced: true, peak_height: Some(9_220_177), network_peak_height: Some(9_220_177) });
+        let wire = arrivals_wire(
+            30,
+            &[],
+            42,
+            AnswerTier {
+                synced: true,
+                peak_height: Some(9_220_177),
+                network_peak_height: Some(9_220_177),
+            },
+        );
         assert_eq!(wire["arrivals"], json!([]));
         assert_eq!(wire["cursor"], json!(30));
         assert_eq!(wire["latest"], json!(42));
@@ -5227,19 +5263,22 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::{WalletCoin, WalletCoinByIdResult};
 
-        let wire = coin_by_id_wire(&WalletCoinByIdResult {
-            coin: Some(WalletCoin {
-                coin_id: "aa".repeat(32),
-                parent_coin_info: "bb".repeat(32),
-                puzzle_hash: "cc".repeat(32),
-                amount: 1_000_000_000_000,
-                created_height: Some(5_000_000),
-                spent_height: Some(5_000_042),
-            }),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        }, None);
+        let wire = coin_by_id_wire(
+            &WalletCoinByIdResult {
+                coin: Some(WalletCoin {
+                    coin_id: "aa".repeat(32),
+                    parent_coin_info: "bb".repeat(32),
+                    puzzle_hash: "cc".repeat(32),
+                    amount: 1_000_000_000_000,
+                    created_height: Some(5_000_000),
+                    spent_height: Some(5_000_042),
+                }),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
 
         assert_eq!(
             wire,
@@ -5277,19 +5316,22 @@ mod tests {
 
         // A CAT-sized amount on a synced DB-tier answer: deliberately the case most likely to
         // tempt a classification, and the opposite tier/sync combination to the test above.
-        let wire = coin_by_id_wire(&WalletCoinByIdResult {
-            coin: Some(WalletCoin {
-                coin_id: "11".repeat(32),
-                parent_coin_info: "22".repeat(32),
-                puzzle_hash: "33".repeat(32),
-                amount: 1_000,
-                created_height: Some(1),
-                spent_height: None,
-            }),
-            source: Source::Db,
-            synced: true,
-            peak_height: Some(6_000_000),
-        }, None);
+        let wire = coin_by_id_wire(
+            &WalletCoinByIdResult {
+                coin: Some(WalletCoin {
+                    coin_id: "11".repeat(32),
+                    parent_coin_info: "22".repeat(32),
+                    puzzle_hash: "33".repeat(32),
+                    amount: 1_000,
+                    created_height: Some(1),
+                    spent_height: None,
+                }),
+                source: Source::Db,
+                synced: true,
+                peak_height: Some(6_000_000),
+            },
+            None,
+        );
 
         assert_eq!(
             wire["coin"]["asset"],
@@ -5321,12 +5363,15 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletCoinByIdResult;
 
-        let wire = coin_by_id_wire(&WalletCoinByIdResult {
-            coin: None,
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        }, None);
+        let wire = coin_by_id_wire(
+            &WalletCoinByIdResult {
+                coin: None,
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
         assert_eq!(
             wire,
             json!({
@@ -5374,16 +5419,19 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::{WalletCoinSpend, WalletCoinSpendResult};
 
-        let wire = coin_spend_wire(&WalletCoinSpendResult {
-            spend: Some(WalletCoinSpend {
-                coin: a_spent_coin(),
-                puzzle_reveal: "ff0180".to_string(),
-                solution: "80".to_string(),
-            }),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        }, None);
+        let wire = coin_spend_wire(
+            &WalletCoinSpendResult {
+                spend: Some(WalletCoinSpend {
+                    coin: a_spent_coin(),
+                    puzzle_reveal: "ff0180".to_string(),
+                    solution: "80".to_string(),
+                }),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
 
         assert_eq!(
             wire,
@@ -5424,12 +5472,15 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletCoinSpendResult;
 
-        let wire = coin_spend_wire(&WalletCoinSpendResult {
-            spend: None,
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        }, None);
+        let wire = coin_spend_wire(
+            &WalletCoinSpendResult {
+                spend: None,
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
         assert_eq!(
             wire,
             json!({
@@ -5623,14 +5674,17 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletCoinsByParentResult;
 
-        let wire = coins_by_parent_wire(&WalletCoinsByParentResult {
-            coins: vec![a_spent_coin()],
-            complete: false,
-            cursor: Some("aa".repeat(32)),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        }, None);
+        let wire = coins_by_parent_wire(
+            &WalletCoinsByParentResult {
+                coins: vec![a_spent_coin()],
+                complete: false,
+                cursor: Some("aa".repeat(32)),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
 
         assert_eq!(
             wire,
@@ -5664,14 +5718,17 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletCoinsByParentResult;
 
-        let wire = coins_by_parent_wire(&WalletCoinsByParentResult {
-            coins: vec![],
-            complete: true,
-            cursor: None,
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        }, None);
+        let wire = coins_by_parent_wire(
+            &WalletCoinsByParentResult {
+                coins: vec![],
+                complete: true,
+                cursor: None,
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
 
         assert_eq!(
             wire,
@@ -5699,26 +5756,32 @@ mod tests {
             WalletCoinSpend, WalletCoinSpendResult, WalletCoinsByParentResult,
         };
 
-        let spend = coin_spend_wire(&WalletCoinSpendResult {
-            spend: Some(WalletCoinSpend {
-                coin: a_spent_coin(),
-                puzzle_reveal: "01".into(),
-                solution: "80".into(),
-            }),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        }, None);
+        let spend = coin_spend_wire(
+            &WalletCoinSpendResult {
+                spend: Some(WalletCoinSpend {
+                    coin: a_spent_coin(),
+                    puzzle_reveal: "01".into(),
+                    solution: "80".into(),
+                }),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
         assert_eq!(spend["spend"]["coin"]["asset"], Value::Null);
 
-        let children = coins_by_parent_wire(&WalletCoinsByParentResult {
-            coins: vec![a_spent_coin()],
-            complete: true,
-            cursor: Some("aa".repeat(32)),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        }, None);
+        let children = coins_by_parent_wire(
+            &WalletCoinsByParentResult {
+                coins: vec![a_spent_coin()],
+                complete: true,
+                cursor: Some("aa".repeat(32)),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
         assert_eq!(children["coins"][0]["asset"], Value::Null);
     }
 
