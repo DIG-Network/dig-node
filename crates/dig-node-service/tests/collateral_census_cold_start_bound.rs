@@ -185,6 +185,17 @@ fn the_cost_of_locating_an_epoch_height_is_independent_of_chain_height() {
     // Chain reads one epoch's height search may cost. A bisection of the whole chain needs about
     // log2(peak) of them -- 24 at mainnet's height and 28 at sixteen times it -- so a budget of
     // twelve cannot be met by any search that starts at height zero.
+    //
+    // THE FIXTURE FLATTERS THE SEEDED PATH, AND THIS BOUND IS NOT EVIDENCE ABOUT MAINNET COST.
+    // `CountingChain::stamp` is `GENESIS_UNIX + height * SECS_PER_BLOCK` -- perfectly uniform --
+    // which is the best case an interpolated search can be handed: it converges in two or three
+    // probes where a jittered chain needs closer to seven. Combined with every block being a
+    // transaction block (one read per probe, see `CountingChain`), a comfortable margin here says
+    // NOTHING about the margin on a real chain. What the assertion is for is the SHAPE: twelve is
+    // below `log2(peak)` at every peak tried, so no search that begins at height zero can pass it,
+    // and passing at all three peaks is what shows the cost stopped tracking the chain's height.
+    // Measuring the constant belongs in `dig-mirror-coin`, whose fixture jitters timestamps and
+    // varies transaction density; do not tighten this number in the hope of measuring it here.
     const BUDGET_PER_EPOCH: u64 = 12;
 
     for multiple in [1u32, 4, 16] {
