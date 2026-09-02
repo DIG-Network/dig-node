@@ -238,7 +238,7 @@ pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const ROOT_NOT_ANCHORED: i64 = -32005;
 
 /// The resource is not available at the requested root — this node does not hold it and no other
-/// tier produced it. Catalogued as `RESOURCE_NOT_AVAILABLE_AT_ROOT` (dig-node `SPEC.md` error table)
+/// tier produced it. Catalogued as `RESOURCE_UNAVAILABLE` (dig-node `SPEC.md` error table)
 /// and already the code the read path returns for content it does not have.
 ///
 /// Named here (#1997) because the read path now reaches it in a NEW way: with no upstream configured
