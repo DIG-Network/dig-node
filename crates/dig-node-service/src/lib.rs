@@ -155,6 +155,10 @@ pub mod wallet_authz;
 /// Never fatal, never a fallback. See [`wallet_bootstrap`].
 pub mod wallet_bootstrap;
 
+/// Announcing the wallet-related environment this process resolved, and refusing the one
+/// destructive consequence of a split per-user root (dig-node#392). See [`wallet_env`].
+pub mod wallet_env;
+
 /// Latching the fact that the node's own wallet has held funds, so no surface calls a funded
 /// auto-created wallet disposable (dig-node#286). See [`wallet_funded`].
 pub mod wallet_funded;

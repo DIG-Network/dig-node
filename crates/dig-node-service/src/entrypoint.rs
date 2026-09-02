@@ -1421,6 +1421,10 @@ fn live_apply_level(logs_matches: &clap::ArgMatches) {
 /// dev dir.
 fn block_on_serve(config: Config) -> std::io::Result<()> {
     crate::logging::init(crate::logging::run_context());
+    // Say what this process actually resolved BEFORE anything is minted (#392): an operator who
+    // overrode `LOCALAPPDATA` has split the seed away from the `wallet.sqlite` replica, and must
+    // read that before - not after - a line reporting a freshly minted wallet.
+    crate::wallet_env::announce_from_env();
     // A seed must exist before anything can use the wallet, and there is no user here to create
     // one — so check on EVERY start (first install, post-update, ordinary boot) and mint one when
     // there is definitely none (#277). Never fatal: a node that cannot establish a wallet still
