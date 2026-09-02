@@ -277,22 +277,41 @@ mod tests {
         let paired = paired_message(std::path::Path::new("/home/u/DigNode/client-token"));
         let terminal = terminal_status_message("expired");
 
-        for (what, text) in [
-            ("waiting banner", banner.as_str()),
-            ("paired message", paired.as_str()),
-            ("expired-before-approval", EXPIRED_BEFORE_APPROVAL),
-            ("terminal status", terminal.as_str()),
+        // The banner is the ONE string with legitimate leading whitespace: it indents a
+        // copy-pasteable command by exactly four spaces so the reader can select it. Every other
+        // string is prose and must carry none, because a lost continuation shows up as leading
+        // indentation just as readily as it shows up mid-line -- `"a\n         b"` prints as
+        // raggedly as `"a          b"`, and a check that trims the start cannot see the first one.
+        const BANNER_INDENT: &str = "    ";
+        for (what, text, indent_allowed) in [
+            ("waiting banner", banner.as_str(), true),
+            ("paired message", paired.as_str(), false),
+            ("expired-before-approval", EXPIRED_BEFORE_APPROVAL, false),
+            ("terminal status", terminal.as_str(), false),
         ] {
             for line in text.lines() {
-                // The banner deliberately indents its copy-pasteable command by four spaces, so
-                // LEADING whitespace is legitimate. A run in the middle of a sentence is not, and
-                // that is exactly what a lost continuation produces.
                 let interior = line.trim_start();
+                let leading = &line[..line.len() - interior.len()];
                 assert!(
                     !interior.contains("   "),
                     "{what}: a run of 3+ spaces mid-line is the signature of a lost `\\` line \
                      continuation in a multi-line literal: {line:?}"
                 );
+                if indent_allowed {
+                    assert!(
+                        leading.is_empty() || leading == BANNER_INDENT,
+                        "{what}: the only legitimate indent is the command line's four spaces; \
+                         anything else is source indentation that leaked into the output: \
+                         {line:?}"
+                    );
+                } else {
+                    assert!(
+                        leading.is_empty(),
+                        "{what}: prose must not be indented -- leading whitespace here is the \
+                         source's own indentation, which is what a lost `\\` continuation \
+                         emits: {line:?}"
+                    );
+                }
             }
         }
     }
