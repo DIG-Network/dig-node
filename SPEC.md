@@ -8888,6 +8888,17 @@ a stolen bond.
 so a node MUST bound the number of bonds it reads against a chain per locate, verifying in source
 order and leaving the remainder at baseline.
 
+**A `bonded` verdict MUST rest on AGREEMENT across independently drawn, concurrently-held untrusted
+peers -- never on one source.** The §25.6 checks establish that a coin and its creating spend are
+internally consistent; none of them establishes that the coin was ever on chain. A coin currying the
+real, public $DIG CAT puzzle around an invented parent satisfies every one of them, so a verdict
+taken from a single provider promotes a bond that does not exist, at no collateral cost to whoever
+published it. The two reads that decide the verdict -- the coin record, and the spend that created
+it -- MUST each be corroborated: below the corroboration floor, or on disagreement, the verdict is
+`unverified` and MUST NOT be `bonded`. A node MUST NOT fall back to a single source when
+corroboration is unavailable, because falling through to one endpoint exactly when the peers failed
+to agree lets that endpoint overrule them.
+
 The verification is performed in the ORDER §25.6 states, with one refinement that is normative: the
 `advertises` binding is checked BEFORE the collateral magnitude. A node that has not censused the
 epoch cannot price a bond, and checking magnitude first would make every verdict on such a node
