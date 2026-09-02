@@ -2772,6 +2772,48 @@ mod tests {
         );
     }
 
+    /// Make `sid`'s store directory genuinely UNREADABLE, portably.
+    ///
+    /// A regular file where the directory would be makes `read_dir` fail with a kind that is NOT
+    /// `NotFound` on every platform this node builds for. A permission bit would not: `chmod 000`
+    /// does not deny directory listing on Windows, so a permissions fixture proves nothing here.
+    /// An empty-but-readable directory would not either -- that is the state this defect is
+    /// indistinguishable from, so a fixture built out of it cannot see the bug.
+    fn make_store_dir_unreadable(store: &ProfileBodyStore, sid: &[u8; 32]) {
+        let path = store.store_dir(sid);
+        std::fs::create_dir_all(path.parent().expect("store dir has a parent")).expect("root dir");
+        std::fs::write(&path, b"a file where a directory belongs").expect("occupy the store dir");
+    }
+
+    /// **Proves:** a store whose directory cannot be enumerated is never reported as one that
+    /// published nothing.
+    ///
+    /// Asserted at the STANDING, not at the enumerator: the defect is a decision, and a test that
+    /// only checks the disk read sits below the decision and passes while the surface still tells
+    /// a person "nothing was ever published here".
+    #[tokio::test]
+    async fn an_unreadable_store_dir_never_claims_nothing_was_ever_published() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+        make_store_dir_unreadable(&store, &sid);
+
+        let chain = AdvancingChain::at(dpb("alice").1);
+        let standing = root_standing(&store, &chain, &sid).await;
+
+        assert_eq!(
+            standing.state(),
+            "held_unreadable",
+            "an I/O failure is its own state, not the state that means consulted-and-empty: {}",
+            standing.detail()
+        );
+        assert!(
+            !standing.detail().contains("nothing was ever published"),
+            "a positive publishing claim must never be manufactured from a failed read: {}",
+            standing.detail()
+        );
+    }
+
     /// Every `(store, root)` the spy was asked to announce, in order.
     fn store_ids_announced(transport: &Transport) -> Vec<([u8; 32], [u8; 32])> {
         transport
