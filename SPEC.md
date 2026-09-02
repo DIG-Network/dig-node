@@ -4396,8 +4396,33 @@ has run.
 
 `dig-wallet` is the DIG Browser's built-in Chia wallet host: a loopback `axum` server bound
 `127.0.0.1:<DIG_WALLET_PORT>` (default `9777`) serving the wallet UI and a dapp-facing JSON-RPC
-surface, with native BLS signing. In the native browser it ALSO runs in-process via the §15 FFI
+surface. That surface is a ROUTER, not a signer: every key/sign method is forwarded to the user's
+Sage wallet over the WalletConnect delegate bridge, and NO signing happens in this process, which
+holds no user key (§908). In the native browser it ALSO runs in-process via the §15 FFI
 (`dig_wallet_rpc`), sharing one process-global wallet state with the loopback UI.
+
+`DIG_WALLET_PORT` is read ONLY by `dig_wallet::run` — that is, by the DIG Browser runtime and by the
+standalone `dig-wallet` binary. The `dig-node` binary NEVER starts a wallet host, so the variable is
+INERT there and nothing binds the port; a `dig-node` run that finds it set says so on start-up.
+
+Likewise `LOCALAPPDATA` relocates only the wallet's OWN artifacts — `DigWallet/seed.bin`,
+`wallet.meta.json` and `DigNode/device/device.key`, which resolve env-first. It does NOT relocate the
+node's cache, `config.json`, or the `wallet.sqlite` coin replica, which resolve through the OS
+known-folder API; `DIG_NODE_CACHE` is the variable that moves those. A `dig-node` start-up that
+resolves the two roots differently MUST WARN, naming both resolved roots.
+
+It MUST additionally REFUSE to mint a new seed (writing nothing) when, and ONLY when, all three of
+the following hold: `LOCALAPPDATA` is set to a root other than the node's own, no seed exists yet,
+and `DIG_NODE_CACHE` is unset. Roots MUST be compared ignoring trailing separators, and ignoring
+case on Windows, so a host whose environment and known-folder result differ only in spelling is NOT
+a split.
+
+Every other divergence MUST proceed and warn only. In particular, roots that diverge with NO
+override — the wallet's env-first resolver falling back to the working directory while the node's
+falls through the platform's passwd entry, which is what a service unit with no `HOME=` produces —
+MUST mint normally: there is no override to undo, `DIG_NODE_CACHE` would not address it, and
+refusing would leave such an install permanently without a wallet. The warning on that path MUST NOT
+prescribe `DIG_NODE_CACHE`, because setting it changes nothing an operator would observe.
 
 ### 16.1. Method surface + dispatch
 

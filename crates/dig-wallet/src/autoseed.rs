@@ -106,13 +106,20 @@ pub fn default_paths() -> WalletPaths {
     WalletPaths::resolve(crate::seed_path())
 }
 
-/// The base directory both roots hang off (NC-3's location contract).
+/// The per-user, non-roaming base directory both roots hang off (NC-3's location contract).
+///
+/// ENV-FIRST BY DESIGN: an operator who sets `DIG_WALLET_BASE` (or, failing that, `LOCALAPPDATA`)
+/// relocates the seed, its metadata and the device key together, and that is the behaviour installs
+/// depend on. The node's own base (`dig_node_core::platform_user_base`) asks the OS known-folder
+/// API first and so does NOT move with it, which means the two can disagree. Public so
+/// `dig_node_service::wallet_env` can compare them and say so out loud rather than letting a
+/// start-up mint a seed under one root while the coin replica opens under another (dig-node#392).
 ///
 /// Delegates to [`crate::wallet_base`] rather than re-deriving the chain, so the seed and the
 /// device key can never resolve from different bases. A second copy of this resolution is exactly
 /// how the sibling relationship documented above would come apart: the two files would still be
 /// named correctly and would simply stop being siblings, which nothing downstream checks.
-fn user_base() -> PathBuf {
+pub fn user_base() -> PathBuf {
     crate::wallet_base()
 }
 

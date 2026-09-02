@@ -184,7 +184,10 @@ pub const WALLET_BASE_ENV: &str = "DIG_WALLET_BASE";
 /// relative base resolves against the process working directory, which for a systemd system unit
 /// is `/`. The caller decides what to do with the absence.
 ///
-/// An empty value is treated as unset, matching how the node's other overrides are parsed.
+/// An empty value is treated as unset, matching how the node's other overrides are parsed, and the
+/// value RETURNED is trimmed: an environment file written as `DIG_WALLET_BASE = /srv/dig ` would
+/// otherwise yield a path with leading or trailing spaces, which is a different directory from the
+/// one the operator wrote and would silently split the seed away from an existing wallet.
 pub fn resolve_wallet_base(
     base_override: Option<&str>,
     localappdata: Option<&str>,
@@ -193,7 +196,8 @@ pub fn resolve_wallet_base(
     [base_override, localappdata, home]
         .into_iter()
         .flatten()
-        .find(|v| !v.trim().is_empty())
+        .map(|v| v.trim())
+        .find(|v| !v.is_empty())
         .map(PathBuf::from)
 }
 
@@ -1207,6 +1211,23 @@ mod tests {
             Some(PathBuf::from("/home/op"))
         );
         assert_eq!(resolve_wallet_base(Some(""), Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn a_padded_value_resolves_to_the_path_the_operator_wrote() {
+        // The gap the whitespace-ONLY case above cannot see: a value that is padded but not empty
+        // is accepted, so an untrimmed return would hand back a path with the padding still on it.
+        // `" /srv/dig "` and `"/srv/dig"` are different directories, so the padded form would open
+        // a second, empty wallet beside the operator's real one rather than the one they named.
+        assert_eq!(
+            resolve_wallet_base(Some("  /srv/dig  "), None, None),
+            Some(PathBuf::from("/srv/dig"))
+        );
+        // Padding on a lower rung is trimmed too - the rung that wins is not special.
+        assert_eq!(
+            resolve_wallet_base(None, Some("\t"), Some(" /home/op\n")),
+            Some(PathBuf::from("/home/op"))
+        );
     }
 
     #[test]

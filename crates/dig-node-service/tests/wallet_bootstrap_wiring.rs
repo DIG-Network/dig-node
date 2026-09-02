@@ -19,6 +19,12 @@ const SERVER: &str = include_str!("../src/server.rs");
 /// The exact call the guards look for.
 const CALL: &str = "wallet_bootstrap::ensure_wallet_seed()";
 
+/// The environment announcement that must run BEFORE the bootstrap on every serve entrypoint
+/// (#392). Guarded for the same reason as `CALL`: an announcement present on only one of the two
+/// entrypoints is silent on exactly the unattended service run nobody is watching, and no
+/// behavioural test can see that - `announce_from_env` is correct in isolation either way.
+const ANNOUNCE: &str = "wallet_env::announce_from_env()";
+
 /// **Proves:** the foreground entrypoint checks for a seed on start.
 #[test]
 fn the_foreground_entrypoint_ensures_a_wallet_seed() {
@@ -27,6 +33,46 @@ fn the_foreground_entrypoint_ensures_a_wallet_seed() {
         body.contains(CALL),
         "`block_on_serve` must ensure a wallet seed on every start (#277); it is the entrypoint \
          for `dig-node run` and for the non-Windows service"
+    );
+}
+
+/// **Proves:** the foreground entrypoint says what it resolved before it mints anything.
+///
+/// Order matters and is asserted: an operator must read WHY a wallet was refused before, not
+/// after, the line that would otherwise have reported one minted.
+#[test]
+fn the_foreground_entrypoint_announces_the_wallet_environment_first() {
+    let body = between(
+        ENTRYPOINT,
+        "fn block_on_serve(",
+        "
+}
+",
+    )
+    .expect("block_on_serve exists");
+    let announce = body.find(ANNOUNCE).expect(
+        "`block_on_serve` must announce the resolved wallet environment on every start (#392)",
+    );
+    let bootstrap = body.find(CALL).expect("and it must still bootstrap");
+    assert!(
+        announce < bootstrap,
+        "the announcement must precede the mint, or the refusal is explained after the fact (#392)"
+    );
+}
+
+/// **Proves:** the Windows SCM entrypoint announces too.
+///
+/// It does not share `block_on_serve`, so it carries its own call - and it is the unattended path,
+/// where a missing warning has nobody to notice it.
+#[test]
+fn the_windows_service_entrypoint_announces_the_wallet_environment_first() {
+    let announce = WIN_SERVICE
+        .find(ANNOUNCE)
+        .expect("the Windows SCM entrypoint must announce the wallet environment (#392)");
+    let bootstrap = WIN_SERVICE.find(CALL).expect("and must still bootstrap");
+    assert!(
+        announce < bootstrap,
+        "the announcement must precede the mint on the SCM path too (#392)"
     );
 }
 

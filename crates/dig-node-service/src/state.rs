@@ -261,7 +261,13 @@ pub fn anchor_service_data_dirs() {
     // at the path. `legacy_wallet_present` treats an undeterminable answer as PRESENT, which is
     // the direction that cannot strand a funded wallet.
     let legacy_wallet = dig_wallet::legacy_wallet_present();
-    if legacy_wallet {
+    // Gated on the SAME conjunction the anchoring decision uses, not on `legacy_wallet` alone.
+    // `service_data_dir_overrides` leaves the wallet base alone when the operator has already set
+    // `DIG_WALLET_BASE`, so with that variable set the service opens the operator's base and NOT
+    // the legacy path - and a warning naming the legacy path as "the one it keeps opening" would
+    // be a false statement about where live key material sits, inviting a migration or a deletion
+    // of the wrong file.
+    if legacy_wallet && !env_is_set(WALLET_BASE_ENV) {
         // The PATH only. Never the contents, and never a hint at them.
         tracing::warn!(
             seed = %dig_wallet::legacy_seed_path().display(),
@@ -1105,6 +1111,27 @@ mod tests {
             false
         )
         .is_empty());
+    }
+
+    #[test]
+    fn an_operator_set_wallet_base_wins_even_with_a_legacy_wallet_on_disk() {
+        // The state the start-up warning used to mis-narrate. With BOTH a stale seed at the legacy
+        // path AND an operator-set `DIG_WALLET_BASE`, the anchor emits nothing because the operator
+        // already placed the base - so the service opens the OPERATOR's base, not the legacy path.
+        // The warning in `anchor_service_data_dirs` is gated on the same conjunction for that
+        // reason: narrating the legacy path here would name the wrong file as the live one.
+        assert!(
+            service_data_dir_overrides(
+                true,
+                Path::new("/var/lib/dig-node"),
+                true,
+                true,
+                true,
+                true
+            )
+            .is_empty(),
+            "an explicit wallet base outranks the legacy-wallet guard as well as the anchor"
+        );
     }
 
     #[test]
