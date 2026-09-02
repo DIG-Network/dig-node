@@ -122,7 +122,10 @@ fn run_service() -> std::io::Result<()> {
 
     // Same start-up wallet check the foreground entrypoint runs (#277). The SCM path does not go
     // through `block_on_serve`, so it needs its own call — a service install is the case where
-    // there is most certainly no user present to create a seed.
+    // there is most certainly no user present to create a seed. The environment announcement (#392)
+    // goes with it for the same reason: an announcement that exists on only one of the two serve
+    // entrypoints is silent on exactly the unattended run nobody is watching.
+    crate::wallet_env::announce_from_env();
     crate::wallet_bootstrap::ensure_wallet_seed();
 
     // Build the runtime and serve, shutting down when the control handler fires.
