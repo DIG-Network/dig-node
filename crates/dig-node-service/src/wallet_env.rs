@@ -3,8 +3,8 @@
 //! Two independent resolvers decide "the per-user base directory" inside one `dig-node` process,
 //! and they can disagree:
 //!
-//! - [`dig_wallet::autoseed::user_base`] is ENV-FIRST (`LOCALAPPDATA`, then `HOME`, then `"."`), so
-//!   it honours an override. It owns `DigWallet/seed.bin`, `wallet.meta.json` and
+//! - [`dig_wallet::autoseed::user_base`] is ENV-FIRST (`DIG_WALLET_BASE`, then `LOCALAPPDATA`, then
+//!   `HOME`, then `"."`), so it honours an override. It owns `DigWallet/seed.bin`, `wallet.meta.json` and
 //!   `DigNode/device/device.key`.
 //! - [`dig_node_core::platform_user_base`] asks the OS for the Known Folder and only then falls
 //!   back to the environment. It owns `cache/`, `config.json` and therefore `wallet.sqlite`, the
@@ -130,12 +130,13 @@ pub const SPLIT_ROOTS: &str = concat!(
 /// is purely the honest version of the silence this ticket is about.
 pub const AMBIENT_SPLIT_ROOTS: &str = concat!(
     "the wallet's per-user root and the node's per-user root resolved to DIFFERENT places, and ",
-    "no override caused it: neither LOCALAPPDATA nor HOME is set in this environment, so the ",
-    "wallet's env-first resolver fell back to the working directory while the node's asked the ",
-    "OS for the account's home. Both resolved roots are logged below as `wallet_base` and ",
-    "`node_base`, and the seed file this run will read or create is logged as `seed`. Nothing ",
-    "is refused and nothing is wrong with the wallet; set HOME in the service environment if you ",
-    "want the two halves to share one root."
+    "no override caused it: the wallet base is anchored by DIG_WALLET_BASE (falling back to ",
+    "LOCALAPPDATA, then HOME) while the node's root comes from the OS known-folder API or the ",
+    "account's home, so on a stock service install the two legitimately differ. Both resolved ",
+    "roots are logged below as `wallet_base` and `node_base`, and the seed file this run will ",
+    "read or create is logged as `seed`. Nothing is refused and nothing is wrong with the ",
+    "wallet; DIG_WALLET_BASE outranks LOCALAPPDATA and HOME, so it is the variable that decides ",
+    "where the wallet half lives."
 );
 
 /// The prose for the refusal.
@@ -361,11 +362,17 @@ mod tests {
         .expect("an override splits the roots")
     }
 
-    /// The stock Linux `.deb` shape: no `LOCALAPPDATA`, no `HOME`, so the wallet half collapses to
-    /// "." while the node half falls through `getpwuid_r` to the account home.
+    /// The stock Linux `.deb` shape: no `LOCALAPPDATA` and no `HOME`, so the wallet half resolves
+    /// from its anchored base while the node half falls through `getpwuid_r` to the account home.
+    /// Divergent roots with nothing overridden - the ordinary case, not a fault.
     fn ambient() -> WalletRootSplit {
-        split_of(Path::new("."), Path::new("/root"), None, false)
-            .expect("divergent roots are still a split")
+        split_of(
+            Path::new("/var/lib/dig-node"),
+            Path::new("/root"),
+            None,
+            false,
+        )
+        .expect("divergent roots are still a split")
     }
 
     #[test]
@@ -534,9 +541,16 @@ mod tests {
             !AMBIENT_SPLIT_ROOTS.contains(CACHE_DIR_ENV),
             "DIG_NODE_CACHE does not address an ambient split"
         );
-        assert!(AMBIENT_SPLIT_ROOTS.contains("HOME"));
+        assert!(
+            AMBIENT_SPLIT_ROOTS.contains(dig_wallet::WALLET_BASE_ENV),
+            "the variable that actually decides the wallet base must be named"
+        );
+        assert!(
+            !AMBIENT_SPLIT_ROOTS.contains("set HOME"),
+            "HOME is outranked by DIG_WALLET_BASE, so prescribing it is an inert remedy"
+        );
         assert!(AMBIENT_SPLIT_ROOTS.contains("LOCALAPPDATA"));
-        assert!(AMBIENT_SPLIT_ROOTS.contains("seed"));
+        assert!(AMBIENT_SPLIT_ROOTS.contains("`seed`"));
         assert!(AMBIENT_SPLIT_ROOTS.contains("Nothing is refused"));
     }
 

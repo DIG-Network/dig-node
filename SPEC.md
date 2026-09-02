@@ -1576,6 +1576,24 @@ is a property of a SERVICE RUN and not of one packaging target.
 An `DIG_IDENTITY_DIR` / `DIG_NODE_CACHE` value the operator set explicitly MUST be preserved; a CLI
 run MUST be left untouched, keeping the user's identity shared with their other DIG tools.
 
+**The wallet base — same anchoring, with one condition.** The node's operator wallet (§16.4) resolves
+its base from `DIG_WALLET_BASE`, then `%LOCALAPPDATA%`, then `$HOME`. Inside the packaged systemd
+unit none of those is set: the unit declares no `User=`, so systemd sets no `$HOME`, and no
+`WorkingDirectory=`, so the working directory is `/`. A relative fallback therefore resolves the seed
+to `/DigWallet/seed.bin`, and that write SUCCEEDS — the unit runs as root and `ProtectSystem=full`
+leaves `/` writable — so the node operates normally with its wallet at the filesystem root.
+
+A SERVICE run MUST therefore anchor `DIG_WALLET_BASE` at the resolved state dir, giving
+`<state_dir>/DigWallet/seed.bin` and `<state_dir>/DigNode/device/device.key`. The override names the
+BASE and never either directory: both roots MUST derive from one value, or the sibling relationship
+§16.4 requires could be broken by configuration alone.
+
+It MUST be adopted ONLY when no wallet is present at the base the service would otherwise have
+resolved. The operator wallet holds real $DIG for mirror-coin collateral, so re-rooting a host that
+already has one would leave the funded seed unreferenced and mint an empty replacement; a Windows
+LocalSystem service, whose `%LOCALAPPDATA%` IS set, is exactly that case. Presence that cannot be
+DETERMINED MUST count as present. Key material MUST NOT be moved or copied automatically.
+
 **Creation + ACL — the HARDENING CONTRACT.** The state dir holds the control token that grants FULL
 local control, so its ACL MUST NOT be world/all-users-readable. On Windows this is the HARD case:
 `%PROGRAMDATA%` grants `BUILTIN\Users` "create subfolder", so ANY low-priv user can pre-create
@@ -1670,7 +1688,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
 | `control.cache.get` | — | `cap_bytes`, `used_bytes`, `capsule_bytes`, `response_bytes`, `dir`, `shared` |
 | `control.profile.putBody` | `store_id`, `root` (64-hex), `body_b64` (standard padded base64 of the DPB bytes) | `stored: true`, `store_id`, `root`, `body_bytes`, `announced_to_peers`, `unreachable_peers`. `announced_to_peers` is a TRUE delivery count — peers the 223 announce was actually sent to, excluding lazy and NAT-bound peers that are connected but cannot be pushed to — so `0` does NOT mean failure and MUST NOT be treated as one: the body is persisted either way and the periodic re-announce reaches whoever connects later. `unreachable_peers` reports that connected-but-unreachable remainder, so a caller can distinguish "no peers exist" from "peers exist and none could be reached". The node MUST independently resolve the root on chain and refuse unless the chain confirms exactly that root AND the bytes hash to it (§22.3). A refusal is an ERROR, never an `Ok` carrying `stored: false`. A decoded body above `MAX_BODY_BYTES` (4 MiB) is `INVALID_PARAMS` before anything is persisted. |
-| `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`, `standing`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. `standing` is `{state, chain_root, held_roots, detail}` and carries §22.5c's reconciliation: `state` is one of `current` / `superseded` / `nothing_held` / `no_generation` / `chain_unreadable`, and it is what distinguishes an un-published store from an empty one — `body_b64: null` alone is the same answer for at least four different situations. `chain_root` is `null` (NEVER an all-zero root, which the body format rejects outright) whenever the chain named none or could not be read. The chain read is ADDITIVE: `body_b64` keeps its exact meaning as the disk read at the REQUESTED root, a failed disk read is still `CONTROL_ERROR`, and a chain read that RETURNS an error degrades to `state: "chain_unreadable"` rather than failing the call — a node whose chain access is down MUST still be able to answer what it holds. Named limitation: a chain source that is UNRESPONSIVE rather than failing returns no error to degrade on, so it blocks this call for as long as it blocks — exactly as it already does for `control.profile.putBody`, which resolves the same root through the same resolver as its FIRST action. Bounding that read is one change across both methods, not a bound on this one alone. |
+| `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`, `standing`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. `standing` is `{state, chain_root, held_roots, detail}` and carries §22.5c's reconciliation: `state` is one of `current` / `superseded` / `nothing_held` / `no_generation` / `chain_unreadable` / `held_unreadable`, and it is what distinguishes an un-published store from an empty one — `body_b64: null` alone is the same answer for at least four different situations. `chain_root` is `null` (NEVER an all-zero root, which the body format rejects outright) whenever the chain named none or could not be read. `held_roots` is `null` when the local store could not be enumerated — distinct from `[]`, which means consulted-and-holds-nothing. A node MUST NOT report an unreadable local store as an empty one, and when the local read fails the node MUST report `state: "held_unreadable"` WITHOUT consulting the chain, because a chain read must never be able to mask a broken disk, the one condition whose remedy is on that machine. The chain read is ADDITIVE: `body_b64` keeps its exact meaning as the disk read at the REQUESTED root, a failed disk read is still `CONTROL_ERROR`, and a chain read that RETURNS an error degrades to `state: "chain_unreadable"` rather than failing the call — a node whose chain access is down MUST still be able to answer what it holds. Named limitation: a chain source that is UNRESPONSIVE rather than failing returns no error to degrade on, so it blocks this call for as long as it blocks — exactly as it already does for `control.profile.putBody`, which resolves the same root through the same resolver as its FIRST action. Bounding that read is one change across both methods, not a bound on this one alone. |
 | `control.cache.setCap` | `cap_bytes` (number) | `cap_bytes` (floored at 64 MiB) |
 | `control.cache.clear` | — | `cleared: true` |
 | `control.hostedStores.list` | — | `stores[]`: `store_id`, `pinned`, `capsule_count`, `total_bytes`, `capsules[]` (capsule, root, size_bytes, last_used_unix_ms) — cached stores ∪ pinned stores |
@@ -4595,6 +4613,10 @@ protected `D:P(A;;FA;;;<user>)` DACL on Windows, never the ACL inherited from `%
 | `<wallet_dir>/seed.bin` | the sealed mnemonic — format unchanged |
 | `<device_dir>/device.key` | 32 raw CSPRNG bytes, no header |
 | `<wallet_dir>/wallet.meta.json` | `origin`, `created_at` (RFC 3339), `ever_funded` |
+
+`<user_base>` is resolved from `DIG_WALLET_BASE`, then `%LOCALAPPDATA%`, then `$HOME`, by ONE resolver
+that both roots below use. A service run anchors that base at the machine state dir under the
+condition stated in §7.3a.
 
 `<device_dir>` is `<user_base>/DigNode/device/` — a **SIBLING** of `<wallet_dir>`
 (`<user_base>/DigWallet/`), never a child. **That separation IS the partial-exfiltration boundary and
@@ -7775,7 +7797,7 @@ anywhere and is invisible to the publisher, who is the only party that can fix i
 therefore surface a store whose held bodies are all superseded — in its own log on each sweep, and
 in `control.profile.getBody`'s `standing` (§10) — naming the chain's current root and the remedy.
 
-A node MUST distinguish these five standings, because each needs a different remedy and a caller
+A node MUST distinguish these six standings, because each needs a different remedy and a caller
 shown a merged answer cannot choose between them:
 
 | `state` | Means | Remedy |
@@ -7785,6 +7807,7 @@ shown a merged answer cannot choose between them:
 | `nothing_held` | the chain names a root, this node holds nothing for the store | publish here |
 | `no_generation` | the chain reports no confirmed generation | an unconfirmed mint, or a store id naming nothing |
 | `chain_unreadable` | the chain could not be read | the standing is UNKNOWN, not absent; fix chain access |
+| `held_unreadable` | the node's own store directory could not be enumerated | what this node holds is UNKNOWN, not absent; fix local disk access. `held_roots` is `null` here, and the chain is NOT consulted |
 
 ### 22.6. Penalization is narrow (MUST NOT widen)
 
