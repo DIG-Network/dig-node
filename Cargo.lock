@@ -2880,9 +2880,9 @@ dependencies = [
 
 [[package]]
 name = "dig-mirror-coin"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eceab37a1234805e0043c30d096f5da38f5b86581032f465d8a2db807cf10b64"
+checksum = "2ac3c72506f13eef2cd6dccce66fd715191e2fc7b751f3b682332d92bf545812"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-protocol 0.36.1",

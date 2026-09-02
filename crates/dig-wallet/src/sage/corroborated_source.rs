@@ -325,7 +325,7 @@ mod tests {
 
     use super::*;
     use crate::sage::peer_reads::{CoinPeer, PeerSample};
-    use crate::wallet_db::WalletDb;
+    use crate::sage::db::WalletDb;
 
     /// A sample that holds no peers -- enough to build a source, since these cases never read.
     struct NoPeers;
