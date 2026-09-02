@@ -86,7 +86,7 @@ const MAX_PENDING: usize = 32;
 ///
 /// The stored value stays BYTE-VERBATIM; neutralisation happens at render time
 /// ([`crate::untrusted_text::render_untrusted`]), because only the display is a lie surface.
-const MAX_CLIENT_NAME: usize = 64;
+pub const MAX_CLIENT_NAME: usize = 64;
 
 /// Current unix time in milliseconds (0 on a clock error — only affects TTL math).
 fn now_ms() -> u64 {
