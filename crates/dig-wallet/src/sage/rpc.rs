@@ -1027,6 +1027,66 @@ impl WalletBackend {
         }
     }
 
+    /// The height that bounds an answer the CHAIN TIER produced on THIS call, or `None`.
+    ///
+    /// The single measurement behind both tier fields of every live-consulted `Source::Fallback`
+    /// answer. `Some(h)` yields `synced: true, peak_height: Some(h)`; `None` yields
+    /// `synced: false, peak_height: None`. The two fields are DERIVED from this one `Option` at
+    /// each call site rather than computed independently, so the pairing
+    /// `{synced: true, peak_height: null}` has no constructor on these arms at all — structural,
+    /// not asserted, which is the same invariant the sync-phase family enforces from the other
+    /// direction (dig-node#290, dig-node#495).
+    ///
+    /// # Why a peer-announced peak legitimately bounds a chain-tier answer
+    ///
+    /// The answer came from a full node reading the chain at its tip, moments ago, and this node's
+    /// OWN held Chia peers independently name that tip at the same moment. Two parties that did not
+    /// consult each other agree on where the chain is, and the answer was taken between them.
+    ///
+    /// That is not the latched-replica failure `stale_by` exists to catch. `initial_sync_complete`
+    /// records that a catch-up once FINISHED and is cleared only by a backwards chain move, so a
+    /// replica satisfying it can sit thousands of blocks behind (dig-node#416 measured 8,380). A
+    /// full node's CURRENT view cannot: it is not a latch, it is a read.
+    ///
+    /// The residual risk is real and is stated rather than talked down: a third-party oracle could
+    /// serve a materially stale answer while this node's peers sit at the tip, and nothing here
+    /// detects that. What it replaces is a measured harm rather than a hypothetical one — with
+    /// these fields hardcoded, no non-wallet-scoped read could EVER carry a warrant, so every
+    /// consumer-side freshness guard degenerated into an unconditional refusal and profile creation
+    /// could not complete at all.
+    ///
+    /// # Why `None` is the honest answer with no peer peak
+    ///
+    /// [`super::fallback::ChainPeerTier::peak_height`] is `None` until a held peer announces one, so
+    /// a node that has established no chain view of its own keeps saying "I cannot bound this" and
+    /// the absence stays unwarranted. The fail-toward-withheld ordering is therefore a property of
+    /// the data, not of a guard someone must remember to write.
+    ///
+    /// # Why the CACHED arms never call this
+    ///
+    /// A cached coin record was taken at some earlier, unrecorded moment — the rows are permanent
+    /// by design, because a spent coin's record is immutable (dig_ecosystem#3044,
+    /// dig_ecosystem#3050). Stamping the CURRENT peer peak on one would claim it is level with the
+    /// network when nothing measured that, which is this same defect mirrored. Those arms keep
+    /// `synced: false, peak_height: None`.
+    ///
+    /// # What this does to `stale_by`
+    ///
+    /// `control.rs` computes `stale_by(answer_height, network_peak)`, which was `null` on every
+    /// fallback answer because `peak_height` was `null`. It now typically becomes `0`, and `0` is a
+    /// POSITIVE claim — "nothing known puts this answer behind the network" — which is exactly what
+    /// is meant, and which that field's own null-vs-zero language already distinguishes.
+    ///
+    /// Said plainly so a reviewer need not discover it: `peak_height` and `network_peak_height`
+    /// will usually be the SAME number here, because `control.rs` takes the network peak from
+    /// `wallet_sync_status().chia_peer_peak_height`, which is this same
+    /// [`super::fallback::ChainPeerTier::peak_height`]. That is not a tautology dressed as
+    /// evidence — it is one measurement bounding both sides, and the honest reading is that the two
+    /// agree BECAUSE the same measurement bounds both.
+    async fn chain_tier_answer_height(&self) -> Option<u32> {
+        self.chain_peer_tier().await.peak_height
+    }
+
     /// Whether a figure taken from the replica AT `peak_height` may be reported as CURRENT.
     ///
     /// `db_synced` — which chose the replica in the first place — cannot answer this. It is
@@ -1529,15 +1589,18 @@ impl WalletBackend {
                         pending += u128::from(c.amount);
                     }
                 }
+                // The DB neither produced this figure nor bounds its freshness, so its flag and
+                // its peak say nothing about it. What DOES bound it is the height this node's own
+                // held peers announce, taken now, alongside the chain read that just ran —
+                // `chain_tier_answer_height` carries the reasoning, and both fields derive from
+                // that ONE `Option` so a claim can never travel without its bound.
+                let bound = self.chain_tier_answer_height().await;
                 Ok(WalletBalanceResult {
                     balance,
                     pending,
                     source,
-                    // The DB neither produced this figure nor bounds its freshness, so its
-                    // flag and its peak say nothing about it. `false` / `null` is the truth
-                    // about a coinset-served answer, whatever the local replica's state.
-                    synced: false,
-                    peak_height: None,
+                    synced: bound.is_some(),
+                    peak_height: bound,
                 })
             }
         }
@@ -1677,14 +1740,16 @@ impl WalletBackend {
                 // per request either way.
                 let complete = remaining.len() <= page_size;
                 let coins: Vec<WalletCoin> = remaining.into_iter().take(page_size).collect();
+                // The replica neither produced these coins nor bounds their freshness (#2233); the
+                // held peers' announced height does, and both fields derive from that one read.
+                let bound = self.chain_tier_answer_height().await;
                 Ok(WalletCoinsResult {
                     cursor: coins.last().map(|c| c.coin_id.clone()),
                     complete,
                     coins,
                     source,
-                    // The replica neither produced these coins nor bounds their freshness (#2233).
-                    synced: false,
-                    peak_height: None,
+                    synced: bound.is_some(),
+                    peak_height: bound,
                 })
             }
         }
@@ -1789,6 +1854,9 @@ impl WalletBackend {
             return Ok(WalletCoinByIdResult {
                 coin: Some(coin_from_fallback(&coin)),
                 source: Source::Fallback,
+                // UNBOUNDED, deliberately: this row was taken at an earlier, unrecorded moment, so
+                // no height here would be a measurement of it. See `chain_tier_answer_height` —
+                // only the arms that consulted the chain on THIS call may claim a bound.
                 synced: false,
                 peak_height: None,
             });
@@ -1815,11 +1883,15 @@ impl WalletBackend {
             .coin_record_by_id(coin_id)
             .await
             .map_err(|e| BalanceError::ReadFailed(e.to_string()))?;
+        // Bounded by the peers' announced height, taken alongside the read that just ran. This is
+        // the arm the absence warrant hangs on: `coin: None` here is a chain source SAYING no, and
+        // without a bound no consumer could ever read it that way.
+        let bound = self.chain_tier_answer_height().await;
         Ok(WalletCoinByIdResult {
             coin: coin.as_ref().map(coin_from_fallback),
             source: Source::Fallback,
-            synced: false,
-            peak_height: None,
+            synced: bound.is_some(),
+            peak_height: bound,
         })
     }
 
@@ -1922,6 +1994,8 @@ impl WalletBackend {
             return Ok(WalletCoinSpendResult {
                 spend: Some(composed_spend(&spend, &record, coin_id)?),
                 source: Source::Fallback,
+                // The cached half of the same rule as `coin_by_id`'s: nothing recorded when either
+                // cached row was taken, so nothing bounds this answer.
                 synced: false,
                 peak_height: None,
             });
@@ -1960,11 +2034,13 @@ impl WalletBackend {
                 Some(composed_spend(&spend, &record, coin_id)?)
             }
         };
+        // Same bound as every other live consult, from the same single measurement.
+        let bound = self.chain_tier_answer_height().await;
         Ok(WalletCoinSpendResult {
             spend,
             source: Source::Fallback,
-            synced: false,
-            peak_height: None,
+            synced: bound.is_some(),
+            peak_height: bound,
         })
     }
 
@@ -2042,13 +2118,16 @@ impl WalletBackend {
         let page_size = limit as usize;
         let complete = remaining.len() <= page_size;
         let coins: Vec<WalletCoin> = remaining.into_iter().take(page_size).collect();
+        // Same bound as every other live consult: a lineage walk reads an empty page as *this is
+        // the tip*, so the page needs a height a caller can check that reading against.
+        let bound = self.chain_tier_answer_height().await;
         Ok(WalletCoinsByParentResult {
             cursor: coins.last().map(|c| c.coin_id.clone()),
             complete,
             coins,
             source: Source::Fallback,
-            synced: false,
-            peak_height: None,
+            synced: bound.is_some(),
+            peak_height: bound,
         })
     }
 
@@ -11367,5 +11446,148 @@ mod tests {
             1,
             "a lapsed reservation stranded the coin"
         );
+    }
+
+    // ---- dig-node#290: a non-wallet-scoped read must be able to CARRY a warrant -------------
+
+    /// The peer tier a node with no chain view of its own reports — no peers, so no peak, so
+    /// nothing that could bound anybody's answer.
+    fn peers_unobservable() -> super::super::fallback::ChainPeerTier {
+        super::super::fallback::ChainPeerTier {
+            peer_count: None,
+            peak_height: None,
+        }
+    }
+
+    /// The height a fallback-tier answer is bounded by in these fixtures. Deliberately NOT
+    /// [`REPLICA_PEAK`]: an assertion that named the replica's peak could be satisfied by an
+    /// implementation that reached for the wrong measurement.
+    const PEERS_PEAK: u32 = REPLICA_PEAK + 12;
+
+    /// **Proves:** a live, non-wallet-scoped `coin_by_id` on a node whose held Chia peers announce
+    /// a peak comes back WARRANTED — `synced: true` paired with `peak_height: Some(peak)`
+    /// (dig-node#290).
+    ///
+    /// THE DEFECT THIS PINS. Both fields were unconditional literals — `false` / `None` — written
+    /// after a read that genuinely consulted the chain. dig-app's `ControlChainSource` gates its
+    /// absence warrant on `synced`, and `control.rs` derives `stale_by` from `peak_height`, so with
+    /// both hardcoded NO consumer could ever obtain a warrant from a read that is not
+    /// wallet-scoped, and the guard degenerated into an unconditional refusal.
+    ///
+    /// FIXTURE DESIGN. The sharpest case is a coin that DOES NOT EXIST: absence is the answer whose
+    /// definite reading the warrant unlocks, and it is the ticket's own acceptance. The peer peak
+    /// is distinct from the replica's, so an implementation that stamped the wrong measurement
+    /// fails here rather than passing by coincidence. Both fields are asserted together, because
+    /// fixing either alone leaves the consumer exactly as blind as before.
+    #[tokio::test]
+    async fn a_live_fallback_read_carries_the_peak_its_held_peers_announce() {
+        let (be, fb) = by_id_backend(&[], vec![], peers_level_at(PEERS_PEAK)).await;
+
+        let r = be.coin_by_id("no-such-coin").await.unwrap();
+
+        assert_eq!(fb.call_count(), 1, "the chain tier really was consulted");
+        assert_eq!(r.source, Source::Fallback);
+        assert!(r.coin.is_none(), "the absence under test");
+        assert_eq!(
+            (r.synced, r.peak_height),
+            (true, Some(PEERS_PEAK)),
+            "a chain-tier answer taken while this node's peers name the tip is bounded by it"
+        );
+    }
+
+    /// **Proves:** with NO peer peak there is nothing to bound the answer, so the answer claims
+    /// nothing — the fail-toward-withheld ordering the ticket requires to survive the fix.
+    ///
+    /// This is the control that keeps the fix from being "set the flags". It varies ONE actor from
+    /// the case above — the peer tier — and every other participant stays truthful.
+    #[tokio::test]
+    async fn a_live_fallback_read_with_no_peer_peak_still_claims_nothing() {
+        let (be, _fb) = by_id_backend(&[], vec![], peers_unobservable()).await;
+
+        let r = be.coin_by_id("no-such-coin").await.unwrap();
+
+        assert_eq!(
+            (r.synced, r.peak_height),
+            (false, None),
+            "a node with no chain view of its own bounded an answer anyway"
+        );
+    }
+
+    /// **Proves:** a CACHE-served answer stays unwarranted even while the peer tier announces a
+    /// peak, because nothing recorded WHEN that row was taken.
+    ///
+    /// This one passes both before and after the change, and is stated as such rather than
+    /// presented as part of the RED: it is the guard against OVER-applying the fix. The cached rows
+    /// are permanent by design (a spent coin's record is immutable), so a current peer peak stamped
+    /// on one would assert currency nobody measured.
+    #[tokio::test]
+    async fn a_cache_served_fallback_answer_stays_unwarranted() {
+        let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+        let fb = Arc::new(
+            MockFallback::default()
+                .with_cached(vec![fallback_coin("cached", "other-ph", 7, Some(11), None)], vec![]),
+        );
+        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(PEERS_PEAK));
+
+        let r = be.coin_by_id("cached").await.unwrap();
+
+        assert_eq!(fb.call_count(), 0, "served from cache, no egress");
+        assert!(r.coin.is_some(), "the cached row really answered");
+        assert_eq!(
+            (r.synced, r.peak_height),
+            (false, None),
+            "a cached row was stamped with a peak measured long after it was taken"
+        );
+    }
+
+    /// **Proves:** the PAIRING invariant across every live fallback arm — none of the five may emit
+    /// `synced: true` beside `peak_height: None`, and none may emit a peak while claiming nothing.
+    ///
+    /// Asserted over the ARMS rather than over one fixture, because the failure this guards is a
+    /// future arm computing the two fields independently. Both fields derive from the single
+    /// `chain_tier_answer_height` measurement, so the invariant is structural; this test is what
+    /// notices if that stops being true.
+    #[tokio::test]
+    async fn no_live_fallback_arm_pairs_a_claim_with_a_missing_bound() {
+        for peers in [peers_level_at(PEERS_PEAK), peers_unobservable()] {
+            let expected = peers.peak_height;
+            let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+            let fb = Arc::new(
+                MockFallback::with_coins(vec![fallback_coin(
+                    "child",
+                    "other-ph",
+                    7,
+                    Some(11),
+                    Some(12),
+                )])
+                .with_spends(vec![fallback_spend("child")]),
+            );
+            let be = WalletBackend::new(db, fb, WalletConfig::default())
+                .with_chain_peer_tier_for_tests(peers);
+
+            let pairs = [
+                {
+                    let r = be.coin_by_id("child").await.unwrap();
+                    ("coin_by_id", r.synced, r.peak_height)
+                },
+                {
+                    let r = be.coin_spend("child").await.unwrap();
+                    ("coin_spend", r.synced, r.peak_height)
+                },
+                {
+                    let r = be.coins_by_parent("pp", None, 10).await.unwrap();
+                    ("coins_by_parent", r.synced, r.peak_height)
+                },
+            ];
+
+            for (arm, synced, peak) in pairs {
+                assert_eq!(
+                    (synced, peak),
+                    (expected.is_some(), expected),
+                    "{arm} broke the pairing: a claim and its bound must travel together"
+                );
+            }
+        }
     }
 }
