@@ -552,7 +552,7 @@ fn remedy_for_unreadable_token(path: &Path, dir: &str, unix: bool) -> String {
     );
     if unix {
         format!(
-            "{elevated}. For a program that must keep running as an ordinary user (the dig-app Agent on a server), do NOT widen the mode on this file — it is the master capability. Pair a scoped, revocable token for that client instead: `sudo dign pair` LISTS the pending requests and `sudo dign pair approve <pairing_id>` approves one -- the bare verb only lists, it approves nothing -- and the token the client receives cannot mint or revoke pairings and cannot grant chain authority. Revoke it any time with `sudo dign pair revoke <token_id>`."
+            "{elevated}. If you cannot elevate, you do not have to: run `dign pair connect` as THIS account to request a scoped token of your own, then ask the operator to approve it. Do NOT widen the mode on this file — it is the master capability. On the operator's side: `sudo dign pair` LISTS the pending requests and `sudo dign pair approve <pairing_id>` approves one -- the bare verb only lists, it approves nothing -- and the token the client receives cannot mint or revoke pairings and cannot grant chain authority. Revoke it any time with `sudo dign pair revoke <token_id>`."
         )
     } else {
         format!(
@@ -6668,6 +6668,21 @@ mod tests {
         assert!(
             unix.contains("revoke"),
             "a grant with no stated revocation is a permanent one: {unix}"
+        );
+        // dig-node#403 -- this message is rung 3 of the ladder, so the ONLY reader who ever sees
+        // it is one holding neither token: an unprivileged user who by construction cannot run a
+        // `sudo` verb. Naming only the operator's half sends that reader to find an
+        // administrator for a step they can perform themselves. The verb is asserted UNPREFIXED
+        // (`contains("sudo dign pair connect")` would be the same dead end wearing the right
+        // words), and the operator half is asserted above and below rather than replaced -- a fix
+        // that swapped one audience's guidance for the other's is not a fix.
+        assert!(
+            unix.contains("run `dign pair connect`"),
+            "the unprivileged reader must be told the verb THEY can run: {unix}"
+        );
+        assert!(
+            !unix.contains("sudo dign pair connect"),
+            "`pair connect` needs no elevation; prefixing it recreates the dead end: {unix}"
         );
         assert!(
             !unix.contains("uninstall"),
