@@ -122,21 +122,44 @@ fn blocks_per_epoch() -> u64 {
 /// placed so that every one of them has already happened at `peak` -- a search for an epoch the
 /// chain has not reached returns `None` without bisecting, and would measure nothing.
 fn reads_to_locate(epochs: u32, peak: u32) -> u64 {
+    reads_to_locate_with(epochs, peak, Seeding::FromPredecessor)
+}
+
+/// Whether the walk carries each epoch's located height into the next epoch's search.
+///
+/// The shipped walk does (`collateral_census::seed_from`), because every record it writes persists
+/// the height it was censused at. `Unseeded` reproduces the pre-fix behaviour AND the behaviour the
+/// fix falls back to when the predecessor's height is not one this node censused itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seeding {
+    FromPredecessor,
+    Unseeded,
+}
+
+/// Locate `epochs` successive epoch heights and report the reads, under a given seeding policy.
+fn reads_to_locate_with(epochs: u32, peak: u32, seeding: Seeding) -> u64 {
     let chain = CountingChain::at_peak(peak);
     let per_epoch = blocks_per_epoch();
     // Start far enough below the peak that `epochs` of them fit underneath it.
     let first = u64::from(peak) - per_epoch * u64::from(epochs) - 1;
 
+    // The first search of a cold start has nothing below it to bound: epoch 1 is derived from
+    // nothing and was taken at no height, so it is unseeded under either policy.
+    let mut seed: Option<u32> = None;
+
     for n in 0..u64::from(epochs) {
         let height = u32::try_from(first + n * per_epoch).expect("height fits");
         let instant = CountingChain::stamp(height);
-        let found = dig_mirror_coin::census_height(&chain, instant)
+        let found = dig_mirror_coin::census_height_seeded(&chain, instant, seed)
             .expect("the fixture answers every read")
             .expect("the epoch has started on chain");
         assert_eq!(
             found.height, height,
             "the search must land on the first block at or after the instant"
         );
+        if seeding == Seeding::FromPredecessor {
+            seed = Some(found.height);
+        }
     }
     chain.reads()
 }
@@ -153,9 +176,11 @@ fn reads_to_locate(epochs: u32, peak: u32) -> u64 {
 fn locating_a_census_height_costs_more_on_a_taller_chain() {
     const EPOCHS: u32 = 20;
 
-    let at_mainnet = reads_to_locate(EPOCHS, MAINNET_PEAK);
-    let at_four_times = reads_to_locate(EPOCHS, MAINNET_PEAK * 4);
-    let at_sixteen_times = reads_to_locate(EPOCHS, MAINNET_PEAK * 16);
+    // UNSEEDED deliberately. This test measures the defect, which is the growth an unseeded search
+    // pays; asserting it against the seeded walk would assert that the fix does not work.
+    let at_mainnet = reads_to_locate_with(EPOCHS, MAINNET_PEAK, Seeding::Unseeded);
+    let at_four_times = reads_to_locate_with(EPOCHS, MAINNET_PEAK * 4, Seeding::Unseeded);
+    let at_sixteen_times = reads_to_locate_with(EPOCHS, MAINNET_PEAK * 16, Seeding::Unseeded);
 
     println!(
         "reads for {EPOCHS} epochs: peak {MAINNET_PEAK} -> {at_mainnet}, \
@@ -206,6 +231,31 @@ fn the_cost_of_locating_an_epoch_height_is_independent_of_chain_height() {
             reads <= budget,
             "locating {EPOCHS} epoch heights at peak {peak} cost {reads} chain reads, over the \
              budget of {budget} -- the search is still paying for the chain's height"
+        );
+    }
+}
+
+/// **The seed is a hint, never an answer**: the same heights come back whether the walk seeds or
+/// not, at every chain height tried.
+///
+/// This is the property that makes seeding safe to do at all, and it is asserted here rather than
+/// inferred from `dig-mirror-coin`'s own tests because it is what THIS consumer depends on: a
+/// seeded search that returned a different height would have this node deriving a collateral
+/// requirement no other node agrees with. `reads_to_locate_with` already asserts each located
+/// height equals the one the fixture placed, so agreement across both policies is agreement with
+/// the truth, not merely with each other.
+#[test]
+fn seeding_changes_the_read_count_and_never_the_located_height() {
+    const EPOCHS: u32 = 20;
+
+    for multiple in [1u32, 4, 16] {
+        let peak = MAINNET_PEAK * multiple;
+        let seeded = reads_to_locate_with(EPOCHS, peak, Seeding::FromPredecessor);
+        let unseeded = reads_to_locate_with(EPOCHS, peak, Seeding::Unseeded);
+
+        assert!(
+            seeded < unseeded,
+            "at peak {peak} the seeded walk cost {seeded} reads and the unseeded one {unseeded}:              if seeding costs no less, this whole change buys nothing"
         );
     }
 }

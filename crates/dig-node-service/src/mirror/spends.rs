@@ -182,6 +182,15 @@ pub fn build_create(
             root_hash,
             epoch: epoch.clone(),
             urls,
+            // No declaration, which is EXACTLY what this builder has always written: nothing here
+            // has ever put a peer id in a mirror coin's memo tail, and `declared_peer` is the field
+            // dig-mirror-coin 0.9 introduced to make that silence a decision rather than a default.
+            // Choosing anything else would be this branch inventing a claimant on a money path --
+            // `build_create` is handed no peer id to name, and a coin that declares one credits its
+            // collateral to that peer. The read side already reports such a coin honestly:
+            // `mirror::bond_verify` maps a silent coin to `BondVerdict::Unverified`, never
+            // `Bonded`. Writing declarations is its own change and is not this one.
+            declared_peer: None,
             collateral: collateral_dig_base_units,
         },
         dig_coins,

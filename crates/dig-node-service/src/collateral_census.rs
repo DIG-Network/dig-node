@@ -39,7 +39,7 @@
 //! already agrees on, and arrives at the same records as a node that never stopped.
 
 use dig_chainsource_interface::ChainSource;
-use dig_mirror_coin::{census, census_height, CensusOutcome, Exclusions, MirrorError};
+use dig_mirror_coin::{census, census_height_seeded, CensusOutcome, Exclusions, MirrorError};
 
 use crate::collateral::{
     EpochRecordStore, PutOutcome, RecordProvenance, StoredEpoch, StoredRecord, GENESIS_EPOCH,
@@ -376,7 +376,7 @@ fn record_one<S: ChainSource>(
     // The predecessor arrives as the STORED record rather than the bare consensus one, because its
     // envelope carries the census height dig-node#404 seeds the next search with. `prior.record` is
     // what the model consumes; `prior.census_height` is what the search consumes.
-    let at = match census_height(source, epoch_start_unix_secs(epoch)) {
+    let at = match census_height_seeded(source, epoch_start_unix_secs(epoch), seed_from(&prior)) {
         Ok(Some(at)) => at,
         Ok(None) => return Err(CensusStop::EpochNotStartedOnChain { epoch }),
         Err(e) => return Err(chain_stop(epoch, e)),
@@ -464,6 +464,37 @@ fn prior_record(store: &EpochRecordStore, epoch: u64) -> Result<StoredRecord, Ce
     }
 }
 
+/// The lower bound the next height search may start from, or `None` for an unseeded search.
+///
+/// **Only a height this node censused ITSELF.** `census_height_seeded` already treats the seed as
+/// untrusted and verifies it against the source, so a bad seed there costs work rather than
+/// correctness. This narrower rule closes a different gap, one that verification alone cannot: a
+/// record with [`RecordProvenance::AdoptedFromPeers`] carries a census height supplied by a peer
+/// cohort — a SECOND trust domain, independent of the chain source — and its verification probe is
+/// a single `block_timestamp` read that the chain source alone answers. Accepting a peer-supplied
+/// seed would let a peer cohort and a stale or forked source combine to prune the true height from
+/// below, which neither could do on its own.
+///
+/// A `Censused` height was established by this node from the same source the new search reads, so
+/// seeding from it adds no trust the search does not already place. `Bootstrap` (epoch 1, taken at
+/// no height) and the weakest-provenance default both yield `None`, so the first search of a cold
+/// start is unseeded — correct, since there is nothing below it to bound.
+///
+/// # Named limitation
+///
+/// The seed-verification probe is not corroborated across the node's peer cohort, because the
+/// corroborated surface (`dig_wallet::sage::CorroboratedChainSource`, dig-node#506) does not serve
+/// `block_timestamp` at all — it answers by coin id, and returns `Unsupported` for timestamps. Every
+/// probe of the height search therefore comes from one source whether it is seeded or not, so the
+/// seed does not widen the trust boundary the search already has; it reduces the number of reads
+/// inside it. Corroborating height reads is tracked separately.
+fn seed_from(prior: &StoredRecord) -> Option<u32> {
+    match prior.provenance {
+        RecordProvenance::Censused => prior.census_height,
+        RecordProvenance::Bootstrap | RecordProvenance::AdoptedFromPeers { .. } => None,
+    }
+}
+
 /// Map a [`MirrorError`] onto the stop it describes.
 ///
 /// Every variant lands on [`CensusStop::ChainUnavailable`] deliberately: from this walk's point of
@@ -494,6 +525,46 @@ fn epoch_start_unix_secs(epoch: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A peer-supplied census height is never used as a search seed.**
+    ///
+    /// The discriminating test for `seed_from`. `census_height_seeded` verifies its seed against the
+    /// chain source, so this is not about a seed that is merely wrong — it is about WHOSE claim the
+    /// seed is. A record adopted from peers carries a height from a trust domain the chain source
+    /// cannot check, and its verification probe is a single uncorroborated `block_timestamp` read;
+    /// a gate written as `prior.census_height` alone would pass every other test in this file while
+    /// letting a peer cohort bound the search from below.
+    #[test]
+    fn only_a_height_this_node_censused_itself_may_seed_the_next_search() {
+        let record = EpochRecord::bootstrap();
+
+        let mine = StoredRecord::censused(record, 8_000);
+        assert_eq!(
+            seed_from(&mine),
+            Some(8_000),
+            "a height this node established from its own chain reads is exactly what the walk              already knows and is what makes the search bounded"
+        );
+
+        let theirs = StoredRecord {
+            record,
+            census_height: Some(8_000),
+            provenance: RecordProvenance::AdoptedFromPeers {
+                agreed: 5,
+                sampled: 5,
+            },
+        };
+        assert_eq!(
+            seed_from(&theirs),
+            None,
+            "a peer-supplied height must not bound this node's search, however many peers agreed:              agreement among peers is not a chain read"
+        );
+
+        assert_eq!(
+            seed_from(&StoredRecord::bootstrap()),
+            None,
+            "epoch 1 was taken at no height, so there is nothing below the first search to bound it"
+        );
+    }
     use dig_chainsource_interface::CoinRecord;
     use dig_mirror_collateral::EpochRecord;
     use std::cell::RefCell;
