@@ -3292,7 +3292,52 @@ batch's not-held → holder-hint enrichment (`Node::availability_answer`) runs t
 `find_providers` lookup per not-held item. Both spend this node's network bandwidth, so a caller who
 cannot name any content it actually wants could otherwise amplify this node by naming arbitrary
 `(store_id, root, retrieval_key)` triples — and a `getAvailability` batch is the LARGEST such vector,
-naming up to `MAX_AVAILABILITY_ITEMS` (= 512) content ids in one request. Three bounds govern the path:
+naming up to `MAX_AVAILABILITY_ITEMS` (= 512) content ids in one request. FOUR bounds govern the
+path, and the first of them (10.4.0) runs in FRONT of the per-requestor budget of 10.4.1:
+
+10.4.0. **Inbound admission on the mTLS peer surface (dig-sex SPEC 8.5, dig-node#269).** Every
+inbound `dig.getAvailability` and peer JSON-RPC request MUST pass a concurrency meter BEFORE the
+request is read, decoded or dispatched — ahead of the per-requestor token bucket of 10.4.1. A refused
+request is answered `-32000` with `message: "request refused"` and `data.reason` naming the LIMIT that
+was reached, never the standing of the peer: `unauthenticated`, `request too large`,
+`node at capacity`, `peer at capacity`, `relay budget exhausted`, `meter full`. A second
+implementation MUST produce these answers and MUST be able to interpret them; they say "retry later"
+(or, for the first two, "this request is not admissible as framed"), never "you are banned".
+
+- **Metered by the authenticated identity.** The meter key MUST be the mTLS-verified `peer_id` of the
+  session, as lowercase 64-hex. A session carrying no such identity is REFUSED (`unauthenticated`) —
+  never admitted unmetered, and never coerced into a placeholder key. Admitting an identity-less
+  request unmetered would make presenting no identity the cheapest way out of the meter, and metering
+  every such request under one shared key would let a single caller exhaust the allowance of everyone.
+  A caller-less session therefore serves only the range and module-range paths.
+- **A batch past `MAX_AVAILABILITY_ITEMS` (= 512) is refused WHOLE**, with reason `request too large`,
+  rather than answered as a truncated 512-item prefix. The clamp is on the quantity the caller chose,
+  applied at the boundary, and it MUST equal the batch size the node advertises it answers: a clamp set
+  below the advertised limit would refuse work this contract says is served. A batch AT 512 MUST be
+  answered in full.
+- **Two pools, and the property they buy.** The FIRST concurrent unit of work of a peer is charged to a
+  reserve whose per-peer share is exactly 1, sized `RESERVED_FIRST_SLOTS` = `MAX_INFLIGHT_PEER_CONNECTIONS`
+  (= 512); every further concurrent unit of that peer, and all relayed work, draws on the shared
+  node-wide pool. The reserve grants no peer any extra concurrency — the total concurrent share of a
+  peer is unchanged, and only the pool its first unit is charged to differs.
+
+  The normative property is this: **a bounded number of free identities MUST NOT be able to deny the
+  peer surface to everyone else.** With a single shared pool, the identities needed to hold the
+  node-wide ceiling is `global_ceiling / per_peer_share` — a small constant, each identity costing one
+  self-signed keypair and each staying inside its own share so the per-peer limiter never fires.
+  Reserving the first unit makes the cost of denying an honest peer **one identity AND one held
+  connection per slot** — linear, and bounded by the connection cap the node already enforces. An
+  implementation MAY choose different numbers; it MUST NOT make denial cheaper than one held connection
+  per denied slot.
+- **A peer holding no work in flight is admitted while a busy node sheds**, for up to
+  `RESERVED_FIRST_SLOTS` such peers concurrently. Shedding under load MUST
+  come out of the shared pool, so load-shedding degrades the peers that are already consuming
+  concurrency rather than locking out peers that are asking for the first time.
+- **The relay budget is configured and VACUOUS on this node.** Nothing here constructs relayed work, so
+  the separate relay ceiling is satisfied because the case it governs never occurs — not because it is
+  enforced. It is retained so that the first producer of relayed work inherits a budget rather than an
+  omission. It is recorded as vacuous rather than listed as an active rule, because a limit nobody
+  reaches and a limit nobody applies are indistinguishable from the number alone.
 
 10.4.1. **Per-requestor rate limit.** A token-bucket limiter (default burst
 `DEFAULT_MISS_LOOKUP_BURST` = 16, refill `DEFAULT_MISS_LOOKUP_REFILL_PER_SEC` = 4/s) sits in FRONT of

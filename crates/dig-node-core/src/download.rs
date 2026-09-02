@@ -898,6 +898,15 @@ pub struct NodeContent {
     /// at all, because pool membership is its liveness gate. Folding them together would make one
     /// structure whose key, lifetime and eviction rule all mean two different things at once.
     ask_routing: AskRoutingState,
+    /// What this node has observed each pool peer DO, and the dial share that earns them (#268).
+    ///
+    /// Held beside [`Self::ask_routing`] because the two read the same verified identity and are
+    /// bounded by the same pool: routing ranks the peers worth asking FIRST, conduct decides which are
+    /// worth asking AT ALL. Node-local and never gossiped — a shared reputation channel would be a
+    /// defamation primitive.
+    conduct: crate::seams::dig_peer::conduct::ConductState,
+    /// The instant conduct ticks are measured from. Wall-clock-free and monotonic.
+    conduct_epoch: std::time::Instant,
 }
 
 /// What a holder search ESTABLISHED — the records it found AND whether an empty result is a fact.
@@ -1407,6 +1416,8 @@ impl NodeContent {
             ask_seen: AskSeenSet::new(),
             onion_relay: std::sync::atomic::AtomicBool::new(onion_relay_from_env()),
             ask_routing,
+            conduct: crate::seams::dig_peer::conduct::ConductState::new(),
+            conduct_epoch: std::time::Instant::now(),
         })
     }
 
@@ -1906,15 +1917,22 @@ impl NodeContent {
             .filter_map(|(peer, _)| RoutedPeer::from_pool_key(peer))
             .collect();
 
+        // CONDUCT gates who is dialable at all (#268, SPEC 8.3); routing then ranks what remains.
+        // The order matters: ranking a peer this node has PROVEN dishonest would still spend a dial on
+        // it whenever the ranking happened to favour it. A peer excluded here has a verifiable fault
+        // against it — a lie or a self-contradiction — and never merely a slow or silent history,
+        // which `dial_share` floors above zero precisely so distress cannot evict an honest holder.
+        let dialable = self.conduct.dialable(&routable, self.conduct_ticks());
+
         // Ranked by what THIS node has observed, not by the pool `HashMap`'s arbitrary order — and the
-        // observations of peers no longer in `routable` are dropped in the same call, so a cycled-away
+        // observations of peers no longer in `dialable` are dropped in the same call, so a cycled-away
         // peer leaves this node's memory when it leaves the pool.
         let decision = self.ask_routing.decide(
             &config,
             asker,
             budget.remaining(config.hop_cap),
             me,
-            &routable,
+            &dialable,
             self.relay_rate_limiter.check(requestor),
         );
 
@@ -2002,6 +2020,30 @@ impl NodeContent {
             // The ONLY writer of this node's routing memory, fed an outcome this node classified from
             // an exchange it issued and saw complete (dig_ecosystem#3129).
             self.ask_routing.record(routed, &outcome, started.elapsed());
+            // The SAME exchange, classified for conduct (#268). An outcome where the peer answered —
+            // including an honest "I do not have it" — is an `HonestAnswer`, because SPEC 8.2A
+            // requires that answering is never worse than staying silent. A refusal, a timeout and an
+            // unreachable peer are `NonPerformance`: unverifiable, decaying, and floored, since none
+            // of them can be distinguished from distress an attacker induced in an honest peer.
+            //
+            // Neither VERIFIABLE class is produced here, and deliberately so. A `ProvenLie` needs
+            // bytes that failed verification against the anchor, attributed to the peer that supplied
+            // them; that attribution happens inside `dig-download`'s engine against `chunk_hashes` and
+            // is not surfaced per-peer to this node (see the report on #268). Claiming one from a
+            // transport error would brand an honest peer on unverifiable evidence, which is the exact
+            // conflation SPEC 8.2A exists to prevent.
+            self.conduct.observe(
+                routed,
+                match outcome {
+                    AskOutcome::Answered(_) | AskOutcome::AnsweredInconclusive(_) => {
+                        dig_sex::ConductEvidence::HonestAnswer
+                    }
+                    AskOutcome::Refused | AskOutcome::TimedOut | AskOutcome::Unreachable => {
+                        dig_sex::ConductEvidence::NonPerformance
+                    }
+                },
+                self.conduct_ticks(),
+            );
             match outcome {
                 AskOutcome::Answered(records) => answers.records.extend(records),
                 // The peer answered and told us its OWN subtree did not finish. Its records are
@@ -2036,6 +2078,16 @@ impl NodeContent {
             .filter(|(_, addrs)| !addrs.is_empty())
             .map(|(peer, addrs)| (peer.clone(), addrs.clone()))
             .collect()
+    }
+
+    /// This node's monotonic conduct clock, in seconds since process start.
+    ///
+    /// Conduct decay is measured in elapsed ticks and nothing else, so the clock must advance on its
+    /// own — a counter incremented per exchange would mean a peer nobody dials never ages out of its
+    /// penalty, and the recovery SPEC 8.2A requires would be unreachable for exactly the peer being
+    /// punished.
+    fn conduct_ticks(&self) -> u64 {
+        self.conduct_epoch.elapsed().as_secs()
     }
 
     /// This node's routing memory, so a test can drive the forwarded ask and then ask what the ask
