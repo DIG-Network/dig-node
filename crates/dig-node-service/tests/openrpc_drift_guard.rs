@@ -142,27 +142,35 @@ fn get_content_is_catalogued_local() {
     assert!(!m.requires_auth);
 }
 
-/// The reconciled error catalogue carries the upstream `-32004` ("resource not
-/// available at the requested root") that the read path's §21 remote client recognizes
-/// and this service relays — previously undocumented — with the right origin and a
-/// stable symbolic name, and it surfaces in the machine-readable catalogue JSON.
+/// The error catalogue carries `-32004` ("resource not available at the requested root")
+/// under the name the shared contract assigns and the node actually emits, with the origin
+/// of the layer this node itself mints it from, and it surfaces in the catalogue JSON.
+///
+/// This assertion previously pinned `RESOURCE_NOT_AVAILABLE_AT_ROOT`/`upstream` — a name no
+/// frame has ever carried and an origin that ignored the local mint — so it held the defect
+/// in place instead of catching it (#478).
 #[test]
 fn reconciled_error_codes_are_catalogued_with_correct_origin() {
-    assert_eq!(ErrorCode::ResourceNotAvailableAtRoot.code(), -32004);
+    assert_eq!(ErrorCode::ResourceUnavailable.code(), -32004);
     assert_eq!(
-        ErrorCode::ResourceNotAvailableAtRoot.name(),
-        "RESOURCE_NOT_AVAILABLE_AT_ROOT"
+        ErrorCode::ResourceUnavailable.name(),
+        "RESOURCE_UNAVAILABLE"
     );
-    assert_eq!(ErrorCode::ResourceNotAvailableAtRoot.origin(), "upstream");
+    assert_eq!(ErrorCode::ResourceUnavailable.origin(), "node");
 
     let catalogue = meta::error_catalogue();
     let arr = catalogue.as_array().expect("error catalogue array");
     assert!(
         arr.iter()
-            .any(|e| e["name"] == json!("RESOURCE_NOT_AVAILABLE_AT_ROOT")
+            .any(|e| e["name"] == json!("RESOURCE_UNAVAILABLE")
                 && e["code"] == json!(-32004)
-                && e["origin"] == json!("upstream")),
-        "error catalogue missing the reconciled -32004 RESOURCE_NOT_AVAILABLE_AT_ROOT"
+                && e["origin"] == json!("node")),
+        "error catalogue missing the reconciled -32004 RESOURCE_UNAVAILABLE"
+    );
+    assert!(
+        !arr.iter()
+            .any(|e| e["name"] == json!("RESOURCE_NOT_AVAILABLE_AT_ROOT")),
+        "the catalogue still publishes a name no frame carries"
     );
 }
 
@@ -276,4 +284,95 @@ fn served_classes_are_well_formed() {
             other => panic!("{} has an unknown served class {other:?}", m.name),
         }
     }
+}
+
+/// THE INVARIANT, not a list: for every code the shell catalogues that the shared
+/// `dig-rpc-protocol` contract also declares, the shell's machine name MUST equal the
+/// crate's. A hard-coded assertion on one number only ever checks that number; this is
+/// the test that catches the NEXT drift, wherever it appears.
+///
+/// `DispatchFailed`/-32000 is the one deliberate exclusion: the shell mints it and
+/// publishes it under its own name, so shell and wire AGREE there. Reconciling it with
+/// the crate's generic `SERVER_ERROR` is a genuine shipped-name change with a different
+/// risk profile, tracked separately.
+#[test]
+fn shell_error_names_match_the_shared_catalogue() {
+    let mut checked = 0usize;
+    let mut drifted: Vec<String> = Vec::new();
+
+    for shell in ErrorCode::all() {
+        if *shell == ErrorCode::DispatchFailed {
+            continue;
+        }
+        let Some(shared) = dig_rpc_protocol::ErrorCode::ALL
+            .iter()
+            .find(|c| i64::from(c.code()) == shell.code())
+        else {
+            continue;
+        };
+        checked += 1;
+        if shell.name() != shared.machine_code() {
+            drifted.push(format!(
+                "{}: shell says {:?}, dig-rpc-protocol says {:?}",
+                shell.code(),
+                shell.name(),
+                shared.machine_code()
+            ));
+        }
+    }
+
+    assert!(
+        checked >= 7,
+        "the shell shares fewer codes with dig-rpc-protocol than expected ({checked}) — \
+         this guard may be checking nothing"
+    );
+    assert!(
+        drifted.is_empty(),
+        "shell error names drifted from the shared catalogue: {drifted:#?}"
+    );
+}
+
+/// THE EMITTED FRAME, not the catalogue: drive a real `-32004` out of the node and assert
+/// the catalogue entry for `-32004` carries the SAME `data.code` string the frame does.
+/// Comparing the two artefacts is what makes this a decision test rather than a presence
+/// test — a catalogue that agrees with itself proves nothing about the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_catalogued_name_for_32004_is_the_name_the_node_emits() {
+    let (node, _scratch) = ephemeral_node();
+
+    // An empty ephemeral node holds nothing, so any well-formed capsule read misses
+    // locally and mints -32004 without touching the network.
+    let resp = handle_rpc(
+        &node,
+        json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{
+            "store_id": "11".repeat(32), "root": "22".repeat(32),
+        }}),
+        dig_node_core::download::ReadOrigin::Local,
+        dig_node_core::download::RequestProvenance::FirstParty,
+    )
+    .await;
+
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32004),
+        "expected a local capsule miss to mint -32004, got: {resp}"
+    );
+    let emitted = resp["error"]["data"]["code"]
+        .as_str()
+        .expect("the emitted frame carries a machine name in data.code")
+        .to_string();
+    assert_eq!(emitted, "RESOURCE_UNAVAILABLE");
+
+    let catalogue = meta::error_catalogue();
+    let entry = catalogue
+        .as_array()
+        .expect("error catalogue array")
+        .iter()
+        .find(|e| e["code"] == json!(-32004))
+        .expect("the catalogue declares -32004");
+    assert_eq!(
+        entry["name"],
+        json!(emitted),
+        "the discovery document names -32004 differently from the frame the node emits"
+    );
 }
