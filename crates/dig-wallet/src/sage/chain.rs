@@ -190,8 +190,11 @@ pub struct PushOutcome {
 ///   its own vocabulary, a peer inventing text — all land in the hold class and cost at most one
 ///   bounded `RESERVATION_TTL_MS`. The same names written as "free unless one of these" would free
 ///   on every string nobody foresaw.
-/// - **A hostile source gains nothing.** To get inputs freed it must now emit one of these exact
-///   names; before dig-node#460 any non-empty string would do. The free set strictly SHRANK.
+/// - **The free set strictly SHRANK**, which removes the ACCIDENTAL free: a source that denies a
+///   relay it performed, or answers with its own conflict, no longer frees. It does NOT raise the bar
+///   against a DELIBERATE attacker in the answering position — these names are public constants, so
+///   emitting one is a lookup rather than a feat. This guard fixes the honest-race defect; it is not
+///   a defence against a hostile last destination, and must not be described as one.
 /// - **The other direction is unchanged.** A source wanting the inputs HELD could already achieve
 ///   that by stating no reason at all, which dig-node#348 made a hold. This adds no new lockout
 ///   capability, and the TTL that bounds it MUST NOT be shortened to compensate.
@@ -207,16 +210,28 @@ pub struct PushOutcome {
 /// `ASSERT_BEFORE_*`) are evaluated against the asked node's PEAK, so a node behind the tip refuses
 /// what a node at the tip admits.
 ///
+/// **The CLVM-EXECUTION names are absent for the SAME reason, which is not obvious and was got
+/// wrong once.** `GENERATOR_RUNTIME_ERROR`, `BLOCK_COST_EXCEEDS_MAX`, `INVALID_BLOCK_COST` and
+/// `INVALID_SPEND_BUNDLE` look like pure properties of the bytes and are not. Bundle validation is
+/// parameterised by the answering node's HEIGHT and by a caller-supplied cost budget:
+/// `chia_consensus::spendbundle_validation::get_flags_for_height_and_constants` derives
+/// `COST_CONDITIONS` / `ENABLE_KECCAK_OPS_OUTSIDE_GUARD` / `SIMPLE_GENERATOR` from `prev_tx_height`,
+/// and `run_spendbundle(.., max_cost, flags, ..)` runs under both. So a node above a hard fork and a
+/// node below it can reach DIFFERENT verdicts on identical bytes — the same property that excludes
+/// the timelocks. Do not re-add them.
+///
 /// The list is also kept SHORT on purpose: a name is added only when every node is certain to
 /// refuse it identically. The announcement-consumption names are omitted for that reason, not
 /// because they are believed view-dependent. Omission costs a bounded hold; a wrong inclusion costs
 /// a double-select window.
+///
+/// **The one acknowledged residue.** `BAD_AGGREGATE_SIGNATURE` is verified against messages built
+/// with the node's own `AGG_SIG_ME_ADDITIONAL_DATA`, so it is a property of the bundle only for
+/// nodes on the same network. The peer handshake's `network_id` check is what makes that hold in
+/// practice; it is stated rather than left implicit, because it is the assumption this entry rests
+/// on.
 const BUNDLE_INTRINSIC_REFUSALS: &[&str] = &[
     "BAD_AGGREGATE_SIGNATURE",
-    "INVALID_SPEND_BUNDLE",
-    "GENERATOR_RUNTIME_ERROR",
-    "BLOCK_COST_EXCEEDS_MAX",
-    "INVALID_BLOCK_COST",
     "COIN_AMOUNT_NEGATIVE",
     "COIN_AMOUNT_EXCEEDS_MAXIMUM",
     "DUPLICATE_OUTPUT",
@@ -923,8 +938,13 @@ mod tests {
     /// it likes — so the property that matters is that everything outside the list holds. Written
     /// as a denylist the same names would read almost identically and fail the opposite way.
     ///
+    /// The four CLVM-execution rows are a REGRESSION PIN, not filler. They were on the allowlist in
+    /// the first draft and the adversarial gate used one of them to construct a sequence in which
+    /// the inputs are freed for a bundle that later lands. They read as bundle properties and are
+    /// not, so the only thing preventing their return is an assertion that names them.
+    ///
     /// **Catches:** inverting the default, matching by substring or prefix, or moving a
-    /// view-dependent name onto the allowlist.
+    /// view-dependent name onto the allowlist -- including re-adding the four that were removed.
     #[test]
     fn only_a_bundle_intrinsic_reason_is_definitive() {
         for definitive in [
@@ -956,6 +976,16 @@ mod tests {
             // Evaluated against the asked node's peak.
             "FAILED: ASSERT_HEIGHT_ABSOLUTE_FAILED",
             "FAILED: ASSERT_SECONDS_RELATIVE_FAILED",
+            // The CLVM-EXECUTION names. These LOOK intrinsic and are not: bundle validation runs
+            // under flags derived from the answering node's height and under a caller-supplied cost
+            // budget, so a node above a hard fork and a node below it can disagree on identical
+            // bytes. They were on the allowlist in the first draft of dig-node#460 and the
+            // adversarial gate built the free-then-lands sequence from `BLOCK_COST_EXCEEDS_MAX`.
+            // Their presence HERE is what stops them being re-added.
+            "FAILED: BLOCK_COST_EXCEEDS_MAX",
+            "FAILED: GENERATOR_RUNTIME_ERROR",
+            "FAILED: INVALID_BLOCK_COST",
+            "FAILED: INVALID_SPEND_BUNDLE",
             // Nothing this crate enumerated -- must land on the safe side.
             "FAILED: THE_NODE_WAS_HAVING_A_BAD_DAY",
             "PENDING: ",
@@ -970,6 +1000,60 @@ mod tests {
                  destination may be holding this very bundle"
             );
         }
+    }
+
+    /// **Proves (dig-node#460):** a peer's error string reaches the classifier VERBATIM, all the way
+    /// from the wire ack.
+    ///
+    /// Everything else in this file starts from a hand-built `TxStatus`, so the whole chain rests on
+    /// an unpinned assumption: that `chia_query` hands the full node's own words through unaltered.
+    /// If it ever normalised, prefixed or title-cased the error, every exact match here would stop
+    /// matching — silently, and in the HOLD direction, so no test would go red and no operator would
+    /// see anything except coins held for ten minutes more often than before.
+    ///
+    /// So this composes the REAL `chia_query::peer::translate::ack_to_tx_status` with
+    /// `stated_rejection` and `refusal_is_bundle_intrinsic`, driven by the chia ack STATUS BYTE
+    /// rather than by a label this crate chose. The same route `spend.rs` takes for its own fixture
+    /// (dig-node#444), for the same reason.
+    ///
+    /// **Catches:** an upstream change to the error passthrough or to the status labelling, either of
+    /// which would quietly disable the free path this guard is built around.
+    #[test]
+    fn a_peers_own_words_reach_the_classifier_through_the_real_translation() {
+        // Chia ack status 3 = FAILED. The reason is the full node's `Err` variant name.
+        let peer_local = chia_query::peer::translate::ack_to_tx_status(
+            3,
+            Some("ALREADY_INCLUDING_TRANSACTION".to_string()),
+        );
+        let stated = super::ChainTransport::stated_rejection(&peer_local)
+            .expect("the node stated a reason, so one must survive translation");
+        assert_eq!(
+            stated, "FAILED: ALREADY_INCLUDING_TRANSACTION",
+            "the peer's own words did not survive the wire-to-outcome path intact"
+        );
+        assert!(
+            !super::refusal_is_bundle_intrinsic(&stated),
+            "the #460 refusal arrived intact and was still read as the network's verdict"
+        );
+
+        let intrinsic = chia_query::peer::translate::ack_to_tx_status(
+            3,
+            Some("BAD_AGGREGATE_SIGNATURE".to_string()),
+        );
+        let stated = super::ChainTransport::stated_rejection(&intrinsic).expect("a stated reason");
+        assert!(
+            super::refusal_is_bundle_intrinsic(&stated),
+            "a bundle no node will admit is being held for the full TTL; the translation changed              the reason's spelling and every exact match silently stopped matching"
+        );
+
+        // Status 2 = PENDING, the node declining to admit without saying why.
+        assert_eq!(
+            super::ChainTransport::stated_rejection(
+                &chia_query::peer::translate::ack_to_tx_status(2, None)
+            ),
+            None,
+            "a bare ack must not acquire a reason in translation"
+        );
     }
 
     /// **The hex form round-trips.** Pinned because the wire carries hex, not a struct: a bundle

@@ -2206,10 +2206,13 @@ impl WalletBackend {
     /// One peer's refusal is one peer's opinion; the network has no verdict this code can read.
     /// What CAN be read is whether the stated reason is one every honest node would reach from the
     /// same bytes. That question is answered without trusting the source, because the classifier is
-    /// an ALLOWLIST with a HOLD default: an unrecognised or view-dependent reason holds, and a
-    /// hostile source must now emit one of a short list of exact names to get a free that any
-    /// non-empty string used to buy. The free set strictly shrank in both the accidental and the
-    /// adversarial direction.
+    /// an ALLOWLIST with a HOLD default: an unrecognised or view-dependent reason holds.
+    ///
+    /// **What that does and does not buy.** It removes the ACCIDENTAL free — the honest race above,
+    /// and a source denying a relay it performed. It does NOT defeat a DELIBERATE attacker in the
+    /// answering position, who can read the allowlist and emit a name from it. The free set shrank;
+    /// the ATTACKER's free set did not. Claiming otherwise would invite the next reader to treat the
+    /// reason string as trusted, which it is not and cannot be made.
     fn is_definitive_rejection(outcome: &PushOutcome) -> bool {
         !outcome.accepted
             && outcome
