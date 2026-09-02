@@ -82,8 +82,8 @@ impl WalletPaths {
     /// Resolve the production layout: the seed and its metadata under `DigWallet/`, the device key
     /// under the sibling `DigNode/device/`.
     ///
-    /// Both roots derive from the same per-user base the wallet already used (`%LOCALAPPDATA%`,
-    /// falling back to `$HOME`), so this adds no new location contract — only the split.
+    /// Both roots derive from the same base the wallet already used (`DIG_WALLET_BASE`, then
+    /// `%LOCALAPPDATA%`, then `$HOME`), so this adds no new location contract — only the split.
     pub fn resolve(seed: PathBuf) -> Self {
         let meta = sibling(&seed, "wallet.meta.json");
         let device_key = user_base()
@@ -106,12 +106,14 @@ pub fn default_paths() -> WalletPaths {
     WalletPaths::resolve(crate::seed_path())
 }
 
-/// The per-user, non-roaming base directory both roots hang off (NC-3's location contract).
+/// The base directory both roots hang off (NC-3's location contract).
+///
+/// Delegates to [`crate::wallet_base`] rather than re-deriving the chain, so the seed and the
+/// device key can never resolve from different bases. A second copy of this resolution is exactly
+/// how the sibling relationship documented above would come apart: the two files would still be
+/// named correctly and would simply stop being siblings, which nothing downstream checks.
 fn user_base() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base)
+    crate::wallet_base()
 }
 
 /// A path beside `path`, keeping its directory. Falls back to a bare relative name only when

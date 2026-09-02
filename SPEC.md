@@ -1568,6 +1568,24 @@ is a property of a SERVICE RUN and not of one packaging target.
 An `DIG_IDENTITY_DIR` / `DIG_NODE_CACHE` value the operator set explicitly MUST be preserved; a CLI
 run MUST be left untouched, keeping the user's identity shared with their other DIG tools.
 
+**The wallet base — same anchoring, with one condition.** The node's operator wallet (§16.4) resolves
+its base from `DIG_WALLET_BASE`, then `%LOCALAPPDATA%`, then `$HOME`. Inside the packaged systemd
+unit none of those is set: the unit declares no `User=`, so systemd sets no `$HOME`, and no
+`WorkingDirectory=`, so the working directory is `/`. A relative fallback therefore resolves the seed
+to `/DigWallet/seed.bin`, and that write SUCCEEDS — the unit runs as root and `ProtectSystem=full`
+leaves `/` writable — so the node operates normally with its wallet at the filesystem root.
+
+A SERVICE run MUST therefore anchor `DIG_WALLET_BASE` at the resolved state dir, giving
+`<state_dir>/DigWallet/seed.bin` and `<state_dir>/DigNode/device/device.key`. The override names the
+BASE and never either directory: both roots MUST derive from one value, or the sibling relationship
+§16.4 requires could be broken by configuration alone.
+
+It MUST be adopted ONLY when no wallet is present at the base the service would otherwise have
+resolved. The operator wallet holds real $DIG for mirror-coin collateral, so re-rooting a host that
+already has one would leave the funded seed unreferenced and mint an empty replacement; a Windows
+LocalSystem service, whose `%LOCALAPPDATA%` IS set, is exactly that case. Presence that cannot be
+DETERMINED MUST count as present. Key material MUST NOT be moved or copied automatically.
+
 **Creation + ACL — the HARDENING CONTRACT.** The state dir holds the control token that grants FULL
 local control, so its ACL MUST NOT be world/all-users-readable. On Windows this is the HARD case:
 `%PROGRAMDATA%` grants `BUILTIN\Users` "create subfolder", so ANY low-priv user can pre-create
@@ -4461,6 +4479,10 @@ protected `D:P(A;;FA;;;<user>)` DACL on Windows, never the ACL inherited from `%
 | `<wallet_dir>/seed.bin` | the sealed mnemonic — format unchanged |
 | `<device_dir>/device.key` | 32 raw CSPRNG bytes, no header |
 | `<wallet_dir>/wallet.meta.json` | `origin`, `created_at` (RFC 3339), `ever_funded` |
+
+`<user_base>` is resolved from `DIG_WALLET_BASE`, then `%LOCALAPPDATA%`, then `$HOME`, by ONE resolver
+that both roots below use. A service run anchors that base at the machine state dir under the
+condition stated in §7.3a.
 
 `<device_dir>` is `<user_base>/DigNode/device/` — a **SIBLING** of `<wallet_dir>`
 (`<user_base>/DigWallet/`), never a child. **That separation IS the partial-exfiltration boundary and

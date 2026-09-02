@@ -162,12 +162,87 @@ fn is_self_origin(origin: &str) -> bool {
     origin == format!("http://127.0.0.1:{port}") || origin == format!("http://localhost:{port}")
 }
 
+/// The env var that overrides the base directory BOTH wallet roots hang off.
+///
+/// It names the BASE, never a wallet directory, and that is the whole point: `DigWallet/` and the
+/// device key's `DigNode/device/` are resolved from one value, so they cannot be pointed at
+/// unrelated places. See [`crate::autoseed`] — the sibling relationship between those two
+/// directories IS the partial-exfiltration boundary, and a per-directory override would let a
+/// well-meaning operator collapse it.
+pub const WALLET_BASE_ENV: &str = "DIG_WALLET_BASE";
+
+/// Pick the base directory the wallet roots hang off, from explicitly-supplied inputs.
+///
+/// Pure, and takes its three inputs rather than reading them, for a reason the crate has already
+/// paid for once: the environment is process-global, so an env-reading resolver can only be tested
+/// under a mutex that serialises every other test touching the same variables (see `ENV_LOCK` in
+/// this module's tests), and the Windows arm is then unreachable on a Linux CI runner. Explicit
+/// inputs make every arm runnable everywhere.
+///
+/// `None` means NOTHING resolved a base. That is a real answer and is deliberately not collapsed
+/// into a relative fallback here: a service unit sets no `HOME` and no `WorkingDirectory`, so a
+/// relative base resolves against the process working directory, which for a systemd system unit
+/// is `/`. The caller decides what to do with the absence.
+///
+/// An empty value is treated as unset, matching how the node's other overrides are parsed.
+pub fn resolve_wallet_base(
+    base_override: Option<&str>,
+    localappdata: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    [base_override, localappdata, home]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// The base both wallet roots hang off, resolved from this process's environment.
+fn wallet_base() -> PathBuf {
+    resolve_wallet_base(
+        std::env::var(WALLET_BASE_ENV).ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The base a build WITHOUT [`WALLET_BASE_ENV`] would have resolved.
+///
+/// Used only to answer "is there already a wallet where the previous build put one?" — see
+/// [`legacy_wallet_present`]. It keeps the relative fallback precisely because that fallback is
+/// where the stray wallet this guard exists to protect actually is.
+fn legacy_wallet_base() -> PathBuf {
+    resolve_wallet_base(
+        None,
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The seed file a build WITHOUT [`WALLET_BASE_ENV`] would have opened.
+pub fn legacy_seed_path() -> PathBuf {
+    legacy_wallet_base().join("DigWallet").join("seed.bin")
+}
+
+/// Whether a wallet already exists where a pre-override build would have put one.
+///
+/// The node's own operator wallet holds real funds, so relocating the base out from under an
+/// existing one would strand it: the node would mint a fresh empty wallet and the funded file
+/// would sit unreferenced. Answers `true` when presence cannot be determined at all, the same
+/// fail-closed direction as [`wallet_exists`] and for the same reason — the unknown case must not
+/// be the one that abandons a wallet.
+pub fn legacy_wallet_present() -> bool {
+    !matches!(
+        autoseed::presence(&legacy_seed_path()),
+        Ok(autoseed::Presence::Absent)
+    )
+}
+
 /// Path to the encrypted seed file (per-user, off the profile dir).
 fn seed_path() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("DigWallet").join("seed.bin")
+    wallet_base().join("DigWallet").join("seed.bin")
 }
 
 /// Path to the persisted dapp allow-list (next to the seed file).
@@ -1103,6 +1178,93 @@ mod tests {
     /// persistence assertions flaky. A tokio mutex so the guard is held safely across
     /// the `.await`s in these async tests. Held for the whole body of each such test.
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    // -- Where the wallet base comes from (#491) ---------------------------------------------
+    //
+    // These assert on the RESOLVER, not on a file that happens to appear: the bug is that a base
+    // resolves to something relative, and a fixture that hands the resolver a directory cannot
+    // exhibit it. The inputs are the ones a systemd system unit really presents - no
+    // `LOCALAPPDATA`, no `HOME` - because that unit sets no `User=`, so systemd sets no `$HOME`,
+    // and no `WorkingDirectory=`, so the working directory is `/`.
+
+    #[test]
+    fn a_service_environment_with_no_home_resolves_no_base_at_all() {
+        // The defect, stated as a property: with nothing to resolve from, the answer is the
+        // ABSENCE of a base. The old chain answered `"."` here, which joined to
+        // `/DigWallet/seed.bin` on a stock `.deb` service - a wallet at the filesystem root,
+        // written successfully, because that unit runs as root under `ProtectSystem=full`, which
+        // leaves `/` writable.
+        assert_eq!(resolve_wallet_base(None, None, None), None);
+    }
+
+    #[test]
+    fn an_empty_value_is_treated_as_unset_at_every_rung() {
+        // An exported-but-empty variable is how a unit file most often "sets" something by
+        // accident. Falling through to the next rung matches how the node parses its other
+        // overrides; treating it as a base would root the wallet at the working directory again.
+        assert_eq!(
+            resolve_wallet_base(Some("  "), Some(""), Some("/home/op")),
+            Some(PathBuf::from("/home/op"))
+        );
+        assert_eq!(resolve_wallet_base(Some(""), Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn the_override_outranks_both_platform_variables() {
+        assert_eq!(
+            resolve_wallet_base(
+                Some("/var/lib/dig-node"),
+                Some("C:/Users/op/AppData/Local"),
+                Some("/home/op")
+            ),
+            Some(PathBuf::from("/var/lib/dig-node"))
+        );
+    }
+
+    #[test]
+    fn localappdata_still_outranks_home_when_no_override_is_set() {
+        // The Windows ordering is unchanged. Stated explicitly because a LocalSystem service DOES
+        // get `LOCALAPPDATA` (the systemprofile path), so this rung is what existing Windows
+        // installs already resolved through - and what must keep resolving for them.
+        assert_eq!(
+            resolve_wallet_base(
+                None,
+                Some("C:/Windows/system32/config/systemprofile/AppData/Local"),
+                Some("/home/op")
+            ),
+            Some(PathBuf::from(
+                "C:/Windows/system32/config/systemprofile/AppData/Local"
+            ))
+        );
+    }
+
+    /// **Proves:** the ONE override moves BOTH roots together.
+    ///
+    /// This is why the override names a BASE and not a wallet directory. `autoseed`'s
+    /// `the_device_key_never_shares_the_wallet_directory` proves the two roots are siblings for a
+    /// given base; this proves there is no way to give them DIFFERENT bases, which is the failure
+    /// a per-directory override would have introduced. A test that moved only the seed and checked
+    /// only the seed would pass under exactly that broken shape.
+    #[tokio::test]
+    async fn one_base_override_moves_the_seed_and_the_device_key_together() {
+        let _g = ENV_LOCK.lock().await;
+        let td = tempfile::tempdir().unwrap();
+        std::env::set_var(WALLET_BASE_ENV, td.path());
+
+        let paths = autoseed::default_paths();
+        assert!(paths.seed.starts_with(td.path()), "seed under the base");
+        assert!(
+            paths.device_key.starts_with(td.path()),
+            "device key under the SAME base"
+        );
+        assert_eq!(paths.seed.parent().unwrap(), td.path().join("DigWallet"));
+        assert_eq!(
+            paths.device_key.parent().unwrap(),
+            td.path().join("DigNode").join("device")
+        );
+
+        std::env::remove_var(WALLET_BASE_ENV);
+    }
 
     #[test]
     fn cache_cap_is_floored_so_caching_cant_be_disabled() {
