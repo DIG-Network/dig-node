@@ -542,7 +542,8 @@ mod tests {
         assert_eq!(
             seed_from(&mine),
             Some(8_000),
-            "a height this node established from its own chain reads is exactly what the walk              already knows and is what makes the search bounded"
+            "a height this node established from its own chain reads is exactly what the walk \
+             already knows and is what makes the search bounded"
         );
 
         let theirs = StoredRecord {
@@ -556,7 +557,8 @@ mod tests {
         assert_eq!(
             seed_from(&theirs),
             None,
-            "a peer-supplied height must not bound this node's search, however many peers agreed:              agreement among peers is not a chain read"
+            "a peer-supplied height must not bound this node's search, however many peers \
+             agreed: agreement among peers is not a chain read"
         );
 
         assert_eq!(

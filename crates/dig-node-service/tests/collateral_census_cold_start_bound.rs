@@ -125,15 +125,26 @@ fn reads_to_locate(epochs: u32, peak: u32) -> u64 {
     reads_to_locate_with(epochs, peak, Seeding::FromPredecessor)
 }
 
-/// Whether the walk carries each epoch's located height into the next epoch's search.
+/// How each epoch's height is located, which is THREE distinct behaviours and not two.
 ///
-/// The shipped walk does (`collateral_census::seed_from`), because every record it writes persists
-/// the height it was censused at. `Unseeded` reproduces the pre-fix behaviour AND the behaviour the
-/// fix falls back to when the predecessor's height is not one this node censused itself.
+/// Conflating any two of them produces a test that cannot see what it claims to measure, and the
+/// first version of this file did exactly that: it used `census_height_seeded(.., None)` as the
+/// "before" baseline and measured no growth at any chain height, because that function is
+/// interpolated whether or not it is given a seed. The pre-fix behaviour is a DIFFERENT entry
+/// point.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Seeding {
+    /// The shipped walk: each located height seeds the next epoch's search
+    /// (`collateral_census::seed_from`), because every record persists the height it was censused
+    /// at.
     FromPredecessor,
-    Unseeded,
+    /// The seeded entry point handed no seed. This is what the fix FALLS BACK TO when the
+    /// predecessor's height is not one this node censused itself -- an interpolated `[0, peak]`
+    /// search, not the old bisection.
+    SeededWithNothing,
+    /// `dig_mirror_coin::census_height`: the bisecting search dig-node#404 was filed against, and
+    /// the only honest control for the growth the defect describes.
+    Bisecting,
 }
 
 /// Locate `epochs` successive epoch heights and report the reads, under a given seeding policy.
@@ -144,13 +155,22 @@ fn reads_to_locate_with(epochs: u32, peak: u32, seeding: Seeding) -> u64 {
     let first = u64::from(peak) - per_epoch * u64::from(epochs) - 1;
 
     // The first search of a cold start has nothing below it to bound: epoch 1 is derived from
-    // nothing and was taken at no height, so it is unseeded under either policy.
+    // nothing and was taken at no height, so it is unseeded under every policy.
     let mut seed: Option<u32> = None;
 
     for n in 0..u64::from(epochs) {
         let height = u32::try_from(first + n * per_epoch).expect("height fits");
         let instant = CountingChain::stamp(height);
-        let found = dig_mirror_coin::census_height_seeded(&chain, instant, seed)
+        let located = match seeding {
+            Seeding::Bisecting => dig_mirror_coin::census_height(&chain, instant),
+            Seeding::SeededWithNothing => {
+                dig_mirror_coin::census_height_seeded(&chain, instant, None)
+            }
+            Seeding::FromPredecessor => {
+                dig_mirror_coin::census_height_seeded(&chain, instant, seed)
+            }
+        };
+        let found = located
             .expect("the fixture answers every read")
             .expect("the epoch has started on chain");
         assert_eq!(
@@ -176,11 +196,13 @@ fn reads_to_locate_with(epochs: u32, peak: u32, seeding: Seeding) -> u64 {
 fn locating_a_census_height_costs_more_on_a_taller_chain() {
     const EPOCHS: u32 = 20;
 
-    // UNSEEDED deliberately. This test measures the defect, which is the growth an unseeded search
-    // pays; asserting it against the seeded walk would assert that the fix does not work.
-    let at_mainnet = reads_to_locate_with(EPOCHS, MAINNET_PEAK, Seeding::Unseeded);
-    let at_four_times = reads_to_locate_with(EPOCHS, MAINNET_PEAK * 4, Seeding::Unseeded);
-    let at_sixteen_times = reads_to_locate_with(EPOCHS, MAINNET_PEAK * 16, Seeding::Unseeded);
+    // `Bisecting` deliberately, and NOT the seeded entry point handed `None`: this test measures
+    // the defect, and the defect is the growth the OLD `census_height` pays. Measuring it against
+    // the new function's unseeded fallback measures the fix's own worst case and reports no growth
+    // at all, which reads as "there was never a defect" rather than as a broken control.
+    let at_mainnet = reads_to_locate_with(EPOCHS, MAINNET_PEAK, Seeding::Bisecting);
+    let at_four_times = reads_to_locate_with(EPOCHS, MAINNET_PEAK * 4, Seeding::Bisecting);
+    let at_sixteen_times = reads_to_locate_with(EPOCHS, MAINNET_PEAK * 16, Seeding::Bisecting);
 
     println!(
         "reads for {EPOCHS} epochs: peak {MAINNET_PEAK} -> {at_mainnet}, \
@@ -235,27 +257,81 @@ fn the_cost_of_locating_an_epoch_height_is_independent_of_chain_height() {
     }
 }
 
-/// **The seed is a hint, never an answer**: the same heights come back whether the walk seeds or
-/// not, at every chain height tried.
+/// **The seed is a hint, never an answer**: every policy locates the same heights, and the shipped
+/// walk is the one that costs strictly less than the search dig-node#404 was filed against.
 ///
-/// This is the property that makes seeding safe to do at all, and it is asserted here rather than
-/// inferred from `dig-mirror-coin`'s own tests because it is what THIS consumer depends on: a
-/// seeded search that returned a different height would have this node deriving a collateral
-/// requirement no other node agrees with. `reads_to_locate_with` already asserts each located
-/// height equals the one the fixture placed, so agreement across both policies is agreement with
-/// the truth, not merely with each other.
+/// Asserted here rather than inferred from `dig-mirror-coin`'s own tests because it is what THIS
+/// consumer depends on: a seeded search that returned a different height would have this node
+/// deriving a collateral requirement no other node agrees with. `reads_to_locate_with` asserts each
+/// located height equals the one the fixture placed, so agreement across policies is agreement with
+/// the truth and not merely with each other -- and a policy that located a wrong height would panic
+/// inside the helper rather than reach the comparison below.
+///
+/// The seeded-vs-unseeded-interpolated comparison is `<=`, not `<`, ON PURPOSE. This fixture stamps
+/// blocks perfectly uniformly, which is the best case an interpolated search can be handed, so the
+/// unseeded fallback already converges in two or three probes and the seed cannot beat it here. A
+/// strict `<` would be asserting a property of the FIXTURE's linearity, not of the change.
 #[test]
-fn seeding_changes_the_read_count_and_never_the_located_height() {
+fn every_policy_locates_the_same_heights_and_seeding_never_costs_more() {
     const EPOCHS: u32 = 20;
 
     for multiple in [1u32, 4, 16] {
         let peak = MAINNET_PEAK * multiple;
         let seeded = reads_to_locate_with(EPOCHS, peak, Seeding::FromPredecessor);
-        let unseeded = reads_to_locate_with(EPOCHS, peak, Seeding::Unseeded);
+        let unseeded = reads_to_locate_with(EPOCHS, peak, Seeding::SeededWithNothing);
+        let bisecting = reads_to_locate_with(EPOCHS, peak, Seeding::Bisecting);
 
         assert!(
-            seeded < unseeded,
-            "at peak {peak} the seeded walk cost {seeded} reads and the unseeded one {unseeded}:              if seeding costs no less, this whole change buys nothing"
+            seeded <= unseeded,
+            "at peak {peak} the seeded walk cost {seeded} reads and the unseeded fallback \
+             {unseeded}: a seed must never make the search more expensive"
+        );
+        assert!(
+            seeded < bisecting,
+            "at peak {peak} the seeded walk cost {seeded} reads and the bisecting search it \
+             replaces cost {bisecting}: if it costs no less, this whole change buys nothing"
         );
     }
+}
+
+/// **A seed ABOVE the true census height must not skip the records between them.**
+///
+/// The hostile case, and the one that distinguishes this change from a wrong version of it. A seed
+/// is a lower bound, so believing an inflated one would confine the search ABOVE the answer and
+/// return a plausible, wrong, strictly-too-high census height -- and a census taken at the wrong
+/// height counts a different population and yields a collateral requirement that forks from every
+/// other node's.
+///
+/// The seed is varied and NOTHING else: the same instants, the same chain, the same expected
+/// heights as the honest walk. A fixture that also moved the target could not tell a search that
+/// rejected the bad seed from one that happened to land right.
+#[test]
+fn a_seed_above_the_true_height_does_not_move_the_located_height() {
+    let peak = MAINNET_PEAK;
+    let per_epoch = blocks_per_epoch();
+    let truth = u32::try_from(u64::from(peak) - per_epoch * 4).expect("height fits");
+    let instant = CountingChain::stamp(truth);
+
+    // One block above the answer is the tightest possible lie and the one a plain `>= seed` search
+    // would swallow; a whole epoch above it is the coarse one. Both must be ignored.
+    for inflated in [truth + 1, truth + u32::try_from(per_epoch).expect("fits")] {
+        let chain = CountingChain::at_peak(peak);
+        let found = dig_mirror_coin::census_height_seeded(&chain, instant, Some(inflated))
+            .expect("the fixture answers every read")
+            .expect("the epoch has started on chain");
+
+        assert_eq!(
+            found.height, truth,
+            "a seed of {inflated} sits above the true census height {truth}; the search must \
+             verify it against the chain and discard it, never search upward from it"
+        );
+    }
+
+    // And an honest seed reaches the same height, so the assertion above is about the seed being
+    // WRONG rather than about seeds being ignored altogether.
+    let chain = CountingChain::at_peak(peak);
+    let honest = dig_mirror_coin::census_height_seeded(&chain, instant, Some(truth - 1_000))
+        .expect("the fixture answers every read")
+        .expect("the epoch has started on chain");
+    assert_eq!(honest.height, truth);
 }
