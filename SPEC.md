@@ -5513,15 +5513,52 @@ runs from stranding a coin permanently. Failing to record a reservation MUST NOT
 mempool already accepted.
 
 A push MUST reserve its inputs unless the network DEFINITIVELY refused the bundle. A refusal is
-definitive only when the mempool stated its reason (`accepted:false` WITH a `rejection`); a bare
-denial carrying no reason, and any transport failure, MUST be treated as POSSIBLY IN FLIGHT and hold
-the inputs to the TTL. The node cannot distinguish "never relayed" from "relayed, and the
-acknowledgement was lost", and under §13 every dialled peer is untrusted, so a source that denies a
-relay it performed MUST NOT thereby return the coins to selection — a second send inside the
-confirmation window could otherwise reselect the same inputs. The TTL MUST NOT be shortened to
-compensate for the wider hold: that trades a double-select for a lockout, and a lockout is the worse
-failure. Requiring a STATED reason is what keeps a genuine mempool rejection from holding a user's
-coins for the full TTL.
+definitive only when the mempool stated its reason (`accepted:false` WITH a `rejection`) AND that
+reason is a property of the BUNDLE rather than of the answering node's own view; a bare denial
+carrying no reason, a refusal whose stated reason is view-dependent, a refusal whose reason the node
+does not recognise, and any transport failure MUST all be treated as POSSIBLY IN FLIGHT and hold the
+inputs to the TTL.
+
+A single push is not a single transmission: the chain client relays to UP TO THREE destinations in
+turn and only the LAST answer is observed, and the earlier attempts fail in ways that do not
+distinguish "never transmitted" from "transmitted, admitted, and the acknowledgement was lost". A
+refusal MUST therefore NOT be read as the network's verdict merely because a destination stated one.
+A reason that reports the answering node's OWN mempool or chain view — a conflict with a bundle it
+already holds, a coin it has not yet seen, a relay-fee policy, a timelock evaluated against its own
+peak — MUST NOT free the inputs, because the destination that answered may be refusing precisely
+BECAUSE an earlier destination admitted the bundle.
+
+The node cannot distinguish "never relayed" from "relayed, and the acknowledgement was lost", and
+under §13 every dialled peer is untrusted, so a source that denies a relay it performed MUST NOT
+thereby return the coins to selection — a second send inside the confirmation window could otherwise
+reselect the same inputs. The TTL MUST NOT be shortened to compensate for the wider hold: that trades
+a double-select for a lockout, and a lockout is the worse failure.
+
+The set of bundle-intrinsic reasons MUST be an ALLOWLIST whose default is to HOLD. The reason text is
+supplied by an untrusted source (§13), so an unrecognised reason MUST hold rather than free: the
+enumeration cannot be complete, and a node MUST NOT be made to free a user's inputs by a reason
+nobody foresaw. A node MUST match an allowlisted reason EXACTLY — never as a substring, prefix or
+suffix — after trimming, and case-insensitively.
+
+The allowlist is exactly these eleven Chia error names, and an independent implementation MUST use
+this set: `BAD_AGGREGATE_SIGNATURE`, `COIN_AMOUNT_NEGATIVE`, `COIN_AMOUNT_EXCEEDS_MAXIMUM`,
+`DUPLICATE_OUTPUT`, `MINTING_COIN`, `RESERVE_FEE_CONDITION_FAILED`, `WRONG_PUZZLE_HASH`,
+`ASSERT_MY_COIN_ID_FAILED`, `ASSERT_MY_PARENT_ID_FAILED`, `ASSERT_MY_PUZZLEHASH_FAILED`,
+`ASSERT_MY_AMOUNT_FAILED`.
+
+A name MUST NOT be admitted to that set unless every node refuses it identically REGARDLESS of the
+node's peak height, activated consensus flags, cost budget and mempool contents. The CLVM-execution
+names — `GENERATOR_RUNTIME_ERROR`, `BLOCK_COST_EXCEEDS_MAX`, `INVALID_BLOCK_COST` and
+`INVALID_SPEND_BUNDLE` — MUST NOT be admitted, even though they appear to be properties of the bytes:
+bundle validation runs under flags derived from the answering node's height and under a
+caller-supplied cost budget, so two honest nodes can disagree on identical bytes. `ASSERT_MY_BIRTH_*`
+is view-dependent and MUST NOT be admitted either.
+
+Requiring a STATED and BUNDLE-INTRINSIC reason is what keeps a mempool rejection the whole network
+agrees on — a bad signature, say — from holding a user's coins for the full TTL. It does NOT keep a
+view-dependent refusal from doing so, and MUST NOT be described as though it did: a bundle every node
+will refuse for a reason outside the allowlist is held for the TTL, and that is the intended and safe
+outcome.
 
 18.8. **Method surface — reads (served).** `login`, `logout`, `get_version`,
 `get_sync_status`, `check_address`, `get_derivations`, `get_are_coins_spendable`,
