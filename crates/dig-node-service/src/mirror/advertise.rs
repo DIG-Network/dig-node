@@ -91,10 +91,10 @@ pub fn configured_urls() -> Vec<String> {
     for (entry, why) in &advertised.rejected {
         let reason = match why {
             Rejection::NotAbsolute => {
-                "it is not an absolute URL with a scheme and a host, so it names no way to reach                  anything"
+                "it is not an absolute URL with a scheme and a host, so it names no way to reach anything"
             }
             Rejection::ThisMachineOnly => {
-                "its host can only mean this machine, so every reader would resolve it to                  themselves"
+                "its host can only mean this machine, so every reader would resolve it to themselves"
             }
         };
         tracing::warn!(
@@ -113,7 +113,7 @@ pub fn configured_urls() -> Vec<String> {
     } else {
         tracing::info!(
             target: "mirror",
-            "no {ADVERTISE_URLS_ENV} entry is publishable, so this node advertises nothing and              creates no mirror coin (SPEC.md 25.10)"
+            "no {ADVERTISE_URLS_ENV} entry is publishable, so this node advertises nothing and creates no mirror coin (SPEC.md 25.10)"
         );
     }
 

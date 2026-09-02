@@ -1381,7 +1381,7 @@ mod tests {
         assert_eq!(
             report.states,
             vec![(bond("aa", "11"), BondState::FundsUnknown)],
-            "not `Unfunded` -- this pass has no evidence the wallet is short, only that it could              not be read"
+            "not `Unfunded` -- this pass has no evidence the wallet is short, only that it could not be read"
         );
     }
 
