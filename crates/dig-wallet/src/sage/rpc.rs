@@ -6748,10 +6748,16 @@ mod tests {
         );
         assert_eq!(fb.call_count(), 1, "the chain tier really ran");
         assert_eq!(r.source, Source::Fallback);
-        assert!(!r.synced, "no local replica produced this answer");
+        // UPDATED by dig-node#290. This fixture holds a peer tier at `REPLICA_PEAK`, and used to
+        // assert `synced: false` / `peak_height: None` — the literals the fallback arm wrote
+        // whatever anyone measured, so the peer tier here was INERT and the assertion pinned a
+        // hardcoding rather than a routing decision. It is now decisive: a live consult reports the
+        // height its held peers announce, and this test's own subject (that the read MOVED to the
+        // chain tier) is carried by `ORACLE_AMOUNT` and `call_count` above.
         assert_eq!(
-            r.peak_height, None,
-            "a caller bounding confirmations reads control.wallet.peak"
+            (r.synced, r.peak_height),
+            (true, Some(REPLICA_PEAK)),
+            "a live chain-tier answer is bounded by the peak this node's peers announce"
         );
     }
 
@@ -6796,7 +6802,13 @@ mod tests {
             "a replica that does not cover what it follows served money anyway"
         );
         assert_eq!(r.source, Source::Fallback);
-        assert!(!r.synced);
+        // UPDATED by dig-node#290, same reason as the case above: `synced` was a literal on this
+        // arm, so asserting `false` here said nothing about eligibility. The subject of this test
+        // is the AMOUNT — which tier answered — and that assertion is untouched.
+        assert!(
+            r.synced,
+            "the chain tier answered with peers at a known peak, so the answer is bounded"
+        );
     }
 
     /// **Proves:** the replica-served answer's `synced` is MEASURED, not a literal — a replica that
@@ -7946,8 +7958,15 @@ mod tests {
         );
     }
 
-    /// **Proves:** a fallback answer is unchanged — it never borrows the replica's freshness or
-    /// its height, however caught-up the replica happens to be.
+    /// **Proves:** a fallback answer never borrows the REPLICA's freshness or the REPLICA's height,
+    /// however caught-up the replica happens to be.
+    ///
+    /// REWRITTEN by dig-node#290, and the distinction it now draws is the whole point. The old
+    /// version asserted `synced: false` / `peak_height: None`, which conflated two different
+    /// claims: "this answer does not inherit the replica's state" (still true, and the subject) and
+    /// "this answer is bounded by nothing" (no longer true, and never what the test was for). The
+    /// fixture puts the peers AHEAD of the replica, so an implementation that leaked the replica's
+    /// peak through would report `REPLICA_PEAK` and fail here.
     #[tokio::test]
     async fn a_fallback_answer_still_claims_neither_freshness_nor_a_height() {
         let db = db_with_owned_derivation(false, Some(REPLICA_PEAK)).await;
@@ -7965,8 +7984,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.source, Source::Fallback);
-        assert!(!result.synced);
-        assert_eq!(result.peak_height, None);
+        assert_eq!(
+            (result.synced, result.peak_height),
+            (true, Some(REPLICA_PEAK + PEERS_AHEAD_BY)),
+            "the bound is the PEERS' height, never the replica's"
+        );
     }
 
     /// **Proves (dig_ecosystem#2869):** an incomplete catch-up NEVER serves from the replica, even
@@ -11523,10 +11545,10 @@ mod tests {
     #[tokio::test]
     async fn a_cache_served_fallback_answer_stays_unwarranted() {
         let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
-        let fb = Arc::new(
-            MockFallback::default()
-                .with_cached(vec![fallback_coin("cached", "other-ph", 7, Some(11), None)], vec![]),
-        );
+        let fb = Arc::new(MockFallback::default().with_cached(
+            vec![fallback_coin("cached", "other-ph", 7, Some(11), None)],
+            vec![],
+        ));
         let be = WalletBackend::new(db, fb.clone(), WalletConfig::default())
             .with_chain_peer_tier_for_tests(peers_level_at(PEERS_PEAK));
 
