@@ -231,15 +231,34 @@ impl ProfileBodyStore {
     }
 
     /// Every root held for `store_id`, in unspecified order.
-    #[must_use]
-    pub fn roots_for_store(&self, store_id: &[u8; 32]) -> Vec<[u8; 32]> {
-        let Ok(entries) = std::fs::read_dir(self.store_dir(store_id)) else {
-            return Vec::new();
+    ///
+    /// `Ok(vec![])` means "consulted, holds nothing"; `Err` means the enumeration itself failed.
+    /// This is the same rule [`get`](Self::get) states two methods up -- the two "need opposite
+    /// remedies from a caller, so they are never collapsed" -- and this method simply did not
+    /// follow it. A bare `Vec` cannot express "I failed", so the failure arrived at the control
+    /// surface wearing the shape of an answer, and `RootStanding::NothingHeld` told a person
+    /// "nothing was ever published here" on the strength of a broken disk.
+    ///
+    /// A `NotFound` directory is deliberately `Ok(vec![])` rather than an error: a store dir is
+    /// created lazily on first write, so its absence is a genuine, positive "nothing was ever
+    /// published here" and is the ONLY thing that keeps that state reachable at all.
+    ///
+    /// Per-ENTRY errors propagate too. Dropping them silently would be the identical collapse one
+    /// level down: a partial listing returned as if it were complete.
+    pub fn roots_for_store(&self, store_id: &[u8; 32]) -> std::io::Result<Vec<[u8; 32]>> {
+        let entries = match std::fs::read_dir(self.store_dir(store_id)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
-        entries
-            .flatten()
-            .filter_map(|e| root_from_file_name(&e.file_name().to_string_lossy()))
-            .collect()
+        let mut roots = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if let Some(root) = root_from_file_name(&entry.file_name().to_string_lossy()) {
+                roots.push(root);
+            }
+        }
+        Ok(roots)
     }
 
     /// Every `(store_id, root)` this node holds a body for, in unspecified order.
@@ -247,23 +266,34 @@ impl ProfileBodyStore {
     /// The re-announce loop's input. Both components are parsed back out of the path with the same
     /// strict 64-lowercase-hex rule that named them, so a stray file, a temp artifact, or a
     /// directory this module did not create is skipped rather than announced as a phantom root.
-    #[must_use]
-    pub fn held_pairs(&self) -> Vec<([u8; 32], [u8; 32])> {
-        let Ok(stores) = std::fs::read_dir(&self.root) else {
-            return Vec::new();
+    ///
+    /// A missing cache root is `Ok(vec![])` -- it is created lazily, so its absence is a real
+    /// "holds nothing". Every other failure, including one store's enumeration failing, is an
+    /// `Err`: a PARTIAL enumeration returned as if it were complete is the identical defect one
+    /// layer up from [`roots_for_store`](Self::roots_for_store).
+    ///
+    /// The cost of that choice is deliberate, and it is NOT bounded to one sweep: while the
+    /// condition persists, a single unreadable store directory withholds the announce for every
+    /// OTHER healthy store too, and goes on doing so until the directory is readable again. The
+    /// loop re-warns each interval rather than degrading quietly, which is the whole reason this
+    /// returns an `Err` a caller must handle instead of an empty set it would silently believe.
+    pub fn held_pairs(&self) -> std::io::Result<Vec<([u8; 32], [u8; 32])>> {
+        let stores = match std::fs::read_dir(&self.root) {
+            Ok(stores) => stores,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
-        stores
-            .flatten()
-            .filter_map(|entry| {
-                let store_id = hex32_from_name(&entry.file_name().to_string_lossy())?;
-                Some(
-                    self.roots_for_store(&store_id)
-                        .into_iter()
-                        .map(move |root| (store_id, root)),
-                )
-            })
-            .flatten()
-            .collect()
+        let mut pairs = Vec::new();
+        for entry in stores {
+            let entry = entry?;
+            let Some(store_id) = hex32_from_name(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+            for root in self.roots_for_store(&store_id)? {
+                pairs.push((store_id, root));
+            }
+        }
+        Ok(pairs)
     }
 
     /// Delete every artifact in `dir` except `keep` and the most recently modified other.
@@ -1023,7 +1053,7 @@ pub async fn announce_held_root(
 
 /// How a store's held profile bodies stand against the root the chain currently anchors.
 ///
-/// # Why five states rather than a boolean
+/// # Why six states rather than a boolean
 ///
 /// Each variant needs a DIFFERENT remedy from whoever reads it, and collapsing any two of them
 /// hands the reader the choice with the evidence removed. [`Superseded`](Self::Superseded) and
@@ -1089,6 +1119,17 @@ pub enum RootStanding {
         /// Every root this node holds for the store, if any. Their standing is unknown.
         held: Vec<[u8; 32]>,
     },
+    /// This node's OWN store directory could not be enumerated, so what it holds is unknown.
+    ///
+    /// The mirror of [`ChainUnreadable`](Self::ChainUnreadable), on the other input. Without this
+    /// variant an I/O failure has nowhere to go but
+    /// [`NothingHeld`](Self::NothingHeld), which tells a person "nothing was ever published here"
+    /// -- a positive claim about a publisher, manufactured from a broken disk. There is no `held`
+    /// field because there is no held set to report: that is precisely what could not be read.
+    HeldUnreadable {
+        /// Why the local store could not be enumerated.
+        reason: String,
+    },
 }
 
 impl RootStanding {
@@ -1110,12 +1151,19 @@ impl RootStanding {
     /// node for the duration of a chain outage would cost real availability and buy no safety, so
     /// the unreadable case deliberately fails OPEN here -- unlike the accept gate, where an
     /// unreadable chain fails closed because there acceptance is the irreversible act.
+    ///
+    /// [`HeldUnreadable`](Self::HeldUnreadable) fails OPEN for the same reason: the chain has
+    /// stated no contradiction, an announce carries no authority, and silencing a healthy node for
+    /// the duration of a LOCAL disk outage would cost real availability and buy no safety. It
+    /// differs from the accept gate, where acceptance is the irreversible act and so fails closed.
     #[must_use]
     pub fn may_announce(&self, held_root: &[u8; 32]) -> bool {
         match self {
             Self::Current { chain_root, .. } => held_root == chain_root,
             Self::Superseded { .. } | Self::NothingHeld { .. } => false,
-            Self::NoGeneration { .. } | Self::ChainUnreadable { .. } => true,
+            Self::NoGeneration { .. }
+            | Self::ChainUnreadable { .. }
+            | Self::HeldUnreadable { .. } => true,
         }
     }
 
@@ -1128,6 +1176,7 @@ impl RootStanding {
             Self::NothingHeld { .. } => "nothing_held",
             Self::NoGeneration { .. } => "no_generation",
             Self::ChainUnreadable { .. } => "chain_unreadable",
+            Self::HeldUnreadable { .. } => "held_unreadable",
         }
     }
 
@@ -1142,19 +1191,28 @@ impl RootStanding {
             Self::Current { chain_root, .. }
             | Self::Superseded { chain_root, .. }
             | Self::NothingHeld { chain_root } => Some(*chain_root),
-            Self::NoGeneration { .. } | Self::ChainUnreadable { .. } => None,
+            Self::NoGeneration { .. }
+            | Self::ChainUnreadable { .. }
+            | Self::HeldUnreadable { .. } => None,
         }
     }
 
-    /// Every root this node holds for the store.
+    /// Every root this node holds for the store, or `None` when the store could not be read.
+    ///
+    /// The `Option` is the whole point. Returning an empty slice for
+    /// [`HeldUnreadable`](Self::HeldUnreadable) would re-collapse the unknown into a zero at the
+    /// accessor -- the control surface would render `held_roots: []`, which means
+    /// consulted-and-holds-nothing -- so the defect this variant exists to remove would simply
+    /// move one layer out.
     #[must_use]
-    pub fn held(&self) -> &[[u8; 32]] {
+    pub fn held(&self) -> Option<&[[u8; 32]]> {
         match self {
-            Self::NothingHeld { .. } => &[],
+            Self::HeldUnreadable { .. } => None,
+            Self::NothingHeld { .. } => Some(&[]),
             Self::Current { held, .. }
             | Self::Superseded { held, .. }
             | Self::NoGeneration { held }
-            | Self::ChainUnreadable { held, .. } => held,
+            | Self::ChainUnreadable { held, .. } => Some(held),
         }
     }
 
@@ -1195,6 +1253,10 @@ impl RootStanding {
                  holds is UNKNOWN rather than absent: {reason}",
                 held.len()
             ),
+            Self::HeldUnreadable { reason } => format!(
+                "this node's own store directory could not be read, so what it holds is UNKNOWN \
+                 rather than absent; the remedy is on this machine (disk or permissions): {reason}"
+            ),
         }
     }
 }
@@ -1210,7 +1272,18 @@ pub async fn root_standing(
     resolver: &dyn AnchoredRootResolver,
     store_id: &[u8; 32],
 ) -> RootStanding {
-    let mut held = store.roots_for_store(store_id);
+    // The DISK read first, and its failure short-circuits: a chain read must never be able to mask
+    // a broken disk, which is the one condition whose remedy is on this machine --
+    // `control.profile.getBody` already states that principle for its body read. Short-circuiting
+    // also means there is no both-failed case to invent a rule for.
+    let mut held = match store.roots_for_store(store_id) {
+        Ok(held) => held,
+        Err(e) => {
+            return RootStanding::HeldUnreadable {
+                reason: e.to_string(),
+            }
+        }
+    };
     // Deterministic order, so a control answer and a log line naming the same set read the same
     // way twice running. `read_dir` order is unspecified and does vary between platforms.
     held.sort_unstable();
@@ -1255,7 +1328,20 @@ pub async fn announce_pass(
 ) -> AnnouncePass {
     let mut by_store: std::collections::BTreeMap<[u8; 32], Vec<[u8; 32]>> =
         std::collections::BTreeMap::new();
-    for (store_id, root) in store.held_pairs() {
+    // A failed enumeration announces nothing -- which is what already happened -- but it is no
+    // longer SILENT: an operator whose disk is broken sees why the node went quiet.
+    let pairs = match store.held_pairs() {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            tracing::warn!(
+                reason = %e,
+                "profile-sync: the held-body store could not be enumerated -- this sweep announces \
+                 nothing; it retries at the next interval"
+            );
+            return AnnouncePass::default();
+        }
+    };
+    for (store_id, root) in pairs {
         by_store.entry(store_id).or_default().push(root);
     }
 
@@ -1784,7 +1870,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             roots.push(root);
         }
-        let held = store.roots_for_store(&sid);
+        let held = store.roots_for_store(&sid).expect("enumerate");
         assert_eq!(held.len(), 2, "current-plus-one, got {held:?}");
         assert!(store.has(&sid, &roots[2]), "the newest must survive");
         assert!(store.has(&sid, &roots[1]), "so must its predecessor");
@@ -2393,7 +2479,7 @@ mod tests {
         store.put(&store_id(1), &bob_root, &bob).expect("put");
         store.put(&store_id(2), &alice_root, &alice).expect("put");
 
-        let mut held = store.held_pairs();
+        let mut held = store.held_pairs().expect("enumerate");
         held.sort();
         let mut expected = vec![
             (store_id(1), alice_root),
@@ -2424,7 +2510,10 @@ mod tests {
         .expect("dir");
         std::fs::write(root_dir.path().join("README.txt"), b"not a store").expect("file");
 
-        assert_eq!(store.held_pairs(), vec![(store_id(1), root)]);
+        assert_eq!(
+            store.held_pairs().expect("enumerate"),
+            vec![(store_id(1), root)]
+        );
     }
 
     /// An originated announce takes the dedup-exempt LOCAL path and goes to every peer — there is
@@ -2645,7 +2734,7 @@ mod tests {
         assert_eq!(r1, r1_persisted);
 
         assert_eq!(
-            store.roots_for_store(&sid).len(),
+            store.roots_for_store(&sid).expect("enumerate").len(),
             2,
             "current-plus-one retention must be holding both, or this test proves nothing"
         );
@@ -2769,6 +2858,119 @@ mod tests {
         assert!(
             !standing.may_announce(&dpb("someone else").1),
             "being in step licenses THIS root, not any other the node might hold"
+        );
+    }
+
+    /// Make `sid`'s store directory genuinely UNREADABLE, portably.
+    ///
+    /// A regular file where the directory would be makes `read_dir` fail with a kind that is NOT
+    /// `NotFound` on every platform this node builds for. A permission bit would not: `chmod 000`
+    /// does not deny directory listing on Windows, so a permissions fixture proves nothing here.
+    /// An empty-but-readable directory would not either -- that is the state this defect is
+    /// indistinguishable from, so a fixture built out of it cannot see the bug.
+    fn make_store_dir_unreadable(store: &ProfileBodyStore, sid: &[u8; 32]) {
+        let path = store.store_dir(sid);
+        std::fs::create_dir_all(path.parent().expect("store dir has a parent")).expect("root dir");
+        std::fs::write(&path, b"a file where a directory belongs").expect("occupy the store dir");
+    }
+
+    /// **Proves:** a store whose directory cannot be enumerated is never reported as one that
+    /// published nothing.
+    ///
+    /// Asserted at the STANDING, not at the enumerator: the defect is a decision, and a test that
+    /// only checks the disk read sits below the decision and passes while the surface still tells
+    /// a person "nothing was ever published here".
+    #[tokio::test]
+    async fn an_unreadable_store_dir_never_claims_nothing_was_ever_published() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+        make_store_dir_unreadable(&store, &sid);
+
+        let chain = AdvancingChain::at(dpb("alice").1);
+        let standing = root_standing(&store, &chain, &sid).await;
+
+        assert_eq!(
+            standing.state(),
+            "held_unreadable",
+            "an I/O failure is its own state, not the state that means consulted-and-empty: {}",
+            standing.detail()
+        );
+        assert!(
+            matches!(standing, RootStanding::HeldUnreadable { .. }),
+            "the unknown must be a state of its own: {standing:?}"
+        );
+        assert!(
+            !standing.detail().contains("nothing was ever published"),
+            "a positive publishing claim must never be manufactured from a failed read: {}",
+            standing.detail()
+        );
+    }
+
+    /// **Proves:** the enumerator itself reports the failure rather than an empty hold.
+    #[test]
+    fn an_unreadable_store_dir_is_an_error_not_an_empty_hold() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+        make_store_dir_unreadable(&store, &sid);
+
+        let err = store
+            .roots_for_store(&sid)
+            .expect_err("an unreadable directory is not an empty one");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the fixture must exercise a REAL read failure, not the never-created case: {err}"
+        );
+    }
+
+    /// **Proves:** the other side of the same bound -- a store nothing was ever written to still
+    /// reports an empty hold rather than an unknown one.
+    ///
+    /// Without this, a lazy `read_dir(...)?` would turn every never-published store into an
+    /// unknown and make `NothingHeld` unreachable, which is a different lie in the same place.
+    #[test]
+    fn a_store_never_written_to_holds_nothing_rather_than_failing() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+
+        assert_eq!(
+            store
+                .roots_for_store(&store_id(7))
+                .expect("a never-created store dir is not an error"),
+            Vec::<[u8; 32]>::new()
+        );
+    }
+
+    /// **Proves:** the accessor the control surface renders keeps the unknown distinguishable from
+    /// the empty one.
+    ///
+    /// This is where the defect would otherwise reappear one layer out: an accessor answering `[]`
+    /// for the unknown makes `held_roots: []` -- consulted-and-holds-nothing -- out of a failed
+    /// read, no matter how carefully the variant below it was built.
+    #[test]
+    fn an_unknown_hold_is_not_reported_as_an_empty_one() {
+        let unknown = RootStanding::HeldUnreadable {
+            reason: "the store directory could not be read".into(),
+        };
+        let empty = RootStanding::NothingHeld {
+            chain_root: dpb("alice").1,
+        };
+
+        assert_eq!(
+            unknown.held(),
+            None,
+            "an unknown hold has no root list to give"
+        );
+        assert_eq!(
+            empty.held(),
+            Some(&[][..]),
+            "an empty hold is an ANSWER, and must stay one"
+        );
+        assert!(
+            unknown.may_announce(&dpb("alice").1),
+            "a local disk outage must not silence a node the chain has not contradicted"
         );
     }
 
