@@ -872,7 +872,7 @@ fn summarize(method: &str, result: &Value) -> String {
 /// stand against the root the chain currently anchors.
 ///
 /// The standing is the load-bearing half (dig-node#294). A bare "no body" reads as "this profile
-/// does not exist", which is the wrong conclusion in three of the five standings and sends a
+/// does not exist", which is the wrong conclusion in four of the six standings and sends a
 /// publisher looking at its store id when the actual remedy is to re-publish at the chain's root.
 ///
 /// The third arm is not dead: a node too old to reconcile omits `standing` entirely, and saying so
