@@ -8116,11 +8116,18 @@ mod tests {
     /// `relay_capsule` has FIVE refusal sites. The operator opt-in (`:121`) and the proxy allowance
     /// (`:125`) both sit behind a live `NodeContent`, which `test_node` does not wire, and the
     /// no-warmer refusal (`:130`) sits behind both. Those first two are exactly the gates the
-    /// rationale above names as the reason the property matters, so the oracle they would leak is
-    /// held today only by all five sites sharing one payload-free `RelayStatus::Refused` return --
-    /// a property of the enum, not something this test observes. Reaching them needs a fixture that
-    /// installs a `NodeContent` and drives `DIG_NODE_ONION_RELAY` under the `test_support` env
-    /// mutex; that is the next guard here, not a gap this one closes.
+    /// rationale above names as the reason the property matters. What holds them today is that all
+    /// five sites return one payload-free `RelayStatus::Refused` -- a property of the enum, not
+    /// something this test observes. Reaching them needs a fixture that installs a `NodeContent`
+    /// and drives `DIG_NODE_ONION_RELAY` under the `test_support` env mutex; that is the next guard
+    /// here, not a gap this one closes.
+    ///
+    /// **And the frame is not the only channel, so do not read this test as closing the oracle.**
+    /// `allow_proxy_fetch` (`:125`) CONSUMES a rate-limit token (`download.rs:1643`) from a bucket
+    /// shared with `miss_outcome`'s second leg (`download.rs:2721`). Draining it flips a later
+    /// `dig.getContent` from fetch-through to redirect, so a stranger can still infer the operator's
+    /// opt-in by spending the allowance and watching a DIFFERENT method change shape. Equal frames
+    /// are necessary for the property in the module doc and are not sufficient for the secret.
     #[tokio::test]
     async fn a_relay_refusal_is_indistinguishable_from_a_plain_miss() {
         let (node, _td) = test_node(None);
