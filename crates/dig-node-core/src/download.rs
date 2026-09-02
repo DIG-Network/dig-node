@@ -785,6 +785,9 @@ pub struct NodeContent {
     /// [`SelfExcludingLocator`] (#1584), so discovery is already self-filtered — this node's own
     /// `peer_id` never appears as a holder — but is otherwise unranked.
     locator: Arc<dyn ProviderLocator>,
+    /// The mirror-coin bond verifier the discovery chain ranks by (dig-node#466), installed once by
+    /// the host binary through [`Self::set_bond_verifier`] when its chain source exists.
+    bond_verifier: crate::mirror_bond::BondVerifierSlot,
     /// The self-optimizing peer selector (#178) — the decision + learning brain between discovery and
     /// download. It ranks the download sources (bridged into dig-download's [`SourceSelector`] seam by
     /// [`SelectorAdapter`], #1442) and learns from every range outcome dig-download reports back
@@ -1298,6 +1301,13 @@ impl NodeContent {
         self_peer_id: Option<String>,
         cache_dir: &Path,
     ) -> Arc<Self> {
+        // The mirror-coin bond layer (dig-node#466) sits OUTSIDE every other locator, so both the
+        // raw discovery leg kept on the engine and the download union built from it below inherit
+        // one ranking. Its verifier arrives later (the host binary owns the chain source), and until
+        // it does the layer is a pass-through.
+        let bond_verifier = crate::mirror_bond::bond_verifier_slot();
+        let locator: Arc<dyn ProviderLocator> =
+            crate::mirror_bond::BondRankingLocator::new(locator, bond_verifier.clone());
         let downloads_dir = cache_dir.join("downloads");
         let _ = std::fs::create_dir_all(&downloads_dir);
         let state_store = Arc::new(CapturingStateStore::new(FileStateStore::new(
@@ -1382,6 +1392,7 @@ impl NodeContent {
         let ask_routing = AskRoutingState::new(self_peer_id.as_deref());
         Arc::new(NodeContent {
             locator,
+            bond_verifier,
             selector,
             downloader,
             state_store,
@@ -1584,6 +1595,20 @@ impl NodeContent {
         // today's shipped behaviour.
         let _ = &dht;
         content
+    }
+
+    /// Install the mirror-coin bond verifier the discovery chain ranks holders by (dig-node#466).
+    ///
+    /// Idempotent and one-way: the first call wins and later ones are ignored, so a node's
+    /// verification posture cannot change under a running download. Before it is called the layer is
+    /// a pass-through, which is the shipped behaviour of every embedder that has no chain source.
+    ///
+    /// Returns whether this call was the one that installed it.
+    pub fn set_bond_verifier(
+        &self,
+        verifier: Arc<dyn crate::mirror_bond::MirrorBondVerifier>,
+    ) -> bool {
+        self.bond_verifier.set(verifier).is_ok()
     }
 
     /// The configured miss behavior (redirect by default; fetch-through when opted in).
@@ -2613,7 +2638,7 @@ impl crate::Node {
     }
 
     /// The attached P2P content engine, if the peer network brought one up.
-    pub(crate) fn p2p_content(&self) -> Option<&Arc<NodeContent>> {
+    pub fn p2p_content(&self) -> Option<&Arc<NodeContent>> {
         self.p2p_content.get()
     }
 
@@ -4462,6 +4487,96 @@ pub(crate) mod tests {
             .fetch_resource(&mock_content_id(), ReadOrigin::Local)
             .await
             .is_err());
+    }
+
+    /// **Proves (dig-node#466):** the bond ranking is live on the ENGINE's own discovery path —
+    /// `NodeContent::find_providers`, the source the redirect-on-miss handler names holders from —
+    /// and not merely inside a locator a test assembled for itself.
+    ///
+    /// **Catches:** the exact state this ticket exists to end. `BondRankingLocator` can be perfect
+    /// and still be reachable from nothing; the whole point of #466 is that a verifier with no
+    /// consumer changes nothing. This test builds the engine through its real constructor and asks
+    /// it, so a wiring that silently dropped the layer fails here even with every unit test in
+    /// `mirror_bond` green.
+    ///
+    /// The slate's input order is neither the expected answer nor its reverse, so an engine that
+    /// ignored the verdicts entirely cannot pass by coincidence.
+    #[tokio::test]
+    async fn the_engine_promotes_a_proven_bond_without_sinking_a_disproven_one() {
+        use crate::mirror_bond::{BondVerdict, MirrorBondVerifier};
+
+        struct ByFirstByte;
+
+        #[async_trait::async_trait]
+        impl MirrorBondVerifier for ByFirstByte {
+            async fn verify(
+                &self,
+                _c: &ContentId,
+                _claiming_peer_id: &str,
+                claimed: Option<[u8; 32]>,
+            ) -> BondVerdict {
+                match claimed {
+                    None => BondVerdict::Unverified,
+                    Some(coin) if coin[0] == 0x01 => BondVerdict::Bonded,
+                    Some(_) => BondVerdict::Unbonded,
+                }
+            }
+        }
+
+        let td = tempfile::tempdir().unwrap();
+        let cid = mock_content_id();
+        let claimed = |peer: u8, coin: Option<[u8; 32]>| {
+            let record = mock_provider(peer, &cid);
+            match coin {
+                Some(id) => record.with_unverified_mirror_coin_id(id),
+                None => record,
+            }
+        };
+
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![
+                // The DISPROVEN record is placed ahead of the merely-unverified one on purpose.
+                // Credit-only keeps 8 before 7 (one baseline tier, stable sort); a three-tier
+                // lattice that sank `Unbonded` would answer 9,7,8. Without this ordering the two
+                // lattices give the identical answer and the assertion below proves nothing about
+                // which one is implemented.
+                claimed(8, Some([0x02; 32])), // a coin bonding something else -> Unbonded
+                claimed(7, None),             // claims nothing                -> Unverified
+                claimed(9, Some([0x01; 32])), // a coin that really bonds this -> Bonded
+            ])),
+            Arc::new(MockRangeTransport::new(anchored_mock_content(30, 3))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        assert!(
+            pc.set_bond_verifier(Arc::new(ByFirstByte)),
+            "the engine accepts exactly one verifier"
+        );
+
+        let located = pc.find_providers(&cid).await.for_finding();
+        let peers: Vec<String> = located
+            .iter()
+            .map(|r| r.provider_peer_id[..2].to_string())
+            .collect();
+
+        assert_eq!(
+            peers,
+            vec![
+                mock_peer_hex(9)[..2].to_string(),
+                mock_peer_hex(8)[..2].to_string(),
+                mock_peer_hex(7)[..2].to_string(),
+            ],
+            "the provable holder is promoted and the other two keep their located order, so the \
+             disproven holder STAYS AHEAD of the merely-unverified one. A three-tier lattice \
+             would answer 9,7,8 here; credit-only answers 9,8,7, because a disproven pointer \
+             withholds credit rather than demoting (dig-node#466)"
+        );
+        assert_eq!(
+            located.len(),
+            3,
+            "a disproven claim is still offered on the redirect path, never dropped from it"
+        );
     }
 
     /// A locator whose walk cannot be performed at all — the network is down, not the content absent.
