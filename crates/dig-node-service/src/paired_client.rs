@@ -37,10 +37,15 @@ use std::time::Duration;
 
 /// The per-user file holding the scoped token this account was granted.
 ///
-/// It lives beside the invoking user's own node state ([`crate::state::legacy_state_dir`] —
-/// `$HOME/DigNode` / `%LOCALAPPDATA%\DigNode`), NOT in the machine-wide state dir: the whole point
-/// is that an ordinary user can own it without anyone touching `/var/lib/dig-node`.
+/// It lives under the invoking user's own home/known-folder base (`$HOME/DigNode` /
+/// `%LOCALAPPDATA%\DigNode`), NOT in the machine-wide state dir: the whole point is that an
+/// ordinary user can own it without anyone touching `/var/lib/dig-node`.
 pub const PAIRED_CLIENT_TOKEN_FILE: &str = "client-token";
+
+/// The folder name the ecosystem uses under the per-user base, byte-identical to the one
+/// [`dig_node_core::config_path`] resolves under. Named here rather than reused from the cache
+/// resolver on purpose — see [`paired_store_dir`].
+const PAIRED_STORE_FOLDER: &str = "DigNode";
 
 /// The default interval between `pairing.poll` calls while waiting for the operator to approve.
 ///
@@ -48,9 +53,54 @@ pub const PAIRED_CLIENT_TOKEN_FILE: &str = "client-token";
 /// rather than a spin. The wait is bounded by the SERVER's `expires_ms`, never by a local count.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Where THIS user's paired token lives.
-pub fn paired_token_path() -> PathBuf {
-    paired_token_path_in(&crate::state::legacy_state_dir())
+/// The directory THIS user's paired token lives in, or a REFUSAL when no per-user base exists.
+///
+/// # Why this does not go through the state/cache resolver
+///
+/// The obvious spelling — [`crate::state::legacy_state_dir`], the parent of
+/// [`dig_node_core::config_path`] — resolves through `resolve_cache_dir`, which falls back to
+/// `std::env::temp_dir()/DigNode-<PID>/cache` whenever the canonical dir is unwritable. That
+/// fallback is a reasonable degraded mode for a CACHE and an unacceptable one for a BEARER
+/// CREDENTIAL: on Unix `/tmp` is mode `1777`, the `<PID>` component is enumerable from `/proc`,
+/// and a directory another user pre-created is accepted by `create_dir_all` without complaint.
+/// Resolving from [`dig_node_core::platform_user_base`] directly makes that path STRUCTURALLY
+/// unreachable for this file rather than merely unlikely — there is no branch left to sanitise.
+///
+/// # Why an unresolvable base REFUSES instead of degrading
+///
+/// [`dig_node_core::platform_user_base`] itself ends in `PathBuf::from(".")` when the OS knows no
+/// home and neither `LOCALAPPDATA` nor `HOME` is set. Writing a bearer token into the process's
+/// current working directory — frequently a shared or world-writable path, and one that moves with
+/// every invocation — is a worse outcome than having no paired token at all, and the ladder
+/// already has a correct answer for "no paired token": rung 3's master remedy. So this refuses,
+/// the same refuse-rather-than-degrade discipline [`validate_client_name`] applies to a name.
+pub fn paired_store_dir() -> io::Result<PathBuf> {
+    paired_store_dir_from(dig_node_core::platform_user_base())
+}
+
+/// The pure core of [`paired_store_dir`], with the resolved base as an ARGUMENT.
+///
+/// The no-home case cannot be produced from a test process — it needs an account the OS knows no
+/// home for and an environment with neither `HOME` nor `LOCALAPPDATA` — so taking the base in is
+/// what makes the REFUSAL assertable at all. Same reason [`select_token`] takes the master read's
+/// outcome rather than performing it (the pattern #458 established).
+fn paired_store_dir_from(base: PathBuf) -> io::Result<PathBuf> {
+    if base.as_os_str().is_empty() || base == Path::new(".") {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "dig-node: cannot store a paired token because no per-user directory could be \
+             resolved for this account (no home directory, and neither HOME nor LOCALAPPDATA is \
+             set). Run this command as an account with a home directory; the token is refused \
+             rather than written to the current working directory, which is not a private place \
+             to keep a credential.",
+        ));
+    }
+    Ok(base.join(PAIRED_STORE_FOLDER))
+}
+
+/// Where THIS user's paired token lives, or the [`paired_store_dir`] refusal.
+pub fn paired_token_path() -> io::Result<PathBuf> {
+    Ok(paired_token_path_in(&paired_store_dir()?))
 }
 
 /// [`paired_token_path`] for an explicit directory, so tests use a temp dir and never touch a
@@ -70,17 +120,44 @@ pub fn load_paired_token(path: &Path) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-/// Persist a freshly-approved token for this user, owner-only.
+/// Persist a freshly-approved token for this user, owner-only from the moment it exists.
 ///
-/// Creates the per-user state dir when absent and applies [`crate::state::restrict_file`] —
-/// `0600` on Unix. The file is created by the INVOKING user, so it is owned by them; this
-/// function never runs elevated and never touches a machine-wide path.
+/// The file is created by the INVOKING user, so it is owned by them; this function never runs
+/// elevated and never touches a machine-wide path.
+///
+/// # Why this is not `write` followed by a chmod
+///
+/// `std::fs::write` creates the file under the process umask — typically `0644` — and any later
+/// `set_permissions` narrows it only AFTER the bytes are on disk, so the token is world-readable
+/// for a window. Worse, `write` follows symlinks: a pre-planted `client-token -> ~/.ssh/authorized_keys`
+/// in a directory another user can create makes this an arbitrary-file clobber running as the
+/// victim, with no race to win. Creating the file EXCLUSIVELY at `0600` closes both — `create_new`
+/// fails outright on an existing path, symlink included, and the mode is applied at `open(2)`
+/// time rather than afterwards. This mirrors [`crate::state::ensure_dir_restricted`] +
+/// `pairing::save_paired_tokens`, one module over.
+///
+/// A pre-existing OWN store is removed first so that re-pairing still works; that removal deletes
+/// the link rather than following it, so it cannot be turned into a write through a symlink.
 pub fn store_paired_token(path: &Path, token: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::state::ensure_dir_restricted(dir)?;
     }
-    std::fs::write(path, token)?;
-    crate::state::restrict_file(path);
+    // `create_new` refuses an existing path; a re-pair legitimately replaces its own store.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    io::Write::write_all(&mut f, token.as_bytes())?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -260,6 +337,129 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "the paired store must be owner-only");
         }
+    }
+
+    /// **Proves (dig-node#403):** the store resolves from the per-user base, so it can NEVER land
+    /// under `std::env::temp_dir()`.
+    ///
+    /// The path it used to take — `state::legacy_state_dir()`, the parent of
+    /// `dig_node_core::config_path()` — runs through `resolve_cache_dir`, whose fallback is
+    /// `temp_dir()/DigNode-<PID>/cache` whenever the canonical dir is unwritable. On Unix that is
+    /// a `1777` directory with a `/proc`-enumerable name, which is where a bearer credential must
+    /// never be written.
+    ///
+    /// Asserted structurally (the dir IS `platform_user_base()/DigNode`) as well as negatively:
+    /// the negative alone would pass on any host whose home simply does not sit under the temp
+    /// dir, which is every host, so it cannot tell a fixed resolver from the broken one.
+    #[test]
+    fn the_store_resolves_from_the_per_user_base_and_never_the_temp_fallback() {
+        let dir = paired_store_dir().expect("this test account has a home directory");
+        assert_eq!(
+            dir,
+            dig_node_core::platform_user_base().join("DigNode"),
+            "the store must come from the per-user base, not the cache resolver"
+        );
+        assert!(
+            !dir.starts_with(std::env::temp_dir()),
+            "a bearer token must never be stored under the world-writable temp dir: {}",
+            dir.display()
+        );
+        // The PID-keyed fallback's own shape, spelled out: no component of the resolved path may
+        // look like the private cache fallback, on any host.
+        assert!(
+            !dir.components().any(|c| c
+                .as_os_str()
+                .to_string_lossy()
+                .starts_with("DigNode-")),
+            "resolved a PID-keyed private fallback dir: {}",
+            dir.display()
+        );
+    }
+
+    /// **Proves:** with no per-user base resolvable, the store REFUSES rather than degrading to
+    /// the current working directory.
+    ///
+    /// `platform_user_base()` ends in `PathBuf::from(".")` when the OS knows no home and neither
+    /// `HOME` nor `LOCALAPPDATA` is set. A token written to `.` is a credential in whatever
+    /// directory the user happened to be standing in — frequently shared, and different on every
+    /// invocation. Refusing is correct because the ladder already has an answer for "no paired
+    /// token": rung 3's master remedy.
+    #[test]
+    fn an_unresolvable_per_user_base_refuses_rather_than_writing_to_the_cwd() {
+        for base in [PathBuf::from("."), PathBuf::new()] {
+            let err = paired_store_dir_from(base.clone())
+                .expect_err("no per-user base must not resolve to a path");
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+            assert!(
+                err.to_string().contains("no per-user directory"),
+                "the refusal must say WHY: {err}"
+            );
+        }
+        // The truthful control: a real base still resolves, so the refusal above is a property of
+        // the unresolvable input and not of the function refusing everything.
+        assert_eq!(
+            paired_store_dir_from(PathBuf::from("/home/u")).unwrap(),
+            PathBuf::from("/home/u").join("DigNode")
+        );
+    }
+
+    /// **Proves (dig-node#403):** the store is created EXCLUSIVELY and never follows a symlink an
+    /// attacker planted at its path.
+    ///
+    /// This is the revert-proof for the safe-create. The previous implementation was
+    /// `fs::write` + a later chmod; `write` opens with `O_TRUNC` and FOLLOWS symlinks, so a
+    /// `client-token -> <victim>` planted in a directory the attacker can create hands them the
+    /// token — or, pointed at `~/.ssh/authorized_keys`, clobbers an arbitrary file as the victim,
+    /// with no race to win. Restoring `fs::write` fails this test: the victim's contents become
+    /// the token.
+    ///
+    /// The transient-mode window (the file existing at `0644` between `write` and the chmod) is
+    /// NOT separately asserted, and deliberately not faked: observing it requires racing a
+    /// single `write` call from another thread, which is inherently flaky and would assert timing
+    /// rather than the property. `create_new` + `mode(0o600)` removes the window structurally —
+    /// the mode is applied at `open(2)` time, so no wider mode ever exists to observe.
+    #[cfg(unix)]
+    #[test]
+    fn the_store_is_created_exclusively_and_never_follows_a_planted_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "PRECIOUS").unwrap();
+
+        let store = dir.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let path = paired_token_path_in(&store);
+        std::os::unix::fs::symlink(&victim, &path).expect("plant the symlink");
+
+        store_paired_token(&path, "scoped-token").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "PRECIOUS",
+            "the token was written THROUGH the symlink into the victim file"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&path).unwrap().is_symlink(),
+            "the store must be a regular file the invoking user created"
+        );
+        assert_eq!(load_paired_token(&path).as_deref(), Some("scoped-token"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "created owner-only, not chmodded afterwards");
+    }
+
+    /// **Proves:** re-pairing REPLACES this user's own store rather than failing on `create_new`.
+    ///
+    /// The exclusive create is what closes the symlink hole, and the obvious way to get it wrong
+    /// is to make a second `pair connect` fail with `AlreadyExists`. Both halves are needed: the
+    /// test above would pass on an implementation that never overwrites anything.
+    #[test]
+    fn re_pairing_replaces_this_users_own_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = paired_token_path_in(dir.path());
+        store_paired_token(&path, "first").unwrap();
+        store_paired_token(&path, "second").unwrap();
+        assert_eq!(load_paired_token(&path).as_deref(), Some("second"));
     }
 
     /// **Proves:** a blank store is not a token — it reads as "this account has no paired token"

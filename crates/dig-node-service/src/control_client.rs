@@ -57,7 +57,11 @@ pub fn call_control(config: &Config, method: &str, params: Value) -> std::io::Re
     // token, else the master read's own remedy verbatim. Rung 2 is a thunk, so a user who can read
     // the master token never touches the per-user store.
     let token = crate::paired_client::select_token(control::load_token_readonly(), || {
-        crate::paired_client::load_paired_token(&crate::paired_client::paired_token_path())
+        // An unresolvable per-user base is "this account has no paired token", not an error of
+        // its own: rung 3's master remedy is the message the user needs either way.
+        crate::paired_client::paired_token_path()
+            .ok()
+            .and_then(|p| crate::paired_client::load_paired_token(&p))
     })?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

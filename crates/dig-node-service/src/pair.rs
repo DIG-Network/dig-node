@@ -120,14 +120,7 @@ fn connect(config: &Config, client_name: Option<String>) -> std::io::Result<Outc
     let code = requested["pairing_code"].as_str().unwrap_or("??????");
     let expires_ms = requested["expires_ms"].as_u64().unwrap_or(0);
 
-    eprintln!(
-        "dig-node: pairing code {code}
-         Ask the machine's operator to CONFIRM this code, then run:
-         
-    sudo dign pair approve {pairing_id}
-
-         Waiting for approval..."
-    );
+    eprintln!("{}", waiting_banner(code, &pairing_id));
 
     loop {
         let polled = call_open(config, "pairing.poll", json!({ "pairing_id": pairing_id }))?;
@@ -136,14 +129,10 @@ fn connect(config: &Config, client_name: Option<String>) -> std::io::Result<Outc
                 let token = polled["token"].as_str().ok_or_else(|| {
                     std::io::Error::other("dig-node: approved pairing carried no token")
                 })?;
-                let path = paired_client::paired_token_path();
+                let path = paired_client::paired_token_path()?;
                 paired_client::store_paired_token(&path, token)?;
                 return Ok(Outcome::new(
-                    format!(
-                        "dig-node: paired. The scoped token is stored for your account at {}.
-                         `dign` control commands now work as this user, with no elevation. The                          operator can revoke it any time with `sudo dign pair revoke <token_id>`.",
-                        path.display()
-                    ),
+                    paired_message(&path),
                     json!({ "status": "approved", "token_path": path.display().to_string() }),
                 ));
             }
@@ -152,7 +141,7 @@ fn connect(config: &Config, client_name: Option<String>) -> std::io::Result<Outc
                 PollStep::Expired => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        "dig-node: the pairing request expired before it was approved.                          Run `dign pair connect` again and have the operator approve it                          within five minutes.",
+                        EXPIRED_BEFORE_APPROVAL,
                     ))
                 }
             },
@@ -161,13 +150,55 @@ fn connect(config: &Config, client_name: Option<String>) -> std::io::Result<Outc
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!(
-                        "dig-node: the pairing request is {other} — it was never approved, or the                          node restarted. Run `dign pair connect` again."
-                    ),
+                    terminal_status_message(other),
                 ))
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The four user-facing strings of `pair connect`, lifted out of the poll loop.
+//
+// They are named functions rather than inline literals for one reason: the loop that emitted them
+// cannot be driven from a unit test (it dials a node and sleeps), so every one of these strings
+// shipped with NOTHING asserting on it. Three of them were corrupted — a lost `\` line
+// continuation left a ~26-space run mid-sentence, which compiles, passes clippy, and is visible
+// only to a reader. Lifting them out is what makes
+// [`tests::the_user_facing_pair_strings_have_no_lost_line_continuation`] able to see them at all.
+// ---------------------------------------------------------------------------
+
+/// What the client prints while it waits for the operator to approve.
+fn waiting_banner(code: &str, pairing_id: &str) -> String {
+    format!(
+        "dig-node: pairing code {code}\n\
+         Ask the machine's operator to CONFIRM this code, then run:\n\n    \
+         sudo dign pair approve {pairing_id}\n\n\
+         Waiting for approval..."
+    )
+}
+
+/// The SUCCESS message of `dig-node pair connect`.
+fn paired_message(path: &std::path::Path) -> String {
+    format!(
+        "dig-node: paired. The scoped token is stored for your account at {}. \
+         `dign` control commands now work as this user, with no elevation. The operator can \
+         revoke it any time with `sudo dign pair revoke <token_id>`.",
+        path.display()
+    )
+}
+
+/// The first terminal failure: the request aged out while still pending.
+const EXPIRED_BEFORE_APPROVAL: &str =
+    "dig-node: the pairing request expired before it was approved. Run `dign pair connect` \
+     again and have the operator approve it within five minutes.";
+
+/// The second terminal failure: the node no longer holds the pending entry at all.
+fn terminal_status_message(status: &str) -> String {
+    format!(
+        "dig-node: the pairing request is {status} — it was never approved, or the node \
+         restarted. Run `dign pair connect` again."
+    )
 }
 
 /// The display budget, in terminal columns, for an attacker-supplied `client_name`.
@@ -227,6 +258,56 @@ fn format_list(result: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Proves (dig-node#403):** none of `pair connect`'s user-facing strings carries the
+    /// signature of a lost `\` line continuation.
+    ///
+    /// A multi-line Rust string literal without the trailing backslash keeps the source's own
+    /// indentation, so the sentence ships with a ~26-space run in the middle of it. Three of these
+    /// four strings shipped that way: the SUCCESS message of the verb this ticket added, and the
+    /// only guidance on BOTH terminal failure paths. It compiles, clippy is clean, and no test
+    /// asserted on them — the defect was reachable only by a human reading the source.
+    ///
+    /// The property asserted is the SIGNATURE, not the specific wording: any run of three or more
+    /// consecutive spaces that is not the deliberate indent of the banner's command line. Wording
+    /// changes freely; a lost continuation is caught mechanically the next time it happens.
+    #[test]
+    fn the_user_facing_pair_strings_have_no_lost_line_continuation() {
+        let banner = waiting_banner("123456", "aabbccdd");
+        let paired = paired_message(std::path::Path::new("/home/u/DigNode/client-token"));
+        let terminal = terminal_status_message("expired");
+
+        for (what, text) in [
+            ("waiting banner", banner.as_str()),
+            ("paired message", paired.as_str()),
+            ("expired-before-approval", EXPIRED_BEFORE_APPROVAL),
+            ("terminal status", terminal.as_str()),
+        ] {
+            for line in text.lines() {
+                // The banner deliberately indents its copy-pasteable command by four spaces, so
+                // LEADING whitespace is legitimate. A run in the middle of a sentence is not, and
+                // that is exactly what a lost continuation produces.
+                let interior = line.trim_start();
+                assert!(
+                    !interior.contains("   "),
+                    "{what}: a run of 3+ spaces mid-line is the signature of a lost `\\` line \
+                     continuation in a multi-line literal: {line:?}"
+                );
+            }
+        }
+    }
+
+    /// **Proves:** the message an unprivileged reader gets on both terminal paths tells them the
+    /// verb THEY can run, not only the one the operator runs.
+    ///
+    /// Asserted here as well as in `control.rs` because these two strings are the entire guidance
+    /// on the failure paths of the new verb; a user who reaches them has already discovered
+    /// `pair connect` and needs to be told to retry it rather than to find an administrator.
+    #[test]
+    fn both_terminal_failures_name_the_verb_the_reader_can_rerun() {
+        assert!(EXPIRED_BEFORE_APPROVAL.contains("`dign pair connect`"));
+        assert!(terminal_status_message("unknown").contains("`dign pair connect`"));
+    }
 
     /// **Proves (dig-node#346):** an attacker-supplied `client_name` cannot forge a line of the
     /// operator's approval prompt.

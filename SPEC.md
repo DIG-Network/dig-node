@@ -1539,8 +1539,13 @@ mutation or custody method is ever open.
 
 The state dir holds ONLY the control/auth state — the control token (§7.3) and the paired-token
 store (`paired-tokens.json`, §7.11). The CLIENT-side paired token (§7.11a) is NOT in this dir: it
-lives at `<user_state_dir>/client-token`, owned by the invoking user, so an unprivileged client can
-hold a token without any machine-wide path being widened. The bulk per-user `.dig` cache and `config.json` (§3.5–3.6) do
+lives at `<per_user_base>/DigNode/client-token`, owned by the invoking user, so an unprivileged
+client can hold a token without any machine-wide path being widened. `<per_user_base>` is the
+platform per-user base — `$HOME` on Unix/macOS, `%LOCALAPPDATA%` on Windows. It MUST be resolved
+directly from that base and MUST NOT be resolved through the cache resolver, whose unwritable-dir
+fallback is a PID-keyed directory under the system temp dir: a world-writable temp directory is
+never an acceptable location for a bearer credential. When no per-user base can be resolved, the
+client MUST REFUSE to store the token rather than degrade to the current working directory. The bulk per-user `.dig` cache and `config.json` (§3.5–3.6) do
 NOT move; they stay per-user (shared with the browser/digstore, #96).
 
 **Resolution order** (the daemon and every operator CLI MUST resolve this identically, so it MUST
@@ -2286,6 +2291,12 @@ machine, and every token-gated `control.*` verb is out of reach. The remedy MUST
 mode — the master token is the master capability, and it authorizes pairing administration and
 chain authority over the wallet replica (§7.11, §18.16).
 
+The unreadable-master-token remedy (§7.3) is read ONLY by a caller holding neither token, i.e. by
+definition an unprivileged one. On Unix it MUST therefore name `dign pair connect` — the verb THAT
+reader can run, unelevated — in addition to the operator's `sudo dign pair approve <pairing_id>`.
+Naming only the elevated half directs the one audience that sees the message to a command it cannot
+execute.
+
 **`dig-node pair connect [--client-name NAME]`** is the CLIENT half of the §7.11 handshake, and the
 one `pair` verb that requires NO token. It MUST:
 
@@ -2296,8 +2307,13 @@ one `pair` verb that requires NO token. It MUST:
    (`sudo dign pair approve <pairing_id>`), so the compare-codes consent step of §7.11 is performed;
 3. poll the OPEN `pairing.poll { pairing_id }` to a TERMINAL state, bounded by the server's own
    `expires_ms` rather than by a local retry count, and terminate on expiry rather than spin;
-4. on `status: "approved"`, persist the delivered token to the INVOKING USER's own state dir
-   (`<user_state_dir>/client-token`, §7.3a), owner-only (`0600` on Unix).
+4. on `status: "approved"`, persist the delivered token to the INVOKING USER's own per-user base
+   (`<per_user_base>/DigNode/client-token`, §7.3a). The file MUST be created EXCLUSIVELY and
+   owner-only in a single step (`O_CREAT|O_EXCL` at mode `0600` on Unix), never written first and
+   restricted afterwards: a write-then-chmod leaves the token readable under the process umask for
+   a window, and a plain write FOLLOWS a symlink planted at that path — which discloses the token,
+   or clobbers an arbitrary file, as the invoking user. Replacing this user's OWN existing store on
+   a re-pair is permitted and MUST unlink it rather than write through it.
 
 `client_name` is bounded by the same 64-character REFUSAL bound the node applies (§7.11): an
 over-long name MUST be refused, never shortened. A name this client shortened is a name the client
@@ -2306,7 +2322,7 @@ partly wrote, and the operator approves what they are shown.
 **The token ladder.** Every CLI `control.*` call selects its token in this fixed order:
 
 1. the MASTER control token, when this account can read it;
-2. otherwise this user's paired token from `<user_state_dir>/client-token`, when present;
+2. otherwise this user's paired token from `<per_user_base>/DigNode/client-token`, when present (an unresolvable per-user base counts as "no paired token", not an error);
 3. otherwise the master read's own error, VERBATIM — its kind (which sets the CLI exit code) and its
    remedy text (§7.3) MUST both survive unchanged, because that sentence is what tells the user how
    to become able to act.
