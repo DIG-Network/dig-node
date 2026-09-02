@@ -3652,6 +3652,13 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
 /// debugging "nobody can see my profile" gets the same `null` in every case, so it cannot tell an
 /// un-published store from an empty one. `standing` names which it is, and names the remedy.
 ///
+/// # An unreadable LOCAL store is its own answer, not an empty one
+///
+/// The standing's own disk read can fail too, and it degrades to `state: "held_unreadable"` with
+/// `held_roots: null` -- never `[]`, which means consulted-and-holds-nothing. The chain is not
+/// consulted at all in that case, for the same reason the body read below runs first: a chain read
+/// must never be able to mask a broken disk.
+///
 /// # The chain read is ADDITIVE and never fatal
 ///
 /// Every pre-existing field keeps its exact meaning: `body_b64` is still the disk read at the
@@ -3708,7 +3715,12 @@ async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
                 // rejects outright, so emitting one would hand a caller a refused sentinel dressed
                 // as an answer.
                 "chain_root": standing.chain_root().map(hex::encode),
-                "held_roots": standing.held().iter().map(hex::encode).collect::<Vec<_>>(),
+                // `null` when the local store could not be enumerated, and an array otherwise.
+                // An empty array MEANS consulted-and-holds-nothing, so rendering one for a failed
+                // read would answer a question this node could not ask.
+                "held_roots": standing.held().map(|roots| {
+                    roots.iter().map(hex::encode).collect::<Vec<_>>()
+                }),
                 "detail": standing.detail(),
             },
         }),
