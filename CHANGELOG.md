@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.236.0] - 2026-09-02
+
+### Features
+- **mirror:** Drive the mirror pass from disk events, timer as backstop (#470)- **mirror:** Verify a peer's mirror-coin bond against chain on the download path (#467)
+
+### Bug Fixes
+- **sync:** The background whole-store sync must not log a download it never stored (#468)- **config:** A mistyped capability flag must be said out loud, not silently guessed (#472)- **wallet:** Retire the last largest-first rival, and make the unguarded sync setter unreachable (#474)- **test:** Own test scratch dirs with tempfile::TempDir so they clean on drop (#476)- **rpc:** Mint error frames from the taxonomy so data.code and data.origin are present (#477)- **mirror:** Skip unauthenticatable funding candidates and alert on a funding shortfall (#469)- **wallet:** Announce a $DIG arrival that reaches `coins` only after promotion (#480)- **cache,serve:** Store-page landing provenance, single cache budget, unrecognised-dir accounting (#455)- **mirror:** A node that advertises nothing says so instead of demanding $DIG (#484)- **profile-sync:** Reconcile a held profile body against its store's on-chain root (#487)
+
+### Performance
+- **serve:** Stream the capsule hash paths instead of reading whole capsules into RAM (#488)
+
 ## [0.206.0] - 2026-09-01
 
 ### Bug Fixes
