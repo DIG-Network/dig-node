@@ -163,6 +163,30 @@ pub type BondVerifierSlot = Arc<OnceLock<Arc<dyn MirrorBondVerifier>>>;
 pub const MAX_VERIFIED_PER_LOCATE: usize = 8;
 
 /// Promotion tier for a verdict — `Bonded` first, everything else in one baseline tier.
+/// A peer id from an untrusted provider record, in a shape that is safe to put in a log field.
+///
+/// `provider_peer_id` is a bare `String` carried off an unsigned provider record with no
+/// wire-boundary normalisation, so it may be any length and hold any UTF-8 — newlines and control
+/// characters included, which is what makes an unbounded log field a log-INJECTION surface rather
+/// than merely a noisy one: a peer that spells its id with an embedded newline writes a second line
+/// into this node's log, and an operator reading that log cannot tell it from one this node wrote.
+///
+/// An honest peer id is exactly 64 hex characters, so keeping only hex digits, lowercasing them and
+/// taking the first [`PEER_ID_HEX_LEN`] discards nothing real. The lowercasing matches the
+/// normalisation the promotion bound above applies for the same reason: two spellings are one
+/// identity, so two log lines about them should read as one peer.
+fn peer_id_for_log(provider_peer_id: &str) -> String {
+    provider_peer_id
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|c| c.to_ascii_lowercase())
+        .take(PEER_ID_HEX_LEN)
+        .collect()
+}
+
+/// The length of a peer id in hex characters — 32 bytes, so 64.
+const PEER_ID_HEX_LEN: usize = 64;
+
 fn credit_rank(verdict: BondVerdict) -> u8 {
     match verdict {
         BondVerdict::Bonded => 0,
@@ -253,7 +277,7 @@ impl ProviderLocator for BondRankingLocator {
                 // disproves its own claim. Logged and NOT demoted — the record may be a stranger's
                 // lie ABOUT an honest holder, and demoting on it is what would make that lie pay.
                 tracing::debug!(
-                    peer = %record.provider_peer_id,
+                    peer = %peer_id_for_log(&record.provider_peer_id),
                     "located holder's claimed mirror coin does not bond this content; no promotion"
                 );
             }
@@ -275,6 +299,47 @@ mod tests {
     use dig_dht::{CandidateAddr, PeerId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    /// **Proves (dig-node#501, security round 1, LOW 5):** peer-supplied text reaching a log field
+    /// is bounded and normalised.
+    ///
+    /// **Catches:** log injection through an unsigned field. `provider_peer_id` is a bare `String`
+    /// with no wire-boundary normalisation, so a peer that spells its id with an embedded newline
+    /// writes a whole second line into this node's log, and an operator reading it cannot tell that
+    /// line from one the node wrote itself. The fixture carries a newline, a carriage return, an
+    /// ANSI escape and 200 characters of padding — each a separate thing the old field would have
+    /// emitted verbatim — and the honest row is the control, so a function that simply returned the
+    /// empty string would not pass.
+    #[test]
+    fn a_peer_id_in_a_log_field_is_bounded_and_normalised() {
+        let honest = "aa".repeat(32);
+        assert_eq!(
+            peer_id_for_log(&honest),
+            honest,
+            "control: an honest 64-hex id must survive unchanged, or the field says nothing"
+        );
+        assert_eq!(
+            peer_id_for_log(&honest.to_uppercase()),
+            honest,
+            "two spellings are one identity, exactly as the promotion bound treats them"
+        );
+
+        let hostile = format!("dead\nbeef\r\u{1b}[31m peer=trusted {}", "f".repeat(200));
+        let logged = peer_id_for_log(&hostile);
+        assert!(
+            !logged.chars().any(char::is_control),
+            "a control character would forge a log line: {logged:?}"
+        );
+        assert!(
+            logged.chars().all(|c| c.is_ascii_hexdigit()),
+            "only hex digits can be part of a peer id: {logged:?}"
+        );
+        assert!(
+            logged.len() <= PEER_ID_HEX_LEN,
+            "the field is bounded at one peer id's worth, got {} characters",
+            logged.len()
+        );
+    }
 
     const STORE: [u8; 32] = [0x11; 32];
     const ROOT: [u8; 32] = [0x22; 32];

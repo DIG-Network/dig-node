@@ -88,6 +88,13 @@ pub enum PassError {
     /// `Display` delegates, so every existing consumer that only renders a `PassError` is
     /// unaffected: the message an operator sees is the `FundingError`'s own.
     Funding(super::funding::FundingError),
+    /// This node cannot yet name ITSELF, so a create would lock uncreditable collateral.
+    ///
+    /// Its own variant rather than a [`PassError::Wallet`] because the wallet is fine and the
+    /// operator has nothing to fix: the peer network has simply not reported an identity yet, and
+    /// the next pass usually has one. Rendering it as a wallet failure would send an operator to
+    /// debug a wallet that is working (dig-node#501, security round 1).
+    Identity(String),
 }
 
 impl std::fmt::Display for PassError {
@@ -97,6 +104,9 @@ impl std::fmt::Display for PassError {
             PassError::Chain(cause) => write!(f, "the chain source could not be read: {cause}"),
             PassError::Wallet(cause) => write!(f, "the operator wallet could not act: {cause}"),
             PassError::Funding(cause) => write!(f, "{cause}"),
+            PassError::Identity(cause) => {
+                write!(f, "this node cannot declare its own peer identity: {cause}")
+            }
         }
     }
 }

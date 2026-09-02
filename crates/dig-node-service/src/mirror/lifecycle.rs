@@ -172,32 +172,44 @@ pub struct NodeMirrorEffects<'a, S: ChainSource> {
     resolved: std::cell::RefCell<HashMap<String, MirrorCoin>>,
 }
 
+/// The declaration a create must carry, or the reason this pass must not create at all.
+///
+/// **A create with no declaration is REFUSED, not degraded (dig-node#501, security round 1).** A
+/// coin created without one locks real collateral for a whole epoch and can never be credited to
+/// this node by any reader — `verdict_for` promotes on the coin's own declaration of the claimant,
+/// so an undeclared coin buys discovery weight it will never receive. The money is spent either
+/// way; only the benefit is lost.
+///
+/// Deferring costs a pass. The scheduler runs again, and a node whose peer network has not yet
+/// reported an identity almost always has one by the next pass. An epoch of locked $DIG against one
+/// deferred pass is not a close call, which is why this fails closed — and why
+/// [`super::spends::build_create`] takes a declaration rather than an `Option`, so the refusal is
+/// structural instead of a rule a later caller could forget.
+fn declaration_for_create(
+    own_peer_id: Option<&str>,
+) -> Result<dig_mirror_coin::PeerDeclaration, PassError> {
+    let Some(peer_id) = own_peer_id else {
+        return Err(PassError::Identity(
+            "the peer network has not reported an identity yet, so a coin created now would name \
+             no peer and no reader could credit its bond to this node"
+                .into(),
+        ));
+    };
+    dig_mirror_coin::PeerDeclaration::from_hex(peer_id).map_err(|error| {
+        PassError::Identity(format!(
+            "this node reported a peer id that is not a well-formed peer id ({error}), so a coin \
+             created now would name no peer"
+        ))
+    })
+}
+
 impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
-    /// The peer declaration to write into a coin this node creates.
+    /// The peer declaration to write into a coin this node creates, or the reason there is none.
     ///
-    /// `None` when the peer network has not started, or -- which should not happen -- when the id it
-    /// reported is not a well-formed peer id. Both are warned about rather than silently dropped: a
-    /// coin created without a declaration locks real collateral for an epoch and can never be
-    /// promoted by any reader, which is a worse outcome than the create being retried next pass.
-    fn declared_peer(&self) -> Option<dig_mirror_coin::PeerDeclaration> {
-        let Some(peer_id) = self.own_peer_id.as_deref() else {
-            tracing::warn!(
-                target: "mirror",
-                "creating a mirror coin before the peer network reported an identity: the coin will                  name no peer and no reader can credit its bond to this node"
-            );
-            return None;
-        };
-        match dig_mirror_coin::PeerDeclaration::from_hex(peer_id) {
-            Ok(declaration) => Some(declaration),
-            Err(error) => {
-                tracing::warn!(
-                    target: "mirror",
-                    %error,
-                    "this node reported a peer id that is not a well-formed peer id; the coin will                      name no peer"
-                );
-                None
-            }
-        }
+    /// Delegates to the free [`declaration_for_create`] so the decision can be driven directly by a
+    /// test without assembling a whole effects struct around it.
+    fn declaration_for_create(&self) -> Result<dig_mirror_coin::PeerDeclaration, PassError> {
+        declaration_for_create(self.own_peer_id.as_deref())
     }
 
     /// Assemble the effects for one pass from readings the scheduler has already taken.
@@ -481,6 +493,18 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         // `sign_and_broadcast` takes the set mutably to record what this bundle consumed, and a
         // borrow still live across that call is a runtime panic on the money path rather than a
         // compile error — so the scope is the guarantee, and it is deliberately narrow.
+        // BEFORE any coin is selected: a coin created with no declaration would lock this
+        // collateral for an epoch uncreditably, so the pass defers rather than spends (see
+        // `declaration_for_create`).
+        let declaration = self.declaration_for_create().inspect_err(|error| {
+            tracing::warn!(
+                target: "mirror",
+                %error,
+                store_id = %bond.store_id,
+                "not creating mirror collateral this pass"
+            );
+        })?;
+
         let dig_coins = {
             let committed = committed.borrow();
             funding::select_operator_dig_cats(
@@ -504,7 +528,7 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
             root_hash,
             num_bigint::BigInt::from(epoch),
             self.advertised_urls.clone(),
-            self.declared_peer(),
+            declaration,
             amount_dig_base_units,
             dig_coins,
             signer.synthetic_key(),
@@ -860,6 +884,77 @@ pub fn journal() -> SpendJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Proves (dig-node#501, security round 1, MEDIUM 3):** a node that cannot name ITSELF does
+    /// not create a mirror coin.
+    ///
+    /// **Catches:** the create-side guard failing OPEN on money. Before this, both reasons a
+    /// declaration could be absent produced a `None` that `build_create` cheerfully turned into a
+    /// coin — so a host whose peer network never reported an identity locked a full epoch's
+    /// collateral, every pass, in a bond no reader could ever credit to it. The rustdoc said so and
+    /// the code did the opposite.
+    ///
+    /// All three rows are asserted, and the `Ok` row is the control: a test that only asserted the
+    /// refusals would pass against a function that refused unconditionally, which would stop this
+    /// node bonding anything at all.
+    #[test]
+    fn a_create_is_refused_when_this_node_cannot_name_itself() {
+        let honest = "aa".repeat(32);
+        let declaration = declaration_for_create(Some(&honest))
+            .expect("control: a well-formed peer id yields a declaration and the create proceeds");
+        assert!(
+            declaration.names(&honest),
+            "control: the declaration written into the coin must name THIS node"
+        );
+
+        for absent in [None, Some("not-a-peer-id"), Some("")] {
+            let refusal = declaration_for_create(absent)
+                .expect_err("a create with no declaration locks uncreditable collateral");
+            assert!(
+                matches!(refusal, PassError::Identity(_)),
+                "the refusal is its own cause, not a wallet failure an operator would go debug: \
+                 got {refusal}"
+            );
+        }
+    }
+
+    /// **Proves (dig-node#501, review round 2, finding 2):** this module's operator-facing refusal
+    /// text is not corrupted by a lost line continuation.
+    ///
+    /// **Catches:** exactly what shipped at `59a0331`. The two `warn!` literals these messages
+    /// replace carried an 18- and a 22-space run from an eaten `\`, so the emitted line read
+    /// "the coin will&nbsp;&nbsp;… name no peer". It compiles, no assertion looked at the text, and
+    /// the mangled and correct forms are indistinguishable in a normal diff view — so nothing but a
+    /// test over the VALUE can see it. Asserted over the rendered message rather than over the
+    /// source, because that is what an operator actually reads, and it also covers the `Display`
+    /// prefix the message is glued to.
+    #[test]
+    fn the_refusal_messages_read_as_sentences() {
+        let messages: Vec<String> = [None, Some("not-a-peer-id")]
+            .into_iter()
+            .map(|peer| {
+                declaration_for_create(peer)
+                    .expect_err("both rows refuse")
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(messages.len(), 2, "both refusal literals must be exercised");
+        for message in &messages {
+            assert!(
+                !message.contains("  "),
+                "a run of two spaces is an eaten line continuation, not prose: {message:?}"
+            );
+            assert!(
+                !message.chars().any(char::is_control),
+                "no control character belongs in an operator-facing line: {message:?}"
+            );
+            assert!(
+                message.contains("no peer"),
+                "control: the message must still say what went wrong: {message:?}"
+            );
+        }
+    }
 
     /// Bring-up with no operator wallet yields NO signer, and says which of the two reasons it was.
     ///

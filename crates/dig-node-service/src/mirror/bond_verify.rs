@@ -59,6 +59,61 @@ const VERDICT_TTL: Duration = Duration::from_secs(600);
 /// earned simply by rotating coin ids, which converts a memoisation into an amplifier.
 const MAX_CACHED_VERDICTS: usize = 1024;
 
+/// The most locate-triggered verifications this PROCESS will pay for in one burst.
+///
+/// Each one costs up to two blocking HTTPS reads through the node's ONE shared `ChiaQuery` client —
+/// the same client the wallet, the collateral census and the mirror spends read through. So this
+/// ceiling is not about fairness between requestors; it is about this node keeping its own chain
+/// access when a stranger directs traffic at it.
+///
+/// The inbound admission gate (`allow_miss_lookup`, burst 16 at 4/sec) is PER REQUESTOR over up to
+/// 4,096 self-minted identities and has no aggregate cap, so it cannot bound this. Sixteen is
+/// therefore chosen against the *outbound* cost, not the inbound one: two locates' worth of a full
+/// slate, after which verification degrades to `Unverified` — which is where every record already
+/// sits when no verifier is installed at all.
+const VERIFICATION_BURST: u32 = 16;
+
+/// How fast [`VERIFICATION_BURST`] refills, in verifications per second.
+///
+/// One per second, deliberately slower than the inbound refill it cannot control: an attacker who
+/// sustains the inbound rate gets a *constant* trickle of outbound reads rather than a multiple of
+/// its own request rate. An honest node's own reads — a capsule it is downloading — are answered
+/// from the burst and then from the verdict cache.
+const VERIFICATION_REFILL_PER_SEC: f64 = 1.0;
+
+/// The most verifications in flight at once, so a burst cannot fan out CONCURRENTLY onto the shared
+/// client even while it is within the rate ceiling.
+///
+/// A rate bound alone still permits sixteen simultaneous blocking reads, which is what a connection
+/// pool experiences as an outage rather than as load.
+const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
+
+/// The most DISTINCT claimed coin ids one claiming peer may spend chain reads on, per
+/// [`CLAIMANT_LEDGER_WINDOW`], without ever proving a bond.
+///
+/// This is the bound that answers the fabricated-coin-id case specifically. [`VerdictKey`] includes
+/// the coin id — it must, or a stranger republishing a public coin id would inherit its holder's
+/// verdict — so eight records carrying eight *invented* coin ids miss the cache eight times by
+/// construction, and no cache design can fix that. What CAN be bounded is how many invented ids one
+/// claimed identity is allowed to be wrong about before this node stops asking on its behalf.
+///
+/// Four, because an honest holder needs ONE: a peer publishes the coin it created. A rollover can
+/// make it briefly two (the old coin and the new one). Anything beyond that is a peer that does not
+/// know which coin it holds, and its records are worth no more chain reads than a stranger's.
+const MAX_UNPROVEN_COINS_PER_CLAIMANT: usize = 4;
+
+/// How long a claimant's unproven-coin ledger is remembered. Matched to [`VERDICT_TTL`] so a peer
+/// that genuinely rotates coins is forgiven on the same clock a cached verdict expires on.
+const CLAIMANT_LEDGER_WINDOW: Duration = VERDICT_TTL;
+
+/// The most claimants tracked in that ledger at once.
+///
+/// A claiming peer id is attacker-chosen and unbounded in supply, so the ledger MUST be bounded.
+/// Once it is full of live entries an UNKNOWN claimant is refused rather than admitted, which is
+/// the fail-closed direction: the cost of being wrong is a holder sitting at the baseline tier it
+/// would occupy with no verifier at all, never a wrong promotion.
+const MAX_TRACKED_CLAIMANTS: usize = 512;
+
 /// A verdict is only ever cached for the exact question it answered.
 ///
 /// The coin id alone is not the key: one coin bonds one `(store, root, epoch)`, so caching by coin
@@ -323,6 +378,173 @@ pub fn verdict_for<S: ChainSource>(
     }
 }
 
+/// Whether a chain read may be spent on one claim, right now.
+///
+/// **Why this exists.** Before promotion went live, `verdict_for` returned at
+/// `declaration_source_is_readable()` and a locate cost zero chain reads. Activating it turned one
+/// cheap inbound token into up to `MAX_VERIFIED_PER_LOCATE` verifications, each two outbound HTTPS
+/// reads, on a client shared with the wallet — and the inbound gate that admits the locate is
+/// per-requestor over self-minted identities, so it bounds nothing in aggregate. This type is the
+/// aggregate bound (dig-node#501, security round 1, HIGH).
+///
+/// Two independent limits, because they answer two different attacks:
+///
+/// * a **process-wide token bucket** ([`VERIFICATION_BURST`] at [`VERIFICATION_REFILL_PER_SEC`]),
+///   which bounds total outbound egress however many identities the traffic is spread across;
+/// * a **per-claimant distinct-coin ledger** ([`MAX_UNPROVEN_COINS_PER_CLAIMANT`]), which bounds
+///   the fabricated-coin-id case the verdict cache structurally cannot absorb.
+///
+/// Exhaustion of either returns [`BondVerdict::Unverified`] having read NOTHING. That is a
+/// degradation and not a refusal of service: `Unverified` and `Unbonded` share a rank, the sort is
+/// stable, and the located slate is returned unchanged — the exact behaviour of a node with no
+/// verifier installed. **The read path is never blocked and no holder is ever ranked below where it
+/// started**, so an attacker who exhausts the budget denies promotion, not content.
+struct ReadAdmission {
+    state: Mutex<AdmissionState>,
+}
+
+/// [`ReadAdmission`]'s interior, held under one lock so the two limits are decided atomically —
+/// a token spent on a claim the ledger was about to refuse would be a leak.
+struct AdmissionState {
+    /// Whole verifications available now. Fractional so a sub-second refill is not rounded away.
+    tokens: f64,
+    /// When `tokens` was last brought up to date.
+    refilled_at: Instant,
+    burst: f64,
+    refill_per_sec: f64,
+    /// Per claimant: when its window opened, and the distinct coin ids it has spent reads on
+    /// without proving a bond. Keyed on the SHA-256 of the lowercased peer id, for the reason
+    /// [`VerdictKey`] hashes it — the key must be fixed-size against an attacker-chosen string, and
+    /// two hex spellings must be one identity.
+    unproven: HashMap<[u8; 32], (Instant, std::collections::HashSet<[u8; 32]>)>,
+}
+
+impl ReadAdmission {
+    /// A budget of the given size. Parameterised so a test can exhaust one in a few calls rather
+    /// than by replicating production's arithmetic.
+    fn new(burst: u32, refill_per_sec: f64) -> Self {
+        ReadAdmission {
+            state: Mutex::new(AdmissionState {
+                tokens: f64::from(burst),
+                refilled_at: Instant::now(),
+                burst: f64::from(burst),
+                refill_per_sec,
+                unproven: HashMap::new(),
+            }),
+        }
+    }
+
+    /// The one budget every locate on this node draws from.
+    ///
+    /// Process-wide rather than per verifier: the constraint being protected is the single shared
+    /// `ChiaQuery` client, which is a property of the process, so a budget scoped to anything
+    /// narrower would be several budgets against one resource.
+    fn shared() -> &'static ReadAdmission {
+        static SHARED: std::sync::OnceLock<ReadAdmission> = std::sync::OnceLock::new();
+        SHARED.get_or_init(|| ReadAdmission::new(VERIFICATION_BURST, VERIFICATION_REFILL_PER_SEC))
+    }
+
+    /// Whether a chain read may be spent on `claimed_coin_id` for `claiming_peer_id`.
+    ///
+    /// Returning `false` costs the network nothing and this node nothing; returning `true` spends a
+    /// token, so it is called exactly once per verification and never as a peek.
+    fn admit(&self, claiming_peer_id: &str, claimed_coin_id: [u8; 32]) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            // A poisoned budget cannot be shown to have capacity, so it has none.
+            return false;
+        };
+
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(state.refilled_at).as_secs_f64();
+        state.tokens = (state.tokens + elapsed * state.refill_per_sec).min(state.burst);
+        state.refilled_at = now;
+
+        let claimant = claimant_key(claiming_peer_id);
+        state
+            .unproven
+            .retain(|_, (opened, _)| opened.elapsed() < CLAIMANT_LEDGER_WINDOW);
+        let known = state.unproven.contains_key(&claimant);
+        if !known && state.unproven.len() >= MAX_TRACKED_CLAIMANTS {
+            return false;
+        }
+        if let Some((_, coins)) = state.unproven.get(&claimant) {
+            // A coin id this claimant has already been read about is not a new question: the cache
+            // entry for it has simply expired, and re-asking is what keeps a verdict fresh. Only
+            // DISTINCT unproven ids count against the ledger.
+            if !coins.contains(&claimed_coin_id) && coins.len() >= MAX_UNPROVEN_COINS_PER_CLAIMANT {
+                return false;
+            }
+        }
+
+        if state.tokens < 1.0 {
+            return false;
+        }
+        state.tokens -= 1.0;
+        state
+            .unproven
+            .entry(claimant)
+            .or_insert_with(|| (now, std::collections::HashSet::new()))
+            .1
+            .insert(claimed_coin_id);
+        true
+    }
+
+    /// Forgive a claimant's ledger: it has proven a bond, so it is not a peer guessing at coin ids.
+    ///
+    /// The process-wide bucket is deliberately NOT refunded. A proven bond says the claimant is
+    /// honest; it says nothing about this node's chain access, which is the thing the bucket exists
+    /// to protect.
+    fn record_proven(&self, claiming_peer_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.unproven.remove(&claimant_key(claiming_peer_id));
+        }
+    }
+}
+
+/// A claiming peer id as a fixed-size ledger key: lowercased, then hashed.
+///
+/// The same normalisation [`VerdictKey`] applies, for the same two reasons — the key must be
+/// fixed-size against an attacker-chosen string, and a peer id's two hex spellings denote one
+/// identity, so a ledger keyed on the raw text would give a stranger a fresh allowance per spelling.
+fn claimant_key(claiming_peer_id: &str) -> [u8; 32] {
+    let mut hasher = chia_sha2::Sha256::new();
+    hasher.update(claiming_peer_id.to_ascii_lowercase().as_bytes());
+    hasher.finalize()
+}
+
+/// [`verdict_for`], but only if the budget allows the reads it would perform.
+///
+/// **This is the composition production uses**, so a test that drives it is exercising the real
+/// ordering rather than re-deriving it: the budget is consulted BEFORE the source is touched, so a
+/// refused claim reads nothing, and a proven bond forgives its claimant's ledger.
+fn admitted_verdict_for<S: ChainSource>(
+    admission: &ReadAdmission,
+    source: &S,
+    store_launcher_id: Bytes32,
+    root_hash: Bytes32,
+    epoch: &BigInt,
+    required_collateral: Option<u64>,
+    claiming_peer_id: &str,
+    claimed_coin_id: Bytes32,
+) -> BondVerdict {
+    if !admission.admit(claiming_peer_id, claimed_coin_id.to_bytes()) {
+        return BondVerdict::Unverified;
+    }
+    let verdict = verdict_for(
+        source,
+        store_launcher_id,
+        root_hash,
+        epoch,
+        required_collateral,
+        claiming_peer_id,
+        claimed_coin_id,
+    );
+    if verdict == BondVerdict::Bonded {
+        admission.record_proven(claiming_peer_id);
+    }
+    verdict
+}
+
 /// The memo of definite verdicts, keyed on the exact question each one answered.
 ///
 /// Its own type, rather than two fields on the verifier, so the key/lookup/eviction rules can be
@@ -353,9 +575,26 @@ impl VerdictCache {
             return;
         };
         if entries.len() >= MAX_CACHED_VERDICTS {
-            // Evict one arbitrary entry, not the map. `HashMap` iteration order is unspecified, so
-            // the victim is not attacker-selectable either; the cost of a wrong guess is one chain
-            // read, never a wrong answer.
+            // Expired first. Eviction should reclaim what is already worthless before it touches
+            // anything live, and a full map is the only moment worth paying the scan for.
+            entries.retain(|_, (taken, _)| taken.elapsed() < VERDICT_TTL);
+        }
+        if entries.len() >= MAX_CACHED_VERDICTS {
+            // Still full of LIVE entries, so admitting this one costs an honest verdict. Only a
+            // `Bonded` is worth that trade, and only a `Bonded` is expensive to obtain: it requires
+            // a coin that exists, is fully collateralised, and declares its claimant.
+            //
+            // **An `Unbonded` is refused admission rather than allowed to evict.** The previous
+            // version evicted one arbitrary entry per insert, which read as conservative but is
+            // paced by the attacker: `Unbonded` is the verdict a stranger elicits for FREE by
+            // naming coin ids that do not exist, so at an attacker-chosen insert rate the map turns
+            // over entirely in well under a minute and every honest `Bonded` this node earned is
+            // discarded. Refusing the cheap insert instead means a flood of invented coin ids
+            // cannot displace a single earned verdict — it only re-reads its own claims, which
+            // `ReadAdmission` is separately bounding.
+            if verdict != BondVerdict::Bonded {
+                return;
+            }
             if let Some(victim) = entries.keys().next().copied() {
                 entries.remove(&victim);
             }
@@ -401,10 +640,23 @@ impl ChainBondVerifier {
             return BondVerdict::Unverified;
         };
 
+        // The concurrency ceiling, and `try_acquire` rather than `acquire`: a queue of tasks
+        // waiting for a permit is an unbounded backlog of attacker-directed work held on this
+        // node's heap, and the honest answer when the budget is saturated is available immediately
+        // -- `Unverified`, the tier every record occupies with no verifier installed.
+        static IN_FLIGHT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+        let Ok(_permit) = IN_FLIGHT
+            .get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFICATIONS))
+            .try_acquire()
+        else {
+            return BondVerdict::Unverified;
+        };
+
         // `ChainSource` is blocking, so the read leaves the async worker rather than parking it.
         let epoch_big = BigInt::from(epoch);
         let verdict = tokio::task::block_in_place(|| {
-            verdict_for(
+            admitted_verdict_for(
+                ReadAdmission::shared(),
                 &source,
                 store,
                 root,
@@ -847,6 +1099,179 @@ mod tests {
             reads.load(AtomicOrdering::Relaxed),
             1,
             "one read settles it; anything more is a retry loop paid for by the reader"
+        );
+    }
+
+    /// **Proves (dig-node#501, security round 1, HIGH):** locate-triggered verification spends a
+    /// PROCESS-WIDE budget of chain reads, so spreading the traffic across identities does not
+    /// multiply this node's outbound egress.
+    ///
+    /// **Catches:** the aggregate cap going missing — the defect this PR introduced by lifting the
+    /// pre-read short-circuit. The inbound gate that admits a locate is per-requestor (burst 16 at
+    /// 4/sec) over up to 4,096 self-minted identities, so it bounds nothing in aggregate; every
+    /// admitted locate then verified up to eight records at two HTTPS reads each, through the ONE
+    /// `ChiaQuery` client the node's own wallet, census and spends read through.
+    ///
+    /// Each row here uses a DISTINCT claimant, so the per-claimant ledger cannot be what bites and
+    /// the number asserted is the aggregate bucket's. The count is asserted from the chain double
+    /// itself rather than from the admission's own bookkeeping — an admission that returned `false`
+    /// while still reading would pass a test that only counted refusals.
+    #[test]
+    fn locate_triggered_chain_reads_are_capped_process_wide() {
+        const BURST: u32 = 4;
+        const CLAIMS: u32 = 20;
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingChain {
+            reads: Arc::clone(&reads),
+        };
+        // No refill during the test: a rate the test cannot outrun would make the cap unobservable.
+        let admission = ReadAdmission::new(BURST, 0.0);
+
+        let mut verdicts = Vec::new();
+        for claim in 0..CLAIMS {
+            verdicts.push(admitted_verdict_for(
+                &admission,
+                &source,
+                Bytes32::new(STORE),
+                Bytes32::new(ROOT),
+                &BigInt::from(7u64),
+                Some(1),
+                // A fresh claimant per row, each a well-formed 64-hex id.
+                &format!("{claim:064x}"),
+                Bytes32::new([0x33; 32]),
+            ));
+        }
+
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            BURST as usize,
+            "the budget is the ceiling on chain reads, whatever the claim rate"
+        );
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|v| **v == BondVerdict::Unbonded)
+                .count(),
+            BURST as usize,
+            "control: every admitted claim was genuinely answered, so the cap is not hiding a \
+             function that stopped reading altogether"
+        );
+        assert!(
+            verdicts[BURST as usize..]
+                .iter()
+                .all(|v| *v == BondVerdict::Unverified),
+            "past the budget a record stays at the tier it would occupy with no verifier at all -- \
+             withheld credit, never a demotion, and never a blocked read"
+        );
+    }
+
+    /// **Proves (dig-node#501, security round 1, HIGH):** one claimant cannot spend an unbounded
+    /// number of chain reads on coin ids it invents.
+    ///
+    /// **Catches:** the case the verdict cache structurally cannot absorb. [`VerdictKey`] includes
+    /// the coin id and MUST — without it a stranger republishing a public coin id would inherit its
+    /// holder's `Bonded` — so a slate of records carrying invented coin ids misses the cache once
+    /// per invented id, by construction. No cache design fixes that; only a bound on how many
+    /// unproven ids one claimed identity is allowed does.
+    ///
+    /// The budget here is deliberately large, so the number asserted can only be the per-claimant
+    /// ledger's. A single-claimant test against the aggregate bucket alone would pass with no
+    /// ledger at all.
+    #[test]
+    fn fabricated_coin_ids_from_one_claimant_stop_costing_chain_reads() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingChain {
+            reads: Arc::clone(&reads),
+        };
+        let admission = ReadAdmission::new(1_000, 0.0);
+        let claimant = "aa".repeat(32);
+
+        for invented in 0..32u8 {
+            admitted_verdict_for(
+                &admission,
+                &source,
+                Bytes32::new(STORE),
+                Bytes32::new(ROOT),
+                &BigInt::from(7u64),
+                Some(1),
+                &claimant,
+                Bytes32::new([invented; 32]),
+            );
+        }
+
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            MAX_UNPROVEN_COINS_PER_CLAIMANT,
+            "a claimant that never proves a bond gets a fixed allowance of invented coin ids"
+        );
+
+        // The control, and the reason the bound is not simply a per-peer denial: a DIFFERENT
+        // claimant is unaffected by this one's exhaustion.
+        admitted_verdict_for(
+            &admission,
+            &source,
+            Bytes32::new(STORE),
+            Bytes32::new(ROOT),
+            &BigInt::from(7u64),
+            Some(1),
+            &"bb".repeat(32),
+            Bytes32::new([0x01; 32]),
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            MAX_UNPROVEN_COINS_PER_CLAIMANT + 1,
+            "the ledger is per claimant; one peer exhausting its allowance must not silence another"
+        );
+    }
+
+    /// **Proves (dig-node#501, security round 1, HIGH, second half):** a flood of cheap negative
+    /// verdicts cannot displace a verdict this node earned.
+    ///
+    /// **Catches:** attacker-paced eviction. The previous `remember` evicted one arbitrary entry per
+    /// insert past [`MAX_CACHED_VERDICTS`], which reads as conservative and is not: `Unbonded` is
+    /// the verdict a stranger elicits for FREE by naming coin ids that do not exist, so at an
+    /// attacker-chosen insert rate the whole map turns over in under a minute and every earned
+    /// `Bonded` is discarded — the "memoisation into an amplifier" the constant's own doc warns
+    /// about, reached one entry at a time instead of all at once.
+    ///
+    /// The honest entries are counted rather than sampled, so an implementation that dropped one
+    /// per cheap insert would fail here rather than pass on the entry the test happened to check.
+    #[test]
+    fn a_flood_of_cheap_negatives_cannot_evict_an_earned_verdict() {
+        let store = Bytes32::new(STORE);
+        let root = Bytes32::new(ROOT);
+        let cache = VerdictCache::default();
+
+        let earned: Vec<VerdictKey> = (0..MAX_CACHED_VERDICTS)
+            .map(|n| VerdictKey::new([n as u8; 32], store, root, 7, &format!("{n:064x}")))
+            .collect();
+        for key in &earned {
+            cache.remember(*key, BondVerdict::Bonded);
+        }
+        let held = earned.iter().filter(|k| cache.get(k).is_some()).count();
+        assert_eq!(
+            held, MAX_CACHED_VERDICTS,
+            "control: the map really is full of live earned verdicts before the flood"
+        );
+
+        let liar = "ff".repeat(32);
+        for invented in 0..64u8 {
+            cache.remember(
+                VerdictKey::new([invented; 32], store, root, 7, &liar),
+                BondVerdict::Unbonded,
+            );
+        }
+
+        assert_eq!(
+            earned.iter().filter(|k| cache.get(k).is_some()).count(),
+            MAX_CACHED_VERDICTS,
+            "not one earned verdict may be traded for a negative that cost the publisher nothing"
+        );
+        assert_eq!(
+            cache.get(&VerdictKey::new([0x07; 32], store, root, 7, &liar)),
+            None,
+            "the cheap negative is refused admission rather than admitted at an honest entry's cost"
         );
     }
 
