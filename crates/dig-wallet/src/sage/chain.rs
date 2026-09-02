@@ -158,6 +158,10 @@ pub struct PushOutcome {
     ///
     /// `None` for a bare verdict, and that absence is load-bearing: dig-node#348's reservation
     /// hold keys on it, because a refusal the mempool did not explain may still be in flight.
+    ///
+    /// Presence alone does not free the inputs. Since dig-node#460 the hold also asks what CLASS
+    /// of reason this is — [`refusal_is_bundle_intrinsic`] — because a push reaches up to three
+    /// destinations and a peer-local refusal from the last one says nothing about the first.
     pub rejection: Option<String>,
     /// The source's label for the answer (`SUCCESS`, `PENDING`, `FAILED`, `UNKNOWN`) — always
     /// present, whether or not a reason came with it.
@@ -166,6 +170,96 @@ pub struct PushOutcome {
     /// may drive the hold. Narrowing `rejection` to a STATED reason would otherwise have left an
     /// operator debugging a bare `PENDING` with three nulls and no label at all.
     pub verdict: String,
+}
+
+/// Chia error names that are a property of the BUNDLE, not of the answering node's own view.
+///
+/// A node refusing for one of these has looked at the bundle's own contents and found them
+/// invalid: the signature does not verify, the outputs exceed the inputs, the puzzle reveal does
+/// not hash to the coin. Every honest node reaches the same verdict from the same bytes, so no
+/// other destination can be holding the bundle and its inputs are safe to return to selection.
+///
+/// # This is an ALLOWLIST, and that is the whole design (dig-node#460)
+///
+/// The reason text is supplied by an untrusted source (§13 / NC-12), so the guard cannot trust it
+/// to make a POSITIVE safety claim. It does not have to. Freeing early is the dangerous direction
+/// and holding is the safe one, so the default is HOLD and this list is the only exception to it.
+/// Three consequences follow, and each is a property the code would lose as a denylist:
+///
+/// - **An incomplete list is safe.** A Chia error name added after this was written, a source with
+///   its own vocabulary, a peer inventing text — all land in the hold class and cost at most one
+///   bounded `RESERVATION_TTL_MS`. The same names written as "free unless one of these" would free
+///   on every string nobody foresaw.
+/// - **A hostile source gains nothing.** To get inputs freed it must now emit one of these exact
+///   names; before dig-node#460 any non-empty string would do. The free set strictly SHRANK.
+/// - **The other direction is unchanged.** A source wanting the inputs HELD could already achieve
+///   that by stating no reason at all, which dig-node#348 made a hold. This adds no new lockout
+///   capability, and the TTL that bounds it MUST NOT be shortened to compensate.
+///
+/// # What is deliberately absent
+///
+/// Everything whose answer depends on WHO was asked. `DOUBLE_SPEND`, `MEMPOOL_CONFLICT` and
+/// `ALREADY_INCLUDING_TRANSACTION` are a node's report of its OWN mempool, and on the multi-
+/// destination push path they are what a peer says when it has already seen the bundle another
+/// destination admitted — the exact refusal that must never free. `UNKNOWN_UNSPENT` is a node that
+/// has not caught up. The fee names (`INVALID_FEE_LOW_FEE`, `INVALID_FEE_TOO_CLOSE_TO_ZERO`) are
+/// per-node relay POLICY. The timelock assertions (`ASSERT_HEIGHT_*`, `ASSERT_SECONDS_*`,
+/// `ASSERT_BEFORE_*`) are evaluated against the asked node's PEAK, so a node behind the tip refuses
+/// what a node at the tip admits.
+///
+/// The list is also kept SHORT on purpose: a name is added only when every node is certain to
+/// refuse it identically. The announcement-consumption names are omitted for that reason, not
+/// because they are believed view-dependent. Omission costs a bounded hold; a wrong inclusion costs
+/// a double-select window.
+const BUNDLE_INTRINSIC_REFUSALS: &[&str] = &[
+    "BAD_AGGREGATE_SIGNATURE",
+    "INVALID_SPEND_BUNDLE",
+    "GENERATOR_RUNTIME_ERROR",
+    "BLOCK_COST_EXCEEDS_MAX",
+    "INVALID_BLOCK_COST",
+    "COIN_AMOUNT_NEGATIVE",
+    "COIN_AMOUNT_EXCEEDS_MAXIMUM",
+    "DUPLICATE_OUTPUT",
+    "MINTING_COIN",
+    "RESERVE_FEE_CONDITION_FAILED",
+    "WRONG_PUZZLE_HASH",
+    "ASSERT_MY_COIN_ID_FAILED",
+    "ASSERT_MY_PARENT_ID_FAILED",
+    "ASSERT_MY_PUZZLEHASH_FAILED",
+    "ASSERT_MY_AMOUNT_FAILED",
+];
+
+/// The bare reason out of a composed [`PushOutcome::rejection`].
+///
+/// `ChainTransport::stated_rejection` composes `"{verdict}: {reason}"` so an operator reading one
+/// field sees both. The dig-node#460 classifier needs the reason ALONE, and re-deriving that split
+/// at the call site would let the two drift apart in silence — a composition change would not fail
+/// anything, it would just start mis-classifying every refusal in the safe-looking direction.
+/// `the_stated_form_round_trips_back_to_the_bare_reason` pins the pair, so a change to one that
+/// this no longer inverts is a failing test rather than a quiet regression.
+///
+/// A string carrying no `": "` is returned whole: a source that stated a bare reason still stated a
+/// reason.
+fn refusal_reason(stated: &str) -> &str {
+    match stated.split_once(": ") {
+        Some((_verdict, reason)) => reason.trim(),
+        None => stated.trim(),
+    }
+}
+
+/// Whether a stated refusal is a property of the BUNDLE rather than of one node's view
+/// (dig-node#460).
+///
+/// This is what [`super::rpc::WalletBackend::push_signed_bundle`] keys its reservation release on.
+/// The match is EXACT against [`BUNDLE_INTRINSIC_REFUSALS`], case-insensitively and after trimming
+/// — never a substring or prefix test. A source that embeds an allowlisted name in wider text
+/// (`"MEMPOOL_CONFLICT (see BAD_AGGREGATE_SIGNATURE)"`) does not match, and lands in the hold
+/// class, which is the direction an unparseable answer belongs in.
+pub(crate) fn refusal_is_bundle_intrinsic(stated: &str) -> bool {
+    let reason = refusal_reason(stated);
+    BUNDLE_INTRINSIC_REFUSALS
+        .iter()
+        .any(|intrinsic| reason.eq_ignore_ascii_case(intrinsic))
 }
 
 /// Pushes an ALREADY-SIGNED bundle to the network.
@@ -510,6 +604,12 @@ impl ChainTransport {
     /// still have put it in flight, and reselecting those coins opens the double-select window §13 and
     /// SPEC §18.7 exist to close.
     ///
+    /// A stated reason is NECESSARY and not sufficient: dig-node#460 added the CLASS test
+    /// ([`refusal_is_bundle_intrinsic`]) on top, because the reason a SECOND push destination states
+    /// is typically its own mempool conflict with the bundle the FIRST one admitted. The text this
+    /// composes is what the operator reads; [`refusal_reason`] is what the classifier reads back
+    /// out of it.
+    ///
     /// An earlier version manufactured a reason here from `status.status`, so `rejection` was
     /// `Some(..)` on EVERY non-admitted answer, `is_definitive_rejection` was true every time, and the
     /// hold could never fire. The guard read as shipped and was vacuous.
@@ -556,10 +656,11 @@ impl ChainTransport {
                 // The node's OWN words, and ONLY its own words. `None` when it sent none.
                 //
                 // This is load-bearing for #348, not cosmetic. `is_definitive_rejection`
-                // (`rpc.rs`) frees the inputs only for a rejection the mempool STATED, and holds
-                // them otherwise — because a peer that relayed the bundle and then answered with a
-                // bare verdict may still have put it in flight, and reselecting those coins opens
-                // the double-select window.
+                // (`rpc.rs`) frees the inputs only for a rejection the mempool STATED — and, since
+                // #460, only when that reason is a property of the BUNDLE — and holds them
+                // otherwise, because a peer that relayed the bundle and then answered with a bare
+                // verdict may still have put it in flight, and reselecting those coins opens the
+                // double-select window.
                 //
                 // Manufacturing a reason here from `status.status` defeated exactly that: it made
                 // `rejection` `Some(..)` on EVERY non-admitted answer, so the guard was true every
@@ -781,6 +882,94 @@ mod tests {
             Some("FAILED: BAD_AGGREGATE_SIGNATURE".to_string()),
             "a reason the node actually stated must survive to the operator"
         );
+    }
+
+    /// **Proves (dig-node#460):** the composed operator string round-trips back to the bare reason.
+    ///
+    /// `stated_rejection` composes `"{verdict}: {reason}"`; `refusal_reason` is its declared
+    /// inverse and the classifier reads only what it returns. Nothing else pins the two together,
+    /// so a change to the composition would otherwise leave the classifier silently reading the
+    /// wrong substring — and it would fail in the direction that LOOKS fine, because an
+    /// unrecognised reason simply holds.
+    ///
+    /// **Catches:** changing the separator, prefixing the verdict differently, or dropping the
+    /// verdict from the composed form without updating the split.
+    #[test]
+    fn the_stated_form_round_trips_back_to_the_bare_reason() {
+        for reason in [
+            "BAD_AGGREGATE_SIGNATURE",
+            "ALREADY_INCLUDING_TRANSACTION",
+            "SOMETHING_NOBODY_ENUMERATED",
+        ] {
+            let composed = super::ChainTransport::stated_rejection(&status("FAILED", Some(reason)))
+                .expect("a stated reason must survive composition");
+            assert_eq!(
+                super::refusal_reason(&composed),
+                reason,
+                "the classifier reads a different substring than the one the source stated"
+            );
+        }
+    }
+
+    /// **Proves (dig-node#460):** the two refusal CLASSES are told apart, and the default is HOLD.
+    ///
+    /// The peer-local rows are not decoration: `ALREADY_INCLUDING_TRANSACTION`, `DOUBLE_SPEND` and
+    /// `MEMPOOL_CONFLICT` are exactly what a second push destination answers once a FIRST
+    /// destination has admitted the bundle and gossiped it, which is the #460 path. Classifying
+    /// any of them as definitive frees the inputs of a bundle sitting in a public mempool.
+    ///
+    /// The unrecognised row is the one that proves the SHAPE rather than the contents. The
+    /// enumeration cannot be complete — Chia adds error names and a hostile source writes whatever
+    /// it likes — so the property that matters is that everything outside the list holds. Written
+    /// as a denylist the same names would read almost identically and fail the opposite way.
+    ///
+    /// **Catches:** inverting the default, matching by substring or prefix, or moving a
+    /// view-dependent name onto the allowlist.
+    #[test]
+    fn only_a_bundle_intrinsic_reason_is_definitive() {
+        for definitive in [
+            "FAILED: BAD_AGGREGATE_SIGNATURE",
+            "FAILED: MINTING_COIN",
+            "FAILED: RESERVE_FEE_CONDITION_FAILED",
+            // The composition is not part of the claim: a bare reason is still a reason.
+            "BAD_AGGREGATE_SIGNATURE",
+            // Case is the source's choice, not a classification.
+            "FAILED: bad_aggregate_signature",
+        ] {
+            assert!(
+                super::refusal_is_bundle_intrinsic(definitive),
+                "{definitive} is a property of the bundle; holding it for the full TTL strands a \
+                 user's coins over a spend no node will ever admit"
+            );
+        }
+
+        for held in [
+            // The #460 path, verbatim: a second destination reporting its OWN mempool.
+            "FAILED: ALREADY_INCLUDING_TRANSACTION",
+            "FAILED: DOUBLE_SPEND",
+            "FAILED: MEMPOOL_CONFLICT",
+            // A node that has not caught up, not a bad bundle.
+            "FAILED: UNKNOWN_UNSPENT",
+            // Per-node relay policy.
+            "FAILED: INVALID_FEE_LOW_FEE",
+            "FAILED: INVALID_FEE_TOO_CLOSE_TO_ZERO",
+            // Evaluated against the asked node's peak.
+            "FAILED: ASSERT_HEIGHT_ABSOLUTE_FAILED",
+            "FAILED: ASSERT_SECONDS_RELATIVE_FAILED",
+            // Nothing this crate enumerated -- must land on the safe side.
+            "FAILED: THE_NODE_WAS_HAVING_A_BAD_DAY",
+            "PENDING: ",
+            "",
+            // An allowlisted name EMBEDDED in wider text is not a match: exact only.
+            "FAILED: MEMPOOL_CONFLICT (see also BAD_AGGREGATE_SIGNATURE)",
+            "FAILED: BAD_AGGREGATE_SIGNATURE_MAYBE",
+        ] {
+            assert!(
+                !super::refusal_is_bundle_intrinsic(held),
+                "{held:?} was treated as the network's definitive verdict; another push \
+                 destination may be holding this very bundle"
+            );
+        }
     }
 
     /// **The hex form round-trips.** Pinned because the wire carries hex, not a struct: a bundle

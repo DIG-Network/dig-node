@@ -5488,9 +5488,25 @@ runs from stranding a coin permanently. Failing to record a reservation MUST NOT
 mempool already accepted.
 
 A push MUST reserve its inputs unless the network DEFINITIVELY refused the bundle. A refusal is
-definitive only when the mempool stated its reason (`accepted:false` WITH a `rejection`); a bare
-denial carrying no reason, and any transport failure, MUST be treated as POSSIBLY IN FLIGHT and hold
-the inputs to the TTL. The node cannot distinguish "never relayed" from "relayed, and the
+definitive only when the mempool stated its reason (`accepted:false` WITH a `rejection`) AND that
+reason is a property of the BUNDLE rather than of the answering node's own view; a bare denial
+carrying no reason, a refusal whose stated reason is view-dependent, a refusal whose reason the node
+does not recognise, and any transport failure MUST all be treated as POSSIBLY IN FLIGHT and hold the
+inputs to the TTL.
+
+A single push is not a single transmission: the chain client relays to UP TO THREE destinations in
+turn and only the LAST answer is observed, and the earlier attempts fail in ways that do not
+distinguish "never transmitted" from "transmitted, admitted, and the acknowledgement was lost". A
+refusal MUST therefore NOT be read as the network's verdict merely because a destination stated one.
+A reason that reports the answering node's OWN mempool or chain view — a conflict with a bundle it
+already holds, a coin it has not yet seen, a relay-fee policy, a timelock evaluated against its own
+peak — MUST NOT free the inputs, because the destination that answered may be refusing precisely
+BECAUSE an earlier destination admitted the bundle.
+
+The set of bundle-intrinsic reasons MUST be an ALLOWLIST whose default is to HOLD. The reason text is
+supplied by an untrusted source (§13), so an unrecognised reason MUST hold rather than free: the
+enumeration cannot be complete, and a node MUST NOT be made to free a user's inputs by a reason
+nobody foresaw. A node MUST match an allowlisted reason EXACTLY, never as a substring or prefix. The node cannot distinguish "never relayed" from "relayed, and the
 acknowledgement was lost", and under §13 every dialled peer is untrusted, so a source that denies a
 relay it performed MUST NOT thereby return the coins to selection — a second send inside the
 confirmation window could otherwise reselect the same inputs. The TTL MUST NOT be shortened to
