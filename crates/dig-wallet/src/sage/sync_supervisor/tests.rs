@@ -1593,16 +1593,26 @@ async fn dropping_a_session_clears_its_subscription_facts() {
 /// `Syncing`.
 ///
 /// The new variant must not swallow the genuine catching-up case it sits next to.
+///
+/// FIXTURE DESIGN - the peer tier is OBSERVABLE and LEVEL with a recorded replica peak. It was
+/// `UNOBSERVABLE` against a db with no peak until dig-node#495, when an unmeasured chain height and
+/// an unmeasured replica height each became independently sufficient to withhold `Synced`. Those
+/// two inputs were inert here before and are decisive now, so the old fixture reported `Syncing`
+/// even with the `initial_sync_complete` clause deleted from the `Synced` arm. Levelling both
+/// heights closes every other route to `Syncing` and re-points the test at the unfinished
+/// catch-up, which is the only property it names.
 #[tokio::test]
 async fn an_enrolled_wallet_mid_catch_up_still_reports_syncing() {
     let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
     handle.set_trust(true);
     handle.set_watched(3, true);
 
     let status = handle
-        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .status(&db, tier_at(FROZEN_REPLICA_PEAK))
         .await
         .unwrap();
     assert_eq!(status.phase, SyncPhase::Syncing);
