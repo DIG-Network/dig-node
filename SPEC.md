@@ -1538,7 +1538,9 @@ mutation or custody method is ever open.
 ### 7.3a. The daemon state dir — location, ACL, threat model (#501)
 
 The state dir holds ONLY the control/auth state — the control token (§7.3) and the paired-token
-store (`paired-tokens.json`, §7.11). The bulk per-user `.dig` cache and `config.json` (§3.5–3.6) do
+store (`paired-tokens.json`, §7.11). The CLIENT-side paired token (§7.11a) is NOT in this dir: it
+lives at `<user_state_dir>/client-token`, owned by the invoking user, so an unprivileged client can
+hold a token without any machine-wide path being widened. The bulk per-user `.dig` cache and `config.json` (§3.5–3.6) do
 NOT move; they stay per-user (shared with the browser/digstore, #96).
 
 **Resolution order** (the daemon and every operator CLI MUST resolve this identically, so it MUST
@@ -2274,6 +2276,51 @@ and REVOCABLE. All token comparisons are constant-time.
 **Paired-token store.** `<state_dir>/paired-tokens.json` (§7.3a) = `{ "tokens": [{ id, token,
 client_name, created_ms }] }`, restricted (dir ACL), atomic writes. The auth gate accepts the master token OR any token in
 this store (except for the pairing-administration methods).
+
+### 7.11a. Client-side pairing and the CLI token ladder (#403)
+
+An MV3 extension is not the only client that cannot read `<state_dir>/control-token`. On a `.deb`
+install that file is `0600 root:root` and its directory `0700 root:root` (§7.3a), so an ORDINARY OS
+USER driving the CLI is in exactly the extension's position: the node is running, the user is on the
+machine, and every token-gated `control.*` verb is out of reach. The remedy MUST NOT be to widen the
+mode — the master token is the master capability, and it authorizes pairing administration and
+chain authority over the wallet replica (§7.11, §18.16).
+
+**`dig-node pair connect [--client-name NAME]`** is the CLIENT half of the §7.11 handshake, and the
+one `pair` verb that requires NO token. It MUST:
+
+1. call the OPEN `pairing.request { client_name }` (never the gated client — a requester holds no
+   token by definition, and routing an open method through the gated path fails with an elevation
+   remedy for a question the node answers to anyone);
+2. DISPLAY the returned `pairing_code` and name the operator's command
+   (`sudo dign pair approve <pairing_id>`), so the compare-codes consent step of §7.11 is performed;
+3. poll the OPEN `pairing.poll { pairing_id }` to a TERMINAL state, bounded by the server's own
+   `expires_ms` rather than by a local retry count, and terminate on expiry rather than spin;
+4. on `status: "approved"`, persist the delivered token to the INVOKING USER's own state dir
+   (`<user_state_dir>/client-token`, §7.3a), owner-only (`0600` on Unix).
+
+`client_name` is bounded by the same 64-character REFUSAL bound the node applies (§7.11): an
+over-long name MUST be refused, never shortened. A name this client shortened is a name the client
+partly wrote, and the operator approves what they are shown.
+
+**The token ladder.** Every CLI `control.*` call selects its token in this fixed order:
+
+1. the MASTER control token, when this account can read it;
+2. otherwise this user's paired token from `<user_state_dir>/client-token`, when present;
+3. otherwise the master read's own error, VERBATIM — its kind (which sets the CLI exit code) and its
+   remedy text (§7.3) MUST both survive unchanged, because that sentence is what tells the user how
+   to become able to act.
+
+Rung 1 MUST NOT consult the per-user store: a user who can read the master token never reads a
+paired one. The selection MUST be expressed as a function of the two read OUTCOMES rather than as a
+compile-time platform branch, because the unprivileged case cannot be reproduced by a test process
+that is privileged, and a `cfg!` branch is exercised only on the platform that compiles it.
+
+**What pairing a CLI client does NOT grant.** The paired token remains SCOPED and REVOCABLE
+(§7.11): it cannot drive `control.pairing.*` and it cannot drive `control.chiaPeers.add`/`.remove`.
+Pairing a user therefore never confers pairing administration or chain authority, and no file mode
+changes anywhere in the flow. Revocation is unchanged: `sudo dign pair revoke <token_id>` invalidates
+it on the very next request.
 
 ### 7.12. Paired-token authorization for wallet methods (#370)
 

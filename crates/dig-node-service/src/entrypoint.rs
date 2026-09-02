@@ -760,7 +760,7 @@ enum PairCommand {
         token_id: String,
     },
     /// Ask this node for a scoped control token for YOUR account, then wait for the operator
-    /// to approve it (#403). Needs no elevation and no master token.
+    /// to approve it. Needs no elevation and no master token.
     Connect {
         /// The label the operator sees when approving. Defaults to `dign CLI (<user>)`.
         /// Refused, never shortened, above 64 characters.
