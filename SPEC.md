@@ -1539,7 +1539,14 @@ mutation or custody method is ever open.
 ### 7.3a. The daemon state dir — location, ACL, threat model (#501)
 
 The state dir holds ONLY the control/auth state — the control token (§7.3) and the paired-token
-store (`paired-tokens.json`, §7.11). The bulk per-user `.dig` cache and `config.json` (§3.5–3.6) do
+store (`paired-tokens.json`, §7.11). The CLIENT-side paired token (§7.11a) is NOT in this dir: it
+lives at `<per_user_base>/DigNode/client-token`, owned by the invoking user, so an unprivileged
+client can hold a token without any machine-wide path being widened. `<per_user_base>` is the
+platform per-user base — `$HOME` on Unix/macOS, `%LOCALAPPDATA%` on Windows. It MUST be resolved
+directly from that base and MUST NOT be resolved through the cache resolver, whose unwritable-dir
+fallback is a PID-keyed directory under the system temp dir: a world-writable temp directory is
+never an acceptable location for a bearer credential. When no per-user base can be resolved, the
+client MUST REFUSE to store the token rather than degrade to the current working directory. The bulk per-user `.dig` cache and `config.json` (§3.5–3.6) do
 NOT move; they stay per-user (shared with the browser/digstore, #96).
 
 **Resolution order** (the daemon and every operator CLI MUST resolve this identically, so it MUST
@@ -1568,6 +1575,24 @@ is a property of a SERVICE RUN and not of one packaging target.
 
 An `DIG_IDENTITY_DIR` / `DIG_NODE_CACHE` value the operator set explicitly MUST be preserved; a CLI
 run MUST be left untouched, keeping the user's identity shared with their other DIG tools.
+
+**The wallet base — same anchoring, with one condition.** The node's operator wallet (§16.4) resolves
+its base from `DIG_WALLET_BASE`, then `%LOCALAPPDATA%`, then `$HOME`. Inside the packaged systemd
+unit none of those is set: the unit declares no `User=`, so systemd sets no `$HOME`, and no
+`WorkingDirectory=`, so the working directory is `/`. A relative fallback therefore resolves the seed
+to `/DigWallet/seed.bin`, and that write SUCCEEDS — the unit runs as root and `ProtectSystem=full`
+leaves `/` writable — so the node operates normally with its wallet at the filesystem root.
+
+A SERVICE run MUST therefore anchor `DIG_WALLET_BASE` at the resolved state dir, giving
+`<state_dir>/DigWallet/seed.bin` and `<state_dir>/DigNode/device/device.key`. The override names the
+BASE and never either directory: both roots MUST derive from one value, or the sibling relationship
+§16.4 requires could be broken by configuration alone.
+
+It MUST be adopted ONLY when no wallet is present at the base the service would otherwise have
+resolved. The operator wallet holds real $DIG for mirror-coin collateral, so re-rooting a host that
+already has one would leave the funded seed unreferenced and mint an empty replacement; a Windows
+LocalSystem service, whose `%LOCALAPPDATA%` IS set, is exactly that case. Presence that cannot be
+DETERMINED MUST count as present. Key material MUST NOT be moved or copied automatically.
 
 **Creation + ACL — the HARDENING CONTRACT.** The state dir holds the control token that grants FULL
 local control, so its ACL MUST NOT be world/all-users-readable. On Windows this is the HARD case:
@@ -1663,7 +1688,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
 | `control.cache.get` | — | `cap_bytes`, `used_bytes`, `capsule_bytes`, `response_bytes`, `dir`, `shared` |
 | `control.profile.putBody` | `store_id`, `root` (64-hex), `body_b64` (standard padded base64 of the DPB bytes) | `stored: true`, `store_id`, `root`, `body_bytes`, `announced_to_peers`, `unreachable_peers`. `announced_to_peers` is a TRUE delivery count — peers the 223 announce was actually sent to, excluding lazy and NAT-bound peers that are connected but cannot be pushed to — so `0` does NOT mean failure and MUST NOT be treated as one: the body is persisted either way and the periodic re-announce reaches whoever connects later. `unreachable_peers` reports that connected-but-unreachable remainder, so a caller can distinguish "no peers exist" from "peers exist and none could be reached". The node MUST independently resolve the root on chain and refuse unless the chain confirms exactly that root AND the bytes hash to it (§22.3). A refusal is an ERROR, never an `Ok` carrying `stored: false`. A decoded body above `MAX_BODY_BYTES` (4 MiB) is `INVALID_PARAMS` before anything is persisted. |
-| `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`, `standing`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. `standing` is `{state, chain_root, held_roots, detail}` and carries §22.5c's reconciliation: `state` is one of `current` / `superseded` / `nothing_held` / `no_generation` / `chain_unreadable`, and it is what distinguishes an un-published store from an empty one — `body_b64: null` alone is the same answer for at least four different situations. `chain_root` is `null` (NEVER an all-zero root, which the body format rejects outright) whenever the chain named none or could not be read. The chain read is ADDITIVE: `body_b64` keeps its exact meaning as the disk read at the REQUESTED root, a failed disk read is still `CONTROL_ERROR`, and a chain read that RETURNS an error degrades to `state: "chain_unreadable"` rather than failing the call — a node whose chain access is down MUST still be able to answer what it holds. Named limitation: a chain source that is UNRESPONSIVE rather than failing returns no error to degrade on, so it blocks this call for as long as it blocks — exactly as it already does for `control.profile.putBody`, which resolves the same root through the same resolver as its FIRST action. Bounding that read is one change across both methods, not a bound on this one alone. |
+| `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`, `standing`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. `standing` is `{state, chain_root, held_roots, detail}` and carries §22.5c's reconciliation: `state` is one of `current` / `superseded` / `nothing_held` / `no_generation` / `chain_unreadable` / `held_unreadable`, and it is what distinguishes an un-published store from an empty one — `body_b64: null` alone is the same answer for at least four different situations. `chain_root` is `null` (NEVER an all-zero root, which the body format rejects outright) whenever the chain named none or could not be read. `held_roots` is `null` when the local store could not be enumerated — distinct from `[]`, which means consulted-and-holds-nothing. A node MUST NOT report an unreadable local store as an empty one, and when the local read fails the node MUST report `state: "held_unreadable"` WITHOUT consulting the chain, because a chain read must never be able to mask a broken disk, the one condition whose remedy is on that machine. The chain read is ADDITIVE: `body_b64` keeps its exact meaning as the disk read at the REQUESTED root, a failed disk read is still `CONTROL_ERROR`, and a chain read that RETURNS an error degrades to `state: "chain_unreadable"` rather than failing the call — a node whose chain access is down MUST still be able to answer what it holds. Named limitation: a chain source that is UNRESPONSIVE rather than failing returns no error to degrade on, so it blocks this call for as long as it blocks — exactly as it already does for `control.profile.putBody`, which resolves the same root through the same resolver as its FIRST action. Bounding that read is one change across both methods, not a bound on this one alone. |
 | `control.cache.setCap` | `cap_bytes` (number) | `cap_bytes` (floored at 64 MiB) |
 | `control.cache.clear` | — | `cleared: true` |
 | `control.hostedStores.list` | — | `stores[]`: `store_id`, `pinned`, `capsule_count`, `total_bytes`, `capsules[]` (capsule, root, size_bytes, last_used_unix_ms) — cached stores ∪ pinned stores |
@@ -2275,6 +2300,62 @@ and REVOCABLE. All token comparisons are constant-time.
 **Paired-token store.** `<state_dir>/paired-tokens.json` (§7.3a) = `{ "tokens": [{ id, token,
 client_name, created_ms }] }`, restricted (dir ACL), atomic writes. The auth gate accepts the master token OR any token in
 this store (except for the pairing-administration methods).
+
+### 7.11a. Client-side pairing and the CLI token ladder (#403)
+
+An MV3 extension is not the only client that cannot read `<state_dir>/control-token`. On a `.deb`
+install that file is `0600 root:root` and its directory `0700 root:root` (§7.3a), so an ORDINARY OS
+USER driving the CLI is in exactly the extension's position: the node is running, the user is on the
+machine, and every token-gated `control.*` verb is out of reach. The remedy MUST NOT be to widen the
+mode — the master token is the master capability, and it authorizes pairing administration and
+chain authority over the wallet replica (§7.11, §18.16).
+
+The unreadable-master-token remedy (§7.3) is read ONLY by a caller holding neither token, i.e. by
+definition an unprivileged one. On Unix it MUST therefore name `dign pair connect` — the verb THAT
+reader can run, unelevated — in addition to the operator's `sudo dign pair approve <pairing_id>`.
+Naming only the elevated half directs the one audience that sees the message to a command it cannot
+execute.
+
+**`dig-node pair connect [--client-name NAME]`** is the CLIENT half of the §7.11 handshake, and the
+one `pair` verb that requires NO token. It MUST:
+
+1. call the OPEN `pairing.request { client_name }` (never the gated client — a requester holds no
+   token by definition, and routing an open method through the gated path fails with an elevation
+   remedy for a question the node answers to anyone);
+2. DISPLAY the returned `pairing_code` and name the operator's command
+   (`sudo dign pair approve <pairing_id>`), so the compare-codes consent step of §7.11 is performed;
+3. poll the OPEN `pairing.poll { pairing_id }` to a TERMINAL state, bounded by the server's own
+   `expires_ms` rather than by a local retry count, and terminate on expiry rather than spin;
+4. on `status: "approved"`, persist the delivered token to the INVOKING USER's own per-user base
+   (`<per_user_base>/DigNode/client-token`, §7.3a). The file MUST be created EXCLUSIVELY and
+   owner-only in a single step (`O_CREAT|O_EXCL` at mode `0600` on Unix), never written first and
+   restricted afterwards: a write-then-chmod leaves the token readable under the process umask for
+   a window, and a plain write FOLLOWS a symlink planted at that path — which discloses the token,
+   or clobbers an arbitrary file, as the invoking user. Replacing this user's OWN existing store on
+   a re-pair is permitted and MUST unlink it rather than write through it.
+
+`client_name` is bounded by the same 64-character REFUSAL bound the node applies (§7.11): an
+over-long name MUST be refused, never shortened. A name this client shortened is a name the client
+partly wrote, and the operator approves what they are shown.
+
+**The token ladder.** Every CLI `control.*` call selects its token in this fixed order:
+
+1. the MASTER control token, when this account can read it;
+2. otherwise this user's paired token from `<per_user_base>/DigNode/client-token`, when present (an unresolvable per-user base counts as "no paired token", not an error);
+3. otherwise the master read's own error, VERBATIM — its kind (which sets the CLI exit code) and its
+   remedy text (§7.3) MUST both survive unchanged, because that sentence is what tells the user how
+   to become able to act.
+
+Rung 1 MUST NOT consult the per-user store: a user who can read the master token never reads a
+paired one. The selection MUST be expressed as a function of the two read OUTCOMES rather than as a
+compile-time platform branch, because the unprivileged case cannot be reproduced by a test process
+that is privileged, and a `cfg!` branch is exercised only on the platform that compiles it.
+
+**What pairing a CLI client does NOT grant.** The paired token remains SCOPED and REVOCABLE
+(§7.11): it cannot drive `control.pairing.*` and it cannot drive `control.chiaPeers.add`/`.remove`.
+Pairing a user therefore never confers pairing administration or chain authority, and no file mode
+changes anywhere in the flow. Revocation is unchanged: `sudo dign pair revoke <token_id>` invalidates
+it on the very next request.
 
 ### 7.12. Paired-token authorization for wallet methods (#370)
 
@@ -4532,6 +4613,10 @@ protected `D:P(A;;FA;;;<user>)` DACL on Windows, never the ACL inherited from `%
 | `<wallet_dir>/seed.bin` | the sealed mnemonic — format unchanged |
 | `<device_dir>/device.key` | 32 raw CSPRNG bytes, no header |
 | `<wallet_dir>/wallet.meta.json` | `origin`, `created_at` (RFC 3339), `ever_funded` |
+
+`<user_base>` is resolved from `DIG_WALLET_BASE`, then `%LOCALAPPDATA%`, then `$HOME`, by ONE resolver
+that both roots below use. A service run anchors that base at the machine state dir under the
+condition stated in §7.3a.
 
 `<device_dir>` is `<user_base>/DigNode/device/` — a **SIBLING** of `<wallet_dir>`
 (`<user_base>/DigWallet/`), never a child. **That separation IS the partial-exfiltration boundary and
@@ -7712,7 +7797,7 @@ anywhere and is invisible to the publisher, who is the only party that can fix i
 therefore surface a store whose held bodies are all superseded — in its own log on each sweep, and
 in `control.profile.getBody`'s `standing` (§10) — naming the chain's current root and the remedy.
 
-A node MUST distinguish these five standings, because each needs a different remedy and a caller
+A node MUST distinguish these six standings, because each needs a different remedy and a caller
 shown a merged answer cannot choose between them:
 
 | `state` | Means | Remedy |
@@ -7722,6 +7807,7 @@ shown a merged answer cannot choose between them:
 | `nothing_held` | the chain names a root, this node holds nothing for the store | publish here |
 | `no_generation` | the chain reports no confirmed generation | an unconfirmed mint, or a store id naming nothing |
 | `chain_unreadable` | the chain could not be read | the standing is UNKNOWN, not absent; fix chain access |
+| `held_unreadable` | the node's own store directory could not be enumerated | what this node holds is UNKNOWN, not absent; fix local disk access. `held_roots` is `null` here, and the chain is NOT consulted |
 
 ### 22.6. Penalization is narrow (MUST NOT widen)
 
@@ -8887,6 +8973,17 @@ a stolen bond.
 **One locate is bounded work.** The size of a located set is chosen by whoever answered the lookup,
 so a node MUST bound the number of bonds it reads against a chain per locate, verifying in source
 order and leaving the remainder at baseline.
+
+**A `bonded` verdict MUST rest on AGREEMENT across independently drawn, concurrently-held untrusted
+peers -- never on one source.** The §25.6 checks establish that a coin and its creating spend are
+internally consistent; none of them establishes that the coin was ever on chain. A coin currying the
+real, public $DIG CAT puzzle around an invented parent satisfies every one of them, so a verdict
+taken from a single provider promotes a bond that does not exist, at no collateral cost to whoever
+published it. The two reads that decide the verdict -- the coin record, and the spend that created
+it -- MUST each be corroborated: below the corroboration floor, or on disagreement, the verdict is
+`unverified` and MUST NOT be `bonded`. A node MUST NOT fall back to a single source when
+corroboration is unavailable, because falling through to one endpoint exactly when the peers failed
+to agree lets that endpoint overrule them.
 
 The verification is performed in the ORDER §25.6 states, with one refinement that is normative: the
 `advertises` binding is checked BEFORE the collateral magnitude. A node that has not censused the

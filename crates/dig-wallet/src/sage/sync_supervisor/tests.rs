@@ -1124,20 +1124,16 @@ async fn phase_is_syncing_when_caught_up_but_no_peer() {
     // A peer whose trust is unresolved may not write, and a non-writing session cannot be synced
     // (dig_ecosystem#2666). This fixture is about the PEER COUNT, so give it a corroborated peer.
     handle.set_trust(true);
+    // The tier is OBSERVABLE and level with the replica, so the SUBSCRIPTION peer count is the
+    // only axis varied below. An unobservable tier would withhold the synced claim for its own
+    // reason (dig-node#495), and this test would stop being about the peer count at all.
     assert_eq!(
-        handle
-            .status(&db, ChainPeerTier::UNOBSERVABLE)
-            .await
-            .unwrap()
-            .phase,
+        handle.status(&db, tier_at(6_000_000)).await.unwrap().phase,
         SyncPhase::Synced
     );
 
     handle.set_connected(0);
-    let status = handle
-        .status(&db, ChainPeerTier::UNOBSERVABLE)
-        .await
-        .unwrap();
+    let status = handle.status(&db, tier_at(6_000_000)).await.unwrap();
     assert_eq!(
         status.phase,
         SyncPhase::Syncing,
@@ -1164,22 +1160,17 @@ async fn phase_ladder_not_started_syncing_synced() {
 
     handle.set_connected(1);
     handle.set_trust(true);
+    // Level with its peers throughout, so the LATCH is the only axis varied across the rungs
+    // (dig-node#495: an unmeasured height withholds `Synced` on its own).
+    db.set_peak(6_000_000, "aa").await.unwrap();
     assert_eq!(
-        handle
-            .status(&db, ChainPeerTier::UNOBSERVABLE)
-            .await
-            .unwrap()
-            .phase,
+        handle.status(&db, tier_at(6_000_000)).await.unwrap().phase,
         SyncPhase::Syncing
     );
 
     db.force_initial_sync_complete_for_test(true).await.unwrap();
     assert_eq!(
-        handle
-            .status(&db, ChainPeerTier::UNOBSERVABLE)
-            .await
-            .unwrap()
-            .phase,
+        handle.status(&db, tier_at(6_000_000)).await.unwrap().phase,
         SyncPhase::Synced
     );
 }
@@ -1421,6 +1412,9 @@ async fn a_previously_synced_wallet_restarted_locked_is_not_reported_as_synced()
 async fn a_completed_catch_up_still_reports_synced_while_watching_addresses() {
     let db = WalletDb::open_in_memory().await.unwrap();
     db.force_initial_sync_complete_for_test(true).await.unwrap();
+    // Both heights measured and level: a control for the arm ordering must not be prevented from
+    // reaching `Synced` by the unmeasured-height rule (dig-node#495), or it stops being a control.
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
@@ -1429,7 +1423,7 @@ async fn a_completed_catch_up_still_reports_synced_while_watching_addresses() {
 
     assert_eq!(
         handle
-            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .status(&db, tier_at(FROZEN_REPLICA_PEAK))
             .await
             .unwrap()
             .phase,
@@ -1599,16 +1593,26 @@ async fn dropping_a_session_clears_its_subscription_facts() {
 /// `Syncing`.
 ///
 /// The new variant must not swallow the genuine catching-up case it sits next to.
+///
+/// FIXTURE DESIGN - the peer tier is OBSERVABLE and LEVEL with a recorded replica peak. It was
+/// `UNOBSERVABLE` against a db with no peak until dig-node#495, when an unmeasured chain height and
+/// an unmeasured replica height each became independently sufficient to withhold `Synced`. Those
+/// two inputs were inert here before and are decisive now, so the old fixture reported `Syncing`
+/// even with the `initial_sync_complete` clause deleted from the `Synced` arm. Levelling both
+/// heights closes every other route to `Syncing` and re-points the test at the unfinished
+/// catch-up, which is the only property it names.
 #[tokio::test]
 async fn an_enrolled_wallet_mid_catch_up_still_reports_syncing() {
     let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
     handle.set_trust(true);
     handle.set_watched(3, true);
 
     let status = handle
-        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .status(&db, tier_at(FROZEN_REPLICA_PEAK))
         .await
         .unwrap();
     assert_eq!(status.phase, SyncPhase::Syncing);
@@ -3242,14 +3246,24 @@ async fn the_following_tolerance_holds_at_the_bound_and_fails_one_beyond_it() {
     );
 }
 
-/// **Proves (dig_ecosystem#2851):** an unmeasured height on EITHER side leaves the phase exactly as
-/// it was.
+/// **Proves (dig-node#495):** an unmeasured height on EITHER side WITHHOLDS the `Synced` claim.
 ///
-/// The Option-honesty guard. `None` is unobservable, never a zero, and an unobservable gap is not
-/// an accusation — a node with no chain transport must not be reported as behind a chain it cannot
-/// see.
+/// This test previously asserted the opposite, and that expectation was wrong in two ways worth
+/// stating rather than quietly deleting.
+///
+/// It GENERALISED a justification that only ever applied to ONE side. "An unobservable gap is not
+/// an accusation" is sound about the PEER tier: a node whose chain transport was never built has
+/// no second opinion, and a missing second opinion must not be spent as evidence against the
+/// replica. It says nothing about a missing REPLICA height, which is the subject of the claim
+/// having no measurement whatsoever.
+///
+/// And it treated a phase as the ABSENCE OF AN ACCUSATION. `Synced` is a positive claim of
+/// currency, so it needs evidence FOR itself, not merely the lack of evidence against.
+/// [`SyncPhase::Syncing`] already covers both cases in its own words: the replica is "otherwise
+/// not both caught up AND currently following the chain" — and with either height missing,
+/// "currently following" cannot be established.
 #[tokio::test]
-async fn an_unmeasured_height_leaves_the_phase_unchanged() {
+async fn an_unmeasured_height_on_either_side_withholds_the_synced_claim() {
     let db = WalletDb::open_in_memory().await.unwrap();
     db.force_initial_sync_complete_for_test(true).await.unwrap();
 
@@ -3261,8 +3275,8 @@ async fn an_unmeasured_height_leaves_the_phase_unchanged() {
     // The replica's own peak is unknown; the peers' is far ahead.
     assert_eq!(
         handle.status(&db, tier_at(PEERS_PEAK)).await.unwrap().phase,
-        SyncPhase::Synced,
-        "an unknown replica peak was read as evidence of being behind"
+        SyncPhase::Syncing,
+        "a replica that cannot name its own height claimed to be current at it"
     );
 
     // The replica's peak is known; nobody has measured the peers'.
@@ -3273,8 +3287,8 @@ async fn an_unmeasured_height_leaves_the_phase_unchanged() {
             .await
             .unwrap()
             .phase,
-        SyncPhase::Synced,
-        "an unobservable peer tier was read as evidence against the replica"
+        SyncPhase::Syncing,
+        "a replica with no second opinion was reported as current on that basis alone"
     );
 }
 
@@ -4292,9 +4306,11 @@ async fn one_host_is_one_voice_however_many_ports_it_answers_on() {
 /// watched addresses put the fixture squarely on the path that actually reaches `Synced`, which is
 /// the only path this ticket is about.
 ///
-/// The peer tier is `UNOBSERVABLE` so [`is_following`] answers `true` and cannot be the thing that
-/// fails the assertion: an unmeasured chain peak already returns the phase unchanged, so a fixture
-/// carrying a lagging tier peak would go green against a node that never learned about refusal.
+/// The peer tier is OBSERVABLE and LEVEL with the replica so the refusal is the only thing that
+/// can fail the assertion. It was `UNOBSERVABLE` until dig-node#495, on the reasoning that an
+/// unmeasured chain peak returned the phase unchanged; that is no longer true - an unmeasured
+/// height now withholds `Synced` by itself, which would have made this test pass against a node
+/// that never learned about refusal at all. A lagging tier peak would be vacuous the same way.
 ///
 /// What the user saw before: `{phase: "synced", peak_height: <frozen>}` on a node whose every
 /// frame is dropped before any DB write — unbounded, invisible staleness reported as settled.
@@ -4303,6 +4319,7 @@ async fn a_refused_writer_is_not_reported_as_synced() {
     let db = WalletDb::open_in_memory().await.unwrap();
     // The catch-up genuinely completed in an earlier run; the flag is persistent.
     db.force_initial_sync_complete_for_test(true).await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
@@ -4312,7 +4329,7 @@ async fn a_refused_writer_is_not_reported_as_synced() {
     handle.set_watched(3, true);
 
     let status = handle
-        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .status(&db, tier_at(FROZEN_REPLICA_PEAK))
         .await
         .unwrap();
     assert_ne!(
@@ -4874,4 +4891,200 @@ async fn a_frame_on_a_live_session_attributes_through_the_update_loop() {
     );
 
     h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// A synced phase must carry the heights that bound it (dig-node#495)
+// ---------------------------------------------------------------------------
+
+/// **Proves (dig-node#495):** a replica that has never recorded a peak of its own is never
+/// reported as `Synced`, however complete its latched catch-up is.
+///
+/// This state is production-reachable, not hypothetical.
+/// [`crate::sage::db::WalletDb::latch_synced_over_unless_reset`] sets `initial_sync_complete`
+/// without ever writing a peak — its own doc says the path "has replayed nothing and has no
+/// terminal height to offer". With a may-write session attached, that emitted
+/// `{phase: "synced", peak_height: null}`: a positive claim of currency beside a refusal to say
+/// what height it is current AT.
+///
+/// FIXTURE DESIGN: everything else on the ladder is the honest, synced-reaching case — latched
+/// catch-up, a peer attached now, write authority, a non-empty watched set — so the ONLY thing
+/// that can withhold the claim is the missing replica peak. The peers are deliberately far ahead
+/// so the gap would be damning if it could be computed at all.
+#[tokio::test]
+async fn a_replica_with_no_peak_of_its_own_is_never_reported_as_synced() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
+    // No `set_peak`: this replica has no terminal height to offer.
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(1, true);
+
+    let status = handle.status(&db, tier_at(PEERS_PEAK)).await.unwrap();
+    assert_ne!(
+        status.phase,
+        SyncPhase::Synced,
+        "a replica with no peak of its own claimed to be current at a height it cannot name"
+    );
+    assert_eq!(status.phase, SyncPhase::Syncing);
+    // The measurement stays honest: unknown is still reported as unknown, never fabricated.
+    assert_eq!(
+        status.peak_height, None,
+        "an absent replica peak must not be invented to make the payload look complete"
+    );
+}
+
+/// **Proves (dig-node#495):** a replica with no second opinion about the chain tip is never
+/// reported as `Synced`.
+///
+/// [`crate::sage::fallback::ChainPeerTier::peak_height`] is `None` until one of the node's own
+/// peers says something. A replica thousands of blocks behind then reported `synced` purely
+/// because nothing was in a position to contradict it — the shape of dig-node#416, whose measured
+/// lag was 8,380 blocks.
+///
+/// FIXTURE DESIGN: the replica DOES know its own peak here, so the two unmeasured arms stay
+/// distinguishable — this half fails only for the missing peer height, and its sibling above only
+/// for the missing replica height. The payload assertion is the point: `chia_peer_peak_height`
+/// stays `None`, which is what reports this case DISTINCTLY from a measured lag.
+#[tokio::test]
+async fn a_replica_with_no_second_opinion_is_never_reported_as_synced() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.force_initial_sync_complete_for_test(true).await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(1, true);
+
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
+    assert_ne!(
+        status.phase,
+        SyncPhase::Synced,
+        "a replica nothing was able to contradict was reported as current on that basis alone"
+    );
+    assert_eq!(status.phase, SyncPhase::Syncing);
+    assert_eq!(
+        status.chia_peer_peak_height, None,
+        "the unmeasured peer tier is what makes this case distinguishable, and it must be \
+         reported as unmeasured rather than as an observed zero"
+    );
+    assert_eq!(status.peak_height, Some(FROZEN_REPLICA_PEAK));
+}
+
+/// **Proves (dig-node#495):** ACROSS THE WHOLE INPUT SPACE of the phase ladder, `Synced` implies
+/// both bounding heights are present. The pairing this ticket removes is unrepresentable, not
+/// merely absent from a chosen fixture.
+///
+/// FIXTURE DESIGN: the full cross-product of every input [`SyncHandle::status`] reads — the
+/// replica peak, the peer peak, the latched flag, the session's history (never attached, attached
+/// then dropped, attached now), its write authority, its resolved watched set, and whether a
+/// wallet is enrolled. A single hand-picked fixture would prove only that ONE route to `Synced`
+/// carries its heights; the grid proves every route does.
+///
+/// THE NON-VACUITY ASSERTION IS LOAD-BEARING. An implication over an input space that never
+/// reaches `Synced` holds trivially, so this test would pass against an implementation that
+/// simply never emitted the phase — the strongest possible false green here. Counting the
+/// combinations that DO reach it, and demanding the count be non-zero, is what makes the
+/// implication evidence.
+///
+/// The handle is driven in the order the supervisor learns its facts (connect, then trust, then
+/// the resolved set), because `set_connected(0)` deliberately clears trust and the watched set —
+/// a dropped session's measurement is no longer a measurement.
+#[tokio::test]
+async fn a_synced_phase_always_carries_the_heights_that_bound_it() {
+    /// How the session reached its current state, which is not recoverable from the peer count
+    /// alone: never attaching and attaching-then-dropping both report zero peers, and only the
+    /// first is `NotStarted`.
+    #[derive(Debug, Clone, Copy)]
+    enum Session {
+        NeverConnected,
+        Dropped,
+        Connected,
+    }
+
+    let replica_peaks = [None, Some(FROZEN_REPLICA_PEAK), Some(PEERS_PEAK)];
+    let peer_peaks = [None, Some(PEERS_PEAK)];
+    let sessions = [
+        Session::NeverConnected,
+        Session::Dropped,
+        Session::Connected,
+    ];
+
+    let mut synced_reached = 0usize;
+
+    for replica_peak in replica_peaks {
+        for latched in [false, true] {
+            // One DB per (replica peak, latched) pair: those are the only inputs the DB carries,
+            // and re-opening one per combination would spend the whole grid on migrations.
+            let db = WalletDb::open_in_memory().await.unwrap();
+            if let Some(peak) = replica_peak {
+                db.set_peak(peak, "aa").await.unwrap();
+            }
+            db.force_initial_sync_complete_for_test(latched)
+                .await
+                .unwrap();
+
+            for peer_peak in peer_peaks {
+                for session in sessions {
+                    for may_write in [false, true] {
+                        for watched in [None, Some(0u32), Some(1u32)] {
+                            for wallet_enrolled in [false, true] {
+                                let (handle, _rx) = SyncHandle::new();
+                                match session {
+                                    Session::NeverConnected => {}
+                                    Session::Dropped | Session::Connected => {
+                                        handle.set_connected(1);
+                                        handle.set_trust(may_write);
+                                        if let Some(n) = watched {
+                                            handle.set_watched(n, wallet_enrolled);
+                                        }
+                                        if matches!(session, Session::Dropped) {
+                                            handle.set_connected(0);
+                                        }
+                                    }
+                                }
+
+                                let tier = match peer_peak {
+                                    None => ChainPeerTier::UNOBSERVABLE,
+                                    Some(peak) => tier_at(peak),
+                                };
+                                let status = handle.status(&db, tier).await.unwrap();
+
+                                let combination = format!(
+                                    "replica_peak={replica_peak:?} peer_peak={peer_peak:?} \
+                                     latched={latched} session={session:?} \
+                                     may_write={may_write} watched={watched:?} \
+                                     wallet_enrolled={wallet_enrolled}"
+                                );
+
+                                if status.phase == SyncPhase::Synced {
+                                    synced_reached += 1;
+                                    assert!(
+                                        status.peak_height.is_some(),
+                                        "synced with no replica height, at {combination}"
+                                    );
+                                    assert!(
+                                        status.chia_peer_peak_height.is_some(),
+                                        "synced with no peer height, at {combination}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        synced_reached > 0,
+        "no combination reached Synced, so the implication above held vacuously and proves \
+         nothing about an implementation that does emit the phase"
+    );
 }
