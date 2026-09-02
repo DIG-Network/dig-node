@@ -1393,13 +1393,21 @@ impl WalletBackend {
     ///
     /// - **Wallet-owned address, DB synced** → the local DB is authoritative:
     ///   [`db::WalletDb::balance_scoped`] (confirmed) + [`db::WalletDb::pending_scoped`]
-    ///   (unconfirmed); `source = "db"`, `synced = true`, `peak_height` = the node's own peak.
+    ///   (unconfirmed); `source = "db"`, `peak_height` = the node's own peak.
     /// - **Otherwise** → the fallback (coinset) tier answers; `source = "fallback"`,
-    ///   `synced = false`, `peak_height = null`. If no LIVE fallback is attached, the read
+    ///   `peak_height = null`. If no LIVE fallback is attached, the read
     ///   cannot honestly answer, so it returns a DISTINCT error rather than a fabricated `0`:
     ///   [`BalanceError::NotSynced`] for the wallet's own address (the DB would answer once
     ///   synced), [`BalanceError::NoChainSource`] for an arbitrary address (only a chain
     ///   source could).
+    ///
+    /// **`synced` is NOT one of the routing outcomes above** (dig-node#490). It is computed
+    /// separately, from [`replica_answer_is_current`] — a CURRENCY test — so the routing tier and
+    /// the currency claim are independent, and `{source: "db", synced: false}` is a real,
+    /// reachable, common state: the replica was eligible to answer and is behind the chain. This
+    /// list previously read `synced = true` on the first bullet and `synced = false` on the
+    /// second, which denied a state production produces — and denied it about precisely the
+    /// answer the most useful CLI line renders.
     ///
     /// **Every reported state field describes the tier that answered** (#2233). Reading the
     /// DB's `synced` / `peak_height` on a coinset-served answer would describe the local
