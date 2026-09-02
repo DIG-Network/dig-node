@@ -653,9 +653,18 @@ impl ChainBondVerifier {
         //
         // Re-read per call rather than held from bring-up, matching the mirror pass: a transport
         // built once would make a node that started offline one that never verifies again.
+        //
+        // At the BOND floor, not the sync one (dig-node#513). `CORROBORATION_FLOOR` is two
+        // because the sync path writes the wallet's replica and a refused round stalls it; this
+        // path writes nothing, so a refusal costs `Unverified` -- the tier every record occupies
+        // with no verifier installed -- while believing a two-voice round sells a promotion for
+        // the price of two peers.
         let Ok(source) = self
             .chain
             .corroborated_chain_source(tokio::runtime::Handle::current())
+            .map(|source| {
+                source.requiring_corroboration(dig_wallet::sage::quorum::BOND_CORROBORATION_FLOOR)
+            })
         else {
             return BondVerdict::Unverified;
         };

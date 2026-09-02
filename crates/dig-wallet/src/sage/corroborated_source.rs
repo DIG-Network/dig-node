@@ -60,13 +60,35 @@ use super::peer_reads::PeerCorroboratedReads;
 pub struct CorroboratedChainSource {
     reads: Arc<PeerCorroboratedReads>,
     handle: tokio::runtime::Handle,
+    /// How many peers must corroborate each read. [`super::quorum::CORROBORATION_FLOOR`] unless a
+    /// caller asked for more via [`CorroboratedChainSource::requiring_corroboration`].
+    floor: usize,
 }
 
 impl CorroboratedChainSource {
     /// A source over `reads`, bridging each blocking call onto `handle`.
     #[must_use]
     pub fn new(reads: Arc<PeerCorroboratedReads>, handle: tokio::runtime::Handle) -> Self {
-        Self { reads, handle }
+        Self {
+            reads,
+            handle,
+            floor: super::quorum::CORROBORATION_FLOOR,
+        }
+    }
+
+    /// The same source, refusing any read fewer than `floor` peers corroborate.
+    ///
+    /// The seam a caller whose verdict RANKS a peer uses -- dig-node's mirror bond path passes
+    /// [`super::quorum::BOND_CORROBORATION_FLOOR`] here. It is a caller's choice rather than this
+    /// type's default because the two callers pay opposite prices for a refusal: the sync path
+    /// stalls a replica, the bond path merely declines a promotion.
+    ///
+    /// A `floor` below [`super::quorum::CORROBORATION_FLOOR`] is not honoured; this can only
+    /// tighten.
+    #[must_use]
+    pub fn requiring_corroboration(mut self, floor: usize) -> Self {
+        self.floor = floor.max(super::quorum::CORROBORATION_FLOOR);
+        self
     }
 
     /// Drives one corroborated read to completion from a synchronous caller.
@@ -86,10 +108,31 @@ impl CorroboratedChainSource {
                         .to_string(),
                 ))
             }
-            Ok(_) => Ok(tokio::task::block_in_place(|| self.handle.block_on(fut))),
-            Err(_) => Ok(self.handle.block_on(fut)),
+            Ok(_) => guard_panics(|| tokio::task::block_in_place(|| self.handle.block_on(fut))),
+            Err(_) => guard_panics(|| self.handle.block_on(fut)),
         }
     }
+}
+
+/// Runs `f`, converting a panic into a [`ChainSourceError::Transport`] so the synchronous
+/// [`ChainSource`] boundary never unwinds (dig-node#513).
+///
+/// `chia-query`'s own bridge carries this backstop (`provider_registry::bridge::guard_panics`) and
+/// this adapter, which replaces that bridge on the bond path, must not be weaker than the thing it
+/// replaces. The runtime-flavour check above catches the misuse we can NAME; this catches the ones
+/// we cannot. A panic crossing a `ChainSource` method has no defined behaviour for the caller --
+/// on the bond path it would unwind out of a `block_in_place` inside a locate, taking a read-path
+/// task with it, which turns a chain hiccup into a denial of the read the verdict was decorating.
+///
+/// `AssertUnwindSafe` because the future is consumed exactly once and a panic leaves no observable
+/// half-mutated state behind this facade -- the same reasoning `chia-query` records for its own.
+fn guard_panics<T>(f: impl FnOnce() -> T) -> Result<T, ChainSourceError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| {
+        ChainSourceError::Transport(
+            "corroborated chain source caught a panic while blocking on the async runtime"
+                .to_string(),
+        )
+    })
 }
 
 /// The one spelling of a coin id [`PeerCorroboratedReads`] keys its cache on: lowercase hex, no
@@ -188,7 +231,11 @@ impl ChainSource for CorroboratedChainSource {
     fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
         let key = key_for(coin_id);
         let answer = self
-            .block_on(async { self.reads.coin_record_by_id(&key).await })?
+            .block_on(async {
+                self.reads
+                    .coin_record_by_id_at_floor(&key, self.floor)
+                    .await
+            })?
             .map_err(|e| ChainSourceError::Transport(e.to_string()))?;
         answer
             .as_ref()
@@ -201,7 +248,7 @@ impl ChainSource for CorroboratedChainSource {
     fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
         let key = key_for(coin_id);
         let answer = self
-            .block_on(async { self.reads.coin_spend(&key).await })?
+            .block_on(async { self.reads.coin_spend_at_floor(&key, self.floor).await })?
             .map_err(|e| ChainSourceError::Transport(e.to_string()))?;
         answer
             .as_ref()
@@ -266,5 +313,84 @@ impl ChainSource for CorroboratedChainSource {
         Err(ChainSourceError::Unsupported(
             "corroborated peer reads do not resolve block timestamps",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! dig-node#513 item 5 -- this adapter replaces `chia-query`'s bridge on the bond path, and
+    //! must not be weaker than the thing it replaces.
+
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::sage::peer_reads::{CoinPeer, PeerSample};
+    use crate::wallet_db::WalletDb;
+
+    /// A sample that holds no peers -- enough to build a source, since these cases never read.
+    struct NoPeers;
+
+    #[async_trait::async_trait]
+    impl PeerSample for NoPeers {
+        async fn draw(&self) -> Vec<Arc<dyn CoinPeer>> {
+            Vec::new()
+        }
+    }
+
+    async fn source() -> CorroboratedChainSource {
+        let db = WalletDb::open_in_memory()
+            .await
+            .expect("in-memory wallet db");
+        let reads = Arc::new(PeerCorroboratedReads::new(Arc::new(NoPeers), db));
+        CorroboratedChainSource::new(reads, tokio::runtime::Handle::current())
+    }
+
+    /// PROPERTY: a panic raised while blocking becomes a `ChainSourceError`, and does NOT unwind
+    /// out of the synchronous trait boundary.
+    ///
+    /// NEAREST WRONG IMPLEMENTATION: the runtime-flavour check alone, which is what this adapter
+    /// shipped with. It catches the misuse we can NAME and nothing else, while the bridge it
+    /// replaces (`chia_query::provider_registry::bridge::guard_panics`) catches the rest. The
+    /// assertion is on the RETURN, not on `catch_unwind` being present: a test that merely called
+    /// `guard_panics` directly would pass with the backstop deleted from `block_on`, so this drives
+    /// it through the real path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panic_while_blocking_becomes_an_error_rather_than_unwinding() {
+        let source = source().await;
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let outcome: Result<(), ChainSourceError> =
+            source.block_on(async { panic!("a read panicked") });
+
+        std::panic::set_hook(previous);
+        assert!(
+            matches!(outcome, Err(ChainSourceError::Transport(_))),
+            "a panic crossed the ChainSource boundary instead of becoming an error"
+        );
+    }
+
+    /// PROPERTY: the control -- the guarded path still RETURNS an ordinary value, so the case above
+    /// is not satisfied by a `block_on` that errs unconditionally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ordinary_read_still_returns_its_value_through_the_guard() {
+        let source = source().await;
+        assert_eq!(source.block_on(async { 7u32 }).ok(), Some(7));
+    }
+
+    /// PROPERTY: the bond floor is a caller's choice and can only TIGHTEN.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_corroboration_floor_can_only_tighten() {
+        let strict = source()
+            .await
+            .requiring_corroboration(super::super::quorum::BOND_CORROBORATION_FLOOR);
+        assert_eq!(strict.floor, super::super::quorum::BOND_CORROBORATION_FLOOR);
+
+        let relaxed = source().await.requiring_corroboration(1);
+        assert_eq!(
+            relaxed.floor,
+            super::super::quorum::CORROBORATION_FLOOR,
+            "a caller talked the source down to a single source"
+        );
     }
 }

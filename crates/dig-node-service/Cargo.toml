@@ -107,7 +107,7 @@ dig-mirror-collateral = "0.3"
 # The chain half of the same model: `census` counts the collateralised network at a block height
 # and hands `dig-mirror-collateral` the three integers its controller consumes (dig-node#400).
 # Without it a node could only ever record epoch 1, which is derivable from nothing.
-dig-mirror-coin = "0.8"
+dig-mirror-coin = "0.9"
 
 # The canonical `ChainSource` trait `dig-mirror-coin`'s census is generic over. Declared, not
 # implemented: `chia-query` already provides the implementation this node uses
