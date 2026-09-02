@@ -2906,6 +2906,11 @@ fn spawn_mirror_passes(
                             // any chain read rather than staking collateral on an advertisement
                             // nobody can act on.
                             advertised_urls.clone(),
+                            // Re-read per pass rather than captured at spawn: this task starts
+                            // beside the peer network rather than after it, so a value read once
+                            // could be `None` for the life of the node and every coin it created
+                            // would name nobody.
+                            node.own_peer_id(),
                             &source,
                             owner_puzzle_hash,
                             signer_ref,

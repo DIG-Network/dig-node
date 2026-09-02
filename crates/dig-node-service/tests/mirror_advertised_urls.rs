@@ -246,6 +246,9 @@ fn the_configured_urls_reach_the_coin_in_the_operators_order() {
         Ok(PER_COIN),
         Ok(HashSet::new()),
         urls,
+        // No peer declaration: this fixture is about URLs and reservations, not about the
+        // coin naming a peer. `None` is what a node writes before its peer network is up.
+        None,
         &chain,
         signer.owner_puzzle_hash(),
         Some(&signer),
@@ -311,6 +314,9 @@ fn an_all_rejected_value_refuses_and_spends_nothing() {
         Ok(PER_COIN),
         Ok(HashSet::new()),
         urls,
+        // No peer declaration: this fixture is about URLs and reservations, not about the
+        // coin naming a peer. `None` is what a node writes before its peer network is up.
+        None,
         &chain,
         signer.owner_puzzle_hash(),
         Some(&signer),

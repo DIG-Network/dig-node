@@ -170,6 +170,7 @@ pub fn build_create(
     root_hash: Bytes32,
     epoch: BigInt,
     urls: Vec<String>,
+    declared_peer: Option<dig_mirror_coin::PeerDeclaration>,
     collateral_dig_base_units: u64,
     dig_coins: Vec<Cat>,
     synthetic_key: PublicKey,
@@ -178,6 +179,12 @@ pub fn build_create(
 ) -> Result<MirrorSpends, MirrorError> {
     let spends = dig_mirror_coin::create(
         MirrorAdvertisement {
+            // The peer this collateral stands behind. A coin that names nobody bonds content for no
+            // one in particular: no reader can credit it to this node, so the collateral buys
+            // discovery weight it will never receive. `None` still creates the coin -- refusing
+            // would leave a node unable to bond at all before its peer network is up -- and the
+            // caller logs it.
+            declared_peer,
             store_launcher_id,
             root_hash,
             epoch: epoch.clone(),

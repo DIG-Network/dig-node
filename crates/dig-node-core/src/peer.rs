@@ -229,6 +229,16 @@ impl PeerStatus {
         Arc::new(PeerStatus::default())
     }
 
+    /// This node's own `peer_id`, once the peer network has started.
+    ///
+    /// `None` before start-up. A caller that must NAME this node — writing the peer declaration into
+    /// a mirror coin, say — has to tolerate that: the identity exists on disk from the first boot,
+    /// but this status only learns it when the network comes up, so an early caller MUST treat
+    /// `None` as "not yet" rather than as "this node has no identity".
+    pub fn peer_id(&self) -> Option<String> {
+        self.peer_id.lock().unwrap().clone()
+    }
+
     /// Mark the peer network running under `peer_id` (clears the last error).
     pub fn set_running(&self, peer_id: String) {
         self.running.store(true, Ordering::Relaxed);
@@ -2472,8 +2482,11 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     //    pool's cert/key at the persisted `NodeCert` files themselves (dig-gossip only READS them);
     //    letting the GossipService mint its OWN throwaway cert would hash to a DIFFERENT peer_id and
     //    a dial to this node can reach a DIFFERENT identity than the one advertised (#1532 — the
-    //    identity split). Not every dialler refuses that: dig-gossip derives the peer id and does not
-    //    pin it (DIG-Network/dig-gossip#85), so this must be right at the source rather than caught.
+    //    identity split). A pinning dialler DOES refuse that -- dig-gossip's production dials go
+    //    through dig-nat, which pins the expected id in dig-tls -- but getting it right at the source
+    //    is still what this does, because a caught mismatch is a refused connection rather than a
+    //    working one. (dig-gossip's own legacy rustls outbound does not pin, DIG-Network/dig-gossip#85,
+    //    but nothing here dials on it.)
     //    `cfg.peer_id` is set to that same identity so the pool's self-dial guard + handshake agree.
     //    The address book (`peers.json`) stays under `peer-net/`; only the identity is shared.
     let gossip_dir = node.peer_cert_dir();

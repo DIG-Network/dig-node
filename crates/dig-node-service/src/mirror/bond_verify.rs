@@ -91,8 +91,13 @@ impl VerdictKey {
         epoch: u64,
         claiming_peer_id: &str,
     ) -> Self {
+        // ASCII-lowercased before hashing. A peer id is fixed-length hex, so its two spellings are
+        // one identity, and `peer_declaration` already treats them as one because it compares
+        // decoded bytes. Hashing the raw text would give each spelling its own cache entry, so a
+        // stranger could multiply the chain reads one claim costs simply by varying case -- turning
+        // a memo into an amplifier against `api.coinset.org`.
         let mut hasher = chia_sha2::Sha256::new();
-        hasher.update(claiming_peer_id.as_bytes());
+        hasher.update(claiming_peer_id.to_ascii_lowercase().as_bytes());
         VerdictKey {
             coin_id,
             store_launcher_id: store.to_bytes(),
@@ -273,17 +278,19 @@ fn chain_bond_verdict_and_coin<S: ChainSource>(
 
 /// The full verdict: the chain half, then **whose bond it is**.
 ///
-/// A valid, fully-collateralised coin bonding exactly this content still says nothing about the
-/// peer offering the record — every field of that record, the coin id included, was chosen by
-/// whoever answered the lookup. Only the coin's own owner-written declaration of a peer closes that,
-/// and this node cannot read one yet (see [`peer_declaration`]), so nothing is promoted today.
+/// A valid, fully-collateralised coin bonding exactly this content still says nothing about the peer
+/// offering the record — every field of that record, the coin id included, was chosen by whoever
+/// answered the lookup. Only the coin's own owner-written declaration of a peer closes that, and
+/// [`peer_declaration`] reads it, so a `Bonded` here means BOTH halves held: the coin bonds this
+/// content, and the coin's owner named this claimant.
 ///
 /// Credit is withheld, never subtracted: a record naming this coin may be a stranger's lie ABOUT the
 /// coin's real holder, and demoting on it is what would make that lie pay.
 ///
-/// **No chain is read at all while the ownership half has no source** (see
-/// [`declaration_source_is_readable`]): with `Bonded` unreachable, the reads would be paid for an
-/// answer this function is about to discard.
+/// **A node with no censused requirement for the epoch cannot promote anyone**, because it cannot
+/// price a bond — `required_collateral` is then `None` and the verdict degrades to `Unverified`
+/// rather than to `Bonded`. Detection of a false claim still works there (the binding is checked
+/// first, deliberately), but certification does not.
 pub fn verdict_for<S: ChainSource>(
     source: &S,
     store_launcher_id: Bytes32,
@@ -714,7 +721,7 @@ mod tests {
                 "attacker-2.example",
                 "attacker-3.example",
             ],
-            "exactly one copy is promoted; the rest fall back to baseline in source order, never              below it"
+            "exactly one copy is promoted; the rest fall back to baseline in source order, never below it"
         );
     }
 
@@ -752,6 +759,57 @@ mod tests {
             cache.get(&VerdictKey::new(coin, store, root, 7, &stranger)),
             None,
             "a stranger republishing the same coin id must re-ask, not inherit the holder's verdict"
+        );
+    }
+
+    /// **Proves (dig-node#473, adversarial gate):** the promotion bound is keyed on the peer's
+    /// IDENTITY, not on the text a record happened to spell it with.
+    ///
+    /// **Catches:** the bound being defeated at zero cost. Everything that GRANTS a promotion
+    /// compares bytes — the coin's declaration decodes the hex, and the TLS pin compares certificate
+    /// hashes — so a peer id in upper case and the same id in lower case are one peer to every check
+    /// that matters. A bound keyed on the raw string is not: a stranger returning one honest
+    /// holder's peer id in eight different hex spellings, each with its own addresses, would have
+    /// eight distinct keys, eight promotions, and eight chain reads, and would occupy the whole
+    /// verified budget on the strength of a single bond it does not hold.
+    ///
+    /// The two records below differ ONLY in the case of that one field, so a set keyed on the text
+    /// promotes both and a set keyed on the identity promotes one.
+    #[tokio::test]
+    async fn the_promotion_bound_is_not_defeated_by_respelling_one_peer_id() {
+        let mut shouted = holder_at(0xAA, Some([0x01; 32]), "attacker.example");
+        shouted.provider_peer_id = shouted.provider_peer_id.to_uppercase();
+        assert_ne!(
+            shouted.provider_peer_id,
+            holder_at(0xAA, None, "x").provider_peer_id,
+            "the fixture must actually differ as TEXT, or it proves nothing"
+        );
+
+        // The honest holder sits BETWEEN the two spellings, and that placement is the whole test.
+        // With it last, a promoted respelling and a baseline one land in the same position under a
+        // stable sort and the two behaviours are indistinguishable -- the test would pass either
+        // way. Here, promoting the respelling moves it AHEAD of the honest record; bounding it
+        // leaves the honest record in front.
+        let slate = Slate(vec![
+            holder_at(0xAA, Some([0x01; 32]), "attacker-lower.example"),
+            holder_at(0xCC, None, "honest.example"),
+            shouted,
+        ]);
+        let slot = bond_verifier_slot();
+        let _ = slot.set(Arc::new(EveryChainCheckPasses));
+        let locator = BondRankingLocator::new(Arc::new(slate), slot);
+
+        let got = locator.find_providers(&capsule()).await.expect("located");
+        let hosts: Vec<String> = got.iter().map(|r| r.addresses[0].host.clone()).collect();
+
+        assert_eq!(
+            hosts,
+            vec![
+                "attacker-lower.example",
+                "honest.example",
+                "attacker.example",
+            ],
+            "one identity earns one promoted slot however it is spelled; the respelling stays at baseline, BEHIND the honest holder it would otherwise have jumped"
         );
     }
 

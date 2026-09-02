@@ -210,6 +210,14 @@ impl ProviderLocator for BondRankingLocator {
         // not to: a comparison-driven lookup would read the same coin O(n log n) times.
         let mut ranked: Vec<(u8, ProviderRecord)> = Vec::with_capacity(found.len());
         let mut verified = 0usize;
+        // Keyed on the ASCII-LOWERCASED peer id, never the raw wire string. A peer id is fixed-length
+        // hex, so its two spellings denote one identity -- and every check that GRANTS the promotion
+        // already knows that: the coin's declaration compares 32 decoded bytes, and the TLS pin
+        // compares 32 bytes of certificate hash. A set keyed on the text would therefore admit the
+        // same peer once per hex spelling, and one stolen identity could fill every promoted slot at
+        // zero collateral by varying case alone. dig-dht applies exactly this normalisation to the
+        // neighbouring `unverified_mirror_coin_id` field, for the reason its own doc gives: without
+        // it "dedup and equality would split on presentation".
         let mut promoted_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
         for record in found {
             let claimed = record.unverified_mirror_coin_id_bytes();
@@ -236,7 +244,7 @@ impl ProviderLocator for BondRankingLocator {
             // credit-only. It also costs an honest holder nothing -- a peer that legitimately
             // announces twice keeps its first record promoted.
             if rank == credit_rank(BondVerdict::Bonded)
-                && !promoted_peers.insert(record.provider_peer_id.clone())
+                && !promoted_peers.insert(record.provider_peer_id.to_ascii_lowercase())
             {
                 rank = credit_rank(BondVerdict::Unverified);
             }

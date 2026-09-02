@@ -147,6 +147,9 @@ pub struct NodeMirrorEffects<'a, S: ChainSource> {
     committed_coin_ids: Result<std::cell::RefCell<std::collections::HashSet<String>>, PassError>,
     /// Where this node advertises its stores can be fetched from. Empty means it cannot advertise.
     advertised_urls: Vec<String>,
+    /// This node's own `peer_id`, written into every coin it creates so a reader can credit the bond
+    /// to it. `None` before the peer network has started.
+    own_peer_id: Option<String>,
     /// The chain, for the owned-coin scan and for the reclaim spends.
     source: &'a S,
     /// This node's operator puzzle hash — a public value, derived once at bring-up.
@@ -170,6 +173,33 @@ pub struct NodeMirrorEffects<'a, S: ChainSource> {
 }
 
 impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
+    /// The peer declaration to write into a coin this node creates.
+    ///
+    /// `None` when the peer network has not started, or -- which should not happen -- when the id it
+    /// reported is not a well-formed peer id. Both are warned about rather than silently dropped: a
+    /// coin created without a declaration locks real collateral for an epoch and can never be
+    /// promoted by any reader, which is a worse outcome than the create being retried next pass.
+    fn declared_peer(&self) -> Option<dig_mirror_coin::PeerDeclaration> {
+        let Some(peer_id) = self.own_peer_id.as_deref() else {
+            tracing::warn!(
+                target: "mirror",
+                "creating a mirror coin before the peer network reported an identity: the coin will                  name no peer and no reader can credit its bond to this node"
+            );
+            return None;
+        };
+        match dig_mirror_coin::PeerDeclaration::from_hex(peer_id) {
+            Ok(declaration) => Some(declaration),
+            Err(error) => {
+                tracing::warn!(
+                    target: "mirror",
+                    %error,
+                    "this node reported a peer id that is not a well-formed peer id; the coin will                      name no peer"
+                );
+                None
+            }
+        }
+    }
+
     /// Assemble the effects for one pass from readings the scheduler has already taken.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -177,6 +207,7 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
         dig_balance: Result<u64, PassError>,
         committed_coin_ids: Result<std::collections::HashSet<String>, PassError>,
         advertised_urls: Vec<String>,
+        own_peer_id: Option<String>,
         source: &'a S,
         owner_puzzle_hash: Bytes32,
         signer: Option<&'a MirrorSigner>,
@@ -191,6 +222,7 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
             // of the audit record, and within-pass accumulation is this type's business.
             committed_coin_ids: committed_coin_ids.map(std::cell::RefCell::new),
             advertised_urls,
+            own_peer_id,
             source,
             owner_puzzle_hash,
             signer,
@@ -472,6 +504,7 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
             root_hash,
             num_bigint::BigInt::from(epoch),
             self.advertised_urls.clone(),
+            self.declared_peer(),
             amount_dig_base_units,
             dig_coins,
             signer.synthetic_key(),
