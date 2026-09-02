@@ -8106,10 +8106,21 @@ mod tests {
     /// two spellings of one input and would pass under any implementation, so the inequality below
     /// is asserted first and pins the arms apart.
     ///
-    /// **On the revert:** turn any one of `relay_capsule`'s refusals into a distinguishable status
-    /// -- `RelayStatus::Pending { staged_bytes: 0 }` is the one-line version -- and the frame
-    /// equality fires, because that arm becomes the inconclusive-miss code carrying a progress
-    /// field while the other stays `RESOURCE_UNAVAILABLE`.
+    /// **On the revert:** turn EITHER of the two refusals this fixture actually reaches --
+    /// `module_relay.rs:114` (the requestor did not ask) or `:117` (this build has no content
+    /// engine) -- into a distinguishable status. `RelayStatus::Pending { staged_bytes: 0 }` is the
+    /// one-line version, and the frame equality fires because that arm becomes the inconclusive-miss
+    /// code carrying a progress field while the other stays `RESOURCE_UNAVAILABLE`.
+    ///
+    /// **What this fixture does NOT reach, said plainly so it is not read as full cover.**
+    /// `relay_capsule` has FIVE refusal sites. The operator opt-in (`:121`) and the proxy allowance
+    /// (`:125`) both sit behind a live `NodeContent`, which `test_node` does not wire, and the
+    /// no-warmer refusal (`:130`) sits behind both. Those first two are exactly the gates the
+    /// rationale above names as the reason the property matters, so the oracle they would leak is
+    /// held today only by all five sites sharing one payload-free `RelayStatus::Refused` return --
+    /// a property of the enum, not something this test observes. Reaching them needs a fixture that
+    /// installs a `NodeContent` and drives `DIG_NODE_ONION_RELAY` under the `test_support` env
+    /// mutex; that is the next guard here, not a gap this one closes.
     #[tokio::test]
     async fn a_relay_refusal_is_indistinguishable_from_a_plain_miss() {
         let (node, _td) = test_node(None);
