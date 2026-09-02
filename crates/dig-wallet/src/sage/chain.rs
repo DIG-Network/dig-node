@@ -210,6 +210,14 @@ pub struct PushOutcome {
 /// `ASSERT_BEFORE_*`) are evaluated against the asked node's PEAK, so a node behind the tip refuses
 /// what a node at the tip admits.
 ///
+/// `TOO_MANY_ANNOUNCEMENTS` is the subtle one and the reason this paragraph names it explicitly. It
+/// reads as a pure property of the bundle — a bundle either carries too many announcements or it does
+/// not — and it is NOT: `chia_consensus::conditions` decrements the per-spend announcement countdown
+/// only `if (flags & COST_CONDITIONS) == 0`, and `COST_CONDITIONS` is derived from the answering
+/// node's height. So a node below `hard_fork2_height` refuses an announcement-heavy bundle that a node
+/// above it admits. It is absent, so it holds, and it is written down HERE because it is the entry a
+/// future reader is most likely to add believing it intrinsic.
+///
 /// **The CLVM-EXECUTION names are absent for the SAME reason, which is not obvious and was got
 /// wrong once.** `GENERATOR_RUNTIME_ERROR`, `BLOCK_COST_EXCEEDS_MAX`, `INVALID_BLOCK_COST` and
 /// `INVALID_SPEND_BUNDLE` look like pure properties of the bytes and are not. Bundle validation is
@@ -938,7 +946,8 @@ mod tests {
     /// it likes — so the property that matters is that everything outside the list holds. Written
     /// as a denylist the same names would read almost identically and fail the opposite way.
     ///
-    /// The four CLVM-execution rows are a REGRESSION PIN, not filler. They were on the allowlist in
+    /// The `TOO_MANY_ANNOUNCEMENTS` row and the four CLVM-execution rows are a REGRESSION PIN, not
+    /// filler. They were on the allowlist in
     /// the first draft and the adversarial gate used one of them to construct a sequence in which
     /// the inputs are freed for a bundle that later lands. They read as bundle properties and are
     /// not, so the only thing preventing their return is an assertion that names them.
@@ -976,6 +985,10 @@ mod tests {
             // Evaluated against the asked node's peak.
             "FAILED: ASSERT_HEIGHT_ABSOLUTE_FAILED",
             "FAILED: ASSERT_SECONDS_RELATIVE_FAILED",
+            // Height-dependent at the CONDITION level: the announcement countdown is decremented
+            // only when `COST_CONDITIONS` is clear, and that flag comes from the answering node's
+            // height. Reads as a pure bundle property and is not.
+            "FAILED: TOO_MANY_ANNOUNCEMENTS",
             // The CLVM-EXECUTION names. These LOOK intrinsic and are not: bundle validation runs
             // under flags derived from the answering node's height and under a caller-supplied cost
             // budget, so a node above a hard fork and a node below it can disagree on identical
