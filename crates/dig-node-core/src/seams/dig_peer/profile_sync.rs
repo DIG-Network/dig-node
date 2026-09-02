@@ -270,8 +270,13 @@ impl ProfileBodyStore {
     /// A missing cache root is `Ok(vec![])` -- it is created lazily, so its absence is a real
     /// "holds nothing". Every other failure, including one store's enumeration failing, is an
     /// `Err`: a PARTIAL enumeration returned as if it were complete is the identical defect one
-    /// layer up from [`roots_for_store`](Self::roots_for_store). The availability cost is bounded
-    /// to a single sweep, which the announce loop retries at the next interval.
+    /// layer up from [`roots_for_store`](Self::roots_for_store).
+    ///
+    /// The cost of that choice is deliberate, and it is NOT bounded to one sweep: while the
+    /// condition persists, a single unreadable store directory withholds the announce for every
+    /// OTHER healthy store too, and goes on doing so until the directory is readable again. The
+    /// loop re-warns each interval rather than degrading quietly, which is the whole reason this
+    /// returns an `Err` a caller must handle instead of an empty set it would silently believe.
     pub fn held_pairs(&self) -> std::io::Result<Vec<([u8; 32], [u8; 32])>> {
         let stores = match std::fs::read_dir(&self.root) {
             Ok(stores) => stores,
