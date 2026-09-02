@@ -295,8 +295,15 @@ declare_sync_phases! {
     ///
     /// It is NOT a fourth way of spelling `Synced`: `Synced` licenses
     /// [`crate::sage::routing::route`] to serve wallet-scoped reads from the local replica, and
-    /// over an un-queried DB that reads a funded wallet as empty. This says the chain replica is
-    /// current AND that no wallet-scoped claim is being made at all.
+    /// over an un-queried DB that reads a funded wallet as empty. This says only that NO
+    /// wallet-scoped claim is being made at all.
+    ///
+    /// It deliberately claims nothing about the replica's currency, and an earlier version of this
+    /// sentence did (dig-node#495): this arm reads no heights whatsoever -- no
+    /// `initial_sync_complete`, no gap against the peers -- so it is in no position to. Requiring
+    /// currency HERE would regress dig_ecosystem#2609 straight back to reporting a default install
+    /// as forever catching up, which is why the arm's behaviour is right and only its description
+    /// was wrong.
     NoWalletEnrolled => "no_wallet_enrolled",
     /// **A wallet IS enrolled, but no addresses are being watched for it** — so the user's coins
     /// are not being followed.
@@ -422,7 +429,7 @@ impl SyncHandle {
     /// Compose the live counters with the DB's persisted sync state.
     ///
     /// `Synced` requires a completed catch-up, a peer attached now, AND the replica actually
-    /// following the chain ([`is_following`]): an offline replica is stale, however complete its
+    /// following the chain ([`FollowingEvidence`]): an offline replica is stale, however complete its
     /// last catch-up was, and reporting it synced is the shape that makes a client trust a day-old
     /// balance. Neither of the first two clauses is about the PRESENT — one is a latched flag, the
     /// other says a socket exists — so a replica frozen behind a half-open peer satisfied both and
@@ -439,8 +446,8 @@ impl SyncHandle {
     ) -> sqlx::Result<WalletSyncStatus> {
         let observed = self.observed();
         let state = db.sync_state().await?;
-        let phase = if !observed.ever_connected {
-            SyncPhase::NotStarted
+        let settled = if !observed.ever_connected {
+            settled::SettledPhase::not_started(state.peak_height)
         } else if observed.peers >= 1 && observed.session_may_write && observed.watched == Some(0) {
             // Three facts get us to "this session is watching nothing", and each rules out a
             // different lie:
@@ -475,22 +482,24 @@ impl SyncHandle {
             // indistinguishable from the address set alone, which is exactly how the first version
             // of this fix came to report a locked wallet as settled.
             if observed.wallet_enrolled {
-                SyncPhase::WalletNotUnlocked
+                settled::SettledPhase::wallet_not_unlocked(state.peak_height)
             } else {
-                SyncPhase::NoWalletEnrolled
+                settled::SettledPhase::no_wallet_enrolled(state.peak_height)
             }
-        } else if state.initial_sync_complete
-            && observed.peers >= 1
-            && observed.session_may_write
-            && is_following(state.peak_height, tier.peak_height)
+        } else if let Some(evidence) =
+            FollowingEvidence::measure(state.peak_height, tier.peak_height).filter(|_| {
+                state.initial_sync_complete && observed.peers >= 1 && observed.session_may_write
+            })
         {
-            SyncPhase::Synced
+            // The evidence is what licenses the claim AND what supplies the height reported with
+            // it, so a `synced` phase can never be paired with an absent peak (dig-node#495).
+            settled::SettledPhase::synced(evidence)
         } else {
-            SyncPhase::Syncing
+            settled::SettledPhase::syncing(state.peak_height)
         };
         Ok(WalletSyncStatus {
-            phase,
-            peak_height: state.peak_height,
+            phase: settled.phase(),
+            peak_height: settled.peak_height(),
             chia_peer_count: tier.peer_count,
             subscription_peer_count: Some(observed.peers),
             chia_peer_peak_height: tier.peak_height,
@@ -567,20 +576,125 @@ impl SyncHandle {
     }
 }
 
-/// Whether the replica is following the chain RIGHT NOW, judged by the only evidence the status
-/// payload already carries: the gap between the replica's own peak and what the node's OWN peers
-/// announced.
+/// Evidence that the replica is following the chain RIGHT NOW: the two heights whose gap
+/// establishes it, held together.
 ///
-/// `None` on either side is UNOBSERVABLE, and an unobservable gap is never an accusation — it
-/// answers `true` and leaves the phase exactly as it was before this existed. That matters because
-/// the peer tier is genuinely unmeasured on a node whose chain transport has not been built, and a
-/// missing measurement must not be spent as evidence against the replica.
+/// It exists as a TYPE rather than a predicate so the heights travel with the verdict. A `bool`
+/// answer can be paired with any peak a caller happens to read separately, and that is exactly how
+/// `{phase: "synced", peak_height: null}` was reachable (dig-node#495) — a positive claim of
+/// currency beside a refusal to say what height it is current AT.
+///
+/// **An unmeasured height on EITHER side yields no evidence.** The predicate this replaces answered
+/// `true` whenever either was `None`, on the reasoning that an unobservable gap is not an
+/// accusation. That reasoning is REVERSED here, and it must not be left standing as though it still
+/// held: it is sound only about the PEER side, and only for a verdict that is the absence of an
+/// accusation.
+///
+/// - **No PEER height** — there is no second opinion. Fairly read as no accusation, but equally it
+///   is no evidence FOR currency: a replica thousands of blocks behind reports the same thing
+///   (dig-node#416, measured at 8,380 blocks behind).
+/// - **No REPLICA height** — the subject of the claim has no measurement whatsoever, which supports
+///   no verdict in either direction. Production-reachable: [`super::db::WalletDb`]'s latch-over path
+///   sets `initial_sync_complete` without ever writing a peak.
+///
+/// A phase is not the absence of an accusation. [`SyncPhase::Synced`] ASSERTS currency, so it needs
+/// evidence for itself; [`SyncPhase::Syncing`] already covers both unmeasured cases in its own
+/// words — the replica is otherwise not both caught up AND currently following the chain.
 ///
 /// See [`FOLLOWING_TOLERANCE`] for why the slack is small and which way it is allowed to be wrong.
-pub(crate) fn is_following(replica: Option<u32>, peers: Option<u32>) -> bool {
-    match (replica, peers) {
-        (Some(replica), Some(peers)) => peers.saturating_sub(replica) <= FOLLOWING_TOLERANCE,
-        _ => true,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FollowingEvidence {
+    replica_peak: u32,
+    peer_peak: u32,
+}
+
+impl FollowingEvidence {
+    /// The ONLY constructor: `None` when either height is unmeasured, or when the measured gap
+    /// exceeds [`FOLLOWING_TOLERANCE`].
+    pub(crate) fn measure(replica: Option<u32>, peers: Option<u32>) -> Option<Self> {
+        let (replica_peak, peer_peak) = (replica?, peers?);
+        (peer_peak.saturating_sub(replica_peak) <= FOLLOWING_TOLERANCE).then_some(Self {
+            replica_peak,
+            peer_peak,
+        })
+    }
+
+    /// The replica height this evidence was drawn from — the height a `Synced` claim is a claim
+    /// ABOUT, so it is reported from here rather than re-read from a separate field.
+    pub(crate) fn replica_peak(self) -> u32 {
+        self.replica_peak
+    }
+}
+
+/// The phase and the replica peak, produced TOGETHER so neither can be chosen without the other.
+///
+/// The privacy boundary is the whole mechanism, and it is a MODULE rather than a struct because
+/// Rust privacy is module-scoped: private fields are visible to the rest of their own module, so a
+/// struct declared beside [`SyncHandle::status`] could still be built by a literal there, with any
+/// pairing at all. Declared here, [`settled::SettledPhase`]'s fields are unreachable from the
+/// parent, so its constructors are the only way to make one — and [`settled::SettledPhase::synced`]
+/// is the only route to [`SyncPhase::Synced`] in this crate's non-test code (dig-node#495).
+mod settled {
+    use super::{FollowingEvidence, SyncPhase};
+
+    /// A phase and the replica peak reported beside it.
+    pub(super) struct SettledPhase {
+        phase: SyncPhase,
+        peak_height: Option<u32>,
+    }
+
+    impl SettledPhase {
+        /// The ONLY route to [`SyncPhase::Synced`]: it demands the evidence, and takes the reported
+        /// height FROM that evidence rather than from a separately read field. A caller therefore
+        /// cannot claim currency without naming the height it is current at.
+        pub(super) fn synced(evidence: FollowingEvidence) -> Self {
+            Self {
+                phase: SyncPhase::Synced,
+                peak_height: Some(evidence.replica_peak()),
+            }
+        }
+
+        /// No peer has ever attached. The DB's peak — known or not — is still reported honestly.
+        pub(super) fn not_started(peak_height: Option<u32>) -> Self {
+            Self {
+                phase: SyncPhase::NotStarted,
+                peak_height,
+            }
+        }
+
+        /// Not both caught up AND currently following. Every phase other than `Synced` reports the
+        /// replica's peak exactly as the DB holds it, `None` included: withholding a claim is not a
+        /// reason to withhold a measurement.
+        pub(super) fn syncing(peak_height: Option<u32>) -> Self {
+            Self {
+                phase: SyncPhase::Syncing,
+                peak_height,
+            }
+        }
+
+        /// No wallet is enrolled, so there is nothing to follow.
+        pub(super) fn no_wallet_enrolled(peak_height: Option<u32>) -> Self {
+            Self {
+                phase: SyncPhase::NoWalletEnrolled,
+                peak_height,
+            }
+        }
+
+        /// A wallet is enrolled but its addresses are not being watched.
+        pub(super) fn wallet_not_unlocked(peak_height: Option<u32>) -> Self {
+            Self {
+                phase: SyncPhase::WalletNotUnlocked,
+                peak_height,
+            }
+        }
+
+        pub(super) fn phase(&self) -> SyncPhase {
+            self.phase
+        }
+
+        pub(super) fn peak_height(&self) -> Option<u32> {
+            self.peak_height
+        }
     }
 }
 
@@ -595,9 +709,10 @@ pub async fn status_without_supervisor(
     tier: super::fallback::ChainPeerTier,
 ) -> sqlx::Result<WalletSyncStatus> {
     let state = db.sync_state().await?;
+    let settled = settled::SettledPhase::not_started(state.peak_height);
     Ok(WalletSyncStatus {
-        phase: SyncPhase::NotStarted,
-        peak_height: state.peak_height,
+        phase: settled.phase(),
+        peak_height: settled.peak_height(),
         chia_peer_count: tier.peer_count,
         // No supervisor is attached, so nobody is holding a subscription session to count.
         subscription_peer_count: None,
