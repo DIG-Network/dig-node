@@ -373,13 +373,16 @@ fn record_one<S: ChainSource>(
 
     let prior = prior_record(store, epoch)?;
 
+    // The predecessor arrives as the STORED record rather than the bare consensus one, because its
+    // envelope carries the census height dig-node#404 seeds the next search with. `prior.record` is
+    // what the model consumes; `prior.census_height` is what the search consumes.
     let at = match census_height(source, epoch_start_unix_secs(epoch)) {
         Ok(Some(at)) => at,
         Ok(None) => return Err(CensusStop::EpochNotStartedOnChain { epoch }),
         Err(e) => return Err(chain_stop(epoch, e)),
     };
 
-    let counted = match census(source, &prior, at) {
+    let counted = match census(source, &prior.record, at) {
         Ok(CensusOutcome::Final(counted)) => counted,
         Ok(CensusOutcome::Pending {
             census_height,
@@ -412,6 +415,7 @@ fn record_one<S: ChainSource>(
     // protocol version on both sides, and produces the record — including the floor clamp that a
     // restated formula loses.
     let record = prior
+        .record
         .advance(counted.census())
         .map_err(|e| CensusStop::Arithmetic {
             epoch,
@@ -439,10 +443,13 @@ fn record_one<S: ChainSource>(
 
 /// The record `epoch` is derived from — epoch `epoch - 1` — refusing anything this build cannot
 /// interpret.
-fn prior_record(
-    store: &EpochRecordStore,
-    epoch: u64,
-) -> Result<dig_mirror_collateral::EpochRecord, CensusStop> {
+///
+/// Returns the STORED record rather than the bare [`dig_mirror_collateral::EpochRecord`] it wraps.
+/// The consensus record is what the model advances from, but the envelope also carries the height
+/// the predecessor's census was taken at, and that height is a strict lower bound for this epoch's
+/// — the seed that keeps a cold-start walk from re-bisecting the whole chain per epoch
+/// (dig-node#404). Reading it here costs nothing: the line has already been fetched and parsed.
+fn prior_record(store: &EpochRecordStore, epoch: u64) -> Result<StoredRecord, CensusStop> {
     let prior_epoch = epoch.saturating_sub(1);
     match store.get(prior_epoch) {
         StoredEpoch::Found(stored) if !stored.is_interpretable() => {
@@ -451,7 +458,7 @@ fn prior_record(
                 protocol_version: stored.record.protocol_version.0,
             })
         }
-        StoredEpoch::Found(stored) => Ok(stored.record),
+        StoredEpoch::Found(stored) => Ok(*stored),
         StoredEpoch::Absent => Err(CensusStop::PriorEpochMissing { epoch: prior_epoch }),
         StoredEpoch::Unreadable => Err(CensusStop::PriorEpochUnreadable { epoch: prior_epoch }),
     }
