@@ -87,6 +87,10 @@ pub mod network_info;
 /// handler argument, then opens the user's default browser at the resolving URL. See [`open`].
 pub mod open;
 pub mod pair;
+/// The CLIENT half of the #280 pairing handshake (#403): the token ladder + the per-user
+/// paired-token store, so an unprivileged user can drive `control.*` without widening a mode.
+/// See [`paired_client`].
+pub mod paired_client;
 pub mod pairing;
 /// `control.peers.ping` (dig_ecosystem#1985): the connection-ladder diagnostic — dial one peer a
 /// tier at a time and report WHICH tier reached it. See [`peer_ping`].

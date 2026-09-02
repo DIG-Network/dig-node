@@ -759,6 +759,14 @@ enum PairCommand {
         /// The token id from `dig-node pair`.
         token_id: String,
     },
+    /// Ask this node for a scoped control token for YOUR account, then wait for the operator
+    /// to approve it (#403). Needs no elevation and no master token.
+    Connect {
+        /// The label the operator sees when approving. Defaults to `dign CLI (<user>)`.
+        /// Refused, never shortened, above 64 characters.
+        #[arg(long)]
+        client_name: Option<String>,
+    },
 }
 
 impl Command {
@@ -876,6 +884,7 @@ pub fn run() -> std::process::ExitCode {
                 None | Some(PairCommand::List) => PairAction::List,
                 Some(PairCommand::Approve { pairing_id }) => PairAction::Approve { pairing_id },
                 Some(PairCommand::Revoke { token_id }) => PairAction::Revoke { token_id },
+                Some(PairCommand::Connect { client_name }) => PairAction::Connect { client_name },
             };
             render(pair::run(&config, pair_action), action, json)
         }
@@ -1463,6 +1472,7 @@ mod tests {
                 None | Some(PairCommand::List) => PairAction::List,
                 Some(PairCommand::Approve { pairing_id }) => PairAction::Approve { pairing_id },
                 Some(PairCommand::Revoke { token_id }) => PairAction::Revoke { token_id },
+                Some(PairCommand::Connect { client_name }) => PairAction::Connect { client_name },
             },
             _ => panic!("expected a pair command from {argv:?}"),
         };
@@ -1477,6 +1487,22 @@ mod tests {
                 PairAction::Approve { ref pairing_id } if pairing_id == "abc123"
             ),
             "`pair approve <id>` must approve, and must carry the id through"
+        );
+        // #403: `connect` is a DISTINCT verb, and it must never be reachable by accident from the
+        // bare noun -- the bare noun is the operator's read-only listing.
+        assert!(
+            matches!(
+                pair_action(&["dig-node", "pair", "connect"]),
+                PairAction::Connect { client_name: None }
+            ),
+            "`pair connect` with no flag must default its own label"
+        );
+        assert!(
+            matches!(
+                pair_action(&["dig-node", "pair", "connect", "--client-name", "Agent"]),
+                PairAction::Connect { client_name: Some(ref n) } if n == "Agent"
+            ),
+            "`--client-name` must reach the action verbatim -- the operator approves what they see"
         );
     }
 

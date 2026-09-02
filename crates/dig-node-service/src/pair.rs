@@ -12,6 +12,11 @@
 //!     The operator FIRST confirms the printed `pairing_code` matches what the
 //!     extension shows (compare-codes consent), then approves.
 //!   * `dig-node pair revoke <token_id>` — revoke an issued controller token.
+//!   * `dig-node pair connect [--client-name NAME]` — the CLIENT side (#403), and the only verb
+//!     here that needs NO master token: it asks for a token, prints the code for the operator to
+//!     compare, waits for approval, and stores the granted token in the invoking user's own state
+//!     dir. This is how an ordinary OS user drives `control.*` against a root-owned service
+//!     without any file mode being widened.
 //!
 //! Everything here reaches the node over `POST /` on its loopback address with the
 //! `X-Dig-Control-Token` header — the same authorized surface the DIG Browser uses.
@@ -22,7 +27,10 @@ use crate::untrusted_text::render_untrusted;
 
 use crate::cli::Outcome;
 use crate::config::Config;
-use crate::control_client::call_control;
+use crate::control_client::{call_control, call_open};
+use crate::paired_client::{
+    self, default_client_name, next_poll_step, validate_client_name, PollStep, POLL_INTERVAL,
+};
 
 /// The operator action, clap-agnostic (mapped from the CLI subcommand in `main.rs`).
 pub enum PairAction {
@@ -32,6 +40,9 @@ pub enum PairAction {
     Approve { pairing_id: String },
     /// Revoke an issued controller token by id.
     Revoke { token_id: String },
+    /// CLIENT side (#403): ask this node for a scoped token, wait for the operator to approve,
+    /// and persist the result in THIS user's own state dir.
+    Connect { client_name: Option<String> },
 }
 
 /// Run a `pair` subcommand: read the master token, call the node's `control.pairing.*`,
@@ -64,6 +75,7 @@ pub fn run(config: &Config, action: PairAction) -> std::io::Result<Outcome> {
                 result,
             ))
         }
+        PairAction::Connect { client_name } => connect(config, client_name),
         PairAction::Revoke { token_id } => {
             let result = call_control(
                 config,
@@ -77,6 +89,83 @@ pub fn run(config: &Config, action: PairAction) -> std::io::Result<Outcome> {
                 format!("dig-node: no controller token with id {token_id} (nothing revoked).")
             };
             Ok(Outcome::new(summary, result))
+        }
+    }
+}
+
+/// Current unix time in milliseconds (0 on a clock error — only affects the poll deadline, and a
+/// zero clock reads as "not yet expired", so the server's own sweep remains the real bound).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `dig-node pair connect` — the CLIENT half of the handshake (#403).
+///
+/// Uses [`call_open`], never [`call_control`]: the requester by definition holds no token yet, and
+/// routing an OPEN method through the gated client would fail with an elevation remedy for a
+/// question the node answers to anyone. Progress goes to STDERR so `--json` stdout stays a single
+/// machine-readable object.
+fn connect(config: &Config, client_name: Option<String>) -> std::io::Result<Outcome> {
+    let name = client_name.unwrap_or_else(default_client_name);
+    validate_client_name(&name)?;
+
+    let requested = call_open(config, "pairing.request", json!({ "client_name": name }))?;
+    let pairing_id = requested["pairing_id"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("dig-node: pairing.request returned no pairing_id"))?
+        .to_string();
+    let code = requested["pairing_code"].as_str().unwrap_or("??????");
+    let expires_ms = requested["expires_ms"].as_u64().unwrap_or(0);
+
+    eprintln!(
+        "dig-node: pairing code {code}
+         Ask the machine's operator to CONFIRM this code, then run:
+         
+    sudo dign pair approve {pairing_id}
+
+         Waiting for approval..."
+    );
+
+    loop {
+        let polled = call_open(config, "pairing.poll", json!({ "pairing_id": pairing_id }))?;
+        match polled["status"].as_str().unwrap_or("unknown") {
+            "approved" => {
+                let token = polled["token"].as_str().ok_or_else(|| {
+                    std::io::Error::other("dig-node: approved pairing carried no token")
+                })?;
+                let path = paired_client::paired_token_path();
+                paired_client::store_paired_token(&path, token)?;
+                return Ok(Outcome::new(
+                    format!(
+                        "dig-node: paired. The scoped token is stored for your account at {}.
+                         `dign` control commands now work as this user, with no elevation. The                          operator can revoke it any time with `sudo dign pair revoke <token_id>`.",
+                        path.display()
+                    ),
+                    json!({ "status": "approved", "token_path": path.display().to_string() }),
+                ));
+            }
+            "pending" => match next_poll_step(now_ms(), expires_ms, POLL_INTERVAL) {
+                PollStep::Wait(d) => std::thread::sleep(d),
+                PollStep::Expired => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "dig-node: the pairing request expired before it was approved.                          Run `dign pair connect` again and have the operator approve it                          within five minutes.",
+                    ))
+                }
+            },
+            // `expired` and `unknown` are both terminal: the node has dropped the pending entry,
+            // so no amount of further polling can change the answer.
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "dig-node: the pairing request is {other} — it was never approved, or the                          node restarted. Run `dign pair connect` again."
+                    ),
+                ))
+            }
         }
     }
 }
