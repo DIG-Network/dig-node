@@ -541,7 +541,26 @@ const DEFAULT_FALLBACK_REFILL_PER_SEC: f64 = 2.0;
 /// ten minutes is roughly a dozen chances for the spend to land — well past the point where a
 /// still-unconfirmed bundle is more likely dropped than pending, and short enough that a stranded
 /// coin returns on a timescale a user waits out rather than reports as lost.
-const RESERVATION_TTL_MS: i64 = 10 * 60 * 1000;
+pub(crate) const RESERVATION_TTL_MS: i64 = 10 * 60 * 1000;
+
+/// The most a single bundle's reservation may hold its inputs in TOTAL, measured from the FIRST
+/// push rather than from the latest one (dig-node#502): one hour.
+///
+/// [`RESERVATION_TTL_MS`] bounds one hold. It does not bound a SEQUENCE of holds: the re-arm on
+/// re-push is computed from `now`, so a caller re-pushing the same bundle more often than every
+/// TTL renews the hold forever and the inputs never return. That is the lockout failure the TTL's
+/// own doc names as the worse of the two, reachable without a single dishonest answer.
+///
+/// Expressed as a MULTIPLE of the TTL, in this one place, so the two cannot drift: lengthening the
+/// TTL because a bundle needs longer to land also lengthens the total a retrying caller may hold.
+/// A cap shorter than the TTL would be a covert shortening of the TTL, which is forbidden.
+///
+/// Six is sized by the same question as the TTL. Chia blocks are ~52s apart, so an hour is roughly
+/// seventy chances for the spend to land — far past the point where an unconfirmed bundle is more
+/// likely dropped than pending — while still returning a stranded coin on a timescale a user waits
+/// out. The clamp is anchored on `submitted_at`, which the reservation upsert never rewrites, so it
+/// is a bound on the bundle's whole life rather than on any one attempt.
+pub(crate) const MAX_RESERVATION_HOLD_MS: i64 = 6 * RESERVATION_TTL_MS;
 
 /// The Sage-parity wallet backend.
 #[derive(Clone)]
