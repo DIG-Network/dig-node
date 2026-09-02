@@ -836,7 +836,33 @@ fn summarize(method: &str, result: &Value) -> String {
             summarize_margin(result)
         }
         "control.updater.status" => summarize_updater_status(result),
+        "control.profile.getBody" => summarize_profile_get_body(result),
         _ => compact(result),
+    }
+}
+
+/// `dign profile get-body` — what this node holds at the root asked for, and how its held bodies
+/// stand against the root the chain currently anchors.
+///
+/// The standing is the load-bearing half (dig-node#294). A bare "no body" reads as "this profile
+/// does not exist", which is the wrong conclusion in three of the five standings and sends a
+/// publisher looking at its store id when the actual remedy is to re-publish at the chain's root.
+///
+/// The third arm is not dead: a node too old to reconcile omits `standing` entirely, and saying so
+/// is better than printing nothing. Inventing a standing for it would produce exactly the merged
+/// answer this exists to prevent.
+fn summarize_profile_get_body(result: &Value) -> String {
+    let body = if result["body_b64"].is_null() {
+        "NO body at the root asked for".to_string()
+    } else {
+        format!(
+            "{}-byte body held at the root asked for",
+            result["body_bytes"].as_u64().unwrap_or(0)
+        )
+    };
+    match result["standing"]["detail"].as_str() {
+        Some(detail) => format!("{body} · {detail}"),
+        None => format!("{body} · standing not reported (a node too old to reconcile)"),
     }
 }
 
