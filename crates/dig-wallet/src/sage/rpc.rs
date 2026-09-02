@@ -558,8 +558,35 @@ pub(crate) const RESERVATION_TTL_MS: i64 = 10 * 60 * 1000;
 /// Six is sized by the same question as the TTL. Chia blocks are ~52s apart, so an hour is roughly
 /// seventy chances for the spend to land — far past the point where an unconfirmed bundle is more
 /// likely dropped than pending — while still returning a stranded coin on a timescale a user waits
-/// out. The clamp is anchored on `submitted_at`, which the reservation upsert never rewrites, so it
-/// is a bound on the bundle's whole life rather than on any one attempt.
+/// out.
+///
+/// # What this bound is NOT
+///
+/// Three limitations are deliberate. Each is the price of having a finite cap at all, and each is
+/// stated here because the bound is otherwise easy to read as stronger than it is.
+///
+/// 1. **It bounds a CONTINUOUS hold, not an AGGREGATE one.** `submitted_at` anchors the clamp only
+///    while the row exists, and `WalletDb::prune_reservations` DELETEs the row at the cap. The next
+///    re-push therefore INSERTs a fresh row with a new `submitted_at` and a full new hour, so an
+///    indefinitely retrying caller produces a SAWTOOTH — one-hour holds separated by an instant of
+///    selectability — rather than one bounded total across the bundle's life. This is intended: at
+///    each release the coins were genuinely selectable again, and refusing to ever re-hold a bundle
+///    that already had its hour would mean permanently declining to protect a bundle that may still
+///    land, which is the double-spend direction. Pinned by
+///    `a_repushed_bundle_gets_a_fresh_anchor_after_the_cap_prunes_its_row`.
+/// 2. **A bundle whose TIMELOCK matures later than the cap has its inputs freed while still
+///    valid.** This is the one class where the network genuinely retains the bundle — a node
+///    answers PENDING rather than FAILED for an unmet `ASSERT_HEIGHT_ABSOLUTE` or
+///    `ASSERT_SECONDS_ABSOLUTE` — so the inputs are released while some mempool is really still
+///    holding it, and it will be admitted once the condition is met. Accepted rather than fixed: the
+///    release is CLOCK-driven, so no peer can advance it and the case carries no attacker leverage;
+///    this node builds no timelocked bundles of its own; and the alternative is the indefinite
+///    lockout this constant exists to close.
+/// 3. **Near the cap, a re-push buys strictly LESS than a full TTL.** Between
+///    `submitted_at + 5 * RESERVATION_TTL_MS` and the cap the clamp binds, so each renewal extends
+///    the deadline by a shrinking amount that reaches zero exactly at the cap. That is what a clamp
+///    does rather than a defect, and
+///    `a_repush_inside_the_last_ttl_before_the_cap_buys_less_than_a_full_ttl` pins the boundary.
 pub(crate) const MAX_RESERVATION_HOLD_MS: i64 = 6 * RESERVATION_TTL_MS;
 
 /// The Sage-parity wallet backend.
@@ -2170,8 +2197,7 @@ impl WalletBackend {
         // mempool by this point, and reporting a push that did happen as an error would be a worse
         // lie than the double-selection this guards against.
         if !matches!(&pushed, Ok(o) if Self::is_definitive_rejection(o)) {
-            let may_extend = Self::attempt_may_extend_the_hold(&pushed);
-            if let Err(e) = self.reserve_pushed_bundle(&bundle, may_extend).await {
+            if let Err(e) = self.reserve_pushed_bundle(&bundle).await {
                 tracing::warn!(
                     error = %e,
                     "pushed bundle may be in flight but its coins could not be reserved; a second \
@@ -2180,39 +2206,6 @@ impl WalletBackend {
             }
         }
         pushed.map_err(|e| PushError::Unreachable(e.to_string()))
-    }
-
-    /// Whether THIS push attempt may push an existing reservation's deadline further out
-    /// (dig-node#502).
-    ///
-    /// The hold itself is decided by [`Self::is_definitive_rejection`] and is unchanged; this
-    /// decides only whether an attempt RENEWS one. The two questions differ because renewal is
-    /// worth something only while some destination may plausibly still be holding the bundle. When
-    /// the last answer was a complaint about the bundle's own CONTENTS that no later push can turn
-    /// into an acceptance, renewing buys nothing — and composed with a caller that retries, an
-    /// unconditional renewal held the inputs for as long as the retries continued, for a bundle
-    /// that was never going to land.
-    ///
-    /// The default is CONSERVATIVE: everything except a recognised foreclosing reason extends.
-    ///
-    /// | outcome | may extend |
-    /// |---|---|
-    /// | `Err` — no verdict was reached, so the bundle may be in flight | yes |
-    /// | accepted | yes |
-    /// | refused with no stated reason | yes |
-    /// | refused for a reason in `chain::refusal_forecloses_a_later_push` | **no** |
-    /// | refused for any other or unrecognised reason | yes |
-    ///
-    /// A bundle-intrinsic refusal never reaches this question at all:
-    /// [`Self::is_definitive_rejection`] skips the reservation entirely for those.
-    fn attempt_may_extend_the_hold(pushed: &Result<PushOutcome>) -> bool {
-        match pushed {
-            Ok(outcome) if !outcome.accepted => !outcome
-                .rejection
-                .as_deref()
-                .is_some_and(super::chain::refusal_forecloses_a_later_push),
-            _ => true,
-        }
     }
 
     /// Whether `outcome` is the network DEFINITIVELY refusing this bundle — the only case in which
@@ -2289,7 +2282,7 @@ impl WalletBackend {
     /// sign (§908), so a validation failure here says nothing about whether the bundle is
     /// legitimate — the mempool has already accepted it. An uncomputable fee is stored as `None`
     /// and reported as `null`, never as zero.
-    async fn reserve_pushed_bundle(&self, bundle: &SpendBundle, may_extend: bool) -> Result<()> {
+    async fn reserve_pushed_bundle(&self, bundle: &SpendBundle) -> Result<()> {
         let now = super::custody::now_ms() as i64;
         let row = super::db::PendingTransactionRow {
             transaction_id: hex::encode(bundle.name()),
@@ -2300,7 +2293,6 @@ impl WalletBackend {
             submitted_at: now,
             expires_at: now + RESERVATION_TTL_MS,
             attempts: 1,
-            may_extend_expiry: may_extend,
             reserved_coin_ids: bundle
                 .coin_spends
                 .iter()
@@ -10892,7 +10884,6 @@ mod tests {
             submitted_at: 1_000,
             expires_at,
             attempts: 1,
-            may_extend_expiry: true,
             reserved_coin_ids: coin_ids.to_vec(),
         }
     }
