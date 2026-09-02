@@ -612,6 +612,23 @@ fn canonical_cache_dir() -> PathBuf {
     {
         return PathBuf::from(env);
     }
+    platform_user_base().join("DigNode").join("cache")
+}
+
+/// The per-user base directory this node resolves everything under: the cache, `config.json`, and
+/// therefore the `wallet.sqlite` coin replica that hangs off the config's directory.
+///
+/// It asks the OS for the known folder FIRST and only then falls back to the environment. That
+/// ordering is deliberate and load-bearing for the shared-cache guarantee above -- it is correct on
+/// a Windows host whose raw env vars are unset -- but it also means an operator who overrides
+/// `LOCALAPPDATA` does NOT move this path, while the wallet's own env-first resolver
+/// (`dig_wallet::autoseed::user_base`) does. The two halves of that disagreement are announced by
+/// `dig_node_service::wallet_env` (dig-node#392); this function is public so that comparison can be
+/// made against the real resolver rather than a second spelling of it.
+///
+/// Extracted verbatim from [`canonical_cache_dir`], which still calls it: the resolution order is
+/// unchanged in every arm.
+pub fn platform_user_base() -> PathBuf {
     let base = directories::BaseDirs::new().map(|b| {
         if cfg!(windows) {
             b.data_local_dir().to_path_buf()
@@ -621,11 +638,9 @@ fn canonical_cache_dir() -> PathBuf {
             b.home_dir().to_path_buf()
         }
     });
-    let root = base
-        .or_else(|| std::env::var("LOCALAPPDATA").ok().map(PathBuf::from))
+    base.or_else(|| std::env::var("LOCALAPPDATA").ok().map(PathBuf::from))
         .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    root.join("DigNode").join("cache")
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// A deterministic process-private fallback cache dir, used only when the
