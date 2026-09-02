@@ -177,6 +177,10 @@ pub const IDENTITY_DIR_ENV: &str = "DIG_IDENTITY_DIR";
 /// The env var that overrides the node's content CACHE dir (read by `dig_node_core`).
 pub const CACHE_DIR_ENV: &str = "DIG_NODE_CACHE";
 
+/// The env var that overrides the base BOTH wallet roots hang off. Re-exported from the crate
+/// that owns the layout rather than re-spelled here, so the two can never drift apart.
+pub use dig_wallet::WALLET_BASE_ENV;
+
 /// PURE decision core (no I/O): the identity + cache directory overrides a SERVICE run must
 /// adopt, given whether it is a service, the resolved machine `state_dir`, and whether the
 /// operator has already set each override explicitly.
@@ -195,12 +199,38 @@ pub const CACHE_DIR_ENV: &str = "DIG_NODE_CACHE";
 /// the process environment, and so the ONE place that mutates the environment is a single
 /// documented call early in startup.
 ///
+/// # The wallet base, and the one condition on it (dig-node#491)
+///
+/// The wallet's own resolver (`DIG_WALLET_BASE`, then `%LOCALAPPDATA%`, then `$HOME`) misses every
+/// rung inside the shipped systemd unit: it sets no `User=`, so systemd sets no `$HOME`, and no
+/// `WorkingDirectory=`, so the working directory is `/`. The seed was therefore CREATED at
+/// `/DigWallet/seed.bin`, and the write SUCCEEDED — the unit runs as root and `ProtectSystem=full`
+/// leaves `/` writable — so the node came up with a working wallet at the filesystem root and
+/// nothing anywhere said so.
+///
+/// `legacy_wallet_present` is what keeps that fix from being worse than the bug. The node's
+/// operator wallet holds real $DIG for mirror-coin collateral, so anchoring a host that ALREADY
+/// has a wallet at the old location would leave the funded file unreferenced and mint a fresh
+/// empty one beside it. This is a live risk on Windows in particular, where `%LOCALAPPDATA%` IS
+/// set for a LocalSystem service, so existing installs already hold a seed under the systemprofile
+/// path. Existing hosts therefore keep their old base; only a host with no wallet yet adopts the
+/// anchored one, and moving key material is left to a deliberate operator-run migration.
+///
+/// This is NOT the "derive the wallet base from the node's cache dir" change
+/// [`crate::wallet_env`] argues against. That one would re-root the seed onto a cache directory
+/// this function has ALREADY moved, so it would find nothing there and mint a fresh wallet on
+/// every existing install. The difference is the whole design: this is an independent explicit
+/// base, adopted only where there is nothing to orphan. An intra-doc link rather than a code
+/// span, so rustdoc fails if the module the argument lives in ever moves.
+///
 /// An override the operator set explicitly is never replaced — their choice outranks ours.
 pub fn service_data_dir_overrides(
     is_service: bool,
     state_dir: &Path,
     identity_dir_set: bool,
     cache_dir_set: bool,
+    wallet_base_set: bool,
+    legacy_wallet_present: bool,
 ) -> Vec<(&'static str, PathBuf)> {
     if !is_service {
         return Vec::new();
@@ -211,6 +241,9 @@ pub fn service_data_dir_overrides(
     }
     if !cache_dir_set {
         out.push((CACHE_DIR_ENV, state_dir.join("cache")));
+    }
+    if !wallet_base_set && !legacy_wallet_present {
+        out.push((WALLET_BASE_ENV, state_dir.to_path_buf()));
     }
     out
 }
@@ -226,11 +259,33 @@ pub fn anchor_service_data_dirs() {
         return;
     }
     let dir = state_dir();
+    // Asked BEFORE the override is written, and answered by the crate that owns the layout, so the
+    // question is genuinely "what would this build have opened a moment ago" rather than a guess
+    // at the path. `legacy_wallet_present` treats an undeterminable answer as PRESENT, which is
+    // the direction that cannot strand a funded wallet.
+    let legacy_wallet = dig_wallet::legacy_wallet_present();
+    // Gated on the SAME conjunction the anchoring decision uses, not on `legacy_wallet` alone.
+    // `service_data_dir_overrides` leaves the wallet base alone when the operator has already set
+    // `DIG_WALLET_BASE`, so with that variable set the service opens the operator's base and NOT
+    // the legacy path - and a warning naming the legacy path as "the one it keeps opening" would
+    // be a false statement about where live key material sits, inviting a migration or a deletion
+    // of the wrong file.
+    if legacy_wallet && !env_is_set(WALLET_BASE_ENV) {
+        // The PATH only. Never the contents, and never a hint at them.
+        tracing::warn!(
+            seed = %dig_wallet::legacy_seed_path().display(),
+            state_dir = %dir.display(),
+            "a wallet already exists at the pre-#491 location, so this service keeps opening it \
+             rather than the machine state dir; move it deliberately if you want it anchored"
+        );
+    }
     let overrides = service_data_dir_overrides(
         true,
         &dir,
         env_is_set(IDENTITY_DIR_ENV),
         env_is_set(CACHE_DIR_ENV),
+        env_is_set(WALLET_BASE_ENV),
+        legacy_wallet,
     );
     for (key, value) in overrides {
         // Create it up front so the first write does not race, and so a failure surfaces here
@@ -981,8 +1036,14 @@ mod tests {
     fn a_service_run_anchors_both_identity_and_cache_under_the_machine_state_dir() {
         // The exact failure this prevents: the packaged unit sets ProtectHome=true, so a seed
         // written under $HOME fails EROFS and the peer network never starts.
-        let overrides =
-            service_data_dir_overrides(true, Path::new("/var/lib/dig-node"), false, false);
+        let overrides = service_data_dir_overrides(
+            true,
+            Path::new("/var/lib/dig-node"),
+            false,
+            false,
+            true,
+            true,
+        );
         assert_eq!(
             overrides,
             vec![
@@ -995,29 +1056,128 @@ mod tests {
         );
     }
 
+    // -- The wallet base (#491) ---------------------------------------------------------------
+    //
+    // On the shipped systemd unit the wallet's own chain resolves nothing (no `User=` so no
+    // `$HOME`, and no `LOCALAPPDATA` on Linux) and collapses to the working directory, which for a
+    // system unit is `/`. The seed was created at `/DigWallet/seed.bin` and the write SUCCEEDED,
+    // so the node has been running with a wallet at the filesystem root.
+
     #[test]
-    fn a_cli_run_is_left_entirely_alone() {
-        // The CLI legitimately lives under the user's home and shares that identity with the
-        // user's other DIG tools; anchoring it machine-wide would change where an existing
-        // user's key is looked up.
-        assert!(
-            service_data_dir_overrides(false, Path::new("/var/lib/dig-node"), false, false)
-                .is_empty()
+    fn a_service_with_no_wallet_yet_anchors_the_wallet_base_at_the_state_dir() {
+        let overrides = service_data_dir_overrides(
+            true,
+            Path::new("/var/lib/dig-node"),
+            true,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            overrides,
+            vec![(WALLET_BASE_ENV, PathBuf::from("/var/lib/dig-node"))],
+            "the BASE, not the wallet directory: the seed and the device key both hang off it"
         );
     }
 
     #[test]
+    fn a_service_that_already_has_a_wallet_keeps_opening_the_old_one() {
+        // The safety-critical direction. The node's operator wallet holds real $DIG for
+        // mirror-coin collateral, so re-rooting an existing install would leave the funded seed
+        // unreferenced and mint a fresh empty wallet in its place. Existing Windows service
+        // installs are the live case: `%LOCALAPPDATA%` IS set for LocalSystem, so they already
+        // hold a seed under the systemprofile path.
+        assert!(
+            service_data_dir_overrides(
+                true,
+                Path::new("/var/lib/dig-node"),
+                true,
+                true,
+                false,
+                true
+            )
+            .is_empty(),
+            "no wallet override may be emitted while a wallet exists at the legacy path"
+        );
+    }
+
+    #[test]
+    fn an_operator_set_wallet_base_outranks_the_anchor() {
+        // Even with nothing to orphan: the operator's explicit choice wins, exactly as it does for
+        // the identity and cache dirs.
+        assert!(service_data_dir_overrides(
+            true,
+            Path::new("/var/lib/dig-node"),
+            true,
+            true,
+            true,
+            false
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_operator_set_wallet_base_wins_even_with_a_legacy_wallet_on_disk() {
+        // The state the start-up warning used to mis-narrate. With BOTH a stale seed at the legacy
+        // path AND an operator-set `DIG_WALLET_BASE`, the anchor emits nothing because the operator
+        // already placed the base - so the service opens the OPERATOR's base, not the legacy path.
+        // The warning in `anchor_service_data_dirs` is gated on the same conjunction for that
+        // reason: narrating the legacy path here would name the wrong file as the live one.
+        assert!(
+            service_data_dir_overrides(
+                true,
+                Path::new("/var/lib/dig-node"),
+                true,
+                true,
+                true,
+                true
+            )
+            .is_empty(),
+            "an explicit wallet base outranks the legacy-wallet guard as well as the anchor"
+        );
+    }
+
+    #[test]
+    fn a_cli_run_is_left_entirely_alone() {
+        // The CLI legitimately lives under the user's home and shares that identity with the
+        // user's other DIG tools; anchoring it machine-wide would change where an existing
+        // user's key is looked up — and for the wallet base that would mean a CLI reading a
+        // different seed from the one it read yesterday.
+        assert!(service_data_dir_overrides(
+            false,
+            Path::new("/var/lib/dig-node"),
+            false,
+            false,
+            false,
+            false
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn an_operator_set_override_is_never_replaced() {
-        let overrides =
-            service_data_dir_overrides(true, Path::new("/var/lib/dig-node"), true, false);
+        let overrides = service_data_dir_overrides(
+            true,
+            Path::new("/var/lib/dig-node"),
+            true,
+            false,
+            true,
+            true,
+        );
         assert_eq!(
             overrides,
             vec![(CACHE_DIR_ENV, PathBuf::from("/var/lib/dig-node/cache"))],
             "only the unset one is filled in"
         );
-        assert!(
-            service_data_dir_overrides(true, Path::new("/var/lib/dig-node"), true, true).is_empty()
-        );
+        assert!(service_data_dir_overrides(
+            true,
+            Path::new("/var/lib/dig-node"),
+            true,
+            true,
+            true,
+            true
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1025,7 +1185,7 @@ mod tests {
         // A user-level service that could not create /var/lib falls back to a per-user dir; the
         // anchor must follow it rather than hardcoding the machine path.
         let legacy = Path::new("/home/u/.local/share/DigNode");
-        for (_, path) in service_data_dir_overrides(true, legacy, false, false) {
+        for (_, path) in service_data_dir_overrides(true, legacy, false, false, false, false) {
             assert!(
                 path.starts_with(legacy),
                 "{} must live under the resolved state dir",

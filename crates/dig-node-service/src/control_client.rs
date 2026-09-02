@@ -15,6 +15,16 @@
 //! mutating CLI control is gated by the same capability as the WS, not an unauthenticated side
 //! door. A node running as a service under another OS account surfaces the precise
 //! service-vs-user remedy from `load_token_readonly` (elevate / grant read ACL / start the node).
+//!
+//! # The ladder (#403) -- a paired token when the master token is out of reach
+//!
+//! On a `.deb` install the master token is `0600 root:root` (#501), so an ordinary user's read is
+//! DENIED. Rather than widen that mode -- it is the master capability -- the client falls through
+//! to the scoped token an operator approved for this account (`dign pair connect`, then
+//! `sudo dign pair approve <pairing_id>`; see [`crate::paired_client`]). That token is strictly
+//! less powerful: it cannot administer pairings and carries no chain authority over the wallet
+//! replica. With NEITHER token the master read's rich remedy is returned unchanged, because it is
+//! the message that tells the user what to do next.
 
 use serde_json::{json, Value};
 
@@ -43,7 +53,16 @@ fn build_control_client() -> reqwest::Result<reqwest::Client> {
 /// ("is the node running?"), a JSON-RPC `error` → `Other` (the node's own message).
 pub fn call_control(config: &Config, method: &str, params: Value) -> std::io::Result<Value> {
     let addr = config.bind_addr();
-    let token = control::load_token_readonly()?;
+    // The #403 ladder: the master token when this account can read it, else this user's paired
+    // token, else the master read's own remedy verbatim. Rung 2 is a thunk, so a user who can read
+    // the master token never touches the per-user store.
+    let token = crate::paired_client::select_token(control::load_token_readonly(), || {
+        // An unresolvable per-user base is "this account has no paired token", not an error of
+        // its own: rung 3's master remedy is the message the user needs either way.
+        crate::paired_client::paired_token_path()
+            .ok()
+            .and_then(|p| crate::paired_client::load_paired_token(&p))
+    })?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
