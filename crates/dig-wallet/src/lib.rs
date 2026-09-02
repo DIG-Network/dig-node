@@ -238,10 +238,18 @@ pub fn legacy_seed_path() -> PathBuf {
 /// fail-closed direction as [`wallet_exists`] and for the same reason — the unknown case must not
 /// be the one that abandons a wallet.
 pub fn legacy_wallet_present() -> bool {
-    !matches!(
-        autoseed::presence(&legacy_seed_path()),
-        Ok(autoseed::Presence::Absent)
-    )
+    presence_counts_as_present(autoseed::presence(&legacy_seed_path()))
+}
+
+/// The fail-closed reading of a presence probe: only a definite `Absent` counts as "no wallet".
+///
+/// Split out from [`legacy_wallet_present`] so the safety-critical direction is assertable without
+/// a platform-specific unreadable-path fixture. It also makes the property structural: a refactor
+/// to `Path::exists()` — which collapses every metadata error to `false` — cannot keep this
+/// function's `io::Result` argument, so it fails to compile rather than silently stranding a
+/// funded wallet.
+fn presence_counts_as_present(probe: std::io::Result<autoseed::Presence>) -> bool {
+    !matches!(probe, Ok(autoseed::Presence::Absent))
 }
 
 /// Path to the encrypted seed file (per-user, off the profile dir).
@@ -1228,6 +1236,36 @@ mod tests {
             resolve_wallet_base(None, Some("\t"), Some(" /home/op\n")),
             Some(PathBuf::from("/home/op"))
         );
+    }
+
+    /// **Proves:** an UNREADABLE legacy seed path answers PRESENT, never absent.
+    ///
+    /// This is the safety-critical direction of the #491 guard: `legacy_wallet_present` decides
+    /// whether a service run may re-anchor the wallet base, so an absent answer for a path the
+    /// process merely could not read would relocate the base out from under a FUNDED wallet and
+    /// mint a fresh empty one beside it. A later refactor to `Path::exists()` - which collapses
+    /// every metadata error to `false` - would be green without this assertion.
+    ///
+    /// Asserted on the mapping rather than through a real unreadable path, because the portable
+    /// unreadable fixture (a base containing an interior NUL) cannot be delivered through the
+    /// environment on Windows: `set_var` rejects it outright.
+    #[test]
+    fn an_unreadable_legacy_seed_path_counts_as_present() {
+        // The control: only a definite Absent may answer "no wallet here".
+        assert!(!presence_counts_as_present(Ok(autoseed::Presence::Absent)));
+        assert!(presence_counts_as_present(Ok(autoseed::Presence::Present)));
+
+        // The property under test: an unanswerable existence question must count as PRESENT.
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(
+                presence_counts_as_present(Err(std::io::Error::from(kind))),
+                "an unreadable seed path ({kind:?}) must never be read as an absent wallet"
+            );
+        }
     }
 
     #[test]
