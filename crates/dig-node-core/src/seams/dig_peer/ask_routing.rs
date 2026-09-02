@@ -69,7 +69,7 @@ const TICK: Duration = Duration::from_secs(1);
 ///
 /// See the module docs: this type existing at all is the security boundary, because it is the only
 /// way a `dig-sex` routing key can be minted and it can only be minted from a verified identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RoutedPeer([u8; 32]);
 
 impl RoutedPeer {

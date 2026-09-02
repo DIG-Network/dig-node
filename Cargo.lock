@@ -2881,6 +2881,8 @@ dependencies = [
 [[package]]
 name = "dig-mirror-coin"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eceab37a1234805e0043c30d096f5da38f5b86581032f465d8a2db807cf10b64"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-protocol 0.36.1",
@@ -2967,7 +2969,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.66.0"
+version = "0.67.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3029,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.244.0"
+version = "0.253.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3335,7 +3337,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.46.0"
+version = "0.48.0"
 dependencies = [
  "async-trait",
  "axum",

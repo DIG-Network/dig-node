@@ -919,6 +919,11 @@ pub trait PeerRpcResponder: Send + Sync {
     /// by the SAME per-requestor miss-lookup budget as the single-item legs (dig_ecosystem#2007). A
     /// batch is the LARGEST amplification vector (up to `MAX_AVAILABILITY_ITEMS` lookups per request),
     /// so it must key by the ASKING peer, never one shared peer bucket every peer could exhaust.
+    ///
+    /// A batch LARGER than `MAX_AVAILABILITY_ITEMS` is refused whole at the admission boundary
+    /// (`-32000`, reason `request too large`) rather than answered as a truncated prefix: the node
+    /// admits exactly the batch size it advertises, and a caller that asked for more is told so
+    /// instead of being handed a short answer it must diff against its request to notice.
     async fn handle_availability(&self, items: Value, conn_key: &str) -> Value;
 
     /// Stream a `dig.fetchRange` response for `req` (the RangeRequest value) by writing framed
@@ -1057,13 +1062,22 @@ async fn reconcile_and_flood(
 /// [`PeerRpcResponder::handle_availability`], a range fetch via [`PeerRpcResponder::stream_range`].
 /// Returns when the peer closes the connection. The caller has already verified the remote `peer_id`
 /// (dig-nat enforces it during the mTLS handshake), so every stream here is from an authenticated peer.
+///
+/// This entry point threads NO caller identity through to the responder, and since #269 that is
+/// observable: the JSON-RPC and availability paths meter against the mTLS-verified `peer_id` and
+/// refuse a session without one (`-32000`, reason `unauthenticated`). Callers that have the verified
+/// identity — every production listener does — MUST use [`serve_peer_session_from`], which is what
+/// keeps those two paths served.
 pub async fn serve_peer_session(
     mut session: dig_nat::mux::PeerSession,
     responder: Arc<dyn PeerRpcResponder>,
 ) {
     // No authenticated caller threaded here (the mTLS-verified caller is supplied by the listener via
-    // `serve_peer_session_from`); a caller-less session still serves the JSON-RPC/range/availability
-    // paths — only DHT routing-table population needs the caller.
+    // `serve_peer_session_from`). Since #269 a caller-less session serves the RANGE and module-range
+    // paths only: JSON-RPC and availability now meter against the mTLS-verified peer_id, and an
+    // absent one is refused `-32000` (`unauthenticated`) rather than admitted unmetered — otherwise
+    // presenting no identity would be the cheapest way out of the meter. DHT routing-table
+    // population likewise needs the caller. Every production listener supplies one.
     serve_peer_session_from(None, &mut session, responder).await
 }
 
@@ -1248,6 +1262,30 @@ where
     }
 }
 
+/// The JSON-RPC error body for inbound work refused at the admission boundary (#269).
+///
+/// `-32000` (server error) rather than a method/param error: the request was well-formed and the node
+/// simply declined to spend on it now. The reason names the LIMIT, never the peer's standing, so shed
+/// load stays distinguishable from a ban by the peer and from an outage by the operator.
+fn admission_refused(
+    id: Value,
+    conn_key: &str,
+    refusal: crate::seams::dig_peer::admission::AdmissionRefusal,
+) -> Value {
+    // The refused PEER is named, because a refusal log that omits it cannot answer the only question
+    // an operator has when the node starts shedding: is one caller taking the allowance, or is the
+    // node simply loaded? A count without identities looks identical in both cases (gate S3 on
+    // dig-node#456). Truncated to the 16-hex prefix — enough to tell callers apart in a log, short
+    // enough not to turn every refusal into a full identity dump.
+    tracing::debug!(
+        reason = refusal.reason(),
+        peer = %conn_key.get(..16).unwrap_or(conn_key),
+        "peer serve: inbound work refused at admission"
+    );
+    json!({"jsonrpc":"2.0","id":id,
+        "error":{"code":-32000,"message":"request refused","data":{"reason":refusal.reason()}}})
+}
+
 /// Whether `method` may be answered over the **mTLS peer surface** (other DIG nodes).
 ///
 /// The allowlist itself lives in ONE place — [`dig_rpc_protocol::Method::is_peer_reachable`],
@@ -1413,6 +1451,18 @@ impl PeerRpcResponder for NodeResponder {
     async fn handle_json_rpc(&self, req: Value, conn_key: &str) -> Value {
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         let id = req.get("id").cloned().unwrap_or(json!(1));
+        // ADMISSION (dig-sex SPEC 8.5, #269) — ahead of the allowlist and every dispatch below, so a
+        // refused request costs a hex decode and a counter bump rather than a read, a decode or a DHT
+        // lookup. The guard is held for the whole method: it releases on `Drop`, including on the
+        // early `return`s below, which is why no path here needs to remember to.
+        let _admitted = match self
+            .node
+            .peer_admission()
+            .admit(conn_key, dig_sex::WorkKind::Own, 1)
+        {
+            Ok(guard) => guard,
+            Err(refusal) => return admission_refused(id, conn_key, refusal),
+        };
         // PEER-SURFACE ALLOWLIST (audit #179 CRITICAL). The mTLS verifier accepts any self-signed
         // leaf, so an "authenticated" peer is merely "some peer_id", NOT an authorized admin. Route
         // ONLY the intended L7 read/discovery/announce methods to the shared dispatch; return -32601
@@ -1476,6 +1526,19 @@ impl PeerRpcResponder for NodeResponder {
     }
 
     async fn handle_availability(&self, items: Value, conn_key: &str) -> Value {
+        // ADMISSION (dig-sex SPEC 8.5, #269) — before the items are even read. `items.len()` is the
+        // attacker-chosen quantity this request asks for, so it is what gets clamped at the boundary
+        // (`AdmissionLimits::max_request_units`); clamping it deeper in would already have paid for it.
+        let requested_units =
+            u32::try_from(items.as_array().map_or(0, Vec::len)).unwrap_or(u32::MAX);
+        let _admitted = match self.node.peer_admission().admit(
+            conn_key,
+            dig_sex::WorkKind::Own,
+            requested_units,
+        ) {
+            Ok(guard) => guard,
+            Err(refusal) => return admission_refused(json!(1), conn_key, refusal),
+        };
         let items = items.as_array().cloned().unwrap_or_default();
         // The verified mTLS peer_id (`conn_key`) keys the per-requestor miss-lookup budget, identical
         // to the range-stream miss on this same peer surface (dig_ecosystem#2007).
@@ -5438,8 +5501,17 @@ pub(crate) mod tests {
         // End-to-end over the responder: a peer JSON-RPC frame naming a management/mutation
         // method is answered with -32601 (method not found) WITHOUT ever reaching the
         // node's `handle_rpc` dispatch (which would run the mutation). getPeers still works.
+        //
+        // The conn_key is a well-formed 64-hex peer id — the shape every production session supplies,
+        // since both listeners derive it from the verified client leaf. It became load-bearing when
+        // admission landed (#269): the meter runs AHEAD of this allowlist and refuses a session with
+        // no verified identity, so an empty key would now answer -32000 and this test would stop
+        // exercising the allowlist at all. Using a real one keeps the property under test unchanged —
+        // an AUTHENTICATED peer is still merely "some peer_id", never an authorized admin, which is
+        // the whole point of audit #179.
         let (node, _td) = crate::test_support::test_node_for_peer_surface();
         let responder = NodeResponder::without_pool(node);
+        let authenticated = "ab".repeat(32);
         for m in [
             "cache.clear",
             "cache.setCapBytes",
@@ -5448,7 +5520,7 @@ pub(crate) mod tests {
             "dig.stage",
         ] {
             let req = json!({"jsonrpc":"2.0","id":1,"method":m,"params":{}});
-            let resp = responder.handle_json_rpc(req, "").await;
+            let resp = responder.handle_json_rpc(req, &authenticated).await;
             assert_eq!(
                 resp["error"]["code"],
                 json!(-32601),
@@ -5463,7 +5535,7 @@ pub(crate) mod tests {
         let ok = responder
             .handle_json_rpc(
                 json!({"jsonrpc":"2.0","id":1,"method":"dig.getNetworkInfo"}),
-                "",
+                &authenticated,
             )
             .await;
         assert!(
@@ -5472,9 +5544,95 @@ pub(crate) mod tests {
         );
         // getPeers is answered from the (empty) pool view, not -32601.
         let peers = responder
-            .handle_json_rpc(json!({"jsonrpc":"2.0","id":1,"method":"dig.getPeers"}), "")
+            .handle_json_rpc(
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getPeers"}),
+                &authenticated,
+            )
             .await;
         assert!(peers["result"]["peers"].is_array());
+    }
+
+    /// **Proves (#269):** the admission meter is LIVE on the responder — not merely implemented
+    /// beside it — and it refuses a session that carries no verified identity BEFORE the method
+    /// allowlist is consulted.
+    ///
+    /// This is the wiring assertion. `admission.rs`'s unit tests prove the meter behaves; they cannot
+    /// prove anything calls it, and a meter nothing calls is the exact defect this ticket describes.
+    /// The authenticated control is what makes the refusal meaningful: without it, a responder that
+    /// refused EVERY request would pass.
+    #[tokio::test]
+    async fn the_responder_refuses_an_unauthenticated_session_before_consulting_the_allowlist() {
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let responder = NodeResponder::without_pool(node);
+        let method = json!({"jsonrpc":"2.0","id":1,"method":"dig.getNetworkInfo"});
+
+        // No verified peer id: refused at admission, and NOT with the allowlist's -32601 — which is
+        // how we know the meter ran first rather than the request simply failing later.
+        let refused = responder.handle_json_rpc(method.clone(), "").await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32000),
+            "an unauthenticated peer session must be refused at admission"
+        );
+        assert!(
+            refused.get("result").is_none(),
+            "a refused request must produce no result — the work must not have been done"
+        );
+
+        // CONTROL: the same method, from an authenticated session, is served.
+        let served = responder.handle_json_rpc(method, &"cd".repeat(32)).await;
+        assert!(
+            served.get("result").is_some(),
+            "an authenticated peer must still be served, or the meter is refusing everybody"
+        );
+    }
+    /// **Proves (#269):** the admission clamp and the availability batch's own advertised limit are
+    /// the SAME number, measured through the responder that actually decides.
+    ///
+    /// The clamp lives in [`NodeResponder::handle_availability`], above
+    /// [`crate::Node::availability_batch`]. `lib.rs`'s cap test calls the batch directly, BELOW that
+    /// decision, so it passes identically whether the clamp admits this batch, refuses it, or is not
+    /// wired at all — a test below the decision passes under the defect. This one asks the responder.
+    ///
+    /// Both sides are pinned, because a bound tested only from below can only confirm itself: a batch
+    /// AT [`crate::MAX_AVAILABILITY_ITEMS`] must be ANSWERED (a clamp set lower than the advertised
+    /// limit would refuse work this node says it serves), and one item past it must be REFUSED at
+    /// admission (a clamp set higher would let the meter admit work the batch will not answer).
+    #[tokio::test]
+    async fn the_responder_serves_a_batch_at_the_advertised_limit_and_refuses_one_past_it() {
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let responder = NodeResponder::without_pool(node);
+        let authenticated = "ef".repeat(32);
+        let batch = |n: usize| -> Value {
+            (0..n)
+                .map(|_| json!({ "store_id": "ee".repeat(32) }))
+                .collect::<Vec<Value>>()
+                .into()
+        };
+
+        let at_bound = responder
+            .handle_availability(batch(crate::MAX_AVAILABILITY_ITEMS), &authenticated)
+            .await;
+        assert_eq!(
+            at_bound["items"].as_array().map(Vec::len),
+            Some(crate::MAX_AVAILABILITY_ITEMS),
+            "a batch at the advertised limit must be ANSWERED in full — the node states it serves \
+             this many items, so refusing it denies work of its own contract"
+        );
+
+        let past_bound = responder
+            .handle_availability(batch(crate::MAX_AVAILABILITY_ITEMS + 1), &authenticated)
+            .await;
+        assert_eq!(
+            past_bound["error"]["data"]["reason"],
+            json!("request too large"),
+            "one item past the advertised limit must be refused AT admission, before the batch is \
+             read — not silently truncated after the cost is committed"
+        );
+        assert!(
+            past_bound.get("items").is_none(),
+            "a refused batch must produce no answers at all"
+        );
     }
 
     // -- OUTGOING-BANDWIDTH THROTTLE on the peer range-stream (dig_ecosystem #30) --------------------

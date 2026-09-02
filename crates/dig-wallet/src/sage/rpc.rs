@@ -1035,7 +1035,7 @@ impl WalletBackend {
     /// `synced: true` on that basis told a client a stale balance was settled, which is the
     /// money-adjacent falsehood dig_ecosystem#2869 exists to remove.
     ///
-    /// It reuses [`super::sync_supervisor::is_following`] — the SAME predicate
+    /// It reuses [`super::sync_supervisor::FollowingEvidence`] — the SAME evidence
     /// `control.wallet.syncStatus` reports its phase from — so a client cannot be told `synced` by
     /// one endpoint and `syncing` by the other about the same moment.
     ///
@@ -1046,12 +1046,16 @@ impl WalletBackend {
     /// `db.is_synced()` directly and so could, and on a live node did, report `synced: true`
     /// about the same replica this method was calling stale (dig-node#293).
     ///
-    /// It narrows that predicate on BOTH of its unobservable arms, and only here. `is_following`
-    /// answers `true` whenever EITHER height is missing, because on a status endpoint an absent
-    /// measurement is not an accusation against the replica. On a money read it is the opposite:
-    /// currency is a claim, and nothing that was never measured can establish one. Either arm left
-    /// unnarrowed leaves `synced: true` resting on the latched `initial_sync_complete` this method
-    /// exists to stop trusting.
+    /// BOTH unobservable arms withhold the claim, and that is now a property of the evidence type
+    /// itself rather than a narrowing applied at this call site. `FollowingEvidence::measure`
+    /// yields `None` whenever EITHER height is missing: currency is a claim, and nothing that was
+    /// never measured can establish one. Either arm left permissive would leave `synced: true`
+    /// resting on the latched `initial_sync_complete` this method exists to stop trusting.
+    ///
+    /// This method used to hold that narrowing alone, in two `let ... else { return false }`
+    /// guards duplicating exactly those arms. dig-node#495 moved the rule into the constructor and
+    /// this call site simply asks for the evidence — one narrowing, in one place, for both
+    /// endpoints.
     ///
     /// - **No PEER height** — there is no second opinion to compare the replica against.
     /// - **No REPLICA height** — there is no figure to compare, and `synced: true` would then be
@@ -1065,35 +1069,24 @@ impl WalletBackend {
     /// Either way the figure is still SERVED, with whatever `peak_height` is actually known,
     /// labelled stale — never withheld.
     ///
-    /// `is_following` itself is deliberately left ALONE. Its permissive `_ => true` is correct for
-    /// the sync-phase reporting it was written for, where an unmeasured tier must not be spent as
-    /// evidence against a replica; narrowing it there would change a phase machine owned by another
-    /// family. The narrowing is a property of the MONEY read, so it lives at this call site.
+    /// The structural agreement claimed above is now TRUE, and it was FALSE when first written —
+    /// which is the point of the convergence (dig-node#495). This method is the single gate for
+    /// every read served by [`WalletBackend`], but it was never the only producer of a `synced`
+    /// claim in the crate: [`super::sync_supervisor::SyncHandle::status`] reached
+    /// `SyncPhase::Synced` through a predicate permissive on both unmeasured arms, and paired it
+    /// with the replica's separately-read `peak_height`, so `control.wallet.syncStatus` could emit
+    /// `{phase: "synced", peak_height: null}` — the exact pairing this gate abolished on the money
+    /// reads while the status endpoint kept producing it.
     ///
-    /// That placement has a LIMIT, and it is stated here rather than left to be rediscovered:
-    /// this method is the single gate for every read served by [`WalletBackend`] — each one either
-    /// passes through here or writes the literal `false` — but it is NOT the only producer of a
-    /// `synced` claim in the crate. [`super::sync_supervisor::SyncHandle::status`] reaches
-    /// `SyncPhase::Synced` through its own `is_following` call and pairs it with the replica's raw
-    /// `peak_height`, so `control.wallet.sync-status` can still emit
-    /// `{phase: "synced", peak_height: null}` — the exact pairing this gate abolishes on the money
-    /// reads. That path is deliberately out of scope: it is a status endpoint rather than a
-    /// currency claim, and the phase machine belongs to another family (dig_ecosystem#2761).
-    ///
-    /// The asymmetry worth carrying into that work: `is_following`'s own doc justifies its
-    /// permissive arm ENTIRELY in terms of an unmeasured PEER tier, and offers no justification at
-    /// all for the unmeasured-REPLICA arm. Those are different things. An absent peer height is a
-    /// missing second opinion, which is fairly read as no accusation; an absent replica height is
-    /// the subject of the claim having no measurement whatsoever, which supports no verdict in
-    /// either direction.
+    /// Both endpoints now derive `synced` from the same [`super::sync_supervisor::FollowingEvidence`],
+    /// and on that path the reported height comes FROM the evidence, so the pairing is
+    /// unrepresentable rather than merely unlikely.
     async fn replica_answer_is_current(&self, peak_height: Option<u32>) -> bool {
-        let Some(replica_peak) = peak_height else {
-            return false;
-        };
-        let Some(peer_peak) = self.chain_peer_tier().await.peak_height else {
-            return false;
-        };
-        super::sync_supervisor::is_following(Some(replica_peak), Some(peer_peak))
+        super::sync_supervisor::FollowingEvidence::measure(
+            peak_height,
+            self.chain_peer_tier().await.peak_height,
+        )
+        .is_some()
     }
 
     /// The chain-sync supervisor's handle, if one is running.
@@ -1393,13 +1386,21 @@ impl WalletBackend {
     ///
     /// - **Wallet-owned address, DB synced** → the local DB is authoritative:
     ///   [`db::WalletDb::balance_scoped`] (confirmed) + [`db::WalletDb::pending_scoped`]
-    ///   (unconfirmed); `source = "db"`, `synced = true`, `peak_height` = the node's own peak.
+    ///   (unconfirmed); `source = "db"`, `peak_height` = the node's own peak.
     /// - **Otherwise** → the fallback (coinset) tier answers; `source = "fallback"`,
-    ///   `synced = false`, `peak_height = null`. If no LIVE fallback is attached, the read
+    ///   `peak_height = null`. If no LIVE fallback is attached, the read
     ///   cannot honestly answer, so it returns a DISTINCT error rather than a fabricated `0`:
     ///   [`BalanceError::NotSynced`] for the wallet's own address (the DB would answer once
     ///   synced), [`BalanceError::NoChainSource`] for an arbitrary address (only a chain
     ///   source could).
+    ///
+    /// **`synced` is NOT one of the routing outcomes above** (dig-node#490). It is computed
+    /// separately, from [`replica_answer_is_current`] — a CURRENCY test — so the routing tier and
+    /// the currency claim are independent, and `{source: "db", synced: false}` is a real,
+    /// reachable, common state: the replica was eligible to answer and is behind the chain. This
+    /// list previously read `synced = true` on the first bullet and `synced = false` on the
+    /// second, which denied a state production produces — and denied it about precisely the
+    /// answer the most useful CLI line renders.
     ///
     /// **Every reported state field describes the tier that answered** (#2233). Reading the
     /// DB's `synced` / `peak_height` on a coinset-served answer would describe the local
@@ -2175,8 +2176,11 @@ impl WalletBackend {
     ///
     /// # What counts as definitive, and what this does NOT claim
     ///
-    /// A refusal is definitive only when the mempool STATED its reason (`accepted == false` with a
-    /// `rejection`). A bare `accepted: false` with no reason is an unexplained denial and is held.
+    /// A refusal is definitive only when the mempool STATED its reason AND that reason is a
+    /// property of the BUNDLE rather than of the answering node's own view —
+    /// [`super::chain::refusal_is_bundle_intrinsic`]. A bare `accepted: false` with no reason is an
+    /// unexplained denial and is held; so, since dig-node#460, is a reason that only the node that
+    /// sent it can vouch for.
     ///
     /// This does not make the flag trustworthy — a hostile source can fabricate a rejection string,
     /// and nothing here can verify one without an independent chain read. What it does is make the
@@ -2188,8 +2192,34 @@ impl WalletBackend {
     /// `available=4000000 selectable=0`, renewable indefinitely. Requiring a STATED reason is what
     /// keeps a genuine mempool rejection (a bad signature, say) from locking the user's coins for
     /// the full TTL.
+    ///
+    /// # Why the presence of a reason was not enough (dig-node#460)
+    ///
+    /// One push is not one transmission. `chia_query`'s `push_tx` runs
+    /// `peer_then_coinset(peer, peer_retry, coinset)` and only the LAST answer arrives here, so a
+    /// refusal from destination B can free the inputs of a bundle destination A already admitted.
+    /// The first attempt fails as `Err` on a `request timed out` raised AFTER the bundle bytes went
+    /// out, and the peer that answers next has by then SEEN the gossip — so the reason it states is
+    /// `DOUBLE_SPEND`, `MEMPOOL_CONFLICT` or `ALREADY_INCLUDING_TRANSACTION`. Those are one node's
+    /// report of its OWN mempool, and on this path they mean the bundle IS in flight. Keying on the
+    /// mere PRESENCE of a reason therefore freed the coins precisely when they were least free.
+    ///
+    /// One peer's refusal is one peer's opinion; the network has no verdict this code can read.
+    /// What CAN be read is whether the stated reason is one every honest node would reach from the
+    /// same bytes. That question is answered without trusting the source, because the classifier is
+    /// an ALLOWLIST with a HOLD default: an unrecognised or view-dependent reason holds.
+    ///
+    /// **What that does and does not buy.** It removes the ACCIDENTAL free — the honest race above,
+    /// and a source denying a relay it performed. It does NOT defeat a DELIBERATE attacker in the
+    /// answering position, who can read the allowlist and emit a name from it. The free set shrank;
+    /// the ATTACKER's free set did not. Claiming otherwise would invite the next reader to treat the
+    /// reason string as trusted, which it is not and cannot be made.
     fn is_definitive_rejection(outcome: &PushOutcome) -> bool {
-        !outcome.accepted && outcome.rejection.is_some()
+        !outcome.accepted
+            && outcome
+                .rejection
+                .as_deref()
+                .is_some_and(super::chain::refusal_is_bundle_intrinsic)
     }
 
     /// Record an accepted bundle as in-flight and hold its inputs out of further selection.
@@ -7514,10 +7544,11 @@ mod tests {
     /// chain peer that has announced a height serves its figure labelled stale.
     ///
     /// This is the state a freshly-started node sits in, and the one a node with no reachable chain
-    /// peer sits in indefinitely. [`super::sync_supervisor::is_following`] answers `true` there by
-    /// design (an absent second opinion is not an accusation on a status endpoint), so a money read
-    /// delegating to it unnarrowed pairs `synced: true` with an arbitrarily old `peak_height` — the
-    /// stale-presented-as-current claim this PR exists to remove.
+    /// peer sits in indefinitely. The predicate this gate once delegated to answered `true` there
+    /// by design (an absent second opinion was read as no accusation), so a money read delegating
+    /// to it unnarrowed pairs `synced: true` with an arbitrarily old `peak_height`, the
+    /// stale-presented-as-current claim this PR exists to remove. Since dig-node#495
+    /// [`super::sync_supervisor::FollowingEvidence::measure`] withholds the evidence itself.
     ///
     /// FIXTURE DESIGN — `peak_height: None` is what makes the tier unobservable, and it is the only
     /// axis varied from [`a_replica_level_with_its_peers_still_reports_synced`], which stays green
@@ -7561,8 +7592,8 @@ mod tests {
     /// **Proves:** an UNKNOWN REPLICA height is never reported as current either — the other
     /// `None` arm of the same predicate, on the endpoint where it actually reaches production.
     ///
-    /// [`super::sync_supervisor::is_following`] answers `true` when EITHER side is `None`, and
-    /// [`WalletBackend::replica_answer_is_current`] narrowed only the peer side. `chain_peak`
+    /// The predicate this gate once delegated to answered `true` when EITHER side was `None`, and
+    /// an earlier [`WalletBackend::replica_answer_is_current`] narrowed only the peer side. `chain_peak`
     /// escapes the remaining arm by construction — it calls the gate inside `if let Some(peak)`,
     /// so it can never hand it a `None` replica. The balance and coin reads do not: they read
     /// `sync_state().peak_height` as an `Option` and pass it straight through. So the money reads,
@@ -11033,7 +11064,7 @@ mod tests {
         assert_eq!(selectable[0].amount, 500, "the wrong coin was held");
     }
 
-    /// **The control:** a mempool refusal that STATES ITS REASON reserves nothing.
+    /// **The control:** a mempool refusal that states a BUNDLE-INTRINSIC reason reserves nothing.
     ///
     /// Without it, reserving unconditionally satisfies the tests above while stranding a user's
     /// coins over a spend that will never happen — the lockout that is the worse of the two
@@ -11043,6 +11074,11 @@ mod tests {
     /// `a_bundle_denied_without_a_reason_is_held_rather_than_freed`: the two fixtures differ in the
     /// `rejection` field alone and demand opposite outcomes, so together they pin the bound from
     /// both sides. Neither is meaningful without the other.
+    ///
+    /// The reason text was `"mempool said no"` until dig-node#460, which is a shape no mempool
+    /// emits and which made this test reason-AGNOSTIC — it asserted only that SOME reason frees,
+    /// so it could not see that a peer-local reason must not. It now carries a real Chia error
+    /// name, and the #460 pair below carries the two it must be told apart from.
     #[tokio::test]
     async fn a_refused_bundle_reserves_nothing() {
         let mut refused = spendable_row(0xa1, 100);
@@ -11050,7 +11086,7 @@ mod tests {
         let refusing = FakePusher::answering(Ok(PushOutcome {
             accepted: false,
             transaction_id: None,
-            rejection: Some("mempool said no".into()),
+            rejection: Some("FAILED: BAD_AGGREGATE_SIGNATURE".into()),
             verdict: "FAILED".into(),
         }));
         let be = backend_with(vec![refused.clone()], true)
@@ -11072,6 +11108,172 @@ mod tests {
             be.spendable_coins(None).await.unwrap().len(),
             1,
             "a refused bundle stranded the coins it never committed"
+        );
+    }
+
+    /// **Proves (dig-node#460):** a refusal that is a property of ONE peer's VIEW does not return
+    /// the inputs to selection, because another destination may be holding the very bundle.
+    ///
+    /// **The defect this catches.** `chia_query`'s `push_tx` is not one transmission. It runs
+    /// `peer_then_coinset(peer, peer_retry, coinset)`: peer A, then a DIFFERENT peer B, then
+    /// coinset, and only the LAST answer reaches this crate. Attempt 1 fails as `Err` on a
+    /// `request timed out` raised AFTER the bundle bytes went out, so peer A may have admitted it
+    /// and gossiped it. Peer B, having now SEEN it, refuses with a stated conflict. Keying the
+    /// free on the mere PRESENCE of a reason then frees the inputs of a bundle sitting in a public
+    /// mempool -- and the strings that arrive on this path (`DOUBLE_SPEND`,
+    /// `ALREADY_INCLUDING_TRANSACTION`, `MEMPOOL_CONFLICT`) are precisely the ones that mean the
+    /// bundle IS in flight. The race does not merely reach the unsafe branch occasionally; when it
+    /// happens, the unsafe branch is the EXPECTED one.
+    ///
+    /// FIXTURE DESIGN. The refusal is AMBIGUOUS, which is the only kind that can see this bug: an
+    /// unambiguous refusal (`BAD_AGGREGATE_SIGNATURE`, the sibling below) is refused identically
+    /// by every node and freeing it is correct. Two coins, one spent by the bundle, so a
+    /// mis-scoped reservation that simply empties selection cannot pass for a correct one. This
+    /// and `a_bundle_intrinsic_refusal_still_frees_its_inputs` differ ONLY in the reason TEXT and
+    /// demand OPPOSITE outcomes: that pairing is what proves the guard reads the reason's CLASS
+    /// rather than its presence, and neither test means anything without the other.
+    #[tokio::test]
+    async fn a_peer_local_refusal_holds_inputs_another_destination_may_be_carrying() {
+        let mut spent_by_the_bundle = spendable_row(0xa1, 100);
+        let (bundle_hex, transaction_id) = a_bundle_spending(&mut spent_by_the_bundle);
+        let untouched = spendable_row(0xb2, 500);
+        // The second destination's answer, verbatim in the shape `stated_rejection` composes:
+        // a node that already holds this bundle telling us it conflicts.
+        let already_seen_it = FakePusher::answering(Ok(PushOutcome {
+            accepted: false,
+            transaction_id: None,
+            rejection: Some("FAILED: ALREADY_INCLUDING_TRANSACTION".into()),
+            verdict: "FAILED".into(),
+        }));
+        let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
+            .await
+            .with_pusher(already_seen_it);
+
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            2,
+            "the fixture must start with BOTH coins selectable, or the assertion below is vacuous"
+        );
+
+        let outcome = be.push_signed_bundle(&bundle_hex).await.unwrap();
+        assert!(
+            !outcome.accepted,
+            "the refusal is reported honestly -- what changes is what is RESERVED, not what is said"
+        );
+        assert_eq!(
+            outcome.rejection.as_deref(),
+            Some("FAILED: ALREADY_INCLUDING_TRANSACTION"),
+            "the operator must still be shown the peer's own words verbatim"
+        );
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending.len(),
+            1,
+            "one peer's view-local refusal freed the inputs of a bundle another destination may \
+             already hold; a second send inside the confirmation window can reselect them"
+        );
+        assert_eq!(pending[0].transaction_id, transaction_id);
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(
+            selectable.len(),
+            1,
+            "the possibly-in-flight bundle's input is still offered to a second spend"
+        );
+        assert_eq!(
+            selectable[0].amount, 500,
+            "the wrong coin was held: the untouched control left selection"
+        );
+    }
+
+    /// **Proves (dig-node#460):** a reason NOBODY ENUMERATED is held, not freed.
+    ///
+    /// This is the property that makes classifying an untrusted string acceptable at all. The
+    /// definitive set is an ALLOWLIST with a hold DEFAULT, so the enumeration being incomplete --
+    /// a Chia error name that did not exist when this was written, a source with its own
+    /// vocabulary, a peer inventing text -- costs at most a bounded `RESERVATION_TTL_MS` hold. A
+    /// DENYLIST of the same reasons would read almost identically and would fail the opposite way:
+    /// every unforeseen string would free the coins.
+    ///
+    /// **Catches:** re-inverting the default, and any refactor that treats "not recognised as
+    /// peer-local" as "therefore definitive".
+    #[tokio::test]
+    async fn an_unrecognised_refusal_reason_is_held_rather_than_freed() {
+        let mut spent_by_the_bundle = spendable_row(0xa1, 100);
+        let (bundle_hex, _) = a_bundle_spending(&mut spent_by_the_bundle);
+        let untouched = spendable_row(0xb2, 500);
+        let speaking_its_own_language = FakePusher::answering(Ok(PushOutcome {
+            accepted: false,
+            transaction_id: None,
+            // Not a Chia error name, and deliberately not one this crate could ever enumerate.
+            rejection: Some("FAILED: THE_NODE_WAS_HAVING_A_BAD_DAY".into()),
+            verdict: "FAILED".into(),
+        }));
+        let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
+            .await
+            .with_pusher(speaking_its_own_language);
+
+        assert_eq!(be.spendable_coins(None).await.unwrap().len(), 2);
+        be.push_signed_bundle(&bundle_hex).await.unwrap();
+
+        assert_eq!(
+            be.get_pending_transactions()
+                .await
+                .unwrap()
+                .transactions
+                .len(),
+            1,
+            "an unrecognised reason freed the inputs; the allowlist's default must be to HOLD, or \
+             every reason this crate has not enumerated is a free path"
+        );
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(selectable.len(), 1);
+        assert_eq!(selectable[0].amount, 500, "the wrong coin was held");
+    }
+
+    /// **The paired control (dig-node#460):** a BUNDLE-INTRINSIC refusal still frees its inputs
+    /// immediately.
+    ///
+    /// Without this the #460 fix degenerates into "hold on every refusal", which is the lockout
+    /// that is the worse of the two failures -- measured on dig-account as `available=4000000
+    /// selectable=0`. `BAD_AGGREGATE_SIGNATURE` is a property of the BUNDLE: every honest node
+    /// refuses it identically, so no destination can be holding it and there is nothing to protect.
+    ///
+    /// It differs from `a_peer_local_refusal_holds_inputs_another_destination_may_be_carrying` in
+    /// the reason text ALONE. A guard that went back to keying on presence, or forward to keying
+    /// on nothing, fails exactly one of the pair.
+    #[tokio::test]
+    async fn a_bundle_intrinsic_refusal_still_frees_its_inputs() {
+        let mut spent_by_the_bundle = spendable_row(0xa1, 100);
+        let (bundle_hex, _) = a_bundle_spending(&mut spent_by_the_bundle);
+        let untouched = spendable_row(0xb2, 500);
+        let bad_signature = FakePusher::answering(Ok(PushOutcome {
+            accepted: false,
+            transaction_id: None,
+            rejection: Some("FAILED: BAD_AGGREGATE_SIGNATURE".into()),
+            verdict: "FAILED".into(),
+        }));
+        let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
+            .await
+            .with_pusher(bad_signature);
+
+        assert_eq!(be.spendable_coins(None).await.unwrap().len(), 2);
+        be.push_signed_bundle(&bundle_hex).await.unwrap();
+
+        assert!(
+            be.get_pending_transactions()
+                .await
+                .unwrap()
+                .transactions
+                .is_empty(),
+            "a bundle no node will ever admit was recorded as in flight"
+        );
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            2,
+            "a bundle refused for its OWN contents stranded the coins it never committed for the \
+             full TTL; the #460 fix must narrow the free path, not close it"
         );
     }
 

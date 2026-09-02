@@ -238,7 +238,7 @@ pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const ROOT_NOT_ANCHORED: i64 = -32005;
 
 /// The resource is not available at the requested root — this node does not hold it and no other
-/// tier produced it. Catalogued as `RESOURCE_NOT_AVAILABLE_AT_ROOT` (dig-node `SPEC.md` error table)
+/// tier produced it. Catalogued as `RESOURCE_UNAVAILABLE` (dig-node `SPEC.md` error table)
 /// and already the code the read path returns for content it does not have.
 ///
 /// Named here (#1997) because the read path now reaches it in a NEW way: with no upstream configured
@@ -492,6 +492,12 @@ pub struct Node {
     /// registry. The registry's distinct-generation cap ([`crate::seams::dig_peer::DEFAULT_MAX_CONCURRENT_WARMS`])
     /// therefore bounds concurrent acquisitions across BOTH legs, not each in isolation.
     capsule_acquisition: Arc<crate::seams::dig_peer::WarmRegistry>,
+    /// Inbound admission for the mTLS peer surface (dig-sex SPEC 8.5, #269).
+    ///
+    /// One meter for the whole NODE, not one per connection or per responder: the ceiling it enforces
+    /// is node-wide, and a per-connection meter would let a peer buy more allowance simply by opening
+    /// more connections.
+    peer_admission: Arc<crate::seams::dig_peer::admission::PeerAdmission>,
     /// A WEAK self-reference, installed by the standalone peer-network bring-up (which holds the
     /// `Arc<Node>`), so a `&self` read handler can spawn a detached background task that needs an owned
     /// `Arc<Node>` — the capsule backfill (§14.3). `Weak` (not `Arc`) so the node's refcount is
@@ -612,6 +618,23 @@ fn canonical_cache_dir() -> PathBuf {
     {
         return PathBuf::from(env);
     }
+    platform_user_base().join("DigNode").join("cache")
+}
+
+/// The per-user base directory this node resolves everything under: the cache, `config.json`, and
+/// therefore the `wallet.sqlite` coin replica that hangs off the config's directory.
+///
+/// It asks the OS for the known folder FIRST and only then falls back to the environment. That
+/// ordering is deliberate and load-bearing for the shared-cache guarantee above -- it is correct on
+/// a Windows host whose raw env vars are unset -- but it also means an operator who overrides
+/// `LOCALAPPDATA` does NOT move this path, while the wallet's own env-first resolver
+/// (`dig_wallet::autoseed::user_base`) does. The two halves of that disagreement are announced by
+/// `dig_node_service::wallet_env` (dig-node#392); this function is public so that comparison can be
+/// made against the real resolver rather than a second spelling of it.
+///
+/// Extracted verbatim from [`canonical_cache_dir`], which still calls it: the resolution order is
+/// unchanged in every arm.
+pub fn platform_user_base() -> PathBuf {
     let base = directories::BaseDirs::new().map(|b| {
         if cfg!(windows) {
             b.data_local_dir().to_path_buf()
@@ -621,11 +644,9 @@ fn canonical_cache_dir() -> PathBuf {
             b.home_dir().to_path_buf()
         }
     });
-    let root = base
-        .or_else(|| std::env::var("LOCALAPPDATA").ok().map(PathBuf::from))
+    base.or_else(|| std::env::var("LOCALAPPDATA").ok().map(PathBuf::from))
         .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    root.join("DigNode").join("cache")
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// A deterministic process-private fallback cache dir, used only when the
@@ -4156,7 +4177,11 @@ impl Node {
     /// a per-request walk of the whole cache is a cost amplifier a peer controls.
     ///
     /// The batch is CAPPED at [`MAX_AVAILABILITY_ITEMS`] — the item count is caller-controlled — with
-    /// the excess simply not answered (the result array is aligned to the answered prefix).
+    /// the excess simply not answered (the result array is aligned to the answered prefix). That
+    /// truncation is the LAST line of defence, reached only by in-process callers: on the peer
+    /// surface an oversized batch never gets here, because
+    /// `NodeResponder::handle_availability` (peer.rs) meters the requested item
+    /// count against the same limit and refuses the whole request at the boundary (#269).
     ///
     /// `requestor` keys the per-item not-held → DHT `find_providers` enrichment against its
     /// per-requestor miss-lookup budget (dig_ecosystem#2007), so a large batch of not-held items from
@@ -4661,6 +4686,11 @@ impl Node {
         self.capsule_acquisition.clone()
     }
 
+    /// The node-wide inbound admission meter (dig-sex SPEC 8.5, #269).
+    pub(crate) fn peer_admission(&self) -> &Arc<crate::seams::dig_peer::admission::PeerAdmission> {
+        &self.peer_admission
+    }
+
     /// Build a node from the environment (cache dir/cap, §21 identity, upstream).
     /// Used by both the standalone bin's [`run`] and the in-process `dig-runtime`.
     pub fn from_env() -> Arc<Node> {
@@ -4739,6 +4769,7 @@ impl Node {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5061,6 +5092,7 @@ pub(crate) mod test_support {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5850,6 +5882,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5983,6 +6016,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -6050,6 +6084,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -6142,6 +6177,9 @@ mod tests {
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
                 capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+                peer_admission: Arc::new(
+                    crate::seams::dig_peer::admission::PeerAdmission::default(),
+                ),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
@@ -6216,6 +6254,9 @@ mod tests {
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
                 capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+                peer_admission: Arc::new(
+                    crate::seams::dig_peer::admission::PeerAdmission::default(),
+                ),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
@@ -9202,6 +9243,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -10982,6 +11024,10 @@ mod tests {
         assert_eq!(arr[2]["available"], false, "unknown capsule is a miss");
     }
 
+    /// Pins the IN-PROCESS truncation only. A peer-surface batch this size is refused whole at
+    /// admission long before it reaches here, and this test cannot see that: it calls the batch
+    /// BELOW the responder that decides. The responder-level pair lives in `peer.rs`
+    /// (`the_responder_serves_a_batch_at_the_advertised_limit_and_refuses_one_past_it`).
     #[tokio::test]
     async fn availability_batch_caps_the_item_count() {
         let (node, _td) = test_node(None);
