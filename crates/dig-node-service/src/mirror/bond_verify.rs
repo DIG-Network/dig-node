@@ -455,7 +455,9 @@ impl ReadAdmission {
         };
 
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(state.refilled_at).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(state.refilled_at)
+            .as_secs_f64();
         state.tokens = (state.tokens + elapsed * state.refill_per_sec).min(state.burst);
         state.refilled_at = now;
 

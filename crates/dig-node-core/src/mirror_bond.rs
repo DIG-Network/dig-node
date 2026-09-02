@@ -242,7 +242,8 @@ impl ProviderLocator for BondRankingLocator {
         // zero collateral by varying case alone. dig-dht applies exactly this normalisation to the
         // neighbouring `unverified_mirror_coin_id` field, for the reason its own doc gives: without
         // it "dedup and equality would split on presentation".
-        let mut promoted_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut promoted_peers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for record in found {
             let claimed = record.unverified_mirror_coin_id_bytes();
             // A holder that claims nothing, and every record past the budget, keeps its place with
