@@ -758,7 +758,7 @@ fn summarize(method: &str, result: &Value) -> String {
             "balance {} · pending {} · {}",
             amount(&result["balance"]),
             amount(&result["pending"]),
-            balance_freshness(result),
+            answer_freshness(result),
         ),
         // `result["coin"]` yields `Null` for a missing key, but indexing the INNER map would
         // panic on one — so every field is read with `get`, and a coin record short of a field
@@ -771,19 +771,31 @@ fn summarize(method: &str, result: &Value) -> String {
             amount(&result["coins_dropped"]),
             amount(&result["staged_dropped"]),
         ),
+        // The arrival ledger is local, but it is FED by the chain replica, so an empty page from
+        // a replica that is not following the chain is not evidence that nobody paid you.
         "control.wallet.arrivals" => {
             let n = result["arrivals"].as_array().map(Vec::len).unwrap_or(0);
             format!(
-                "{n} arrival(s) · cursor {}",
-                result["cursor"].as_i64().unwrap_or(0)
+                "{n} arrival(s) · cursor {} · {}",
+                result["cursor"].as_i64().unwrap_or(0),
+                answer_freshness(result),
             )
         }
+        // The sharpest of the four (#490): the miss is an assertion about the CHAIN, made from a
+        // replica that may never have reached the height the coin was created at. A caller
+        // polling a mint reads `no such coin on chain` as *the mint failed*. So the definite
+        // wording is reserved for a tier that can bound its own answer; an unbounded tier reports
+        // only what it can honestly report — that IT has no record.
         "control.wallet.coinById" => match result["coin"].as_object() {
-            None => "no such coin on chain".to_string(),
+            None if answer_is_current(result) => "no such coin on chain".to_string(),
+            None => format!(
+                "this node has no record of that coin · {}",
+                answer_freshness(result)
+            ),
             Some(coin) => {
                 let field = |key: &str| coin.get(key).unwrap_or(&Value::Null).clone();
                 format!(
-                    "coin {} · {} · created {} · {}",
+                    "coin {} · {} · created {} · {} · {}",
                     field("coin_id").as_str().unwrap_or("?"),
                     mojos(&field("amount")),
                     height(&field("created_height")),
@@ -791,6 +803,7 @@ fn summarize(method: &str, result: &Value) -> String {
                         Some(h) => format!("spent at {h}"),
                         None => "unspent".to_string(),
                     },
+                    answer_freshness(result),
                 )
             }
         },
@@ -798,15 +811,24 @@ fn summarize(method: &str, result: &Value) -> String {
         // kilobytes: a human summary that scrolls a terminal off its own screen is not a summary.
         // `--json` carries the bytes for anything that needs them.
         "control.wallet.coinSpend" => match result["spend"].as_object() {
-            None => "no spend of that coin on chain (unspent, or unknown)".to_string(),
+            // The fifth sibling of the same defect, fixed here because it is the same line: an
+            // absent spend read from an unbounded tier is not a statement about the chain either.
+            None if answer_is_current(result) => {
+                "no spend of that coin on chain (unspent, or unknown)".to_string()
+            }
+            None => format!(
+                "this node has no record of a spend of that coin · {}",
+                answer_freshness(result)
+            ),
             Some(spend) => {
                 let hex_len = |key: &str| spend[key].as_str().unwrap_or_default().len() / 2;
                 format!(
-                    "spend of {} at height {} · puzzle reveal {} bytes · solution {} bytes",
+                    "spend of {} at height {} · puzzle reveal {} bytes · solution {} bytes · {}",
                     spend["coin"]["coin_id"].as_str().unwrap_or("?"),
                     height(&spend["coin"]["spent_height"]),
                     hex_len("puzzle_reveal"),
                     hex_len("solution"),
+                    answer_freshness(result),
                 )
             }
         },
@@ -818,13 +840,18 @@ fn summarize(method: &str, result: &Value) -> String {
         // holdings -- which is a person deciding they cannot afford something they can.
         "control.wallet.coins" => {
             let coins = result["coins"].as_array().map(Vec::len).unwrap_or(0);
-            format!("{coins} unspent coin(s){}", page_suffix(result))
+            format!(
+                "{coins} unspent coin(s){} · {}",
+                page_suffix(result),
+                answer_freshness(result)
+            )
         }
         "control.wallet.coinsByParent" => {
             let coins = result["coins"].as_array().map(Vec::len).unwrap_or(0);
             format!(
-                "{coins} direct child coin(s) — one hop, not a lineage{}",
-                page_suffix(result)
+                "{coins} direct child coin(s) — one hop, not a lineage{} · {}",
+                page_suffix(result),
+                answer_freshness(result)
             )
         }
         "control.collateral.requirement" => summarize_collateral_requirement(result),
@@ -851,6 +878,16 @@ fn summarize(method: &str, result: &Value) -> String {
 /// tell it apart from a node that measured and found the set complete.
 fn page_suffix(result: &Value) -> String {
     match (result["complete"].as_bool(), result["cursor"].as_str()) {
+        // `complete` is a claim about the PAGE — that the node handed over everything IT found.
+        // Printed bare beside a tier that has just said it cannot bound its own answer's height,
+        // a reader takes it for a claim about the CHAIN: *nothing was left out*. That is the
+        // reading dig-node#490 was filed on, from a page that said `complete: true` alongside
+        // `synced: false, peak_height: null`. The flag is still reported — it is true, and a
+        // pager needs it — but it is scoped to what this node can see, and the freshness clause
+        // that follows says how much that is.
+        (Some(true), _) if !answer_is_current(result) => {
+            " · complete for what this node can see".to_string()
+        }
         (Some(true), _) => " · complete".to_string(),
         (_, Some(cursor)) => format!(" · MORE remain — resume after {cursor}"),
         _ => " · completeness unknown (a node too old to say)".to_string(),
@@ -1456,7 +1493,7 @@ fn amount(v: &Value) -> String {
     }
 }
 
-/// How much a rendered balance can be trusted (dig-node#416).
+/// How much a rendered ANSWER can be trusted (dig-node#416, extended to the coin reads by #490).
 ///
 /// # The defect this exists to remove
 ///
@@ -1478,9 +1515,16 @@ fn amount(v: &Value) -> String {
 ///   Nothing bounds the figure at all, so it is not evidence of anything, least of all emptiness.
 ///
 /// Every non-current case is prefixed `NOT CURRENT` so the qualifier cannot be missed beside the
-/// digit, and the last one says outright that the figure may not reflect the wallet — because
-/// that is the case in which a reader is most likely to conclude they own nothing.
-fn balance_freshness(result: &Value) -> String {
+/// digit, and the last one says outright that the answer is not evidence — because that is the
+/// case in which a reader is most likely to conclude there is nothing there.
+///
+/// # Why it is subject-neutral (#490)
+///
+/// It reads only `synced`, `peak_height` and `stale_by`, which every wallet read that touches
+/// the chain replica now emits. The same four claims are the same four claims about a balance, a
+/// coins page, a child page, a coin lookup and a spend lookup — they all describe the TIER, not
+/// the subject — so one renderer serves all of them and there is no second contract to drift.
+fn answer_freshness(result: &Value) -> String {
     if result["synced"].as_bool().unwrap_or(false) {
         return match result["peak_height"].as_u64() {
             Some(h) => format!("current as of height {h}"),
@@ -1496,11 +1540,19 @@ fn balance_freshness(result: &Value) -> String {
             format!("NOT CURRENT — as of height {h}, distance from the network unknown")
         }
         (None, _) => concat!(
-            "NOT CURRENT — this node cannot say what height this reflects; the figure may ",
-            "not reflect the wallet"
+            "NOT CURRENT — this node cannot say what height this answer reflects; it is not ",
+            "evidence that there is nothing there"
         )
         .to_string(),
     }
+}
+
+/// Whether an answer's own tier says it is current. PURE.
+///
+/// A missing `synced` reads as NOT current, deliberately: a response short of the field is a
+/// node that did not say, and "did not say" must never resolve toward the reassuring claim.
+fn answer_is_current(result: &Value) -> bool {
+    result["synced"].as_bool().unwrap_or(false)
 }
 
 /// A coin amount for a human line: `N mojos`, or `amount unknown` when the field is missing or is
@@ -2718,6 +2770,190 @@ mod tests {
         );
         assert!(!s.contains("0 mojos"), "got: {s}");
         assert!(s.contains("amount unknown"), "got: {s}");
+    }
+
+    // ---- dig-node#490: the four sibling reads must bound their own answers ------------------
+    //
+    // #454 taught `control.wallet.balance` to say when its answer is not current. Its siblings
+    // answer from the SAME tier and said nothing, so the two states #416 exists to separate --
+    // *there is nothing there* and *this node cannot see* -- were again indistinguishable one
+    // method over.
+
+    /// An unspent-coins page from a tier that cannot say what height it reflects must not
+    /// assert completeness.
+    ///
+    /// # The property, and the input that distinguishes it
+    ///
+    /// `complete: true` is a POSITIVE claim -- *nothing was left out*. A bare `0` merely fails
+    /// to qualify itself; `complete` asserts. The measured reading is a page that says
+    /// `complete: true` in the same breath as `synced: false, peak_height: null`, i.e. that it
+    /// cannot bound its own answer's height.
+    ///
+    /// The nearest wrong implementation is one that appends a freshness clause to every coins
+    /// line and leaves the completeness clause untouched -- it satisfies "the stale line warns"
+    /// while the assertion a reader acts on is still unqualified. So this asserts on the
+    /// COMPLETENESS clause specifically (`· complete ·`, the unqualified form) and keeps a
+    /// synced control that must still carry it.
+    #[test]
+    fn a_page_that_cannot_bound_its_height_never_asserts_completeness() {
+        // The ticket's measured reading: `0 unspent coin(s) - complete`, from a fallback tier.
+        let unbounded = summarize(
+            "control.wallet.coins",
+            &json!({
+                "coins": [], "complete": true, "cursor": null,
+                "source": "fallback", "synced": false,
+                "peak_height": null, "network_peak_height": null, "stale_by": null,
+            }),
+        );
+        // The honest empty address: a synced replica saying it holds nothing.
+        let current = summarize(
+            "control.wallet.coins",
+            &json!({
+                "coins": [], "complete": true, "cursor": null,
+                "source": "db", "synced": true,
+                "peak_height": 9_220_177u64, "network_peak_height": 9_220_177u64, "stale_by": 0,
+            }),
+        );
+
+        assert_ne!(
+            unbounded, current,
+            "an unbounded empty page must not read like an empty address"
+        );
+        assert!(
+            unbounded.contains("NOT CURRENT"),
+            "an unbounded page must be marked not current: {unbounded}"
+        );
+        assert!(
+            !unbounded.contains(" · complete ·") && !unbounded.ends_with(" · complete"),
+            "an unbounded page must not assert bare completeness: {unbounded}"
+        );
+        // The control, which a blanket-qualifier implementation cannot satisfy.
+        assert!(
+            current.contains(" · complete"),
+            "a current page still states completeness plainly: {current}"
+        );
+        assert!(
+            !current.contains("NOT CURRENT"),
+            "a current page must NOT be scare-marked: {current}"
+        );
+    }
+
+    /// `coinsByParent` is the same page shape one hop over, and drifted the same way.
+    #[test]
+    fn a_children_page_that_cannot_bound_its_height_never_asserts_completeness() {
+        let unbounded = summarize(
+            "control.wallet.coinsByParent",
+            &json!({
+                "coins": [], "complete": true, "cursor": null,
+                "source": "fallback", "synced": false,
+                "peak_height": null, "network_peak_height": null, "stale_by": null,
+            }),
+        );
+        assert!(unbounded.contains("NOT CURRENT"), "got: {unbounded}");
+        assert!(
+            !unbounded.contains(" · complete ·") && !unbounded.ends_with(" · complete"),
+            "an unbounded children page must not assert completeness: {unbounded}"
+        );
+    }
+
+    /// A missing coin read from a tier that may never have reached the coin's creation height is
+    /// NOT a statement about the chain.
+    ///
+    /// The old line was `no such coin on chain` -- an assertion about the CHAIN, rendered from a
+    /// replica that cannot say what height it reflects. A caller polling a mint reads that as
+    /// *the mint failed*. The synced control is what makes this load-bearing: the definite
+    /// wording must survive where the node CAN bound its answer, so this cannot be satisfied by
+    /// deleting the sentence.
+    #[test]
+    fn a_missing_coin_from_an_unbounded_tier_is_not_a_claim_about_the_chain() {
+        let unbounded = summarize(
+            "control.wallet.coinById",
+            &json!({
+                "coin": null, "source": "fallback", "synced": false,
+                "peak_height": null, "network_peak_height": null, "stale_by": null,
+            }),
+        );
+        let current = summarize(
+            "control.wallet.coinById",
+            &json!({
+                "coin": null, "source": "db", "synced": true,
+                "peak_height": 9_220_177u64, "network_peak_height": 9_220_177u64, "stale_by": 0,
+            }),
+        );
+
+        assert!(
+            !unbounded.contains("on chain"),
+            "an unbounded miss must not assert anything about the chain: {unbounded}"
+        );
+        assert!(
+            unbounded.contains("NOT CURRENT"),
+            "an unbounded miss must be marked not current: {unbounded}"
+        );
+        assert!(
+            current.contains("no such coin on chain"),
+            "a bounded miss keeps its definite wording: {current}"
+        );
+        assert_ne!(unbounded, current);
+    }
+
+    /// A bounded-but-behind answer is a THIRD line: usable, and it names the gap.
+    ///
+    /// `stale_by: 0` and `stale_by: null` are OPPOSITE claims -- zero says *level with the
+    /// network*, absence says *nothing bounds this*. A renderer that collapsed them would pass
+    /// the unbounded tests above by treating every non-synced answer alike.
+    #[test]
+    fn a_coins_page_behind_the_network_names_its_gap() {
+        let behind = summarize(
+            "control.wallet.coins",
+            &json!({
+                "coins": [], "complete": true, "cursor": null,
+                "source": "db", "synced": false,
+                "peak_height": 9_211_798u64, "network_peak_height": 9_220_177u64,
+                "stale_by": 8_379,
+            }),
+        );
+        let unbounded = summarize(
+            "control.wallet.coins",
+            &json!({
+                "coins": [], "complete": true, "cursor": null,
+                "source": "fallback", "synced": false,
+                "peak_height": null, "network_peak_height": null, "stale_by": null,
+            }),
+        );
+        assert!(behind.contains("8379"), "the gap must be named: {behind}");
+        assert!(
+            behind.contains("9211798"),
+            "the as-of height must be named: {behind}"
+        );
+        assert_ne!(
+            behind, unbounded,
+            "a bounded stale page differs from an unbounded one"
+        );
+    }
+
+    /// `arrivals` reads a LOCAL ledger, but that ledger is fed by the replica, so an empty page
+    /// from a replica that is not following the chain is not evidence nobody paid you.
+    #[test]
+    fn an_arrivals_page_from_an_unbounded_tier_says_so() {
+        let unbounded = summarize(
+            "control.wallet.arrivals",
+            &json!({
+                "arrivals": [], "cursor": 0, "latest": 0, "synced": false,
+                "peak_height": null, "network_peak_height": null, "stale_by": null,
+            }),
+        );
+        let current = summarize(
+            "control.wallet.arrivals",
+            &json!({
+                "arrivals": [], "cursor": 0, "latest": 0, "synced": true,
+                "peak_height": 9_220_177u64, "network_peak_height": 9_220_177u64, "stale_by": 0,
+            }),
+        );
+        assert!(unbounded.contains("NOT CURRENT"), "got: {unbounded}");
+        assert!(
+            !current.contains("NOT CURRENT"),
+            "a current empty page is a real answer: {current}"
+        );
     }
 
     #[test]

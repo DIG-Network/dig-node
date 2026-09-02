@@ -1670,6 +1670,55 @@ fn stale_by(answer_height: Option<u32>, network_peak: Option<u32>) -> Option<u32
     Some(network_peak?.saturating_sub(answer_height?))
 }
 
+/// What the peers this node HOLDS say the chain's peak is, or `None` when nothing is known.
+///
+/// Read separately from the answer it qualifies, and allowed to fail: its job is to make an
+/// answer's staleness legible, so losing it must degrade the answer to *cannot say how stale*
+/// rather than failing a read that otherwise succeeded.
+async fn held_peers_peak(ctx: &ControlCtx) -> Option<u32> {
+    ctx.wallet
+        .wallet_sync_status()
+        .await
+        .ok()
+        .and_then(|s| s.chia_peer_peak_height)
+}
+
+/// The freshness of the tier that produced an answer, for the reads that do not carry one of
+/// their own (dig-node#490 — today, `control.wallet.arrivals`).
+///
+/// The chain reads get these three values from the wallet backend's own routing decision, which
+/// knows which tier actually answered. `arrivals` reads a LOCAL ledger and so has no routing
+/// decision to report; its freshness is the chain replica's, taken from the sync status.
+#[derive(Debug, Clone, Copy)]
+struct AnswerTier {
+    /// Whether the replica is caught up AND following the chain for the enrolled wallet.
+    synced: bool,
+    /// The replica's own peak. `None` is UNKNOWN, never height zero.
+    peak_height: Option<u32>,
+    /// What the held Chia peers say the chain's peak is.
+    network_peak_height: Option<u32>,
+}
+
+/// Read the chain replica's freshness for a read that has no tier of its own.
+///
+/// A status this node cannot read at all degrades to *nothing is known* — `synced: false` with
+/// both heights absent — which [`stale_by`] turns into a `null` gap and the CLI renders as
+/// NOT CURRENT. That is the truthful reading: a node that cannot describe its own replica cannot
+/// bound an answer drawn from it.
+async fn replica_tier(ctx: &ControlCtx) -> AnswerTier {
+    let status = ctx.wallet.wallet_sync_status().await.ok();
+    AnswerTier {
+        // Only `Synced` licenses serving wallet-scoped reads from the replica, so only `Synced`
+        // may claim a wallet-scoped answer is current. Every other phase — including the
+        // all-clear `NoWalletEnrolled` — is making a different claim, or none.
+        synced: status
+            .as_ref()
+            .is_some_and(|s| matches!(s.phase, dig_wallet::sage::sync_supervisor::SyncPhase::Synced)),
+        peak_height: status.as_ref().and_then(|s| s.peak_height),
+        network_peak_height: status.and_then(|s| s.chia_peer_peak_height),
+    }
+}
+
 /// `control.wallet.balance` (#1851) — the READ-ONLY balance of a PUBLIC address, for XCH or
 /// $DIG. An OPEN read (no token gate, [`is_open_control_read`]): it needs only an address, never
 /// a seed or signing key, so it carries zero custody risk. It reuses the wallet backend's B.6
@@ -1707,15 +1756,7 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         Err(e) => return e,
     };
 
-    // The peers' announced peak is read SEPARATELY and is allowed to fail: it makes the answer's
-    // staleness legible, and losing it must degrade the answer to "cannot say how stale" rather
-    // than failing a balance read that otherwise succeeded.
-    let network_peak = ctx
-        .wallet
-        .wallet_sync_status()
-        .await
-        .ok()
-        .and_then(|s| s.chia_peer_peak_height);
+    let network_peak = held_peers_peak(ctx).await;
 
     match ctx.wallet.balance_for_address(address, asset).await {
         Ok(r) => control_ok(id, balance_wire(&r, network_peak)),
@@ -2073,12 +2114,13 @@ async fn wallet_coins(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
+    let network_peak = held_peers_peak(ctx).await;
     match ctx
         .wallet
         .coins_for_address(&address, asset, after_coin_id.as_deref(), limit)
         .await
     {
-        Ok(r) => control_ok(id, coins_wire(&r, asset)),
+        Ok(r) => control_ok(id, coins_wire(&r, asset, network_peak)),
         Err(e) => wallet_read_error(METHOD, id, &address, e),
     }
 }
@@ -2105,8 +2147,9 @@ async fn wallet_coin_by_id(ctx: &ControlCtx, id: Value, params: &Value) -> Value
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
+    let network_peak = held_peers_peak(ctx).await;
     match ctx.wallet.coin_by_id(&coin_id).await {
-        Ok(r) => control_ok(id, coin_by_id_wire(&r)),
+        Ok(r) => control_ok(id, coin_by_id_wire(&r, network_peak)),
         Err(e) => wallet_read_error("control.wallet.coinById", id, &coin_id, e),
     }
 }
@@ -2136,8 +2179,9 @@ async fn wallet_coin_spend(ctx: &ControlCtx, id: Value, params: &Value) -> Value
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
+    let network_peak = held_peers_peak(ctx).await;
     match ctx.wallet.coin_spend(&coin_id).await {
-        Ok(r) => control_ok(id, coin_spend_wire(&r)),
+        Ok(r) => control_ok(id, coin_spend_wire(&r, network_peak)),
         Err(e) => wallet_read_error(METHOD, id, &coin_id, e),
     }
 }
@@ -2168,6 +2212,7 @@ async fn wallet_coins_by_parent(ctx: &ControlCtx, id: Value, params: &Value) -> 
     // `effective_limit` resolves an omitted page size using the CONTRACT's default, so a node and a
     // client can never disagree about where an unspecified page ends.
     let limit = request.effective_limit();
+    let network_peak = held_peers_peak(ctx).await;
     match ctx
         .wallet
         .coins_by_parent(
@@ -2177,7 +2222,7 @@ async fn wallet_coins_by_parent(ctx: &ControlCtx, id: Value, params: &Value) -> 
         )
         .await
     {
-        Ok(r) => control_ok(id, coins_by_parent_wire(&r)),
+        Ok(r) => control_ok(id, coins_by_parent_wire(&r, network_peak)),
         Err(e) => wallet_read_error(METHOD, id, &request.parent_coin_id, e),
     }
 }
@@ -2241,12 +2286,13 @@ async fn wallet_arrivals(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             format!("{METHOD} after_seq must be a non-negative integer"),
         );
     }
+    let tier = replica_tier(ctx).await;
     match ctx
         .wallet
         .wallet_arrivals(after_seq, arrivals_limit(params))
         .await
     {
-        Ok((page, latest)) => control_ok(id, arrivals_wire(after_seq, &page, latest)),
+        Ok((page, latest)) => control_ok(id, arrivals_wire(after_seq, &page, latest, tier)),
         // Only the local wallet DB can fail here — there is no chain call to blame.
         Err(e) => control_error(
             id,
@@ -2291,9 +2337,19 @@ fn arrivals_wire(
     after_seq: i64,
     arrivals: &[dig_wallet::sage::arrivals::Arrival],
     latest: i64,
+    tier: AnswerTier,
 ) -> Value {
     let cursor = arrivals.last().map_or(after_seq, |a| a.seq);
     json!({
+        // The ledger is LOCAL, but it is written from the chain replica, so its freshness is the
+        // replica's freshness (dig-node#490). An empty page is the answer to "did I just get
+        // paid?", and from a replica that is not following the chain it is not evidence that
+        // nobody did. Spelled with the same three field names the chain reads use, because it is
+        // the same claim about the same tier.
+        "synced": tier.synced,
+        "peak_height": tier.peak_height,
+        "network_peak_height": tier.network_peak_height,
+        "stale_by": stale_by(tier.peak_height, tier.network_peak_height),
         "arrivals": arrivals.iter().map(|a| json!({
             "seq": a.seq,
             "coin_id": a.coin_id,
@@ -3256,7 +3312,11 @@ fn no_watchlist(id: Value) -> Value {
 /// The `asset` is echoed onto every coin because dig-app's frozen `CoinRecord` carries one and
 /// filters by it; the read is already scoped to a single asset, so echoing the REQUESTED one is
 /// exactly what the coins are.
-fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset) -> Value {
+fn coins_wire(
+    r: &dig_wallet::sage::rpc::WalletCoinsResult,
+    asset: BalanceAsset,
+    network_peak: Option<u32>,
+) -> Value {
     // Serialized through the published `Asset`, so the echo is spelled exactly as the contract
     // spells it — `"dig"` for $DIG, `{"cat":"<hex>"}` for any other CAT — and never `null`.
     let asset = serde_json::to_value(ControlAsset::from(asset))
@@ -3276,11 +3336,17 @@ fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset)
         })).collect::<Vec<_>>(),
         // Always a concrete boolean. The contract's `null` means "a node too old to page", and
         // emitting it from a node that DOES page would tell a caller its cursor is meaningless.
+        //
+        // It scopes the PAGE, never the chain: `complete: true` says this node handed over
+        // everything it found, and `stale_by` below says how much of the chain that was
+        // (dig-node#490). The two must be read together, which is why they now travel together.
         "complete": r.complete,
         "cursor": r.cursor,
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
 }
 
@@ -3289,7 +3355,10 @@ fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset)
 /// `asset` is ALWAYS `null` here, unlike [`coins_wire`]. A coin id alone does not reveal whether a
 /// coin is XCH, a CAT or a singleton — that needs the puzzle, which this read never inspects — so
 /// naming one would be asserting a classification the node did not verify.
-fn coin_by_id_wire(r: &dig_wallet::sage::rpc::WalletCoinByIdResult) -> Value {
+fn coin_by_id_wire(
+    r: &dig_wallet::sage::rpc::WalletCoinByIdResult,
+    network_peak: Option<u32>,
+) -> Value {
     json!({
         "coin": r.coin.as_ref().map(|c| json!({
             "coin_id": c.coin_id,
@@ -3303,6 +3372,12 @@ fn coin_by_id_wire(r: &dig_wallet::sage::rpc::WalletCoinByIdResult) -> Value {
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
+        // A `null` coin is the sharpest case these fields exist for (dig-node#490): it is a
+        // statement about the CHAIN, made from a replica that may never have reached the height
+        // the coin was created at. Without a freshness bound a caller polling a mint cannot tell
+        // "not seen yet" from "never happened".
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
 }
 
@@ -3333,7 +3408,10 @@ fn unclassified_coin_wire(c: &dig_wallet::sage::rpc::WalletCoin) -> Value {
 /// decodes this field with `required_option`, so an absent key is a decode FAILURE on the client
 /// and not a verdict. That is deliberate on both sides — "no spend" must be something the node
 /// actually said.
-fn coin_spend_wire(r: &dig_wallet::sage::rpc::WalletCoinSpendResult) -> Value {
+fn coin_spend_wire(
+    r: &dig_wallet::sage::rpc::WalletCoinSpendResult,
+    network_peak: Option<u32>,
+) -> Value {
     json!({
         "spend": r.spend.as_ref().map(|s| json!({
             "coin": unclassified_coin_wire(&s.coin),
@@ -3343,6 +3421,8 @@ fn coin_spend_wire(r: &dig_wallet::sage::rpc::WalletCoinSpendResult) -> Value {
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
 }
 
@@ -3352,7 +3432,10 @@ fn coin_spend_wire(r: &dig_wallet::sage::rpc::WalletCoinSpendResult) -> Value {
 /// positively — `complete`, not `truncated` — precisely so that the reading a client falls into when
 /// the field is missing or defaulted is "there may be more", and it decodes `cursor` with
 /// `required_option` so an absent key cannot become a confident "nothing to resume from".
-fn coins_by_parent_wire(r: &dig_wallet::sage::rpc::WalletCoinsByParentResult) -> Value {
+fn coins_by_parent_wire(
+    r: &dig_wallet::sage::rpc::WalletCoinsByParentResult,
+    network_peak: Option<u32>,
+) -> Value {
     json!({
         "coins": r.coins.iter().map(unclassified_coin_wire).collect::<Vec<_>>(),
         "complete": r.complete,
@@ -3360,6 +3443,8 @@ fn coins_by_parent_wire(r: &dig_wallet::sage::rpc::WalletCoinsByParentResult) ->
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
 }
 
