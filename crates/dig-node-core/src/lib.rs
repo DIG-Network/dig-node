@@ -56,6 +56,7 @@ pub mod chat;
 pub mod dht_sampling;
 pub mod download;
 pub mod inbound_demand;
+pub mod mirror_bond;
 mod module_tier_tag;
 pub mod peer;
 pub mod rate_limit;

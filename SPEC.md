@@ -8357,6 +8357,17 @@ itself (SYSTEM.md §4.1).
 >   by name BEFORE any chain read (dig-node#426). **RECLAIMS are implemented** and are supported at `fee = 0` with
 >   no fee coins, which is §25.4.4 — and are never gated on any funding read, including the
 >   committed-coin read.
+> * **§25.10's verification of OTHER peers' claims is BUILT BUT INERT — no claim is verified on a
+>   running node today.** The mechanism is present and wired: `dig-node-core`'s `mirror_bond` (the
+>   three verdicts and the ranking locator, installed inside `NodeContent::new`) and
+>   `dig-node-service`'s `mirror/bond_verify.rs` (the chain read, installed on the running node by
+>   `spawn_bond_verifier_install`). But this node has no sound source for the coin-to-peer binding
+>   §25.6a requires, so `bonded` is unreachable for every input, the chain read is short-circuited
+>   before it is paid, and every holder receives the same verdict — the ranking is a no-op on every
+>   slate. **A reader must not take this bullet as saying collateral is enforced; it is not.** The
+>   binding is tracked as <https://github.com/DIG-Network/dig-node/issues/473>, and promotion
+>   becomes reachable the moment it lands, with no further change here. What is verified once it does
+>   is a peer's claim; this node still attaches no pointer of its own, per the next bullet.
 > * **§25.6's DHT pointer is not attached.** `ProviderRecord::unverified_mirror_coin_id` lives in
 >   dig-dht 0.15, and `dig-download` 0.21.0 and `dig-peer-selector` 0.10.0 both require
 >   `dig-dht ^0.13` — semver-incompatible on a `0.x` line, so taking 0.15 here would resolve two
@@ -8750,6 +8761,87 @@ genuinely $DIG with the asset id re-derived from the creating spend, carries the
 collateral, and `MirrorCoin::advertises(store, root, epoch)` passes — an exact equality on the
 declared tuple plus a recomputed hint, which is what defeats the constructible additive-morph
 collision (the epoch term is freely chosen, so hint equality alone proves nothing).
+
+### 25.6a. Acting on another peer's claim
+
+A node that LOCATES a holder verifies that holder's claimed bond and **promotes a proven one**. The
+verdict has three states, which are never collapsed into two, but the ranking has exactly TWO tiers:
+
+| verdict | established | ranking |
+|---|---|---|
+| bonded | the named coin passes every §25.6 check for this exact `(store, root, epoch)` AND declares the peer claiming it | promoted |
+| unverified | no pointer was published, the chain could not answer, this node holds no censused requirement for the epoch, or the coin does not declare the claimant | baseline, position unchanged |
+| unbonded | the chain answered and the claim is false | baseline, position unchanged |
+
+**Ranking gives credit; it MUST NOT take credit away.** A provider record is hearsay — whoever
+answers a lookup chooses every field of it, including a coin id it attributes to somebody else — so a
+disproven pointer MUST NOT rank a holder below where no pointer at all would have put it. Otherwise
+attaching a bogus coin id to an honest holder's record would be a demotion primitive available to any
+stranger at no cost. Withholding credit has no such abuse: the most a liar achieves is the ranking
+that would have existed had it said nothing.
+
+**A coin id proves the bond, never the bearer.** A coin id is a public fact, so a coin that bonds the
+content says nothing about WHO is offering it. Promotion therefore additionally requires the coin's
+own owner-written declaration of the claiming `peer_id`, and a node that cannot read such a
+declaration MUST NOT promote.
+
+That declaration closes coin substitution — a stranger republishing another's coin id under its OWN
+peer id earns nothing, because the coin does not name it. **It does NOT close address substitution,
+and a node MUST NOT treat it as though it did.** A record may carry an honest holder's peer id, that
+holder's real coin id, and the ATTACKER's addresses: the coin binds coin to `peer_id`, never `peer_id`
+to an address, and a provider record's `peer_id`-to-address association is unauthenticated hearsay
+that no chain read can settle. Such a record satisfies the declaration check and would be promoted on
+the strength of somebody else's bond.
+
+Closing that requires a separate restriction, which a node performing promotion MUST apply: promote
+only from a record whose `peer_id`-to-address association is itself authoritative — a first-hand
+announce from the peer being ranked, not a slate forwarded by a third party — or defer the credit
+until the dialled identity has been checked against the claimed `peer_id`. A dialler is not by itself
+a backstop, because peer ids are derived from the presented certificate rather than pinned against
+the dialled identity; the residual an unrestricted implementation carries is traffic redirection, not
+a stolen bond.
+
+**One locate is bounded work.** The size of a located set is chosen by whoever answered the lookup,
+so a node MUST bound the number of bonds it reads against a chain per locate, verifying in source
+order and leaving the remainder at baseline.
+
+The verification is performed in the ORDER §25.6 states, with one refinement that is normative: the
+`advertises` binding is checked BEFORE the collateral magnitude. A node that has not censused the
+epoch cannot price a bond, and checking magnitude first would make every verdict on such a node
+`unverified` — including a holder pointing at a coin that plainly bonds a different store.
+
+**A holder is never refused, dropped, or blocklisted on a verdict.** A chain outage, an epoch
+rollover, a republished record carrying a pointer that has since gone stale, and a deliberate lie are
+indistinguishable at the moment of reading, and only one of them is an attack; a node that refuses on
+any of them converts its own partition into a rejection of honest peers. Promotion is the whole
+remedy: a holder that proves its bond is served first, and every other holder keeps exactly the
+standing its source gave it.
+
+Absence of a pointer is the ORDINARY case and MUST cost no chain read at all. `unverified` for an
+absent pointer is not a degraded answer — it is the honest state of a claim nobody looked at.
+
+A verdict is cached only for the exact `(coin id, store, root, epoch, claiming peer id)` it answered.
+Every component is load-bearing. One coin bonds one `(store, root, epoch)` tuple, so caching by coin
+id alone would let a genuine bond answer for content the same coin does not bond — the substitution
+`advertises` exists to refuse. And the verdict is peer-DEPENDENT: it is `bonded` only when the coin
+declares the peer offering the record, so a key omitting the claiming peer id would serve one
+holder's earned `bonded`, for the whole cache lifetime, to any stranger republishing the same
+publicly-visible coin id — reinstating through the memo the substitution the ownership question
+exists to refuse. The cache MUST also be probed under the node's TRUE current epoch rather than a
+remembered one, or a probe taken after a rollover hits the entry stored under the previous epoch and
+returns a verdict taken under the wrong one.
+
+While the node has no sound source for the coin-to-peer binding, `bonded` is unreachable for every
+input, and the verifier MUST then read no chain at all: the reads would be paid, at a third party, for
+a verdict the credit-only ranking provably discards. That short-circuit MUST be conditioned on the
+binding source itself, so that it lifts when the source arrives rather than needing a second switch
+to be remembered.
+
+Only DEFINITE verdicts are
+cached: `unverified` records this node's own momentary inability to look, and holding it would keep
+an outage in force after it had ended. The cache is keyed partly on attacker-chosen input, so it MUST
+be bounded, and overflow MUST evict rather than clear — clearing would let a stranger discard every
+verdict a node has earned by rotating coin ids.
 
 ### 25.7. Consent, the switch, and revocation
 
