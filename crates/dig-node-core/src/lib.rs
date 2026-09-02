@@ -8098,6 +8098,88 @@ mod tests {
         );
     }
 
+    /// **Proves (NC-12, `seams::dig_peer::module_relay` module doc):** a relay REFUSAL leaves the
+    /// pre-existing `RESOURCE_UNAVAILABLE` answer byte-identical to the one a requestor that never
+    /// asked for a relay receives. A refusal must not narrate WHICH gate refused.
+    ///
+    /// **Why that is a security property and not tidiness.** The gates are, in order, the
+    /// requestor's own `proxy` flag, the OPERATOR's opt-in (`DIG_NODE_ONION_RELAY`, default off),
+    /// and the requestor's proxy-class allowance. A frame that differs by gate is an oracle a
+    /// stranger reads for free: it says whether this operator enabled relaying, and it says when a
+    /// requestor has exhausted its allowance -- which is the rate-limiter's own state, told to the
+    /// party the limiter exists to bound.
+    ///
+    /// **Fixture design -- the two arms refuse at DIFFERENT gates.** Arm one omits `proxy`, so gate
+    /// one refuses: this request never wanted a relay. Arm two sets `proxy: true`, clears gate one,
+    /// and refuses at the content-engine gate instead. Two arms refusing at the SAME gate would be
+    /// two spellings of one input and would pass under any implementation, so the inequality below
+    /// is asserted first and pins the arms apart.
+    ///
+    /// **On the revert:** turn EITHER of the two refusals this fixture actually reaches --
+    /// `module_relay.rs:114` (the requestor did not ask) or `:117` (this build has no content
+    /// engine) -- into a distinguishable status. `RelayStatus::Pending { staged_bytes: 0 }` is the
+    /// one-line version, and the frame equality fires because that arm becomes the inconclusive-miss
+    /// code carrying a progress field while the other stays `RESOURCE_UNAVAILABLE`.
+    ///
+    /// **What this fixture does NOT reach, said plainly so it is not read as full cover.**
+    /// `relay_capsule` has FIVE refusal sites. The operator opt-in (`:121`) and the proxy allowance
+    /// (`:125`) both sit behind a live `NodeContent`, which `test_node` does not wire, and the
+    /// no-warmer refusal (`:130`) sits behind both. Those first two are exactly the gates the
+    /// rationale above names as the reason the property matters. What holds them today is that all
+    /// five sites return one payload-free `RelayStatus::Refused` -- a property of the enum, not
+    /// something this test observes. Reaching them needs a fixture that installs a `NodeContent`
+    /// and drives `DIG_NODE_ONION_RELAY` under the `test_support` env mutex; that is the next guard
+    /// here, not a gap this one closes.
+    ///
+    /// **And the frame is not the only channel, so do not read this test as closing the oracle.**
+    /// `allow_proxy_fetch` (`:125`) CONSUMES a rate-limit token (`download.rs:1643`) from a bucket
+    /// shared with `miss_outcome`'s second leg (`download.rs:2721`). Draining it flips a later
+    /// `dig.getContent` from fetch-through to redirect, so a stranger can still infer the operator's
+    /// opt-in by spending the allowance and watching a DIFFERENT method change shape. Equal frames
+    /// are necessary for the property in the module doc and are not sufficient for the secret.
+    #[tokio::test]
+    async fn a_relay_refusal_is_indistinguishable_from_a_plain_miss() {
+        let (node, _td) = test_node(None);
+        // Nothing is cached, so BOTH arms are genuine misses and the relay leg is the only thing
+        // that could make them differ.
+        let (store, root) = (id_hex(0x31), id_hex(0x32));
+
+        let never_asked = json!({"store_id": store, "root": root});
+        let asked = json!({"store_id": store, "root": root, "proxy": true});
+
+        // Side effect first: the two params genuinely differ in the field gate one reads, so the
+        // assertions below compare two different journeys rather than one input written twice.
+        assert_ne!(
+            crate::download::proxy_requested(&never_asked),
+            crate::download::proxy_requested(&asked),
+            "fixture precondition: one arm must ask for a relay and the other must not, or the \
+             arms refuse at the same gate and prove nothing"
+        );
+
+        let answer = |params: Value| {
+            handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":7,"method":"dig.getModuleInfo","params":params}),
+                crate::download::ReadOrigin::Peer,
+                crate::download::RequestProvenance::FirstParty,
+            )
+        };
+        let plain_miss = answer(never_asked).await;
+        let refused_relay = answer(asked).await;
+
+        assert_eq!(
+            plain_miss["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "the control: a miss with no relay asked for is the settled not-held answer"
+        );
+        assert_eq!(
+            refused_relay, plain_miss,
+            "a refused relay must be INDISTINGUISHABLE from a plain miss; any difference tells a \
+             stranger which gate refused, and the gates encode the operator's opt-in and the \
+             requestor's remaining allowance"
+        );
+    }
+
     /// **Proves (#2022):** `dig.listInventory` with `store_id` omitted — the whole-inventory
     /// enumeration ("a free map of everything this node holds") — is REFUSED over the permissionless
     /// peer surface (`ReadOrigin::Peer`) with -32601, yet still answered from the loopback/control
