@@ -860,12 +860,19 @@ pub use crate::shared::identity::{install_crypto_provider, load_or_generate_node
 /// peer-RPC server, the DHT dials, and the gossip pool). Without this the pool would present a cert
 /// hashing to a different peer_id than the one this node advertises (#1532).
 ///
-/// **A dialler is not guaranteed to notice.** `dig-gossip` DERIVES a peer id from the presented SPKI
-/// and does not compare it against the one it dialled — every `expected_peer_id` occurrence in that
-/// crate is inside `#[cfg(test)]` (DIG-Network/dig-gossip#85). So a split identity is not caught by a
-/// fail-closed handshake in the general case; where pinning does happen it is the dialler's own
-/// (`dig-tls::pin_and_bind`, used by the ping path). Do not rely on a mismatch being refused. dig-gossip only READS these files (`dig_peer_protocol::load_ssl_cert`), so pointing at the
-/// canonical identity files can never clobber them.
+/// **A dialler DOES notice, on every path this node is dialled over.** An earlier version of this
+/// note said the opposite, and it was wrong in a way worth stating: it generalised one true fact
+/// about `dig-gossip` into a claim about every dial. The true fact is narrow — `dig-gossip`'s legacy
+/// rustls outbound derives a peer id from the presented SPKI without comparing it to the one it
+/// dialled, and every `expected_peer_id` in that crate is inside `#[cfg(test)]`
+/// (DIG-Network/dig-gossip#85). But dig-node never dials on that path. Its dials go through
+/// `dig-nat`, which passes the expected id to `dig-tls`; the verifier compares it against the leaf
+/// the far end presents and fails the handshake with `peer_id mismatch: expected <..>, got <..>`,
+/// and `dig-peer` re-checks it after connect. The download path pins the same way, from a provider
+/// record's own `provider_peer_id`. So a split identity IS caught fail-closed here, which is exactly
+/// why keeping these files canonical matters. dig-gossip only READS them
+/// (`dig_peer_protocol::load_ssl_cert`), so pointing at the canonical identity files can never
+/// clobber them.
 ///
 /// [`node_cert_dir`]: crate::seams::key_mgmt::key_manager::KeyManager::node_cert_dir
 fn gossip_identity_paths(node_cert_dir: &std::path::Path) -> (String, String) {

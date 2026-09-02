@@ -105,11 +105,9 @@ impl VerdictKey {
 
 /// What a mirror coin's advertised terms say about the peer claiming it.
 ///
-/// `DeclaresThisPeer` and `Silent` are matched but not yet constructed: nothing can construct them
-/// until [`peer_declaration`] has a typed source for the binding, which is exactly the promotion gate
-/// described there. They are written now so the shape of the answer is fixed before the source
-/// arrives, and so the call site reads as the full decision rather than a placeholder.
-#[allow(dead_code)]
+/// Two answers, not three. Until `dig-mirror-coin` 0.8.0 there was a `NotReadable` state for "this
+/// node has no way to read a declaration at all"; the typed accessor removed the situation, so the
+/// variant was removed with it rather than left as a case nothing constructs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerDeclaration {
     /// The coin's owner declared this exact peer, in code the chain executed.
@@ -117,36 +115,30 @@ pub(crate) enum PeerDeclaration {
     /// The coin declares some other peer, or none. Credit is withheld — never subtracted, because
     /// the record naming this coin may be a stranger's lie ABOUT the coin's real holder.
     Silent,
-    /// This node cannot read the declaration at all, so it knows nothing either way.
-    NotReadable,
 }
 
 /// Whether `advertised_terms` — the free tail of a mirror coin's memo — declares `claiming_peer_id`.
 ///
-/// **This is deliberately unreadable today, and that is the promotion gate.** The tail is arbitrary
-/// UTF-8 and `MirrorCoin::urls()` already hands it over, so a `dig-peer:<64-hex>` term COULD be
-/// parsed here — and must not be. `dig-mirror-coin` 0.8.0 is about to own that format with a typed
-/// accessor; parsing it here would create a second parser for a security-critical format, in the
-/// consumer, where a divergence between the two would be a silent authorization difference rather
-/// than a compile error (CLAUDE.md 2.0, centralize rival implementations).
+/// The answer comes from `dig-mirror-coin`'s typed accessor and is NOT parsed here. A second parser
+/// for this format, living in the consumer, would make a divergence between the two a silent
+/// authorization difference rather than a compile error (CLAUDE.md §2.0, centralize rival
+/// implementations). Everything the format means — exact prefix matching, byte-wise peer-id
+/// comparison, and the rule that a coin carrying two declarations declares NOBODY — is stated once,
+/// in that crate's `SPEC.md` §5.1.
 ///
-/// So promotion is switched OFF until that accessor exists: with no sound source for the
-/// coin -> peer binding, `Bonded` cannot be established, and the layer withholds credit from
-/// everyone rather than granting it on a check it cannot make. Nothing is demoted by this
-/// (mirror_bond's lattice is credit-only), so the interim behaviour is exactly the behaviour of a
-/// node with no verifier at all.
-///
-/// Replacing the body with the 0.8.0 accessor turns promotion on, and three things MUST land in
-/// that same change, never after: the authoritative-record restriction on dig-node#466, the
-/// claiming peer id staying part of [`VerdictKey`] (a peer-agnostic key would serve one peer's
-/// earned `Bonded` to a stranger republishing the same public coin id), and the cost analysis on
-/// [`declaration_source_is_readable`], whose short-circuit lifts itself the moment this function
-/// can answer.
+/// **What a `DeclaresThisPeer` establishes.** Memos are written by the spend that creates the coin
+/// and only the owner's key can produce that spend, so the term is an owner attestation carried by
+/// executed on-chain code. It binds the coin to a `peer_id`. It does NOT bind that `peer_id` to the
+/// addresses travelling beside it in the provider record — see `SPEC.md` §25.6a for why that gap is
+/// closed by the transport rather than here.
 pub(crate) fn peer_declaration(
-    _advertised_terms: &[String],
-    _claiming_peer_id: &str,
+    advertised_terms: &[String],
+    claiming_peer_id: &str,
 ) -> PeerDeclaration {
-    PeerDeclaration::NotReadable
+    match dig_mirror_coin::declared_peer(advertised_terms) {
+        Some(declared) if declared.names(claiming_peer_id) => PeerDeclaration::DeclaresThisPeer,
+        _ => PeerDeclaration::Silent,
+    }
 }
 
 /// Whether [`peer_declaration`] can bind a coin to a peer AT ALL — probed through the real
@@ -320,7 +312,7 @@ pub fn verdict_for<S: ChainSource>(
     };
     match peer_declaration(mirror.urls(), claiming_peer_id) {
         PeerDeclaration::DeclaresThisPeer => BondVerdict::Bonded,
-        PeerDeclaration::Silent | PeerDeclaration::NotReadable => BondVerdict::Unverified,
+        PeerDeclaration::Silent => BondVerdict::Unverified,
     }
 }
 
@@ -565,11 +557,11 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    /// A chain that counts every read reaching it and answers nothing.
+    /// A chain that counts every read reaching it and answers "no such coin".
     ///
-    /// Answering nothing is deliberate: the property under test is that the source is not consulted
-    /// AT ALL, so a double that could satisfy a read would let a short-circuit that merely fails
-    /// fast look identical to one that never asks.
+    /// Answering nothing is deliberate. It makes the read COUNT the only variable: a claim against
+    /// this source is disproven at the first step, so any count above one is a retry loop or a
+    /// second question, both of which this module owes the network not to perform.
     struct CountingChain {
         reads: Arc<AtomicUsize>,
     }
@@ -677,31 +669,35 @@ mod tests {
             let terms = vec![format!("dig-peer:{claiming_peer_id}")];
             match peer_declaration(&terms, claiming_peer_id) {
                 PeerDeclaration::DeclaresThisPeer => BondVerdict::Bonded,
-                PeerDeclaration::Silent | PeerDeclaration::NotReadable => BondVerdict::Unverified,
+                PeerDeclaration::Silent => BondVerdict::Unverified,
             }
         }
     }
 
-    /// **Proves (dig-node#466, HIGH finding 2 — the residual the credit-only lattice does NOT
-    /// close):** a hearsay record naming an honest holder's peer id AND its real coin id, but
-    /// carrying the ATTACKER's addresses, is not promoted — so the address a redirected reader
-    /// dials is unchanged by it.
+    /// **Proves (dig-node#473):** a record carrying an honest holder's peer id and real coin id but
+    /// the ATTACKER's addresses IS promoted here — and the promotion is bounded to ONE slot however
+    /// many copies of it a slate contains.
     ///
-    /// **Catches:** the hole neither other test can see. Every field of this record is honest
-    /// except the one that matters, so a coin-id check passes, a peer-id check passes, and the peer
-    /// id is IDENTICAL in the passing and failing versions of the code — which is why the assertion
-    /// is on the addresses. `stop_on_providers` means one answer can be the whole slate, so a
-    /// promotion here puts the attacker's host first for every reader that trusts the ranking, and
-    /// the dial does not pin the peer id (DIG-Network/dig-gossip#85) to catch it afterwards.
+    /// **This test previously asserted the opposite, and it was wrong for a measured reason.** Its
+    /// premise was that "the dial does not pin the peer id (dig-gossip#85) to catch it afterwards".
+    /// That is true only of `dig-gossip`'s legacy rustls outbound, which dig-node never dials on:
+    /// every dial it makes passes the expected id through `dig-nat` to `dig-tls`, whose verifier
+    /// fails the handshake with `peer_id mismatch`. So the attacker's addresses buy a refused
+    /// connection, not a redirected reader, and the honest promotion is not a hole.
     ///
-    /// The verifier is driven through the REAL [`peer_declaration`] gate rather than a hand-written
-    /// verdict, so this test measures production's answer: with no sound coin -> peer binding
-    /// available, nothing is promoted at all.
+    /// **Catches:** the bound going missing. The coin binds coin -> peer id and never peer id ->
+    /// address, so nothing in this layer can tell the honest holder's record from the attacker's
+    /// copy of it — both name the same peer and the same real coin. What this layer CAN do is refuse
+    /// to spend more than one promoted slot on one claimed peer id, which is what keeps a single
+    /// stolen identity from filling the whole verified budget. The slate below carries three copies
+    /// and one ordinary holder, so a missing dedup shows up as three promotions instead of one.
     #[tokio::test]
-    async fn an_honest_peer_id_with_attacker_addresses_is_not_promoted() {
+    async fn one_stolen_identity_cannot_occupy_more_than_one_promoted_slot() {
         let slate = Slate(vec![
-            holder_at(0xCC, None, "honest.example"), // an ordinary holder, no pointer
-            holder_at(0xAA, Some([0x01; 32]), "attacker.example"),
+            holder_at(0xCC, None, "honest-no-pointer.example"),
+            holder_at(0xAA, Some([0x01; 32]), "attacker-1.example"),
+            holder_at(0xAA, Some([0x01; 32]), "attacker-2.example"),
+            holder_at(0xAA, Some([0x01; 32]), "attacker-3.example"),
         ]);
         let slot = bond_verifier_slot();
         let _ = slot.set(Arc::new(EveryChainCheckPasses));
@@ -712,9 +708,13 @@ mod tests {
 
         assert_eq!(
             hosts,
-            vec!["honest.example", "attacker.example"],
-            "a record whose peer id and coin id are both honest must still not promote the \
-             addresses it chose for itself"
+            vec![
+                "attacker-1.example",
+                "honest-no-pointer.example",
+                "attacker-2.example",
+                "attacker-3.example",
+            ],
+            "exactly one copy is promoted; the rest fall back to baseline in source order, never              below it"
         );
     }
 
@@ -755,19 +755,16 @@ mod tests {
         );
     }
 
-    /// **Proves (dig-node#466, security F1):** no chain is read at all while nothing can bind a
-    /// coin to a peer.
+    /// **Proves (dig-node#466 / #473):** a wrong pointer costs the verifier exactly ONE chain read,
+    /// with no retry loop — the cost the ticket requires be borne by the publisher, not the reader.
     ///
-    /// **Catches:** the amplifier. The production `ChainSource` reaches `api.coinset.org`, and a
-    /// `Bonded` that degrades to `Unverified` is the one verdict the cache refuses to hold — so
-    /// each read is re-paid on every locate, up to the locate budget, for an answer the stable
-    /// credit-only sort provably discards. The counting source makes the absence of that egress an
-    /// assertion rather than a claim.
-    ///
-    /// The count is asserted at zero AND the verdict at `Unverified`, so a short-circuit that
-    /// changed the answer would fail here rather than pass quietly.
+    /// **Catches:** the amplifier. The production `ChainSource` reaches `api.coinset.org`, the coin
+    /// id is chosen by whoever wrote the provider record, and `Unbonded` is a verdict a stranger can
+    /// elicit for free. A retry, or a second question asked of a claim already disproven, multiplies
+    /// attacker-directed egress by the locate budget. The count is asserted alongside the verdict so
+    /// a change that stopped reading altogether would fail here rather than pass quietly.
     #[test]
-    fn nothing_is_read_from_the_chain_while_the_declaration_has_no_source() {
+    fn a_disproven_pointer_costs_exactly_one_chain_read() {
         let reads = Arc::new(AtomicUsize::new(0));
         let source = CountingChain {
             reads: Arc::clone(&reads),
@@ -785,34 +782,87 @@ mod tests {
 
         assert_eq!(
             verdict,
-            BondVerdict::Unverified,
-            "withholding credit is the answer the short-circuit must preserve"
+            BondVerdict::Unbonded,
+            "the chain answered and there is no such coin, which disproves the claim"
         );
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "a verdict that cannot be `Bonded` must cost no chain read"
-        );
-        assert!(
-            !declaration_source_is_readable(),
-            "control: the short-circuit is active precisely because the source is unreadable — \
-             when 0.8.0's accessor lands this flips and the reads resume"
+            1,
+            "one read settles it; anything more is a retry loop paid for by the reader"
         );
     }
 
+    /// **Proves (dig-node#473):** the declaration source is LIVE, so the pre-read short-circuit no
+    /// longer withholds every verdict — and the probe that lifts it is a genuine fail-closed
+    /// self-test rather than a switch someone must remember to flip.
+    ///
+    /// **Catches:** a silent regression in the format agreement. The probe asks the production
+    /// [`peer_declaration`] for the one term a coin owned by `probe_peer` would carry. If a future
+    /// `dig-mirror-coin` changed the declaration format, or the accessor stopped answering, this
+    /// goes false and `verdict_for` returns to withholding credit from everyone — the safe
+    /// direction — instead of promoting on a check it can no longer make. Asserting it TRUE here is
+    /// what makes that failure visible as a red test rather than as silently inert ranking.
     #[test]
-    fn no_visible_term_promotes_a_claim_before_the_typed_accessor_exists() {
+    fn the_declaration_source_is_live_and_its_probe_is_a_fail_closed_self_test() {
+        assert!(
+            declaration_source_is_readable(),
+            "the typed accessor must answer, or promotion is unreachable for every input"
+        );
+
         let peer = "aa".repeat(32);
-        for terms in [
-            vec![],
+        assert_eq!(
+            peer_declaration(&[format!("dig-peer:{peer}")], &peer),
+            PeerDeclaration::DeclaresThisPeer,
+            "control: the probe and the production path are the same function"
+        );
+    }
+
+    /// **Proves (dig-node#473):** only the coin's own declaration of THIS claimant promotes it.
+    ///
+    /// **Catches:** the binding degrading to "some coin bonds this content", which is the weaker
+    /// question a stranger republishing a public coin id passes. Every row shares one claimant and
+    /// varies only what the coin says, so a check that ignored the terms would answer identically
+    /// for all of them.
+    #[test]
+    fn only_the_coins_own_declaration_of_this_claimant_promotes_it() {
+        let peer = "aa".repeat(32);
+        let other = "bb".repeat(32);
+
+        let promotes = [
             vec![format!("dig-peer:{peer}")],
-            vec![format!("dig-peer:{}", "bb".repeat(32))],
-            vec!["https://mirror.example/store".to_string()],
-        ] {
-            assert_ne!(
+            vec![
+                "https://mirror.example/store".to_string(),
+                format!("dig-peer:{peer}"),
+            ],
+            // The owner wrote the id in the other case; it denotes the same SHA-256.
+            vec![format!("dig-peer:{}", peer.to_uppercase())],
+        ];
+        for terms in promotes {
+            assert_eq!(
                 peer_declaration(&terms, &peer),
                 PeerDeclaration::DeclaresThisPeer,
-                "promotion must stay unreachable until the binding has a typed source; terms {terms:?}"
+                "terms {terms:?}"
+            );
+        }
+
+        let withholds = [
+            vec![],
+            vec!["https://mirror.example/store".to_string()],
+            // Someone else's coin, republished by this claimant.
+            vec![format!("dig-peer:{other}")],
+            // Two declarations name nobody -- one coin's collateral must not back two peers.
+            vec![format!("dig-peer:{peer}"), format!("dig-peer:{other}")],
+            // Prefix lookalikes are ordinary advertised strings.
+            vec![format!("xdig-peer:{peer}")],
+            vec![format!("dig-peers:{peer}")],
+            // A payload that is not a peer id.
+            vec!["dig-peer:nope".to_string()],
+        ];
+        for terms in withholds {
+            assert_eq!(
+                peer_declaration(&terms, &peer),
+                PeerDeclaration::Silent,
+                "terms {terms:?}"
             );
         }
     }
