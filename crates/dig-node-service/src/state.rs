@@ -216,9 +216,12 @@ pub use dig_wallet::WALLET_BASE_ENV;
 /// path. Existing hosts therefore keep their old base; only a host with no wallet yet adopts the
 /// anchored one, and moving key material is left to a deliberate operator-run migration.
 ///
-/// This is NOT the "derive the wallet base from the node's cache dir" change `crate::wallet_env`
-/// argues against, and the difference is the whole design: this is an independent explicit base,
-/// adopted only where there is nothing to orphan.
+/// This is NOT the "derive the wallet base from the node's cache dir" change
+/// [`crate::wallet_env`] argues against. That one would re-root the seed onto a cache directory
+/// this function has ALREADY moved, so it would find nothing there and mint a fresh wallet on
+/// every existing install. The difference is the whole design: this is an independent explicit
+/// base, adopted only where there is nothing to orphan. An intra-doc link rather than a code
+/// span, so rustdoc fails if the module the argument lives in ever moves.
 ///
 /// An override the operator set explicitly is never replaced — their choice outranks ours.
 pub fn service_data_dir_overrides(
