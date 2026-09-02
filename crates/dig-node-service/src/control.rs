@@ -4780,8 +4780,7 @@ mod tests {
                 synced: true,
                 peak_height: Some(5_000_000),
             },
-            BalanceAsset::DIG,
-        );
+            BalanceAsset::DIG, None);
 
         assert_eq!(
             wire,
@@ -4799,7 +4798,7 @@ mod tests {
                     }
                 ],
                 "complete": true, "cursor": "dd".repeat(32),
-                "source": "db", "synced": true, "peak_height": 5_000_000
+                "source": "db", "synced": true, "peak_height": 5_000_000, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -4843,8 +4842,7 @@ mod tests {
                 synced: false,
                 peak_height: None,
             },
-            asset,
-        );
+            asset, None);
         assert_eq!(
             wire["coins"][0]["asset"],
             json!({ "cat": id }),
@@ -4905,8 +4903,7 @@ mod tests {
                 synced: false,
                 peak_height: None,
             },
-            BalanceAsset::Xch,
-        );
+            BalanceAsset::Xch, None);
 
         assert_eq!(
             wire["coins"][0]["spent_height"],
@@ -4928,6 +4925,110 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("params.address"));
+    }
+
+    /// dig-node#490 — every coin read carries the SAME staleness bound `balance` does, and
+    /// `stale_by: 0` and `stale_by: null` stay OPPOSITE claims on each of them.
+    ///
+    /// # The input that distinguishes this from the nearest wrong implementation
+    ///
+    /// An implementation that merely ADDED the two keys — say, always `null` — passes any test
+    /// that only checks the fields are present. So each read is exercised at all three points:
+    /// level with the network (`0`), a real gap (`8_379`), and unbounded (`null`), with an
+    /// explicit `assert_ne!` between the first and the last. That pair is the whole contract:
+    /// zero says *this answer is as current as the network*, absence says *nothing bounds it*,
+    /// and a caller that cannot tell them apart is back at the reading #416 was filed on.
+    ///
+    /// The three heights are the ticket's own measured numbers, not round ones, so a fixture
+    /// that silently lost a digit would not still arithmetic out.
+    #[test]
+    fn every_coin_read_bounds_its_answer_with_the_null_versus_zero_contract() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::{
+            WalletCoinByIdResult, WalletCoinsByParentResult, WalletCoinsResult,
+        };
+
+        const REPLICA: u32 = 9_211_798;
+        const NETWORK: u32 = 9_220_177;
+        const GAP: u32 = 8_379;
+
+        let coins = |peak: Option<u32>, network: Option<u32>| {
+            coins_wire(
+                &WalletCoinsResult {
+                    coins: vec![],
+                    complete: true,
+                    cursor: None,
+                    source: Source::Fallback,
+                    synced: false,
+                    peak_height: peak,
+                },
+                BalanceAsset::Xch,
+                network,
+            )
+        };
+        let by_id = |peak: Option<u32>, network: Option<u32>| {
+            coin_by_id_wire(
+                &WalletCoinByIdResult {
+                    coin: None,
+                    source: Source::Fallback,
+                    synced: false,
+                    peak_height: peak,
+                },
+                network,
+            )
+        };
+        let by_parent = |peak: Option<u32>, network: Option<u32>| {
+            coins_by_parent_wire(
+                &WalletCoinsByParentResult {
+                    coins: vec![],
+                    complete: true,
+                    cursor: None,
+                    source: Source::Fallback,
+                    synced: false,
+                    peak_height: peak,
+                },
+                network,
+            )
+        };
+        let arrivals = |peak: Option<u32>, network: Option<u32>| {
+            arrivals_wire(
+                0,
+                &[],
+                0,
+                AnswerTier {
+                    synced: false,
+                    peak_height: peak,
+                    network_peak_height: network,
+                },
+            )
+        };
+
+        for (name, read) in [
+            ("coins", &coins as &dyn Fn(Option<u32>, Option<u32>) -> Value),
+            ("coinById", &by_id),
+            ("coinsByParent", &by_parent),
+            ("arrivals", &arrivals),
+        ] {
+            let behind = read(Some(REPLICA), Some(NETWORK));
+            assert_eq!(behind["stale_by"], json!(GAP), "{name}: gap must be named");
+            assert_eq!(behind["network_peak_height"], json!(NETWORK), "{name}");
+
+            let level = read(Some(NETWORK), Some(NETWORK));
+            assert_eq!(level["stale_by"], json!(0), "{name}: level is a ZERO gap");
+
+            // No answer height at all — the ticket's measured reading.
+            let unbounded = read(None, Some(NETWORK));
+            assert_eq!(unbounded["stale_by"], json!(null), "{name}");
+            assert_ne!(
+                level["stale_by"], unbounded["stale_by"],
+                "{name}: level-with-the-network and unbounded are OPPOSITE claims"
+            );
+
+            // No held peer has announced a peak: bounded answer, unmeasurable distance.
+            let unmeasurable = read(Some(REPLICA), None);
+            assert_eq!(unmeasurable["stale_by"], json!(null), "{name}");
+            assert_eq!(unmeasurable["network_peak_height"], json!(null), "{name}");
+        }
     }
 
     // ---- control.wallet.arrivals (dig_ecosystem#2548) --------------------------------------
@@ -4958,8 +5059,7 @@ mod tests {
                     confirmed_height: 5_000_001,
                 },
             ],
-            8,
-        );
+            8, AnswerTier { synced: true, peak_height: Some(9_220_177), network_peak_height: Some(9_220_177) });
         assert_eq!(wire["arrivals"][0]["amount"], json!("18446744073709551615"));
         assert_eq!(wire["arrivals"][0]["asset_id"], Value::Null);
         assert_eq!(wire["arrivals"][0]["confirmed_height"], json!(5_000_000));
@@ -4985,7 +5085,7 @@ mod tests {
             confirmed_height: 100,
         };
         // The page ends at 8; the ledger has since reached 12.
-        let wire = arrivals_wire(0, &[row(7), row(8)], 12);
+        let wire = arrivals_wire(0, &[row(7), row(8)], 12, AnswerTier { synced: true, peak_height: Some(9_220_177), network_peak_height: Some(9_220_177) });
         assert_eq!(
             wire["cursor"],
             json!(8),
@@ -4998,7 +5098,7 @@ mod tests {
     /// first-run client can start from NOW instead of replaying the ledger as a burst of toasts.
     #[test]
     fn an_empty_arrivals_page_holds_the_cursor_and_still_reports_latest() {
-        let wire = arrivals_wire(30, &[], 42);
+        let wire = arrivals_wire(30, &[], 42, AnswerTier { synced: true, peak_height: Some(9_220_177), network_peak_height: Some(9_220_177) });
         assert_eq!(wire["arrivals"], json!([]));
         assert_eq!(wire["cursor"], json!(30));
         assert_eq!(wire["latest"], json!(42));
@@ -5139,7 +5239,7 @@ mod tests {
             source: Source::Fallback,
             synced: false,
             peak_height: None,
-        });
+        }, None);
 
         assert_eq!(
             wire,
@@ -5155,7 +5255,7 @@ mod tests {
                 },
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -5189,7 +5289,7 @@ mod tests {
             source: Source::Db,
             synced: true,
             peak_height: Some(6_000_000),
-        });
+        }, None);
 
         assert_eq!(
             wire["coin"]["asset"],
@@ -5226,14 +5326,14 @@ mod tests {
             source: Source::Fallback,
             synced: false,
             peak_height: None,
-        });
+        }, None);
         assert_eq!(
             wire,
             json!({
                 "coin": null,
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
 
@@ -5283,7 +5383,7 @@ mod tests {
             source: Source::Fallback,
             synced: false,
             peak_height: None,
-        });
+        }, None);
 
         assert_eq!(
             wire,
@@ -5303,7 +5403,7 @@ mod tests {
                 },
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -5329,14 +5429,14 @@ mod tests {
             source: Source::Fallback,
             synced: false,
             peak_height: None,
-        });
+        }, None);
         assert_eq!(
             wire,
             json!({
                 "spend": null,
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
 
@@ -5530,7 +5630,7 @@ mod tests {
             source: Source::Fallback,
             synced: false,
             peak_height: None,
-        });
+        }, None);
 
         assert_eq!(
             wire,
@@ -5548,7 +5648,7 @@ mod tests {
                 "cursor": "aa".repeat(32),
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -5571,7 +5671,7 @@ mod tests {
             source: Source::Fallback,
             synced: false,
             peak_height: None,
-        });
+        }, None);
 
         assert_eq!(
             wire,
@@ -5581,7 +5681,7 @@ mod tests {
                 "cursor": null,
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -5608,7 +5708,7 @@ mod tests {
             source: Source::Fallback,
             synced: false,
             peak_height: None,
-        });
+        }, None);
         assert_eq!(spend["spend"]["coin"]["asset"], Value::Null);
 
         let children = coins_by_parent_wire(&WalletCoinsByParentResult {
@@ -5618,7 +5718,7 @@ mod tests {
             source: Source::Fallback,
             synced: false,
             peak_height: None,
-        });
+        }, None);
         assert_eq!(children["coins"][0]["asset"], Value::Null);
     }
 
