@@ -224,6 +224,19 @@ pub struct PendingTransactionRow {
     pub expires_at: i64,
     /// How many times this bundle has been pushed (1 on first broadcast).
     pub attempts: i64,
+    /// Whether THIS attempt may push the deadline further out (dig-node#502).
+    ///
+    /// An INPUT to [`WalletDb::reserve_spend`], not a stored column: it is a property of the push
+    /// that produced this row, not of the bundle. Rows read back out of the database report `true`,
+    /// the conservative value, because the answer that produced them is not kept.
+    ///
+    /// `false` says the last destination complained about the bundle's own CONTENTS in a way no
+    /// later push can turn into an acceptance
+    /// (`chain::refusal_forecloses_a_later_push`). The coins still stay held for the
+    /// remaining hold — the verdict is height- and cost-budget-dependent, so this crate declines to
+    /// trust one node's view of it — but a retry loop against a systematically broken bundle must
+    /// not be able to renew that hold forever.
+    pub may_extend_expiry: bool,
     /// The coin ids the bundle spends — the coins held out of further selection while it is live.
     pub reserved_coin_ids: Vec<String>,
 }
@@ -2762,6 +2775,34 @@ impl WalletDb {
     ///
     /// Idempotent on the transaction id: re-pushing the same bundle updates its expiry and attempt
     /// count rather than duplicating it, because a resubmission is the same transaction.
+    ///
+    /// # The re-arm is BOUNDED, and the bound is in the SQL (dig-node#502)
+    ///
+    /// The expiry used to be taken straight from the incoming row, which is `now + TTL`. That
+    /// bounds ONE hold and not a SEQUENCE of them: a caller re-pushing the same bundle more often
+    /// than the TTL renewed its hold forever, and the inputs never returned — the lockout failure
+    /// `rpc::RESERVATION_TTL_MS`'s own doc names as the worse of the two.
+    ///
+    /// Three rules compose to bound it without shortening the TTL:
+    ///
+    /// 1. **Clamped to the FIRST push.** `submitted_at` is not in the `DO UPDATE SET` list, so the
+    ///    stored value is a stable anchor, and the new deadline may not exceed
+    ///    `submitted_at + MAX_RESERVATION_HOLD_MS`.
+    /// 2. **A foreclosing attempt does not extend at all** — see
+    ///    [`PendingTransactionRow::may_extend_expiry`].
+    /// 3. **A re-push may never move the deadline EARLIER.** This is what makes rules 1 and 2 add
+    ///    up to the property the ticket asks for without a per-attempt history table: if every
+    ///    attempt is non-extending the deadline never leaves the first `submitted_at + TTL`, and if
+    ///    an extending attempt happened at any point its grant survives every later one. It also
+    ///    keeps a second, later-anchored view of the same transaction from shortening a live hold.
+    ///
+    /// The clamp is expressed in SQL rather than computed in the caller because it must be atomic
+    /// against the STORED anchor: a read-then-write above this layer would race two concurrent
+    /// pushes of the same bundle. `MIN`/`MAX` are the two-argument SCALAR forms (the one-argument
+    /// forms are aggregates), which `the_clamp_uses_the_scalar_two_argument_min_and_max` pins.
+    ///
+    /// `coin_reservations`' `ON CONFLICT(coin_id) DO NOTHING` below is untouched: a coin still
+    /// backs exactly one bundle and the FIRST claim still wins.
     pub async fn reserve_spend(&self, tx: &PendingTransactionRow) -> sqlx::Result<()> {
         let mut conn = self.pool.begin().await?;
         sqlx::query(
@@ -2769,7 +2810,13 @@ impl WalletDb {
                 (transaction_id, bundle_hex, fee, submitted_at, expires_at, attempts)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(transaction_id) DO UPDATE SET
-                expires_at = excluded.expires_at,
+                expires_at = CASE
+                    WHEN ? = 0 THEN pending_transactions.expires_at
+                    ELSE MAX(
+                        pending_transactions.expires_at,
+                        MIN(excluded.expires_at, pending_transactions.submitted_at + ?)
+                    )
+                END,
                 attempts = pending_transactions.attempts + 1",
         )
         .bind(&tx.transaction_id)
@@ -2778,6 +2825,8 @@ impl WalletDb {
         .bind(tx.submitted_at)
         .bind(tx.expires_at)
         .bind(tx.attempts)
+        .bind(i64::from(tx.may_extend_expiry))
+        .bind(super::rpc::MAX_RESERVATION_HOLD_MS)
         .execute(&mut *conn)
         .await?;
         for coin_id in &tx.reserved_coin_ids {
@@ -3042,6 +3091,9 @@ impl WalletDb {
                 submitted_at: r.get("submitted_at"),
                 expires_at: r.get("expires_at"),
                 attempts: r.get("attempts"),
+                // Not a stored column: a row read back describes a bundle, not the push that
+                // produced it. `true` is the conservative answer (see the field's own doc).
+                may_extend_expiry: true,
                 reserved_coin_ids: coins.into_iter().map(|c| c.get("coin_id")).collect(),
             });
         }
@@ -4690,8 +4742,8 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::rpc::{MAX_RESERVATION_HOLD_MS, RESERVATION_TTL_MS};
+    use super::*;
 
     /// **Proves (dig-node#462):** the only public write of `initial_sync_complete` that production
     /// can reach DISARMS, and it really does clear a flag that was armed.
@@ -6390,6 +6442,7 @@ mod tests {
             submitted_at,
             expires_at,
             attempts: 1,
+            may_extend_expiry: true,
             reserved_coin_ids: coin_ids.iter().map(|c| (*c).to_string()).collect(),
         }
     }
@@ -6500,9 +6553,14 @@ mod tests {
         let mut pushes = 0;
         let mut at = first_push;
         while at <= deadline {
-            db.reserve_spend(&reservation("tx1", &["c1"], first_push, at + RESERVATION_TTL_MS))
-                .await
-                .unwrap();
+            db.reserve_spend(&reservation(
+                "tx1",
+                &["c1"],
+                first_push,
+                at + RESERVATION_TTL_MS,
+            ))
+            .await
+            .unwrap();
             assert_eq!(
                 db.prune_reservations(at).await.unwrap(),
                 0,
@@ -6541,14 +6599,24 @@ mod tests {
             .unwrap();
 
         let first = 1_000;
-        db.reserve_spend(&reservation("tx1", &["c1"], first, first + RESERVATION_TTL_MS))
-            .await
-            .unwrap();
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
 
         let again = first + 9 * 60 * 1000;
-        db.reserve_spend(&reservation("tx1", &["c1"], first, again + RESERVATION_TTL_MS))
-            .await
-            .unwrap();
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            again + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
 
         let row = &db.pending_transactions().await.unwrap()[0];
         assert_eq!(
@@ -6569,12 +6637,22 @@ mod tests {
             .await
             .unwrap();
 
-        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 1_000 + RESERVATION_TTL_MS))
-            .await
-            .unwrap();
-        db.reserve_spend(&reservation("tx1", &["c1"], 500_000, 500_000 + RESERVATION_TTL_MS))
-            .await
-            .unwrap();
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            1_000,
+            1_000 + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            500_000,
+            500_000 + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
 
         let row = &db.pending_transactions().await.unwrap()[0];
         assert_eq!(
@@ -6596,9 +6674,14 @@ mod tests {
             .unwrap();
 
         let first = 1_000;
-        db.reserve_spend(&reservation("tx1", &["c1"], first, first + RESERVATION_TTL_MS))
-            .await
-            .unwrap();
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
 
         // A re-push far beyond the cap: MIN picks the cap, MAX keeps it above the stored value.
         db.reserve_spend(&reservation(
@@ -6615,6 +6698,169 @@ mod tests {
             row.expires_at,
             first + MAX_RESERVATION_HOLD_MS,
             "an over-cap re-push must clamp to the cap exactly"
+        );
+    }
+
+    /// A reservation whose push may not extend the deadline (dig-node#502).
+    fn non_extending(
+        tx: &str,
+        coin_ids: &[&str],
+        submitted_at: i64,
+        expires_at: i64,
+    ) -> PendingTransactionRow {
+        PendingTransactionRow {
+            may_extend_expiry: false,
+            ..reservation(tx, coin_ids, submitted_at, expires_at)
+        }
+    }
+
+    /// **The systematic-emitter case the adversarial gate on #497 named.** A broken
+    /// wallet-construction path answers `BLOCK_COST_EXCEEDS_MAX` on every attempt and a caller
+    /// keeps retrying. Every one of those refusals is a complaint about the bundle's own contents,
+    /// so no destination is plausibly holding it and renewing the hold buys nothing. The deadline
+    /// must therefore stay at the FIRST push's, however many attempts arrive — a strictly tighter
+    /// bound than the total cap, reached without any clock argument.
+    #[tokio::test]
+    async fn a_bundle_refused_only_for_its_own_contents_never_renews_its_hold() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let first = 1_000;
+        db.reserve_spend(&non_extending(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        for attempt in 1..=20 {
+            let at = first + attempt * 60 * 1000;
+            db.reserve_spend(&non_extending(
+                "tx1",
+                &["c1"],
+                first,
+                at + RESERVATION_TTL_MS,
+            ))
+            .await
+            .unwrap();
+        }
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.expires_at,
+            first + RESERVATION_TTL_MS,
+            "a refusal no later push can turn into an acceptance must not renew the hold"
+        );
+        assert_eq!(row.attempts, 21, "the attempts are real re-pushes");
+
+        assert_eq!(
+            db.prune_reservations(first + RESERVATION_TTL_MS)
+                .await
+                .unwrap(),
+            1,
+            "the coins must return at the first push's deadline"
+        );
+        assert_eq!(db.unreserved_unspent_coins(None).await.unwrap().len(), 1);
+    }
+
+    /// A re-push may never move the deadline EARLIER. This is what lets the two rules above compose
+    /// into "a bundle whose every observed refusal was foreclosing does not renew" without keeping
+    /// a per-attempt history: an extending attempt's grant survives every later non-extending one.
+    #[tokio::test]
+    async fn a_non_extending_repush_never_shortens_a_deadline_already_granted() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let first = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let extended_at = first + 9 * 60 * 1000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            extended_at + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        // A later attempt that may not extend, carrying an EARLIER deadline than the granted one.
+        db.reserve_spend(&non_extending(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.expires_at,
+            extended_at + RESERVATION_TTL_MS,
+            "a non-extending attempt must leave an already-granted deadline alone, never shorten it"
+        );
+    }
+
+    /// The asymmetry the ticket requires to SURVIVE the fix: a coin backs exactly one in-flight
+    /// bundle and the FIRST claim wins. No path added for the cap may let a second bundle take a
+    /// coin already reserved, or shorten the first bundle's hold on it.
+    #[tokio::test]
+    async fn a_second_bundle_can_neither_take_nor_shorten_a_first_claim() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let first = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+        // A second bundle claiming the same coin, non-extending and lapsing immediately.
+        db.reserve_spend(&non_extending("tx2", &["c1"], first, first + 1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.prune_reservations(first + 1).await.unwrap(),
+            1,
+            "only the second bundle lapses; the first still holds its coin"
+        );
+        assert!(
+            db.unreserved_unspent_coins(None).await.unwrap().is_empty(),
+            "the first claim must keep the coin out of selection"
+        );
+
+        let held: Vec<String> = db
+            .pending_transactions()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| !r.reserved_coin_ids.is_empty())
+            .map(|r| r.transaction_id)
+            .collect();
+        assert_eq!(
+            held,
+            vec!["tx1".to_string()],
+            "the coin must still be reserved by the FIRST bundle"
         );
     }
 
@@ -7195,6 +7441,7 @@ mod tests {
             submitted_at: NOW,
             expires_at: NOW + 600_000,
             attempts: 1,
+            may_extend_expiry: true,
             reserved_coin_ids: vec!["aa".into()],
         })
         .await
@@ -7562,6 +7809,7 @@ mod tests {
             submitted_at: NOW,
             expires_at: NOW + 600_000,
             attempts: 1,
+            may_extend_expiry: true,
             reserved_coin_ids: vec!["bb".into()],
         })
         .await
@@ -7592,6 +7840,7 @@ mod tests {
             submitted_at: NOW,
             expires_at: NOW + 600_000,
             attempts: 1,
+            may_extend_expiry: true,
             reserved_coin_ids: vec!["aa".into()],
         })
         .await

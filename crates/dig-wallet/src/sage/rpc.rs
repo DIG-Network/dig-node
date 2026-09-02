@@ -2170,7 +2170,8 @@ impl WalletBackend {
         // mempool by this point, and reporting a push that did happen as an error would be a worse
         // lie than the double-selection this guards against.
         if !matches!(&pushed, Ok(o) if Self::is_definitive_rejection(o)) {
-            if let Err(e) = self.reserve_pushed_bundle(&bundle).await {
+            let may_extend = Self::attempt_may_extend_the_hold(&pushed);
+            if let Err(e) = self.reserve_pushed_bundle(&bundle, may_extend).await {
                 tracing::warn!(
                     error = %e,
                     "pushed bundle may be in flight but its coins could not be reserved; a second \
@@ -2179,6 +2180,39 @@ impl WalletBackend {
             }
         }
         pushed.map_err(|e| PushError::Unreachable(e.to_string()))
+    }
+
+    /// Whether THIS push attempt may push an existing reservation's deadline further out
+    /// (dig-node#502).
+    ///
+    /// The hold itself is decided by [`Self::is_definitive_rejection`] and is unchanged; this
+    /// decides only whether an attempt RENEWS one. The two questions differ because renewal is
+    /// worth something only while some destination may plausibly still be holding the bundle. When
+    /// the last answer was a complaint about the bundle's own CONTENTS that no later push can turn
+    /// into an acceptance, renewing buys nothing — and composed with a caller that retries, an
+    /// unconditional renewal held the inputs for as long as the retries continued, for a bundle
+    /// that was never going to land.
+    ///
+    /// The default is CONSERVATIVE: everything except a recognised foreclosing reason extends.
+    ///
+    /// | outcome | may extend |
+    /// |---|---|
+    /// | `Err` — no verdict was reached, so the bundle may be in flight | yes |
+    /// | accepted | yes |
+    /// | refused with no stated reason | yes |
+    /// | refused for a reason in `chain::refusal_forecloses_a_later_push` | **no** |
+    /// | refused for any other or unrecognised reason | yes |
+    ///
+    /// A bundle-intrinsic refusal never reaches this question at all:
+    /// [`Self::is_definitive_rejection`] skips the reservation entirely for those.
+    fn attempt_may_extend_the_hold(pushed: &Result<PushOutcome>) -> bool {
+        match pushed {
+            Ok(outcome) if !outcome.accepted => !outcome
+                .rejection
+                .as_deref()
+                .is_some_and(super::chain::refusal_forecloses_a_later_push),
+            _ => true,
+        }
     }
 
     /// Whether `outcome` is the network DEFINITIVELY refusing this bundle — the only case in which
@@ -2255,7 +2289,7 @@ impl WalletBackend {
     /// sign (§908), so a validation failure here says nothing about whether the bundle is
     /// legitimate — the mempool has already accepted it. An uncomputable fee is stored as `None`
     /// and reported as `null`, never as zero.
-    async fn reserve_pushed_bundle(&self, bundle: &SpendBundle) -> Result<()> {
+    async fn reserve_pushed_bundle(&self, bundle: &SpendBundle, may_extend: bool) -> Result<()> {
         let now = super::custody::now_ms() as i64;
         let row = super::db::PendingTransactionRow {
             transaction_id: hex::encode(bundle.name()),
@@ -2266,6 +2300,7 @@ impl WalletBackend {
             submitted_at: now,
             expires_at: now + RESERVATION_TTL_MS,
             attempts: 1,
+            may_extend_expiry: may_extend,
             reserved_coin_ids: bundle
                 .coin_spends
                 .iter()
@@ -10857,6 +10892,7 @@ mod tests {
             submitted_at: 1_000,
             expires_at,
             attempts: 1,
+            may_extend_expiry: true,
             reserved_coin_ids: coin_ids.to_vec(),
         }
     }

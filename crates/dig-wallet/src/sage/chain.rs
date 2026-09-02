@@ -285,6 +285,55 @@ pub(crate) fn refusal_is_bundle_intrinsic(stated: &str) -> bool {
         .any(|intrinsic| reason.eq_ignore_ascii_case(intrinsic))
 }
 
+/// Refusals that are about the BUNDLE'S OWN CONTENTS but are deliberately absent from
+/// [`BUNDLE_INTRINSIC_REFUSALS`] because the verdict depends on the answering node's HEIGHT and
+/// cost budget (dig-node#502).
+///
+/// These are the four CLVM-execution / cost names the list above names explicitly as excluded, for
+/// exactly that reason: `chia_consensus::spendbundle_validation` derives its flags from
+/// `prev_tx_height` and runs under a caller-supplied `max_cost`, so two honest nodes can reach
+/// different verdicts on identical bytes. They must keep HOLDING the inputs, and that is unchanged.
+///
+/// What this list decides is narrower: whether such a refusal may EXTEND an existing hold. It may
+/// not. Extending buys something only when some destination may plausibly still be holding the
+/// bundle, and here nothing is: the complaint is about the bytes. Composed with a systematic
+/// emitter — a broken wallet-construction path that answers `BLOCK_COST_EXCEEDS_MAX` on every
+/// attempt — and a caller that keeps retrying, an unconditional re-arm holds the inputs for as long
+/// as the retries continue, for a bundle that was never going to land.
+///
+/// # What must NOT be added here, and why a future reader will want to
+///
+/// The other absentees from [`BUNDLE_INTRINSIC_REFUSALS`] look like they belong and do not. The
+/// timelock assertions (`ASSERT_HEIGHT_*`, `ASSERT_SECONDS_*`, `ASSERT_BEFORE_*`), the fee-policy
+/// names, `UNKNOWN_UNSPENT` and `TOO_MANY_ANNOUNCEMENTS` can each be ADMITTED by a DIFFERENT node
+/// than the one that refused — a node further ahead, with a different relay policy, or caught up.
+/// A later push of the same bundle may therefore genuinely land, so extending the hold is CORRECT
+/// for them. The four here differ only in degree, but the degree is the point: a cost or generator
+/// verdict does not turn into an acceptance by asking a better-synced peer.
+///
+/// Matching is EXACT, case-insensitive and trimmed, via [`refusal_reason`] — never substring or
+/// prefix, for the same reason [`refusal_is_bundle_intrinsic`] gives. An unrecognised reason is not
+/// on this list, so it EXTENDS: the conservative default, because a hold that lapses too early is
+/// the double-select this family exists to close.
+const VIEW_DEPENDENT_BUNDLE_CONTENT_REFUSALS: &[&str] = &[
+    "GENERATOR_RUNTIME_ERROR",
+    "BLOCK_COST_EXCEEDS_MAX",
+    "INVALID_BLOCK_COST",
+    "INVALID_SPEND_BUNDLE",
+];
+
+/// Whether a stated refusal is a complaint about the bundle's own contents that no later push can
+/// turn into an acceptance — the class that HOLDS but must not EXTEND the hold (dig-node#502).
+///
+/// See [`VIEW_DEPENDENT_BUNDLE_CONTENT_REFUSALS`] for the membership rule and for the names that
+/// deliberately stay out of it.
+pub(crate) fn refusal_forecloses_a_later_push(stated: &str) -> bool {
+    let reason = refusal_reason(stated);
+    VIEW_DEPENDENT_BUNDLE_CONTENT_REFUSALS
+        .iter()
+        .any(|foreclosing| reason.eq_ignore_ascii_case(foreclosing))
+}
+
 /// Pushes an ALREADY-SIGNED bundle to the network.
 ///
 /// A trait rather than a concrete client so the control surface can be driven end to end without a
@@ -930,6 +979,66 @@ mod tests {
                 super::refusal_reason(&composed),
                 reason,
                 "the classifier reads a different substring than the one the source stated"
+            );
+        }
+    }
+
+    /// **Proves (dig-node#502):** the foreclosing class is recognised exactly, and everything else
+    /// EXTENDS.
+    ///
+    /// The membership rows are the four CLVM-execution / cost names. The shape rows are the ones
+    /// that matter more than the contents: an unrecognised reason must extend (the conservative
+    /// default, since a hold that lapses too early is the double-select this family exists to
+    /// close), and a name EMBEDDED in wider text must not match — the same exact-match discipline
+    /// `refusal_is_bundle_intrinsic` keeps, because a substring test lets a source turn any string
+    /// into a non-extending one by quoting a name inside it.
+    #[test]
+    fn the_foreclosing_refusals_match_exactly_and_everything_else_extends() {
+        for foreclosing in [
+            "GENERATOR_RUNTIME_ERROR",
+            "BLOCK_COST_EXCEEDS_MAX",
+            "INVALID_BLOCK_COST",
+            "INVALID_SPEND_BUNDLE",
+            "  block_cost_exceeds_max  ",
+            "FAILED: BLOCK_COST_EXCEEDS_MAX",
+        ] {
+            assert!(
+                super::refusal_forecloses_a_later_push(foreclosing),
+                "{foreclosing} must not renew a hold: trimmed, case-insensitive, exact"
+            );
+        }
+
+        for extending in [
+            "DOUBLE_SPEND",
+            "MEMPOOL_CONFLICT",
+            "ALREADY_INCLUDING_TRANSACTION",
+            "UNKNOWN_UNSPENT",
+            "TOO_MANY_ANNOUNCEMENTS",
+            "ASSERT_HEIGHT_ABSOLUTE_FAILED",
+            "ASSERT_SECONDS_RELATIVE_FAILED",
+            "ASSERT_BEFORE_HEIGHT_ABSOLUTE_FAILED",
+            "INVALID_FEE_LOW_FEE",
+            "SOMETHING_NOBODY_ENUMERATED",
+            "MEMPOOL_CONFLICT (see BLOCK_COST_EXCEEDS_MAX)",
+            "",
+        ] {
+            assert!(
+                !super::refusal_forecloses_a_later_push(extending),
+                "{extending:?} may be admitted by a better-synced or differently-configured node, \
+                 so a later push may land and the hold must still renew"
+            );
+        }
+    }
+
+    /// The two allowlists answer DIFFERENT questions — free the coins now, versus renew the hold —
+    /// and a name on both would mean the second list is dead code, because a bundle-intrinsic
+    /// refusal never reserves at all.
+    #[test]
+    fn the_foreclosing_list_is_disjoint_from_the_bundle_intrinsic_one() {
+        for name in super::VIEW_DEPENDENT_BUNDLE_CONTENT_REFUSALS {
+            assert!(
+                !super::refusal_is_bundle_intrinsic(name),
+                "{name} is on both lists, so its non-extending rule is unreachable"
             );
         }
     }
