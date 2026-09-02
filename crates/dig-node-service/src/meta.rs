@@ -912,7 +912,11 @@ impl ErrorCode {
             ErrorCode::InvalidParams => "Invalid or missing method parameters.",
             ErrorCode::DispatchFailed => "The node failed to dispatch the request.",
             ErrorCode::ResourceUnavailable => {
-                "The requested resource is not available at the requested root — a genuine \n                 content miss, whether this node missed locally or a relayed upstream did."
+                concat!(
+                    "The requested resource is not available at the requested root — ",
+                    "a genuine content miss, whether this node missed locally or a ",
+                    "relayed upstream did.",
+                )
             }
             ErrorCode::UpstreamError => {
                 "The blind-passthrough relay to the upstream DIG RPC failed."
@@ -1225,6 +1229,47 @@ fn openrpc_error_components() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Pins the EXACT published text of the one multi-clause catalogue message.**
+    ///
+    /// `description()` is the `"message"` field of the published discovery document, so
+    /// its bytes are a consumer-visible contract. This message is the only one long
+    /// enough to tempt a re-wrap, and a re-wrap is precisely what breaks it: a
+    /// backslash-continued literal that `cargo fmt` (or a hand edit) rejoins becomes a
+    /// literal newline escape followed by this file's source indentation, which compiles,
+    /// lints clean, and silently publishes a control character plus a run of spaces.
+    /// Asserting the RENDERED string — never the source shape — makes that failure loud.
+    #[test]
+    fn resource_unavailable_description_is_one_line_of_exact_published_text() {
+        assert_eq!(
+            ErrorCode::ResourceUnavailable.description(),
+            concat!(
+                "The requested resource is not available at the requested root \u{2014} ",
+                "a genuine content miss, whether this node missed locally or a ",
+                "relayed upstream did.",
+            ),
+        );
+    }
+
+    /// **Closes the class, not the instance (#478 review):** no catalogued message may
+    /// carry a control character. `description()` is the one catalogue field with no
+    /// guard, which is how an embedded newline reached the published document unnoticed.
+    /// A run of consecutive spaces is the same artifact seen from the other side — prose
+    /// never needs one — so both are refused.
+    #[test]
+    fn no_catalogued_description_carries_a_control_character_or_run_of_spaces() {
+        for code in ErrorCode::all() {
+            let message = code.description();
+            assert!(
+                !message.chars().any(char::is_control),
+                "catalogued message for {code:?} carries a control character: {message:?}",
+            );
+            assert!(
+                !message.contains("  "),
+                "catalogued message for {code:?} carries a run of spaces: {message:?}",
+            );
+        }
+    }
 
     #[test]
     fn build_info_carries_the_one_canonical_version_service_commit_and_protocol() {
