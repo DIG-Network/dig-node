@@ -8936,6 +8936,37 @@ rule above is not weakened by it.
 so a node MUST bound the number of bonds it reads against a chain per locate, verifying in source
 order and leaving the remainder at baseline.
 
+**A per-locate bound is not by itself sufficient, and a node MUST NOT rely on one.** The gate that
+admits a locate is per-requestor over self-minted identities, so it bounds nothing in aggregate: an
+adversary spreads its locates across fresh identities and multiplies the per-locate ceiling by as
+many as it cares to mint. A node performing promotion therefore MUST additionally hold an
+AGGREGATE bound on the chain reads promotion causes, and that bound MUST be consulted BEFORE the
+chain is touched, so that a refused claim costs nothing.
+
+Two limits are required, because they answer two different attacks:
+
+- a **process-wide** budget on verifications, which bounds this node's total outbound read volume
+  however many identities the traffic is spread across. It is process-wide rather than per-verifier
+  because the resource being protected — the node's shared chain client — is a property of the
+  process, so any narrower scope would be several budgets against one resource;
+- a **per-claimant** limit on DISTINCT coin ids the claimant has caused reads for without ever
+  proving a bond, which bounds the fabricated-coin-id case. A coin id the claimant has already been
+  read about MUST NOT count again: that is a cache entry expiring and being refreshed, not a new
+  question. A claimant that proves a bond MUST have this ledger forgiven; the process-wide budget
+  MUST NOT be refunded, since a proven bond says the claimant is honest and says nothing about this
+  node's chain access.
+
+Exhausting either limit yields `unverified` having read nothing. **This is a degradation and never a
+refusal of service**: `unverified` and `unbonded` share a rank, the sort is stable, and the located
+slate is returned unchanged — precisely the behaviour of a node with no verifier installed. The read
+path is never blocked and no holder is ever ranked below where it started, so an adversary who
+exhausts the budget denies promotion, not content.
+
+Both limits are keyed on the claiming peer id LOWERCASED before use. A peer id is fixed-length hex,
+so its two spellings denote one identity, and every check that GRANTS promotion already treats them
+as one — the coin's declaration compares decoded bytes and the TLS pin compares certificate-hash
+bytes. A limit keyed on the raw wire text would hand a stranger a fresh allowance per spelling.
+
 The verification is performed in the ORDER §25.6 states, with one refinement that is normative: the
 `advertises` binding is checked BEFORE the collateral magnitude. A node that has not censused the
 epoch cannot price a bond, and checking magnitude first would make every verdict on such a node
@@ -8971,8 +9002,18 @@ to be remembered.
 Only DEFINITE verdicts are
 cached: `unverified` records this node's own momentary inability to look, and holding it would keep
 an outage in force after it had ended. The cache is keyed partly on attacker-chosen input, so it MUST
-be bounded, and overflow MUST evict rather than clear — clearing would let a stranger discard every
-verdict a node has earned by rotating coin ids.
+be bounded, and overflow MUST NOT clear — clearing would let a stranger discard every verdict a node
+has earned by rotating coin ids.
+
+**Nor may overflow evict indiscriminately.** Reclaiming already-expired entries first is always
+correct. But when the cache is full of LIVE entries, admitting a new one costs an honest verdict, and
+only `bonded` is worth that trade: `bonded` is expensive to obtain — it requires a coin that exists,
+is fully collateralised, and declares its claimant — whereas `unbonded` is the verdict a stranger
+elicits for FREE by naming coin ids that do not exist. A policy of evicting one arbitrary entry per
+insert reads as conservative but is paced by the attacker, who at a chosen insert rate turns the
+whole cache over in well under a minute and discards every earned verdict. An `unbonded` MUST
+therefore be refused admission to a cache full of live entries rather than allowed to displace a
+`bonded`.
 
 ### 25.7. Consent, the switch, and revocation
 

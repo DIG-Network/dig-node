@@ -519,6 +519,13 @@ fn claimant_key(claiming_peer_id: &str) -> [u8; 32] {
 /// **This is the composition production uses**, so a test that drives it is exercising the real
 /// ordering rather than re-deriving it: the budget is consulted BEFORE the source is touched, so a
 /// refused claim reads nothing, and a proven bond forgives its claimant's ledger.
+///
+/// The parameter list is `verdict_for`'s, in `verdict_for`'s order, with the budget in front. That
+/// is deliberate and is why the lint is allowed here rather than satisfied by grouping: four of the
+/// arguments are opaque 32-byte values, so the one mistake this wrapper could make is transposing
+/// two of them, and a signature that mirrors the wrapped function exactly makes such a transposition
+/// visible at the call site below instead of hiding it inside a re-packing struct.
+#[allow(clippy::too_many_arguments)]
 fn admitted_verdict_for<S: ChainSource>(
     admission: &ReadAdmission,
     source: &S,
