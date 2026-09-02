@@ -367,10 +367,8 @@ mod tests {
         // The PID-keyed fallback's own shape, spelled out: no component of the resolved path may
         // look like the private cache fallback, on any host.
         assert!(
-            !dir.components().any(|c| c
-                .as_os_str()
-                .to_string_lossy()
-                .starts_with("DigNode-")),
+            !dir.components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with("DigNode-")),
             "resolved a PID-keyed private fallback dir: {}",
             dir.display()
         );
