@@ -107,7 +107,14 @@ pub fn default_paths() -> WalletPaths {
 }
 
 /// The per-user, non-roaming base directory both roots hang off (NC-3's location contract).
-fn user_base() -> PathBuf {
+///
+/// ENV-FIRST BY DESIGN: an operator who sets `LOCALAPPDATA` relocates the seed, its metadata and
+/// the device key, and that is the behaviour installs depend on. The node's own base
+/// (`dig_node_core::platform_user_base`) asks the OS known-folder API first and so does NOT move
+/// with it, which means the two can disagree. Public so `dig_node_service::wallet_env` can compare
+/// them and say so out loud rather than letting a start-up mint a seed under one root while the
+/// coin replica opens under another (dig-node#392). The body is unchanged.
+pub fn user_base() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());
