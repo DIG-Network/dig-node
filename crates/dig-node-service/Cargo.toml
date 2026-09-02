@@ -332,7 +332,7 @@ chia-protocol = "0.36.1"
 # hand-written `CoinRecord` cannot exercise the authentication path the census runs, so the probe
 # would assert its property against a fixture that could not exhibit it.
 #
-# Every version here is the one `dig-mirror-coin` 0.7 itself compiles against, and the whole set
+# Every version here is the one `dig-mirror-coin` 0.8 itself compiles against, and the whole set
 # moves together: the chia ceiling is not one number, and a crate split across two chia lines
 # compiles only until something crosses a public signature.
 chia-puzzle-types = "0.36.1"
