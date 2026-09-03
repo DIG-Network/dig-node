@@ -190,12 +190,67 @@ else
 fi
 
 printf '\n== the MSI field limits are pinned from BOTH sides ==\n'
-ok 'minor at the MSI ceiling' '0.255.0' '0.255.0' '0.255.0'
-rejects 'minor one over the MSI ceiling' '0.256.0'
+ok 'minor at the pre-carry passthrough boundary' '0.255.0' '0.255.0' '0.255.0'
 ok 'major at the MSI ceiling' '255.0.0' '255.0.0' '255.0.0'
 rejects 'major one over the MSI ceiling' '256.0.0'
 ok 'patch at the MSI ceiling' '0.1.65535' '0.1.65535' '0.1.65535'
 rejects 'patch one over the MSI ceiling' '0.1.65536'
+
+# ── MINOR exceeding 255 carries into the otherwise-idle MSI major field (dig_ecosystem#521/#522) ──
+#
+# dig-node's `0.<minor>.<patch>` scheme puts an ever-incrementing feat/breaking counter in MINOR
+# (CLAUDE.md §2.4), which ran out at 0.255.x — `0.256.0` used to `die` here, which made every native
+# package (.deb amd64/arm64, .msi, .pkg) unbuildable for every release after it. The fix folds MINOR
+# into a legal MSI (major, minor) pair in base 256, reusing the MSI major field, which is otherwise
+# idle at 0 for this repo's whole pre-1.0 lifetime. This must stay a byte-identical passthrough for
+# every already-released version (MINOR <= 255) and must newly SUCCEED, not die, the instant it
+# crosses 255.
+printf '\n== minor exceeding 255 carries into the otherwise-idle MSI major field (dig_ecosystem#521/#522) ==\n'
+ok 'last value before the carry activates' '0.255.9' '0.255.9' '0.255.9'
+ok 'first carried value -- this used to die' '0.256.0' '0.256.0' '1.0.0'
+ok 'carry mid-range' '0.511.0' '0.511.0' '1.255.0'
+ok 'carry rolls the MSI major again' '0.512.3' '0.512.3' '2.0.3'
+ok 'minor at the new outer ceiling' '0.65535.100' '0.65535.100' '255.255.100'
+rejects 'minor one over the new ceiling' '0.65536.0'
+rejects 'a real nonzero major collides with an overflowed minor' '1.256.0'
+ok 'a nightly with an overflowed minor carries the same way; BUILD stays the day count' \
+  '0.256.0-nightly.20260804.603187a' \
+  '0.256.0-nightly.20260804.603187a' \
+  "1.0.${DAYS_20260804}"
+
+# The carry must be MONOTONIC across the boundary it exists for, exactly like the nightly day-count
+# mapping above — not merely "each value individually looks right". `msi_compared` (defined above)
+# strips to the fields msiexec actually reads, so this is the real comparison, not an assumption
+# about it.
+printf '\n== the carry is strictly increasing across the 255/256 boundary and beyond ==\n'
+carry_boundary_versions=(
+  '0.255.9'
+  '0.256.0'
+  '0.511.0'
+  '0.512.3'
+  '0.65535.100'
+)
+for i in $(seq 1 $((${#carry_boundary_versions[@]} - 1))); do
+  earlier="${carry_boundary_versions[$((i - 1))]}"
+  later="${carry_boundary_versions[$i]}"
+  a="$(msi_compared "$earlier")"
+  b="$(msi_compared "$later")"
+  order="$(awk -v a="$a" -v b="$b" 'BEGIN {
+    split(a, x, "."); split(b, y, ".");
+    for (i = 1; i <= 3; i++) {
+      if ((y[i] + 0) > (x[i] + 0)) { print "greater"; exit }
+      if ((y[i] + 0) < (x[i] + 0)) { print "lower"; exit }
+    }
+    print "equal";
+  }')"
+  if [ "$order" = "greater" ]; then
+    printf 'ok   %s -> %s upgrades (%s < %s)\n' "$earlier" "$later" "$a" "$b"
+  else
+    printf 'FAIL %s -> %s does not compare greater under msiexec (%s vs %s, order=%s)\n' \
+      "$earlier" "$later" "$a" "$b" "$order"
+    failures=$((failures + 1))
+  fi
+done
 
 printf '\n== anything that could carry shell or control-file meaning is REJECTED ==\n'
 rejects 'empty'                  ''
