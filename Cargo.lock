@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.253.5"
+version = "0.254.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3346,6 +3346,7 @@ dependencies = [
  "chia-bls 0.36.1",
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
+ "chia-puzzles",
  "chia-query",
  "chia-sdk-test 0.36.0",
  "chia-sha2 0.36.1",
@@ -3358,6 +3359,7 @@ dependencies = [
  "dig-node-control-interface",
  "dig-node-core",
  "dig-offers",
+ "dig-options",
  "digstore-chain",
  "digstore-core 0.29.0",
  "futures-core",
