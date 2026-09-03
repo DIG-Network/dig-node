@@ -445,6 +445,82 @@ pub(super) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A disciplined view of [`now_ms`] that cannot advance faster than real time actually elapses.
+///
+/// dig-node#502/#525/#528 anchor a reservation's lifetime (`RESERVATION_TTL_MS`,
+/// `MAX_RESERVATION_HOLD_MS`) entirely on raw wall-clock readings — `submitted_at`/`expires_at`
+/// are written from [`now_ms`], and every prune compares them against a fresh [`now_ms`] read.
+/// #528 closes the case where the clock is ALREADY wrong at the instant a reservation is first
+/// written (a self-contradiction between a row's own two columns). It does not close the general
+/// form (dig-node#532): a wall clock that steps FORWARD while a reservation is already
+/// live — an NTP step correction, a VM pause/resume, an operator setting the clock — produces no
+/// such contradiction (the anchor and the jumped reading are each, in isolation, perfectly
+/// ordinary), yet the very next prune reads the jumped clock as "this much time has passed" and
+/// can retire a bundle's hold while it is still genuinely in flight. Unlike #528's residual, this
+/// has NO bound at all: a clock stepped forward by a day retires every hold in the database on
+/// the next read — the #348/#497 double-spend direction, with no ceiling.
+///
+/// `ClockGovernor` closes it by refusing to let its reported "now" advance faster than a
+/// **monotonic** clock says real time has elapsed since the last reading. A wall-clock jump
+/// forward is absorbed rather than trusted: the reported value keeps pace with real time and
+/// simply runs behind the wall clock until real time genuinely catches up, at which point it
+/// resumes tracking the wall clock exactly as before. There is no permanent freeze here — once
+/// real elapsed time reaches the jumped value, the clamp stops binding on its own
+/// (`the_clamp_releases_itself_once_real_time_catches_up`).
+///
+/// **The one direction this governor deliberately does NOT correct:** a wall clock that steps
+/// BACKWARD is passed straight through, unclamped. That can only make a hold last LONGER than
+/// intended, never shorter — the safe direction, and the one #502/#528 already accept elsewhere.
+/// A governor that also clamped backward steps would be deciding a hold expired sooner than
+/// either clock claims, which is exactly the failure this exists to close.
+///
+/// Lives for the process's lifetime and is NOT persisted: a restart re-seeds it from whatever the
+/// wall clock reads at that moment (`WalletBackend::new`). A clock that is already wrong AT BOOT
+/// is therefore unguarded by this governor — that is `now_ms` written directly into a fresh
+/// reservation, and #528's write-time contradiction check is what catches it. This governor's job
+/// starts the instant after boot: a clock that reads fine at startup and jumps forward LATER, mid
+/// process lifetime, mid hold.
+pub(super) struct ClockGovernor {
+    /// The most recent reading this governor has vouched for.
+    disciplined_ms: i64,
+    /// The monotonic instant `disciplined_ms` was recorded at, so the NEXT reading is checked
+    /// against how much real time a steady clock says has elapsed since then.
+    anchor: std::time::Instant,
+}
+
+impl ClockGovernor {
+    /// Seed the governor with the wall clock's current reading. Called once, at `WalletBackend`
+    /// construction — never mid-lifetime, or every re-seed would re-trust whatever the wall clock
+    /// says at that moment and defeat the discipline.
+    pub(super) fn new(wall_now_ms: i64) -> Self {
+        Self {
+            disciplined_ms: wall_now_ms,
+            anchor: std::time::Instant::now(),
+        }
+    }
+
+    /// Accept a fresh wall-clock reading and return the disciplined value to use as "now" for
+    /// reservation bookkeeping.
+    pub(super) fn observe(&mut self, wall_now_ms: i64) -> i64 {
+        self.observe_at(wall_now_ms, std::time::Instant::now())
+    }
+
+    /// The pure decision, with the monotonic instant taken as an explicit parameter so tests can
+    /// construct two readings a known duration apart deterministically — `Instant + Duration` is a
+    /// real, valid `Instant`, so this needs no sleep and no fake-clock trait to be exact.
+    fn observe_at(&mut self, wall_now_ms: i64, at: std::time::Instant) -> i64 {
+        let elapsed_ms: i64 = at
+            .saturating_duration_since(self.anchor)
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let ceiling = self.disciplined_ms.saturating_add(elapsed_ms);
+        let disciplined = wall_now_ms.min(ceiling);
+        self.disciplined_ms = disciplined;
+        self.anchor = at;
+        disciplined
+    }
+}
+
 /// Restrict a file to owner read/write on Unix (`0600`); best-effort defense-in-depth (loopback-only
 /// + at-rest encryption are the primary controls). No-op on non-Unix.
 #[cfg(unix)]
@@ -454,3 +530,208 @@ fn restrict_permissions(path: &Path) {
 }
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // ---- ClockGovernor (dig-node#532) -------------------------------------
+    //
+    // Every test below drives `observe_at` with EXPLICIT `Instant` values rather than sleeping —
+    // `Instant::now() + Duration` is a real, valid instant a fixed distance from another, so the
+    // "real elapsed time" side of the decision is exact and the test is not flaky under load.
+
+    #[test]
+    fn a_wall_clock_matching_real_time_passes_through_unclamped() {
+        let i0 = std::time::Instant::now();
+        let mut gov = ClockGovernor {
+            disciplined_ms: 1_000,
+            anchor: i0,
+        };
+
+        // Five real seconds pass, and the wall clock agrees: it also reads five seconds later.
+        let disciplined = gov.observe_at(6_000, i0 + Duration::from_secs(5));
+
+        assert_eq!(
+            disciplined, 6_000,
+            "a wall clock that agrees with real elapsed time is never clamped"
+        );
+    }
+
+    #[test]
+    fn a_forward_jump_mid_hold_is_clamped_to_real_elapsed_time() {
+        let i0 = std::time::Instant::now();
+        let mut gov = ClockGovernor {
+            disciplined_ms: 1_000,
+            anchor: i0,
+        };
+
+        // Only 100 real ms pass, but the wall clock jumps forward a full hour (an NTP step, a VM
+        // resume, an operator setting the clock) — exactly the case #528's write-time check
+        // cannot see, because nothing about the reading itself is self-contradictory.
+        let jumped_wall_clock = 1_000 + 3_600_000;
+        let disciplined = gov.observe_at(jumped_wall_clock, i0 + Duration::from_millis(100));
+
+        assert_eq!(
+            disciplined, 1_100,
+            "the jump is absorbed: the disciplined clock advances only by the real 100ms elapsed, \
+             never by the hour the wall clock claims"
+        );
+    }
+
+    #[test]
+    fn a_backward_step_passes_through_unclamped() {
+        let i0 = std::time::Instant::now();
+        let mut gov = ClockGovernor {
+            disciplined_ms: 1_000,
+            anchor: i0,
+        };
+
+        // The wall clock steps BACKWARD to 500 (before the anchor). This governor's one job is
+        // closing the EARLY-release direction; a backward step can only extend a hold, so it is
+        // let through exactly as #502/#528 already accept elsewhere.
+        let disciplined = gov.observe_at(500, i0 + Duration::from_millis(100));
+
+        assert_eq!(
+            disciplined, 500,
+            "a backward wall-clock step is never clamped -- it can only make a hold last longer"
+        );
+    }
+
+    #[test]
+    fn the_clamp_releases_itself_once_real_time_catches_up() {
+        let i0 = std::time::Instant::now();
+        let mut gov = ClockGovernor {
+            disciplined_ms: 0,
+            anchor: i0,
+        };
+
+        // The wall clock jumps forward by one hour and then STAYS THERE (a one-time step, not a
+        // runaway clock) while real time keeps advancing normally underneath it.
+        let jumped = 3_600_000;
+
+        // Immediately after the jump: almost no real time has passed, so the clamp binds hard.
+        let d1 = gov.observe_at(jumped, i0 + Duration::from_millis(1));
+        assert_eq!(
+            d1, 1,
+            "right after the jump, real elapsed time still governs"
+        );
+
+        // Real time keeps advancing while the wall clock holds steady at `jumped`.
+        let d2 = gov.observe_at(jumped, i0 + Duration::from_secs(1800));
+        assert_eq!(
+            d2, 1_800_000,
+            "the disciplined clock keeps tracking REAL elapsed time, still behind the jump"
+        );
+
+        // Once real elapsed time actually reaches the jumped value, the clamp stops binding on
+        // its own -- no special unfreeze step, no repair to run, unlike #525/#528's lockout.
+        let d3 = gov.observe_at(jumped, i0 + Duration::from_millis(3_600_000));
+        assert_eq!(
+            d3, jumped,
+            "once real time catches up to the jumped wall clock, tracking resumes normally"
+        );
+
+        // And from here it tracks the wall clock again, exactly as if no jump had ever happened.
+        let d4 = gov.observe_at(jumped + 60_000, i0 + Duration::from_millis(3_660_000));
+        assert_eq!(
+            d4,
+            jumped + 60_000,
+            "tracking is fully restored after the catch-up"
+        );
+    }
+
+    // ---- the money property this governor protects ------------------------
+    //
+    // Built from the REAL `WalletDb` reservation API, not a hand-placed row -- the same shape
+    // #528's own regression tests use, and for the same reason: a fixture starting in a state
+    // production cannot reach hides the bug it is meant to catch.
+
+    fn coin(id: &str) -> super::super::db::CoinRow {
+        super::super::db::CoinRow {
+            coin_id: id.into(),
+            parent_coin_info: "pp".into(),
+            puzzle_hash: "ph".into(),
+            amount: "100".into(),
+            created_height: Some(10),
+            spent_height: None,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    fn reservation(
+        tx: &str,
+        coin_ids: &[&str],
+        submitted_at: i64,
+        expires_at: i64,
+    ) -> super::super::db::PendingTransactionRow {
+        super::super::db::PendingTransactionRow {
+            transaction_id: tx.into(),
+            bundle_hex: format!("bundle-of-{tx}"),
+            fee: Some("10".into()),
+            submitted_at,
+            expires_at,
+            attempts: 1,
+            reserved_coin_ids: coin_ids.iter().map(|c| (*c).to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forward_clock_jump_mid_hold_no_longer_releases_a_live_reservation_early() {
+        let db = super::super::db::WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1")).await.unwrap();
+
+        let ttl = super::super::rpc::RESERVATION_TTL_MS;
+        let i0 = std::time::Instant::now();
+        let mut gov = ClockGovernor {
+            disciplined_ms: 0,
+            anchor: i0,
+        };
+
+        // The bundle is pushed through the governed clock, at t=0. Real elapsed so far: none.
+        let submitted = gov.observe_at(0, i0);
+        db.reserve_spend(&reservation("tx1", &["c1"], submitted, submitted + ttl))
+            .await
+            .unwrap();
+
+        // Two real minutes later, the wall clock is stepped forward by a full TTL's worth of time
+        // in one jump (an NTP step) -- comfortably enough, read raw, to look like the reservation
+        // has already lapsed, even though only two real minutes have actually passed.
+        let raw_jumped_wall_clock = ttl + 1;
+        let governed_now = gov.observe_at(raw_jumped_wall_clock, i0 + Duration::from_secs(120));
+        assert!(
+            governed_now < ttl,
+            "the governed reading must stay well short of the reservation's real deadline -- a \
+             raw read of {raw_jumped_wall_clock} would already exceed it"
+        );
+
+        // Pruning against the DISCIPLINED reading must not retire the still-live reservation.
+        db.prune_reservations(governed_now).await.unwrap();
+        assert!(
+            db.unreserved_unspent_coins(None).await.unwrap().is_empty(),
+            "a mid-hold forward clock jump must not release a coin whose bundle may still be \
+             genuinely in flight -- the #348/#497 double-spend direction"
+        );
+
+        // The coin still returns once its true (governed) deadline is actually reached.
+        let past_deadline = gov.observe_at(
+            raw_jumped_wall_clock,
+            i0 + Duration::from_millis(ttl as u64 + 1),
+        );
+        db.prune_reservations(past_deadline).await.unwrap();
+        assert_eq!(
+            db.unreserved_unspent_coins(None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|c| c.coin_id)
+                .collect::<Vec<_>>(),
+            vec!["c1".to_string()],
+            "the coin is released once real elapsed time actually reaches the reservation's TTL"
+        );
+    }
+}
