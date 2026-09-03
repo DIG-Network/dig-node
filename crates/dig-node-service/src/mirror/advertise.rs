@@ -50,6 +50,22 @@ pub enum Rejection {
     ThisMachineOnly,
 }
 
+impl Rejection {
+    /// Every variant, so the operator-message guard can walk the set rather than a chosen example.
+    ///
+    /// Declared beside the enum, not spelled inside the test. A walk built from an array literal in
+    /// the test would still compile, still be the same length, and still pass after a variant was
+    /// added — so the new variant's message would ship unguarded by the very test written to guard
+    /// it, which is the shape of gap this module already shipped once.
+    ///
+    /// **What is and is not enforced, stated precisely because the looser claim was wrong.** The
+    /// `match` in [`rejection_reason`] is exhaustive, so a new variant CANNOT compile without a
+    /// developer editing this module and giving it a message. Nothing in Rust then forces that
+    /// variant into this array — but the guard asserts its walk against `ALL.len()`, so the walk and
+    /// this list cannot drift apart, and this is the one place to add it.
+    pub const ALL: [Rejection; 2] = [Rejection::NotAbsolute, Rejection::ThisMachineOnly];
+}
+
 /// What [`parse_advertised_urls`] made of the operator's value.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Advertised {
@@ -75,6 +91,49 @@ pub fn advertised_urls_from_env() -> Advertised {
     parse_advertised_urls(&std::env::var(ADVERTISE_URLS_ENV).unwrap_or_default())
 }
 
+/// Why one configured entry is not advertised, in the words an operator reads.
+///
+/// Split out of [`configured_urls`] so a test can walk EVERY variant and assert over the rendered
+/// text. That is not tidiness: all three of this module's operator-facing lines shipped with 14- to
+/// 18-space runs baked into the middle of a sentence, left behind when a `\` string continuation
+/// lost its backslash. Such a literal compiles, no caller inspects it, and the mangled and correct
+/// forms are indistinguishable in a diff — so only a test over the VALUE can see it, and it has to
+/// reach these literals rather than a neighbouring module's.
+fn rejection_reason(why: &Rejection) -> &'static str {
+    match why {
+        Rejection::NotAbsolute => {
+            "it is not an absolute URL with a scheme and a host, so it names no way to reach anything"
+        }
+        Rejection::ThisMachineOnly => {
+            "its host can only mean this machine, so every reader would resolve it to themselves"
+        }
+    }
+}
+
+/// The whole line an operator sees when one entry is dropped, the reason included.
+///
+/// The wrapper around the reason is operator-facing prose too, so it belongs in the guard's walk.
+/// Checking only the reason would leave the sentence it is embedded in unchecked while the guard
+/// claims to cover every line this module emits.
+fn not_advertised(reason: &str) -> String {
+    format!("{ADVERTISE_URLS_ENV} entry is not advertised: {reason}")
+}
+
+/// What this node reports when at least one entry survived and will be published.
+const ADVERTISING_AT_CONFIGURED_URLS: &str =
+    "advertising this node's stores at the operator-configured URLs, in the configured order";
+
+/// What this node reports when no configured entry may be published.
+///
+/// A function rather than a `const` because it names the environment variable, and `concat!` cannot
+/// take a `const`. Spelling the variable a second time as a literal would be a second source of
+/// truth for the same name — exactly the drift this module's tests exist to catch.
+fn nothing_publishable() -> String {
+    format!(
+        "no {ADVERTISE_URLS_ENV} entry is publishable, so this node advertises nothing and creates no mirror coin (SPEC.md 25.10)"
+    )
+}
+
 /// The URLs this node will publish, with every rejected entry reported to the operator.
 ///
 /// This is the whole operator surface as the mirror scheduler consumes it: one call, at bring-up,
@@ -89,18 +148,11 @@ pub fn configured_urls() -> Vec<String> {
     let advertised = advertised_urls_from_env();
 
     for (entry, why) in &advertised.rejected {
-        let reason = match why {
-            Rejection::NotAbsolute => {
-                "it is not an absolute URL with a scheme and a host, so it names no way to reach                  anything"
-            }
-            Rejection::ThisMachineOnly => {
-                "its host can only mean this machine, so every reader would resolve it to                  themselves"
-            }
-        };
         tracing::warn!(
             target: "mirror",
             entry = %entry,
-            "{ADVERTISE_URLS_ENV} entry is not advertised: {reason}"
+            "{}",
+            not_advertised(rejection_reason(why))
         );
     }
 
@@ -108,13 +160,10 @@ pub fn configured_urls() -> Vec<String> {
         tracing::info!(
             target: "mirror",
             urls = ?advertised.accepted,
-            "advertising this node's stores at the operator-configured URLs, in the configured order"
+            "{ADVERTISING_AT_CONFIGURED_URLS}"
         );
     } else {
-        tracing::info!(
-            target: "mirror",
-            "no {ADVERTISE_URLS_ENV} entry is publishable, so this node advertises nothing and              creates no mirror coin (SPEC.md 25.10)"
-        );
+        tracing::info!(target: "mirror", "{}", nothing_publishable());
     }
 
     advertised.accepted
@@ -216,6 +265,75 @@ fn is_this_machine_only_v4(ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every operator-facing line this module emits reads as a sentence.**
+    ///
+    /// All three of them shipped corrupted: a `\` string continuation lost its backslash and baked
+    /// 14 to 18 literal spaces into the middle of each sentence. Nothing else can catch that. The
+    /// compiler is happy, no caller inspects the text, the two forms are indistinguishable in a
+    /// diff, and the only witness is an operator reading a line that looks broken at the moment
+    /// they are trying to work out why nothing is being advertised.
+    ///
+    /// The guard walks the whole SET rather than a chosen example, and asserts the count, so
+    /// deleting a message from the walk fails here instead of silently shrinking the sweep. A
+    /// sibling guard over `lifecycle.rs`'s two refusals exists and is NOT a substitute: it cannot
+    /// reach these literals, which is how three corrupted runtime lines sat behind a green test
+    /// that appeared to cover them.
+    #[test]
+    fn every_operator_facing_line_reads_as_a_sentence() {
+        // Driven from `Rejection::ALL`, and the expected count is DERIVED from it rather than
+        // written as a literal. A hard-coded `4` would actively cement a subset: add a variant,
+        // give it a message, leave it out of `ALL`, and a literal count still matches while the new
+        // line ships unchecked. The `match` below only forces the variant to be NAMED — that is
+        // what makes it visible, not what makes it walked — so the derived length is what actually
+        // ties the two together.
+        let lines: Vec<(&str, String)> = Rejection::ALL
+            .iter()
+            .map(|why| {
+                let name = match why {
+                    Rejection::NotAbsolute => "Rejection::NotAbsolute",
+                    Rejection::ThisMachineOnly => "Rejection::ThisMachineOnly",
+                };
+                // The wrapper, not the bare reason: that is the line an operator actually reads,
+                // and it contains the reason, so this covers both.
+                (name, not_advertised(rejection_reason(why)))
+            })
+            .chain([
+                (
+                    "ADVERTISING_AT_CONFIGURED_URLS",
+                    ADVERTISING_AT_CONFIGURED_URLS.to_string(),
+                ),
+                ("nothing_publishable", nothing_publishable()),
+            ])
+            .collect();
+
+        assert_eq!(
+            lines.len(),
+            Rejection::ALL.len() + 2,
+            "every line this module emits must be walked, never a subset: {lines:?}"
+        );
+        for (name, line) in &lines {
+            assert!(
+                !line.contains("  "),
+                "{name}: a run of two spaces is an eaten line continuation, not prose: {line:?}"
+            );
+            assert!(
+                !line.chars().any(char::is_control),
+                "{name}: no control character belongs in an operator-facing line: {line:?}"
+            );
+            // Control: a fixture too empty to exhibit the property must not pass. Both assertions
+            // above are satisfied by "" and by a single word.
+            assert!(
+                line.split_whitespace().count() >= 8,
+                "{name}: control -- each line must still be a sentence saying what happened: {line:?}"
+            );
+        }
+        assert!(
+            lines[3].1.contains(ADVERTISE_URLS_ENV),
+            "control: the no-entry line must name the variable an operator has to set: {:?}",
+            lines[3].1
+        );
+    }
 
     /// The refusal that exists today survives an unset value: no URL means no advertisement, which
     /// is what makes `create` decline rather than publish somewhere unreachable.
