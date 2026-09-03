@@ -19,23 +19,45 @@
 //! for the strike within `expiration_seconds`") — CAT/NFT-underlying options are a tracked
 //! follow-on once that machinery is factored for reuse across `send_cat`/`transfer_nfts`.
 //!
-//! ## `exercise_options` — a documented follow-on, not implemented here
+//! ## `exercise_options` - served, bounded, and built through `dig-options`
 //!
-//! Exercising an option additionally requires reconstructing the UNDERLYING coin's OWN
-//! lineage (it sits at a derived puzzle hash the wallet's ordinary HD puzzle-hash
-//! subscription set does not cover — see design B.3) and building the `MipsSpend`/merkle-proof
-//! machinery `OptionUnderlying::exercise_spend` needs. That is a substantial unit on its own;
-//! [`exercise_options_unimplemented`] documents the exact reason and is the seam the
-//! follow-on lands in. `get_options`/`get_option`/`mint_option`/`transfer_options` are fully
-//! served in the meantime.
+//! Exercise is NOT re-derived here. It is built through **`dig-options`**, the ecosystem's
+//! canonical option-contract crate (`modules/crates/00-foundation/dig-options`), for two
+//! reasons a local re-implementation would have had to rediscover:
+//!
+//! 1. `dig_options::exercise` emits the **underlying-claim leg**. Unlocking the underlying puts
+//!    it on a BARE settlement coin anyone can spend; the claim leg is what pays it to the
+//!    holder, and consensus does not force it. Omitting it strands the underlying for any
+//!    mempool watcher to take while the holder has already paid the strike.
+//! 2. `dig_options::rehydrate` VERIFIES a reconstructed `OptionUnderlying` against three
+//!    independent on-chain commitments, so a wrong creator puzzle hash is REJECTED rather than
+//!    silently building a spend against a different merkle root.
+//!
+//! ### The served envelope, and what returns a 400
+//!
+//! Exercise needs the whole underlying `Coin` and the creator puzzle hash. Neither is
+//! invertible from the option puzzle: the underlying sits behind a 1-of-2 merkle path, and its
+//! coin sits at a derived puzzle hash the wallet does not subscribe to, so the replica holds no
+//! row for it. Both are therefore recovered from what this wallet recorded AT MINT
+//! (`underlying_parent_coin_id`, plus creator = the minting address), and every recovered value
+//! is verified by `rehydrate` before it is used.
+//!
+//! The served envelope is an **XCH-underlying, XCH-strike option this wallet minted** and still
+//! owns, whose mint recorded the underlying parent. Anything outside it -- an option acquired by
+//! TRANSFER (reconstruction would need replaying the mint launcher spend from chain history), a
+//! CAT/NFT strike, or a row predating the `underlying_parent_coin_id` column -- returns a
+//! **400 naming the limitation**, never a 500 and never a mis-built spend. That mirrors the
+//! guard idiom [`build_mint_option`] already uses.
 
 use chia_protocol::{Bytes32, Coin, CoinSpend, Program};
 use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{
-    OptionContract, OptionInfo, OptionLauncher, OptionLauncherInfo, OptionType, Puzzle,
-    SpendContext, StandardLayer,
+    OptionContract, OptionInfo, OptionLauncher, OptionLauncherInfo, OptionType, OptionUnderlying,
+    Puzzle, SpendContext, StandardLayer,
 };
 use chia_wallet_sdk::types::Conditions;
+use clvm_utils::ToTreeHash;
+use dig_options::{Owner, RehydratedTerms, StrikePayment};
 
 use super::db::OptionDbRow;
 use super::singleton::{self, ParentSpend};
@@ -248,17 +270,156 @@ fn reserve_fee_linked(
     Ok(())
 }
 
-/// `exercise_options` — a documented follow-on (module docs), not a silent gap: returns a
-/// clear, typed `500` error naming the exact missing piece (underlying-coin lineage tracking
-/// and the `MipsSpend`/merkle-proof exercise machinery) rather than mis-building or panicking.
-/// `sage::rpc`'s `exercise_options` dispatch returns this directly.
-pub fn exercise_options_unimplemented() -> Error {
-    Error::internal(
-        "exercise_options is not yet implemented: it requires tracking the option's \
-         underlying-lock coin lineage (a derived, non-HD puzzle hash outside the wallet's \
-         ordinary subscription set) plus the MipsSpend/merkle-proof exercise machinery — see \
-         SPEC.md §18 and crate::sage::options module docs",
+/// The terms an option's exercise needs that its puzzle does NOT reveal, recovered from what
+/// this wallet recorded at mint and returned only when ALL of them are present.
+///
+/// `Ok(None)` means "this wallet cannot reconstruct this option" -- the caller turns that into a
+/// 400 naming the limitation. It is never a reason to substitute a default: `creator_puzzle_hash`
+/// is committed only inside the underlying's clawback path, so a wrong value produces a spend
+/// against a different merkle root and burns a real fee for nothing.
+///
+/// # Why `p2_puzzle_hash` is a legitimate creator candidate
+///
+/// [`build_mint_option`] passes `owner_ph` as BOTH the option's p2 owner and the creator, so for
+/// an option this wallet minted and still holds the two are equal. That makes the row's current
+/// owner a *candidate*, not an assumption: `dig_options::rehydrate` rejects it against the
+/// on-chain 1-of-2 path if the option was in fact created by someone else.
+pub fn underlying_from_row(row: &OptionDbRow) -> Result<Option<(Coin, RehydratedTerms)>> {
+    let Some(parent_hex) = row.underlying_parent_coin_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(record) = record_from_row(row, "") else {
+        return Ok(None);
+    };
+    let strike = strike_type_from_asset(&OptionAsset {
+        asset_id: record.strike_asset.asset_id.clone(),
+        amount: record.strike_amount.clone(),
+    })?;
+    let underlying_amount = record
+        .underlying_amount
+        .to_u64()
+        .ok_or_else(|| Error::api("stored underlying amount exceeds u64 range"))?;
+    let launcher_id = parse_hash(&row.option_id)?;
+    let creator_puzzle_hash = parse_hash(&row.p2_puzzle_hash)?;
+    let terms = RehydratedTerms {
+        creator_puzzle_hash,
+        expiry_seconds: record.expiration_seconds,
+        strike_type: strike,
+    };
+    // Rebuild the underlying coin. Its puzzle hash is the underlying's own 1-of-2 path hash,
+    // which is computed from the SAME terms -- so `rehydrate`'s path-hash check is tautological
+    // under this construction and is NOT what makes this sound. The check that carries it is the
+    // coin-id check against `option.info.underlying_coin_id`, an independent value the option
+    // singleton itself commits to: a wrong creator hash or expiry changes the path hash, hence
+    // the coin id, and is rejected there.
+    let underlying = OptionUnderlying::new(
+        launcher_id,
+        creator_puzzle_hash,
+        record.expiration_seconds,
+        underlying_amount,
+        strike,
+    );
+    let coin = Coin::new(
+        parse_hash(parent_hex)?,
+        underlying.tree_hash().into(),
+        underlying_amount,
+    );
+    Ok(Some((coin, terms)))
+}
+
+/// The option's current owner (p2) puzzle hash, parsed from its stored row.
+pub fn p2_hash_of(row: &OptionDbRow) -> Result<Bytes32> {
+    parse_hash(&row.p2_puzzle_hash)
+}
+
+/// Build the (unsigned) spends that reserve `fee` from `fee_coins` alone, linked to `link_to`.
+///
+/// Kept separate from [`build_exercise_option`] because `dig_options::exercise` drains the whole
+/// [`SpendContext`] it is handed; the fee leg is built in its own context and appended.
+pub fn build_fee_only(
+    signer: &WalletSigner,
+    fee_coins: &[Coin],
+    change: Bytes32,
+    fee: u64,
+    link_to: Option<Bytes32>,
+) -> Result<Vec<CoinSpend>> {
+    let mut ctx = SpendContext::new();
+    reserve_fee_linked(&mut ctx, signer, fee_coins, change, fee, link_to)?;
+    Ok(ctx.take())
+}
+
+/// Parse a 32-byte hex hash (with or without a `0x` prefix).
+fn parse_hash(hex_str: &str) -> Result<Bytes32> {
+    let bytes = hex::decode(hex_str.trim_start_matches("0x"))
+        .map_err(|_| Error::api("expected a hex-encoded 32-byte hash"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| Error::api("expected a hex-encoded 32-byte hash"))?;
+    Ok(Bytes32::from(arr))
+}
+
+/// Build the (unsigned) coin spends that EXERCISE `option` -- paying the strike from
+/// `strike_funding` and unlocking the underlying to the option's current owner.
+///
+/// Delegates to `dig_options::exercise`, which emits BOTH settlement legs (the strike to the
+/// creator and the unlocked underlying to the holder) in one bundle. The returned spends MUST be
+/// broadcast intact: dropping the underlying-claim leg leaves the unlocked underlying on a
+/// publicly-claimable settlement coin.
+///
+/// `strike_funding` MUST sit at the option's own p2 puzzle hash. One [`Owner`] authorizes both
+/// the singleton spend and the strike-funding spend, so a funding coin at a different address
+/// would be signed for the wrong key; requiring them equal is a guard, not a limitation the
+/// caller cannot satisfy (the option's p2 hash is an ordinary wallet address).
+pub fn build_exercise_option(
+    signer: &WalletSigner,
+    option: &(ParentSpend, Coin),
+    underlying_coin: Coin,
+    terms: &RehydratedTerms,
+    strike_funding: Coin,
+) -> Result<Vec<CoinSpend>> {
+    let mut ctx = SpendContext::new();
+    let (parent, child) = option;
+    let contract = parse_option_in(&mut ctx, parent, *child)?
+        .ok_or_else(|| Error::not_found("coin is not a spendable option (or parent not found)"))?;
+
+    if !matches!(terms.strike_type, OptionType::Xch { .. }) {
+        return Err(Error::api(
+            "exercise_options: only an XCH strike can be exercised (see crate::sage::options \
+             module docs); the CAT/NFT settlement leg is not built by dig-options",
+        ));
+    }
+    if strike_funding.puzzle_hash != contract.info.p2_puzzle_hash {
+        return Err(Error::api(
+            "exercise_options: the strike must be funded from a coin at the option's own owner \
+             address",
+        ));
+    }
+
+    // Every reconstructed field is verified here against the option's on-chain commitments; a
+    // mismatch means this wallet did not mint the option (or its record drifted), which is a
+    // documented 400 rather than an internal error.
+    let created = dig_options::rehydrate(&contract, terms, underlying_coin).map_err(|e| {
+        Error::api(format!(
+            "exercise_options: this wallet cannot reconstruct the option's underlying terms \
+             ({e}); only an option minted by this wallet, still owned by it, and recorded with \
+             its underlying parent can be exercised"
+        ))
+    })?;
+
+    let pk = signer
+        .synthetic_for(contract.info.p2_puzzle_hash)
+        .ok_or_else(|| Error::api("no signing key for the option's owner address"))?;
+    let holder = Owner::Standard(pk);
+    let spend = dig_options::exercise(
+        &mut ctx,
+        &holder,
+        &created,
+        &StrikePayment {
+            funding_coin: strike_funding,
+        },
     )
+    .map_err(|e| Error::internal(format!("exercise option: {e}")))?;
+    Ok(spend.coin_spends)
 }
 
 /// Render a stored [`OptionDbRow`] + its parsed strike/underlying fields as the wire
@@ -513,6 +674,7 @@ mod tests {
             option_id: "opt1".into(),
             coin_id: "coin2".into(), // simulate a later coin after a spend
             underlying_coin_id: "u1".into(),
+            underlying_parent_coin_id: None,
             underlying_delegated_puzzle_hash: "dph".into(),
             p2_puzzle_hash: "p2".into(),
             visible: false,
@@ -528,10 +690,143 @@ mod tests {
         assert_eq!(restored.underlying_asset.ticker.as_deref(), Some("XCH"));
     }
 
+    /// Exercise an option end to end on the simulator.
+    ///
+    /// This REPLACES `exercise_options_returns_a_clear_named_error`, which asserted only that a
+    /// named error existed. That assertion passes under the defect -- it measures the string
+    /// table, not the method -- so it is deleted rather than kept alongside.
+    ///
+    /// Asserts three things the simulator can actually see: the bundle is accepted, the option
+    /// singleton is MELTED (its coin is spent and it creates no successor), and a coin of the
+    /// full underlying amount lands at the holder's own puzzle hash. The third is the one that
+    /// catches a dropped underlying-claim leg: without it the underlying is stranded on a
+    /// publicly-claimable settlement coin and the holder receives nothing.
     #[test]
-    fn exercise_options_returns_a_clear_named_error() {
-        let e = exercise_options_unimplemented();
-        assert_eq!(e.kind, super::super::ErrorKind::Internal);
-        assert!(e.message.contains("not yet implemented"));
+    fn exercise_option_spend_is_accepted_by_the_simulator() {
+        use chia_puzzles::SETTLEMENT_PAYMENT_HASH;
+        use chia_traits::Streamable;
+        use chia_wallet_sdk::driver::SpendContext as Ctx;
+
+        const UNDERLYING: u64 = 1_000;
+        const STRIKE: u64 = 500;
+        // An ABSOLUTE unix timestamp far in the future: exercise emits an
+        // assert-before-seconds-absolute, so an expiry in the past is refused by consensus and
+        // would make this test measure the wrong refusal.
+        const EXPIRY: u64 = 4_000_000_000;
+
+        let mut sim = Simulator::new();
+        let alice = sim.bls(1);
+        let signer = signer_for(alice.sk.clone());
+        let alice_p2 = StandardLayer::new(alice.pk);
+
+        let ctx = &mut Ctx::new();
+        let underlying_funding = sim.new_coin(alice.puzzle_hash, UNDERLYING);
+        let strike_funding = sim.new_coin(alice.puzzle_hash, STRIKE);
+
+        let launcher = OptionLauncher::new(
+            ctx,
+            alice.coin.coin_id(),
+            OptionLauncherInfo::new(
+                alice.puzzle_hash,
+                alice.puzzle_hash,
+                EXPIRY,
+                UNDERLYING,
+                OptionType::Xch { amount: STRIKE },
+            ),
+            1,
+        )
+        .unwrap();
+        let p2_option = launcher.p2_puzzle_hash();
+        alice_p2
+            .spend(
+                ctx,
+                underlying_funding,
+                Conditions::new().create_coin(p2_option, UNDERLYING, Memos::None),
+            )
+            .unwrap();
+        let underlying_coin = Coin::new(underlying_funding.coin_id(), p2_option, UNDERLYING);
+        let launcher = launcher.with_underlying(underlying_coin.coin_id());
+        let (mint_option, option) = launcher.mint(ctx).unwrap();
+        alice_p2.spend(ctx, alice.coin, mint_option).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
+
+        // The current option's parent is the eve option, spent in the mint bundle.
+        let eve_id = option.coin.parent_coin_info;
+        let parent = ParentSpend {
+            coin: sim.coin_state(eve_id).unwrap().coin,
+            puzzle_reveal: sim.puzzle_reveal(eve_id).unwrap().to_bytes().unwrap(),
+            solution: sim.solution(eve_id).unwrap().to_bytes().unwrap(),
+        };
+
+        let terms = RehydratedTerms {
+            creator_puzzle_hash: alice.puzzle_hash,
+            expiry_seconds: EXPIRY,
+            strike_type: OptionType::Xch { amount: STRIKE },
+        };
+        let coin_spends = build_exercise_option(
+            &signer,
+            &(parent, option.coin),
+            underlying_coin,
+            &terms,
+            strike_funding,
+        )
+        .expect("the exercise must build");
+
+        let sig = signer.sign(&coin_spends).unwrap();
+        sim.new_transaction(chia_protocol::SpendBundle::new(coin_spends, sig))
+            .expect("the simulator must accept the option exercise");
+
+        // (b) the option singleton is melted -- spent, with no successor.
+        let melted = sim.coin_state(option.coin.coin_id()).unwrap();
+        assert!(
+            melted.spent_height.is_some(),
+            "the option singleton must be spent by its exercise"
+        );
+
+        // (c) the unlocked underlying reached the holder. The claim leg spends the settlement
+        // coin the underlying lands on and pays the holder's own p2 hash; naming that coin is
+        // what makes a dropped claim leg visible rather than merely unasserted.
+        let settlement = Coin::new(
+            underlying_coin.coin_id(),
+            SETTLEMENT_PAYMENT_HASH.into(),
+            UNDERLYING,
+        );
+        let holder_coin = Coin::new(settlement.coin_id(), alice.puzzle_hash, UNDERLYING);
+        assert!(
+            sim.coin_state(holder_coin.coin_id()).is_some(),
+            "the exercised underlying must land at the holder's address, not stay on the \
+             publicly-claimable settlement coin"
+        );
+    }
+
+    /// A row with no recorded underlying parent is UNKNOWN, and unknown must refuse rather than
+    /// default. A default here would build a spend against a different coin.
+    #[test]
+    fn an_option_without_a_recorded_underlying_parent_is_not_reconstructible() {
+        let row = OptionDbRow {
+            option_id: "11".repeat(32),
+            coin_id: "c1".into(),
+            underlying_coin_id: "u1".into(),
+            underlying_parent_coin_id: None,
+            underlying_delegated_puzzle_hash: "dph".into(),
+            p2_puzzle_hash: "22".repeat(32),
+            visible: true,
+            created_height: None,
+            record_json: serde_json::to_string(&new_record(
+                &"11".repeat(32),
+                &"11".repeat(32),
+                "xch1a",
+                1,
+                asset_for(None),
+                1_000,
+                "u1",
+                asset_for(None),
+                500,
+                4_000_000_000,
+            ))
+            .unwrap(),
+        };
+        assert!(underlying_from_row(&row).unwrap().is_none());
     }
 }

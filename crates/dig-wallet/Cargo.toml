@@ -52,6 +52,13 @@ clvm-utils = "0.36.1"
 # Needed to NAME the SDK spendable `Cat` type when assembling a make-offer's
 # MakerFunds, and `SpendContext` to serialize NFT metadata into a Program.
 chia-wallet-sdk = { version = "0.36.0", features = ["offer-compression"] }
+# The ecosystem's canonical option-contract builder (modules/crates/00-foundation/dig-options).
+# `exercise_options` is built through it rather than re-deriving the exercise/settlement legs
+# here: it owns the underlying-claim leg whose omission would strand the unlocked underlying on
+# a publicly-claimable settlement coin, and its `rehydrate` VERIFIES a reconstructed
+# `OptionUnderlying` against three independent on-chain commitments, so a wrong creator puzzle
+# hash is rejected instead of producing a spend against a wrong merkle root. Same chia 0.36 line.
+dig-options = "0.4.0"
 # CLVM runtime types (NodePtr/Allocator) used by the #216 singleton reconstruction + spend
 # builders. Pinned to the same 0.16 the SDK resolves so the NodePtr types unify.
 clvmr = "0.16.2"
@@ -193,6 +200,10 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# `SETTLEMENT_PAYMENT_HASH`, so the exercise test can NAME the settlement coin the unlocked
+# underlying lands on and assert the claim leg actually paid it to the holder. Test-only; the
+# same 0.20.3 line dig-options builds on.
+chia-puzzles = "0.20.3"
 # Recompute the canonical offer id with THIS crate's chia stack, so the parity test can pin
 # dig-offers' (newer) stack and ours to the same value rather than trusting they agree (#283).
 # Pinned to the 0.36.1 line the local chia-protocol resolves.
