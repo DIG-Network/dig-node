@@ -3694,6 +3694,85 @@ repeating discovery.
 - Every cached entry remains a candidate to DIAL and never a fact (NC-12): the whole-resource merkle
   bind against the chain-anchored root is what admits bytes, so a stale entry costs one wasted dial.
 
+### 10.5. Peer conduct: exclusion is not ranking (dig-sex SPEC 8.2A/8.3, #268)
+
+This node maintains THREE separate per-peer models, each with one job, and they MUST NOT be merged
+or duplicated:
+
+- **`dig_sex::conduct`**, held in `ConductState` (`crates/dig-node-core/src/seams/dig_peer/conduct.rs`)
+  — a **binary exclusion gate**: which pool peers are dialable at all.
+- **`dig_sex::routing`**, held in `AskRoutingState` (`ask_routing.rs`) — **ranks** the forwarded-ask
+  fan-out among whoever conduct left dialable.
+- **`dig_peer_selector::PeerSelector`** (`selector_adapter.rs`) — **ranks** content-fetch sources.
+
+`download.rs:1920` states the split at the call site: *"CONDUCT gates who is dialable at all (#268,
+SPEC 8.3); routing then ranks what remains"* (see also the field doc at `download.rs:904`). A fourth
+per-peer quality model MUST NOT be introduced, and conduct MUST NOT become a ranking input — ordering
+is `routing`'s job, and `dig_sex::routing::rank` already discharges dig-sex SPEC 8.2A's ordering
+clause: its own tests `an_inconclusive_answer_ranks_above_silence` and
+`a_good_answerer_outranks_an_unobserved_peer_which_outranks_a_silent_one` (dig-sex `src/routing.rs`)
+prove peers are ordered by observed answer quality, never excluded by it.
+
+**Non-performance MUST NEVER exclude.** `dig_sex::dial_share` returns `0.0` only when a record's
+`proven_faults > 0`; every non-performance penalty is floored at `MIN_NON_PERFORMANCE_DIAL_SHARE`
+(0.1) and one unit of it decays for every `NON_PERFORMANCE_DECAY_TICKS` (600) of elapsed time, with
+no requirement that the peer be re-dialled or prove anything to recover. The penalty MUST be a
+function of elapsed ticks ALONE and never of how often this node happened to observe the peer:
+`decay` carries the unspent remainder of a period forward rather than restamping the record
+(dig-sex `src/conduct.rs`, `decay`), so a peer this node talks to often cannot be held un-decayed by the
+observation traffic itself. This is what stops an attacker
+who can degrade an honest peer — load, connection-slot exhaustion, a partition — from evicting it
+from every reader's dial set merely by making it slow. `conduct.rs:217`
+(`sustained_non_performance_never_silences_a_peer_completely`) and `conduct.rs:277`
+(`a_proven_liar_leaves_the_dial_set_while_a_merely_slow_peer_stays_in_it`) pin this at the decision
+layer: only a peer with a proven fault ever leaves `ConductState::dialable`'s output
+(`conduct.rs:104`); a peer with any amount of non-performance never does.
+
+**The exclusion arm is currently UNREACHABLE, and this MUST be read as vacuously satisfied, not
+satisfied** (the same discipline dig-sex's own SPEC applies at its 2.4 and 2A.1). No production code
+path constructs `ConductEvidence::ProvenLie` or `ConductEvidence::SelfContradiction` — both variants
+are produced only inside `conduct.rs`'s `#[cfg(test)]` module. The one non-test call to `observe`
+(`download.rs:2035-2046`) classifies every completed exchange as either `HonestAnswer` (the peer
+answered, including an honest "I do not have it") or `NonPerformance` (a refusal, a timeout, an
+unreachable peer). Consequently `proven_faults` is always zero on a running node, `dial_share` is
+always `> 0.0` for every pool peer, and `ConductState::dialable` currently returns its whole input
+unconditionally.
+
+**Why each verifiable class stays unproduced, and why producing either unsafely is forbidden:**
+
+- **`ProvenLie`** needs a per-peer verification verdict this node does not receive today. The
+  `dig-peer-selector` adapter (`selector_adapter.rs`) already carries a `peer_id` on every
+  `RangeOutcome` it records, but `dig-download`'s own engine collapses a verification failure and a
+  transport failure into the same `RangeResult::Failed`, which `map_range_result`
+  (`selector_adapter.rs:122-131`) in turn maps to one undifferentiated `OutcomeResult::Failure`.
+  Because `proven_faults` never decays, wiring a `ProvenLie` from today's `Failed` would let an
+  attacker who merely disrupts a transport connection **permanently** zero an honest peer's dial
+  share. A `ProvenLie` MUST NOT be synthesised from a transport-layer failure; it requires a
+  merkle-verification verdict attributed per-peer, which does not yet exist on this path.
+- **`SelfContradiction`** is different: the raw data already exists in this node.
+  `forwarded_ask.rs`'s `responder_holds`/`responder_record` (`forwarded_ask.rs:364,384`) turn a
+  peer's own `available: true` claim into a `ProviderRecord` keyed on the same mTLS-verified
+  `peer_id`, and `holder_cache.rs`'s `FirstHandHolderCache` (§10.4.7) can hold that claim for up to
+  its TTL. It stays unproduced because a **legitimate eviction is a retraction** (dig-sex SPEC 7.1)
+  announced by flood rather than acknowledgement, and a cached first-hand claim can outlive it. An
+  attacker able to force an honest peer to evict under load, then race a correlating ask before the
+  retraction propagates, could brand that peer with a penalty that never decays. **A
+  `SelfContradiction` MUST NOT be recorded unless the window between the original claim and the
+  contradicting denial is bounded such that a legitimate eviction cannot explain it.**
+
+**Conduct state is node-local, ephemeral, and bounded.** It is never advertised, exchanged, or
+written to any peer-visible surface (`conduct.rs:23-27`) — a shared reputation channel is a
+defamation primitive, since one node's claim that a peer lied would become every node's belief with
+no way to check it. It is not persisted: `ConductState` carries no serde derive
+(`conduct.rs:47`) and is constructed only in-process via `ConductState::new()`, so a restart resets
+it to empty. **If conduct is ever persisted, an unreadable record MUST resolve to
+`ConductRecord::neutral()`, never to a penalised state** — losing a file MUST NOT become an
+exclusion. It is bounded per dig-sex SPEC 8.4: `ConductState::dialable` calls `retain(pool)` at its
+head (`conduct.rs:105,113-115`), so the map is keyed only to the current pool and cannot outgrow it.
+Its key, `RoutedPeer`, is the mTLS-verified `peer_id` and is constructible ONLY from a connected-pool
+key (`ask_routing.rs:16-24`) — never from an address, a provider record, or any peer-supplied frame
+field — so an unauthenticated identity flood cannot grow this map either.
+
 
 ---
 
