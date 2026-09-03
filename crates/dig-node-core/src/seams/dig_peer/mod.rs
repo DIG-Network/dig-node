@@ -15,13 +15,8 @@ pub mod admission;
 pub mod ask_routing;
 pub mod bootstrap;
 pub mod capsule_fallback;
-pub mod conduct;
-// The self-verifying tier-0 preimage resolver (#2033, PR-2). Its surface is exercised by its own
-// tests but not yet CALLED by production code — the tier-0 fetch loop wires it in PR-3 — so the
-// as-yet-unconsumed client + resolver would otherwise trip `dead_code`. The allow is removed when
-// PR-3 constructs it.
-#[allow(dead_code)]
 pub mod capsule_resolver;
+pub mod conduct;
 pub mod dht;
 pub mod forwarded_ask;
 pub mod holder_cache;

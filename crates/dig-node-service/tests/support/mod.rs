@@ -3,6 +3,9 @@
 //! Every mirror coin built here comes from a genuine CAT spend whose puzzle is executed to produce
 //! its conditions — the same execution `MirrorCoin::from_creating_spend` performs. A hand-written
 //! struct cannot exhibit the properties these tests are about, so none is used.
+// Shared test-support builders: this module is compiled into EVERY integration-test binary in
+// the crate, so any builder a given binary does not call reads as dead there. Consumed by the
+// mirror/bond test binaries; the allow stays while the module is shared.
 #![allow(dead_code)]
 
 use chia_bls::{PublicKey, SecretKey};

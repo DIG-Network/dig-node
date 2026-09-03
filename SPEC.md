@@ -3882,6 +3882,32 @@ a dig-node release — the installer's pre-rename fallback targets the SEPARATE
 `DIG-Network/dig-companion` repo's own frozen historical releases, not this asset name — so it was
 pure release-noise.
 
+11.2a. **Legacy `dig-companion` naming: the KEEP verdict (#242).** dig-node was formerly
+dig-companion (#209). Every surviving `dig-companion` / `DIG_COMPANION` reference in this repo is
+deliberate and load-bearing, and a future legacy sweep MUST NOT delete them. They fall into exactly
+three classes:
+
+- **A live byte-identical contract** — the shared on-disk cache path. `canonical_cache_dir()` stays
+  byte-identical to dig-companion's `cache_dir()` so the two share one cache; changing it orphans
+  every existing cache. Documented at `crates/dig-node-core/src/lib.rs:598, 608, 643, 726, 745, 921,
+  10158, 10168` and `crates/dig-node-core/src/seams/dig_rpc/dispatch.rs:516`. Deleting the naming
+  here deletes the reason the path may not change.
+- **A frozen historical release name** — `.github/workflows/build-binaries.yml:17-19` and
+  `.github/workflows/release.yml:9`, plus §11.2 above. The dig-installer's pre-rename fallback
+  targets the SEPARATE `DIG-Network/dig-companion` repo's own frozen historical releases, so the
+  name must remain readable here to explain why this repo publishes no such asset.
+- **A guard test asserting the legacy asset is NOT shipped** —
+  `crates/dig-node-service/tests/release_workflow_dign_guard.rs:82`,
+  `release_workflow_no_longer_ships_the_legacy_dig_companion_asset`. It greps the workflows for the
+  staged asset path `dist/dig-companion` (`:90`), so a literal "the grep for `companion` must be
+  clean" sweep would delete the very test that enforces the cleanliness it is checking for.
+
+The bare-word "companion" prose drift in the service test suite was separately swept to zero (#242).
+**`#[deprecated]` attributes in this repo: ZERO** — measured, not assumed. The single grep hit,
+`crates/dig-wallet/src/seed_store.rs:20`, is the word inside a `//!` doc comment explaining why the
+attribute was deliberately NOT applied; it is not an attribute. Stated here so a later audit reads
+the measurement instead of re-deriving it.
+
 11.3. **Matrix + the Linux platform floor (HARD RULE).** Five assets are published:
 `windows-x64` (x86_64-pc-windows-msvc), `linux-x64` (x86_64-unknown-linux-gnu), `linux-arm64`
 (aarch64-unknown-linux-gnu), `macos-arm64` (aarch64-apple-darwin), and `macos-x64`
@@ -6217,10 +6243,20 @@ unit wires the LIVE path, gated so it is OFF by default (money-safe) and ON only
   consensus incl. BLS) or the recording `MockBroadcaster`/`MockConfirmer`. A future live pass MUST get
   its signature from outside the node.
 
-18.12a. **Deferred to follow-on units.** The off-chain NFT data-blob/CHIP-0015 metadata fetch
-(`get_nft_data` returns on-chain fields; the metadata JSON surfaces when fetched), `exercise_options`
-(§18.15 — a documented, non-silent follow-on), and real image-derived theme content (§18.16 — this
-backend stores a placeholder). The point-read live sync above populates the DB for the spend path;
+18.12a. **Intentionally unserved, and deferred, units.** The off-chain NFT data-blob/CHIP-0015
+metadata fetch is INTENTIONALLY UNSERVED: this backend never issues outbound HTTP for NFT metadata.
+`get_nft_data` returns on-chain fields only, and its `metadata_json` is ALWAYS `null` in production —
+the `nft_metadata_json` cache it reads has no writer outside tests, so a client MUST treat the field
+as permanently absent rather than as "not fetched yet". `redownload_nft` consequently clears an
+always-empty cache and is a NO-OP; it MUST NOT be presented to a person as having refetched anything.
+The rationale is a security boundary, not effort: an NFT's metadata URI is third-party-controlled data
+recorded on chain, and fetching it would place attacker-chosen URLs into a network client running
+inside a loopback wallet daemon that holds spend keys (SSRF against the host's private network,
+redirect chasing, unbounded bodies, content-type confusion). Serving it requires the full guard set —
+post-resolution private-range refusal re-checked across redirects, a streamed size cap, total and idle
+timeouts, a scheme and content-type allowlist, and execution out of process from the signing path —
+and is out of scope for this backend. Real image-derived theme content is likewise intentionally
+unserved (§18.16). `exercise_options` (§18.15 — a documented, non-silent follow-on) remains deferred. The point-read live sync above populates the DB for the spend path;
 the richer live direct-peer SUBSCRIPTION sync loop (§18.6) — feeding the shared `EventBus` from real
 chain `coin_state_update` pushes for continuous wallet-data reads — remains the follow-on integration
 (until it is spawned, wallet-data reads outside a live spend use the fallback tier / point-read sync).
@@ -6270,10 +6306,16 @@ lowers an existing floor; requires `hardened` and/or `unhardened` be requested).
 design Part F MAY/N-A) is DB-backed, keyed by NFT id. **Verified against the generated OpenAPI
 (§18.19):** the real `save_user_theme` request carries ONLY `nft_id` — Sage derives the theme from the
 NFT's own artwork (color extraction) rather than accepting caller-supplied content (an initial guess
-added a `theme: String` field, caught and fixed). This backend has no image/color-extraction pipeline,
-so `save_user_theme` persists a fixed placeholder (`crate::sage::themes::DERIVED_THEME_PLACEHOLDER`)
-rather than a real derived theme — `get_user_theme(s)` still correctly reports "is this NFT themed",
-just not a real color scheme; real derivation is a tracked follow-on.
+added a `theme: String` field, caught and fixed). Real image-derived theme content is
+INTENTIONALLY UNSERVED here, not deferred: color extraction from NFT artwork is a Sage-DESKTOP-UI
+concern that requires decoding third-party image bytes, and this backend is a headless RPC surface
+with no image pipeline and no renderer to consume a color scheme. `save_user_theme` therefore persists
+the fixed opaque marker `crate::sage::themes::DERIVED_THEME_PLACEHOLDER` (`"auto"`), and the store's
+served meaning is exactly "has a theme been saved for this NFT" — a boolean wearing a string. A client
+MUST NOT render the stored value as a color scheme, and MUST NOT infer from a non-null value that a
+theme was derived from the artwork. A client that wants real derived colors derives them itself from
+the NFT's image and keeps them client-side; this endpoint is the parity-shaped persistence slot, not
+the derivation.
 
 18.17. **Network / peer / sync settings (design A.5, #205 PR4).** `get_peers`/`add_peer`/`remove_peer`
 are DB-backed: `add_peer` persists a user-managed entry at the standard Chia full-node port (design
@@ -7300,9 +7342,10 @@ node-side in the interim:
   applies to the node's PEX candidate dials; when dig-gossip ships a pool dial-priority hook the same
   ranking drives the pool's own maintenance dial loop.
 
-Exercising the connected pool end-to-end is gated on the network-genesis bring-up (the pre-launch
-placeholder genesis is rejected by `GossipService::start`); these behaviors are unit-tested
-independently of a live pool.
+The network-genesis bring-up does NOT gate this: the canonical DIG mainnet genesis is a real,
+non-zero value, so `GossipService::start` accepts the config and the pool comes up. Exercising the
+CONNECTED pool end-to-end still needs reachable peers, which a unit test cannot supply, so these
+behaviors are unit-tested independently of a live pool.
 
 ### 19.8. Relay reservation — control dial + advertised listen candidates
 
