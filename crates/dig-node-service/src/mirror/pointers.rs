@@ -12,8 +12,8 @@
 //!
 //! # The claim is UNTRUSTED, and this type cannot make it trusted
 //!
-//! Publishing a coin id tells a verifier WHERE TO LOOK — one coin to fetch instead of a scan of the
-//! mirror puzzle hash, which every node's coins share — and never WHAT THE COIN IS. A verifier
+//! Publishing a coin id tells a verifier WHERE TO LOOK — one coin to fetch instead of searching
+//! for it — and never WHAT THE COIN IS. A verifier
 //! accepts a coin on the coin's OWN evidence, and nothing published here enters that judgement
 //! (NC-12). So the worst a wrong pointer can do is cost a lookup, and that is the property that
 //! makes reading it from a cached observation acceptable at all.

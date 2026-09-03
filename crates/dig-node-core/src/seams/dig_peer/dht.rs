@@ -432,7 +432,7 @@ pub async fn announce_inventory_ids(
 /// claims were drawn for (#422).
 ///
 /// The claim is **UNTRUSTED** (NC-12). Publishing it tells a verifier WHERE TO LOOK — one coin to
-/// fetch instead of a scan of the mirror puzzle hash — and never WHAT THE COIN IS. A verifier
+/// fetch instead of searching for it — and never WHAT THE COIN IS. A verifier
 /// accepts a coin only on the coin's own evidence: found at the mirror puzzle hash, genuinely $DIG
 /// with the asset id re-derived from the creating spend, carrying the declared collateral, and
 /// `MirrorCoin::advertises(store, root, epoch)` passing. Nothing published here enters that

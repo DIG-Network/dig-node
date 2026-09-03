@@ -670,10 +670,11 @@ The served set drives the node's DHT provider records so peers find it as a hold
 - **The store-granularity record is unbondable by construction.** A mirror coin bonds a
   `(store, root, owner, epoch)` tuple, and `ContentId::store(store_id)` names no root, so a
   store-granularity record can never carry a mirror-coin pointer that a verifier could check. Since
-  the node announces at BOTH granularities, every held capsule always yields one pointer-less record
-  alongside one that may carry a pointer. This is the specified shape, not a gap: a measurement
-  finding that a large share of all provider records carry no pointer has measured exactly this, and
-  MUST NOT be read as a population of uncollateralised holders.
+  the node announces at both granularities and deduplicates the store id across a store's capsules
+  (`inventory_content_ids`), a node holding N capsules across S distinct stores publishes S
+  pointer-less records and N that may carry a pointer. This is the specified shape, not a gap: a
+  measurement finding that some provider records carry no pointer has measured exactly this, and MUST
+  NOT be read as a population of uncollateralised holders.
 - **A pointer-less record is unverified, never demoted.** A verifier with no pointer to fetch has no
   cheaper route to the coin — `dig_mirror_coin`'s hint queries are keyed by the owner puzzle hash,
   which morphs the hint and which a provider record does not carry — so it withholds credit and
