@@ -5820,6 +5820,23 @@ MUST increment the attempt count, and MUST NOT rewrite the anchor. A re-push MUS
 recorded deadline EARLIER, so that a clock which steps backwards cannot shorten a hold that is
 already live.
 
+Every reading above is a raw wall-clock reading, and a wall clock can be stepped by the environment
+at any time — an NTP correction, a VM pause/resume, an operator setting the clock — independent of
+any push. A wall clock stepped FORWARD while a reservation is already live, mid-hold, produces no
+value that is individually implausible: the anchor is unchanged and the jumped reading looks like an
+ordinary "now". Left unguarded, the very next liveness check reads the jump as elapsed time and can
+retire a bundle's hold while it is genuinely still in flight, with no bound on how far forward the
+step goes — the double-spend direction this section exists to prevent, and strictly worse than the
+bounded residue a bad reading AT THE FIRST PUSH leaves behind (dig-node#525). A node MUST therefore
+discipline its "now" for reservation bookkeeping against a MONOTONIC clock: the disciplined value
+MUST NOT advance, between two observations, by more than a steady clock reports has actually
+elapsed in that interval. A wall clock that steps BACKWARD MUST be let through undisciplined —
+that can only lengthen a hold, never shorten one, and disciplining it would mean judging a hold
+expired sooner than either clock claims. This monotonic discipline is a property of the RUNNING
+PROCESS only and is NOT itself persisted; across a restart it is re-seeded from the wall clock read
+at that moment, so a clock that is already wrong AT BOOT remains the first-push anchor's problem,
+governed by the FIRST-PUSH bound above, not by this discipline.
+
 This bound is on CONTINUOUS hold. Once the deadline passes, the reservation and its coin claims are
 released and the inputs become selectable again; a subsequent push of the same transaction is a new
 reservation with a new anchor and MAY hold the inputs for a further full period. A node MUST NOT

@@ -3337,7 +3337,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.48.0"
+version = "0.48.1"
 dependencies = [
  "async-trait",
  "axum",

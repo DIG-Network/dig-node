@@ -13,7 +13,7 @@
 //! the plain-text message.
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use serde::Serialize;
@@ -689,6 +689,13 @@ pub struct WalletBackend {
     /// fallback is a cheap amplification/oracle surface, so its aggregate call rate is capped
     /// here. Shared across `Clone`s so one bucket governs the whole backend, not per-connection.
     fallback_rate: Arc<super::rate_limit::TokenBucket>,
+    /// Disciplines every reservation-lifecycle "now" reading against a monotonic clock, so a
+    /// wall-clock jump occurring MID-HOLD cannot retire a live reservation early (dig-node#532) —
+    /// see [`super::custody::ClockGovernor`] for why this is a different failure than #525/#528's
+    /// write-time contradiction check. Shared across every `Clone` of this backend, like
+    /// `custodied_public_keys`, so every writer and reader observes ONE continuous disciplined
+    /// timeline rather than each clone keeping its own.
+    reservation_clock: Arc<Mutex<super::custody::ClockGovernor>>,
 }
 
 /// The connected client's PUBLIC identity for a session (#407). Scoping data only — no key.
@@ -732,7 +739,20 @@ impl WalletBackend {
                 DEFAULT_FALLBACK_BURST,
                 DEFAULT_FALLBACK_REFILL_PER_SEC,
             )),
+            reservation_clock: Arc::new(Mutex::new(super::custody::ClockGovernor::new(
+                super::custody::now_ms() as i64,
+            ))),
         }
+    }
+
+    /// The disciplined "now" for reservation-lifecycle bookkeeping (dig-node#532). Every write and
+    /// read in the reservation lifecycle (`reserve_coins`, `reserve_pushed_bundle`,
+    /// `prune_reservations`) MUST read the clock through here rather than calling
+    /// [`super::custody::now_ms`] directly, or it steps outside the discipline this exists to
+    /// provide — see [`super::custody::ClockGovernor`] for the reasoning and the failure it closes.
+    fn reservation_now_ms(&self) -> i64 {
+        let wall_now_ms = super::custody::now_ms() as i64;
+        self.reservation_clock.lock().unwrap().observe(wall_now_ms)
     }
 
     /// Override the coinset-fallback rate bound (#1957) — primarily for tests that want a small,
@@ -872,7 +892,7 @@ impl WalletBackend {
     /// caller to spend and "I cannot tell you" must stop it, and collapsing the two restores the
     /// double-select the set exists to prevent.
     pub async fn reservations_held(&self) -> sqlx::Result<(Vec<ReservedCoinRow>, i64)> {
-        let now_ms = super::custody::now_ms() as i64;
+        let now_ms = self.reservation_now_ms();
         // Retire what has lapsed before reporting, so a hold that is already over is never shown
         // to a caller as something to wait for.
         self.db.prune_reservations(now_ms).await?;
@@ -892,7 +912,7 @@ impl WalletBackend {
         coin_ids: &[String],
         ttl_secs: Option<u64>,
     ) -> std::result::Result<ClientReservation, ReserveClientCoinsError> {
-        let now_ms = super::custody::now_ms() as i64;
+        let now_ms = self.reservation_now_ms();
         self.db.prune_reservations(now_ms).await?;
         // `saturating_mul` rather than a cast: a caller naming a TTL near `u64::MAX` must not wrap
         // into a negative lifetime, which would produce a hold already expired at birth and read
@@ -2326,7 +2346,7 @@ impl WalletBackend {
     /// legitimate — the mempool has already accepted it. An uncomputable fee is stored as `None`
     /// and reported as `null`, never as zero.
     async fn reserve_pushed_bundle(&self, bundle: &SpendBundle) -> Result<()> {
-        let now = super::custody::now_ms() as i64;
+        let now = self.reservation_now_ms();
         let row = super::db::PendingTransactionRow {
             transaction_id: hex::encode(bundle.name()),
             bundle_hex: super::chain::encode_signed_bundle(bundle)?,
@@ -2961,7 +2981,7 @@ impl WalletBackend {
     /// "nothing is in flight" — and this surface must never make one it cannot support.
     async fn get_pending_transactions(&self) -> Result<GetPendingTransactionsResponse> {
         self.db
-            .prune_reservations(super::custody::now_ms() as i64)
+            .prune_reservations(self.reservation_now_ms())
             .await?;
         let mut transactions = Vec::new();
         for t in self.db.pending_transactions().await? {
@@ -3228,7 +3248,7 @@ impl WalletBackend {
     async fn spendable_coins(&self, asset_id: Option<&str>) -> Result<Vec<Coin>> {
         self.require_authoritative_coins().await?;
         self.db
-            .prune_reservations(super::custody::now_ms() as i64)
+            .prune_reservations(self.reservation_now_ms())
             .await?;
         let rows = self.db.unreserved_unspent_coins(asset_id).await?;
         rows.iter().map(singleton::coin_from_row).collect()
@@ -3695,7 +3715,7 @@ impl WalletBackend {
         // The unreserved set, for the same reason as `spendable_coins` (dig_ecosystem#2763): a CAT
         // coin committed to an in-flight bundle must not be selected into a second one.
         self.db
-            .prune_reservations(super::custody::now_ms() as i64)
+            .prune_reservations(self.reservation_now_ms())
             .await?;
         let rows = select_cat_rows(
             self.db.unreserved_unspent_coins(Some(asset_id)).await?,
