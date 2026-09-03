@@ -5793,6 +5793,19 @@ MUST increment the attempt count, and MUST NOT rewrite the anchor. A re-push MUS
 recorded deadline EARLIER, so that a clock which steps backwards cannot shorten a hold that is
 already live.
 
+The anchor and the deadline are both recorded from a wall clock, so a single bad clock reading can
+record a deadline no honest push could have produced. A recorded deadline that exceeds the current
+instant by more than `MAX_RESERVATION_HOLD_MS` MUST be treated as CONTRADICTING the clock, because a
+deadline recorded honestly never exceeds its own anchor by more than that bound and an anchor never
+follows the present moment. Such a reservation MUST be re-anchored to the current instant and granted
+a fresh reservation lifetime — as though pushed now — before any expiry is evaluated, and the same
+treatment MUST be applied to a client build-window hold, which MUST be re-granted its own maximum
+lifetime from the current instant. A node MUST therefore never hold a reservation beyond
+`MAX_RESERVATION_HOLD_MS` measured from an instant the node has actually observed. Without this, a
+deadline recorded far in the future never arrives, no re-push can move it inwards, and the coin is
+withheld from selection permanently with no recovery available inside the product — the lockout this
+section names as the worse failure, in its unrecoverable form.
+
 This bound is on CONTINUOUS hold. Once the deadline passes, the reservation and its coin claims are
 released and the inputs become selectable again; a subsequent push of the same transaction is a new
 reservation with a new anchor and MAY hold the inputs for a further full period. A node MUST NOT
