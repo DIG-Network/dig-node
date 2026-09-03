@@ -1995,19 +1995,40 @@ async fn a_peers_absence_claim_cannot_move_this_nodes_verdict() {
     );
 }
 
-/// **Proves (dig-node#508):** an answer whose records are ALL dropped downstream is not an absence.
+/// **Proves (dig-node#508):** an emptiness produced by FILTERING is not a search that found nobody.
 ///
-/// **The second route into the same defect, and it does not go through `absence_established` at
-/// all.** The forwarded fold's `Answered` arm preserved conclusiveness on the strength of the peer
-/// having answered; the merge then legitimately removes records - here the self-filter, because a
-/// peer is perfectly free to ANSWER with a record naming us and `retain_excluding_self_tagged` drops
-/// it. Emptiness arrived AFTER the flag was decided, and the result was a proven absence resting on
-/// an answer that named a holder.
+/// **A merge-layer property, NOT a second door into the defect.** An earlier version of this comment
+/// claimed this test showed a route into #508 that "does not go through `absence_established` at
+/// all". That was false, and it is corrected on the ticket. `parse_forwarded_answer` reaches
+/// `AskOutcome::Answered` by exactly two arms: `held && !records.is_empty()`
+/// (`forwarded_ask.rs:351`), which leads with `responder_record` - minted for the RESPONDER, so it
+/// survives this node's self-filter; and `SubtreeClaim::Established` (`:355`), which by definition
+/// carries `absence_established: true`. The all-dropped state is production-reachable only as "the
+/// original wire lie plus a `providers` entry naming us": the same door with an extra step.
 ///
-/// **Fixture design - the removal is a production-reachable one, and one actor varies.** The peer
-/// answers with exactly one record, naming this node; the node knows its own identity, which is the
-/// precondition the self-filter needs. A fixture whose records were dropped by something only a test
-/// can arrange would prove nothing about production.
+/// **What this test does pin.** `retain_excluding_self_tagged` runs at the MERGE
+/// (`download.rs:1870`) and `establishes_absence` reads `records.is_empty()` after it (`:973`). A
+/// peer is free to ANSWER with a record naming this node, and the filter removes it - so the
+/// emptiness the caller sees was manufactured by this node's own filtering rather than found by
+/// anyone's search. The `is_empty` assertion below is the live discriminator: remove the merge-site
+/// `retain_excluding_self_tagged` call and it goes red.
+///
+/// **Vacuity, stated rather than reported as satisfied.** The `!establishes_absence` assertion is
+/// OVER-DETERMINED on this leg after the fix: `ForwardedAnswers::asked` sets `conclusive: false`
+/// unconditionally (`download.rs:1041-1046`), so no arrangement of records can make a forwarded ask
+/// establish an absence. It guards against restoring conclusiveness to the asked path; it does not
+/// measure the filter. The same shape is LIVE on the first-hand leg, where `retain_excluding_self`
+/// runs inside `walk_for_providers` (`download.rs:2201`) AFTER `first_hand_conclusive` is decided.
+/// That is safe today only because `dig-dht-0.15.0/src/service.rs:596-613` refuses an `AddProvider`
+/// whose `provider_peer_id` is not the authenticated caller - and only when the transport supplies a
+/// caller identity at all. Recorded on dig-node#508 rather than fixed here.
+///
+/// **Fixture design - the seam injection is deliberate, and it is NOT wire evidence.** The outcome
+/// is injected through the `PerPeerAsk` seam, bypassing `parse_forwarded_answer`, because the
+/// property under test lives at the merge rather than on the wire. That is the right shape for a
+/// merge-layer property and the wrong shape for any claim about what a real frame can produce, so
+/// this test makes no such claim. The removal itself needs nothing a test alone can arrange: the
+/// node knows its own identity, which is the self-filter's only precondition.
 #[tokio::test]
 async fn a_holder_answer_whose_records_are_all_dropped_is_not_an_absence() {
     let cid = content();
@@ -2084,6 +2105,15 @@ fn an_empty_answer_and_an_inconclusive_answer_are_indistinguishable_to_routing_a
         quality_after(&answered),
         quality_after(&timed_out),
         "a peer that never answered is NOT the same as one that answered 'nobody'"
+    );
+    assert_ne!(
+        conduct_evidence(&answered),
+        conduct_evidence(&timed_out),
+        concat!(
+            "and conduct separates them too - without this, a scorer that collapsed EVERY outcome ",
+            "to one value would satisfy both equalities above while measuring nothing, which is ",
+            "exactly the vacuity this control exists to rule out"
+        )
     );
     assert_eq!(
         conduct_evidence(&timed_out),
