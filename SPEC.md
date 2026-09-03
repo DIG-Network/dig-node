@@ -8420,6 +8420,20 @@ the epoch's start instant — and MUST derive the record with
 `dig_mirror_collateral::EpochRecord::advance`. It MUST NOT restate either. A census height chosen
 any other way is a fork, because every node must reach the same height without coordinating.
 
+The node MUST locate that height with `dig_mirror_coin::census_height_seeded`, which returns exactly
+what `census_height` returns for the same instant under every seed and differs only in how many
+chain reads it pays. The seed MUST be the predecessor record's `census_height` when and only when
+that record carries `censused` provenance; a record whose height was adopted from peers, or which
+carries no provenance, MUST yield an unseeded search. A peer-supplied height comes from a trust
+domain the chain source cannot check, and the seed's verification probe is a single uncorroborated
+`block_timestamp` read, so accepting one would let a peer cohort and a stale or forked source
+together prune the true height from below.
+
+Corroborating the height search itself is a NAMED LIMITATION, not a claim: the corroborated chain
+surface answers by coin id and does not serve `block_timestamp`, so every probe of the search comes
+from one source whether it is seeded or not. Seeding therefore reduces the reads inside that trust
+boundary and does not widen it.
+
 The chain reads MUST be served through a `dig_chainsource_interface::ChainSource`. The node MUST NOT
 open a second connection to the chain for this purpose: it takes a `ChainSource` view of the one
 transport that already serves its wallet reads, so a node holds ONE peer pool.
