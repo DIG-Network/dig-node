@@ -7277,9 +7277,10 @@ node-side in the interim:
   applies to the node's PEX candidate dials; when dig-gossip ships a pool dial-priority hook the same
   ranking drives the pool's own maintenance dial loop.
 
-Exercising the connected pool end-to-end is gated on the network-genesis bring-up (the pre-launch
-placeholder genesis is rejected by `GossipService::start`); these behaviors are unit-tested
-independently of a live pool.
+The network-genesis bring-up does NOT gate this: the canonical DIG mainnet genesis is a real,
+non-zero value, so `GossipService::start` accepts the config and the pool comes up. Exercising the
+CONNECTED pool end-to-end still needs reachable peers, which a unit test cannot supply, so these
+behaviors are unit-tested independently of a live pool.
 
 ### 19.8. Relay reservation — control dial + advertised listen candidates
 

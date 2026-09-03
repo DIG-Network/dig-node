@@ -734,19 +734,24 @@ unless `DIG_PEER_NETWORK` is `off`/`0`/`false`; the in-process FFI host never do
    loop, one mTLS session → yamux mux per peer;
 8. bring up dig-pex (peer-exchange engine + pool feeder + tick loop).
 
-Steps 3–8 are best-effort and gated on the P2P layer coming up; step 2 (autonomous sync) is not. In
-the pre-launch state, the DIG network genesis is a placeholder, so the gossip config is rejected and
-steps 3–8 do not start — the node still watches the chain and proactively gap-fills (step 2) and
-serves the HTTP read path.
+Steps 3–8 are best-effort and gated on the P2P layer coming up; step 2 (autonomous sync) is not. The
+DIG network genesis is a REAL, non-zero value — `dig_constants::DIG_MAINNET.genesis_challenge()`, the
+Chia mainnet header hash at height 9,021,277 — so the gossip config is ACCEPTED and steps 3–8 do
+start. `dig-gossip` rejects only an all-zero `network_id`, and no code path can produce one (see the
+override below), so bring-up is not gated on the genesis. Acceptance means the bring-up PROCEEDS; it
+does not by itself mean the pool reaches any peer, which depends on discovery and reachability.
 
 **`DIG_NETWORK_GENESIS` override (#285).** Step 3's `GossipConfig.network_id` is resolved by
 `peer::genesis_challenge_from_env`: when the env var `DIG_NETWORK_GENESIS` is set to a valid
 non-zero 64-hex (32-byte) value, THAT value is used as the gossip network id; otherwise (unset,
-blank, non-hex, wrong length, or all-zero) the pre-launch placeholder
-`dig_constants::DIG_MAINNET.genesis_challenge()` is used, preserving today's graceful-skip
-behavior. This lets a dev/local deployment (or, at launch, the real mainnet genesis) bring steps
-3–8 up without dig-node baking in an unreleased value — the real mainnet genesis remains a launch
-decision (#214) and MUST NOT be hardcoded here.
+blank, non-hex, wrong length, or all-zero) the canonical DIG mainnet genesis
+`dig_constants::DIG_MAINNET.genesis_challenge()` is used. That fallback is a real, non-zero,
+verifiable value, so EVERY invalid input still yields a `network_id` gossip accepts — there is no
+code path that hands gossip an all-zero id, and therefore no graceful-skip outcome. This lets a
+dev/local deployment select its own network without dig-node baking the value into its own source.
+The canonical value is owned by `dig-constants` and documented there as revisable at true mainnet
+launch; revising it is a deliberate protocol event with every derived AGG_SIG domain recomputed, and
+it MUST NOT be changed here.
 
 `control.peerStatus` reports a snapshot: `{ running: bool, peer_id: 64hex|null, network_id: string,
 relay: { url, reserved: bool, peer_count: u64 }, connected_peers: u64, pool: { connected, in_flight, target, min, max, backed_off, under_connected }, last_error: string|null }`.
@@ -1212,7 +1217,7 @@ cache cap is `config.json` > env > default).
 | `DIG_NODE_WATCH_INTERVAL` | chain-watch poll interval (seconds) over the subscribed store set (§4.3) | `30` (floor `1`) |
 | `DIG_PEER_NETWORK` | `off`/`0`/`false` disables the peer network (read path only) | on |
 | `DIG_NETWORK_ID` | network id for peer discovery / handshake scope | `DIG_MAINNET` |
-| `DIG_NETWORK_GENESIS` | gossip `network_id` genesis-challenge override (64-hex, 32 bytes); invalid/unset/zero ⇒ placeholder (§7.2) | `dig_constants::DIG_MAINNET.genesis_challenge()` (all-zero placeholder) |
+| `DIG_NETWORK_GENESIS` | gossip `network_id` genesis-challenge override (64-hex, 32 bytes); invalid/unset/zero ⇒ the canonical DIG mainnet genesis (§7.2) | `dig_constants::DIG_MAINNET.genesis_challenge()` (real, non-zero) |
 | `DIG_RELAY_URL` | relay endpoint (`off`/`disabled` disables the reservation) | `wss://relay.dig.net:443` |
 | `DIG_NODE_ADVERTISE_LOOPBACK` | advertise loopback candidates when no routable address (§7.3) | off |
 | `DIG_WALLET_WC_PROJECT_ID` | WalletConnect project id (persisted in `config.json`) | unset |
