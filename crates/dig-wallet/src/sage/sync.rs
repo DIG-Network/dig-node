@@ -2947,6 +2947,112 @@ mod tests {
         );
     }
 
+    /// **Proves (dig-node#546):** a $DIG arrival attributed WITHIN a frame is announced by the
+    /// end of that SAME frame — it must not wait for a second `CoinStateUpdate` that may never
+    /// arrive.
+    ///
+    /// # The bug, and why the fixture must drive `run_update_loop` itself
+    ///
+    /// `handle_coin_state_update` runs `record_arrivals` **before** the attribution pass promotes
+    /// a staged CAT into `coins` — that ordering is #479/#480's own fix (see
+    /// `a_cat_promoted_after_the_watermark_advanced_is_still_announced` in `db.rs`), so the hold
+    /// `promote_cat_admission` leaves in `arrival_pending` is only ever examined by the NEXT
+    /// frame's `record_arrivals` call. A wallet that receives once and then falls quiet never gets
+    /// a second frame, so the row waits forever — confirmed live on mainnet in #546 across ~50
+    /// minutes, two restarts, and a second watched address.
+    ///
+    /// A test that manually called `record_arrivals` again after promoting would prove only that
+    /// the DB layer is idempotent — already covered by the #479 test above — and it would pass
+    /// identically on the UNFIXED code, because the manual call substitutes for the very
+    /// production behaviour under test instead of exercising it. So this drives the real glue,
+    /// `run_update_loop`, over exactly ONE inbound message, with a REAL CAT parent spend so
+    /// attribution genuinely promotes it, and the test itself never calls `record_arrivals`.
+    #[tokio::test]
+    async fn a_cat_attributed_within_one_frame_is_announced_in_that_same_frame() {
+        use crate::sage::cat_discovery::tests::real_cat;
+        use crate::sage::singleton::LineageAnswer;
+
+        let f = real_cat();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        // Already synced with nothing news yet — exactly the "receives once, then goes quiet"
+        // wallet #546 reports: one completed catch-up, then a single live arrival.
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 9, "hh", &[]).unwrap())
+            .await
+            .unwrap();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+
+        // The ONE frame: the $DIG coin lands at its derived outer hash, above the baseline, and
+        // nothing else ever arrives after it.
+        let update = CoinStateUpdate {
+            height: 10,
+            fork_height: 9,
+            peak_hash: Bytes32::new([2; 32]),
+            items: vec![state(f.child, Some(10), None)],
+        };
+        let events = EventBus::with_capacity(8);
+        let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(4);
+        tx.send(Message {
+            msg_type: ProtocolMessageTypes::CoinStateUpdate,
+            id: None,
+            data: chia_traits::Streamable::to_bytes(&update).unwrap().into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        /// A [`LineageSource`] that answers `Found` for exactly one parent, real CLVM bytes and
+        /// all — a fake reconstruction cannot exist, since `singleton::reconstruct` uncurries the
+        /// actual puzzle/solution rather than trusting anything this double asserts.
+        struct FixedLineage {
+            parent_id: String,
+            spend: crate::sage::singleton::ParentSpend,
+        }
+        #[async_trait::async_trait]
+        impl LineageSource for FixedLineage {
+            async fn parent_spend(
+                &self,
+                parent_coin_id: &str,
+                _spent_height: u32,
+            ) -> crate::sage::Result<LineageAnswer> {
+                if parent_coin_id.eq_ignore_ascii_case(&self.parent_id) {
+                    Ok(LineageAnswer::Found(Box::new(self.spend.clone())))
+                } else {
+                    Ok(LineageAnswer::Unavailable)
+                }
+            }
+        }
+        let lineage = FixedLineage {
+            parent_id: hex::encode(f.child.parent_coin_info),
+            spend: f.parent,
+        };
+        let plain = HashSet::new();
+        let attributor = CatAttributor {
+            lineage: &lineage,
+            prefix: "xch",
+            plain_puzzle_hashes: &plain,
+        };
+        let subscribed = subscribed_owned();
+        let mut session = operator(&subscribed).following_derived_cats(&derived);
+
+        run_update_loop(&db, receiver, &events, Some(&attributor), &mut session)
+            .await
+            .unwrap();
+
+        let ids: Vec<String> = db
+            .arrivals_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.coin_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![hex::encode(f.child.coin_id())],
+            "a CAT attributed within this frame must be announced by the end of the SAME frame, \
+             not left waiting in arrival_pending for a frame that may never come"
+        );
+    }
+
     /// **Proves (dig-node#383):** a frame the node REFUSED schedules no attribution pass.
     ///
     /// # The fixture varies one actor and keeps an honest control

@@ -577,7 +577,7 @@ fn staged_as_coin(row: &StagedCatRow) -> super::db::CoinRow {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sage::db::{CoinRow, CAT_ADMISSION_PENDING_MAX_ROWS};
     use crate::sage::singleton::ParentSpend;
@@ -590,12 +590,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A real CAT coin owned by a real key, with the parent spend that proves it.
-    struct CatFixture {
-        asset_id: Bytes32,
-        owner_p2: Bytes32,
-        child: Coin,
-        parent: ParentSpend,
-        amount: u64,
+    ///
+    /// `pub(crate)`, and the module carrying it too (dig-node#546): the sync-loop regression that
+    /// proves a $DIG arrival drains within the frame that attributes it needs a REAL parent spend
+    /// -- there is no way to fake `singleton::reconstruct`'s CLVM uncurry -- and this is the one
+    /// place in the crate that already builds one. Duplicating the simulator/driver setup in
+    /// `sync.rs` would just be a second copy of this fixture drifting from this one.
+    pub(crate) struct CatFixture {
+        pub(crate) asset_id: Bytes32,
+        pub(crate) owner_p2: Bytes32,
+        pub(crate) child: Coin,
+        pub(crate) parent: ParentSpend,
+        pub(crate) amount: u64,
     }
 
     /// Issue a CAT, spend it once, and hand back the child coin plus its parent's spend.
@@ -603,7 +609,7 @@ mod tests {
     /// The child is what a wallet actually receives: a CAT whose PARENT is itself a CAT, which is
     /// the only shape `Cat::parse_children` can reconstruct. Its amount is deliberately not round
     /// so an assertion cannot pass against a hard-coded default.
-    fn real_cat() -> CatFixture {
+    pub(crate) fn real_cat() -> CatFixture {
         let mut sim = Simulator::new();
         let ctx = &mut SpendContext::new();
         let alice = sim.bls(1000);
