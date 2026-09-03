@@ -8122,12 +8122,15 @@ mod tests {
     /// and drives `DIG_NODE_ONION_RELAY` under the `test_support` env mutex; that is the next guard
     /// here, not a gap this one closes.
     ///
-    /// **And the frame is not the only channel, so do not read this test as closing the oracle.**
-    /// `allow_proxy_fetch` (`:125`) CONSUMES a rate-limit token (`download.rs:1643`) from a bucket
-    /// shared with `miss_outcome`'s second leg (`download.rs:2721`). Draining it flips a later
-    /// `dig.getContent` from fetch-through to redirect, so a stranger can still infer the operator's
-    /// opt-in by spending the allowance and watching a DIFFERENT method change shape. Equal frames
-    /// are necessary for the property in the module doc and are not sufficient for the secret.
+    /// **The frame is not the only channel, and the other one is now CLOSED (dig-node#512).**
+    /// `allow_proxy_fetch` CONSUMES a rate-limit token (`download.rs:1643`) from a bucket shared with
+    /// `miss_outcome`'s second leg (`download.rs:2721`), and it used to be checked BEFORE the
+    /// capsule-warmer gate — so a refused relay could still spend a token, and a stranger inferred
+    /// the operator's opt-in by draining the allowance and watching a DIFFERENT method flip from
+    /// fetch-through to redirect. The allowance is now charged LAST, so no path returning `Refused`
+    /// consumes anything. Equal frames remain necessary and not sufficient for the secret; what makes
+    /// them sufficient is `a_refused_relay_leaves_no_trace_in_the_proxy_allowance`, which varies only
+    /// the opt-in and reads the shared bucket through `dig.fetchRange`.
     #[tokio::test]
     async fn a_relay_refusal_is_indistinguishable_from_a_plain_miss() {
         let (node, _td) = test_node(None);
