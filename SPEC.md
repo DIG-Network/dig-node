@@ -5820,6 +5820,44 @@ MUST increment the attempt count, and MUST NOT rewrite the anchor. A re-push MUS
 recorded deadline EARLIER, so that a clock which steps backwards cannot shorten a hold that is
 already live.
 
+The anchor and the deadline are both recorded from a wall clock, so a single bad clock reading can
+record a deadline no honest push could have produced. A recorded deadline that exceeds the current
+instant by more than `MAX_RESERVATION_HOLD_MS` MUST be treated as CONTRADICTING the clock, because a
+deadline recorded honestly never exceeds its own anchor by more than that bound and an anchor never
+follows the present moment. Such a reservation MUST be re-anchored to the current instant and granted
+a fresh reservation lifetime — as though pushed now — before any expiry is evaluated, and the same
+treatment MUST be applied to a client build-window hold, which MUST be re-granted its own maximum
+lifetime from the current instant. Without this, a deadline recorded far in the future never
+arrives, no re-push can move it inwards, and the coin is withheld from selection permanently with no
+recovery available inside the product -- the lockout this section names as the worse failure, in its
+unrecoverable form.
+
+**The residual bound, stated exactly.** This repair does NOT reduce the worst case to
+`MAX_RESERVATION_HOLD_MS`, and a node MUST NOT claim that it does. A forward clock glitch smaller
+than `MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS` is invisible to the test above by construction:
+the first push records `expires_at = submitted_at + RESERVATION_TTL_MS`, so while the anchor leads
+true time by at most that difference the recorded deadline never exceeds the observing instant by
+more than the cap, and every later re-push carries a deadline drawn from the true clock, which
+cannot exceed it either. The anchor therefore survives, and the total-hold cap pins the deadline at
+`submitted_at + MAX_RESERVATION_HOLD_MS`. **A node MUST NOT hold a reservation beyond
+`2 * MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS` (110 minutes) measured from an instant the node
+has actually observed**, and that bound is TIGHT: it is attained exactly when the forward glitch
+equals `MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS` and the caller keeps re-pushing.
+
+That same difference is the bound seen from its other side: it is also the smallest BACKWARDS clock
+step that can make the test fire on a reservation recorded honestly. The evasion window for a
+forward glitch and the false-fire floor for a backwards step are one constant, and neither can be
+narrowed without widening the other.
+
+**This residual is what dig-node#532's monotonic discipline (below) additionally bounds for any
+observation after process start.** The 110-minute figure above is reachable only through a glitch
+present AT THE FIRST PUSH -- i.e. present already when this process's own disciplined clock is
+seeded at boot (`WalletBackend::new`) -- because every later observation is clamped against real
+elapsed monotonic time and cannot itself introduce a forward glitch. The two mechanisms are
+therefore complementary, not competing: this contradiction check is what catches a clock that is
+ALREADY wrong at the instant the disciplined clock is seeded; dig-node#532's discipline is what
+catches every clock jump AFTER that instant, for the rest of the process's lifetime.
+
 Every reading above is a raw wall-clock reading, and a wall clock can be stepped by the environment
 at any time — an NTP correction, a VM pause/resume, an operator setting the clock — independent of
 any push. A wall clock stepped FORWARD while a reservation is already live, mid-hold, produces no
@@ -5835,7 +5873,7 @@ that can only lengthen a hold, never shorten one, and disciplining it would mean
 expired sooner than either clock claims. This monotonic discipline is a property of the RUNNING
 PROCESS only and is NOT itself persisted; across a restart it is re-seeded from the wall clock read
 at that moment, so a clock that is already wrong AT BOOT remains the first-push anchor's problem,
-governed by the FIRST-PUSH bound above, not by this discipline.
+governed by the write-time contradiction check below, not by this discipline.
 
 This bound is on CONTINUOUS hold. Once the deadline passes, the reservation and its coin claims are
 released and the inputs become selectable again; a subsequent push of the same transaction is a new

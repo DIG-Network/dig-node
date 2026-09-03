@@ -2878,6 +2878,120 @@ impl WalletDb {
     /// writer fixes all three AND leaves the key usable, so keeping the `LOWER()` beside it would
     /// buy nothing but the scan. It is deliberately NOT retained as belt-and-braces.
     pub async fn prune_reservations(&self, now_ms: i64) -> sqlx::Result<u64> {
+        // One transaction, and the two REPAIRS come first on purpose. Repairing is a WRITE, so it
+        // takes SQLite's write lock before anything is read - the ordering `reserve_client_coins`
+        // documents as what actually prevents a `SQLITE_BUSY` that a caller would see mis-mapped
+        // to `Unavailable`. A deferred transaction that read first would reintroduce exactly that.
+        let mut tx = self.pool.begin().await?;
+
+        // A row whose recorded deadline CONTRADICTS the clock is re-anchored as if pushed now
+        // (dig-node#525).
+        //
+        // The predicate is a self-contradiction check on the row's own two columns, not a
+        // heuristic. INSERT writes `expires_at = now + RESERVATION_TTL_MS`; the `DO UPDATE` clamp
+        // writes at most `submitted_at + MAX_RESERVATION_HOLD_MS`; so every healthy row satisfies
+        // `expires_at <= submitted_at + MAX_RESERVATION_HOLD_MS`, and with `submitted_at <= now`
+        // it satisfies `expires_at <= now + MAX_RESERVATION_HOLD_MS`. Hence
+        // `expires_at > now + MAX_RESERVATION_HOLD_MS` implies `submitted_at > now`: the row
+        // claims to have been submitted after the present moment, which no honest push produces.
+        //
+        // `reserve_pushed_bundle` reads the clock ONCE and writes both columns from that reading,
+        // so a single reading far in the future stores a deadline decades out. Nothing else can
+        // retire it: the DELETE below fires on `expires_at <= now`, which never arrives, and the
+        // upsert clamp's outer `MAX` means a later push under a corrected clock leaves the stored
+        // deadline alone. The coin stays out of selection FOR EVER and `reset_chain_cache` refuses
+        // while the row exists - a freeze with no in-product recovery. Repairing at OBSERVATION
+        // rather than at write time is what makes it recoverable: nothing re-pushes an accepted
+        // bundle unprompted, so a write-time-only fix would leave that headline case permanent.
+        //
+        // # The grant, and why `submitted_at` moves too
+        //
+        // The row is rewritten to precisely what an honest push at `now` would have written: one
+        // `RESERVATION_TTL_MS`, not one `MAX_RESERVATION_HOLD_MS`, which would hand a repaired row
+        // six times a healthy row's first hold.
+        //
+        // Re-anchoring `submitted_at` is NOT optional. Left at the impossible future value,
+        // `stored.submitted_at + MAX_RESERVATION_HOLD_MS` stays decades out, #502's cap clause
+        // stops binding on that row for ever, and a retrying caller renews the hold indefinitely -
+        // resurrecting the lockout the cap exists to close.
+        //
+        // This does not regress #502's stable-anchor rule. That rule keeps `submitted_at` out of
+        // `DO UPDATE SET` so a CALLER cannot move the anchor. This write is not a caller; it is
+        // the row's owner replacing a value the system has proven impossible - a submission
+        // timestamp in the future - with one from the currently trusted clock.
+        //
+        // # What this costs, stated rather than argued away
+        //
+        // Let `E = expires_at - submitted_at`, so `E = min(age_at_last_push + TTL, CAP)`. The
+        // predicate fires iff `now < submitted_at + E - CAP`, so a BACKWARDS clock step of `d` on
+        // a row of age `e` fires iff `d > max(CAP - TTL, e)`. The minimum step that can trip the
+        // repair on a legitimately created row is therefore `CAP - TTL` = 50 minutes, and more for
+        // an older row; a small backwards step trips nothing.
+        //
+        // Past that floor the cost is real: a LIVE bundle's row is re-anchored and gets only one
+        // further TTL, where the unrepaired code would have held it until the clock caught up. So
+        // a backwards step exceeding 50 minutes can return a still-live bundle's inputs one TTL
+        // later instead of on clock recovery - a genuine move toward the #348/#497 double-spend
+        // direction, bounded by a gross clock anomaly. It is accepted because the alternative it
+        // replaces is a permanent, in-product-unrecoverable freeze, which `RESERVATION_TTL_MS`'
+        // own doc and `SPEC.md` 18.9a both name as the worse failure.
+        //
+        // # What this does NOT bound, and the exact residue
+        //
+        // This repair does not reduce the worst-case hold to `CAP`. A FORWARD glitch of at most
+        // `CAP - TTL` evades the predicate by construction: the first push records
+        // `expires_at = submitted_at + TTL`, so while the anchor leads true time by no more than
+        // that difference the deadline never exceeds the observing instant by more than `CAP`, and
+        // every later re-push draws its deadline from the true clock, which cannot exceed it
+        // either. The anchor survives, and #502's cap pins the deadline at `submitted_at + CAP`.
+        //
+        // The worst case is therefore `2 * CAP - TTL` = 110 minutes from an OBSERVED instant, and
+        // it is tight - attained when the glitch is exactly `CAP - TTL` and the caller keeps
+        // re-pushing. Pinned by
+        // `a_forward_clock_glitch_under_the_detector_threshold_is_bounded_at_two_caps_less_a_ttl`.
+        //
+        // Note the symmetry: `CAP - TTL` is BOTH the largest forward glitch that evades this
+        // predicate AND the smallest backwards step that can make it fire on an honest row. One
+        // constant seen from two sides; neither margin can be narrowed without widening the other.
+        //
+        // This 110-minute ceiling is #502's cap behaviour under a forward glitch and predates this
+        // repair. It is recorded rather than fixed: closing it needs a monotonic anchor for elapsed
+        // time, not a tighter predicate.
+        sqlx::query(
+            "UPDATE pending_transactions
+                SET submitted_at = ?, expires_at = ?
+              WHERE expires_at > ?",
+        )
+        .bind(now_ms)
+        .bind(now_ms.saturating_add(super::rpc::RESERVATION_TTL_MS))
+        .bind(now_ms.saturating_add(super::rpc::MAX_RESERVATION_HOLD_MS))
+        .execute(&mut *tx)
+        .await?;
+
+        // The same repair for a CLIENT build-window hold, with two deliberate asymmetries.
+        //
+        // The detector uses `MAX_RESERVATION_HOLD_MS`, not this table's own 10-minute ceiling, and
+        // the reason is money: keyed on its own ceiling, a roughly five-minute backwards clock step
+        // would re-clamp a HEALTHY client hold and reopen the cross-process selection window
+        // dig_ecosystem#3127 exists to close. One hour is the longest hold of any kind this wallet
+        // grants, so a deadline more than an hour past the observing clock is impossible for either
+        // table, and the shared threshold buys both the same ~50-minute false-fire floor.
+        //
+        // The GRANT is this table's ceiling rather than `RESERVATION_TTL_MS`, because there is no
+        // `submitted_at` column here and the caller's originally requested TTL is unrecoverable.
+        // Granting the ceiling errs LONG, which is the safe direction for a build-window hold: an
+        // over-long hold delays a spend, an under-long one lets a second selection take the coins
+        // a client is still building against.
+        sqlx::query(
+            "UPDATE client_coin_reservations
+                SET expires_at_ms = ?
+              WHERE expires_at_ms > ?",
+        )
+        .bind(now_ms.saturating_add(CLIENT_RESERVATION_MAX_TTL_MS))
+        .bind(now_ms.saturating_add(super::rpc::MAX_RESERVATION_HOLD_MS))
+        .execute(&mut *tx)
+        .await?;
+
         let n = sqlx::query(
             "DELETE FROM pending_transactions WHERE expires_at <= ?
              OR transaction_id IN (
@@ -2887,7 +3001,7 @@ impl WalletDb {
              )",
         )
         .bind(now_ms)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
 
@@ -2897,6 +3011,7 @@ impl WalletDb {
         //
         // Not added to `n`: the returned count means "bundles retired", and a client hold is not a
         // bundle. Folding them together would inflate a figure callers read as in-flight spends.
+        // A REPAIRED row is not retired either, and for the same reason it is not counted.
         sqlx::query(
             "DELETE FROM client_coin_reservations WHERE expires_at_ms <= ?
              OR coin_id IN (
@@ -2905,8 +3020,10 @@ impl WalletDb {
              )",
         )
         .bind(now_ms)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(n)
     }
@@ -4360,6 +4477,31 @@ pub struct NetworkSettingsRow {
 /// that crashes between reserving and building, and a coin held out of selection forever — so a
 /// caller does not get to ask for a hold this node would not itself clean up.
 pub const CLIENT_RESERVATION_MAX_TTL_MS: i64 = 600_000;
+
+/// The clock-contradiction detector in [`WalletDb::prune_reservations`] uses
+/// `MAX_RESERVATION_HOLD_MS` as the impossible-deadline threshold for BOTH reservation tables
+/// (dig-node#525). That is only sound while this ceiling sits at or below it: a client hold longer
+/// than the longest bundle hold would make the detector fire on healthy client rows.
+const _: () = assert!(
+    CLIENT_RESERVATION_MAX_TTL_MS <= super::rpc::MAX_RESERVATION_HOLD_MS,
+    "the clock-contradiction detector uses MAX_RESERVATION_HOLD_MS for both tables; a client \
+     ceiling above it would make the detector fire on healthy client holds"
+);
+
+/// The repair in [`WalletDb::prune_reservations`] grants one `RESERVATION_TTL_MS` from the
+/// observing instant, and the detector fires above `MAX_RESERVATION_HOLD_MS` from that same
+/// instant. A TTL LONGER than the cap would make the row the repair just wrote satisfy the
+/// detector again on the very next prune, re-anchoring it for ever - an unbounded freeze produced
+/// by the repair itself, which is precisely the failure the repair exists to close (dig-node#525).
+///
+/// Unreachable today, since the cap is defined as `6 * RESERVATION_TTL_MS`. Pinned anyway: if the
+/// constant pair whose drift would make the detector over-fire earns a compile-time guard, so does
+/// the pair whose drift would turn the repair into a loop.
+const _: () = assert!(
+    super::rpc::RESERVATION_TTL_MS <= super::rpc::MAX_RESERVATION_HOLD_MS,
+    "the repair grants one RESERVATION_TTL_MS and the detector fires past MAX_RESERVATION_HOLD_MS; \
+     a TTL above the cap would make every repaired row re-trigger the detector for ever"
+);
 
 /// The lifetime applied when a caller names none, in milliseconds.
 ///
@@ -6893,12 +7035,18 @@ mod tests {
         .await
         .unwrap();
 
-        // The clock steps backwards, so this re-push carries an EARLIER deadline than the live one.
+        // The clock steps backwards, so this re-push carries an EARLIER deadline than the live
+        // one. Both columns move together, because `reserve_pushed_bundle` reads the clock ONCE
+        // and derives both from that reading - a push carrying the ORIGINAL `submitted_at` beside
+        // a moved `expires_at` is a state production cannot reach (dig-node#525). The step is 60 s,
+        // far under the 50-minute floor at which the clock-contradiction repair can fire, so the
+        // row must be left to the clamp alone.
+        let step_back = 60_000;
         db.reserve_spend(&reservation(
             "tx1",
             &["c1"],
-            first,
-            first + RESERVATION_TTL_MS,
+            first - step_back,
+            first - step_back + RESERVATION_TTL_MS,
         ))
         .await
         .unwrap();
@@ -6911,6 +7059,353 @@ mod tests {
         );
     }
 
+    /// **The defect (dig-node#525).** `WalletBackend::reserve_pushed_bundle` reads the clock ONCE
+    /// and writes both `submitted_at` and `expires_at` from that reading. A single reading far in
+    /// the future therefore stores a deadline decades out, and nothing in the system can retire
+    /// it: `prune_reservations` deletes on `expires_at <= now`, which never arrives, and #502's
+    /// upsert clamp is `MAX(stored, ...)` so a later push under a corrected clock leaves the
+    /// stored deadline alone. The coin is held out of selection FOR EVER, and `reset_chain_cache`
+    /// refuses while the row exists.
+    ///
+    /// Asserted on [`WalletDb::unreserved_unspent_coins`], the surface where the money is actually
+    /// frozen: a row count in `pending_transactions` sits one layer below the decision and would
+    /// pass under a broken cascade.
+    #[tokio::test]
+    async fn a_reservation_anchored_to_a_far_future_clock_stops_freezing_its_coin_for_ever() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        // The poisoned first push: one clock reading, decades ahead.
+        let far_forward = 10_000_000_000;
+        let corrected = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            far_forward,
+            far_forward + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        // Every selection prunes first, so this is the observation that repairs the row.
+        db.prune_reservations(corrected).await.unwrap();
+        assert!(
+            db.unreserved_unspent_coins(None).await.unwrap().is_empty(),
+            "a repaired hold is legitimately live for one fresh TTL, not released on sight"
+        );
+
+        db.prune_reservations(corrected + RESERVATION_TTL_MS)
+            .await
+            .unwrap();
+        let free: Vec<String> = db
+            .unreserved_unspent_coins(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.coin_id)
+            .collect();
+        assert_eq!(
+            free,
+            vec!["c1".to_string()],
+            "one TTL after the repair the coin returns to selection; before this fix it never did"
+        );
+    }
+
+    /// The repair grants exactly what an honest push at the observing instant would have written:
+    /// one [`RESERVATION_TTL_MS`], not one [`MAX_RESERVATION_HOLD_MS`]. Granting the cap would hand
+    /// a repaired row six times a healthy row's first hold.
+    #[tokio::test]
+    async fn the_clock_contradiction_repair_grants_one_fresh_ttl_not_the_maximum_hold() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let far_forward = 10_000_000_000;
+        let corrected = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            far_forward,
+            far_forward + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        db.prune_reservations(corrected).await.unwrap();
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.expires_at,
+            corrected + RESERVATION_TTL_MS,
+            "the repair re-anchors to the observing clock and grants exactly one fresh TTL"
+        );
+    }
+
+    /// **Why `submitted_at` MUST be re-anchored too.** Leaving it at the impossible future value
+    /// leaves `stored.submitted_at + MAX_RESERVATION_HOLD_MS` decades out, so #502's cap clause
+    /// stops binding on that row for ever and a retrying caller renews the hold indefinitely,
+    /// resurrecting the very lockout the cap closes.
+    ///
+    /// This is NOT a regression of #502's stable-anchor rule. That rule keeps `submitted_at` out
+    /// of `DO UPDATE SET` so a CALLER cannot move the anchor. This write is not a caller; it is
+    /// the row's owner replacing a value the system has proven impossible, a submission timestamp
+    /// in the future, with one from the currently trusted clock.
+    #[tokio::test]
+    async fn the_clock_contradiction_repair_re_anchors_submitted_at_so_the_cap_still_binds() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let far_forward = 10_000_000_000;
+        let corrected = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            far_forward,
+            far_forward + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        db.prune_reservations(corrected).await.unwrap();
+
+        // A re-push late enough that the total-hold cap binds, but only if the anchor moved.
+        let late = corrected + 5 * RESERVATION_TTL_MS + RESERVATION_TTL_MS / 2;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            far_forward,
+            late + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.expires_at,
+            corrected + MAX_RESERVATION_HOLD_MS,
+            "the cap binds from the REPAIRED anchor; left at the future value it would not bind"
+        );
+    }
+
+    /// The same repair for a client build-window hold. There is no `submitted_at` column there and
+    /// the caller's originally requested TTL is unrecoverable, so the grant is the ceiling a caller
+    /// could legitimately have asked for.
+    #[tokio::test]
+    async fn a_client_hold_written_under_a_far_future_clock_is_repaired_and_then_lapses() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let far_forward = 10_000_000_000;
+        let corrected = 1_000;
+        db.reserve_client_coins(
+            &["c1".to_string()],
+            Some(CLIENT_RESERVATION_MAX_TTL_MS),
+            far_forward,
+        )
+        .await
+        .unwrap();
+
+        db.prune_reservations(corrected).await.unwrap();
+        assert!(
+            db.unreserved_unspent_coins(None).await.unwrap().is_empty(),
+            "a repaired client hold is live for one fresh ceiling, not released on sight"
+        );
+
+        db.prune_reservations(corrected + CLIENT_RESERVATION_MAX_TTL_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.unreserved_unspent_coins(None).await.unwrap().len(),
+            1,
+            "the repaired client hold lapses; before this fix it held its coin for ever"
+        );
+    }
+
+    /// No false positives on an ordinary backwards clock step. The detector fires only when a row
+    /// CONTRADICTS itself against the clock, and the arithmetic puts the floor for a legitimately
+    /// created row at `MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS` (50 minutes), never at 1 ms.
+    #[tokio::test]
+    async fn a_one_millisecond_backwards_clock_step_repairs_nothing() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let submitted = 1_000_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            submitted,
+            submitted + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        db.prune_reservations(submitted - 1).await.unwrap();
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.submitted_at, submitted,
+            "a healthy row keeps its anchor"
+        );
+        assert_eq!(
+            row.expires_at,
+            submitted + RESERVATION_TTL_MS,
+            "a healthy row keeps its deadline through a 1 ms backwards step"
+        );
+    }
+
+    /// **A SYNTHETIC test of the SQL predicate's `>` versus `>=`, not a claim about production.**
+    ///
+    /// It writes both rows through `reserve_spend` directly, and the `past-bound` row -
+    /// `submitted_at = now, expires_at = now + MAX_RESERVATION_HOLD_MS + 1` - is a state NO writer
+    /// can produce: `INSERT` writes `submitted_at + RESERVATION_TTL_MS` and the clamp never exceeds
+    /// `submitted_at + MAX_RESERVATION_HOLD_MS`. It exists solely so the boundary is pinned from
+    /// both sides, and it must not be read as evidence about reachable behaviour.
+    ///
+    /// The reachable consequence of that same boundary - what a forward clock glitch small enough
+    /// to EVADE this predicate actually costs - is pinned separately and honestly by
+    /// `a_forward_clock_glitch_under_the_detector_threshold_is_bounded_at_two_caps_less_a_ttl`. An
+    /// earlier version of this file had only the synthetic test, and its unreachable fixture is
+    /// what hid the residue.
+    #[tokio::test]
+    async fn the_clock_contradiction_predicate_is_strict_at_the_maximum_hold() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        for id in ["c1", "c2"] {
+            db.upsert_coin(&coin(id, 100, Some(10), None))
+                .await
+                .unwrap();
+        }
+
+        let now = 1_000_000;
+        db.reserve_spend(&reservation(
+            "at-bound",
+            &["c1"],
+            now,
+            now + MAX_RESERVATION_HOLD_MS,
+        ))
+        .await
+        .unwrap();
+        db.reserve_spend(&reservation(
+            "past-bound",
+            &["c2"],
+            now,
+            now + MAX_RESERVATION_HOLD_MS + 1,
+        ))
+        .await
+        .unwrap();
+
+        db.prune_reservations(now).await.unwrap();
+
+        let rows = db.pending_transactions().await.unwrap();
+        let at_bound = rows
+            .iter()
+            .find(|r| r.transaction_id == "at-bound")
+            .expect("the at-bound row survives");
+        let past_bound = rows
+            .iter()
+            .find(|r| r.transaction_id == "past-bound")
+            .expect("the past-bound row survives, repaired rather than deleted");
+
+        assert_eq!(
+            at_bound.expires_at,
+            now + MAX_RESERVATION_HOLD_MS,
+            "exactly at the bound is reachable by an honest push and must not be repaired"
+        );
+        assert_eq!(
+            past_bound.expires_at,
+            now + RESERVATION_TTL_MS,
+            "one millisecond past the bound is repaired (synthetic row; see the doc comment)"
+        );
+    }
+
+    /// **The residue this fix does NOT close, built only from REACHABLE states.**
+    ///
+    /// A forward clock glitch of at most `MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS` evades the
+    /// clock-contradiction detector by construction: the first push records
+    /// `expires_at = submitted_at + RESERVATION_TTL_MS`, so the recorded deadline never exceeds the
+    /// observing instant by more than the cap, and every later re-push draws its deadline from the
+    /// true clock, which cannot exceed it either. The glitched anchor therefore SURVIVES, and
+    /// #502's cap pins the deadline at `submitted_at + MAX_RESERVATION_HOLD_MS`.
+    ///
+    /// The coin is consequently held for `2 * MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS` (110
+    /// minutes) measured from an instant the node actually observed, and that bound is TIGHT. This
+    /// is #502's cap behaviour under a forward glitch, predating this repair; it is pinned here
+    /// rather than fixed, because closing it needs a monotonic anchor rather than a tighter
+    /// predicate.
+    ///
+    /// Every write below goes through the real API at a value a real clock could have produced -
+    /// no hand-placed row - which is what makes this a measurement rather than a restatement.
+    #[tokio::test]
+    async fn a_forward_clock_glitch_under_the_detector_threshold_is_bounded_at_two_caps_less_a_ttl()
+    {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        // The largest forward glitch that still evades the detector.
+        let glitch = MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            glitch,
+            glitch + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        // True time is zero. The row is NOT repaired: it does not contradict the clock.
+        db.prune_reservations(0).await.unwrap();
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            (row.submitted_at, row.expires_at),
+            (glitch, glitch + RESERVATION_TTL_MS),
+            "a glitch at the evasion threshold leaves the row untouched - this is the residue"
+        );
+
+        // A caller retrying under the TRUE clock, always re-pushing before the deadline lapses.
+        let mut t = glitch + RESERVATION_TTL_MS / 2;
+        while t < 2 * MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS {
+            db.prune_reservations(t).await.unwrap();
+            db.reserve_spend(&reservation("tx1", &["c1"], t, t + RESERVATION_TTL_MS))
+                .await
+                .unwrap();
+            t += RESERVATION_TTL_MS / 2;
+        }
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.submitted_at, glitch,
+            "the glitched anchor survives every re-push; nothing ever repaired it"
+        );
+
+        let release = glitch + MAX_RESERVATION_HOLD_MS;
+        assert_eq!(
+            row.expires_at, release,
+            "the cap pins the deadline at the glitched anchor plus one cap"
+        );
+
+        db.prune_reservations(release - 1).await.unwrap();
+        assert!(
+            db.unreserved_unspent_coins(None).await.unwrap().is_empty(),
+            "one millisecond before the bound the coin is still frozen"
+        );
+
+        db.prune_reservations(release).await.unwrap();
+        assert_eq!(
+            db.unreserved_unspent_coins(None).await.unwrap().len(),
+            1,
+            "the coin returns at exactly 2 * CAP - TTL from an observed instant, and not before"
+        );
+    }
     /// The asymmetry the ticket requires to SURVIVE the fix: a coin backs exactly one in-flight
     /// bundle and the FIRST claim wins. No path added for the cap may let a second bundle take a
     /// coin already reserved, or shorten the first bundle's hold on it.
