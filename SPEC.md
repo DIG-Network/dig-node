@@ -4008,7 +4008,8 @@ build passes its version through `scripts/package-version.sh` before it reaches 
 `pkgbuild --version`, or the WiX `-d Version=` argument — all of which end up inside a package that
 runs with elevated privilege. The script accepts, by whitelist, ONLY `X.Y.Z` or
 `X.Y.Z-nightly.YYYYMMDD.<shortsha>`, and rejects everything else with a non-zero exit; it MUST also
-reject a component exceeding Windows Installer's field limits (major/minor > 255, patch > 65535).
+reject MAJOR > 255 or PATCH > 65535 outright, and MINOR > 65535 — the ceiling past which even the
+§11.5c overflow carry can no longer map MINOR into a legal MSI `(major, minor)` pair.
 
 It emits two values, which differ on purpose:
 
@@ -4054,6 +4055,35 @@ number, so `0.96.<days>` outranks every stable `0.96.z`: `msiexec` aborts on
 channel. This is not a regression — no nightly `.msi` existed before — but it is newly reachable. A
 host switched from `nightly` back to `stable` on Windows requires an uninstall of the nightly
 package before the stable one installs, until the version scheme distinguishes channels.
+
+**Stable-channel MINOR overflow (dig_ecosystem#521, dig_ecosystem#522).** dig-node's
+`0.<minor>.<patch>` scheme puts an ever-incrementing feat/breaking counter (CLAUDE.md §2.4) in
+MINOR, and unlike MAJOR or PATCH that field is not bounded the way MSI's is — it reached Windows
+Installer's 255-value field ceiling first, at `0.256.0`, with every subsequent release otherwise
+unable to build any native package at all. `scripts/package-version.sh` folds MINOR into a legal
+MSI `(major, minor)` pair once it exceeds 255, reusing the MSI MAJOR field, which is otherwise idle
+at 0 for this repo's entire pre-1.0 lifetime:
+
+- **`MINOR <= 255`:** `MSI_MAJOR, MSI_MINOR = MAJOR, MINOR` — an unchanged passthrough.
+- **`MINOR > 255`:** `MSI_MAJOR, MSI_MINOR = MINOR div 256, MINOR mod 256` — a base-256 split that
+  ACTIVATES only above the old ceiling, and requires the real MAJOR to be `0` while it is active.
+  Should MAJOR ever become nonzero (a deliberate 1.0.0 decision) at the same time MINOR is ALSO
+  over 255, the two would collide in the same MSI field, so the script fails closed rather than
+  guess — that combination needs a fresh mapping decision, not this one.
+
+This is a STRICT BACKWARD-COMPATIBLE EXTENSION of the accepted range, never a behaviour change to
+an already-legal version: every version released before this carry existed has `MINOR <= 255`, so
+it maps identically under the new rule as it did under the old one. The carry preserves the
+invariant this section opened with — msiexec compares ProductVersion as a numeric
+`(major, minor, build)` tuple in that priority order, so a base-256 split into MSI MAJOR then MSI
+MINOR is monotonic across the boundary by construction: `1.0.0` (real MINOR 256) compares greater
+than `0.255.9` (real MINOR 255) purely because MSI MAJOR alone already decides it, before MSI MINOR
+or BUILD are even read. This raises the effective ceiling from MINOR 255 to MINOR 65535
+(`256*255+255`, a ~257x increase) with no new state and no change to how engineers choose
+MAJOR/MINOR/PATCH day to day. Applies identically on both the stable and nightly mapping paths
+(the BUILD field keeps carrying the nightly day-count regardless of whether MINOR has overflowed).
+Verified by `scripts/tests/package-version.test.sh`, including the boundary that used to fail
+closed and a dedicated monotonicity check across it.
 
 11.6. **Reusable build.** The cross-OS build lives once in `.github/workflows/build-binaries.yml`
 (`on: workflow_call`, inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel
