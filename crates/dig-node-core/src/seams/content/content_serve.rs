@@ -30,9 +30,6 @@ use serde_json::{json, Value};
 
 use crate::{decide_pin, pin_enforced, CapsuleStore, Node, PinDecision, ROOT_NOT_ANCHORED};
 
-/// JSON-RPC-style code for a serve that fetched bytes but could not verify/decrypt/reach them —
-/// distinct from a clean content miss (`NotFound`) and from the anchored-root pin (`RootError`).
-const SERVE_UNREADABLE: i64 = -32000;
 /// The upstream/peer "resource not available at this root" code — a genuine content miss (SPEC §10).
 const RESOURCE_UNAVAILABLE: i64 = -32004;
 
@@ -138,11 +135,11 @@ pub enum PlaintextOutcome {
     InvalidParams { message: String },
     /// Bytes were fetched but verification or decryption failed (tamper / wrong key / decode error),
     /// or the fetch itself errored at the transport level. Fail-closed — no plaintext is returned.
-    Unreadable {
-        code: i64,
-        message: String,
-        root_hex: String,
-    },
+    ///
+    /// Carries NO numeric code: this outcome's only sink is the HTTP serve path, which answers
+    /// `502 BAD_GATEWAY` from the message alone. A `-32000` field here never reached any wire and
+    /// was therefore a dead producer rather than a taxonomy gap (dig-node#496).
+    Unreadable { message: String, root_hex: String },
 }
 
 /// The canonical ROOTLESS resource URN whose SHA-256 is the retrieval key and whose bytes seed the AES
@@ -992,7 +989,6 @@ impl Node {
                     None
                 }
                 Err(ProxyMiss::Error(message)) => Some(PlaintextOutcome::Unreadable {
-                    code: SERVE_UNREADABLE,
                     message,
                     root_hex: root_hex.to_string(),
                 }),
