@@ -113,6 +113,10 @@ impl VerifiedCapsuleKey {
     }
 
     /// The sampled DHT content-key this preimage was proven against (what a fetcher announces/fetches).
+    // The one accessor tier-0 does not yet read: `tier0_live` consumes the store_id/root preimage and
+    // announces against the key it already holds. Kept so a verified key is readable back off the
+    // proof rather than re-derived; consumed when the fetch loop announces from the VERIFIED value.
+    #[allow(dead_code)]
     pub(crate) fn content_key(&self) -> [u8; 32] {
         self.content_key
     }
