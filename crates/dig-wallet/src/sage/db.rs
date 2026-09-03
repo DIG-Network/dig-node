@@ -7002,7 +7002,6 @@ mod tests {
         );
     }
 
-
     /// **The defect (dig-node#525).** `WalletBackend::reserve_pushed_bundle` reads the clock ONCE
     /// and writes both `submitted_at` and `expires_at` from that reading. A single reading far in
     /// the future therefore stores a deadline decades out, and nothing in the system can retire
@@ -7195,7 +7194,10 @@ mod tests {
         db.prune_reservations(submitted - 1).await.unwrap();
 
         let row = &db.pending_transactions().await.unwrap()[0];
-        assert_eq!(row.submitted_at, submitted, "a healthy row keeps its anchor");
+        assert_eq!(
+            row.submitted_at, submitted,
+            "a healthy row keeps its anchor"
+        );
         assert_eq!(
             row.expires_at,
             submitted + RESERVATION_TTL_MS,
