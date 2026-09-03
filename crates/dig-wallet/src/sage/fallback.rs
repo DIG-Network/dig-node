@@ -248,6 +248,39 @@ pub trait ChainFallback: Send + Sync {
     async fn peak_height(&self) -> Result<Option<u32>> {
         Ok(None)
     }
+
+    /// The peak THIS tier reports as part of the read it is serving right now — the ONLY value a
+    /// fallback-tier answer may report as its `peak_height` (dig-node#290).
+    ///
+    /// `dig-node-control-interface` 0.31.0 defines `synced` on a `fallback` answer exactly: it is
+    /// `true` if and only if the reported `peak_height` is the height the tier that ANSWERED
+    /// reported in the same read that produced the figures. So the bound must be produced BY the
+    /// answering tier, WHILE it answers — never carried over from an earlier read, never taken from
+    /// the replica, and never taken from the high-water mark of the node's held peers. Each of
+    /// those three is a height some other party measured, stamped onto figures whose freshness it
+    /// does not bound.
+    ///
+    /// The default is `None`, which is the honest answer for a tier that tracks no peak of its own
+    /// ([`EmptyFallback`]) and for a read whose peak could not be obtained. `None` therefore makes
+    /// the answer report `peak_height: null` / `synced: false`, which is what the contract requires
+    /// of a node that cannot bind the two together.
+    ///
+    /// It returns `Option` rather than `Result` on purpose: a failure to obtain the bound is not a
+    /// failure of the READ. The figures are still served, unbounded and labelled as such, exactly
+    /// as a stale replica answer is served and labelled.
+    ///
+    /// # The residual, stated rather than laundered
+    ///
+    /// coinset's coin-record responses carry no peak of their own, and `chia-query` 0.20.0 exposes
+    /// no peak-bearing read, so [`CoinsetFallback`] obtains this from its own tier immediately
+    /// while serving the read rather than from the same HTTP response. That bounds the answer to
+    /// one tier and one read operation and excludes every carried-over value — which is what the
+    /// contract's rule protects — but it is not a single-response binding, and a caller MUST NOT
+    /// read `synced: true` as corroboration by the network. A peak-bearing chain read upstream
+    /// would remove the residual; until it exists this is the tightest bound available.
+    async fn answer_peak_height(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// The production fallback: `chia_query::ChiaQuery` (coinset.org + peer point-reads),
@@ -347,6 +380,14 @@ impl ChainFallback for CoinsetFallback {
     /// A real coinset/peer connection: a genuinely live chain source (#1851).
     fn is_live(&self) -> bool {
         true
+    }
+
+    /// The oracle's OWN peak, read from this tier while it serves the answer (dig-node#290).
+    ///
+    /// A read failure yields `None` rather than propagating: the figures are still served, and the
+    /// answer then honestly reports itself unbounded.
+    async fn answer_peak_height(&self) -> Option<u32> {
+        self.peak_height().await.ok().flatten()
     }
 
     async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>> {
@@ -1441,6 +1482,15 @@ pub(crate) mod mock {
         /// the live source every other test assumes — a `live: bool` would default to `false` and
         /// silently flip every existing fixture onto the no-chain-source path.
         pub offline: bool,
+        /// The peak this double reports AS PART OF the read it serves (dig-node#290) — the value
+        /// the fallback-tier answer is bound by.
+        ///
+        /// Deliberately INDEPENDENT of the harness's `ChainPeerTier` override, because the whole
+        /// discriminating question is whether an implementation reaches for the answering tier's
+        /// own height or for the peers' high-water mark. A double that varied them together could
+        /// not tell the two apart, which is exactly the blindness that let dig-node#510 bind the
+        /// wrong measurement and pass its suite.
+        pub answer_peak: Option<u32>,
     }
 
     impl MockFallback {
@@ -1474,6 +1524,11 @@ pub(crate) mod mock {
             self.offline = true;
             self
         }
+        /// The peak this double reports while answering (dig-node#290).
+        pub fn with_answer_peak(mut self, peak: u32) -> Self {
+            self.answer_peak = Some(peak);
+            self
+        }
         pub fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
@@ -1485,6 +1540,10 @@ pub(crate) mod mock {
         /// the opposite via [`MockFallback::offline`] (dig_ecosystem#3050).
         fn is_live(&self) -> bool {
             !self.offline
+        }
+
+        async fn answer_peak_height(&self) -> Option<u32> {
+            self.answer_peak
         }
 
         async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>> {

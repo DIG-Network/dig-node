@@ -2368,10 +2368,20 @@ fn arrivals_wire(
 
 /// `control.wallet.peak` (dig_ecosystem#2376) — the node's current chain peak height.
 ///
-/// Its own method rather than a field on a balance: a balance reports `peak_height: null` on every
-/// fallback-tier answer by design (#2233), so a caller bounding a claimed confirmation could not get
-/// one from the very node that most needs to answer. `peak_height: null` here means UNKNOWN — never
-/// height zero, which every block is trivially above.
+/// Its own method rather than a field on a balance. It was introduced when a balance reported
+/// `peak_height: null` on EVERY fallback-tier answer by design (#2233), leaving a caller bounding a
+/// claimed confirmation with nothing from the very node that most needs to answer. Since
+/// `dig-node-control-interface` 0.31.0 a fallback answer CAN carry a peak — the one its own
+/// answering tier produced in that same read (dig-node#290) — so this method is no longer the only
+/// route to a height. It remains the one that is address-independent, and the only one whose height
+/// is settled on the node's own peers AGREEING (NC-12) rather than taken from a single tier.
+///
+/// This endpoint is deliberately UNCHANGED by dig-node#290: [`ChainPeak`] carries no `source`
+/// field, so the answering-tier rule cannot be expressed on it at all — see
+/// <https://github.com/DIG-Network/dig-node-control-interface/issues/46>.
+///
+/// `peak_height: null` here means UNKNOWN — never height zero, which every block is trivially
+/// above.
 async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
     match ctx.wallet.chain_peak().await {
         Ok(peak) => control_ok(
