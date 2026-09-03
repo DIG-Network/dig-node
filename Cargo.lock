@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.252.22"
+version = "0.252.41"
 dependencies = [
  "async-trait",
  "axum",
