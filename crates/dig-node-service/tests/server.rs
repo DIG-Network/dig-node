@@ -271,9 +271,7 @@ async fn start_node_probe_state(
 /// Like [`start_node_full`] but ALSO returns the served wallet backend (#368/#369) so a WS
 /// push test can drive the backend's event bus directly. Same per-call on-disk isolation + env
 /// lock (the wallet DB + seed live under the same per-test config dir).
-async fn start_node_wallet(
-    upstream: &str,
-) -> (SocketAddr, String, Arc<WalletBackend>, EnvHold) {
+async fn start_node_wallet(upstream: &str) -> (SocketAddr, String, Arc<WalletBackend>, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
