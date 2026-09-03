@@ -9376,6 +9376,16 @@ at this operator's puzzle hash. The node MUST NOT treat an unauthenticated candi
 * A candidate that fails authentication MUST be passed over rather than aborting the selection, MUST
   be counted and reported, and MUST NOT occupy an input slot.
 
+**The report of passed-over candidates MUST be one bounded message per selection, and MUST frame
+any total the pass quotes as a FLOOR.** One message per candidate makes the log volume a figure the
+attacker chooses, since the candidate count is set by whoever paid coins into the public address;
+the aggregate MUST therefore also bound how many coin ids it names, or the volume moves from the
+message count to the message length. The report MUST be reachable on the funding path the node
+actually uses, including where the selection SUCCEEDS: the same skip covers a genuine lineage
+defect, so a pass that funded while passing candidates over has established only a lower bound on
+what the operator can spend, and a total quoted flat would understate their money.
+
+
 **Authentication costs one chain read per candidate, so it MUST be bounded by a constant** that does
 not depend on how many candidates exist. Without such a bound the reads one automated pass performs
 are chosen by whoever paid coins into the address, on the pass timer, indefinitely.
@@ -9409,6 +9419,20 @@ unreported, and leaves a shortfall already alerted on latched at a figure that c
 corrected. The message MUST name the condition and an action the operator can take, and MUST NOT
 assert a remedy the observation does not establish — in particular a truncated walk MUST NOT tell
 an operator to add $DIG, since adding it need not help.
+
+**Whether an *unmeasured* pass is the SAME condition as the last one MUST be decided without
+reference to any figure a stranger can move.** The repeat-suppression above is what keeps an
+unattended pass timer from becoming a notification stream, so a condition whose identity includes an
+attacker-chosen field is not suppressed at all: one coin paid into the publicly derivable operator
+address changes the count, the condition compares unequal, and the operator is notified on every
+pass indefinitely, for the price of one dust spend. A node MUST therefore exclude the truncated
+walk's attempted and skipped counts from that comparison, while still stating them in the message
+body.
+
+Conversely a node MUST re-raise when a figure the operator must ACT on has changed and no stranger
+can move it -- in particular the epoch collateral requirement, which is derived from the plan rather
+than from the wallet. Suppressing that is not repeat-suppression but under-reporting: the operator
+has been told a different amount is needed than the amount now needed.
 
 A *short* observation's spendable total MUST be authenticated (§25.11). A pass that has no
 authenticated total is *unmeasured*, never *short with the address total*.
