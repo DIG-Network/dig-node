@@ -59,6 +59,61 @@ const VERDICT_TTL: Duration = Duration::from_secs(600);
 /// earned simply by rotating coin ids, which converts a memoisation into an amplifier.
 const MAX_CACHED_VERDICTS: usize = 1024;
 
+/// The most locate-triggered verifications this PROCESS will pay for in one burst.
+///
+/// Each one costs up to two blocking HTTPS reads through the node's ONE shared `ChiaQuery` client —
+/// the same client the wallet, the collateral census and the mirror spends read through. So this
+/// ceiling is not about fairness between requestors; it is about this node keeping its own chain
+/// access when a stranger directs traffic at it.
+///
+/// The inbound admission gate (`allow_miss_lookup`, burst 16 at 4/sec) is PER REQUESTOR over up to
+/// 4,096 self-minted identities and has no aggregate cap, so it cannot bound this. Sixteen is
+/// therefore chosen against the *outbound* cost, not the inbound one: two locates' worth of a full
+/// slate, after which verification degrades to `Unverified` — which is where every record already
+/// sits when no verifier is installed at all.
+const VERIFICATION_BURST: u32 = 16;
+
+/// How fast [`VERIFICATION_BURST`] refills, in verifications per second.
+///
+/// One per second, deliberately slower than the inbound refill it cannot control: an attacker who
+/// sustains the inbound rate gets a *constant* trickle of outbound reads rather than a multiple of
+/// its own request rate. An honest node's own reads — a capsule it is downloading — are answered
+/// from the burst and then from the verdict cache.
+const VERIFICATION_REFILL_PER_SEC: f64 = 1.0;
+
+/// The most verifications in flight at once, so a burst cannot fan out CONCURRENTLY onto the shared
+/// client even while it is within the rate ceiling.
+///
+/// A rate bound alone still permits sixteen simultaneous blocking reads, which is what a connection
+/// pool experiences as an outage rather than as load.
+const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
+
+/// The most DISTINCT claimed coin ids one claiming peer may spend chain reads on, per
+/// [`CLAIMANT_LEDGER_WINDOW`], without ever proving a bond.
+///
+/// This is the bound that answers the fabricated-coin-id case specifically. [`VerdictKey`] includes
+/// the coin id — it must, or a stranger republishing a public coin id would inherit its holder's
+/// verdict — so eight records carrying eight *invented* coin ids miss the cache eight times by
+/// construction, and no cache design can fix that. What CAN be bounded is how many invented ids one
+/// claimed identity is allowed to be wrong about before this node stops asking on its behalf.
+///
+/// Four, because an honest holder needs ONE: a peer publishes the coin it created. A rollover can
+/// make it briefly two (the old coin and the new one). Anything beyond that is a peer that does not
+/// know which coin it holds, and its records are worth no more chain reads than a stranger's.
+const MAX_UNPROVEN_COINS_PER_CLAIMANT: usize = 4;
+
+/// How long a claimant's unproven-coin ledger is remembered. Matched to [`VERDICT_TTL`] so a peer
+/// that genuinely rotates coins is forgiven on the same clock a cached verdict expires on.
+const CLAIMANT_LEDGER_WINDOW: Duration = VERDICT_TTL;
+
+/// The most claimants tracked in that ledger at once.
+///
+/// A claiming peer id is attacker-chosen and unbounded in supply, so the ledger MUST be bounded.
+/// Once it is full of live entries an UNKNOWN claimant is refused rather than admitted, which is
+/// the fail-closed direction: the cost of being wrong is a holder sitting at the baseline tier it
+/// would occupy with no verifier at all, never a wrong promotion.
+const MAX_TRACKED_CLAIMANTS: usize = 512;
+
 /// A verdict is only ever cached for the exact question it answered.
 ///
 /// The coin id alone is not the key: one coin bonds one `(store, root, epoch)`, so caching by coin
@@ -91,8 +146,13 @@ impl VerdictKey {
         epoch: u64,
         claiming_peer_id: &str,
     ) -> Self {
+        // ASCII-lowercased before hashing. A peer id is fixed-length hex, so its two spellings are
+        // one identity, and `peer_declaration` already treats them as one because it compares
+        // decoded bytes. Hashing the raw text would give each spelling its own cache entry, so a
+        // stranger could multiply the chain reads one claim costs simply by varying case -- turning
+        // a memo into an amplifier against `api.coinset.org`.
         let mut hasher = chia_sha2::Sha256::new();
-        hasher.update(claiming_peer_id.as_bytes());
+        hasher.update(claiming_peer_id.to_ascii_lowercase().as_bytes());
         VerdictKey {
             coin_id,
             store_launcher_id: store.to_bytes(),
@@ -105,11 +165,9 @@ impl VerdictKey {
 
 /// What a mirror coin's advertised terms say about the peer claiming it.
 ///
-/// `DeclaresThisPeer` and `Silent` are matched but not yet constructed: nothing can construct them
-/// until [`peer_declaration`] has a typed source for the binding, which is exactly the promotion gate
-/// described there. They are written now so the shape of the answer is fixed before the source
-/// arrives, and so the call site reads as the full decision rather than a placeholder.
-#[allow(dead_code)]
+/// Two answers, not three. Until `dig-mirror-coin` 0.8.0 there was a `NotReadable` state for "this
+/// node has no way to read a declaration at all"; the typed accessor removed the situation, so the
+/// variant was removed with it rather than left as a case nothing constructs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerDeclaration {
     /// The coin's owner declared this exact peer, in code the chain executed.
@@ -117,36 +175,30 @@ pub(crate) enum PeerDeclaration {
     /// The coin declares some other peer, or none. Credit is withheld — never subtracted, because
     /// the record naming this coin may be a stranger's lie ABOUT the coin's real holder.
     Silent,
-    /// This node cannot read the declaration at all, so it knows nothing either way.
-    NotReadable,
 }
 
 /// Whether `advertised_terms` — the free tail of a mirror coin's memo — declares `claiming_peer_id`.
 ///
-/// **This is deliberately unreadable today, and that is the promotion gate.** The tail is arbitrary
-/// UTF-8 and `MirrorCoin::urls()` already hands it over, so a `dig-peer:<64-hex>` term COULD be
-/// parsed here — and must not be. `dig-mirror-coin` 0.8.0 is about to own that format with a typed
-/// accessor; parsing it here would create a second parser for a security-critical format, in the
-/// consumer, where a divergence between the two would be a silent authorization difference rather
-/// than a compile error (CLAUDE.md 2.0, centralize rival implementations).
+/// The answer comes from `dig-mirror-coin`'s typed accessor and is NOT parsed here. A second parser
+/// for this format, living in the consumer, would make a divergence between the two a silent
+/// authorization difference rather than a compile error (CLAUDE.md §2.0, centralize rival
+/// implementations). Everything the format means — exact prefix matching, byte-wise peer-id
+/// comparison, and the rule that a coin carrying two declarations declares NOBODY — is stated once,
+/// in that crate's `SPEC.md` §5.1.
 ///
-/// So promotion is switched OFF until that accessor exists: with no sound source for the
-/// coin -> peer binding, `Bonded` cannot be established, and the layer withholds credit from
-/// everyone rather than granting it on a check it cannot make. Nothing is demoted by this
-/// (mirror_bond's lattice is credit-only), so the interim behaviour is exactly the behaviour of a
-/// node with no verifier at all.
-///
-/// Replacing the body with the 0.8.0 accessor turns promotion on, and three things MUST land in
-/// that same change, never after: the authoritative-record restriction on dig-node#466, the
-/// claiming peer id staying part of [`VerdictKey`] (a peer-agnostic key would serve one peer's
-/// earned `Bonded` to a stranger republishing the same public coin id), and the cost analysis on
-/// [`declaration_source_is_readable`], whose short-circuit lifts itself the moment this function
-/// can answer.
+/// **What a `DeclaresThisPeer` establishes.** Memos are written by the spend that creates the coin
+/// and only the owner's key can produce that spend, so the term is an owner attestation carried by
+/// executed on-chain code. It binds the coin to a `peer_id`. It does NOT bind that `peer_id` to the
+/// addresses travelling beside it in the provider record — see `SPEC.md` §25.6a for why that gap is
+/// closed by the transport rather than here.
 pub(crate) fn peer_declaration(
-    _advertised_terms: &[String],
-    _claiming_peer_id: &str,
+    advertised_terms: &[String],
+    claiming_peer_id: &str,
 ) -> PeerDeclaration {
-    PeerDeclaration::NotReadable
+    match dig_mirror_coin::declared_peer(advertised_terms) {
+        Some(declared) if declared.names(claiming_peer_id) => PeerDeclaration::DeclaresThisPeer,
+        _ => PeerDeclaration::Silent,
+    }
 }
 
 /// Whether [`peer_declaration`] can bind a coin to a peer AT ALL — probed through the real
@@ -281,17 +333,19 @@ fn chain_bond_verdict_and_coin<S: ChainSource>(
 
 /// The full verdict: the chain half, then **whose bond it is**.
 ///
-/// A valid, fully-collateralised coin bonding exactly this content still says nothing about the
-/// peer offering the record — every field of that record, the coin id included, was chosen by
-/// whoever answered the lookup. Only the coin's own owner-written declaration of a peer closes that,
-/// and this node cannot read one yet (see [`peer_declaration`]), so nothing is promoted today.
+/// A valid, fully-collateralised coin bonding exactly this content still says nothing about the peer
+/// offering the record — every field of that record, the coin id included, was chosen by whoever
+/// answered the lookup. Only the coin's own owner-written declaration of a peer closes that, and
+/// [`peer_declaration`] reads it, so a `Bonded` here means BOTH halves held: the coin bonds this
+/// content, and the coin's owner named this claimant.
 ///
 /// Credit is withheld, never subtracted: a record naming this coin may be a stranger's lie ABOUT the
 /// coin's real holder, and demoting on it is what would make that lie pay.
 ///
-/// **No chain is read at all while the ownership half has no source** (see
-/// [`declaration_source_is_readable`]): with `Bonded` unreachable, the reads would be paid for an
-/// answer this function is about to discard.
+/// **A node with no censused requirement for the epoch cannot promote anyone**, because it cannot
+/// price a bond — `required_collateral` is then `None` and the verdict degrades to `Unverified`
+/// rather than to `Bonded`. Detection of a false claim still works there (the binding is checked
+/// first, deliberately), but certification does not.
 pub fn verdict_for<S: ChainSource>(
     source: &S,
     store_launcher_id: Bytes32,
@@ -320,8 +374,184 @@ pub fn verdict_for<S: ChainSource>(
     };
     match peer_declaration(mirror.urls(), claiming_peer_id) {
         PeerDeclaration::DeclaresThisPeer => BondVerdict::Bonded,
-        PeerDeclaration::Silent | PeerDeclaration::NotReadable => BondVerdict::Unverified,
+        PeerDeclaration::Silent => BondVerdict::Unverified,
     }
+}
+
+/// Whether a chain read may be spent on one claim, right now.
+///
+/// **Why this exists.** Before promotion went live, `verdict_for` returned at
+/// `declaration_source_is_readable()` and a locate cost zero chain reads. Activating it turned one
+/// cheap inbound token into up to `MAX_VERIFIED_PER_LOCATE` verifications, each two outbound HTTPS
+/// reads, on a client shared with the wallet — and the inbound gate that admits the locate is
+/// per-requestor over self-minted identities, so it bounds nothing in aggregate. This type is the
+/// aggregate bound (dig-node#501, security round 1, HIGH).
+///
+/// Two independent limits, because they answer two different attacks:
+///
+/// * a **process-wide token bucket** ([`VERIFICATION_BURST`] at [`VERIFICATION_REFILL_PER_SEC`]),
+///   which bounds total outbound egress however many identities the traffic is spread across;
+/// * a **per-claimant distinct-coin ledger** ([`MAX_UNPROVEN_COINS_PER_CLAIMANT`]), which bounds
+///   the fabricated-coin-id case the verdict cache structurally cannot absorb.
+///
+/// Exhaustion of either returns [`BondVerdict::Unverified`] having read NOTHING. That is a
+/// degradation and not a refusal of service: `Unverified` and `Unbonded` share a rank, the sort is
+/// stable, and the located slate is returned unchanged — the exact behaviour of a node with no
+/// verifier installed. **The read path is never blocked and no holder is ever ranked below where it
+/// started**, so an attacker who exhausts the budget denies promotion, not content.
+struct ReadAdmission {
+    state: Mutex<AdmissionState>,
+}
+
+/// [`ReadAdmission`]'s interior, held under one lock so the two limits are decided atomically —
+/// a token spent on a claim the ledger was about to refuse would be a leak.
+struct AdmissionState {
+    /// Whole verifications available now. Fractional so a sub-second refill is not rounded away.
+    tokens: f64,
+    /// When `tokens` was last brought up to date.
+    refilled_at: Instant,
+    burst: f64,
+    refill_per_sec: f64,
+    /// Per claimant: when its window opened, and the distinct coin ids it has spent reads on
+    /// without proving a bond. Keyed on the SHA-256 of the lowercased peer id, for the reason
+    /// [`VerdictKey`] hashes it — the key must be fixed-size against an attacker-chosen string, and
+    /// two hex spellings must be one identity.
+    unproven: HashMap<[u8; 32], (Instant, std::collections::HashSet<[u8; 32]>)>,
+}
+
+impl ReadAdmission {
+    /// A budget of the given size. Parameterised so a test can exhaust one in a few calls rather
+    /// than by replicating production's arithmetic.
+    fn new(burst: u32, refill_per_sec: f64) -> Self {
+        ReadAdmission {
+            state: Mutex::new(AdmissionState {
+                tokens: f64::from(burst),
+                refilled_at: Instant::now(),
+                burst: f64::from(burst),
+                refill_per_sec,
+                unproven: HashMap::new(),
+            }),
+        }
+    }
+
+    /// The one budget every locate on this node draws from.
+    ///
+    /// Process-wide rather than per verifier: the constraint being protected is the single shared
+    /// `ChiaQuery` client, which is a property of the process, so a budget scoped to anything
+    /// narrower would be several budgets against one resource.
+    fn shared() -> &'static ReadAdmission {
+        static SHARED: std::sync::OnceLock<ReadAdmission> = std::sync::OnceLock::new();
+        SHARED.get_or_init(|| ReadAdmission::new(VERIFICATION_BURST, VERIFICATION_REFILL_PER_SEC))
+    }
+
+    /// Whether a chain read may be spent on `claimed_coin_id` for `claiming_peer_id`.
+    ///
+    /// Returning `false` costs the network nothing and this node nothing; returning `true` spends a
+    /// token, so it is called exactly once per verification and never as a peek.
+    fn admit(&self, claiming_peer_id: &str, claimed_coin_id: [u8; 32]) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            // A poisoned budget cannot be shown to have capacity, so it has none.
+            return false;
+        };
+
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(state.refilled_at)
+            .as_secs_f64();
+        state.tokens = (state.tokens + elapsed * state.refill_per_sec).min(state.burst);
+        state.refilled_at = now;
+
+        let claimant = claimant_key(claiming_peer_id);
+        state
+            .unproven
+            .retain(|_, (opened, _)| opened.elapsed() < CLAIMANT_LEDGER_WINDOW);
+        let known = state.unproven.contains_key(&claimant);
+        if !known && state.unproven.len() >= MAX_TRACKED_CLAIMANTS {
+            return false;
+        }
+        if let Some((_, coins)) = state.unproven.get(&claimant) {
+            // A coin id this claimant has already been read about is not a new question: the cache
+            // entry for it has simply expired, and re-asking is what keeps a verdict fresh. Only
+            // DISTINCT unproven ids count against the ledger.
+            if !coins.contains(&claimed_coin_id) && coins.len() >= MAX_UNPROVEN_COINS_PER_CLAIMANT {
+                return false;
+            }
+        }
+
+        if state.tokens < 1.0 {
+            return false;
+        }
+        state.tokens -= 1.0;
+        state
+            .unproven
+            .entry(claimant)
+            .or_insert_with(|| (now, std::collections::HashSet::new()))
+            .1
+            .insert(claimed_coin_id);
+        true
+    }
+
+    /// Forgive a claimant's ledger: it has proven a bond, so it is not a peer guessing at coin ids.
+    ///
+    /// The process-wide bucket is deliberately NOT refunded. A proven bond says the claimant is
+    /// honest; it says nothing about this node's chain access, which is the thing the bucket exists
+    /// to protect.
+    fn record_proven(&self, claiming_peer_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.unproven.remove(&claimant_key(claiming_peer_id));
+        }
+    }
+}
+
+/// A claiming peer id as a fixed-size ledger key: lowercased, then hashed.
+///
+/// The same normalisation [`VerdictKey`] applies, for the same two reasons — the key must be
+/// fixed-size against an attacker-chosen string, and a peer id's two hex spellings denote one
+/// identity, so a ledger keyed on the raw text would give a stranger a fresh allowance per spelling.
+fn claimant_key(claiming_peer_id: &str) -> [u8; 32] {
+    let mut hasher = chia_sha2::Sha256::new();
+    hasher.update(claiming_peer_id.to_ascii_lowercase().as_bytes());
+    hasher.finalize()
+}
+
+/// [`verdict_for`], but only if the budget allows the reads it would perform.
+///
+/// **This is the composition production uses**, so a test that drives it is exercising the real
+/// ordering rather than re-deriving it: the budget is consulted BEFORE the source is touched, so a
+/// refused claim reads nothing, and a proven bond forgives its claimant's ledger.
+///
+/// The parameter list is `verdict_for`'s, in `verdict_for`'s order, with the budget in front. That
+/// is deliberate and is why the lint is allowed here rather than satisfied by grouping: four of the
+/// arguments are opaque 32-byte values, so the one mistake this wrapper could make is transposing
+/// two of them, and a signature that mirrors the wrapped function exactly makes such a transposition
+/// visible at the call site below instead of hiding it inside a re-packing struct.
+#[allow(clippy::too_many_arguments)]
+fn admitted_verdict_for<S: ChainSource>(
+    admission: &ReadAdmission,
+    source: &S,
+    store_launcher_id: Bytes32,
+    root_hash: Bytes32,
+    epoch: &BigInt,
+    required_collateral: Option<u64>,
+    claiming_peer_id: &str,
+    claimed_coin_id: Bytes32,
+) -> BondVerdict {
+    if !admission.admit(claiming_peer_id, claimed_coin_id.to_bytes()) {
+        return BondVerdict::Unverified;
+    }
+    let verdict = verdict_for(
+        source,
+        store_launcher_id,
+        root_hash,
+        epoch,
+        required_collateral,
+        claiming_peer_id,
+        claimed_coin_id,
+    );
+    if verdict == BondVerdict::Bonded {
+        admission.record_proven(claiming_peer_id);
+    }
+    verdict
 }
 
 /// The memo of definite verdicts, keyed on the exact question each one answered.
@@ -354,9 +584,26 @@ impl VerdictCache {
             return;
         };
         if entries.len() >= MAX_CACHED_VERDICTS {
-            // Evict one arbitrary entry, not the map. `HashMap` iteration order is unspecified, so
-            // the victim is not attacker-selectable either; the cost of a wrong guess is one chain
-            // read, never a wrong answer.
+            // Expired first. Eviction should reclaim what is already worthless before it touches
+            // anything live, and a full map is the only moment worth paying the scan for.
+            entries.retain(|_, (taken, _)| taken.elapsed() < VERDICT_TTL);
+        }
+        if entries.len() >= MAX_CACHED_VERDICTS {
+            // Still full of LIVE entries, so admitting this one costs an honest verdict. Only a
+            // `Bonded` is worth that trade, and only a `Bonded` is expensive to obtain: it requires
+            // a coin that exists, is fully collateralised, and declares its claimant.
+            //
+            // **An `Unbonded` is refused admission rather than allowed to evict.** The previous
+            // version evicted one arbitrary entry per insert, which read as conservative but is
+            // paced by the attacker: `Unbonded` is the verdict a stranger elicits for FREE by
+            // naming coin ids that do not exist, so at an attacker-chosen insert rate the map turns
+            // over entirely in well under a minute and every honest `Bonded` this node earned is
+            // discarded. Refusing the cheap insert instead means a flood of invented coin ids
+            // cannot displace a single earned verdict — it only re-reads its own claims, which
+            // `ReadAdmission` is separately bounding.
+            if verdict != BondVerdict::Bonded {
+                return;
+            }
             if let Some(victim) = entries.keys().next().copied() {
                 entries.remove(&victim);
             }
@@ -406,9 +653,30 @@ impl ChainBondVerifier {
         //
         // Re-read per call rather than held from bring-up, matching the mirror pass: a transport
         // built once would make a node that started offline one that never verifies again.
+        //
+        // At the BOND floor, not the sync one (dig-node#513). `CORROBORATION_FLOOR` is two
+        // because the sync path writes the wallet's replica and a refused round stalls it; this
+        // path writes nothing, so a refusal costs `Unverified` -- the tier every record occupies
+        // with no verifier installed -- while believing a two-voice round sells a promotion for
+        // the price of two peers.
         let Ok(source) = self
             .chain
             .corroborated_chain_source(tokio::runtime::Handle::current())
+            .map(|source| {
+                source.requiring_corroboration(dig_wallet::sage::quorum::BOND_CORROBORATION_FLOOR)
+            })
+        else {
+            return BondVerdict::Unverified;
+        };
+
+        // The concurrency ceiling, and `try_acquire` rather than `acquire`: a queue of tasks
+        // waiting for a permit is an unbounded backlog of attacker-directed work held on this
+        // node's heap, and the honest answer when the budget is saturated is available immediately
+        // -- `Unverified`, the tier every record occupies with no verifier installed.
+        static IN_FLIGHT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+        let Ok(_permit) = IN_FLIGHT
+            .get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFICATIONS))
+            .try_acquire()
         else {
             return BondVerdict::Unverified;
         };
@@ -416,7 +684,8 @@ impl ChainBondVerifier {
         // `ChainSource` is blocking, so the read leaves the async worker rather than parking it.
         let epoch_big = BigInt::from(epoch);
         let verdict = tokio::task::block_in_place(|| {
-            verdict_for(
+            admitted_verdict_for(
+                ReadAdmission::shared(),
                 &source,
                 store,
                 root,
@@ -576,11 +845,11 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    /// A chain that counts every read reaching it and answers nothing.
+    /// A chain that counts every read reaching it and answers "no such coin".
     ///
-    /// Answering nothing is deliberate: the property under test is that the source is not consulted
-    /// AT ALL, so a double that could satisfy a read would let a short-circuit that merely fails
-    /// fast look identical to one that never asks.
+    /// Answering nothing is deliberate. It makes the read COUNT the only variable: a claim against
+    /// this source is disproven at the first step, so any count above one is a retry loop or a
+    /// second question, both of which this module owes the network not to perform.
     struct CountingChain {
         reads: Arc<AtomicUsize>,
     }
@@ -688,31 +957,35 @@ mod tests {
             let terms = vec![format!("dig-peer:{claiming_peer_id}")];
             match peer_declaration(&terms, claiming_peer_id) {
                 PeerDeclaration::DeclaresThisPeer => BondVerdict::Bonded,
-                PeerDeclaration::Silent | PeerDeclaration::NotReadable => BondVerdict::Unverified,
+                PeerDeclaration::Silent => BondVerdict::Unverified,
             }
         }
     }
 
-    /// **Proves (dig-node#466, HIGH finding 2 — the residual the credit-only lattice does NOT
-    /// close):** a hearsay record naming an honest holder's peer id AND its real coin id, but
-    /// carrying the ATTACKER's addresses, is not promoted — so the address a redirected reader
-    /// dials is unchanged by it.
+    /// **Proves (dig-node#473):** a record carrying an honest holder's peer id and real coin id but
+    /// the ATTACKER's addresses IS promoted here — and the promotion is bounded to ONE slot however
+    /// many copies of it a slate contains.
     ///
-    /// **Catches:** the hole neither other test can see. Every field of this record is honest
-    /// except the one that matters, so a coin-id check passes, a peer-id check passes, and the peer
-    /// id is IDENTICAL in the passing and failing versions of the code — which is why the assertion
-    /// is on the addresses. `stop_on_providers` means one answer can be the whole slate, so a
-    /// promotion here puts the attacker's host first for every reader that trusts the ranking, and
-    /// the dial does not pin the peer id (DIG-Network/dig-gossip#85) to catch it afterwards.
+    /// **This test previously asserted the opposite, and it was wrong for a measured reason.** Its
+    /// premise was that "the dial does not pin the peer id (dig-gossip#85) to catch it afterwards".
+    /// That is true only of `dig-gossip`'s legacy rustls outbound, which dig-node never dials on:
+    /// every dial it makes passes the expected id through `dig-nat` to `dig-tls`, whose verifier
+    /// fails the handshake with `peer_id mismatch`. So the attacker's addresses buy a refused
+    /// connection, not a redirected reader, and the honest promotion is not a hole.
     ///
-    /// The verifier is driven through the REAL [`peer_declaration`] gate rather than a hand-written
-    /// verdict, so this test measures production's answer: with no sound coin -> peer binding
-    /// available, nothing is promoted at all.
+    /// **Catches:** the bound going missing. The coin binds coin -> peer id and never peer id ->
+    /// address, so nothing in this layer can tell the honest holder's record from the attacker's
+    /// copy of it — both name the same peer and the same real coin. What this layer CAN do is refuse
+    /// to spend more than one promoted slot on one claimed peer id, which is what keeps a single
+    /// stolen identity from filling the whole verified budget. The slate below carries three copies
+    /// and one ordinary holder, so a missing dedup shows up as three promotions instead of one.
     #[tokio::test]
-    async fn an_honest_peer_id_with_attacker_addresses_is_not_promoted() {
+    async fn one_stolen_identity_cannot_occupy_more_than_one_promoted_slot() {
         let slate = Slate(vec![
-            holder_at(0xCC, None, "honest.example"), // an ordinary holder, no pointer
-            holder_at(0xAA, Some([0x01; 32]), "attacker.example"),
+            holder_at(0xCC, None, "honest-no-pointer.example"),
+            holder_at(0xAA, Some([0x01; 32]), "attacker-1.example"),
+            holder_at(0xAA, Some([0x01; 32]), "attacker-2.example"),
+            holder_at(0xAA, Some([0x01; 32]), "attacker-3.example"),
         ]);
         let slot = bond_verifier_slot();
         let _ = slot.set(Arc::new(EveryChainCheckPasses));
@@ -723,9 +996,13 @@ mod tests {
 
         assert_eq!(
             hosts,
-            vec!["honest.example", "attacker.example"],
-            "a record whose peer id and coin id are both honest must still not promote the \
-             addresses it chose for itself"
+            vec![
+                "attacker-1.example",
+                "honest-no-pointer.example",
+                "attacker-2.example",
+                "attacker-3.example",
+            ],
+            "exactly one copy is promoted; the rest fall back to baseline in source order, never below it"
         );
     }
 
@@ -766,19 +1043,67 @@ mod tests {
         );
     }
 
-    /// **Proves (dig-node#466, security F1):** no chain is read at all while nothing can bind a
-    /// coin to a peer.
+    /// **Proves (dig-node#473, adversarial gate):** the promotion bound is keyed on the peer's
+    /// IDENTITY, not on the text a record happened to spell it with.
     ///
-    /// **Catches:** the amplifier. The production `ChainSource` reaches `api.coinset.org`, and a
-    /// `Bonded` that degrades to `Unverified` is the one verdict the cache refuses to hold — so
-    /// each read is re-paid on every locate, up to the locate budget, for an answer the stable
-    /// credit-only sort provably discards. The counting source makes the absence of that egress an
-    /// assertion rather than a claim.
+    /// **Catches:** the bound being defeated at zero cost. Everything that GRANTS a promotion
+    /// compares bytes — the coin's declaration decodes the hex, and the TLS pin compares certificate
+    /// hashes — so a peer id in upper case and the same id in lower case are one peer to every check
+    /// that matters. A bound keyed on the raw string is not: a stranger returning one honest
+    /// holder's peer id in eight different hex spellings, each with its own addresses, would have
+    /// eight distinct keys, eight promotions, and eight chain reads, and would occupy the whole
+    /// verified budget on the strength of a single bond it does not hold.
     ///
-    /// The count is asserted at zero AND the verdict at `Unverified`, so a short-circuit that
-    /// changed the answer would fail here rather than pass quietly.
+    /// The two records below differ ONLY in the case of that one field, so a set keyed on the text
+    /// promotes both and a set keyed on the identity promotes one.
+    #[tokio::test]
+    async fn the_promotion_bound_is_not_defeated_by_respelling_one_peer_id() {
+        let mut shouted = holder_at(0xAA, Some([0x01; 32]), "attacker.example");
+        shouted.provider_peer_id = shouted.provider_peer_id.to_uppercase();
+        assert_ne!(
+            shouted.provider_peer_id,
+            holder_at(0xAA, None, "x").provider_peer_id,
+            "the fixture must actually differ as TEXT, or it proves nothing"
+        );
+
+        // The honest holder sits BETWEEN the two spellings, and that placement is the whole test.
+        // With it last, a promoted respelling and a baseline one land in the same position under a
+        // stable sort and the two behaviours are indistinguishable -- the test would pass either
+        // way. Here, promoting the respelling moves it AHEAD of the honest record; bounding it
+        // leaves the honest record in front.
+        let slate = Slate(vec![
+            holder_at(0xAA, Some([0x01; 32]), "attacker-lower.example"),
+            holder_at(0xCC, None, "honest.example"),
+            shouted,
+        ]);
+        let slot = bond_verifier_slot();
+        let _ = slot.set(Arc::new(EveryChainCheckPasses));
+        let locator = BondRankingLocator::new(Arc::new(slate), slot);
+
+        let got = locator.find_providers(&capsule()).await.expect("located");
+        let hosts: Vec<String> = got.iter().map(|r| r.addresses[0].host.clone()).collect();
+
+        assert_eq!(
+            hosts,
+            vec![
+                "attacker-lower.example",
+                "honest.example",
+                "attacker.example",
+            ],
+            "one identity earns one promoted slot however it is spelled; the respelling stays at baseline, BEHIND the honest holder it would otherwise have jumped"
+        );
+    }
+
+    /// **Proves (dig-node#466 / #473):** a wrong pointer costs the verifier exactly ONE chain read,
+    /// with no retry loop — the cost the ticket requires be borne by the publisher, not the reader.
+    ///
+    /// **Catches:** the amplifier. The production `ChainSource` reaches `api.coinset.org`, the coin
+    /// id is chosen by whoever wrote the provider record, and `Unbonded` is a verdict a stranger can
+    /// elicit for free. A retry, or a second question asked of a claim already disproven, multiplies
+    /// attacker-directed egress by the locate budget. The count is asserted alongside the verdict so
+    /// a change that stopped reading altogether would fail here rather than pass quietly.
     #[test]
-    fn nothing_is_read_from_the_chain_while_the_declaration_has_no_source() {
+    fn a_disproven_pointer_costs_exactly_one_chain_read() {
         let reads = Arc::new(AtomicUsize::new(0));
         let source = CountingChain {
             reads: Arc::clone(&reads),
@@ -796,34 +1121,260 @@ mod tests {
 
         assert_eq!(
             verdict,
-            BondVerdict::Unverified,
-            "withholding credit is the answer the short-circuit must preserve"
+            BondVerdict::Unbonded,
+            "the chain answered and there is no such coin, which disproves the claim"
         );
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "a verdict that cannot be `Bonded` must cost no chain read"
-        );
-        assert!(
-            !declaration_source_is_readable(),
-            "control: the short-circuit is active precisely because the source is unreadable — \
-             when 0.8.0's accessor lands this flips and the reads resume"
+            1,
+            "one read settles it; anything more is a retry loop paid for by the reader"
         );
     }
 
+    /// **Proves (dig-node#501, security round 1, HIGH):** locate-triggered verification spends a
+    /// PROCESS-WIDE budget of chain reads, so spreading the traffic across identities does not
+    /// multiply this node's outbound egress.
+    ///
+    /// **Catches:** the aggregate cap going missing — the defect this PR introduced by lifting the
+    /// pre-read short-circuit. The inbound gate that admits a locate is per-requestor (burst 16 at
+    /// 4/sec) over up to 4,096 self-minted identities, so it bounds nothing in aggregate; every
+    /// admitted locate then verified up to eight records at two HTTPS reads each, through the ONE
+    /// `ChiaQuery` client the node's own wallet, census and spends read through.
+    ///
+    /// Each row here uses a DISTINCT claimant, so the per-claimant ledger cannot be what bites and
+    /// the number asserted is the aggregate bucket's. The count is asserted from the chain double
+    /// itself rather than from the admission's own bookkeeping — an admission that returned `false`
+    /// while still reading would pass a test that only counted refusals.
     #[test]
-    fn no_visible_term_promotes_a_claim_before_the_typed_accessor_exists() {
+    fn locate_triggered_chain_reads_are_capped_process_wide() {
+        const BURST: u32 = 4;
+        const CLAIMS: u32 = 20;
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingChain {
+            reads: Arc::clone(&reads),
+        };
+        // No refill during the test: a rate the test cannot outrun would make the cap unobservable.
+        let admission = ReadAdmission::new(BURST, 0.0);
+
+        let mut verdicts = Vec::new();
+        for claim in 0..CLAIMS {
+            verdicts.push(admitted_verdict_for(
+                &admission,
+                &source,
+                Bytes32::new(STORE),
+                Bytes32::new(ROOT),
+                &BigInt::from(7u64),
+                Some(1),
+                // A fresh claimant per row, each a well-formed 64-hex id.
+                &format!("{claim:064x}"),
+                Bytes32::new([0x33; 32]),
+            ));
+        }
+
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            BURST as usize,
+            "the budget is the ceiling on chain reads, whatever the claim rate"
+        );
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|v| **v == BondVerdict::Unbonded)
+                .count(),
+            BURST as usize,
+            "control: every admitted claim was genuinely answered, so the cap is not hiding a \
+             function that stopped reading altogether"
+        );
+        assert!(
+            verdicts[BURST as usize..]
+                .iter()
+                .all(|v| *v == BondVerdict::Unverified),
+            "past the budget a record stays at the tier it would occupy with no verifier at all -- \
+             withheld credit, never a demotion, and never a blocked read"
+        );
+    }
+
+    /// **Proves (dig-node#501, security round 1, HIGH):** one claimant cannot spend an unbounded
+    /// number of chain reads on coin ids it invents.
+    ///
+    /// **Catches:** the case the verdict cache structurally cannot absorb. [`VerdictKey`] includes
+    /// the coin id and MUST — without it a stranger republishing a public coin id would inherit its
+    /// holder's `Bonded` — so a slate of records carrying invented coin ids misses the cache once
+    /// per invented id, by construction. No cache design fixes that; only a bound on how many
+    /// unproven ids one claimed identity is allowed does.
+    ///
+    /// The budget here is deliberately large, so the number asserted can only be the per-claimant
+    /// ledger's. A single-claimant test against the aggregate bucket alone would pass with no
+    /// ledger at all.
+    #[test]
+    fn fabricated_coin_ids_from_one_claimant_stop_costing_chain_reads() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingChain {
+            reads: Arc::clone(&reads),
+        };
+        let admission = ReadAdmission::new(1_000, 0.0);
+        let claimant = "aa".repeat(32);
+
+        for invented in 0..32u8 {
+            admitted_verdict_for(
+                &admission,
+                &source,
+                Bytes32::new(STORE),
+                Bytes32::new(ROOT),
+                &BigInt::from(7u64),
+                Some(1),
+                &claimant,
+                Bytes32::new([invented; 32]),
+            );
+        }
+
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            MAX_UNPROVEN_COINS_PER_CLAIMANT,
+            "a claimant that never proves a bond gets a fixed allowance of invented coin ids"
+        );
+
+        // The control, and the reason the bound is not simply a per-peer denial: a DIFFERENT
+        // claimant is unaffected by this one's exhaustion.
+        admitted_verdict_for(
+            &admission,
+            &source,
+            Bytes32::new(STORE),
+            Bytes32::new(ROOT),
+            &BigInt::from(7u64),
+            Some(1),
+            &"bb".repeat(32),
+            Bytes32::new([0x01; 32]),
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            MAX_UNPROVEN_COINS_PER_CLAIMANT + 1,
+            "the ledger is per claimant; one peer exhausting its allowance must not silence another"
+        );
+    }
+
+    /// **Proves (dig-node#501, security round 1, HIGH, second half):** a flood of cheap negative
+    /// verdicts cannot displace a verdict this node earned.
+    ///
+    /// **Catches:** attacker-paced eviction. The previous `remember` evicted one arbitrary entry per
+    /// insert past [`MAX_CACHED_VERDICTS`], which reads as conservative and is not: `Unbonded` is
+    /// the verdict a stranger elicits for FREE by naming coin ids that do not exist, so at an
+    /// attacker-chosen insert rate the whole map turns over in under a minute and every earned
+    /// `Bonded` is discarded — the "memoisation into an amplifier" the constant's own doc warns
+    /// about, reached one entry at a time instead of all at once.
+    ///
+    /// The honest entries are counted rather than sampled, so an implementation that dropped one
+    /// per cheap insert would fail here rather than pass on the entry the test happened to check.
+    #[test]
+    fn a_flood_of_cheap_negatives_cannot_evict_an_earned_verdict() {
+        let store = Bytes32::new(STORE);
+        let root = Bytes32::new(ROOT);
+        let cache = VerdictCache::default();
+
+        let earned: Vec<VerdictKey> = (0..MAX_CACHED_VERDICTS)
+            .map(|n| VerdictKey::new([n as u8; 32], store, root, 7, &format!("{n:064x}")))
+            .collect();
+        for key in &earned {
+            cache.remember(*key, BondVerdict::Bonded);
+        }
+        let held = earned.iter().filter(|k| cache.get(k).is_some()).count();
+        assert_eq!(
+            held, MAX_CACHED_VERDICTS,
+            "control: the map really is full of live earned verdicts before the flood"
+        );
+
+        let liar = "ff".repeat(32);
+        for invented in 0..64u8 {
+            cache.remember(
+                VerdictKey::new([invented; 32], store, root, 7, &liar),
+                BondVerdict::Unbonded,
+            );
+        }
+
+        assert_eq!(
+            earned.iter().filter(|k| cache.get(k).is_some()).count(),
+            MAX_CACHED_VERDICTS,
+            "not one earned verdict may be traded for a negative that cost the publisher nothing"
+        );
+        assert_eq!(
+            cache.get(&VerdictKey::new([0x07; 32], store, root, 7, &liar)),
+            None,
+            "the cheap negative is refused admission rather than admitted at an honest entry's cost"
+        );
+    }
+
+    /// **Proves (dig-node#473):** the declaration source is LIVE, so the pre-read short-circuit no
+    /// longer withholds every verdict — and the probe that lifts it is a genuine fail-closed
+    /// self-test rather than a switch someone must remember to flip.
+    ///
+    /// **Catches:** a silent regression in the format agreement. The probe asks the production
+    /// [`peer_declaration`] for the one term a coin owned by `probe_peer` would carry. If a future
+    /// `dig-mirror-coin` changed the declaration format, or the accessor stopped answering, this
+    /// goes false and `verdict_for` returns to withholding credit from everyone — the safe
+    /// direction — instead of promoting on a check it can no longer make. Asserting it TRUE here is
+    /// what makes that failure visible as a red test rather than as silently inert ranking.
+    #[test]
+    fn the_declaration_source_is_live_and_its_probe_is_a_fail_closed_self_test() {
+        assert!(
+            declaration_source_is_readable(),
+            "the typed accessor must answer, or promotion is unreachable for every input"
+        );
+
         let peer = "aa".repeat(32);
-        for terms in [
-            vec![],
+        assert_eq!(
+            peer_declaration(&[format!("dig-peer:{peer}")], &peer),
+            PeerDeclaration::DeclaresThisPeer,
+            "control: the probe and the production path are the same function"
+        );
+    }
+
+    /// **Proves (dig-node#473):** only the coin's own declaration of THIS claimant promotes it.
+    ///
+    /// **Catches:** the binding degrading to "some coin bonds this content", which is the weaker
+    /// question a stranger republishing a public coin id passes. Every row shares one claimant and
+    /// varies only what the coin says, so a check that ignored the terms would answer identically
+    /// for all of them.
+    #[test]
+    fn only_the_coins_own_declaration_of_this_claimant_promotes_it() {
+        let peer = "aa".repeat(32);
+        let other = "bb".repeat(32);
+
+        let promotes = [
             vec![format!("dig-peer:{peer}")],
-            vec![format!("dig-peer:{}", "bb".repeat(32))],
-            vec!["https://mirror.example/store".to_string()],
-        ] {
-            assert_ne!(
+            vec![
+                "https://mirror.example/store".to_string(),
+                format!("dig-peer:{peer}"),
+            ],
+            // The owner wrote the id in the other case; it denotes the same SHA-256.
+            vec![format!("dig-peer:{}", peer.to_uppercase())],
+        ];
+        for terms in promotes {
+            assert_eq!(
                 peer_declaration(&terms, &peer),
                 PeerDeclaration::DeclaresThisPeer,
-                "promotion must stay unreachable until the binding has a typed source; terms {terms:?}"
+                "terms {terms:?}"
+            );
+        }
+
+        let withholds = [
+            vec![],
+            vec!["https://mirror.example/store".to_string()],
+            // Someone else's coin, republished by this claimant.
+            vec![format!("dig-peer:{other}")],
+            // Two declarations name nobody -- one coin's collateral must not back two peers.
+            vec![format!("dig-peer:{peer}"), format!("dig-peer:{other}")],
+            // Prefix lookalikes are ordinary advertised strings.
+            vec![format!("xdig-peer:{peer}")],
+            vec![format!("dig-peers:{peer}")],
+            // A payload that is not a peer id.
+            vec!["dig-peer:nope".to_string()],
+        ];
+        for terms in withholds {
+            assert_eq!(
+                peer_declaration(&terms, &peer),
+                PeerDeclaration::Silent,
+                "terms {terms:?}"
             );
         }
     }

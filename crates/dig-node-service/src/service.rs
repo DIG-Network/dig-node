@@ -1688,9 +1688,14 @@ pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
         }
         for (home, why) in &sweep.failed {
             summary.push_str(&format!(
-                "
-  WARN could not remove the user-level registration belonging to {} ({why}); it                  may keep starting a second node on the same port. Have that user run: dig-node                  uninstall --scope user",
-                home.display()
+                concat!(
+"
+  WARN could not remove the user-level registration belonging to {home} ({why}); it ",
+"may keep starting a second node on the same port. Have that user run: dig-node ",
+"uninstall --scope user"
+),
+                home = home.display(),
+                why = why
             ));
         }
         summary.push_str(&format!(
@@ -2627,7 +2632,13 @@ mod tests {",
             for (label, dirs) in [("unix", &unix), ("windows", &windows)] {
                 assert!(
                     !dirs.iter().any(|d| d == std::path::Path::new(bad)),
-                    "{bad:?} is writable by a non-privileged user on a common install and MUST NOT                      be a privileged tool directory ({label}): {dirs:?}"
+                    concat!(
+                        "{bad:?} is writable by a non-privileged user on a common install and MUST NOT ",
+                        "be a privileged tool directory ({label}): {dirs:?}"
+                    ),
+                    bad = bad,
+                    label = label,
+                    dirs = dirs
                 );
             }
         }
