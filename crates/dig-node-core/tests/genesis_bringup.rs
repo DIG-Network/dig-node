@@ -46,7 +46,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dig_node_core::peer::{genesis_challenge_from_env, install_crypto_provider, spawn_peer_network};
+use dig_node_core::peer::{
+    genesis_challenge_from_env, install_crypto_provider, spawn_peer_network,
+};
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork;
 use dig_node_core::Node;
 
