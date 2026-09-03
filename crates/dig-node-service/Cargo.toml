@@ -92,7 +92,7 @@ async-trait = "0.1"
 # "0.6.0" the suite went green over a `control.wallet.coinById` the contract had never heard of --
 # it checked nothing about the very method the change added. A caret range keeps the pin moving
 # with the published catalog instead of silently narrowing what CI can see.
-dig-node-control-interface = "0.30"
+dig-node-control-interface = "0.31"
 
 # The deterministic mirror-coin collateral model: the per-epoch requirement, the controller
 # multiplier, the small-network handicap, the floor clamp, and the safety-margin arithmetic.
@@ -107,7 +107,7 @@ dig-mirror-collateral = "0.3"
 # The chain half of the same model: `census` counts the collateralised network at a block height
 # and hands `dig-mirror-collateral` the three integers its controller consumes (dig-node#400).
 # Without it a node could only ever record epoch 1, which is derivable from nothing.
-dig-mirror-coin = "0.7"
+dig-mirror-coin = "0.9"
 
 # The canonical `ChainSource` trait `dig-mirror-coin`'s census is generic over. Declared, not
 # implemented: `chia-query` already provides the implementation this node uses
@@ -120,7 +120,7 @@ dig-chainsource-interface = "0.3"
 # `build_reclaim` pass them straight through. They were dev-dependencies while the module was
 # unwired; a public signature cannot be spelled in a dev-dependency.
 #
-# The whole chia set moves TOGETHER and every version here is the one `dig-mirror-coin` 0.7 and
+# The whole chia set moves TOGETHER and every version here is the one `dig-mirror-coin` 0.9 and
 # `dig-wallet` compile against. A crate split across two chia lines compiles until something
 # crosses a public signature -- which is exactly what these four do -- and then the `Bytes32` the
 # builder wants is a different type from the one the caller holds.
@@ -337,7 +337,7 @@ chia-protocol = "0.36.1"
 # hand-written `CoinRecord` cannot exercise the authentication path the census runs, so the probe
 # would assert its property against a fixture that could not exhibit it.
 #
-# Every version here is the one `dig-mirror-coin` 0.7 itself compiles against, and the whole set
+# Every version here is the one `dig-mirror-coin` 0.9 itself compiles against, and the whole set
 # moves together: the chia ceiling is not one number, and a crate split across two chia lines
 # compiles only until something crosses a public signature.
 chia-puzzle-types = "0.36.1"
