@@ -376,3 +376,41 @@ async fn the_catalogued_name_for_32004_is_the_name_the_node_emits() {
         "the discovery document names -32004 differently from the frame the node emits"
     );
 }
+
+/// THE TWO FRAMES, not the two catalogues: `-32000` has TWO producers on one port — the
+/// dig-node shell (`rpc::rpc_error(DispatchFailed, ..)`, 2 sites) and the embedded read path
+/// (`dig_node_core::rpc_err(.., -32000, ..)`, 11 sites) — and a client branching on
+/// `data.code` cannot see which layer answered. So the two frames MUST publish one name.
+///
+/// Asserting either producer against the catalogue would pass on a catalogue that agrees
+/// with itself; asserting the two EMITTED frames against EACH OTHER is what makes this a
+/// decision test. The third assertion pins which name won, so a future edit cannot satisfy
+/// the equality by reconciling both onto a third string nobody publishes (dig-node#496).
+#[test]
+fn the_shell_and_the_read_path_publish_one_name_for_32000() {
+    let shell = dig_node_service::rpc::rpc_error(json!(1), ErrorCode::DispatchFailed, "x");
+    let read_path = dig_node_core::rpc_err(&json!(1), -32000, "x");
+
+    assert_eq!(
+        shell["error"]["code"], read_path["error"]["code"],
+        "the two producers must be compared at the SAME number"
+    );
+
+    let shell_name = shell["error"]["data"]["code"]
+        .as_str()
+        .expect("the shell frame carries a machine name in data.code");
+    let read_path_name = read_path["error"]["data"]["code"]
+        .as_str()
+        .expect("the read-path frame carries a machine name in data.code");
+
+    assert_eq!(
+        shell_name, read_path_name,
+        "-32000 reaches one client under TWO machine names: the shell says {shell_name:?}, \
+         the read path says {read_path_name:?}"
+    );
+    assert_eq!(
+        shell_name,
+        dig_rpc_protocol::ErrorCode::ServerError.machine_code(),
+        "the reconciled name must be the one the shared catalogue declares at -32000"
+    );
+}

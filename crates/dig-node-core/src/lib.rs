@@ -4573,7 +4573,11 @@ pub async fn handle_rpc_json(
 /// Every frame is minted through [`seams::dig_rpc::errors::error_frame`], so a declared code
 /// carries `data.code` + `data.origin` from `dig-rpc-protocol` by construction rather than by
 /// each call site remembering to add them (dig-node#340).
-fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
+///
+/// PUBLIC so a consumer that also mints frames at the same numbers — the dig-node shell — can be
+/// tested against the frame this crate actually emits, rather than against a restatement of it.
+/// Two producers of one wire shape are one edit away from disagreeing (dig-node#496).
+pub fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
     crate::seams::dig_rpc::errors::error_frame(id, code, message)
 }
 
