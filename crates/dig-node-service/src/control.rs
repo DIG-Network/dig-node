@@ -6078,7 +6078,10 @@ mod tests {
         assert_eq!(
             actual,
             contract.union(&overlay).copied().collect::<BTreeSet<_>>(),
-            "this node's master tier disagrees with dig-node-control-interface plus the declared              local overlay"
+            concat!(
+                "this node's master tier disagrees with dig-node-control-interface plus the declared ",
+                "local overlay"
+            )
         );
         assert!(
             contract.is_subset(&actual),
