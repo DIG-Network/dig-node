@@ -1014,14 +1014,21 @@ async fn a_peer_that_times_out_leaves_the_absence_unproven() {
     );
 }
 
-/// **Proves:** a peer that genuinely answers "nobody" DOES establish an absence.
+/// **Proves:** a peer that genuinely answers "nobody" STILL does not establish an absence
+/// (dig-node#508).
 ///
-/// **Fixture design — this is the truthful CONTROL for the test above, and it is load-bearing.**
-/// Without it, an implementation that marked every search inconclusive would pass every other
-/// assertion here while making every miss on the network unanswerable. The two tests differ in
-/// exactly one thing: whether the peer answered.
+/// **This assertion was INVERTED, on purpose.** It previously read `establishes_absence()` and was
+/// the truthful control for the timeout test above. dig-node#508 changed the answer: a peer's
+/// completed search is that PEER's completed search, and adopting it makes this node re-emit a
+/// stranger's assertion downstream at full strength. The fixture is unchanged so the inversion is
+/// legible in the diff rather than hidden behind a new one.
+///
+/// **The control role transferred, and did not evaporate** —
+/// [`a_node_that_never_asked_still_answers_a_plain_absence`] is now the only thing standing between
+/// this fix and "every miss is inconclusive". If that test is ever weakened, this file no longer
+/// distinguishes the fix from the opposite lie.
 #[tokio::test]
-async fn a_peer_that_answers_nobody_does_establish_an_absence() {
+async fn a_peer_that_answers_nobody_still_does_not_establish_an_absence() {
     let cid = content();
     let (pc, _dir) = engine(Vec::new(), &[1], Some(RecordingAsk::answering(Vec::new())));
 
@@ -1031,12 +1038,18 @@ async fn a_peer_that_answers_nobody_does_establish_an_absence() {
 
     assert!(located.is_empty());
     assert!(
-        located.establishes_absence(),
-        "the peer looked and reported nobody, which is a real answer"
+        !located.establishes_absence(),
+        "the peer answered, and answering is not the same as this node having searched - absence \
+         has no witness, so a hop's completed search proves nothing here (dig-node#508)"
     );
 }
 
 /// **Proves:** a node with recursion REFUSED still reports a plain absence, not an inconclusive one.
+///
+/// **THIS IS THE ANTI-VACUITY CONTROL for the whole file (dig-node#508).** Every other absence
+/// assertion here is now negative — no forwarded answer establishes an absence — and a codebase that
+/// simply never proved one would satisfy all of them. This test is the single assertion that fails
+/// on that implementation, so weakening it silently removes the floor under the fix.
 ///
 /// **Why this is not redundant with the control above:** recursion ships DISABLED, so a refusal is the
 /// ordinary case on almost every node. An implementation that treated "did not ask" as "could not
@@ -1726,6 +1739,13 @@ async fn a_refusal_to_forward_leaves_the_absence_unproven() {
 /// **On the revert** (classifying any `result` frame as a conclusive answer), the assertion on
 /// `establishes_absence` fires; the sibling assertion on the named holder stays green, which is how
 /// the failure is attributable.
+///
+/// **Since dig-node#508 this test is green for a WEAKER reason, and that is worth stating.** The
+/// forwarded leg is now unconditionally inconclusive, so the first assertion would hold even if the
+/// MERGE rule it was written to pin were removed entirely. It is kept because the second assertion —
+/// that the inconclusive child's records are still carried — is unaffected and still load-bearing;
+/// but the cascade property itself is now enforced structurally rather than by this fixture, and a
+/// reader must not treat this test as evidence that the merge still folds inconclusiveness.
 #[tokio::test]
 async fn one_inconclusive_child_defeats_a_sibling_that_found_nobody() {
     let cid = content();
@@ -1783,9 +1803,13 @@ async fn one_identity_over_two_items_forwards_for_both() {
     let two = pc.locate_holders(&second, batch, &RequestorId::Local).await;
 
     assert_eq!(ask.asked().len(), 2, "both items were forwarded for");
+    // INVERTED by dig-node#508: an answer from a peer never establishes an absence, so neither item
+    // may claim one. The `asked().len() == 2` assertion above is untouched and is what this test is
+    // actually for - the seen-set claim being per QUESTION-AND-CONTENT - and it is unaffected.
     assert!(
-        one.establishes_absence() && two.establishes_absence(),
-        "and both absences rest on a peer that actually answered, not on a lost claim"
+        !one.establishes_absence() && !two.establishes_absence(),
+        "both items were forwarded for, and a forwarded answer leaves the absence unproven at this \
+         node whatever the peer claimed"
     );
 }
 
@@ -1916,7 +1940,9 @@ async fn a_peers_absence_claim_cannot_move_this_nodes_verdict() {
         Some(&serde_json::json!(true))
     );
     assert_eq!(
-        disclaimed.frame.pointer("/result/items/0/absence_established"),
+        disclaimed
+            .frame
+            .pointer("/result/items/0/absence_established"),
         Some(&serde_json::json!(false))
     );
     assert!(
@@ -2006,5 +2032,62 @@ async fn a_holder_answer_whose_records_are_all_dropped_is_not_an_absence() {
         !located.establishes_absence(),
         "an emptiness produced by FILTERING is not a search that found nobody - the peer named a \
          holder, and no leg of this node ever proved an absence (dig-node#508)"
+    );
+}
+
+/// **Proves (dig-node#508):** an empty `Answered` and an empty `AnsweredInconclusive` are
+/// INDISTINGUISHABLE to everything downstream of the fold - routing and conduct alike.
+///
+/// **Why this matters to the fix.** The ticket's premise is that lying about `absence_established`
+/// is free: a peer that claims a proven absence and a peer that admits an unproven one are scored
+/// identically, so the only thing the claim ever bought was the verdict this fix removes. That
+/// equivalence was asserted nowhere. If a later change made the two outcomes score differently, the
+/// lie would acquire a price - and the reasoning behind the fix would need revisiting rather than
+/// silently rotting.
+///
+/// **Fixture design - an equality alone would be vacuous, so a third outcome pins the inequality.**
+/// A scorer that collapsed EVERY outcome to one value would satisfy the equality perfectly while
+/// measuring nothing. `TimedOut` is the control: it must score differently in both dimensions,
+/// because a peer that never answered is genuinely not the same as one that answered "nobody".
+#[test]
+fn an_empty_answer_and_an_inconclusive_answer_are_indistinguishable_to_routing_and_conduct() {
+    use crate::download::conduct_evidence;
+    use crate::seams::dig_peer::{AskRoutingState, RoutedPeer};
+
+    let peer = RoutedPeer::from_pool_key(&mock_peer_hex(1)).expect("a pool key is 64-hex");
+    let quality_after = |outcome: &AskOutcome| {
+        let state = AskRoutingState::new(None);
+        state.record(peer, outcome, Duration::ZERO);
+        state.quality_of(peer)
+    };
+
+    let answered = AskOutcome::Answered(Vec::new());
+    let inconclusive = AskOutcome::AnsweredInconclusive(Vec::new());
+
+    assert_eq!(
+        quality_after(&answered),
+        quality_after(&inconclusive),
+        "routing scores an honest 'nobody' exactly as it scores an admitted 'I could not tell': \
+         claiming the stronger one buys a peer no position in this node's ranking"
+    );
+    assert_eq!(
+        conduct_evidence(&answered),
+        conduct_evidence(&inconclusive),
+        "and conduct scores them identically too, because SPEC 8.2A requires that answering is \
+         never worse than staying silent - so the claim buys no reputation either"
+    );
+
+    // The inequality. Without it a scorer that returned one constant would pass the two assertions
+    // above while proving nothing about either dimension.
+    let timed_out = AskOutcome::TimedOut;
+    assert_ne!(
+        quality_after(&answered),
+        quality_after(&timed_out),
+        "a peer that never answered is NOT the same as one that answered 'nobody'"
+    );
+    assert_eq!(
+        conduct_evidence(&timed_out),
+        dig_sex::ConductEvidence::NonPerformance,
+        "and a timeout is non-performance, which is the class an empty answer must never fall into"
     );
 }

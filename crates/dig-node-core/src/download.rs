@@ -978,8 +978,10 @@ impl LocatedHolders {
 /// What the FORWARDED leg alone contributed: hearsay records, and whether every peer it consulted
 /// actually answered.
 ///
-/// `conclusive` starts TRUE and is only ever cleared, so every path that fails to establish something
-/// has to say so explicitly rather than relying on a default.
+/// `conclusive` is decided ONCE, by which constructor built the value, and nothing after that raises
+/// it. Only the two unasked paths — [`ForwardedAnswers::recursion_disabled`] and
+/// [`ForwardedAnswers::refused`] — carry a meaningful value at all; the asked path is unconditionally
+/// inconclusive, because absence has no witness (dig-node#508).
 struct ForwardedAnswers {
     records: Vec<ProviderRecord>,
     conclusive: bool,
@@ -1015,11 +1017,59 @@ impl ForwardedAnswers {
         }
     }
 
-    /// Peers are about to be asked; each one that does not answer clears the flag.
+    /// Peers ARE being asked, and that path is NEVER conclusive (dig-node#508).
+    ///
+    /// # Absence has no witness
+    ///
+    /// Content relayed by a stranger is safe to accept because the merkle root verifies it. There is
+    /// no such verifier for "nobody has it" — an absence is a claim about the whole network that no
+    /// arithmetic can check — so a node may establish one only from its OWN completed search, never
+    /// from testimony. Once this node has delegated part of the search to peers it cannot know
+    /// whether that part completed, and the peers' own word for it is exactly the testimony that
+    /// cannot be checked.
+    ///
+    /// **Nothing on this path may set the flag true.** Not a peer's `absence_established: true`, not
+    /// a full fan-out that all answered, not N corroborating peers: `decide_forward` selects over the
+    /// connected pool, which peer discovery and PEX can shape, so N corroborators an attacker
+    /// influenced is one answer wearing a hat — and an eclipsed pool collapses any k-of-n to 1. NC-12
+    /// survives eclipse only because the thing peers agree on is CONTENT, which verifies
+    /// independently of who said it.
+    ///
+    /// This finishes dig-node#273 rather than extending it. That ticket closed
+    /// *silence becomes an assertion* (`unwrap_or(true)`); this closes
+    /// *a stranger's assertion becomes ours*, the identical class with one door left open.
     fn asked() -> Self {
         Self {
             records: Vec::new(),
-            conclusive: true,
+            conclusive: false,
+        }
+    }
+}
+
+/// How one forwarded-ask outcome scores a peer's CONDUCT (#268).
+///
+/// An outcome where the peer answered — including an honest "I do not have it", and including one
+/// where the peer said its own subtree was incomplete — is an `HonestAnswer`, because SPEC 8.2A
+/// requires that answering is never worse than staying silent. A refusal, a timeout and an
+/// unreachable peer are `NonPerformance`: unverifiable, decaying, and floored, since none of them can
+/// be distinguished from distress an attacker induced in an honest peer.
+///
+/// Neither VERIFIABLE class is produced here, and deliberately so. A `ProvenLie` needs bytes that
+/// failed verification against the anchor, attributed to the peer that supplied them; that
+/// attribution happens inside `dig-download`'s engine against `chunk_hashes` and is not surfaced
+/// per-peer to this node (see the report on #268). Claiming one from a transport error would brand an
+/// honest peer on unverifiable evidence, which is the exact conflation SPEC 8.2A exists to prevent.
+///
+/// A free function so the classification can be asserted directly. dig-node#508 rests on the two
+/// empty-answer outcomes being scored IDENTICALLY here and in `ask_routing` — that is what makes
+/// claiming a proven absence cost a peer nothing — and a rule stated only inline cannot be pinned.
+pub(crate) fn conduct_evidence(outcome: &AskOutcome) -> dig_sex::ConductEvidence {
+    match outcome {
+        AskOutcome::Answered(_) | AskOutcome::AnsweredInconclusive(_) => {
+            dig_sex::ConductEvidence::HonestAnswer
+        }
+        AskOutcome::Refused | AskOutcome::TimedOut | AskOutcome::Unreachable => {
+            dig_sex::ConductEvidence::NonPerformance
         }
     }
 }
@@ -1994,10 +2044,10 @@ impl NodeContent {
             };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                // Out of time with peers left unasked. Those peers established nothing, so the
-                // absence this answer could otherwise claim is unproven.
+                // Out of time with peers left unasked. Logged because it is the operator-visible
+                // symptom of an under-budgeted recursion; it no longer needs to CLEAR anything,
+                // because an asked answer was never conclusive to begin with (dig-node#508).
                 tracing::debug!("forwarded ask: budget spent with peers unasked");
-                answers.conclusive = false;
                 break;
             }
             // The identity travels WITH the ask, because the far end reads it off the wire: an ask
@@ -2020,47 +2070,37 @@ impl NodeContent {
             // The ONLY writer of this node's routing memory, fed an outcome this node classified from
             // an exchange it issued and saw complete (dig_ecosystem#3129).
             self.ask_routing.record(routed, &outcome, started.elapsed());
-            // The SAME exchange, classified for conduct (#268). An outcome where the peer answered —
-            // including an honest "I do not have it" — is an `HonestAnswer`, because SPEC 8.2A
-            // requires that answering is never worse than staying silent. A refusal, a timeout and an
-            // unreachable peer are `NonPerformance`: unverifiable, decaying, and floored, since none
-            // of them can be distinguished from distress an attacker induced in an honest peer.
+            // The SAME exchange, classified for conduct (#268).
+            self.conduct
+                .observe(routed, conduct_evidence(&outcome), self.conduct_ticks());
+            // EVERY arm here leaves `answers.conclusive` false, and that is the fix for
+            // dig-node#508 rather than an oversight. The arms differ only in which RECORDS they
+            // contribute; none of them may raise the flag.
             //
-            // Neither VERIFIABLE class is produced here, and deliberately so. A `ProvenLie` needs
-            // bytes that failed verification against the anchor, attributed to the peer that supplied
-            // them; that attribution happens inside `dig-download`'s engine against `chunk_hashes` and
-            // is not surfaced per-peer to this node (see the report on #268). Claiming one from a
-            // transport error would brand an honest peer on unverifiable evidence, which is the exact
-            // conflation SPEC 8.2A exists to prevent.
-            self.conduct.observe(
-                routed,
-                match outcome {
-                    AskOutcome::Answered(_) | AskOutcome::AnsweredInconclusive(_) => {
-                        dig_sex::ConductEvidence::HonestAnswer
-                    }
-                    AskOutcome::Refused | AskOutcome::TimedOut | AskOutcome::Unreachable => {
-                        dig_sex::ConductEvidence::NonPerformance
-                    }
-                },
-                self.conduct_ticks(),
-            );
+            // The shape this replaces is worth naming, because it is re-derivable and looks
+            // reasonable: three arms cleared the flag and the fourth — a peer that answered and
+            // asserted its own subtree complete — did not. That single arm let a stranger's
+            // assertion become this node's, and `Node::availability_answer` then re-emitted it to
+            // the next hop, so an honest node laundered the claim and it travelled at full strength.
+            // The lie cost the peer nothing: an empty `Answered` and an empty `AnsweredInconclusive`
+            // are scored identically by both `ask_routing` and `conduct`.
             match outcome {
+                // The peer answered and named these providers. They are candidates to dial, and
+                // that is ALL an answer can contribute here: an empty answer names no holder, and a
+                // peer's word that its own search completed is testimony this node cannot check.
                 AskOutcome::Answered(records) => answers.records.extend(records),
                 // The peer answered and told us its OWN subtree did not finish. Its records are
-                // still candidates — a partial answer beats none — but its uncertainty is ours now.
-                // This is the arm that makes inconclusiveness CASCADE instead of dying one hop from
-                // where it arose, and without it a single stalled node manufactures a not-found for
-                // every reader downstream of the honest peer that reported it.
+                // still candidates — a partial answer beats none. Kept as a distinct arm for the
+                // log line: an operator reading this can tell a hop that admitted incompleteness
+                // from one that claimed none, even though the two lead to the same verdict here.
                 AskOutcome::AnsweredInconclusive(records) => {
                     tracing::debug!(peer = %peer, "forwarded ask: peer reports its own subtree unproven");
                     answers.records.extend(records);
-                    answers.conclusive = false;
                 }
                 // The peer did not look, or did not finish looking. Its silence is not an absence,
                 // and saying so is the entire point of dig-node#273.
                 inconclusive => {
                     tracing::debug!(peer = %peer, ?inconclusive, "forwarded ask: absence unproven");
-                    answers.conclusive = false;
                 }
             }
         }
