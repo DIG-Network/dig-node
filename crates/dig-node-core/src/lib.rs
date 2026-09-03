@@ -6136,10 +6136,14 @@ mod tests {
     /// **Proves (#213):** driving the REAL peer-network bring-up the OS service now invokes
     /// ([`peer::spawn_peer_network`]) starts the §14 chain-watch loop, which PROACTIVELY pulls a
     /// subscribed store's missing generation from a local "peer" (a real auth-required §21 remote)
-    /// with NO client read triggering the miss — EVEN THOUGH the P2P pool/DHT bring-up cannot come up
-    /// in this env (the pre-launch placeholder network genesis makes the gossip config invalid). That
-    /// is the whole point of the §14 decoupling: autonomous sync must run regardless of the P2P
-    /// layer's health. Hermetic + mainnet-safe: relay OFF, ephemeral peer port, a deterministic mock
+    /// with NO client read triggering the miss — INDEPENDENTLY of the P2P pool/DHT bring-up, which in
+    /// this env has no peer to reach (relay OFF, loopback only) and so converges on nothing. That is
+    /// for ENVIRONMENTAL reasons, NOT a rejected gossip config: the default network genesis is a REAL
+    /// non-zero value ([`peer::genesis_challenge_from_env`], see `peer.rs`), so the config is valid and
+    /// the bring-up itself proceeds — proved separately by
+    /// `tests/genesis_bringup.rs::default_genesis_brings_up_the_pool_dht_content_engine_and_peer_rpc_listener`
+    /// (dig-node#240). That independence is the whole point of the §14 decoupling: autonomous sync must
+    /// run regardless of the P2P layer's health. Hermetic + mainnet-safe: relay OFF, ephemeral peer port, a deterministic mock
     /// anchored-root resolver, a 1 s watch tick, the upstream a real §21 remote holding the generation.
     /// **Catches:** the exact #213 gap — chain-watch gated behind a pool/DHT bring-up that fails, so
     /// autonomous sync never actually runs even after the service wires the call.

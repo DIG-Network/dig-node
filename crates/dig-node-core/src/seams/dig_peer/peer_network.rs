@@ -32,6 +32,12 @@ pub trait PeerNetwork: Send + Sync {
     /// the FFI path never does). Idempotent — a second install is ignored.
     fn set_inventory_refresher(&self, refresher: InventoryRefresher);
 
+    /// Whether the DHT inventory-refresh hook is installed -- i.e. whether the bring-up got as far
+    /// as step 4c. Observable so an integration test can assert the DOWNSTREAM post-condition of a
+    /// successful pool + DHT bring-up rather than the `running` flag, which is set before the pool
+    /// exists and therefore holds even when every later step fails (dig-node#240).
+    fn has_inventory_refresher(&self) -> bool;
+
     /// Retain the live gossip pool handle (the standalone peer-network bring-up calls this once with
     /// the [`dig_gossip::GossipHandle`] it starts; the FFI path never does). Idempotent — a second
     /// install is ignored. Enables the control surface to dial peers + enumerate the connected pool.
@@ -64,6 +70,10 @@ impl PeerNetwork for Node {
 
     fn set_inventory_refresher(&self, refresher: InventoryRefresher) {
         let _ = self.inventory_refresher.set(refresher);
+    }
+
+    fn has_inventory_refresher(&self) -> bool {
+        self.inventory_refresher.get().is_some()
     }
 
     fn set_gossip_handle(&self, handle: dig_gossip::GossipHandle) {
