@@ -15720,6 +15720,141 @@ mod tests {
         }
     }
 
+    /// **Proves (dig-node#512):** the operator's onion-relay opt-in is not observable to a peer
+    /// through the PROXY ALLOWANCE. A refused relay must leave no trace anywhere a stranger can
+    /// read -- not in the refusal frame (#356/#504 already pin that), and not in the shared
+    /// `proxy_rate_limiter` whose state a LATER `dig.fetchRange` reports by changing shape.
+    ///
+    /// **The channel this closes.** Before the fix, `relay_capsule` charged the proxy allowance at
+    /// gate 3 and only then discovered it had no capsule warmer, so a token was spent on a relay
+    /// that could never happen. Token-consumed therefore held exactly when gates 1 and 2 passed --
+    /// and gate 1 is the attacker's own `proxy` flag, leaving the OPERATOR'S OPT-IN as the only
+    /// variable. `miss_outcome`'s second leg (`download.rs:2721`) checks the SAME bucket, so
+    /// draining it flips a subsequent `dig.fetchRange` from fetch-through to redirect. A stranger
+    /// reads `DIG_NODE_ONION_RELAY` by asking for one relay and watching a different method.
+    ///
+    /// **Fixture design -- vary ONE actor, keep a truthful control.** The two arms differ in
+    /// `set_onion_relay(false|true)` and in nothing else: same node shape, same peer id, same
+    /// no-refill allowance of exactly 1, same uncached capsule. `attach_p2p` deliberately wires NO
+    /// capsule warmer, which is the real build shape this defect lives in and is what makes the
+    /// relay-ON arm reach gate 3 and then refuse anyway.
+    ///
+    /// Both arms MUST answer `RESOURCE_UNAVAILABLE`, and that is asserted rather than assumed: if
+    /// one arm relayed successfully the two journeys would not be comparable and the probe below
+    /// would be measuring an honest difference instead of a leak.
+    ///
+    /// **Asserting equal refusal FRAMES would be vacuous here** -- that is #356/#504's guard, it
+    /// passes under this defect, and it is precisely why this ticket exists. The observation is
+    /// taken through the OTHER method, which is where the bucket's state is legible.
+    ///
+    /// **On the revert:** move the `capsule_warmer()` check in `relay_capsule` back BELOW the
+    /// `allow_proxy_fetch` check. The relay-ON arm then spends its only proxy token on a relay it
+    /// refuses, the probe degrades to `CONTENT_REDIRECT` while the relay-OFF arm still serves
+    /// bytes, and the final assertion fires.
+    #[test]
+    fn a_refused_relay_leaves_no_trace_in_the_proxy_allowance() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+
+        // One arm of the experiment: run a node whose ONLY difference is the operator's opt-in, ask
+        // it for a relay it will refuse, then read the shared proxy bucket through `dig.fetchRange`.
+        // Returns (the refusal frame, what the probe observed).
+        let arm = |relay_on: bool| -> (Value, Value) {
+            let content = anchored_mock_content(30, 3);
+            let cid = anchored_cid_for(&content);
+            let (store_hex, tip_hex, rk_hex) = match &cid {
+                ContentId::Resource {
+                    store_id,
+                    root,
+                    retrieval_key,
+                } => (
+                    hex::encode(store_id),
+                    hex::encode(root),
+                    hex::encode(retrieval_key),
+                ),
+                _ => unreachable!("resource id"),
+            };
+            let anchored_root = Bytes32::from_hex(&tip_hex).expect("64-hex root");
+            let (node, td) =
+                test_node_with_resolver(None, MockResolver::one(&store_hex, anchored_root));
+            attach_p2p(
+                &node,
+                vec![dig_download::testkit::mock_provider(1, &cid)],
+                content.clone(),
+                MissMode::Redirect,
+                &td,
+            );
+            let pc = node.p2p_content().expect("engine attached");
+            // Generous cheap-lookup budget so the probe is never refused for the WRONG reason, and a
+            // proxy allowance of exactly one no-refill token so a single stolen charge is legible.
+            pc.set_miss_rate_limit(100.0, 0.0);
+            pc.set_proxy_rate_limit(1.0, 0.0);
+            pc.set_onion_relay(relay_on);
+
+            // The one peer whose allowance is under observation. Both the relay ask and the probe
+            // are made as this identity, because the bucket is keyed per requestor.
+            let peer = || crate::rate_limit::RequestorId::Peer("5121".to_string());
+
+            // A capsule this node does not hold, so the module read misses and reaches the relay leg.
+            let uncached_store = id_hex(0x51);
+            let uncached_root = id_hex(0x52);
+            let refusal = rt.block_on(handle_rpc_as(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getModuleInfo","params":{
+                    "store_id": uncached_store, "root": uncached_root, "proxy": true,
+                }}),
+                crate::download::ReadOrigin::Peer,
+                crate::download::RequestProvenance::FirstParty,
+                peer(),
+            ));
+
+            // The PROBE: a proxy miss on real, anchored content. It serves bytes while the peer's
+            // proxy allowance holds a token and degrades to a redirect once it does not -- so its
+            // shape IS a readout of the bucket the relay leg may or may not have charged.
+            let probe = rt.block_on(handle_rpc_as(
+                &node,
+                json!({"jsonrpc":"2.0","id":2,"method":"dig.fetchRange","params":{
+                    "store_id": store_hex, "root": tip_hex, "retrieval_key": rk_hex,
+                    "length": 4096, "offset": 0, "proxy": true,
+                }}),
+                crate::download::ReadOrigin::Peer,
+                crate::download::RequestProvenance::FirstParty,
+                peer(),
+            ));
+            let observed = json!({
+                "served": probe.get("result").is_some(),
+                "error_code": probe["error"]["code"].clone(),
+            });
+            (refusal, observed)
+        };
+
+        let (off_refusal, off_observed) = arm(false);
+        let (on_refusal, on_observed) = arm(true);
+
+        // Precondition: BOTH arms must genuinely refuse the relay, or the arms are not comparable
+        // and the probe below is reading an honest difference rather than a side channel.
+        for (label, refusal) in [("relay OFF", &off_refusal), ("relay ON", &on_refusal)] {
+            assert_eq!(
+                refusal["error"]["code"],
+                json!(crate::download::RESOURCE_UNAVAILABLE),
+                "fixture precondition: the {label} arm must REFUSE the relay (this build wires no \
+                 capsule warmer), or the two journeys are not comparable: {refusal}"
+            );
+        }
+
+        // THE PROPERTY. Not the refusal frames -- those are equal under the defect too (#356/#504).
+        // The bucket a DIFFERENT method reports must be identical, because a refused relay must
+        // consume nothing at all.
+        assert_eq!(
+            on_observed, off_observed,
+            "the operator's onion-relay opt-in is observable through the proxy allowance: a \
+             refused relay charged a token on the opt-in arm, so a later dig.fetchRange changed \
+             shape. relay ON saw {on_observed}, relay OFF saw {off_observed}"
+        );
+    }
+
     /// dig_ecosystem#2007 Unit A: the miss → DHT-lookup path is rate-limited PER REQUESTOR — an
     /// over-budget requestor's miss is refused, a DIFFERENT requestor is unaffected.
     ///
