@@ -324,8 +324,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::sage::peer_reads::{CoinPeer, PeerSample};
     use crate::sage::db::WalletDb;
+    use crate::sage::peer_reads::{CoinPeer, PeerSample};
 
     /// A sample that holds no peers -- enough to build a source, since these cases never read.
     struct NoPeers;
