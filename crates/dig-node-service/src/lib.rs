@@ -48,6 +48,8 @@ pub mod config;
 /// `<base>`/Referer store-root rerooting, the content-type map, the SPA-vs-asset classifier, and the
 /// served-store CSP. The wiring lives in [`server`].
 pub mod content;
+#[cfg(test)]
+mod continuation_guard;
 pub mod control;
 /// CLI parity with the node's `control.*` surface (#426): a `dig-node`/`dign` subcommand for every
 /// control the extension can drive (status, config, cache, hosted stores, §21 sync, updater,

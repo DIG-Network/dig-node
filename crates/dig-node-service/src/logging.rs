@@ -258,7 +258,11 @@ mod tests {
     fn the_announcement_text_has_no_lost_string_continuation() {
         assert!(
             !FILE_LOGGING_DEGRADED.contains("  "),
-            "a run of consecutive spaces means a continuation lost its backslash:              {FILE_LOGGING_DEGRADED:?}"
+            concat!(
+                "a run of consecutive spaces means a continuation lost its backslash: ",
+                "{FILE_LOGGING_DEGRADED:?}"
+            ),
+            FILE_LOGGING_DEGRADED = FILE_LOGGING_DEGRADED
         );
     }
 
