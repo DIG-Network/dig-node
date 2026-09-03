@@ -2585,6 +2585,18 @@ fn operator_wallet_answer(ctx: &ControlCtx) -> WalletOperatorAddressResult {
 /// Key material. Every table it clears is chain-derived and reproduced by syncing; a seed is not.
 /// See [`dig_wallet::sage::db::WalletDb::reset_chain_cache`] for the table list, for why the
 /// authoritative flag is cleared in the SAME transaction, and for the in-flight-spend refusal.
+///
+/// # Its clock is the disciplined one (dig-node#541)
+///
+/// The `now_ms` fed into the in-flight-spend check comes from
+/// [`dig_wallet::sage::rpc::WalletBackend::reservation_now_ms`] — the same
+/// `ClockGovernor`-disciplined timeline `reserve_coins`/`prune_reservations` use — never a fresh,
+/// independent `SystemTime::now()` read. This method lives in a different crate than the rest of
+/// the reservation lifecycle, so it was (dig-node#541) the one call site that could silently drift
+/// onto its own clock: a wall clock stepped forward mid-hold (an NTP correction, a VM
+/// pause/resume) would make this reset's `now_ms` disagree with the reading that established the
+/// hold, letting the `SpendInFlight` refusal below be bypassed — the #348/#497 double-spend
+/// direction, since the reservation reads as already-expired though real time never moved.
 async fn wallet_reset_coin_db(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     if params.get("confirm").and_then(Value::as_bool) != Some(true) {
         return control_error(
@@ -2598,16 +2610,18 @@ async fn wallet_reset_coin_db(ctx: &ControlCtx, id: Value, params: &Value) -> Va
         );
     }
 
-    // The node's own clock. A caller-supplied instant would be a lapse oracle: a far-future value
-    // makes every live spend reservation read as expired, which is exactly the guard being asked
-    // to stand down.
-    let now_ms = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-    )
-    .unwrap_or(i64::MAX);
+    // The node's own clock, read through the SAME jump-disciplined timeline every other
+    // reservation call site uses (dig-node#532/#541) — never a fresh, undisciplined
+    // `SystemTime::now()` read. A caller-supplied instant would be a lapse oracle: a far-future
+    // value makes every live spend reservation read as expired, which is exactly the guard being
+    // asked to stand down. An UNDISCIPLINED node-local read has the same effect by accident: a
+    // wall clock stepped forward mid-hold (an NTP correction, a VM pause/resume) would make this
+    // reset's `now_ms` disagree with the reading `reserve_coins`/`prune_reservations` used to
+    // establish the hold, letting a still-live reservation's `SpendInFlight` refusal be bypassed —
+    // the #348/#497 double-spend direction. `reservation_now_ms()` shares its clamp state with
+    // every other reservation call site precisely so this one cannot see a different "now" than
+    // they do.
+    let now_ms = ctx.wallet.reservation_now_ms();
 
     match ctx.wallet.reset_coin_db(now_ms).await {
         Ok(Ok(report)) => control_ok(

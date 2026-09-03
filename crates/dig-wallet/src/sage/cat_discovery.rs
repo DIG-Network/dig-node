@@ -1467,6 +1467,174 @@ mod tests {
         );
     }
 
+    /// **THE WALLET FIXTURE dig-node#396 ASKS FOR** -- one `WalletDb`, produced ENTIRELY by the
+    /// production routing + promotion functions (never `db.upsert_*` directly), that ends up
+    /// holding a real CAT and a real NFT+DID at once.
+    ///
+    /// **Why the simulator carries the proof, and mainnet does not add anything this needs.**
+    /// Every coin here is a real chain-valid spend built with the same driver crate mainnet
+    /// spends use ([`chia_wallet_sdk`]); what a mainnet wallet would add beyond this is real
+    /// dollars behind the coin, which is not part of the claim being tested -- the claim is that
+    /// *the code* discovers a CAT and a singleton it holds, not that the CAT is worth anything.
+    /// Acquiring the real mainnet wallet this ticket originally asked for needs an offer signed
+    /// outside this repo (dig-node deliberately signs nothing for the user, #908) and stays a
+    /// named, checkable limitation rather than a gate -- see the ticket for the disposition.
+    ///
+    /// **This also corrects a citation standing on the ticket.** A prior verdict named
+    /// `db.rs:3365 upsert_cat` (called from `actions.rs:215`) as the production writer that
+    /// populates the `cats` metadata table when a CAT is discovered. It is not: every
+    /// `db.upsert_cat` call site in this crate -- `actions.rs:215` included -- sits inside a
+    /// `#[tokio::test]` function. The only PRODUCTION path to a `cats` row is the user-invoked
+    /// `update_cat` RPC action (`actions.rs:21`, via `update_cat_metadata`'s upsert) -- a CAT
+    /// nobody has renamed never gets one, and that is not a defect: `get_cats()` (`rpc.rs:2763`),
+    /// the surface a real `$DIG` balance actually reads, is scoped from
+    /// `owned_cat_asset_ids_scoped`, which reads `coins.asset_id`, never `cats`. So this fixture
+    /// asserts the signal that is actually load-bearing -- `owned_cat_asset_ids()` / `balance()`
+    /// -- rather than the unrelated metadata cache the ticket's stale citation pointed at.
+    ///
+    /// **The CAT is minted on the SAME [`Simulator`] the singleton was minted on, not a second
+    /// fresh one.** `Simulator::bls` draws its key from the simulator's own RNG, seeded
+    /// identically every `Simulator::new()` -- so two independent simulators' FIRST `.bls()` call
+    /// yields the SAME key every time, and `real_cat()` plus
+    /// `singleton::tests::mint_did_and_nft()`, each starting a fresh simulator, collide on it.
+    /// This fixture caught exactly that collision on its first run (see the non-vacuity control
+    /// below); a SECOND `.bls()` call on one shared simulator draws the next value from the same
+    /// RNG stream and is genuinely different, which is what makes two distinct wallet addresses
+    /// possible here.
+    #[tokio::test]
+    async fn a_wallet_holding_both_a_real_cat_and_a_real_nft_is_discoverable_end_to_end() {
+        let mut singleton = crate::sage::singleton::tests::mint_did_and_nft();
+
+        // Mint a CAT on the singleton's OWN simulator, under a second (genuinely distinct) key --
+        // seeing `real_cat()`'s recipe: issue, then spend once so the child's parent is itself a
+        // CAT coin, which is the only shape `Cat::parse_children` reconstructs from.
+        let ctx = &mut SpendContext::new();
+        let bob = singleton._sim.bls(1000);
+        let bob_p2 = StandardLayer::new(bob.pk);
+        let memos = ctx.hint(bob.puzzle_hash).unwrap();
+        let (issue_cat, cats) = SdkCat::single_issuance(
+            ctx,
+            bob.coin.coin_id(),
+            None,
+            1000,
+            Conditions::new().create_coin(bob.puzzle_hash, 1000, memos),
+        )
+        .unwrap();
+        bob_p2.spend(ctx, bob.coin, issue_cat).unwrap();
+        singleton
+            ._sim
+            .spend_coins(ctx.take(), std::slice::from_ref(&bob.sk))
+            .unwrap();
+        let cat0 = cats[0];
+        let inner = bob_p2
+            .spend_with_conditions(
+                ctx,
+                Conditions::new().create_coin(bob.puzzle_hash, 1000, memos),
+            )
+            .unwrap();
+        SdkCat::spend_all(ctx, &[CatSpend::new(cat0, inner)]).unwrap();
+        singleton._sim.spend_coins(ctx.take(), &[bob.sk]).unwrap();
+        let cat_child = cat0.child(bob.puzzle_hash, 1000).coin;
+        let cat_parent = ParentSpend {
+            coin: cat0.coin,
+            puzzle_reveal: singleton
+                ._sim
+                .puzzle_reveal(cat0.coin.coin_id())
+                .expect("cat parent puzzle reveal")
+                .to_vec(),
+            solution: singleton
+                ._sim
+                .solution(cat0.coin.coin_id())
+                .expect("cat parent solution")
+                .to_vec(),
+        };
+        let cat_asset_id = cat0.info.asset_id;
+        let cat_owner_p2 = bob.puzzle_hash;
+        let cat_amount = 1000u64;
+
+        // NON-VACUITY CONTROL: the two fixtures must be genuinely distinct assets owned by
+        // genuinely distinct keys, or every assertion below could pass for a degenerate reason
+        // (e.g. one fixture's coin standing in for both). This is the exact check that caught
+        // the same-simulator-key collision described above on this test's first run.
+        assert_ne!(
+            cat_asset_id,
+            Bytes32::default(),
+            "the CAT fixture has a real asset id"
+        );
+        assert_ne!(
+            cat_owner_p2, singleton.owner_p2,
+            "the CAT and the singleton are owned by different derived addresses of this wallet"
+        );
+        assert!(cat_amount > 0);
+
+        let derived = DerivedCats::derive(&[cat_owner_p2], &[cat_asset_id]);
+        let ours: HashSet<String> = [hex::encode(cat_owner_p2), hex::encode(singleton.owner_p2)]
+            .into_iter()
+            .collect();
+
+        let mut lineage = CountingLineage::default();
+        lineage
+            .by_parent
+            .insert(hex::encode(cat_child.parent_coin_info), cat_parent.clone());
+        lineage.by_parent.insert(
+            hex::encode(singleton.nft_child.parent_coin_info),
+            singleton.nft_parent.clone(),
+        );
+        lineage.by_parent.insert(
+            hex::encode(singleton.did_child.parent_coin_info),
+            singleton.did_parent.clone(),
+        );
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+
+        // The CAT tier: a coin at the hash this wallet's own address derives for its own asset.
+        let cat_rows = stage_from_states(&[state(cat_child, Some(10), None)], &derived, |_| false);
+        db.stage_cat_admissions(&cat_rows).await.unwrap();
+
+        // The point-read tier: two singleton coins, never at a p2 hash, staged for proof.
+        let singleton_rows = vec![
+            coin_row_of(singleton.nft_child, 100),
+            coin_row_of(singleton.did_child, 100),
+        ];
+        let (believed, staged) =
+            route_point_read_rows(&singleton_rows, &ours, &DerivedCats::default(), |_| false);
+        assert!(
+            believed.is_empty(),
+            "no singleton coin ever sits at an owned p2 hash"
+        );
+        db.stage_cat_admissions(&staged).await.unwrap();
+
+        let stats = promote_staged_cats(&db, &lineage, &ours).await.unwrap();
+        assert_eq!(
+            (stats.promoted, stats.resolved, stats.refused, stats.deferred),
+            (1, 2, 0, 0),
+            "one CAT promoted, both singletons resolved, nothing refused or left hanging: {stats:?}"
+        );
+
+        // THE PROPERTY this ticket actually needs measurable: the surfaces a real wallet's
+        // balance/ownership reads come from all come back non-empty and NAME the right assets.
+        assert_eq!(
+            db.owned_cat_asset_ids().await.unwrap(),
+            vec![hex::encode(cat_asset_id)],
+            "the CAT this wallet holds is discoverable by asset id"
+        );
+        assert_eq!(
+            db.balance(Some(&hex::encode(cat_asset_id))).await.unwrap(),
+            u128::from(cat_amount),
+            "and its balance is exactly what was minted"
+        );
+        let nfts = db.all_nfts().await.unwrap();
+        let dids = db.all_dids().await.unwrap();
+        assert_eq!(
+            nfts.len(),
+            1,
+            "the NFT reaches the table the wallet reads NFTs from"
+        );
+        assert_eq!(dids.len(), 1, "and the DID reaches the DID table");
+        assert_eq!(nfts[0].launcher_id, hex::encode(singleton.nft_launcher));
+        assert_eq!(dids[0].launcher_id, hex::encode(singleton.did_launcher));
+    }
+
     /// The ownership half: the SAME NFT, the SAME proof, and the one varied thing is whether this
     /// wallet controls the p2 hash the parent spend proves owns it.
     ///
