@@ -70,6 +70,9 @@ rpassword = "7"
 # adds only the HTTP transport, control-plane auth, CLI, and OS-service registration
 # around it, and produces the `dig-node` binary (distinct name from the engine lib).
 dig-node-core = { path = "../dig-node-core" }
+# Implementing `dig_node_core::mirror_bond::MirrorBondVerifier` (dig-node#466), whose seam is an
+# async trait. The SAME version dig-node-core already resolves, so no new graph entry appears.
+async-trait = "0.1"
 
 # The PUBLISHED control-plane contract (dig_ecosystem#2376, #2392).
 #
@@ -89,7 +92,7 @@ dig-node-core = { path = "../dig-node-core" }
 # "0.6.0" the suite went green over a `control.wallet.coinById` the contract had never heard of --
 # it checked nothing about the very method the change added. A caret range keeps the pin moving
 # with the published catalog instead of silently narrowing what CI can see.
-dig-node-control-interface = "0.27"
+dig-node-control-interface = "0.31"
 
 # The deterministic mirror-coin collateral model: the per-epoch requirement, the controller
 # multiplier, the small-network handicap, the floor clamp, and the safety-margin arithmetic.
@@ -104,7 +107,7 @@ dig-mirror-collateral = "0.3"
 # The chain half of the same model: `census` counts the collateralised network at a block height
 # and hands `dig-mirror-collateral` the three integers its controller consumes (dig-node#400).
 # Without it a node could only ever record epoch 1, which is derivable from nothing.
-dig-mirror-coin = "0.7"
+dig-mirror-coin = "0.9"
 
 # The canonical `ChainSource` trait `dig-mirror-coin`'s census is generic over. Declared, not
 # implemented: `chia-query` already provides the implementation this node uses
@@ -117,12 +120,16 @@ dig-chainsource-interface = "0.3"
 # `build_reclaim` pass them straight through. They were dev-dependencies while the module was
 # unwired; a public signature cannot be spelled in a dev-dependency.
 #
-# The whole chia set moves TOGETHER and every version here is the one `dig-mirror-coin` 0.7 and
+# The whole chia set moves TOGETHER and every version here is the one `dig-mirror-coin` 0.9 and
 # `dig-wallet` compile against. A crate split across two chia lines compiles until something
 # crosses a public signature -- which is exactly what these four do -- and then the `Bytes32` the
 # builder wants is a different type from the one the caller holds.
 chia-bls = "0.36.1"
 chia-protocol = "0.36.1"
+# The mirror-coin verdict cache keys on a hash of the claiming peer id, so the key stays fixed-size
+# and `Copy` against an attacker-chosen string. Same 0.36.1 line as every other chia primitive here
+# -- a second line would be a second `Sha256`.
+chia-sha2 = "0.36.1"
 chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
 # `MAINNET_CONSTANTS` -- the Chia L1 `AGG_SIG_ME` domain every mirror-coin spend is signed under
 # (`mirror::lifecycle::mirror_agg_sig_data`, dig-node#447). This is the crate `chia_wallet_sdk::types`
@@ -298,6 +305,11 @@ windows-sys = { version = "0.61", features = [
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
 [dev-dependencies]
+# `openrpc_drift_guard.rs` compares the shell's error catalogue against the shared contract
+# crate name-for-name. Already a normal dependency above; restated here only so the
+# integration-test crate can name it, and pinned to the SAME "0.10" line so the guard can
+# never compare against a different catalogue than the shell compiles against.
+dig-rpc-protocol = "0.10"
 # The `never_log` battery (#277) drives the real seed bootstrap against a temp layout so its
 # sentinels are the ACTUAL minted phrase and device key rather than invented strings. Already a
 # normal dependency above; restated here only so the integration-test crate can name it.
@@ -325,7 +337,7 @@ chia-protocol = "0.36.1"
 # hand-written `CoinRecord` cannot exercise the authentication path the census runs, so the probe
 # would assert its property against a fixture that could not exhibit it.
 #
-# Every version here is the one `dig-mirror-coin` 0.7 itself compiles against, and the whole set
+# Every version here is the one `dig-mirror-coin` 0.9 itself compiles against, and the whole set
 # moves together: the chia ceiling is not one number, and a crate split across two chia lines
 # compiles only until something crosses a public signature.
 chia-puzzle-types = "0.36.1"

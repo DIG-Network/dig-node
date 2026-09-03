@@ -1320,7 +1320,7 @@ mod tests {
     use super::*;
     use crate::sage::db::WalletDb;
     use crate::sage::sync_supervisor::{
-        is_following, StallVerdict, StallWatch, SESSION_MAX_LIFETIME, STALL_AFTER,
+        FollowingEvidence, StallVerdict, StallWatch, SESSION_MAX_LIFETIME, STALL_AFTER,
     };
 
     fn coin(parent: u8, ph: u8, amount: u64) -> Coin {
@@ -3341,7 +3341,7 @@ mod tests {
     ///
     /// This is the test the whole change exists for. An accepted `u32::MAX` does not merely
     /// misreport the peak — it permanently DISABLES both of them, and silently:
-    /// [`is_following`]'s `peers.saturating_sub(replica)` is `0` for ever, so the phase reports
+    /// [`FollowingEvidence`]'s `peers.saturating_sub(replica)` is `0` for ever, so the phase reports
     /// `Synced` however far behind the replica really is; and [`StallWatch`]'s
     /// `behind = peers > replica` is false for ever, so the stall clock never starts.
     ///
@@ -3367,7 +3367,7 @@ mod tests {
         let peers = Some(anchor + 50);
 
         assert!(
-            !is_following(replica, peers),
+            FollowingEvidence::measure(replica, peers).is_none(),
             "the phase must still be able to see a replica {replica:?} behind peers {peers:?}"
         );
 
@@ -3611,7 +3611,7 @@ mod tests {
         let peers = Some(anchor + 50);
 
         assert!(
-            !is_following(replica, peers),
+            FollowingEvidence::measure(replica, peers).is_none(),
             "the phase must still see a replica {replica:?} behind peers {peers:?}"
         );
 

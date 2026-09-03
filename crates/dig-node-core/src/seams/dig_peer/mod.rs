@@ -11,15 +11,12 @@
 //! (matching W1b-0's pattern) but is out of scope for this trait carve.
 
 pub mod address_book;
+pub mod admission;
 pub mod ask_routing;
 pub mod bootstrap;
 pub mod capsule_fallback;
-// The self-verifying tier-0 preimage resolver (#2033, PR-2). Its surface is exercised by its own
-// tests but not yet CALLED by production code — the tier-0 fetch loop wires it in PR-3 — so the
-// as-yet-unconsumed client + resolver would otherwise trip `dead_code`. The allow is removed when
-// PR-3 constructs it.
-#[allow(dead_code)]
 pub mod capsule_resolver;
+pub mod conduct;
 pub mod dht;
 pub mod forwarded_ask;
 pub mod holder_cache;
@@ -28,6 +25,7 @@ pub mod module_anchor;
 pub mod module_relay;
 pub mod module_reshare;
 pub mod module_serve;
+pub mod module_stream;
 pub mod module_transport;
 pub mod neighbourhood_probe;
 pub mod net;

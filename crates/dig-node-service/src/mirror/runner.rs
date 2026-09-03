@@ -88,6 +88,13 @@ pub enum PassError {
     /// `Display` delegates, so every existing consumer that only renders a `PassError` is
     /// unaffected: the message an operator sees is the `FundingError`'s own.
     Funding(super::funding::FundingError),
+    /// This node cannot yet name ITSELF, so a create would lock uncreditable collateral.
+    ///
+    /// Its own variant rather than a [`PassError::Wallet`] because the wallet is fine and the
+    /// operator has nothing to fix: the peer network has simply not reported an identity yet, and
+    /// the next pass usually has one. Rendering it as a wallet failure would send an operator to
+    /// debug a wallet that is working (dig-node#501, security round 1).
+    Identity(String),
 }
 
 impl std::fmt::Display for PassError {
@@ -97,6 +104,9 @@ impl std::fmt::Display for PassError {
             PassError::Chain(cause) => write!(f, "the chain source could not be read: {cause}"),
             PassError::Wallet(cause) => write!(f, "the operator wallet could not act: {cause}"),
             PassError::Funding(cause) => write!(f, "{cause}"),
+            PassError::Identity(cause) => {
+                write!(f, "this node cannot declare its own peer identity: {cause}")
+            }
         }
     }
 }
@@ -170,6 +180,12 @@ pub struct PassContext {
     pub margin_bp: u64,
     /// §25.7's switch. Gates creates only; reclaims ignore it.
     pub creates_enabled: bool,
+    /// Whether this node has anywhere to advertise FROM (SPEC.md §25.10, dig-node#426).
+    ///
+    /// `false` makes `MirrorEffects::create` refuse every bond by name before any chain read, so
+    /// the pass must not plan or price creates it cannot attempt. Read once at bring-up beside the
+    /// advertised URL list itself, because a coin's URLs are fixed at create for the whole epoch.
+    pub can_advertise: bool,
 }
 
 /// What one pass actually did.
@@ -365,6 +381,7 @@ impl<E: MirrorEffects> PassRunner<E> {
             margin_bp: ctx.margin_bp,
             dig_balance_base_units,
             creates_enabled: ctx.creates_enabled,
+            can_advertise: ctx.can_advertise,
         });
 
         Ok(self.execute(decision, ctx.current_epoch, locked_dig_base_units))
@@ -762,6 +779,7 @@ mod tests {
             requirement: known(),
             margin_bp: 0,
             creates_enabled: true,
+            can_advertise: true,
         }
     }
 
@@ -1363,7 +1381,7 @@ mod tests {
         assert_eq!(
             report.states,
             vec![(bond("aa", "11"), BondState::FundsUnknown)],
-            "not `Unfunded` -- this pass has no evidence the wallet is short, only that it could              not be read"
+            "not `Unfunded` -- this pass has no evidence the wallet is short, only that it could not be read"
         );
     }
 

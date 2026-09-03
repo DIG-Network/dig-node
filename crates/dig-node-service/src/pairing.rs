@@ -86,7 +86,7 @@ const MAX_PENDING: usize = 32;
 ///
 /// The stored value stays BYTE-VERBATIM; neutralisation happens at render time
 /// ([`crate::untrusted_text::render_untrusted`]), because only the display is a lie surface.
-const MAX_CLIENT_NAME: usize = 64;
+pub const MAX_CLIENT_NAME: usize = 64;
 
 /// Current unix time in milliseconds (0 on a clock error — only affects TTL math).
 fn now_ms() -> u64 {
@@ -143,7 +143,12 @@ pub fn request(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> V
             id,
             ErrorCode::InvalidParams,
             format!(
-                "client_name must be at most {MAX_CLIENT_NAME} characters; this request is                  refused rather than shortened, because a name the node shortened is a name the                  node partly wrote"
+                concat!(
+                    "client_name must be at most {MAX_CLIENT_NAME} characters; this request is ",
+                    "refused rather than shortened, because a name the node shortened is a name the ",
+                    "node partly wrote"
+                ),
+                MAX_CLIENT_NAME = MAX_CLIENT_NAME
             ),
         );
     }
@@ -488,12 +493,22 @@ mod tests {
             json!(ErrorCode::InvalidParams.name()),
             "an over-long name must be refused: {refused}"
         );
+        let message = refused["error"]["message"].as_str().unwrap();
         assert!(
-            refused["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("refused rather than shortened"),
+            message.contains("refused rather than shortened"),
             "the refusal must say why it is a refusal: {refused}"
+        );
+        // dig-node#526: this is the ONE user-visible site of the lost-continuation
+        // class -- prove the fix through the JSON-RPC error path a real client
+        // receives, not against the source literal, and that the join left no
+        // stray multi-space run where the `\` continuation used to be.
+        assert!(
+            message.contains("node partly wrote"),
+            "the full refusal sentence must survive the join: {refused}"
+        );
+        assert!(
+            !message.contains("  "),
+            "a run of consecutive spaces means a continuation lost its backslash: {message:?}"
         );
     }
 

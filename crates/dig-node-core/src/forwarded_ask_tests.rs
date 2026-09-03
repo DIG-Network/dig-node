@@ -312,6 +312,61 @@ async fn a_holder_only_a_peer_knows_about_reaches_the_answer() {
     );
 }
 
+/// **Proves (NC-12, `seams::dig_peer::holder_cache` module doc):** a peer's HEARSAY never enters the
+/// first-hand holder cache, even though it is perfectly welcome in the answer.
+///
+/// **Why this is the sharpest thing to pin about that cache.** `FirstHandHolderCache::remember` says
+/// in its own doc that "the caller is responsible for passing first-hand records only", so the
+/// property is a discipline of `locate_holders` rather than an invariant the type enforces. The
+/// module doc names exactly what it buys: a cache that stored hearsay would let one lying hop plant a
+/// fabricated holder that this node then re-serves as its OWN knowledge for the whole TTL -- "a far
+/// better attack than lying once", because it converts a single lie into an hour of this node
+/// repeating it to everyone who asks.
+///
+/// **Fixture design -- two DISTINGUISHABLE records, one per leg, and the inequality is the test.**
+/// The DHT names peer 1 and the forwarded leg names peer 9. Both are required: with an empty DHT the
+/// cache would be empty because `remember` declines an empty slate, which is a DIFFERENT reason and
+/// would let this test pass under an implementation that cached hearsay happily. With one shared
+/// record there would be nothing to tell "cached mine" from "cached theirs" apart. So the answer must
+/// contain BOTH and the cache must contain ONLY the first-hand one.
+///
+/// **On the revert:** add `self.holder_cache.remember(content, &forwarded.records);` after the
+/// forwarded leg in `NodeContent::locate_holders` -- one line -- and the cache assertion fires.
+#[tokio::test]
+async fn a_peers_hearsay_reaches_the_answer_but_never_the_first_hand_cache() {
+    let cid = content();
+    let ask = RecordingAsk::answering(vec![provider(9, &cid)]);
+    let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(ask.clone()));
+
+    let found = pc
+        .locate_holder_candidates(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
+        .await;
+
+    // The control: BOTH legs genuinely contributed, so the cache assertion below is comparing two
+    // populated sources rather than observing one empty one.
+    assert_eq!(
+        peer_ids(&found),
+        vec![mock_peer_hex(1), mock_peer_hex(9)],
+        "fixture precondition: the answer must carry this node's own finding AND the peer's \
+         hearsay, first-hand ahead of hearsay"
+    );
+
+    let cached = pc
+        .holder_cache()
+        .get(&cid)
+        .expect("a completed walk that found a holder is remembered");
+    assert_eq!(
+        peer_ids(&cached),
+        vec![mock_peer_hex(1)],
+        "only THIS node's own lookup may be remembered; caching the peer's hearsay would let one \
+         lying hop plant a holder this node re-serves as its own for the whole TTL"
+    );
+}
+
 /// **Proves:** with no forwarded-ask leg installed — the FFI/base path — the answer is exactly this
 /// node's own DHT findings, unchanged.
 ///
@@ -959,14 +1014,21 @@ async fn a_peer_that_times_out_leaves_the_absence_unproven() {
     );
 }
 
-/// **Proves:** a peer that genuinely answers "nobody" DOES establish an absence.
+/// **Proves:** a peer that genuinely answers "nobody" STILL does not establish an absence
+/// (dig-node#508).
 ///
-/// **Fixture design — this is the truthful CONTROL for the test above, and it is load-bearing.**
-/// Without it, an implementation that marked every search inconclusive would pass every other
-/// assertion here while making every miss on the network unanswerable. The two tests differ in
-/// exactly one thing: whether the peer answered.
+/// **This assertion was INVERTED, on purpose.** It previously read `establishes_absence()` and was
+/// the truthful control for the timeout test above. dig-node#508 changed the answer: a peer's
+/// completed search is that PEER's completed search, and adopting it makes this node re-emit a
+/// stranger's assertion downstream at full strength. The fixture is unchanged so the inversion is
+/// legible in the diff rather than hidden behind a new one.
+///
+/// **The control role transferred, and did not evaporate** —
+/// [`a_node_that_never_asked_still_answers_a_plain_absence`] is now the only thing standing between
+/// this fix and "every miss is inconclusive". If that test is ever weakened, this file no longer
+/// distinguishes the fix from the opposite lie.
 #[tokio::test]
-async fn a_peer_that_answers_nobody_does_establish_an_absence() {
+async fn a_peer_that_answers_nobody_still_does_not_establish_an_absence() {
     let cid = content();
     let (pc, _dir) = engine(Vec::new(), &[1], Some(RecordingAsk::answering(Vec::new())));
 
@@ -976,12 +1038,18 @@ async fn a_peer_that_answers_nobody_does_establish_an_absence() {
 
     assert!(located.is_empty());
     assert!(
-        located.establishes_absence(),
-        "the peer looked and reported nobody, which is a real answer"
+        !located.establishes_absence(),
+        "the peer answered, and answering is not the same as this node having searched - absence \
+         has no witness, so a hop's completed search proves nothing here (dig-node#508)"
     );
 }
 
 /// **Proves:** a node with recursion REFUSED still reports a plain absence, not an inconclusive one.
+///
+/// **THIS IS THE ANTI-VACUITY CONTROL for the whole file (dig-node#508).** Every other absence
+/// assertion here is now negative — no forwarded answer establishes an absence — and a codebase that
+/// simply never proved one would satisfy all of them. This test is the single assertion that fails
+/// on that implementation, so weakening it silently removes the floor under the fix.
 ///
 /// **Why this is not redundant with the control above:** recursion ships DISABLED, so a refusal is the
 /// ordinary case on almost every node. An implementation that treated "did not ask" as "could not
@@ -1671,6 +1739,13 @@ async fn a_refusal_to_forward_leaves_the_absence_unproven() {
 /// **On the revert** (classifying any `result` frame as a conclusive answer), the assertion on
 /// `establishes_absence` fires; the sibling assertion on the named holder stays green, which is how
 /// the failure is attributable.
+///
+/// **Since dig-node#508 this test is green for a WEAKER reason, and that is worth stating.** The
+/// forwarded leg is now unconditionally inconclusive, so the first assertion would hold even if the
+/// MERGE rule it was written to pin were removed entirely. It is kept because the second assertion —
+/// that the inconclusive child's records are still carried — is unaffected and still load-bearing;
+/// but the cascade property itself is now enforced structurally rather than by this fixture, and a
+/// reader must not treat this test as evidence that the merge still folds inconclusiveness.
 #[tokio::test]
 async fn one_inconclusive_child_defeats_a_sibling_that_found_nobody() {
     let cid = content();
@@ -1728,9 +1803,13 @@ async fn one_identity_over_two_items_forwards_for_both() {
     let two = pc.locate_holders(&second, batch, &RequestorId::Local).await;
 
     assert_eq!(ask.asked().len(), 2, "both items were forwarded for");
+    // INVERTED by dig-node#508: an answer from a peer never establishes an absence, so neither item
+    // may claim one. The `asked().len() == 2` assertion above is untouched and is what this test is
+    // actually for - the seen-set claim being per QUESTION-AND-CONTENT - and it is unaffected.
     assert!(
-        one.establishes_absence() && two.establishes_absence(),
-        "and both absences rest on a peer that actually answered, not on a lost claim"
+        !one.establishes_absence() && !two.establishes_absence(),
+        "both items were forwarded for, and a forwarded answer leaves the absence unproven at this \
+         node whatever the peer claimed"
     );
 }
 
@@ -1778,5 +1857,267 @@ async fn the_identity_a_hop_received_is_the_identity_it_emits() {
         budget.ask_id(),
         "and the identity SURVIVES the wire: a request body that omits ask_id makes the next hop \
          mint a fresh one, and the diamond dedup this whole mechanism rests on never fires"
+    );
+}
+
+/// A [`ForwardedAsk`] double that answers every peer with a literal JSON-RPC FRAME, read through the
+/// production parser.
+///
+/// The other doubles here hand back an [`AskOutcome`] directly, which is the right shape for tests
+/// about the fold. It is the wrong shape for dig-node#508: the question there is whether a field a
+/// PEER controls on the wire can move this node's verdict, and a double that skips the parse cannot
+/// vary that field at all. This one varies exactly the bytes a hostile peer would.
+struct FrameAsk {
+    frame: serde_json::Value,
+}
+
+impl FrameAsk {
+    /// A miss answer from a peer that names nobody, claiming `absence_established` as given. `None`
+    /// OMITS the key entirely - the compatibility case, and a different thing from `Some(false)`.
+    fn missing(absence_established: Option<bool>) -> Arc<Self> {
+        let mut item = serde_json::json!({ "available": false });
+        if let Some(claim) = absence_established {
+            item["absence_established"] = serde_json::json!(claim);
+        }
+        Arc::new(Self {
+            frame: serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "result": { "items": [item] }
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl ForwardedAsk for FrameAsk {
+    async fn ask(
+        &self,
+        peer: &str,
+        addrs: &[SocketAddr],
+        content: &ContentId,
+        _next_depth: u64,
+        _budget: Duration,
+        _ask_id: AskId,
+    ) -> AskOutcome {
+        crate::seams::dig_peer::forwarded_ask::parse_forwarded_answer(
+            content,
+            &self.frame,
+            crate::seams::dig_peer::forwarded_ask::Responder {
+                peer_hex: peer,
+                addrs,
+            },
+        )
+    }
+}
+
+/// **Proves (dig-node#508):** a peer's own `absence_established` claim CANNOT move this node's
+/// verdict. Whatever the hop asserts about its own search, this node's answer is the same.
+///
+/// **Why this is the shape of the fix, not a stricter reading of it: absence has no witness.**
+/// Content from a stranger is safe to accept because the merkle root verifies it. There is no
+/// verifier for "nobody has it", so a node may establish an absence only from its OWN completed
+/// search. Adopting a peer's establishment is adopting testimony, and
+/// [`crate::Node::availability_answer`] then RE-EMITS it downstream - an honest node laundering a
+/// stranger's assertion and passing it on at full strength. dig-node#273 closed the sibling case
+/// (silence read as an assertion, via `unwrap_or(true)`); this closes the last door in the same class.
+///
+/// **Fixture design - three frames, and the FOURTH engine is what stops the test being vacuous.**
+/// Pinning only "all three are inconclusive" would pass against an implementation that never proves
+/// any absence, which is a worse lie in the opposite direction. So the equality across the three
+/// hostile-to-honest frames is paired with an INEQUALITY against a node that installed no asker at
+/// all, whose miss must still be a plain, proven absence. Two distinguishable inputs and a pinned
+/// difference: a single-value fixture could not tell threading from ignoring.
+#[tokio::test]
+async fn a_peers_absence_claim_cannot_move_this_nodes_verdict() {
+    let cid = content();
+
+    // Fixture precondition, asserted rather than assumed: the three frames genuinely differ in the
+    // field under test, and the absent one OMITS the key rather than carrying a null.
+    let claimed = FrameAsk::missing(Some(true));
+    let disclaimed = FrameAsk::missing(Some(false));
+    let silent = FrameAsk::missing(None);
+    assert_eq!(
+        claimed.frame.pointer("/result/items/0/absence_established"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        disclaimed
+            .frame
+            .pointer("/result/items/0/absence_established"),
+        Some(&serde_json::json!(false))
+    );
+    assert!(
+        silent
+            .frame
+            .pointer("/result/items/0/absence_established")
+            .is_none(),
+        "the absent arm must omit the key, not carry a null - otherwise it exercises the same path \
+         as the disclaiming arm and the middle case goes untested"
+    );
+
+    let mut verdicts = Vec::new();
+    for (label, ask) in [
+        ("claims a proven absence", claimed as Arc<dyn ForwardedAsk>),
+        ("admits its search was incomplete", disclaimed),
+        ("says nothing about its search", silent),
+    ] {
+        let (pc, _dir) = engine(Vec::new(), &[1], Some(ask));
+        let located = pc
+            .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+            .await;
+        assert!(
+            located.is_empty(),
+            "{label}: the peer named nobody in every arm"
+        );
+        assert!(
+            !located.establishes_absence(),
+            "{label}: a hop's testimony about its own search may not become this node's \
+             establishment - absence has no witness, so only this node's own completed search can \
+             prove one (dig-node#508)"
+        );
+        verdicts.push(located.establishes_absence());
+    }
+    assert!(
+        verdicts.windows(2).all(|pair| pair[0] == pair[1]),
+        "and the verdict is EQUAL across all three frames: a peer that changes this field changes \
+         nothing this node reports"
+    );
+
+    // The inequality. Without it every assertion above is satisfied by a node that never proves an
+    // absence at all.
+    let (unasking, _dir) = engine(Vec::new(), &[1], None);
+    let plain = unasking
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert!(
+        plain.establishes_absence(),
+        "a node that asked NOBODY still answers a plain absence on its own DHT leg - the fix must \
+         not make every miss on every stock node inconclusive"
+    );
+}
+
+/// **Proves (dig-node#508):** an emptiness produced by FILTERING is not a search that found nobody.
+///
+/// **A merge-layer property, NOT a second door into the defect.** An earlier version of this comment
+/// claimed this test showed a route into #508 that "does not go through `absence_established` at
+/// all". That was false, and it is corrected on the ticket. `parse_forwarded_answer` reaches
+/// `AskOutcome::Answered` by exactly two arms: `held && !records.is_empty()`
+/// (`forwarded_ask.rs:351`), which leads with `responder_record` - minted for the RESPONDER, so it
+/// survives this node's self-filter; and `SubtreeClaim::Established` (`:355`), which by definition
+/// carries `absence_established: true`. The all-dropped state is production-reachable only as "the
+/// original wire lie plus a `providers` entry naming us": the same door with an extra step.
+///
+/// **What this test does pin.** `retain_excluding_self_tagged` runs at the MERGE
+/// (`download.rs:1870`) and `establishes_absence` reads `records.is_empty()` after it (`:973`). A
+/// peer is free to ANSWER with a record naming this node, and the filter removes it - so the
+/// emptiness the caller sees was manufactured by this node's own filtering rather than found by
+/// anyone's search. The `is_empty` assertion below is the live discriminator: remove the merge-site
+/// `retain_excluding_self_tagged` call and it goes red.
+///
+/// **Vacuity, stated rather than reported as satisfied.** The `!establishes_absence` assertion is
+/// OVER-DETERMINED on this leg after the fix: `ForwardedAnswers::asked` sets `conclusive: false`
+/// unconditionally (`download.rs:1041-1046`), so no arrangement of records can make a forwarded ask
+/// establish an absence. It guards against restoring conclusiveness to the asked path; it does not
+/// measure the filter. The same shape is LIVE on the first-hand leg, where `retain_excluding_self`
+/// runs inside `walk_for_providers` (`download.rs:2201`) AFTER `first_hand_conclusive` is decided.
+/// That is safe today only because `dig-dht-0.15.0/src/service.rs:596-613` refuses an `AddProvider`
+/// whose `provider_peer_id` is not the authenticated caller - and only when the transport supplies a
+/// caller identity at all. Recorded on dig-node#508 rather than fixed here.
+///
+/// **Fixture design - the seam injection is deliberate, and it is NOT wire evidence.** The outcome
+/// is injected through the `PerPeerAsk` seam, bypassing `parse_forwarded_answer`, because the
+/// property under test lives at the merge rather than on the wire. That is the right shape for a
+/// merge-layer property and the wrong shape for any claim about what a real frame can produce, so
+/// this test makes no such claim. The removal itself needs nothing a test alone can arrange: the
+/// node knows its own identity, which is the self-filter's only precondition.
+#[tokio::test]
+async fn a_holder_answer_whose_records_are_all_dropped_is_not_an_absence() {
+    let cid = content();
+    let me = mock_peer_hex(0xEE);
+    let ask = Arc::new(PerPeerAsk::new(vec![(
+        mock_peer_hex(1),
+        // The peer ANSWERED, and named a holder: this node itself.
+        AskOutcome::Answered(vec![provider(0xEE, &cid)]),
+    )]));
+    let (pc, _dir) = engine_identified(Vec::new(), &[1], Some(ask), Some(me));
+
+    let located = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert!(
+        located.is_empty(),
+        "fixture precondition: the only record the peer named is this node, so the self-filter \
+         removes it and the answer arrives at the caller empty"
+    );
+    assert!(
+        !located.establishes_absence(),
+        "an emptiness produced by FILTERING is not a search that found nobody - the peer named a \
+         holder, and no leg of this node ever proved an absence (dig-node#508)"
+    );
+}
+
+/// **Proves (dig-node#508):** an empty `Answered` and an empty `AnsweredInconclusive` are
+/// INDISTINGUISHABLE to everything downstream of the fold - routing and conduct alike.
+///
+/// **Why this matters to the fix.** The ticket's premise is that lying about `absence_established`
+/// is free: a peer that claims a proven absence and a peer that admits an unproven one are scored
+/// identically, so the only thing the claim ever bought was the verdict this fix removes. That
+/// equivalence was asserted nowhere. If a later change made the two outcomes score differently, the
+/// lie would acquire a price - and the reasoning behind the fix would need revisiting rather than
+/// silently rotting.
+///
+/// **Fixture design - an equality alone would be vacuous, so a third outcome pins the inequality.**
+/// A scorer that collapsed EVERY outcome to one value would satisfy the equality perfectly while
+/// measuring nothing. `TimedOut` is the control: it must score differently in both dimensions,
+/// because a peer that never answered is genuinely not the same as one that answered "nobody".
+#[test]
+fn an_empty_answer_and_an_inconclusive_answer_are_indistinguishable_to_routing_and_conduct() {
+    use crate::download::conduct_evidence;
+    use crate::seams::dig_peer::{AskRoutingState, RoutedPeer};
+
+    let peer = RoutedPeer::from_pool_key(&mock_peer_hex(1)).expect("a pool key is 64-hex");
+    let quality_after = |outcome: &AskOutcome| {
+        let state = AskRoutingState::new(None);
+        state.record(peer, outcome, Duration::ZERO);
+        state.quality_of(peer)
+    };
+
+    let answered = AskOutcome::Answered(Vec::new());
+    let inconclusive = AskOutcome::AnsweredInconclusive(Vec::new());
+
+    assert_eq!(
+        quality_after(&answered),
+        quality_after(&inconclusive),
+        "routing scores an honest 'nobody' exactly as it scores an admitted 'I could not tell': \
+         claiming the stronger one buys a peer no position in this node's ranking"
+    );
+    assert_eq!(
+        conduct_evidence(&answered),
+        conduct_evidence(&inconclusive),
+        "and conduct scores them identically too, because SPEC 8.2A requires that answering is \
+         never worse than staying silent - so the claim buys no reputation either"
+    );
+
+    // The inequality. Without it a scorer that returned one constant would pass the two assertions
+    // above while proving nothing about either dimension.
+    let timed_out = AskOutcome::TimedOut;
+    assert_ne!(
+        quality_after(&answered),
+        quality_after(&timed_out),
+        "a peer that never answered is NOT the same as one that answered 'nobody'"
+    );
+    assert_ne!(
+        conduct_evidence(&answered),
+        conduct_evidence(&timed_out),
+        concat!(
+            "and conduct separates them too - without this, a scorer that collapsed EVERY outcome ",
+            "to one value would satisfy both equalities above while measuring nothing, which is ",
+            "exactly the vacuity this control exists to rule out"
+        )
+    );
+    assert_eq!(
+        conduct_evidence(&timed_out),
+        dig_sex::ConductEvidence::NonPerformance,
+        "and a timeout is non-performance, which is the class an empty answer must never fall into"
     );
 }

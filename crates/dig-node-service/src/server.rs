@@ -2169,6 +2169,18 @@ where
             crate::mirror::pointers::SnapshotMirrorPointers::new(state.mirror_bonds.clone()),
         ));
         dig_node_core::peer::spawn_peer_network(state.node.clone());
+        // #466: nothing anywhere read a peer's claimed mirror coin against a chain, so the
+        // collateral economy's one guarantee was unenforced end to end. Installed HERE because this
+        // is where both halves exist at once -- the content engine the peer network is bringing up,
+        // and this node's chain transport. Gated on `enable_chain_sync` for the reason the census
+        // is: that flag already means "this node talks to the Chia network", and a harness sets it
+        // false precisely so nothing dials.
+        if config.enable_chain_sync {
+            crate::mirror::bond_verify::spawn_bond_verifier_install(
+                state.node.clone(),
+                state.wallet_chain.clone(),
+            );
+        }
     }
 
     // Prove the configured upstream is not this node (#1997). Fire-and-forget: the evidence is the
@@ -2821,21 +2833,21 @@ fn spawn_mirror_passes(
             // This pass is the observation point because it already reads the operator wallet's
             // own balance on a timer, so the latch costs no extra chain read and cannot drift from
             // the figure the node acts on. `synced` gates ONLY the zero case (see
-            // `FundingObservation::should_latch`), so a stale or fallback answer showing money
+            // `EverFundedEvidence::should_latch`), so a stale or fallback answer showing money
             // still latches immediately.
             {
-                use crate::wallet_funded::FundingObservation;
+                use crate::wallet_funded::EverFundedEvidence;
                 let synced = wallet
                     .wallet_sync_status()
                     .await
                     .is_ok_and(|s| s.phase == dig_wallet::sage::sync_supervisor::SyncPhase::Synced);
                 let observation = match &dig_balance {
                     Ok(base_units) => {
-                        FundingObservation::classify(u128::from(*base_units), 0, synced)
+                        EverFundedEvidence::classify(u128::from(*base_units), 0, synced)
                     }
                     // An unreadable balance is not a zero balance. It says nothing, and the latch
                     // is monotonic, so the next pass that CAN read decides.
-                    Err(_) => FundingObservation::CannotSay,
+                    Err(_) => EverFundedEvidence::CannotSay,
                 };
                 crate::wallet_funded::observe(&paths, observation);
             }
@@ -2871,6 +2883,13 @@ fn spawn_mirror_passes(
                         requirement,
                         margin_bp: config.margin_bp,
                         creates_enabled: config.mirror_enabled,
+                        // The SAME list `create` refuses on (SPEC.md §25.10), read once at
+                        // bring-up above. Passing it here is what lets the STATE surface say what
+                        // the lifecycle log has always said: a node with no publishable URL creates
+                        // no mirror coin. Until this reached the pass, that node's bonds were
+                        // priced against its operator wallet and reported `unfunded` with a base-unit
+                        // figure — a demand for money that would have bonded nothing.
+                        can_advertise: !advertised_urls.is_empty(),
                     };
                     // `block_in_place` rather than `spawn_blocking`: the runner borrows the signer,
                     // the journal and the chain source, none of which is `'static`, and moving them
@@ -2887,6 +2906,11 @@ fn spawn_mirror_passes(
                             // any chain read rather than staking collateral on an advertisement
                             // nobody can act on.
                             advertised_urls.clone(),
+                            // Re-read per pass rather than captured at spawn: this task starts
+                            // beside the peer network rather than after it, so a value read once
+                            // could be `None` for the life of the node and every coin it created
+                            // would name nobody.
+                            node.own_peer_id(),
                             &source,
                             owner_puzzle_hash,
                             signer_ref,
@@ -3438,19 +3462,51 @@ mod tests {
             "a cross-site POST must classify as CrossSite so its landing legs are denied"
         );
 
-        // No Sec-Fetch-Site header (a non-browser client, or a same-origin request) ⇒ first-party.
+        // No Sec-Fetch-Site header ⇒ a NON-BROWSER client (CLI, SDK, FFI). A browser always sends
+        // the header, so its absence is the one case that is genuinely not page-driven.
         assert_eq!(
             provenance_for(&HeaderMap::new()),
             RequestProvenance::FirstParty,
             "an absent header must be first-party — a CLI/SDK read must never be mistaken for cross-site"
         );
 
+        // `same-origin` is PAGE-DRIVEN, and on this node the only HTML surface is `/s/*` — so the
+        // page that sent it was authored by store content, not by the operator.
+        //
+        // This assertion previously read `FirstParty`, with the comment "a same-origin POST still
+        // lands". That was the dig-node#450 defect stated as a requirement: `/s/*path` and `POST /`
+        // share one router and port, and `STORE_CSP` grants `connect-src 'self'` — where `'self'`
+        // IS the RPC endpoint — so a store's own page reached `dig.getContent` as `same-origin`,
+        // landed its capsule `Held`, and staked this operator's $DIG on a stranger's content.
+        //
+        // The test asserted the behaviour the fix exists to remove, which is why it went red on the
+        // fix rather than on the defect.
         let mut same = HeaderMap::new();
         same.insert("sec-fetch-site", "same-origin".parse().unwrap());
         assert_eq!(
             provenance_for(&same),
+            RequestProvenance::StoreServed,
+            "a same-origin POST is page-driven, and every page this node serves is store content"
+        );
+
+        // `none` is a user-initiated navigation, which script can never produce — so it stays
+        // first-party and the reshare flywheel survives: the operator navigating to a store still
+        // lands it.
+        let mut nav = HeaderMap::new();
+        nav.insert("sec-fetch-site", "none".parse().unwrap());
+        assert_eq!(
+            provenance_for(&nav),
             RequestProvenance::FirstParty,
-            "a same-origin POST still lands — only an explicit cross-site value denies landing"
+            "a user-initiated navigation is the operator acting, not store content acting"
+        );
+
+        // An unrecognised value fails CLOSED. It failed open before.
+        let mut odd = HeaderMap::new();
+        odd.insert("sec-fetch-site", "future-value".parse().unwrap());
+        assert_eq!(
+            provenance_for(&odd),
+            RequestProvenance::StoreServed,
+            "an unknown Sec-Fetch-Site must not be treated as the operator"
         );
     }
 

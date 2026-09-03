@@ -2880,9 +2880,9 @@ dependencies = [
 
 [[package]]
 name = "dig-mirror-coin"
-version = "0.7.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f53968cacd4bbb5be4540aab0940b24a70e73b0b26f05cdfca9c8ccc6778e053"
+checksum = "2ac3c72506f13eef2cd6dccce66fd715191e2fc7b751f3b682332d92bf545812"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-protocol 0.36.1",
@@ -2957,9 +2957,9 @@ dependencies = [
 
 [[package]]
 name = "dig-node-control-interface"
-version = "0.27.0"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab037e53be44d038b8460c7ee8f8c611c9bbaabff7333d897a231ca4f88942dd"
+checksum = "714e4022a13278a2c329dcc7b16a24cbf800502027579b80838b1eafa4caafde"
 dependencies = [
  "async-trait",
  "semver",
@@ -2969,7 +2969,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.65.0"
+version = "0.68.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3031,7 +3031,11 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.227.0"
+
+version = "0.254.14"
+
+
+
 dependencies = [
  "async-trait",
  "axum",
@@ -3196,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "dig-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "dig-node-core",
@@ -3337,7 +3341,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.45.0"
+version = "0.48.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3346,6 +3350,7 @@ dependencies = [
  "chia-bls 0.36.1",
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
+ "chia-puzzles",
  "chia-query",
  "chia-sdk-test 0.36.0",
  "chia-sha2 0.36.1",
@@ -3358,6 +3363,7 @@ dependencies = [
  "dig-node-control-interface",
  "dig-node-core",
  "dig-offers",
+ "dig-options",
  "digstore-chain",
  "digstore-core 0.29.0",
  "futures-core",

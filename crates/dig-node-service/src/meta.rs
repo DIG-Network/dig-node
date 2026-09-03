@@ -664,16 +664,26 @@ pub enum ErrorCode {
     MethodNotFound,
     /// `-32602` — invalid params (e.g. missing store_id / urn). From dig-node.
     InvalidParams,
-    /// `-32000` — the dig-node shell failed to dispatch the request to the node.
-    /// Dig-node-shell error.
+    /// `-32000` — a request failed on the way to, or inside, the read path: the shell
+    /// could not dispatch it (a panicked/failed spawn task, an unclassified wallet-proxy
+    /// failure), or the read path itself failed generically.
+    ///
+    /// ONE condition covering BOTH mints, which is why it carries one name: the shell mints
+    /// it at 2 sites and the embedded read path at 11, on the same port and at the same
+    /// number. Which layer answered is carried by `data.origin`, never by the name — so the
+    /// name is taken from the shared catalogue (`SERVER_ERROR`) rather than restated. The
+    /// Rust variant keeps its condition-describing spelling; that is internal identity, not
+    /// the wire (dig-node#496).
     DispatchFailed,
     /// `-32004` — the requested resource is not available at the requested root (a
     /// genuine content miss for that capsule, distinct from a transport failure).
-    /// Returned by the upstream DIG RPC (`rpc.dig.net`) for the content/proof read
-    /// methods and recognized by the read path's §21 remote client; relayed through
-    /// this service on a passthrough. Catalogued so a client can branch on "not at
-    /// this root" rather than scraping the message.
-    ResourceNotAvailableAtRoot,
+    ///
+    /// ONE condition covering BOTH mints, which is why it carries one name: the node
+    /// library mints it for a LOCAL miss (`dig.fetchRange`, `dig.getManifest`), and the
+    /// upstream DIG RPC (`rpc.dig.net`) returns it for a relayed miss that this service
+    /// passes through. Which layer answered is carried by `data.origin`, never by the
+    /// name — so the name is taken from the shared catalogue rather than restated.
+    ResourceUnavailable,
     /// `-32010` — the blind-passthrough relay to the upstream DIG RPC failed
     /// (unreachable / non-JSON). Dig-node-shell error distinguishing a local
     /// proxy failure from an upstream-returned JSON-RPC error.
@@ -773,20 +783,30 @@ pub enum ErrorCode {
     ControlIngressLimited,
 }
 
+/// The numeric code the shared wire contract assigns, widened to the `i64` the JSON-RPC
+/// envelope carries. One place performs the widening so no call site restates a number.
+const fn shared(code: dig_rpc_protocol::ErrorCode) -> i64 {
+    code.code() as i64
+}
+
 impl ErrorCode {
     /// The numeric JSON-RPC error code.
     pub const fn code(self) -> i64 {
         match self {
-            ErrorCode::ParseError => -32700,
-            ErrorCode::InvalidRequest => -32600,
-            ErrorCode::MethodNotFound => -32601,
-            ErrorCode::InvalidParams => -32602,
-            ErrorCode::DispatchFailed => -32000,
-            ErrorCode::ResourceNotAvailableAtRoot => -32004,
-            ErrorCode::UpstreamError => -32010,
-            ErrorCode::Unauthorized => -32030,
-            ErrorCode::NotSupported => -32031,
-            ErrorCode::ControlError => -32032,
+            // Taken from the shared wire contract rather than restated, so this crate cannot
+            // drift from the catalogue it speaks. See `shell_error_names_match_the_shared_catalogue`.
+            ErrorCode::ParseError => shared(dig_rpc_protocol::ErrorCode::ParseError),
+            ErrorCode::InvalidRequest => shared(dig_rpc_protocol::ErrorCode::InvalidRequest),
+            ErrorCode::MethodNotFound => shared(dig_rpc_protocol::ErrorCode::MethodNotFound),
+            ErrorCode::InvalidParams => shared(dig_rpc_protocol::ErrorCode::InvalidParams),
+            ErrorCode::DispatchFailed => shared(dig_rpc_protocol::ErrorCode::ServerError),
+            ErrorCode::ResourceUnavailable => {
+                shared(dig_rpc_protocol::ErrorCode::ResourceUnavailable)
+            }
+            ErrorCode::UpstreamError => shared(dig_rpc_protocol::ErrorCode::UpstreamError),
+            ErrorCode::Unauthorized => shared(dig_rpc_protocol::ErrorCode::Unauthorized),
+            ErrorCode::NotSupported => shared(dig_rpc_protocol::ErrorCode::NotSupported),
+            ErrorCode::ControlError => shared(dig_rpc_protocol::ErrorCode::ControlError),
             ErrorCode::WalletNoChainSource => -32040,
             ErrorCode::WalletNotSynced => -32041,
             ErrorCode::WalletReadFailed => -32042,
@@ -813,16 +833,21 @@ impl ErrorCode {
     /// from the human message.
     pub fn name(self) -> &'static str {
         match self {
-            ErrorCode::ParseError => "PARSE_ERROR",
-            ErrorCode::InvalidRequest => "INVALID_REQUEST",
-            ErrorCode::MethodNotFound => "METHOD_NOT_FOUND",
-            ErrorCode::InvalidParams => "INVALID_PARAMS",
-            ErrorCode::DispatchFailed => "DISPATCH_FAILED",
-            ErrorCode::ResourceNotAvailableAtRoot => "RESOURCE_NOT_AVAILABLE_AT_ROOT",
-            ErrorCode::UpstreamError => "UPSTREAM_ERROR",
-            ErrorCode::Unauthorized => "UNAUTHORIZED",
-            ErrorCode::NotSupported => "NOT_SUPPORTED",
-            ErrorCode::ControlError => "CONTROL_ERROR",
+            // The branch key a client matches on, taken from the shared catalogue rather than
+            // restated: a second copy of a name is what drifts, and a WRONG name defeats a
+            // client's `match` where an absent one merely fails it (#478).
+            ErrorCode::ParseError => dig_rpc_protocol::ErrorCode::ParseError.machine_code(),
+            ErrorCode::InvalidRequest => dig_rpc_protocol::ErrorCode::InvalidRequest.machine_code(),
+            ErrorCode::MethodNotFound => dig_rpc_protocol::ErrorCode::MethodNotFound.machine_code(),
+            ErrorCode::InvalidParams => dig_rpc_protocol::ErrorCode::InvalidParams.machine_code(),
+            ErrorCode::DispatchFailed => dig_rpc_protocol::ErrorCode::ServerError.machine_code(),
+            ErrorCode::ResourceUnavailable => {
+                dig_rpc_protocol::ErrorCode::ResourceUnavailable.machine_code()
+            }
+            ErrorCode::UpstreamError => dig_rpc_protocol::ErrorCode::UpstreamError.machine_code(),
+            ErrorCode::Unauthorized => dig_rpc_protocol::ErrorCode::Unauthorized.machine_code(),
+            ErrorCode::NotSupported => dig_rpc_protocol::ErrorCode::NotSupported.machine_code(),
+            ErrorCode::ControlError => dig_rpc_protocol::ErrorCode::ControlError.machine_code(),
             ErrorCode::WalletNoChainSource => "WALLET_NO_CHAIN_SOURCE",
             ErrorCode::WalletNotSynced => "WALLET_NOT_SYNCED",
             ErrorCode::WalletReadFailed => "WALLET_READ_FAILED",
@@ -870,9 +895,13 @@ impl ErrorCode {
             // INVALID_PARAMS is returned by the embedded read path's locally-served
             // read methods (bad store_id / retrieval_key) before any I/O.
             ErrorCode::InvalidParams => "node",
-            // The upstream DIG RPC returns -32004 for a genuine content miss at the
-            // requested root; this service relays it on a passthrough.
-            ErrorCode::ResourceNotAvailableAtRoot => "upstream",
+            // -32004 has TWO minters — the node library on a local miss (`dig.fetchRange`,
+            // `dig.getManifest`) and the upstream DIG RPC on a relayed one — so the catalogue
+            // declares the one this node itself produces. A frame's OWN `data.origin` is derived
+            // per-frame by its minter and stays authoritative; the catalogue value is the default
+            // a client should expect from this node, and it may not claim `upstream` for a code
+            // this node mints locally on an ordinary miss.
+            ErrorCode::ResourceUnavailable => "node",
         }
     }
 
@@ -885,9 +914,18 @@ impl ErrorCode {
             }
             ErrorCode::MethodNotFound => "Method is not resolved locally or by the upstream.",
             ErrorCode::InvalidParams => "Invalid or missing method parameters.",
-            ErrorCode::DispatchFailed => "The node failed to dispatch the request.",
-            ErrorCode::ResourceNotAvailableAtRoot => {
-                "The requested resource is not available at the requested root."
+            ErrorCode::DispatchFailed => {
+                concat!(
+                    "A generic server error — the shell failed to dispatch the request, or ",
+                    "the embedded read path failed internally, whichever layer answered.",
+                )
+            }
+            ErrorCode::ResourceUnavailable => {
+                concat!(
+                    "The requested resource is not available at the requested root — ",
+                    "a genuine content miss, whether this node missed locally or a ",
+                    "relayed upstream did.",
+                )
             }
             ErrorCode::UpstreamError => {
                 "The blind-passthrough relay to the upstream DIG RPC failed."
@@ -945,7 +983,7 @@ impl ErrorCode {
             ErrorCode::MethodNotFound,
             ErrorCode::InvalidParams,
             ErrorCode::DispatchFailed,
-            ErrorCode::ResourceNotAvailableAtRoot,
+            ErrorCode::ResourceUnavailable,
             ErrorCode::UpstreamError,
             ErrorCode::Unauthorized,
             ErrorCode::NotSupported,
@@ -1200,6 +1238,47 @@ fn openrpc_error_components() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Pins the EXACT published text of the one multi-clause catalogue message.**
+    ///
+    /// `description()` is the `"message"` field of the published discovery document, so
+    /// its bytes are a consumer-visible contract. This message is the only one long
+    /// enough to tempt a re-wrap, and a re-wrap is precisely what breaks it: a
+    /// backslash-continued literal that `cargo fmt` (or a hand edit) rejoins becomes a
+    /// literal newline escape followed by this file's source indentation, which compiles,
+    /// lints clean, and silently publishes a control character plus a run of spaces.
+    /// Asserting the RENDERED string — never the source shape — makes that failure loud.
+    #[test]
+    fn resource_unavailable_description_is_one_line_of_exact_published_text() {
+        assert_eq!(
+            ErrorCode::ResourceUnavailable.description(),
+            concat!(
+                "The requested resource is not available at the requested root \u{2014} ",
+                "a genuine content miss, whether this node missed locally or a ",
+                "relayed upstream did.",
+            ),
+        );
+    }
+
+    /// **Closes the class, not the instance (#478 review):** no catalogued message may
+    /// carry a control character. `description()` is the one catalogue field with no
+    /// guard, which is how an embedded newline reached the published document unnoticed.
+    /// A run of consecutive spaces is the same artifact seen from the other side — prose
+    /// never needs one — so both are refused.
+    #[test]
+    fn no_catalogued_description_carries_a_control_character_or_run_of_spaces() {
+        for code in ErrorCode::all() {
+            let message = code.description();
+            assert!(
+                !message.chars().any(char::is_control),
+                "catalogued message for {code:?} carries a control character: {message:?}",
+            );
+            assert!(
+                !message.contains("  "),
+                "catalogued message for {code:?} carries a run of spaces: {message:?}",
+            );
+        }
+    }
 
     #[test]
     fn build_info_carries_the_one_canonical_version_service_commit_and_protocol() {
@@ -1670,7 +1749,10 @@ mod tests {
             .collect();
         assert!(
             control_wallet_reads.len() >= 2,
-            "expected the light-client chain reads in CONTROL_METHODS; found {} - this guard              would otherwise pass vacuously",
+            concat!(
+                "expected the light-client chain reads in CONTROL_METHODS; found {} - this guard ",
+                "would otherwise pass vacuously"
+            ),
             control_wallet_reads.len()
         );
 
@@ -1678,7 +1760,12 @@ mod tests {
             for prefix in RETIRED_CUSTODY_PREFIXES {
                 assert!(
                     !name.starts_with(prefix),
-                    "`{name}` is a light-client chain read and must stay discoverable, but the                      retired prefix `{prefix}` matches it"
+                    concat!(
+                        "`{name}` is a light-client chain read and must stay discoverable, but the ",
+                        "retired prefix `{prefix}` matches it"
+                    ),
+                    name = name,
+                    prefix = prefix
                 );
             }
         }

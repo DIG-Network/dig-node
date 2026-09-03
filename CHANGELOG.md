@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.252.11] - 2026-09-03
+
+### Features
+- **digsex:** Wire the dig-sex economic layer into the node (#456)- **digsex:** Produce real conduct evidence and persist the reward ledger (#515)
+
+### Bug Fixes
+- **wallet:** Say when a wallet-isolating override was not honoured (#489)- **wallet:** The coins reads say when their answer is not current (#490) (#492)- **wallet:** A peer-local refusal must not free inputs another destination may hold (#497)- **rpc:** Source the shell error catalogue from dig-rpc-protocol so -32004 carries one name (#494)- **wallet:** A synced phase must carry the height that bounds it (#500)- **profile-sync:** An unreadable body directory is unknown, not "nothing was ever published" (#507)- **wallet:** Anchor the service wallet seed instead of resolving it relative to cwd (#491) (#499)- **pairing:** Give a user-run client the client half of the pairing handshake (#498)- **mirror:** A Bonded verdict must not rest on one uncorroborated chain read (#506)- **wallet:** A fallback answer is bounded by the peak from its own read (#514)
+
+### Testing
+- **nc-12:** Measure the NC-12 doc claims in seams/dig_peer, guard 2 (#504)
+
+## [0.236.0] - 2026-09-02
+
+### Features
+- **mirror:** Drive the mirror pass from disk events, timer as backstop (#470)- **mirror:** Verify a peer's mirror-coin bond against chain on the download path (#467)
+
+### Bug Fixes
+- **sync:** The background whole-store sync must not log a download it never stored (#468)- **config:** A mistyped capability flag must be said out loud, not silently guessed (#472)- **wallet:** Retire the last largest-first rival, and make the unguarded sync setter unreachable (#474)- **test:** Own test scratch dirs with tempfile::TempDir so they clean on drop (#476)- **rpc:** Mint error frames from the taxonomy so data.code and data.origin are present (#477)- **mirror:** Skip unauthenticatable funding candidates and alert on a funding shortfall (#469)- **wallet:** Announce a $DIG arrival that reaches `coins` only after promotion (#480)- **cache,serve:** Store-page landing provenance, single cache budget, unrecognised-dir accounting (#455)- **mirror:** A node that advertises nothing says so instead of demanding $DIG (#484)- **profile-sync:** Reconcile a held profile body against its store's on-chain root (#487)
+
+### Performance
+- **serve:** Stream the capsule hash paths instead of reading whole capsules into RAM (#488)
+
 ## [0.206.0] - 2026-09-01
 
 ### Bug Fixes

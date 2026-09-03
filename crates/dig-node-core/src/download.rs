@@ -375,9 +375,20 @@ pub enum ReadOrigin {
 /// provenance closes that CSRF door WITHOUT ever throttling the read: the bytes always serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestProvenance {
-    /// A first-party request: the user's own navigation, a same-origin/same-site subresource, a
-    /// direct address-bar hit, OR any non-browser client (CLI/SDK send no `Sec-Fetch-*` header).
+    /// A first-party request: the user's own top-level navigation (`Sec-Fetch-Site: none` — the
+    /// address bar or a bookmark, which no page script can forge), OR any non-browser client
+    /// (CLI/SDK send no `Sec-Fetch-*` header at all).
     FirstParty,
+    /// A request driven by a page THIS NODE is serving on its own control origin — i.e. by store
+    /// content published by a stranger (`Sec-Fetch-Site: same-origin`/`same-site`, or any value the
+    /// browser reports that is neither `none` nor `cross-site`).
+    ///
+    /// Any HTML served on this origin is either explicitly from `/s/*` (store content, decrypted
+    /// and served plaintext on loopback), or from the SPA fallback (landing on `index.html` of
+    /// the same store when a route is not found in the store's manifest) — both authored by store
+    /// content or the node itself. No HTML on this origin originates from an untrusted external
+    /// page. The read still serves; landing does not.
+    StoreServed,
     /// A cross-site subresource: the browser explicitly reported `Sec-Fetch-Site: cross-site`,
     /// meaning some OTHER origin's page drove this request. The read still serves; landing does not.
     CrossSite,
@@ -386,16 +397,41 @@ pub enum RequestProvenance {
 /// Classify a request's provenance from its `Sec-Fetch-Site` header value (already extracted from
 /// the header map; `None` when the header is absent).
 ///
-/// ONLY an explicit, case-insensitive `cross-site` denies landing. Everything else — `same-origin`,
-/// `same-site`, `none`, an unknown value, AND (critically) an ABSENT header — is [`FirstParty`], so
-/// non-browser clients that never send `Sec-Fetch-*` (the CLI, the SDK) are never mistaken for a
-/// cross-site attacker. Absence must NEVER map to `CrossSite`.
+/// The mapping, and why each arm is where it is:
+///
+/// | `Sec-Fetch-Site` | provenance | why |
+/// |---|---|---|
+/// | absent | [`FirstParty`] | a non-browser client (CLI/SDK). Absence must NEVER deny a CLI read's landing. |
+/// | `none` | [`FirstParty`] | a user-initiated top-level navigation — address bar or bookmark. A page-driven fetch can NEVER produce `none`, and `Sec-*` is a forbidden header name, so script cannot forge it. |
+/// | `cross-site` | [`CrossSite`] | another origin's page drove it. |
+/// | anything else (`same-origin`, `same-site`, an unknown future value) | [`StoreServed`] | page-driven on an origin whose only HTML is `/s/*`. |
+///
+/// **Why `same-origin` is not first-party here (dig-node#450).** `/s/*path` and `POST /` are the
+/// same router on the same port, and `STORE_CSP` grants store pages `script-src 'unsafe-inline'`
+/// plus `connect-src 'self'` — where `'self'` IS the RPC endpoint. So a stranger's store page can
+/// script a request that the browser truthfully labels `same-origin`, and under the old mapping
+/// that landed the attacker's chosen capsule `Held` — bondable, with the operator's $DIG staked on
+/// it. Same-origin stopped being a trust signal the moment the node began serving untrusted content
+/// on its control origin, so the fix is a THIRD provenance rather than a tighter reading of two.
+///
+/// This deliberately does NOT consult `Referer`: a page controls its own referrer-policy and can
+/// strip the path (or the whole header), so a `Referer`-derived rule is bypassable by the exact
+/// party it constrains. `Sec-Fetch-Site` is browser-set and unforgeable by page script.
+///
+/// **Cost, stated plainly:** a subresource of an operator-initiated store view no longer lands on
+/// its own. The flywheel survives because the top-level navigation that opened the store IS `none`
+/// and lands the capsule, and every subresource is then served from that already-landed capsule.
 ///
 /// [`FirstParty`]: RequestProvenance::FirstParty
+/// [`StoreServed`]: RequestProvenance::StoreServed
+/// [`CrossSite`]: RequestProvenance::CrossSite
 pub fn from_sec_fetch_site(hdr: Option<&str>) -> RequestProvenance {
     match hdr.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("none") => RequestProvenance::FirstParty,
         Some("cross-site") => RequestProvenance::CrossSite,
-        _ => RequestProvenance::FirstParty,
+        // Fails CLOSED: an unknown/future value is page-driven until proven otherwise. It still
+        // serves; it merely does not land.
+        Some(_) => RequestProvenance::StoreServed,
     }
 }
 
@@ -412,7 +448,10 @@ pub fn from_sec_fetch_site(hdr: Option<&str>) -> RequestProvenance {
 pub(crate) fn landing_origin(origin: ReadOrigin, provenance: RequestProvenance) -> ReadOrigin {
     match provenance {
         RequestProvenance::FirstParty => origin,
-        RequestProvenance::CrossSite => ReadOrigin::Peer,
+        // A page THIS NODE serves at `/s/` is a stranger's content running on the control origin
+        // (dig-node#450). It folds exactly as a cross-site page does: the bytes serve, nothing
+        // durable lands, so the operator never bonds a capsule an attacker chose.
+        RequestProvenance::StoreServed | RequestProvenance::CrossSite => ReadOrigin::Peer,
     }
 }
 
@@ -746,6 +785,9 @@ pub struct NodeContent {
     /// [`SelfExcludingLocator`] (#1584), so discovery is already self-filtered — this node's own
     /// `peer_id` never appears as a holder — but is otherwise unranked.
     locator: Arc<dyn ProviderLocator>,
+    /// The mirror-coin bond verifier the discovery chain ranks by (dig-node#466), installed once by
+    /// the host binary through [`Self::set_bond_verifier`] when its chain source exists.
+    bond_verifier: crate::mirror_bond::BondVerifierSlot,
     /// The self-optimizing peer selector (#178) — the decision + learning brain between discovery and
     /// download. It ranks the download sources (bridged into dig-download's [`SourceSelector`] seam by
     /// [`SelectorAdapter`], #1442) and learns from every range outcome dig-download reports back
@@ -856,6 +898,15 @@ pub struct NodeContent {
     /// at all, because pool membership is its liveness gate. Folding them together would make one
     /// structure whose key, lifetime and eviction rule all mean two different things at once.
     ask_routing: AskRoutingState,
+    /// What this node has observed each pool peer DO, and the dial share that earns them (#268).
+    ///
+    /// Held beside [`Self::ask_routing`] because the two read the same verified identity and are
+    /// bounded by the same pool: routing ranks the peers worth asking FIRST, conduct decides which are
+    /// worth asking AT ALL. Node-local and never gossiped — a shared reputation channel would be a
+    /// defamation primitive.
+    conduct: crate::seams::dig_peer::conduct::ConductState,
+    /// The instant conduct ticks are measured from. Wall-clock-free and monotonic.
+    conduct_epoch: std::time::Instant,
 }
 
 /// What a holder search ESTABLISHED — the records it found AND whether an empty result is a fact.
@@ -927,8 +978,10 @@ impl LocatedHolders {
 /// What the FORWARDED leg alone contributed: hearsay records, and whether every peer it consulted
 /// actually answered.
 ///
-/// `conclusive` starts TRUE and is only ever cleared, so every path that fails to establish something
-/// has to say so explicitly rather than relying on a default.
+/// `conclusive` is decided ONCE, by which constructor built the value, and nothing after that raises
+/// it. Only the two unasked paths — [`ForwardedAnswers::recursion_disabled`] and
+/// [`ForwardedAnswers::refused`] — carry a meaningful value at all; the asked path is unconditionally
+/// inconclusive, because absence has no witness (dig-node#508).
 struct ForwardedAnswers {
     records: Vec<ProviderRecord>,
     conclusive: bool,
@@ -964,11 +1017,59 @@ impl ForwardedAnswers {
         }
     }
 
-    /// Peers are about to be asked; each one that does not answer clears the flag.
+    /// Peers ARE being asked, and that path is NEVER conclusive (dig-node#508).
+    ///
+    /// # Absence has no witness
+    ///
+    /// Content relayed by a stranger is safe to accept because the merkle root verifies it. There is
+    /// no such verifier for "nobody has it" — an absence is a claim about the whole network that no
+    /// arithmetic can check — so a node may establish one only from its OWN completed search, never
+    /// from testimony. Once this node has delegated part of the search to peers it cannot know
+    /// whether that part completed, and the peers' own word for it is exactly the testimony that
+    /// cannot be checked.
+    ///
+    /// **Nothing on this path may set the flag true.** Not a peer's `absence_established: true`, not
+    /// a full fan-out that all answered, not N corroborating peers: `decide_forward` selects over the
+    /// connected pool, which peer discovery and PEX can shape, so N corroborators an attacker
+    /// influenced is one answer wearing a hat — and an eclipsed pool collapses any k-of-n to 1. NC-12
+    /// survives eclipse only because the thing peers agree on is CONTENT, which verifies
+    /// independently of who said it.
+    ///
+    /// This finishes dig-node#273 rather than extending it. That ticket closed
+    /// *silence becomes an assertion* (`unwrap_or(true)`); this closes
+    /// *a stranger's assertion becomes ours*, the identical class with one door left open.
     fn asked() -> Self {
         Self {
             records: Vec::new(),
-            conclusive: true,
+            conclusive: false,
+        }
+    }
+}
+
+/// How one forwarded-ask outcome scores a peer's CONDUCT (#268).
+///
+/// An outcome where the peer answered — including an honest "I do not have it", and including one
+/// where the peer said its own subtree was incomplete — is an `HonestAnswer`, because SPEC 8.2A
+/// requires that answering is never worse than staying silent. A refusal, a timeout and an
+/// unreachable peer are `NonPerformance`: unverifiable, decaying, and floored, since none of them can
+/// be distinguished from distress an attacker induced in an honest peer.
+///
+/// Neither VERIFIABLE class is produced here, and deliberately so. A `ProvenLie` needs bytes that
+/// failed verification against the anchor, attributed to the peer that supplied them; that
+/// attribution happens inside `dig-download`'s engine against `chunk_hashes` and is not surfaced
+/// per-peer to this node (see the report on #268). Claiming one from a transport error would brand an
+/// honest peer on unverifiable evidence, which is the exact conflation SPEC 8.2A exists to prevent.
+///
+/// A free function so the classification can be asserted directly. dig-node#508 rests on the two
+/// empty-answer outcomes being scored IDENTICALLY here and in `ask_routing` — that is what makes
+/// claiming a proven absence cost a peer nothing — and a rule stated only inline cannot be pinned.
+pub(crate) fn conduct_evidence(outcome: &AskOutcome) -> dig_sex::ConductEvidence {
+    match outcome {
+        AskOutcome::Answered(_) | AskOutcome::AnsweredInconclusive(_) => {
+            dig_sex::ConductEvidence::HonestAnswer
+        }
+        AskOutcome::Refused | AskOutcome::TimedOut | AskOutcome::Unreachable => {
+            dig_sex::ConductEvidence::NonPerformance
         }
     }
 }
@@ -1250,6 +1351,13 @@ impl NodeContent {
         self_peer_id: Option<String>,
         cache_dir: &Path,
     ) -> Arc<Self> {
+        // The mirror-coin bond layer (dig-node#466) sits OUTSIDE every other locator, so both the
+        // raw discovery leg kept on the engine and the download union built from it below inherit
+        // one ranking. Its verifier arrives later (the host binary owns the chain source), and until
+        // it does the layer is a pass-through.
+        let bond_verifier = crate::mirror_bond::bond_verifier_slot();
+        let locator: Arc<dyn ProviderLocator> =
+            crate::mirror_bond::BondRankingLocator::new(locator, bond_verifier.clone());
         let downloads_dir = cache_dir.join("downloads");
         let _ = std::fs::create_dir_all(&downloads_dir);
         let state_store = Arc::new(CapturingStateStore::new(FileStateStore::new(
@@ -1334,6 +1442,7 @@ impl NodeContent {
         let ask_routing = AskRoutingState::new(self_peer_id.as_deref());
         Arc::new(NodeContent {
             locator,
+            bond_verifier,
             selector,
             downloader,
             state_store,
@@ -1357,6 +1466,8 @@ impl NodeContent {
             ask_seen: AskSeenSet::new(),
             onion_relay: std::sync::atomic::AtomicBool::new(onion_relay_from_env()),
             ask_routing,
+            conduct: crate::seams::dig_peer::conduct::ConductState::new(),
+            conduct_epoch: std::time::Instant::now(),
         })
     }
 
@@ -1534,6 +1645,20 @@ impl NodeContent {
         // today's shipped behaviour.
         let _ = &dht;
         content
+    }
+
+    /// Install the mirror-coin bond verifier the discovery chain ranks holders by (dig-node#466).
+    ///
+    /// Idempotent and one-way: the first call wins and later ones are ignored, so a node's
+    /// verification posture cannot change under a running download. Before it is called the layer is
+    /// a pass-through, which is the shipped behaviour of every embedder that has no chain source.
+    ///
+    /// Returns whether this call was the one that installed it.
+    pub fn set_bond_verifier(
+        &self,
+        verifier: Arc<dyn crate::mirror_bond::MirrorBondVerifier>,
+    ) -> bool {
+        self.bond_verifier.set(verifier).is_ok()
     }
 
     /// The configured miss behavior (redirect by default; fetch-through when opted in).
@@ -1842,15 +1967,22 @@ impl NodeContent {
             .filter_map(|(peer, _)| RoutedPeer::from_pool_key(peer))
             .collect();
 
+        // CONDUCT gates who is dialable at all (#268, SPEC 8.3); routing then ranks what remains.
+        // The order matters: ranking a peer this node has PROVEN dishonest would still spend a dial on
+        // it whenever the ranking happened to favour it. A peer excluded here has a verifiable fault
+        // against it — a lie or a self-contradiction — and never merely a slow or silent history,
+        // which `dial_share` floors above zero precisely so distress cannot evict an honest holder.
+        let dialable = self.conduct.dialable(&routable, self.conduct_ticks());
+
         // Ranked by what THIS node has observed, not by the pool `HashMap`'s arbitrary order — and the
-        // observations of peers no longer in `routable` are dropped in the same call, so a cycled-away
+        // observations of peers no longer in `dialable` are dropped in the same call, so a cycled-away
         // peer leaves this node's memory when it leaves the pool.
         let decision = self.ask_routing.decide(
             &config,
             asker,
             budget.remaining(config.hop_cap),
             me,
-            &routable,
+            &dialable,
             self.relay_rate_limiter.check(requestor),
         );
 
@@ -1912,10 +2044,10 @@ impl NodeContent {
             };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                // Out of time with peers left unasked. Those peers established nothing, so the
-                // absence this answer could otherwise claim is unproven.
+                // Out of time with peers left unasked. Logged because it is the operator-visible
+                // symptom of an under-budgeted recursion; it no longer needs to CLEAR anything,
+                // because an asked answer was never conclusive to begin with (dig-node#508).
                 tracing::debug!("forwarded ask: budget spent with peers unasked");
-                answers.conclusive = false;
                 break;
             }
             // The identity travels WITH the ask, because the far end reads it off the wire: an ask
@@ -1938,23 +2070,37 @@ impl NodeContent {
             // The ONLY writer of this node's routing memory, fed an outcome this node classified from
             // an exchange it issued and saw complete (dig_ecosystem#3129).
             self.ask_routing.record(routed, &outcome, started.elapsed());
+            // The SAME exchange, classified for conduct (#268).
+            self.conduct
+                .observe(routed, conduct_evidence(&outcome), self.conduct_ticks());
+            // EVERY arm here leaves `answers.conclusive` false, and that is the fix for
+            // dig-node#508 rather than an oversight. The arms differ only in which RECORDS they
+            // contribute; none of them may raise the flag.
+            //
+            // The shape this replaces is worth naming, because it is re-derivable and looks
+            // reasonable: three arms cleared the flag and the fourth — a peer that answered and
+            // asserted its own subtree complete — did not. That single arm let a stranger's
+            // assertion become this node's, and `Node::availability_answer` then re-emitted it to
+            // the next hop, so an honest node laundered the claim and it travelled at full strength.
+            // The lie cost the peer nothing: an empty `Answered` and an empty `AnsweredInconclusive`
+            // are scored identically by both `ask_routing` and `conduct`.
             match outcome {
+                // The peer answered and named these providers. They are candidates to dial, and
+                // that is ALL an answer can contribute here: an empty answer names no holder, and a
+                // peer's word that its own search completed is testimony this node cannot check.
                 AskOutcome::Answered(records) => answers.records.extend(records),
                 // The peer answered and told us its OWN subtree did not finish. Its records are
-                // still candidates — a partial answer beats none — but its uncertainty is ours now.
-                // This is the arm that makes inconclusiveness CASCADE instead of dying one hop from
-                // where it arose, and without it a single stalled node manufactures a not-found for
-                // every reader downstream of the honest peer that reported it.
+                // still candidates — a partial answer beats none. Kept as a distinct arm for the
+                // log line: an operator reading this can tell a hop that admitted incompleteness
+                // from one that claimed none, even though the two lead to the same verdict here.
                 AskOutcome::AnsweredInconclusive(records) => {
                     tracing::debug!(peer = %peer, "forwarded ask: peer reports its own subtree unproven");
                     answers.records.extend(records);
-                    answers.conclusive = false;
                 }
                 // The peer did not look, or did not finish looking. Its silence is not an absence,
                 // and saying so is the entire point of dig-node#273.
                 inconclusive => {
                     tracing::debug!(peer = %peer, ?inconclusive, "forwarded ask: absence unproven");
-                    answers.conclusive = false;
                 }
             }
         }
@@ -1974,6 +2120,16 @@ impl NodeContent {
             .collect()
     }
 
+    /// This node's monotonic conduct clock, in seconds since process start.
+    ///
+    /// Conduct decay is measured in elapsed ticks and nothing else, so the clock must advance on its
+    /// own — a counter incremented per exchange would mean a peer nobody dials never ages out of its
+    /// penalty, and the recovery SPEC 8.2A requires would be unreachable for exactly the peer being
+    /// punished.
+    fn conduct_ticks(&self) -> u64 {
+        self.conduct_epoch.elapsed().as_secs()
+    }
+
     /// This node's routing memory, so a test can drive the forwarded ask and then ask what the ask
     /// LEFT BEHIND. Without it the recording leg would only be observable through its effect on a
     /// later round, and a test that could not see the write directly could not tell a missing write
@@ -1981,6 +2137,17 @@ impl NodeContent {
     #[cfg(test)]
     pub(crate) fn ask_routing(&self) -> &AskRoutingState {
         &self.ask_routing
+    }
+
+    /// This node's first-hand holder cache, so a test can ask what a completed walk LEFT BEHIND.
+    ///
+    /// `FirstHandHolderCache::remember` states that "the caller is responsible for passing first-hand
+    /// records only", which makes the first-hand property a discipline of THIS module rather than an
+    /// invariant the type can enforce. A discipline nothing observes is a discipline one line can
+    /// break, so the cache has to be readable from a test for that line to be catchable.
+    #[cfg(test)]
+    pub(crate) fn holder_cache(&self) -> &FirstHandHolderCache {
+        &self.holder_cache
     }
 
     /// [`Self::forget_stale_discovery`], reachable from the tests that drive the caches directly.
@@ -2522,7 +2689,7 @@ impl crate::Node {
     }
 
     /// The attached P2P content engine, if the peer network brought one up.
-    pub(crate) fn p2p_content(&self) -> Option<&Arc<NodeContent>> {
+    pub fn p2p_content(&self) -> Option<&Arc<NodeContent>> {
         self.p2p_content.get()
     }
 
@@ -4373,6 +4540,96 @@ pub(crate) mod tests {
             .is_err());
     }
 
+    /// **Proves (dig-node#466):** the bond ranking is live on the ENGINE's own discovery path —
+    /// `NodeContent::find_providers`, the source the redirect-on-miss handler names holders from —
+    /// and not merely inside a locator a test assembled for itself.
+    ///
+    /// **Catches:** the exact state this ticket exists to end. `BondRankingLocator` can be perfect
+    /// and still be reachable from nothing; the whole point of #466 is that a verifier with no
+    /// consumer changes nothing. This test builds the engine through its real constructor and asks
+    /// it, so a wiring that silently dropped the layer fails here even with every unit test in
+    /// `mirror_bond` green.
+    ///
+    /// The slate's input order is neither the expected answer nor its reverse, so an engine that
+    /// ignored the verdicts entirely cannot pass by coincidence.
+    #[tokio::test]
+    async fn the_engine_promotes_a_proven_bond_without_sinking_a_disproven_one() {
+        use crate::mirror_bond::{BondVerdict, MirrorBondVerifier};
+
+        struct ByFirstByte;
+
+        #[async_trait::async_trait]
+        impl MirrorBondVerifier for ByFirstByte {
+            async fn verify(
+                &self,
+                _c: &ContentId,
+                _claiming_peer_id: &str,
+                claimed: Option<[u8; 32]>,
+            ) -> BondVerdict {
+                match claimed {
+                    None => BondVerdict::Unverified,
+                    Some(coin) if coin[0] == 0x01 => BondVerdict::Bonded,
+                    Some(_) => BondVerdict::Unbonded,
+                }
+            }
+        }
+
+        let td = tempfile::tempdir().unwrap();
+        let cid = mock_content_id();
+        let claimed = |peer: u8, coin: Option<[u8; 32]>| {
+            let record = mock_provider(peer, &cid);
+            match coin {
+                Some(id) => record.with_unverified_mirror_coin_id(id),
+                None => record,
+            }
+        };
+
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![
+                // The DISPROVEN record is placed ahead of the merely-unverified one on purpose.
+                // Credit-only keeps 8 before 7 (one baseline tier, stable sort); a three-tier
+                // lattice that sank `Unbonded` would answer 9,7,8. Without this ordering the two
+                // lattices give the identical answer and the assertion below proves nothing about
+                // which one is implemented.
+                claimed(8, Some([0x02; 32])), // a coin bonding something else -> Unbonded
+                claimed(7, None),             // claims nothing                -> Unverified
+                claimed(9, Some([0x01; 32])), // a coin that really bonds this -> Bonded
+            ])),
+            Arc::new(MockRangeTransport::new(anchored_mock_content(30, 3))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        assert!(
+            pc.set_bond_verifier(Arc::new(ByFirstByte)),
+            "the engine accepts exactly one verifier"
+        );
+
+        let located = pc.find_providers(&cid).await.for_finding();
+        let peers: Vec<String> = located
+            .iter()
+            .map(|r| r.provider_peer_id[..2].to_string())
+            .collect();
+
+        assert_eq!(
+            peers,
+            vec![
+                mock_peer_hex(9)[..2].to_string(),
+                mock_peer_hex(8)[..2].to_string(),
+                mock_peer_hex(7)[..2].to_string(),
+            ],
+            "the provable holder is promoted and the other two keep their located order, so the \
+             disproven holder STAYS AHEAD of the merely-unverified one. A three-tier lattice \
+             would answer 9,7,8 here; credit-only answers 9,8,7, because a disproven pointer \
+             withholds credit rather than demoting (dig-node#466)"
+        );
+        assert_eq!(
+            located.len(),
+            3,
+            "a disproven claim is still offered on the redirect path, never dropped from it"
+        );
+    }
+
     /// A locator whose walk cannot be performed at all — the network is down, not the content absent.
     struct UnreachableLocator;
 
@@ -5267,14 +5524,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sec_fetch_site_first_party_values_are_first_party() {
-        for value in ["same-origin", "same-site", "none"] {
+    fn sec_fetch_site_page_driven_values_are_store_served() {
+        // dig-node#450. `same-origin` and `same-site` mean A PAGE drove this request, and the only
+        // HTML this router serves is `/s/*` — a stranger's store. Classifying either as FirstParty
+        // let that page choose which capsule the operator bonds $DIG against.
+        for value in ["same-origin", "same-site"] {
             assert_eq!(
                 from_sec_fetch_site(Some(value)),
-                RequestProvenance::FirstParty,
-                "{value} is a first-party fetch and must land normally"
+                RequestProvenance::StoreServed,
+                "{value} is page-driven on a node whose only HTML surface is store content"
             );
         }
+    }
+
+    #[test]
+    fn sec_fetch_site_none_is_first_party_so_the_operator_still_lands_a_store_they_opened() {
+        // The counterpart to the test above, and the reason the fix does not cost the flywheel:
+        // `none` is a USER-initiated top-level navigation (address bar / bookmark). A page-driven
+        // fetch can never produce it, and `Sec-*` is a forbidden header name so script cannot forge
+        // it. If this arm ever folded to StoreServed, opening a store in a browser would stop
+        // landing it at all.
+        assert_eq!(
+            from_sec_fetch_site(Some("none")),
+            RequestProvenance::FirstParty,
+            "a user-initiated top-level navigation must still land"
+        );
     }
 
     #[test]
@@ -5295,16 +5569,43 @@ pub(crate) mod tests {
             RequestProvenance::CrossSite,
             "the header match must be trimmed + case-insensitive"
         );
+        assert_eq!(
+            from_sec_fetch_site(Some("  Same-Origin ")),
+            RequestProvenance::StoreServed,
+            "the page-driven arm must be trimmed + case-insensitive too, or a browser that cases \
+             the value differently would land an attacker's capsule"
+        );
     }
 
     #[test]
-    fn sec_fetch_site_unknown_value_is_first_party() {
-        // Only an explicit "cross-site" denies landing; an unrecognized value fails OPEN (serves +
-        // lands) so a future/odd Sec-Fetch-Site value never silently breaks landing.
+    fn sec_fetch_site_unknown_value_fails_closed_to_store_served() {
+        // Inverted by dig-node#450: an unrecognised value is PAGE-DRIVEN until proven otherwise.
+        // The request still serves; it merely does not land. Failing open here would make the whole
+        // gate optional to any browser that ships a new value.
         assert_eq!(
             from_sec_fetch_site(Some("wat")),
-            RequestProvenance::FirstParty,
-            "an unknown Sec-Fetch-Site value must default to first-party"
+            RequestProvenance::StoreServed,
+            "an unknown Sec-Fetch-Site value must fail closed"
+        );
+    }
+
+    // -- landing_origin: the fold every landing leg shares -------------------------------------
+
+    #[test]
+    fn a_store_served_request_never_lands_however_local_its_transport_is() {
+        // The decision under test is the FOLD, not the marker a leg later writes. A loopback
+        // transport is the strongest case for landing and is exactly the one dig-node#450 exploits,
+        // so `Local` is the input that distinguishes this fix from doing nothing.
+        assert_eq!(
+            landing_origin(ReadOrigin::Local, RequestProvenance::StoreServed),
+            ReadOrigin::Peer,
+            "a page the node serves at /s/ must not land on the operator's behalf"
+        );
+        // The truthful control, on the same axis: same transport, only the provenance differs.
+        assert_eq!(
+            landing_origin(ReadOrigin::Local, RequestProvenance::FirstParty),
+            ReadOrigin::Local,
+            "the operator's own read must still land, or the fix has disabled the flywheel"
         );
     }
 }

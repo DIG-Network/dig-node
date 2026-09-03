@@ -56,6 +56,7 @@ pub mod chat;
 pub mod dht_sampling;
 pub mod download;
 pub mod inbound_demand;
+pub mod mirror_bond;
 mod module_tier_tag;
 pub mod peer;
 pub mod rate_limit;
@@ -237,7 +238,7 @@ pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const ROOT_NOT_ANCHORED: i64 = -32005;
 
 /// The resource is not available at the requested root — this node does not hold it and no other
-/// tier produced it. Catalogued as `RESOURCE_NOT_AVAILABLE_AT_ROOT` (dig-node `SPEC.md` error table)
+/// tier produced it. Catalogued as `RESOURCE_UNAVAILABLE` (dig-node `SPEC.md` error table)
 /// and already the code the read path returns for content it does not have.
 ///
 /// Named here (#1997) because the read path now reaches it in a NEW way: with no upstream configured
@@ -491,6 +492,12 @@ pub struct Node {
     /// registry. The registry's distinct-generation cap ([`crate::seams::dig_peer::DEFAULT_MAX_CONCURRENT_WARMS`])
     /// therefore bounds concurrent acquisitions across BOTH legs, not each in isolation.
     capsule_acquisition: Arc<crate::seams::dig_peer::WarmRegistry>,
+    /// Inbound admission for the mTLS peer surface (dig-sex SPEC 8.5, #269).
+    ///
+    /// One meter for the whole NODE, not one per connection or per responder: the ceiling it enforces
+    /// is node-wide, and a per-connection meter would let a peer buy more allowance simply by opening
+    /// more connections.
+    peer_admission: Arc<crate::seams::dig_peer::admission::PeerAdmission>,
     /// A WEAK self-reference, installed by the standalone peer-network bring-up (which holds the
     /// `Arc<Node>`), so a `&self` read handler can spawn a detached background task that needs an owned
     /// `Arc<Node>` — the capsule backfill (§14.3). `Weak` (not `Arc`) so the node's refcount is
@@ -557,7 +564,8 @@ pub struct Node {
     /// network, and must keep constructing a `Node` without either.
     ///
     /// `None` is an ORDINARY configuration, never a degraded one — a node with no pointer source
-    /// announces exactly as it always did, and the verifier's fallback is the hint scan.
+    /// announces exactly as it always did, and a verifier that cannot fetch a pointer withholds
+    /// credit rather than demoting the holder.
     mirror_pointers: OnceLock<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>>,
 }
 
@@ -611,6 +619,23 @@ fn canonical_cache_dir() -> PathBuf {
     {
         return PathBuf::from(env);
     }
+    platform_user_base().join("DigNode").join("cache")
+}
+
+/// The per-user base directory this node resolves everything under: the cache, `config.json`, and
+/// therefore the `wallet.sqlite` coin replica that hangs off the config's directory.
+///
+/// It asks the OS for the known folder FIRST and only then falls back to the environment. That
+/// ordering is deliberate and load-bearing for the shared-cache guarantee above -- it is correct on
+/// a Windows host whose raw env vars are unset -- but it also means an operator who overrides
+/// `LOCALAPPDATA` does NOT move this path, while the wallet's own env-first resolver
+/// (`dig_wallet::autoseed::user_base`) does. The two halves of that disagreement are announced by
+/// `dig_node_service::wallet_env` (dig-node#392); this function is public so that comparison can be
+/// made against the real resolver rather than a second spelling of it.
+///
+/// Extracted verbatim from [`canonical_cache_dir`], which still calls it: the resolution order is
+/// unchanged in every arm.
+pub fn platform_user_base() -> PathBuf {
     let base = directories::BaseDirs::new().map(|b| {
         if cfg!(windows) {
             b.data_local_dir().to_path_buf()
@@ -620,11 +645,9 @@ fn canonical_cache_dir() -> PathBuf {
             b.home_dir().to_path_buf()
         }
     });
-    let root = base
-        .or_else(|| std::env::var("LOCALAPPDATA").ok().map(PathBuf::from))
+    base.or_else(|| std::env::var("LOCALAPPDATA").ok().map(PathBuf::from))
         .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    root.join("DigNode").join("cache")
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// A deterministic process-private fallback cache dir, used only when the
@@ -849,6 +872,49 @@ pub fn cache_cap_bytes() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CACHE_CAP)
+}
+/// The share of [`cache_cap_bytes`] reserved for the per-resource response cache
+/// (`<cache>/responses`), expressed as a divisor: `cap / RESPONSE_CACHE_SHARE_DIVISOR`.
+///
+/// **Why a split rather than one number applied twice (dig-node#284).** The cap used to be read
+/// independently by BOTH eviction paths over BOTH subtrees, so a node configured for N bytes held
+/// close to 2N: neither sweep knew the other existed. A user setting a cap did not get it.
+///
+/// **Why a reserved share rather than "modules take whatever responses leave".** Sizing each sweep
+/// against the other's live usage converges to the right total but starves whichever subtree loses
+/// the race — and the response cache, being made of small regenerable windows, always loses to
+/// ~135 MiB capsules. A cache that evicts every response the instant it is written is a bound that
+/// starves the work it protects. An eighth is small enough that capsules keep the bulk of the disk
+/// and large enough that the response cache is never pointless.
+const RESPONSE_CACHE_SHARE_DIVISOR: u64 = 8;
+
+/// How the single [`cache_cap_bytes`] budget is divided between the two evicting subtrees, so their
+/// SUM is bounded by the cap the operator configured and `used_bytes` and `cap_bytes` describe the
+/// same thing (dig-node#284).
+///
+/// Unrecognised bytes are charged to the modules half by [`Node::evict_modules_locked`] rather than
+/// being represented here, because only the sweep that walks `<cache>/modules` can measure them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheBudget {
+    /// The whole operator-configured cap. The sum of the two shares below never exceeds it.
+    pub total: u64,
+    /// Bytes `<cache>/responses` may hold.
+    pub responses: u64,
+    /// Bytes `<cache>/modules` may hold, BEFORE unrecognised bytes are charged against it.
+    pub modules: u64,
+}
+
+/// Split the configured cap into its two shares. See [`CacheBudget`].
+pub fn cache_budget() -> CacheBudget {
+    let total = cache_cap_bytes();
+    let responses = total / RESPONSE_CACHE_SHARE_DIVISOR;
+    CacheBudget {
+        total,
+        responses,
+        // Saturating rather than plain subtraction so the invariant holds even if the divisor is
+        // ever changed to something that could exceed the total.
+        modules: total.saturating_sub(responses),
+    }
 }
 
 /// Persist the cache size cap (bytes) to config.json (the DIG settings page).
@@ -2275,9 +2341,11 @@ impl Node {
                 }
             }
         }
-        // Read the cap dynamically so changes from the DIG settings page apply
-        // without restarting the browser. `self.cache_cap` is the startup default.
-        let cap = cache_cap_bytes();
+        // Read the budget dynamically so changes from the DIG settings page apply without
+        // restarting the browser (`self.cache_cap` is the startup default), and take only the
+        // RESPONSES SHARE of it — the modules sweep spends the rest. Reading the whole cap here,
+        // as this did, let the two subtrees each grow to the full cap (dig-node#284).
+        let cap = cache_budget().responses;
         for victim in plan_eviction(&entries, cap) {
             // Size of the victim, looked up from the scan, so the reclaimed-bytes
             // counter is accurate even though the file is about to be unlinked.
@@ -2386,6 +2454,44 @@ impl Node {
         self.refresh_dht_inventory().await;
     }
 
+    /// Total bytes under `<cache>/modules` that [`Node::scan_cached_modules`] does NOT return as an
+    /// eviction candidate — anything whose store directory is not lowercase 64-hex, plus any file
+    /// inside a recognised store directory that is not a capsule (a `.tier` sidecar, a `.tmp-*`
+    /// write-atomic scratch file, a stray subdirectory).
+    ///
+    /// **Why this exists (dig-node#265).** The scan's hex64 filter governed BOTH the total the sweep
+    /// measured AND the candidate set it could evict, so unrecognised bytes were invisible to the
+    /// bound while still consuming the disk the bound protects. They could grow without limit.
+    ///
+    /// **The semantics chosen, stated here because nowhere else records it:** COUNT, never DELETE.
+    /// These bytes are charged against the modules budget, so recognised capsules are evicted to
+    /// compensate; the sweep never removes a file it cannot identify.
+    fn unrecognised_module_bytes(&self) -> u64 {
+        fn walk(p: &Path, total: &mut u64) {
+            let Ok(rd) = std::fs::read_dir(p) else { return };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, total);
+                } else if let Ok(md) = e.metadata() {
+                    *total += md.len();
+                }
+            }
+        }
+
+        let modules = self.cache_dir.join("modules");
+        let mut everything = 0u64;
+        walk(&modules, &mut everything);
+        // Subtract exactly what the scan WOULD evict, so the two halves partition the subtree by
+        // construction rather than by two filters that must be kept in agreement by hand.
+        let recognised: u64 = self
+            .scan_cached_modules()
+            .iter()
+            .map(|m| m.size_bytes)
+            .sum();
+        everything.saturating_sub(recognised)
+    }
+
     /// Every capsule file under `<cache>/modules`, as the eviction decision needs to see it.
     ///
     /// Also refreshes each store's persisted `.tier` sidecar from the live composition, so tier
@@ -2465,9 +2571,24 @@ impl Node {
     /// advertising content it had deleted (#267).
     fn evict_modules_locked(&self) -> Vec<dig_sex::CapsuleIdentity> {
         let _xproc = acquire_cache_lock();
-        let cap = cache_cap_bytes();
+        // The MODULES SHARE of the one budget, not the whole cap (dig-node#284) — the response
+        // cache spends the rest, so the two subtrees together stay under what the operator set.
+        let budget = cache_budget().modules;
         let cached = self.scan_cached_modules();
         let total: u64 = cached.iter().map(|m| m.size_bytes).sum();
+
+        // dig-node#265: bytes under `<cache>/modules` that this sweep cannot identify as a capsule
+        // are COUNTED but never DELETED. Counted, because they consume exactly the disk the bound
+        // exists to protect, and a bound that cannot see half the directory is not a bound.
+        // Never deleted, because the sweep does not exclusively own this directory and removing
+        // files it does not understand is the kind of thing that is fine until the once it is not.
+        //
+        // The consequence is deliberate and worth stating plainly: unrecognised bytes shrink the
+        // budget available to recognised capsules, so the sweep evicts MORE capsules to stay under
+        // the cap. That is the honest direction — the operator asked for a disk bound, not for a
+        // bound on the subset of the disk this version happens to recognise.
+        let unrecognised = self.unrecognised_module_bytes();
+        let cap = budget.saturating_sub(unrecognised);
 
         // The DECISION — whose capsules to sacrifice, and in what order — belongs to `dig-sex`. This
         // node supplies only the facts (`tier_algorithms`) and performs only the I/O. Note what is
@@ -4057,7 +4178,11 @@ impl Node {
     /// a per-request walk of the whole cache is a cost amplifier a peer controls.
     ///
     /// The batch is CAPPED at [`MAX_AVAILABILITY_ITEMS`] — the item count is caller-controlled — with
-    /// the excess simply not answered (the result array is aligned to the answered prefix).
+    /// the excess simply not answered (the result array is aligned to the answered prefix). That
+    /// truncation is the LAST line of defence, reached only by in-process callers: on the peer
+    /// surface an oversized batch never gets here, because
+    /// `NodeResponder::handle_availability` (peer.rs) meters the requested item
+    /// count against the same limit and refuses the whole request at the boundary (#269).
     ///
     /// `requestor` keys the per-item not-held → DHT `find_providers` enrichment against its
     /// per-requestor miss-lookup budget (dig_ecosystem#2007), so a large batch of not-held items from
@@ -4449,7 +4574,11 @@ pub async fn handle_rpc_json(
 /// Every frame is minted through [`seams::dig_rpc::errors::error_frame`], so a declared code
 /// carries `data.code` + `data.origin` from `dig-rpc-protocol` by construction rather than by
 /// each call site remembering to add them (dig-node#340).
-fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
+///
+/// PUBLIC so a consumer that also mints frames at the same numbers — the dig-node shell — can be
+/// tested against the frame this crate actually emits, rather than against a restatement of it.
+/// Two producers of one wire shape are one edit away from disagreeing (dig-node#496).
+pub fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
     crate::seams::dig_rpc::errors::error_frame(id, code, message)
 }
 
@@ -4562,6 +4691,11 @@ impl Node {
         self.capsule_acquisition.clone()
     }
 
+    /// The node-wide inbound admission meter (dig-sex SPEC 8.5, #269).
+    pub(crate) fn peer_admission(&self) -> &Arc<crate::seams::dig_peer::admission::PeerAdmission> {
+        &self.peer_admission
+    }
+
     /// Build a node from the environment (cache dir/cap, §21 identity, upstream).
     /// Used by both the standalone bin's [`run`] and the in-process `dig-runtime`.
     pub fn from_env() -> Arc<Node> {
@@ -4640,6 +4774,7 @@ impl Node {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -4817,6 +4952,15 @@ impl Node {
     ) -> Option<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>> {
         self.mirror_pointers.get().cloned()
     }
+
+    /// This node's own `peer_id`, once its peer network has started.
+    ///
+    /// The mirror lifecycle needs it to write the peer declaration into a coin it creates: a coin
+    /// that names no peer bonds content for nobody in particular and can never be promoted, so a
+    /// node creating one is paying collateral for a claim no reader can credit to it.
+    pub fn own_peer_id(&self) -> Option<String> {
+        self.peer_status.peer_id()
+    }
 }
 
 /// The COMPOSITION-ROOT upcasts (#1285 W1c — the locked "Option A" shape). `Node` stays ONE
@@ -4953,6 +5097,7 @@ pub(crate) mod test_support {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5098,10 +5243,13 @@ mod tests {
     /// ([`RESOURCE_UNAVAILABLE`] and [`RESOURCE_NOT_AVAILABLE`]) are correctly read as one condition
     /// under two names rather than as a collision.
     ///
-    /// Deliberately NOT exhaustive yet: `content_serve::SERVE_UNREADABLE` (`-32000`) specialises the
-    /// canonical `SERVER_ERROR`, and the chat band (`-32050`..`-32052`) is undeclared upstream
-    /// entirely. Both are pre-existing and out of this change; adding them is a follow-up that has to
+    /// Deliberately NOT exhaustive yet: the chat band (`-32050`..`-32052`) is undeclared upstream
+    /// entirely. That is pre-existing and out of this change; adding it is a follow-up that has to
     /// resolve the condition, not the table.
+    ///
+    /// `content_serve::SERVE_UNREADABLE` used to be named here as a second `-32000` gap. It was not
+    /// one: its code field's only sink answered `502` from the message and never read the number, so
+    /// it was a dead const rather than a producer, and it has been deleted (dig-node#496).
     const LOCAL_WIRE_CODES: &[(i64, &str)] = &[
         (
             crate::download::CONTENT_MISS_RATE_LIMITED,
@@ -5742,6 +5890,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5875,6 +6024,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5942,6 +6092,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -5985,10 +6136,14 @@ mod tests {
     /// **Proves (#213):** driving the REAL peer-network bring-up the OS service now invokes
     /// ([`peer::spawn_peer_network`]) starts the §14 chain-watch loop, which PROACTIVELY pulls a
     /// subscribed store's missing generation from a local "peer" (a real auth-required §21 remote)
-    /// with NO client read triggering the miss — EVEN THOUGH the P2P pool/DHT bring-up cannot come up
-    /// in this env (the pre-launch placeholder network genesis makes the gossip config invalid). That
-    /// is the whole point of the §14 decoupling: autonomous sync must run regardless of the P2P
-    /// layer's health. Hermetic + mainnet-safe: relay OFF, ephemeral peer port, a deterministic mock
+    /// with NO client read triggering the miss — INDEPENDENTLY of the P2P pool/DHT bring-up, which in
+    /// this env has no peer to reach (relay OFF, loopback only) and so converges on nothing. That is
+    /// for ENVIRONMENTAL reasons, NOT a rejected gossip config: the default network genesis is a REAL
+    /// non-zero value ([`peer::genesis_challenge_from_env`], see `peer.rs`), so the config is valid and
+    /// the bring-up itself proceeds — proved separately by
+    /// `tests/genesis_bringup.rs::default_genesis_brings_up_the_pool_dht_content_engine_and_peer_rpc_listener`
+    /// (dig-node#240). That independence is the whole point of the §14 decoupling: autonomous sync must
+    /// run regardless of the P2P layer's health. Hermetic + mainnet-safe: relay OFF, ephemeral peer port, a deterministic mock
     /// anchored-root resolver, a 1 s watch tick, the upstream a real §21 remote holding the generation.
     /// **Catches:** the exact #213 gap — chain-watch gated behind a pool/DHT bring-up that fails, so
     /// autonomous sync never actually runs even after the service wires the call.
@@ -6034,6 +6189,9 @@ mod tests {
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
                 capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+                peer_admission: Arc::new(
+                    crate::seams::dig_peer::admission::PeerAdmission::default(),
+                ),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
@@ -6108,6 +6266,9 @@ mod tests {
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
                 capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+                peer_admission: Arc::new(
+                    crate::seams::dig_peer::admission::PeerAdmission::default(),
+                ),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
@@ -6628,6 +6789,165 @@ mod tests {
         assert!(
             path.exists(),
             "the untagged module survives a no-pressure sweep"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// Total bytes actually on disk under `dir`, recursively. The tests below assert against THIS
+    /// rather than against a function having been called: dig-node#284 is a defect about how many
+    /// bytes survive a sweep, so only the bytes can witness it.
+    fn bytes_on_disk(dir: &Path) -> u64 {
+        let mut total = 0u64;
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                total += bytes_on_disk(&p);
+            } else if let Ok(md) = e.metadata() {
+                total += md.len();
+            }
+        }
+        total
+    }
+
+    /// **Proves (dig-node#284):** the configured cap bounds the WHOLE cache, not each subtree
+    /// separately. Both subtrees are filled well past the cap, both sweeps run, and the bytes left
+    /// on disk are measured against the number the operator configured.
+    ///
+    /// **Catches:** either sweep reading `cache_cap_bytes()` instead of its share of
+    /// [`cache_budget`]. With that defect the cache settles near 2x the cap, which is exactly what
+    /// this asserts against — and no assertion about a call, a policy, or a victim list can see it,
+    /// because both sweeps behave *correctly* in isolation. That is the whole shape of the bug.
+    #[test]
+    fn one_budget_bounds_both_cache_subtrees_together() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let (node, _td) = test_node(None);
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+
+        const CAP: u64 = 40_960;
+        set_cache_cap_bytes(CAP).unwrap();
+
+        // Fill `modules` with sacrificial (tier-0) capsules far past the whole cap, so the modules
+        // sweep has real work and cannot pass by holding nothing.
+        let root = "cd".repeat(32);
+        for i in 0..12u8 {
+            let store = format!("{:02x}", i).repeat(32);
+            crate::tier0_live::mark_tier0_land(&store);
+            let p = module_path(&node.cache_dir, &store, &root);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![0u8; 8_192]).unwrap();
+        }
+
+        // Fill `responses` past the cap too.
+        let responses = node.cache_dir.join("responses");
+        std::fs::create_dir_all(&responses).unwrap();
+        for i in 0..12u8 {
+            std::fs::write(responses.join(format!("window-{i}")), vec![0u8; 8_192]).unwrap();
+        }
+
+        let before = bytes_on_disk(&node.cache_dir);
+        assert!(
+            before > CAP * 2,
+            "the fixture must start ABOVE twice the cap or it cannot distinguish one budget from \
+             two, got {before} against a cap of {CAP}"
+        );
+
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+        node.evict_if_needed(&responses);
+
+        let after = bytes_on_disk(&node.cache_dir);
+        assert!(
+            after <= CAP,
+            "the whole cache must fit the ONE configured cap after both sweeps: {after} bytes on \
+             disk against a cap of {CAP}. Roughly 2x the cap means each subtree enforced the cap \
+             independently (dig-node#284)."
+        );
+        // The truthful control: the bound must not be satisfied by deleting everything. A cache
+        // that evicts itself to nothing is a different defect wearing this test's green.
+        assert!(
+            after > 0,
+            "the sweeps must leave the cache populated, not empty — an empty cache trivially fits \
+             any cap and would prove nothing"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// **Proves (dig-node#265):** bytes under `<cache>/modules` that the scan cannot identify are
+    /// COUNTED against the budget and are NEVER DELETED — the two halves of the semantics chosen in
+    /// [`Node::unrecognised_module_bytes`], asserted separately because a fix could get either one
+    /// right alone.
+    ///
+    /// **Catches:** the hex64 filter governing both the measured total and the candidate set, which
+    /// made unrecognised bytes invisible to the bound. Under that defect the recognised capsule fits
+    /// the budget on its own and survives, so the eviction assertion below fails — the unrecognised
+    /// directory is the ONLY reason the sweep is under pressure at all.
+    #[test]
+    fn unrecognised_bytes_under_modules_are_counted_but_never_deleted() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let (node, _td) = test_node(None);
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+
+        // Sized FROM the split, not guessed: the modules share is 7/8 of the cap. One 4 KiB capsule
+        // fits that share comfortably on its own; adding 8 KiB of unrecognised bytes puts the
+        // subtree over it. So the two worlds — counted and not-counted — give opposite verdicts.
+        // Sized FROM the split rather than guessed, and the sizing IS the fixture. The modules
+        // share is 7/8 of the cap = 10_752. A lone 4 KiB capsule fits it, so under the OLD
+        // behaviour (unrecognised bytes invisible) nothing is evicted. Charging the 8 KiB stray
+        // leaves 2_560, which the same capsule does NOT fit. The two worlds give opposite verdicts
+        // on the identical fixture, which is what makes the eviction assertion evidence about the
+        // COUNTING decision rather than about eviction working at all.
+        const CAP: u64 = 12_288;
+        const CAPSULE: u64 = 4_096;
+        const STRAY: u64 = 8_192;
+        set_cache_cap_bytes(CAP).unwrap();
+        let modules_budget = cache_budget().modules;
+        assert!(
+            modules_budget > CAPSULE,
+            "the capsule must fit the modules share ALONE, or it would be evicted whether or not              the stray bytes were counted"
+        );
+        assert!(
+            modules_budget.saturating_sub(STRAY) < CAPSULE,
+            "charging the stray bytes must push the capsule OVER the share, or counting them              changes nothing observable"
+        );
+
+        let store = "9a".repeat(32);
+        let root = "cd".repeat(32);
+        crate::tier0_live::mark_tier0_land(&store); // sacrificial, so pressure CAN evict it
+        let capsule = module_path(&node.cache_dir, &store, &root);
+        std::fs::create_dir_all(capsule.parent().unwrap()).unwrap();
+        std::fs::write(&capsule, vec![0u8; CAPSULE as usize]).unwrap();
+
+        // A directory whose name is not a lowercase 64-hex store id — invisible to the scan.
+        let stray = node.cache_dir.join("modules").join("not-a-store-id");
+        std::fs::create_dir_all(&stray).unwrap();
+        let stray_file = stray.join("blob.bin");
+        std::fs::write(&stray_file, vec![0u8; STRAY as usize]).unwrap();
+
+        assert_eq!(
+            node.unrecognised_module_bytes(),
+            STRAY,
+            "the unrecognised bytes must be measured, or nothing downstream can charge for them"
+        );
+
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+
+        assert!(
+            !capsule.exists(),
+            "the recognised capsule must be evicted to make room for bytes the sweep counted but \
+             cannot remove — under the old filter it fits the budget alone and survives"
+        );
+        assert!(
+            stray_file.exists(),
+            "the sweep must NEVER delete a file it cannot identify from a directory it does not \
+             exclusively own"
         );
 
         std::env::remove_var("DIG_NODE_CACHE");
@@ -7790,6 +8110,91 @@ mod tests {
         );
     }
 
+    /// **Proves (NC-12, `seams::dig_peer::module_relay` module doc):** a relay REFUSAL leaves the
+    /// pre-existing `RESOURCE_UNAVAILABLE` answer byte-identical to the one a requestor that never
+    /// asked for a relay receives. A refusal must not narrate WHICH gate refused.
+    ///
+    /// **Why that is a security property and not tidiness.** The gates are, in order, the
+    /// requestor's own `proxy` flag, the OPERATOR's opt-in (`DIG_NODE_ONION_RELAY`, default off),
+    /// and the requestor's proxy-class allowance. A frame that differs by gate is an oracle a
+    /// stranger reads for free: it says whether this operator enabled relaying, and it says when a
+    /// requestor has exhausted its allowance -- which is the rate-limiter's own state, told to the
+    /// party the limiter exists to bound.
+    ///
+    /// **Fixture design -- the two arms refuse at DIFFERENT gates.** Arm one omits `proxy`, so gate
+    /// one refuses: this request never wanted a relay. Arm two sets `proxy: true`, clears gate one,
+    /// and refuses at the content-engine gate instead. Two arms refusing at the SAME gate would be
+    /// two spellings of one input and would pass under any implementation, so the inequality below
+    /// is asserted first and pins the arms apart.
+    ///
+    /// **On the revert:** turn EITHER of the two refusals this fixture actually reaches --
+    /// `module_relay.rs:114` (the requestor did not ask) or `:117` (this build has no content
+    /// engine) -- into a distinguishable status. `RelayStatus::Pending { staged_bytes: 0 }` is the
+    /// one-line version, and the frame equality fires because that arm becomes the inconclusive-miss
+    /// code carrying a progress field while the other stays `RESOURCE_UNAVAILABLE`.
+    ///
+    /// **What this fixture does NOT reach, said plainly so it is not read as full cover.**
+    /// `relay_capsule` has FIVE refusal sites. The operator opt-in (`:121`) and the proxy allowance
+    /// (`:125`) both sit behind a live `NodeContent`, which `test_node` does not wire, and the
+    /// no-warmer refusal (`:130`) sits behind both. Those first two are exactly the gates the
+    /// rationale above names as the reason the property matters. What holds them today is that all
+    /// five sites return one payload-free `RelayStatus::Refused` -- a property of the enum, not
+    /// something this test observes. Reaching them needs a fixture that installs a `NodeContent`
+    /// and drives `DIG_NODE_ONION_RELAY` under the `test_support` env mutex; that is the next guard
+    /// here, not a gap this one closes.
+    ///
+    /// **The frame is not the only channel, and the other one is now CLOSED (dig-node#512).**
+    /// `allow_proxy_fetch` CONSUMES a rate-limit token (`download.rs:1643`) from a bucket shared with
+    /// `miss_outcome`'s second leg (`download.rs:2721`), and it used to be checked BEFORE the
+    /// capsule-warmer gate — so a refused relay could still spend a token, and a stranger inferred
+    /// the operator's opt-in by draining the allowance and watching a DIFFERENT method flip from
+    /// fetch-through to redirect. The allowance is now charged LAST, so no path returning `Refused`
+    /// consumes anything. Equal frames remain necessary and not sufficient for the secret; what makes
+    /// them sufficient is `a_refused_relay_leaves_no_trace_in_the_proxy_allowance`, which varies only
+    /// the opt-in and reads the shared bucket through `dig.fetchRange`.
+    #[tokio::test]
+    async fn a_relay_refusal_is_indistinguishable_from_a_plain_miss() {
+        let (node, _td) = test_node(None);
+        // Nothing is cached, so BOTH arms are genuine misses and the relay leg is the only thing
+        // that could make them differ.
+        let (store, root) = (id_hex(0x31), id_hex(0x32));
+
+        let never_asked = json!({"store_id": store, "root": root});
+        let asked = json!({"store_id": store, "root": root, "proxy": true});
+
+        // Side effect first: the two params genuinely differ in the field gate one reads, so the
+        // assertions below compare two different journeys rather than one input written twice.
+        assert_ne!(
+            crate::download::proxy_requested(&never_asked),
+            crate::download::proxy_requested(&asked),
+            "fixture precondition: one arm must ask for a relay and the other must not, or the \
+             arms refuse at the same gate and prove nothing"
+        );
+
+        let answer = |params: Value| {
+            handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":7,"method":"dig.getModuleInfo","params":params}),
+                crate::download::ReadOrigin::Peer,
+                crate::download::RequestProvenance::FirstParty,
+            )
+        };
+        let plain_miss = answer(never_asked).await;
+        let refused_relay = answer(asked).await;
+
+        assert_eq!(
+            plain_miss["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "the control: a miss with no relay asked for is the settled not-held answer"
+        );
+        assert_eq!(
+            refused_relay, plain_miss,
+            "a refused relay must be INDISTINGUISHABLE from a plain miss; any difference tells a \
+             stranger which gate refused, and the gates encode the operator's opt-in and the \
+             requestor's remaining allowance"
+        );
+    }
+
     /// **Proves (#2022):** `dig.listInventory` with `store_id` omitted — the whole-inventory
     /// enumeration ("a free map of everything this node holds") — is REFUSED over the permissionless
     /// peer surface (`ReadOrigin::Peer`) with -32601, yet still answered from the loopback/control
@@ -8935,6 +9340,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            peer_admission: Arc::new(crate::seams::dig_peer::admission::PeerAdmission::default()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -10715,6 +11121,10 @@ mod tests {
         assert_eq!(arr[2]["available"], false, "unknown capsule is a miss");
     }
 
+    /// Pins the IN-PROCESS truncation only. A peer-surface batch this size is refused whole at
+    /// admission long before it reaches here, and this test cannot see that: it calls the batch
+    /// BELOW the responder that decides. The responder-level pair lives in `peer.rs`
+    /// (`the_responder_serves_a_batch_at_the_advertised_limit_and_refuses_one_past_it`).
     #[tokio::test]
     async fn availability_batch_caps_the_item_count() {
         let (node, _td) = test_node(None);
@@ -15332,6 +15742,141 @@ mod tests {
                 "lookup-only miss {i} is untouched by the exhausted proxy allowance: {lookup}"
             );
         }
+    }
+
+    /// **Proves (dig-node#512):** the operator's onion-relay opt-in is not observable to a peer
+    /// through the PROXY ALLOWANCE. A refused relay must leave no trace anywhere a stranger can
+    /// read -- not in the refusal frame (#356/#504 already pin that), and not in the shared
+    /// `proxy_rate_limiter` whose state a LATER `dig.fetchRange` reports by changing shape.
+    ///
+    /// **The channel this closes.** Before the fix, `relay_capsule` charged the proxy allowance at
+    /// gate 3 and only then discovered it had no capsule warmer, so a token was spent on a relay
+    /// that could never happen. Token-consumed therefore held exactly when gates 1 and 2 passed --
+    /// and gate 1 is the attacker's own `proxy` flag, leaving the OPERATOR'S OPT-IN as the only
+    /// variable. `miss_outcome`'s second leg (`download.rs:2721`) checks the SAME bucket, so
+    /// draining it flips a subsequent `dig.fetchRange` from fetch-through to redirect. A stranger
+    /// reads `DIG_NODE_ONION_RELAY` by asking for one relay and watching a different method.
+    ///
+    /// **Fixture design -- vary ONE actor, keep a truthful control.** The two arms differ in
+    /// `set_onion_relay(false|true)` and in nothing else: same node shape, same peer id, same
+    /// no-refill allowance of exactly 1, same uncached capsule. `attach_p2p` deliberately wires NO
+    /// capsule warmer, which is the real build shape this defect lives in and is what makes the
+    /// relay-ON arm reach gate 3 and then refuse anyway.
+    ///
+    /// Both arms MUST answer `RESOURCE_UNAVAILABLE`, and that is asserted rather than assumed: if
+    /// one arm relayed successfully the two journeys would not be comparable and the probe below
+    /// would be measuring an honest difference instead of a leak.
+    ///
+    /// **Asserting equal refusal FRAMES would be vacuous here** -- that is #356/#504's guard, it
+    /// passes under this defect, and it is precisely why this ticket exists. The observation is
+    /// taken through the OTHER method, which is where the bucket's state is legible.
+    ///
+    /// **On the revert:** move the `capsule_warmer()` check in `relay_capsule` back BELOW the
+    /// `allow_proxy_fetch` check. The relay-ON arm then spends its only proxy token on a relay it
+    /// refuses, the probe degrades to `CONTENT_REDIRECT` while the relay-OFF arm still serves
+    /// bytes, and the final assertion fires.
+    #[test]
+    fn a_refused_relay_leaves_no_trace_in_the_proxy_allowance() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+
+        // One arm of the experiment: run a node whose ONLY difference is the operator's opt-in, ask
+        // it for a relay it will refuse, then read the shared proxy bucket through `dig.fetchRange`.
+        // Returns (the refusal frame, what the probe observed).
+        let arm = |relay_on: bool| -> (Value, Value) {
+            let content = anchored_mock_content(30, 3);
+            let cid = anchored_cid_for(&content);
+            let (store_hex, tip_hex, rk_hex) = match &cid {
+                ContentId::Resource {
+                    store_id,
+                    root,
+                    retrieval_key,
+                } => (
+                    hex::encode(store_id),
+                    hex::encode(root),
+                    hex::encode(retrieval_key),
+                ),
+                _ => unreachable!("resource id"),
+            };
+            let anchored_root = Bytes32::from_hex(&tip_hex).expect("64-hex root");
+            let (node, td) =
+                test_node_with_resolver(None, MockResolver::one(&store_hex, anchored_root));
+            attach_p2p(
+                &node,
+                vec![dig_download::testkit::mock_provider(1, &cid)],
+                content.clone(),
+                MissMode::Redirect,
+                &td,
+            );
+            let pc = node.p2p_content().expect("engine attached");
+            // Generous cheap-lookup budget so the probe is never refused for the WRONG reason, and a
+            // proxy allowance of exactly one no-refill token so a single stolen charge is legible.
+            pc.set_miss_rate_limit(100.0, 0.0);
+            pc.set_proxy_rate_limit(1.0, 0.0);
+            pc.set_onion_relay(relay_on);
+
+            // The one peer whose allowance is under observation. Both the relay ask and the probe
+            // are made as this identity, because the bucket is keyed per requestor.
+            let peer = || crate::rate_limit::RequestorId::Peer("5121".to_string());
+
+            // A capsule this node does not hold, so the module read misses and reaches the relay leg.
+            let uncached_store = id_hex(0x51);
+            let uncached_root = id_hex(0x52);
+            let refusal = rt.block_on(handle_rpc_as(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getModuleInfo","params":{
+                    "store_id": uncached_store, "root": uncached_root, "proxy": true,
+                }}),
+                crate::download::ReadOrigin::Peer,
+                crate::download::RequestProvenance::FirstParty,
+                peer(),
+            ));
+
+            // The PROBE: a proxy miss on real, anchored content. It serves bytes while the peer's
+            // proxy allowance holds a token and degrades to a redirect once it does not -- so its
+            // shape IS a readout of the bucket the relay leg may or may not have charged.
+            let probe = rt.block_on(handle_rpc_as(
+                &node,
+                json!({"jsonrpc":"2.0","id":2,"method":"dig.fetchRange","params":{
+                    "store_id": store_hex, "root": tip_hex, "retrieval_key": rk_hex,
+                    "length": 4096, "offset": 0, "proxy": true,
+                }}),
+                crate::download::ReadOrigin::Peer,
+                crate::download::RequestProvenance::FirstParty,
+                peer(),
+            ));
+            let observed = json!({
+                "served": probe.get("result").is_some(),
+                "error_code": probe["error"]["code"].clone(),
+            });
+            (refusal, observed)
+        };
+
+        let (off_refusal, off_observed) = arm(false);
+        let (on_refusal, on_observed) = arm(true);
+
+        // Precondition: BOTH arms must genuinely refuse the relay, or the arms are not comparable
+        // and the probe below is reading an honest difference rather than a side channel.
+        for (label, refusal) in [("relay OFF", &off_refusal), ("relay ON", &on_refusal)] {
+            assert_eq!(
+                refusal["error"]["code"],
+                json!(crate::download::RESOURCE_UNAVAILABLE),
+                "fixture precondition: the {label} arm must REFUSE the relay (this build wires no \
+                 capsule warmer), or the two journeys are not comparable: {refusal}"
+            );
+        }
+
+        // THE PROPERTY. Not the refusal frames -- those are equal under the defect too (#356/#504).
+        // The bucket a DIFFERENT method reports must be identical, because a refused relay must
+        // consume nothing at all.
+        assert_eq!(
+            on_observed, off_observed,
+            "the operator's onion-relay opt-in is observable through the proxy allowance: a \
+             refused relay charged a token on the opt-in arm, so a later dig.fetchRange changed \
+             shape. relay ON saw {on_observed}, relay OFF saw {off_observed}"
+        );
     }
 
     /// dig_ecosystem#2007 Unit A: the miss → DHT-lookup path is rate-limited PER REQUESTOR — an

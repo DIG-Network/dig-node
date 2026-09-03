@@ -48,6 +48,8 @@ pub mod config;
 /// `<base>`/Referer store-root rerooting, the content-type map, the SPA-vs-asset classifier, and the
 /// served-store CSP. The wiring lives in [`server`].
 pub mod content;
+#[cfg(test)]
+mod continuation_guard;
 pub mod control;
 /// CLI parity with the node's `control.*` surface (#426): a `dig-node`/`dign` subcommand for every
 /// control the extension can drive (status, config, cache, hosted stores, §21 sync, updater,
@@ -87,6 +89,10 @@ pub mod network_info;
 /// handler argument, then opens the user's default browser at the resolving URL. See [`open`].
 pub mod open;
 pub mod pair;
+/// The CLIENT half of the #280 pairing handshake (#403): the token ladder + the per-user
+/// paired-token store, so an unprivileged user can drive `control.*` without widening a mode.
+/// See [`paired_client`].
+pub mod paired_client;
 pub mod pairing;
 /// `control.peers.ping` (dig_ecosystem#1985): the connection-ladder diagnostic — dial one peer a
 /// tier at a time and report WHICH tier reached it. See [`peer_ping`].
@@ -150,6 +156,10 @@ pub mod wallet_authz;
 /// The start-up check that a wallet seed exists, minting one if it does not (dig-node#277).
 /// Never fatal, never a fallback. See [`wallet_bootstrap`].
 pub mod wallet_bootstrap;
+
+/// Announcing the wallet-related environment this process resolved, and refusing the one
+/// destructive consequence of a split per-user root (dig-node#392). See [`wallet_env`].
+pub mod wallet_env;
 
 /// Latching the fact that the node's own wallet has held funds, so no surface calls a funded
 /// auto-created wallet disposable (dig-node#286). See [`wallet_funded`].

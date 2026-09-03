@@ -384,6 +384,16 @@ enum WalletCommand {
     },
     /// Print the chain peak this node reads against (READ-ONLY).
     Peak,
+    /// Print the address of this node's OWN machine wallet — where to send $DIG so it can pay
+    /// mirror collateral (READ-ONLY).
+    ///
+    /// This is NOT your wallet. The node holds a machine-custody wallet of its own, and it is the
+    /// one that funds mirror coins; a mirror bond reported as unfunded is a statement about THIS
+    /// address, not about the balance you watch in a wallet app.
+    ///
+    /// Prints an address and a puzzle hash and nothing else. No key, seed or phrase is read,
+    /// derived into a signer, or printed by this command.
+    OperatorAddress,
     /// DESTRUCTIVE: discard this node's cached coin database and re-sync it from chain.
     ///
     /// Use when a coin's asset never resolves — a parent spend that could not be fetched is
@@ -749,6 +759,14 @@ enum PairCommand {
         /// The token id from `dig-node pair`.
         token_id: String,
     },
+    /// Ask this node for a scoped control token for YOUR account, then wait for the operator
+    /// to approve it. Needs no elevation and no master token.
+    Connect {
+        /// The label the operator sees when approving. Defaults to `dign CLI (<user>)`.
+        /// Refused, never shortened, above 64 characters.
+        #[arg(long)]
+        client_name: Option<String>,
+    },
 }
 
 impl Command {
@@ -866,6 +884,7 @@ pub fn run() -> std::process::ExitCode {
                 None | Some(PairCommand::List) => PairAction::List,
                 Some(PairCommand::Approve { pairing_id }) => PairAction::Approve { pairing_id },
                 Some(PairCommand::Revoke { token_id }) => PairAction::Revoke { token_id },
+                Some(PairCommand::Connect { client_name }) => PairAction::Connect { client_name },
             };
             render(pair::run(&config, pair_action), action, json)
         }
@@ -1078,6 +1097,7 @@ fn wallet_action(cmd: WalletCommand) -> Option<ControlAction> {
             ControlAction::WalletArrivals { after_seq, limit }
         }
         WalletCommand::Peak => ControlAction::WalletPeak,
+        WalletCommand::OperatorAddress => ControlAction::WalletOperatorAddress,
         WalletCommand::ResetCoinDb { confirm } => ControlAction::WalletResetCoinDb { confirm },
         WalletCommand::SyncStatus => ControlAction::WalletSyncStatus,
         WalletCommand::Broadcast { signed_bundle_hex } => {
@@ -1401,6 +1421,10 @@ fn live_apply_level(logs_matches: &clap::ArgMatches) {
 /// dev dir.
 fn block_on_serve(config: Config) -> std::io::Result<()> {
     crate::logging::init(crate::logging::run_context());
+    // Say what this process actually resolved BEFORE anything is minted (#392): an operator who
+    // overrode `LOCALAPPDATA` has split the seed away from the `wallet.sqlite` replica, and must
+    // read that before - not after - a line reporting a freshly minted wallet.
+    crate::wallet_env::announce_from_env();
     // A seed must exist before anything can use the wallet, and there is no user here to create
     // one — so check on EVERY start (first install, post-update, ordinary boot) and mint one when
     // there is definitely none (#277). Never fatal: a node that cannot establish a wallet still
@@ -1452,6 +1476,7 @@ mod tests {
                 None | Some(PairCommand::List) => PairAction::List,
                 Some(PairCommand::Approve { pairing_id }) => PairAction::Approve { pairing_id },
                 Some(PairCommand::Revoke { token_id }) => PairAction::Revoke { token_id },
+                Some(PairCommand::Connect { client_name }) => PairAction::Connect { client_name },
             },
             _ => panic!("expected a pair command from {argv:?}"),
         };
@@ -1466,6 +1491,22 @@ mod tests {
                 PairAction::Approve { ref pairing_id } if pairing_id == "abc123"
             ),
             "`pair approve <id>` must approve, and must carry the id through"
+        );
+        // #403: `connect` is a DISTINCT verb, and it must never be reachable by accident from the
+        // bare noun -- the bare noun is the operator's read-only listing.
+        assert!(
+            matches!(
+                pair_action(&["dig-node", "pair", "connect"]),
+                PairAction::Connect { client_name: None }
+            ),
+            "`pair connect` with no flag must default its own label"
+        );
+        assert!(
+            matches!(
+                pair_action(&["dig-node", "pair", "connect", "--client-name", "Agent"]),
+                PairAction::Connect { client_name: Some(ref n) } if n == "Agent"
+            ),
+            "`--client-name` must reach the action verbatim -- the operator approves what they see"
         );
     }
 
@@ -1807,6 +1848,10 @@ mod tests {
                 "control.wallet.arrivals",
             ),
             (vec!["dig-node", "wallet", "peak"], "control.wallet.peak"),
+            (
+                vec!["dig-node", "wallet", "operator-address"],
+                "control.wallet.operatorAddress",
+            ),
             (
                 vec!["dig-node", "wallet", "reset-coin-db", "--confirm"],
                 "control.wallet.resetCoinDb",

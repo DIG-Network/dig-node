@@ -331,6 +331,54 @@ pub struct SkippedCandidate {
     pub reason: String,
 }
 
+/// How many skipped coin ids one report names before it stops listing them.
+///
+/// Coin ids are public, so listing them leaks nothing, and a handful is what makes a report
+/// actionable rather than merely alarming -- an operator can look them up on chain. The bound is
+/// what keeps the line O(1) in a figure an attacker chooses: without it the aggregation would just
+/// move the attacker-driven volume from the line COUNT to the line LENGTH.
+pub const SKIP_SAMPLE: usize = 8;
+
+/// The one operator-facing sentence for a whole selection's passed-over candidates.
+///
+/// `None` when nothing was passed over, so a healthy pass says nothing at all.
+///
+/// # Why it says "at least"
+///
+/// The same path that passes over a stranger's coin passes over one of this node's OWN coins when
+/// lineage handling has a bug. Any total derived from a walk that skipped candidates is therefore a
+/// FLOOR on what the operator can spend, not the total -- and a confident understated figure is the
+/// money lie this module exists to refuse (dig-node#481). An operator told "you have X" acts on X;
+/// an operator told "you have at least X, and N coins here could not be proven yours" knows both
+/// what they can do and what to investigate.
+pub fn skip_report(skipped: &[SkippedCandidate]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let sample: Vec<&str> = skipped
+        .iter()
+        .take(SKIP_SAMPLE)
+        .map(|candidate| candidate.coin_id.as_str())
+        .collect();
+    let ellipsis = if skipped.len() > SKIP_SAMPLE {
+        ", ..."
+    } else {
+        ""
+    };
+    Some(format!(
+        concat!(
+            "{count} coin(s) at the operator's $DIG address could not be proven spendable and ",
+            "were passed over, so any total this pass reports is a FLOOR -- the operator can ",
+            "spend AT LEAST that much, not exactly that much. If any of these is one of this ",
+            "node's own coins, its lineage is not readable from the chain and the shortfall is ",
+            "not real. Coin ids: {sample}{ellipsis}"
+        ),
+        count = skipped.len(),
+        sample = sample.join(", "),
+        ellipsis = ellipsis
+    ))
+}
+
 /// The outcome of a funding selection: the coins to spend, and the candidates passed over.
 #[derive(Debug, Clone)]
 pub struct FundingSelection {
@@ -342,8 +390,14 @@ pub struct FundingSelection {
 
 /// Select spendable $DIG `Cat`s of the OPERATOR wallet covering `need_dig_base_units`.
 ///
-/// The `Vec<Cat>` half of [`select_operator_dig_cats_detailed`], for callers that fund a spend and
-/// have nothing to say about the candidates that were passed over.
+/// The `Vec<Cat>` half of [`select_operator_dig_cats_detailed`], for callers whose only question is
+/// which coins to spend.
+///
+/// NOT the funding route. Discarding [`FundingSelection::skipped`] is what made "a skip is counted
+/// and reported" true of tests and false of the shipped node (dig-node#481), so the mirror
+/// lifecycle calls [`select_operator_dig_cats_detailed`] and consumes the skips. This remains for
+/// the many tests that assert on the coins alone; the aggregated operator report is emitted by the
+/// selection itself, so nothing is silenced by choosing it.
 pub fn select_operator_dig_cats<S: ChainSource>(
     source: &S,
     owner_puzzle_hash: Bytes32,
@@ -379,9 +433,12 @@ pub fn select_operator_dig_cats<S: ChainSource>(
 ///
 /// Two properties keep the skip from becoming a different failure:
 ///
-/// * **A skip is counted and reported**, never swallowed. The same path covers a genuine defect in
-///   lineage handling, and a selection that quietly discarded the operator's own coins while
-///   reporting a shortfall would be indistinguishable from an empty wallet.
+/// * **A skip is counted and reported**, never swallowed -- counted into
+///   [`FundingSelection::skipped`], which the funding caller consumes, and reported once per
+///   selection through [`skip_report`], whose wording makes any total this pass quotes a FLOOR
+///   rather than a figure. The same path covers a genuine defect in lineage handling, and a
+///   selection that quietly discarded the operator's own coins while reporting a shortfall would
+///   be indistinguishable from an empty wallet.
 /// * **A skip costs no selection budget.** Candidates are authenticated BEFORE anything is
 ///   selected, so a candidate that fails is never in a selection, never occupies an input slot and
 ///   never contributes to a total. An attacker who could spend an input slot per dust coin would
@@ -470,21 +527,23 @@ pub fn select_operator_dig_cats_detailed<S: ChainSource>(
                 authenticated_total = authenticated_total.saturating_add(record.coin.amount);
                 authenticated.push((record.clone(), cat));
             }
+            // Collected, not logged. One line per skipped candidate is up to
+            // `MAX_AUTHENTICATION_ATTEMPTS` lines per selection per create per pass, and the
+            // count is chosen by whoever planted the coins -- an attacker-driven log volume in a
+            // module with no rate limit anywhere. The whole walk is reported ONCE below.
             Err(FundingError::Unauthenticated { coin_id, reason }) => {
-                tracing::warn!(
-                    coin_id = %coin_id,
-                    reason = %reason,
-                    concat!(
-                        "a coin at the operator's $DIG address could not be proven spendable ",
-                        "and was passed over; if it is one of this node's own coins, its ",
-                        "lineage is not readable from the chain"
-                    )
-                );
                 skipped.push(SkippedCandidate { coin_id, reason });
             }
             // A source that cannot answer is not a verdict about the coin.
             Err(fatal) => return Err(fatal),
         }
+    }
+
+    // ONE line for the whole walk, whatever this selection goes on to do. Placed before the
+    // refusals below rather than after the `Ok`, because a truncated or uncovered walk is exactly
+    // when an operator most needs to know their address is carrying coins that are not theirs.
+    if let Some(report) = skip_report(&skipped) {
+        tracing::warn!(target: "mirror", skipped = skipped.len(), "{report}");
     }
 
     // The walk was truncated and the requirement is uncovered, so the honest total is UNKNOWN
@@ -622,6 +681,33 @@ pub enum UnmeasuredFunding {
     },
 }
 
+impl UnmeasuredFunding {
+    /// The identity two unmeasured conditions are compared on to decide whether to alert again.
+    ///
+    /// Not the whole value, and not the bare discriminant either -- the two variants differ in
+    /// exactly the property that matters here, so a rule that treated them alike would be wrong in
+    /// one direction or the other:
+    ///
+    /// * [`UnmeasuredFunding::AuthenticationTruncated`] carries `attempted` and `skipped`, both
+    ///   read off a walk over a PUBLIC puzzle hash. A stranger moves `skipped` by paying one more
+    ///   coin there, so including it lets the attacker set the notification rate.
+    /// * [`UnmeasuredFunding::NoCreateAffordable`] carries `need_dig_base_units`, derived from the
+    ///   epoch requirement and the plan and never from the wallet. A change in it is a change in
+    ///   what the operator must actually do, and swallowing that is its own money defect: a real
+    ///   funding problem, materially altered, going unreported.
+    ///
+    /// So the key excludes the attacker-movable fields and keeps the rest.
+    fn alert_key(&self) -> UnmeasuredAlertKey {
+        let kind = std::mem::discriminant(self);
+        match self {
+            UnmeasuredFunding::NoCreateAffordable {
+                need_dig_base_units,
+            } => (kind, Some(*need_dig_base_units)),
+            UnmeasuredFunding::AuthenticationTruncated { .. } => (kind, None),
+        }
+    }
+}
+
 /// What one mirror pass observed about funding — the input the alert gate decides on.
 ///
 /// A pass that could not READ the balance is not a pass that found it short: reporting a shortfall
@@ -748,8 +834,18 @@ pub struct FundingAlertGate {
     /// on an authenticated figure AND then become unmeasurable, and that transition is exactly the
     /// one an operator must hear about — it is the pass on which the correction they were waiting
     /// for stops being possible.
-    unmeasured: Option<UnmeasuredFunding>,
+    ///
+    /// Held as an [`UnmeasuredFunding::alert_key`] rather than as the condition itself, so that
+    /// the fields a stranger can move cannot re-arm the alert. The type is deliberately private:
+    /// nothing outside this module reads it, and the public `observe` signature is unchanged.
+    unmeasured: Option<UnmeasuredAlertKey>,
 }
+
+/// What makes two unmeasured conditions the SAME condition, for alerting purposes.
+///
+/// The discriminant, plus only those payload fields no stranger can move. See
+/// [`UnmeasuredFunding::alert_key`].
+type UnmeasuredAlertKey = (std::mem::Discriminant<UnmeasuredFunding>, Option<u64>);
 
 /// How much a deficit must grow, in percent of the last alerted deficit, to speak again.
 ///
@@ -788,10 +884,22 @@ impl FundingAlertGate {
             // Once per entry. Consecutive unmeasured passes are the attacker's steady state, so a
             // per-pass message would be 144 a day; a single one that stays true is the signal.
             FundingObservation::Unmeasured(reason) => {
-                if self.unmeasured == Some(*reason) {
+                // Latched on [`UnmeasuredFunding::alert_key`], never on the whole value. Equality
+                // over the whole value is not a latch: `AuthenticationTruncated` carries `skipped`,
+                // which is `MAX_AUTHENTICATION_ATTEMPTS` minus however many honest coins the walk
+                // reached -- and anyone may move that by paying one more coin to the operator's
+                // publicly derivable $DIG address. A stranger therefore chose how often the
+                // operator was notified, which is the 144-a-day stream this gate exists to prevent,
+                // bought with a one-time dust spend (dig-node#481).
+                //
+                // The counts stay fully available to the alert BODY below, because an operator who
+                // IS being told deserves the real figures. It is only the decision to speak AGAIN
+                // that ignores the fields a stranger can move.
+                let key = reason.alert_key();
+                if self.unmeasured == Some(key) {
                     return None;
                 }
-                self.unmeasured = Some(*reason);
+                self.unmeasured = Some(key);
                 Some(unmeasured_alert(*reason))
             }
             FundingObservation::Healthy => self.clear_and_announce_recovery(),
@@ -1802,5 +1910,127 @@ mod tests {
             store_id: None,
             bond: None,
         }
+    }
+
+    /// **A repeat truncation whose counts a STRANGER moved must not re-alert.**
+    ///
+    /// The gate latches so that an unattended ten-minute pass cannot become 144 notifications a
+    /// day. `AuthenticationTruncated` carries `skipped`, which is `MAX_AUTHENTICATION_ATTEMPTS`
+    /// minus however many honest coins the walk reached - a figure anyone may move by paying one
+    /// more coin to the operator's publicly derivable $DIG address. Latching on the whole value
+    /// therefore handed the attacker the latch: a new count each pass, an alert each pass, and the
+    /// operator trained to dismiss the one alert that mattered.
+    ///
+    /// The fixture varies exactly ONE thing between the two passes - one additional planted coin -
+    /// because that is the cheapest move an attacker has, and a fixture that changed the kind of
+    /// condition as well could not tell suppression from a coincidence.
+    #[test]
+    fn a_truncation_whose_skip_count_moved_does_not_re_alert() {
+        let mut gate = FundingAlertGate::default();
+
+        let first = gate.observe(&FundingObservation::Unmeasured(
+            UnmeasuredFunding::AuthenticationTruncated {
+                attempted: MAX_AUTHENTICATION_ATTEMPTS,
+                skipped: 40,
+            },
+        ));
+        assert!(
+            first.is_some(),
+            "the transition into a truncated walk is the one pass that must speak"
+        );
+
+        let second = gate.observe(&FundingObservation::Unmeasured(
+            UnmeasuredFunding::AuthenticationTruncated {
+                attempted: MAX_AUTHENTICATION_ATTEMPTS,
+                skipped: 41,
+            },
+        ));
+        assert!(
+            second.is_none(),
+            concat!(
+                "one more planted coin changed `skipped` and nothing else; a gate that latches on ",
+                "the counts does not latch at all, so the attacker sets the notification rate"
+            )
+        );
+    }
+
+    /// **A changed REQUIREMENT is real news and must alert, even though the kind is unchanged.**
+    ///
+    /// The counterweight that keeps the latch from over-correcting, and it guards a money defect
+    /// rather than a nuisance. `NoCreateAffordable` carries `need_dig_base_units`, which is derived
+    /// from the epoch requirement and the plan and never from the wallet, so no stranger can move
+    /// it. When it changes, what the operator must do has changed -- the amount they must add is
+    /// different -- and a latch keyed on the bare discriminant would silently swallow that.
+    ///
+    /// Both passes are the SAME variant on purpose. A fixture that also changed the variant could
+    /// not distinguish "the key carries the requirement" from "the key is just the discriminant".
+    #[test]
+    fn a_changed_collateral_requirement_alerts_again() {
+        let mut gate = FundingAlertGate::default();
+
+        let first = gate.observe(&FundingObservation::Unmeasured(
+            UnmeasuredFunding::NoCreateAffordable {
+                need_dig_base_units: 100,
+            },
+        ));
+        assert!(first.is_some(), "the transition into the condition speaks");
+
+        let second = gate.observe(&FundingObservation::Unmeasured(
+            UnmeasuredFunding::NoCreateAffordable {
+                need_dig_base_units: 5_000,
+            },
+        ));
+        assert!(
+            second.is_some(),
+            concat!(
+                "the collateral requirement rose fifty-fold and the operator was never told the ",
+                "new figure; this field is node-derived, so suppressing it reports nothing about ",
+                "a funding problem that has materially changed"
+            )
+        );
+    }
+
+    /// **Suppressing the counts must not suppress a genuine change of condition.**
+    ///
+    /// The counterweight to the test above, and it guards a money defect rather than a nuisance:
+    /// over-suppression means a real, DIFFERENT funding problem going unreported. A wallet that
+    /// stops being truncated and starts being unable to afford any create at all is a different
+    /// sentence with a different remedy, and the operator must hear it.
+    #[test]
+    fn a_different_unmeasured_kind_still_alerts() {
+        let mut gate = FundingAlertGate::default();
+
+        assert!(
+            gate.observe(&FundingObservation::Unmeasured(
+                UnmeasuredFunding::AuthenticationTruncated {
+                    attempted: MAX_AUTHENTICATION_ATTEMPTS,
+                    skipped: 40,
+                },
+            ))
+            .is_some(),
+            "the first truncation speaks"
+        );
+        assert!(
+            gate.observe(&FundingObservation::Unmeasured(
+                UnmeasuredFunding::NoCreateAffordable {
+                    need_dig_base_units: 500_000,
+                },
+            ))
+            .is_some(),
+            concat!(
+                "a truncated walk and an unaffordable create are different conditions with ",
+                "different remedies; latching on the kind must still let the kind CHANGE"
+            )
+        );
+        assert!(
+            gate.observe(&FundingObservation::Unmeasured(
+                UnmeasuredFunding::AuthenticationTruncated {
+                    attempted: MAX_AUTHENTICATION_ATTEMPTS,
+                    skipped: 99,
+                },
+            ))
+            .is_some(),
+            "and back again -- the transition is what speaks, in either direction"
+        );
     }
 }

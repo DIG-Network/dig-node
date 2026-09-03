@@ -11,14 +11,16 @@
 //! so [`save_user_theme`] persists [`DERIVED_THEME_PLACEHOLDER`] instead of a real derived
 //! theme — `get_user_theme`/`get_user_themes` still report the NFT as themed (parity for
 //! "has a theme been saved"), but the placeholder is not a rendered color scheme. Real
-//! derivation is a tracked follow-on once an image pipeline exists.
+//! image-derived theming is INTENTIONALLY UNSERVED here: it is a rendering concern that belongs
+//! to a client with an image pipeline, not to a wallet backend, so nothing is waiting on it.
 
 use super::db::WalletDb;
 use super::Result;
 
 /// The stored value [`save_user_theme`] uses in place of a real image-derived theme (see the
 /// module docs). Opaque; callers should treat this as "themed with an unspecified theme" and
-/// not attempt to render it as a color scheme.
+/// not attempt to render it as a color scheme. Image-derived theming is intentionally unserved
+/// by this backend rather than pending, so this placeholder is the permanent stored shape.
 pub const DERIVED_THEME_PLACEHOLDER: &str = "auto";
 
 /// `get_user_themes` — every NFT id with a saved theme.

@@ -31,6 +31,8 @@ fn env_guard() -> Arc<tokio::sync::Mutex<()>> {
 
 /// RAII release of the env-serialization lock (held for the whole test).
 #[must_use]
+// Held purely for its Drop (RAII release of the serialization lock). The field is
+// never read -- the value's lifetime IS its purpose -- so silence dead_code.
 struct EnvHold(#[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>);
 
 /// A node's temp tree, **owned** — removed when the test's binding drops, including on panic.
@@ -902,15 +904,33 @@ async fn store_serve_labels_provenance_from_sec_fetch_site_without_blocking_the_
         cross.recorded_provenances()
     );
 
-    // Same-site: a first-party subresource — must land normally.
-    let (same, same_status) = drive_s_get("127.0.0.1:51241", &path, None, Some("same-site")).await;
+    // Same-origin: dig-node#450. `/s/*` and `POST /` share a router, a port and therefore an
+    // ORIGIN, and STORE_CSP lets a store page script a call the browser labels `same-origin`. It
+    // must reach the seam as StoreServed so landing folds to `Peer` — otherwise a stranger's page
+    // chooses which capsule this operator bonds $DIG against.
+    let (same, same_status) =
+        drive_s_get("127.0.0.1:51241", &path, None, Some("same-origin")).await;
     assert!(
         same.recorded_provenances()
             .iter()
-            .all(|p| *p == RequestProvenance::FirstParty)
+            .all(|p| *p == RequestProvenance::StoreServed)
             && !same.recorded_provenances().is_empty(),
-        "a same-site read must reach the seam as FirstParty, got {:?}",
+        "a same-origin read must reach the seam as StoreServed, got {:?}",
         same.recorded_provenances()
+    );
+
+    // The control that keeps the flywheel honest: a USER-initiated top-level navigation
+    // (`Sec-Fetch-Site: none`, unforgeable by page script) is still FirstParty and still lands. If
+    // this arm ever folded too, opening a store in a browser would stop landing it at all — a
+    // regression a StoreServed-only assertion could not see.
+    let (nav, _) = drive_s_get("127.0.0.1:51243", &path, None, Some("none")).await;
+    assert!(
+        nav.recorded_provenances()
+            .iter()
+            .all(|p| *p == RequestProvenance::FirstParty)
+            && !nav.recorded_provenances().is_empty(),
+        "a top-level navigation must reach the seam as FirstParty, got {:?}",
+        nav.recorded_provenances()
     );
 
     // Header ABSENT (a CLI/SDK client sends no Sec-Fetch-*): must be FirstParty, never CrossSite.

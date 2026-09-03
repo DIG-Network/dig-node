@@ -229,6 +229,16 @@ impl PeerStatus {
         Arc::new(PeerStatus::default())
     }
 
+    /// This node's own `peer_id`, once the peer network has started.
+    ///
+    /// `None` before start-up. A caller that must NAME this node — writing the peer declaration into
+    /// a mirror coin, say — has to tolerate that: the identity exists on disk from the first boot,
+    /// but this status only learns it when the network comes up, so an early caller MUST treat
+    /// `None` as "not yet" rather than as "this node has no identity".
+    pub fn peer_id(&self) -> Option<String> {
+        self.peer_id.lock().unwrap().clone()
+    }
+
     /// Mark the peer network running under `peer_id` (clears the last error).
     pub fn set_running(&self, peer_id: String) {
         self.running.store(true, Ordering::Relaxed);
@@ -858,9 +868,21 @@ pub use crate::shared::identity::{install_crypto_provider, load_or_generate_node
 /// Sharing these files is what makes the pool's inbound listener present the node's ADVERTISED
 /// identity, so `peer_id = SHA-256(SPKI DER)` is identical across every listener the node runs (the
 /// peer-RPC server, the DHT dials, and the gossip pool). Without this the pool would present a cert
-/// hashing to a different peer_id and every dial to this node fails closed with `peer_id mismatch`
-/// (#1532). dig-gossip only READS these files (`dig_peer_protocol::load_ssl_cert`), so pointing at the
-/// canonical identity files can never clobber them.
+/// hashing to a different peer_id than the one this node advertises (#1532).
+///
+/// **A dialler DOES notice, on every path this node is dialled over.** An earlier version of this
+/// note said the opposite, and it was wrong in a way worth stating: it generalised one true fact
+/// about `dig-gossip` into a claim about every dial. The true fact is narrow — `dig-gossip`'s legacy
+/// rustls outbound derives a peer id from the presented SPKI without comparing it to the one it
+/// dialled, and every `expected_peer_id` in that crate is inside `#[cfg(test)]`
+/// (DIG-Network/dig-gossip#85). But dig-node never dials on that path. Its dials go through
+/// `dig-nat`, which passes the expected id to `dig-tls`; the verifier compares it against the leaf
+/// the far end presents and fails the handshake with `peer_id mismatch: expected <..>, got <..>`,
+/// and `dig-peer` re-checks it after connect. The download path pins the same way, from a provider
+/// record's own `provider_peer_id`. So a split identity IS caught fail-closed here, which is exactly
+/// why keeping these files canonical matters. dig-gossip only READS them
+/// (`dig_peer_protocol::load_ssl_cert`), so pointing at the canonical identity files can never
+/// clobber them.
 ///
 /// [`node_cert_dir`]: crate::seams::key_mgmt::key_manager::KeyManager::node_cert_dir
 fn gossip_identity_paths(node_cert_dir: &std::path::Path) -> (String, String) {
@@ -897,6 +919,11 @@ pub trait PeerRpcResponder: Send + Sync {
     /// by the SAME per-requestor miss-lookup budget as the single-item legs (dig_ecosystem#2007). A
     /// batch is the LARGEST amplification vector (up to `MAX_AVAILABILITY_ITEMS` lookups per request),
     /// so it must key by the ASKING peer, never one shared peer bucket every peer could exhaust.
+    ///
+    /// A batch LARGER than `MAX_AVAILABILITY_ITEMS` is refused whole at the admission boundary
+    /// (`-32000`, reason `request too large`) rather than answered as a truncated prefix: the node
+    /// admits exactly the batch size it advertises, and a caller that asked for more is told so
+    /// instead of being handed a short answer it must diff against its request to notice.
     async fn handle_availability(&self, items: Value, conn_key: &str) -> Value;
 
     /// Stream a `dig.fetchRange` response for `req` (the RangeRequest value) by writing framed
@@ -1035,13 +1062,22 @@ async fn reconcile_and_flood(
 /// [`PeerRpcResponder::handle_availability`], a range fetch via [`PeerRpcResponder::stream_range`].
 /// Returns when the peer closes the connection. The caller has already verified the remote `peer_id`
 /// (dig-nat enforces it during the mTLS handshake), so every stream here is from an authenticated peer.
+///
+/// This entry point threads NO caller identity through to the responder, and since #269 that is
+/// observable: the JSON-RPC and availability paths meter against the mTLS-verified `peer_id` and
+/// refuse a session without one (`-32000`, reason `unauthenticated`). Callers that have the verified
+/// identity — every production listener does — MUST use [`serve_peer_session_from`], which is what
+/// keeps those two paths served.
 pub async fn serve_peer_session(
     mut session: dig_nat::mux::PeerSession,
     responder: Arc<dyn PeerRpcResponder>,
 ) {
     // No authenticated caller threaded here (the mTLS-verified caller is supplied by the listener via
-    // `serve_peer_session_from`); a caller-less session still serves the JSON-RPC/range/availability
-    // paths — only DHT routing-table population needs the caller.
+    // `serve_peer_session_from`). Since #269 a caller-less session serves the RANGE and module-range
+    // paths only: JSON-RPC and availability now meter against the mTLS-verified peer_id, and an
+    // absent one is refused `-32000` (`unauthenticated`) rather than admitted unmetered — otherwise
+    // presenting no identity would be the cheapest way out of the meter. DHT routing-table
+    // population likewise needs the caller. Every production listener supplies one.
     serve_peer_session_from(None, &mut session, responder).await
 }
 
@@ -1226,6 +1262,36 @@ where
     }
 }
 
+/// The JSON-RPC error body for inbound work refused at the admission boundary (#269).
+///
+/// `-32000` (server error) rather than a method/param error: the request was well-formed and the node
+/// simply declined to spend on it now. The reason names the LIMIT, never the peer's standing, so shed
+/// load stays distinguishable from a ban by the peer and from an outage by the operator.
+fn admission_refused(
+    id: Value,
+    conn_key: &str,
+    refusal: crate::seams::dig_peer::admission::AdmissionRefusal,
+) -> Value {
+    // The refused PEER is named, because a refusal log that omits it cannot answer the only question
+    // an operator has when the node starts shedding: is one caller taking the allowance, or is the
+    // node simply loaded? A count without identities looks identical in both cases (gate S3 on
+    // dig-node#456). Truncated to the 16-hex prefix — enough to tell callers apart in a log, short
+    // enough not to turn every refusal into a full identity dump.
+    tracing::debug!(
+        reason = refusal.reason(),
+        peer = %conn_key.get(..16).unwrap_or(conn_key),
+        "peer serve: inbound work refused at admission"
+    );
+    // Minted through the canonical envelope so the refusal carries `data.code` +
+    // `data.origin` like every other declared code, with `reason` ADDED to that object rather
+    // than replacing it — the same shape `relay_pending_object` uses to attach its progress
+    // field. A frame that carries only `reason` forces a client back to prose for the one
+    // question `data.code` exists to answer (dig-node#496).
+    let mut error = crate::seams::dig_rpc::errors::error_object(-32000, "request refused");
+    error["data"]["reason"] = json!(refusal.reason());
+    json!({"jsonrpc":"2.0","id":id,"error":error})
+}
+
 /// Whether `method` may be answered over the **mTLS peer surface** (other DIG nodes).
 ///
 /// The allowlist itself lives in ONE place — [`dig_rpc_protocol::Method::is_peer_reachable`],
@@ -1391,6 +1457,18 @@ impl PeerRpcResponder for NodeResponder {
     async fn handle_json_rpc(&self, req: Value, conn_key: &str) -> Value {
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         let id = req.get("id").cloned().unwrap_or(json!(1));
+        // ADMISSION (dig-sex SPEC 8.5, #269) — ahead of the allowlist and every dispatch below, so a
+        // refused request costs a hex decode and a counter bump rather than a read, a decode or a DHT
+        // lookup. The guard is held for the whole method: it releases on `Drop`, including on the
+        // early `return`s below, which is why no path here needs to remember to.
+        let _admitted = match self
+            .node
+            .peer_admission()
+            .admit(conn_key, dig_sex::WorkKind::Own, 1)
+        {
+            Ok(guard) => guard,
+            Err(refusal) => return admission_refused(id, conn_key, refusal),
+        };
         // PEER-SURFACE ALLOWLIST (audit #179 CRITICAL). The mTLS verifier accepts any self-signed
         // leaf, so an "authenticated" peer is merely "some peer_id", NOT an authorized admin. Route
         // ONLY the intended L7 read/discovery/announce methods to the shared dispatch; return -32601
@@ -1454,6 +1532,19 @@ impl PeerRpcResponder for NodeResponder {
     }
 
     async fn handle_availability(&self, items: Value, conn_key: &str) -> Value {
+        // ADMISSION (dig-sex SPEC 8.5, #269) — before the items are even read. `items.len()` is the
+        // attacker-chosen quantity this request asks for, so it is what gets clamped at the boundary
+        // (`AdmissionLimits::max_request_units`); clamping it deeper in would already have paid for it.
+        let requested_units =
+            u32::try_from(items.as_array().map_or(0, Vec::len)).unwrap_or(u32::MAX);
+        let _admitted = match self.node.peer_admission().admit(
+            conn_key,
+            dig_sex::WorkKind::Own,
+            requested_units,
+        ) {
+            Ok(guard) => guard,
+            Err(refusal) => return admission_refused(json!(1), conn_key, refusal),
+        };
         let items = items.as_array().cloned().unwrap_or_default();
         // The verified mTLS peer_id (`conn_key`) keys the per-requestor miss-lookup budget, identical
         // to the range-stream miss on this same peer surface (dig_ecosystem#2007).
@@ -1519,7 +1610,7 @@ impl PeerRpcResponder for NodeResponder {
         // MISS -> the RELAY leg (dig-node#276). This is the peer-facing half: a requestor that cannot
         // reach the holder itself asks US, with `proxy: true`, and — if the operator opted in and the
         // requestor is inside its proxy allowance — this node pulls the whole capsule from a holder
-        // and serves the window from its own cache. All three gates live in `relay_capsule`; a refusal
+        // and serves the window from its own cache. All four gates live in `relay_capsule`; a refusal
         // leaves the not-held frame below exactly as it was, so the requestor stays free to ask
         // another hop (NC-12: a hop's "not found" may be a lie, including ours).
         let mut relay = crate::seams::dig_peer::module_relay::RelayStatus::Refused;
@@ -2459,7 +2550,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     //    that the node registers with the relay, advertises, and the auto-dialer PINS. So we point the
     //    pool's cert/key at the persisted `NodeCert` files themselves (dig-gossip only READS them);
     //    letting the GossipService mint its OWN throwaway cert would hash to a DIFFERENT peer_id and
-    //    every dial to this node fails closed with `peer_id mismatch` (#1532 — the identity split).
+    //    a dial to this node can reach a DIFFERENT identity than the one advertised (#1532 — the
+    //    identity split). A pinning dialler DOES refuse that -- dig-gossip's production dials go
+    //    through dig-nat, which pins the expected id in dig-tls -- but getting it right at the source
+    //    is still what this does, because a caught mismatch is a refused connection rather than a
+    //    working one. (dig-gossip's own legacy rustls outbound does not pin, DIG-Network/dig-gossip#85,
+    //    but nothing here dials on it.)
     //    `cfg.peer_id` is set to that same identity so the pool's self-dial guard + handshake agree.
     //    The address book (`peers.json`) stays under `peer-net/`; only the identity is shared.
     let gossip_dir = node.peer_cert_dir();
@@ -2928,6 +3024,9 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         stun_server,
     );
 
+    // #3124: the listener registers every peer it ACCEPTS in this same pool, so clone the handle
+    // before the responder takes ownership of it.
+    let handle_for_pool = handle.clone();
     let mut node_responder = NodeResponder::with_pool(node, handle);
     if let Some(dht) = dht {
         node_responder = node_responder.with_dht(dht);
@@ -2947,7 +3046,14 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         );
     }
 
-    serve_peer_rpc_listener_with(listener, identity, responder, Some(pex)).await
+    serve_peer_rpc_listener_with(
+        listener,
+        identity,
+        responder,
+        Some(pex),
+        Some(handle_for_pool),
+    )
+    .await
 }
 
 /// Bring up the content-location DHT (#163) for a running node: build a [`crate::dht::NatDhtTransport`]
@@ -3073,7 +3179,8 @@ async fn bring_up_dht(
     // tested, and fed by nothing but a test double.
     //
     // `None` remains fully supported: the FFI path and any node without a mirror lifecycle announce
-    // exactly as before, and a verifier falls back to the hint scan.
+    // exactly as before, and a verifier that cannot fetch a pointer withholds credit rather than
+    // demoting the holder.
     let dht = crate::dht::DhtHandle::with_mirror_pointers(
         service,
         initial_ids,
@@ -3250,6 +3357,7 @@ async fn bring_up_dht(
                 tokio::spawn(
                     crate::seams::dig_peer::profile_sync::run_profile_announce_loop(
                         ctx.store.clone(),
+                        ctx.resolver.clone(),
                         ctx.transport.clone(),
                         crate::seams::dig_peer::profile_sync::ANNOUNCE_INTERVAL,
                     ),
@@ -3290,7 +3398,7 @@ pub async fn serve_peer_rpc_listener(
     node: Arc<dig_nat::NodeCert>,
     responder: Arc<dyn PeerRpcResponder>,
 ) -> Result<(), String> {
-    serve_peer_rpc_listener_with(listener, node, responder, None).await
+    serve_peer_rpc_listener_with(listener, node, responder, None, None).await
 }
 
 /// Like [`serve_peer_rpc_listener`] but additionally running the node↔node **PEX** peer-sharing layer
@@ -3298,11 +3406,17 @@ pub async fn serve_peer_rpc_listener(
 /// stream (handshake→snapshot→deltas) and serves the peer's incoming PEX stream, feeding discovered
 /// peers into the pool as dial candidates. `None` disables PEX (the FFI/base path + existing callers),
 /// leaving the serve path byte-identical to before.
+///
+/// `gossip` is the connected pool every accepted peer is registered in for the life of its serve loop
+/// (**dig_ecosystem#3124**). `None` leaves the peer unregistered — correct for the test and FFI
+/// callers below, which run no pool — and is why the 3-argument
+/// [`serve_peer_rpc_listener`] keeps its signature.
 pub async fn serve_peer_rpc_listener_with(
     listener: tokio::net::TcpListener,
     node: Arc<dig_nat::NodeCert>,
     responder: Arc<dyn PeerRpcResponder>,
     pex: Option<Arc<crate::pex::PexServing>>,
+    gossip: Option<dig_gossip::GossipHandle>,
 ) -> Result<(), String> {
     let server_config = build_server_tls_config(&node)?;
     let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
@@ -3325,6 +3439,7 @@ pub async fn serve_peer_rpc_listener_with(
         let acceptor = acceptor.clone();
         let responder = responder.clone();
         let pex = pex.clone();
+        let gossip = gossip.clone();
         let spawned = spawn_with_permit(&conn_permits, async move {
             // mTLS handshake (client cert required by build_server_tls_config; a peer with no cert or
             // a failed handshake is dropped here — no unauthenticated peer traffic reaches the RPC).
@@ -3337,8 +3452,39 @@ pub async fn serve_peer_rpc_listener_with(
                     // body. `None` if (defensively) no client cert is present, which the verifier
                     // should already have rejected.
                     let caller = caller_from_tls(&tls, peer_addr);
+                    // #3124: the identity the pool slot is keyed on comes from the CERTIFICATE the
+                    // handshake just verified — the same derivation `caller_from_tls` uses — never
+                    // from the wire body and never from the DHT contact (whose `peer_id` is a
+                    // display-hex String, not this type). Read before the stream is consumed by the
+                    // mux. `None` when no client cert parsed: there is then no authenticated identity
+                    // to key a slot on, and serving uncounted is safer than inventing one.
+                    let authenticated = peer_id_from_tls(&tls);
                     let mut session = dig_nat::mux::PeerSession::server(tls);
+
+                    // COUNT the peer for as long as we serve it. `peer_addr` is its EPHEMERAL SOURCE
+                    // port, which is why this goes through the direct-INBOUND entry point — the pool
+                    // records the address for observability and never offers it as a dial target. The
+                    // tier is `Direct`: this connection arrived over TCP with no relay.
+                    let adopted = match authenticated {
+                        Some(peer_id) => {
+                            adopt_inbound_peer_in_pool(
+                                gossip.as_ref(),
+                                &peer_id,
+                                peer_addr,
+                                dig_nat::TraversalKind::Direct,
+                                &session,
+                            )
+                            .await
+                        }
+                        None => None,
+                    };
+
                     serve_peer_session_from_with(caller, &mut session, responder, pex).await;
+
+                    // The serve loop has returned, so this node is no longer serving the peer and must
+                    // stop counting it. `disconnect` only ends the ACCOUNTING — the session is ours and
+                    // is closed by dropping it here.
+                    release_inbound_pool_slot(gossip.as_ref(), adopted).await;
                 }
                 Err(e) => tracing::debug!(error = %e, "peer mTLS handshake failed; dropped"),
             }
@@ -3352,6 +3498,159 @@ pub async fn serve_peer_rpc_listener_with(
     }
 }
 
+/// Register an ACCEPTED inbound peer in the dig-gossip connected pool for as long as this node serves
+/// it, and stop counting it when the serve loop ends (**dig_ecosystem#3124**).
+///
+/// # Why this exists
+///
+/// The pool is what every subsystem reads to answer "am I connected", and until this call the node
+/// registered NOTHING it accepted — only peers it dialed. A node serving inbound peers perfectly well
+/// reported `connected_peers` as if it had none.
+///
+/// # Why it registers by HANDLE
+///
+/// The serve loop below needs `&mut PeerSession` to answer the peer's L7 RPC, and `PeerSession` is not
+/// `Clone`. Handing the session to the pool would buy the count and stop serving the peer — strictly
+/// worse than being uncounted. `adopt_direct_inbound_handle` takes a `ClosedHandle` instead, so
+/// ownership stays here and the peer is both counted and served.
+///
+/// Adoption is best-effort by design: it is ACCOUNTING, and every refusal the pool can return (the
+/// accepted-direct cap, a ban, a full pool, a peer already holding a dialable slot) is a decision this
+/// node made on purpose. None of them is a reason to refuse SERVICE to a peer whose handshake already
+/// succeeded, so a refusal is logged and the connection is served uncounted — the behaviour that
+/// shipped before this call existed.
+///
+/// Returns the `PeerId` to deregister once serving ends, or `None` when nothing was registered.
+async fn adopt_inbound_peer_in_pool(
+    gossip: Option<&dig_gossip::GossipHandle>,
+    peer_id: &dig_nat::PeerId,
+    remote: std::net::SocketAddr,
+    method: dig_nat::TraversalKind,
+    session: &dig_nat::mux::PeerSession,
+) -> Option<InboundPoolSlot> {
+    let gossip = gossip?;
+    // dig-nat reports the identity as its own `PeerId`; the pool keys on the gossip `PeerId` (chia
+    // `Bytes32`) over the SAME 32 bytes the mTLS handshake proved.
+    let pool_id = dig_gossip::PeerId::from(*peer_id.as_bytes());
+    let superseded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&superseded);
+    let observed = dig_gossip::ObservedSession::new(session.closed_handle(), move || {
+        // A newer connection for this identity displaced the slot. This session is now obsolete to the
+        // pool, but it is still OURS to end, and the serve loop below ends it on return — so there is
+        // nothing to do here but RECORD it, which is what `release_inbound_pool_slot` reads to keep
+        // its release session-scoped. Dropping the observer silently is what #71 forbids, and tearing
+        // the transport down here would take teardown away from the caller that
+        // `adopt_direct_inbound_handle` documents as owning it. A notice must not block (dig-gossip
+        // fires it inline while finishing an admission), so this is one relaxed store.
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(peer_id = %pool_id, "inbound pool slot superseded by a newer connection");
+    });
+
+    // No broadcast sink (the 5th argument), and `None` is the HONEST state of this layer rather than
+    // a shortcut taken here. Three measured facts, each checkable at the cited symbol:
+    //
+    // 1. There is no wire FRAME for a broadcast. dig-node's only stream codec is `write_framed`
+    //    (`serde_json::to_vec`), while a broadcast carries a `DigMessage` — an opaque chia-protocol
+    //    payload re-exported from `chia-sdk-client` through dig-gossip. There is no encoding of it
+    //    this transport can put on the wire.
+    // 2. Even if one existed, the receiving side would misroute it. `classify_request` in this file
+    //    dispatches on `method`/`length`/`items`; a broadcast frame matches none of those and falls
+    //    to `PeerRequestKind::Unknown`.
+    // 3. There is no ingest path in the other direction either. dig-gossip's `inbound_tx` is
+    //    crate-private (`dig-gossip/src/service/state.rs`) and fed only by its own legacy DigLink
+    //    listener (`dig-gossip/src/connection/listener.rs`); `set_nat_broadcast_sink` covers the send
+    //    direction only.
+    //
+    // So NO dig-nat adoption site in this repo supplies a broadcast sink today. This one passes `None`
+    // explicitly; `seams/dig_peer/bootstrap.rs` and `seams/dig_peer/pex.rs` adopt through
+    // `adopt_nat_connection`, which takes no sink parameter at all; and `serve_accepted_relay_conn`
+    // adopts nothing. Passing `None` makes dig-gossip report such a peer as unreachable for broadcast, which is true;
+    // supplying a sink that cannot deliver would make it report a delivery that never happens.
+    let broadcast_sink = None;
+
+    match gossip
+        .adopt_direct_inbound_handle(pool_id, remote, method, observed, broadcast_sink)
+        .await
+    {
+        Ok(peer_id) => Some(InboundPoolSlot {
+            peer_id,
+            superseded,
+        }),
+        Err(e) => {
+            tracing::debug!(peer_id = %pool_id, error = %e, "inbound peer not adopted into the pool; serving it uncounted");
+            None
+        }
+    }
+}
+
+/// A pool slot this connection adopted, and the flag that says whether it is still THIS session's.
+///
+/// The two travel together because they are only meaningful together: `disconnect` keys on the
+/// IDENTITY, so the identity alone cannot say which SESSION's slot it would remove.
+struct InboundPoolSlot {
+    peer_id: dig_gossip::PeerId,
+    /// Set by the supersede notice when a newer connection for this identity took the slot over.
+    superseded: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Stop counting an inbound peer once its serve loop has ended — but ONLY if the slot is still this
+/// session's.
+///
+/// `disconnect` only stops ACCOUNTING for a slot registered by handle — it does not close the
+/// transport, which is this side's to end and is ended by the serve loop returning.
+///
+/// # Why the supersede check is load-bearing
+///
+/// dig-gossip exposes exactly one removal API and it is `peers.remove(peer_id)` — keyed on IDENTITY,
+/// not on the session that adopted the slot. A peer that reconnects therefore gets a second slot which
+/// supersedes the first (newest-wins), and an UNCONDITIONAL release from the first session's serve loop
+/// would delete the LIVE second slot. Two real harms follow: the peer becomes served-but-uncounted
+/// again — the exact defect this adoption exists to fix, and repeating the cycle drives the accounted
+/// count below the served count, making `max_direct_inbound` / `max_inbound_total` /
+/// `max_direct_inbound_per_group` bypassable — and, if this node later DIALS the same peer, the stale
+/// release would remove an `Owned` slot, whose drop closes the transport with it (the #1717 mux
+/// invariant). Skipping the release when the notice has fired is correct in both cases: a superseded
+/// slot is already gone from the pool, so there is nothing left for this session to deregister.
+///
+/// A narrow race REMAINS and is stated rather than hidden: a supersede can land between the load below
+/// and `disconnect` completing, and that window still evicts the newer slot. Two further dig-gossip
+/// paths remove a slot WITHOUT going through `retire_slot` -- the only setter of `superseded` -- so the
+/// flag this function reads can be stale for reasons besides the timing window above:
+///
+/// 1. **The ban path.** `enforce_timed_ban_and_disconnect` (dig-gossip's service/state.rs:1184-1216)
+///    does an unconditional `peers.remove(&peer_id)` but gates teardown on
+///    `if let Some(PeerSlot::Live(l)) = removed`, so an `Observed` slot loses its accounting with no
+///    close and no notice. Currently UNREACHABLE from dig-node: nothing here calls
+///    `GossipHandle::ban_peer` or `::penalize_peer` (the one unrelated hit is a Chia peer-DB test at
+///    `dig-wallet/src/sage/db.rs:5976`), and the only automatic caller,
+///    `apply_inbound_rate_limit_violation` (state.rs:1391-1424), always passes `Some(generation)`,
+///    whose match arm (state.rs:1195-1201) matches only `PeerSlot::Live` and returns otherwise. This
+///    becomes reachable the day a ban surface is added to `dign` or `penalize_peer` is wired into
+///    dig-node's abuse detection. Tracked: <https://github.com/DIG-Network/dig-gossip/issues/86>.
+/// 2. **The departed-peer reaper.** `reap_departed_peers` (state.rs:1270-1296, 30s cadence) `retain`s
+///    on `slot_is_departed` and removes without calling `retire_slot`. This is narrower than it sounds:
+///    it reaps only slots whose transport is ALREADY closed. The residual window is a reaped-then-
+///    reconnected identity whose first serve loop has not yet returned -- the flag still reads `false`
+///    for that identity, and this function can then `disconnect` the reconnected identity's newer slot.
+///
+/// Closing all of this needs a compare-and-remove (slot-token) API in dig-gossip — a release-first
+/// change to that crate, out of scope here.
+async fn release_inbound_pool_slot(
+    gossip: Option<&dig_gossip::GossipHandle>,
+    adopted: Option<InboundPoolSlot>,
+) {
+    if let (Some(gossip), Some(slot)) = (gossip, adopted) {
+        if slot.superseded.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!(
+                peer_id = %slot.peer_id,
+                "inbound pool slot already superseded; leaving the newer session's slot alone"
+            );
+            return;
+        }
+        let _ = gossip.disconnect(&slot.peer_id).await;
+    }
+}
+
 /// Build the authenticated caller [`dig_dht::Contact`] from an accepted mTLS server connection: read
 /// the client's leaf certificate, derive its `peer_id = SHA-256(SPKI DER)` (the SAME derivation
 /// dig-nat enforces), and pair it with the remote socket address. Returns `None` if no client cert is
@@ -3360,10 +3659,25 @@ fn caller_from_tls(
     tls: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     remote_addr: std::net::SocketAddr,
 ) -> Option<dig_dht::Contact> {
+    let peer_id = peer_id_from_tls(tls)?;
+    Some(crate::dht::caller_contact(&peer_id, remote_addr))
+}
+
+/// The AUTHENTICATED `peer_id = SHA-256(SPKI DER)` of an accepted mTLS peer, read from the leaf
+/// certificate rustls verified during the handshake (**dig_ecosystem#3124**).
+///
+/// Split out of [`caller_from_tls`] because the pool keys a slot on the identity itself, while the DHT
+/// contact carries it as display hex — the two are not interchangeable, and deriving both from this
+/// ONE function is what keeps them from drifting onto different sources.
+///
+/// `None` when the peer presented no certificate or it does not parse; the client-cert verifier should
+/// already have rejected such a peer.
+fn peer_id_from_tls(
+    tls: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> Option<dig_nat::PeerId> {
     let (_io, conn) = tls.get_ref();
     let leaf = conn.peer_certificates()?.first()?;
-    let peer_id = dig_nat::peer_id_from_leaf_cert_der(leaf.as_ref())?;
-    Some(crate::dht::caller_contact(&peer_id, remote_addr))
+    dig_nat::peer_id_from_leaf_cert_der(leaf.as_ref())
 }
 
 /// Build the rustls `ServerConfig` for the mTLS peer-RPC listener from the node's CA-signed
@@ -5410,8 +5724,17 @@ pub(crate) mod tests {
         // End-to-end over the responder: a peer JSON-RPC frame naming a management/mutation
         // method is answered with -32601 (method not found) WITHOUT ever reaching the
         // node's `handle_rpc` dispatch (which would run the mutation). getPeers still works.
+        //
+        // The conn_key is a well-formed 64-hex peer id — the shape every production session supplies,
+        // since both listeners derive it from the verified client leaf. It became load-bearing when
+        // admission landed (#269): the meter runs AHEAD of this allowlist and refuses a session with
+        // no verified identity, so an empty key would now answer -32000 and this test would stop
+        // exercising the allowlist at all. Using a real one keeps the property under test unchanged —
+        // an AUTHENTICATED peer is still merely "some peer_id", never an authorized admin, which is
+        // the whole point of audit #179.
         let (node, _td) = crate::test_support::test_node_for_peer_surface();
         let responder = NodeResponder::without_pool(node);
+        let authenticated = "ab".repeat(32);
         for m in [
             "cache.clear",
             "cache.setCapBytes",
@@ -5420,7 +5743,7 @@ pub(crate) mod tests {
             "dig.stage",
         ] {
             let req = json!({"jsonrpc":"2.0","id":1,"method":m,"params":{}});
-            let resp = responder.handle_json_rpc(req, "").await;
+            let resp = responder.handle_json_rpc(req, &authenticated).await;
             assert_eq!(
                 resp["error"]["code"],
                 json!(-32601),
@@ -5435,7 +5758,7 @@ pub(crate) mod tests {
         let ok = responder
             .handle_json_rpc(
                 json!({"jsonrpc":"2.0","id":1,"method":"dig.getNetworkInfo"}),
-                "",
+                &authenticated,
             )
             .await;
         assert!(
@@ -5444,9 +5767,95 @@ pub(crate) mod tests {
         );
         // getPeers is answered from the (empty) pool view, not -32601.
         let peers = responder
-            .handle_json_rpc(json!({"jsonrpc":"2.0","id":1,"method":"dig.getPeers"}), "")
+            .handle_json_rpc(
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getPeers"}),
+                &authenticated,
+            )
             .await;
         assert!(peers["result"]["peers"].is_array());
+    }
+
+    /// **Proves (#269):** the admission meter is LIVE on the responder — not merely implemented
+    /// beside it — and it refuses a session that carries no verified identity BEFORE the method
+    /// allowlist is consulted.
+    ///
+    /// This is the wiring assertion. `admission.rs`'s unit tests prove the meter behaves; they cannot
+    /// prove anything calls it, and a meter nothing calls is the exact defect this ticket describes.
+    /// The authenticated control is what makes the refusal meaningful: without it, a responder that
+    /// refused EVERY request would pass.
+    #[tokio::test]
+    async fn the_responder_refuses_an_unauthenticated_session_before_consulting_the_allowlist() {
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let responder = NodeResponder::without_pool(node);
+        let method = json!({"jsonrpc":"2.0","id":1,"method":"dig.getNetworkInfo"});
+
+        // No verified peer id: refused at admission, and NOT with the allowlist's -32601 — which is
+        // how we know the meter ran first rather than the request simply failing later.
+        let refused = responder.handle_json_rpc(method.clone(), "").await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(-32000),
+            "an unauthenticated peer session must be refused at admission"
+        );
+        assert!(
+            refused.get("result").is_none(),
+            "a refused request must produce no result — the work must not have been done"
+        );
+
+        // CONTROL: the same method, from an authenticated session, is served.
+        let served = responder.handle_json_rpc(method, &"cd".repeat(32)).await;
+        assert!(
+            served.get("result").is_some(),
+            "an authenticated peer must still be served, or the meter is refusing everybody"
+        );
+    }
+    /// **Proves (#269):** the admission clamp and the availability batch's own advertised limit are
+    /// the SAME number, measured through the responder that actually decides.
+    ///
+    /// The clamp lives in [`NodeResponder::handle_availability`], above
+    /// [`crate::Node::availability_batch`]. `lib.rs`'s cap test calls the batch directly, BELOW that
+    /// decision, so it passes identically whether the clamp admits this batch, refuses it, or is not
+    /// wired at all — a test below the decision passes under the defect. This one asks the responder.
+    ///
+    /// Both sides are pinned, because a bound tested only from below can only confirm itself: a batch
+    /// AT [`crate::MAX_AVAILABILITY_ITEMS`] must be ANSWERED (a clamp set lower than the advertised
+    /// limit would refuse work this node says it serves), and one item past it must be REFUSED at
+    /// admission (a clamp set higher would let the meter admit work the batch will not answer).
+    #[tokio::test]
+    async fn the_responder_serves_a_batch_at_the_advertised_limit_and_refuses_one_past_it() {
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let responder = NodeResponder::without_pool(node);
+        let authenticated = "ef".repeat(32);
+        let batch = |n: usize| -> Value {
+            (0..n)
+                .map(|_| json!({ "store_id": "ee".repeat(32) }))
+                .collect::<Vec<Value>>()
+                .into()
+        };
+
+        let at_bound = responder
+            .handle_availability(batch(crate::MAX_AVAILABILITY_ITEMS), &authenticated)
+            .await;
+        assert_eq!(
+            at_bound["items"].as_array().map(Vec::len),
+            Some(crate::MAX_AVAILABILITY_ITEMS),
+            "a batch at the advertised limit must be ANSWERED in full — the node states it serves \
+             this many items, so refusing it denies work of its own contract"
+        );
+
+        let past_bound = responder
+            .handle_availability(batch(crate::MAX_AVAILABILITY_ITEMS + 1), &authenticated)
+            .await;
+        assert_eq!(
+            past_bound["error"]["data"]["reason"],
+            json!("request too large"),
+            "one item past the advertised limit must be refused AT admission, before the batch is \
+             read — not silently truncated after the cost is committed"
+        );
+        assert!(
+            past_bound.get("items").is_none(),
+            "a refused batch must produce no answers at all"
+        );
     }
 
     // -- OUTGOING-BANDWIDTH THROTTLE on the peer range-stream (dig_ecosystem #30) --------------------

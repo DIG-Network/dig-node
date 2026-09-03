@@ -65,7 +65,8 @@ use dig_node_control_interface::params::{
 };
 use dig_node_control_interface::results::{
     AutomatedSpend, SpendAsset, SpendAuthority, SpendChainReference, SpendFailureStage,
-    SpendOutcome, SpendsListResult,
+    SpendOutcome, SpendsListResult, WalletOperatorAddressResult,
+    WalletOperatorAddressUnavailableReason,
 };
 use dig_node_control_interface::ControlMethod;
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
@@ -195,6 +196,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.operatorAddress",
     "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
@@ -261,6 +263,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
+    "control.wallet.operatorAddress",
     "control.wallet.resetCoinDb",
     "control.wallet.syncStatus",
     "control.wallet.watch",
@@ -549,7 +552,7 @@ fn remedy_for_unreadable_token(path: &Path, dir: &str, unix: bool) -> String {
     );
     if unix {
         format!(
-            "{elevated}. For a program that must keep running as an ordinary user (the dig-app Agent on a server), do NOT widen the mode on this file — it is the master capability. Pair a scoped, revocable token for that client instead: `sudo dign pair` LISTS the pending requests and `sudo dign pair approve <pairing_id>` approves one -- the bare verb only lists, it approves nothing -- and the token the client receives cannot mint or revoke pairings and cannot grant chain authority. Revoke it any time with `sudo dign pair revoke <token_id>`."
+            "{elevated}. If you cannot elevate, you do not have to: run `dign pair connect` as THIS account to request a scoped token of your own, then ask the operator to approve it. Do NOT widen the mode on this file — it is the master capability. On the operator's side: `sudo dign pair` LISTS the pending requests and `sudo dign pair approve <pairing_id>` approves one -- the bare verb only lists, it approves nothing -- and the token the client receives cannot mint or revoke pairings and cannot grant chain authority. Revoke it any time with `sudo dign pair revoke <token_id>`."
         )
     } else {
         format!(
@@ -1032,6 +1035,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.coinsByParent" => wallet_coins_by_parent(ctx, id, params).await,
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
+        "control.wallet.operatorAddress" => wallet_operator_address(ctx, id),
         "control.wallet.resetCoinDb" => wallet_reset_coin_db(ctx, id, params).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
         "control.wallet.watch" => wallet_watch(ctx, id, params).await,
@@ -1056,7 +1060,12 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         // The mirror-coin bond surface (dig-node#412, SPEC.md §25.8) -- one page of this
         // node's OWN bonds. Shell-owned because the bonds are the SERVICE's money, not the
         // embedded engine's.
-        "control.mirror.bondStates" => mirror_bond_states(mirror_bond_observation(ctx), id, params),
+        "control.mirror.bondStates" => mirror_bond_states(
+            mirror_bond_observation(ctx),
+            id,
+            params,
+            operator_wallet_answer(ctx),
+        ),
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
@@ -1661,6 +1670,58 @@ fn stale_by(answer_height: Option<u32>, network_peak: Option<u32>) -> Option<u32
     Some(network_peak?.saturating_sub(answer_height?))
 }
 
+/// What the peers this node HOLDS say the chain's peak is, or `None` when nothing is known.
+///
+/// Read separately from the answer it qualifies, and allowed to fail: its job is to make an
+/// answer's staleness legible, so losing it must degrade the answer to *cannot say how stale*
+/// rather than failing a read that otherwise succeeded.
+async fn held_peers_peak(ctx: &ControlCtx) -> Option<u32> {
+    ctx.wallet
+        .wallet_sync_status()
+        .await
+        .ok()
+        .and_then(|s| s.chia_peer_peak_height)
+}
+
+/// The freshness of the tier that produced an answer, for the reads that do not carry one of
+/// their own (dig-node#490 — today, `control.wallet.arrivals`).
+///
+/// The chain reads get these three values from the wallet backend's own routing decision, which
+/// knows which tier actually answered. `arrivals` reads a LOCAL ledger and so has no routing
+/// decision to report; its freshness is the chain replica's, taken from the sync status.
+#[derive(Debug, Clone, Copy)]
+struct AnswerTier {
+    /// Whether the replica is caught up AND following the chain for the enrolled wallet.
+    synced: bool,
+    /// The replica's own peak. `None` is UNKNOWN, never height zero.
+    peak_height: Option<u32>,
+    /// What the held Chia peers say the chain's peak is.
+    network_peak_height: Option<u32>,
+}
+
+/// Read the chain replica's freshness for a read that has no tier of its own.
+///
+/// A status this node cannot read at all degrades to *nothing is known* — `synced: false` with
+/// both heights absent — which [`stale_by`] turns into a `null` gap and the CLI renders as
+/// NOT CURRENT. That is the truthful reading: a node that cannot describe its own replica cannot
+/// bound an answer drawn from it.
+async fn replica_tier(ctx: &ControlCtx) -> AnswerTier {
+    let status = ctx.wallet.wallet_sync_status().await.ok();
+    AnswerTier {
+        // Only `Synced` licenses serving wallet-scoped reads from the replica, so only `Synced`
+        // may claim a wallet-scoped answer is current. Every other phase — including the
+        // all-clear `NoWalletEnrolled` — is making a different claim, or none.
+        synced: status.as_ref().is_some_and(|s| {
+            matches!(
+                s.phase,
+                dig_wallet::sage::sync_supervisor::SyncPhase::Synced
+            )
+        }),
+        peak_height: status.as_ref().and_then(|s| s.peak_height),
+        network_peak_height: status.and_then(|s| s.chia_peer_peak_height),
+    }
+}
+
 /// `control.wallet.balance` (#1851) — the READ-ONLY balance of a PUBLIC address, for XCH or
 /// $DIG. An OPEN read (no token gate, [`is_open_control_read`]): it needs only an address, never
 /// a seed or signing key, so it carries zero custody risk. It reuses the wallet backend's B.6
@@ -1698,15 +1759,7 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         Err(e) => return e,
     };
 
-    // The peers' announced peak is read SEPARATELY and is allowed to fail: it makes the answer's
-    // staleness legible, and losing it must degrade the answer to "cannot say how stale" rather
-    // than failing a balance read that otherwise succeeded.
-    let network_peak = ctx
-        .wallet
-        .wallet_sync_status()
-        .await
-        .ok()
-        .and_then(|s| s.chia_peer_peak_height);
+    let network_peak = held_peers_peak(ctx).await;
 
     match ctx.wallet.balance_for_address(address, asset).await {
         Ok(r) => control_ok(id, balance_wire(&r, network_peak)),
@@ -2064,12 +2117,13 @@ async fn wallet_coins(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
+    let network_peak = held_peers_peak(ctx).await;
     match ctx
         .wallet
         .coins_for_address(&address, asset, after_coin_id.as_deref(), limit)
         .await
     {
-        Ok(r) => control_ok(id, coins_wire(&r, asset)),
+        Ok(r) => control_ok(id, coins_wire(&r, asset, network_peak)),
         Err(e) => wallet_read_error(METHOD, id, &address, e),
     }
 }
@@ -2096,8 +2150,9 @@ async fn wallet_coin_by_id(ctx: &ControlCtx, id: Value, params: &Value) -> Value
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
+    let network_peak = held_peers_peak(ctx).await;
     match ctx.wallet.coin_by_id(&coin_id).await {
-        Ok(r) => control_ok(id, coin_by_id_wire(&r)),
+        Ok(r) => control_ok(id, coin_by_id_wire(&r, network_peak)),
         Err(e) => wallet_read_error("control.wallet.coinById", id, &coin_id, e),
     }
 }
@@ -2127,8 +2182,9 @@ async fn wallet_coin_spend(ctx: &ControlCtx, id: Value, params: &Value) -> Value
         Ok(parsed) => parsed,
         Err(response) => return response,
     };
+    let network_peak = held_peers_peak(ctx).await;
     match ctx.wallet.coin_spend(&coin_id).await {
-        Ok(r) => control_ok(id, coin_spend_wire(&r)),
+        Ok(r) => control_ok(id, coin_spend_wire(&r, network_peak)),
         Err(e) => wallet_read_error(METHOD, id, &coin_id, e),
     }
 }
@@ -2159,6 +2215,7 @@ async fn wallet_coins_by_parent(ctx: &ControlCtx, id: Value, params: &Value) -> 
     // `effective_limit` resolves an omitted page size using the CONTRACT's default, so a node and a
     // client can never disagree about where an unspecified page ends.
     let limit = request.effective_limit();
+    let network_peak = held_peers_peak(ctx).await;
     match ctx
         .wallet
         .coins_by_parent(
@@ -2168,7 +2225,7 @@ async fn wallet_coins_by_parent(ctx: &ControlCtx, id: Value, params: &Value) -> 
         )
         .await
     {
-        Ok(r) => control_ok(id, coins_by_parent_wire(&r)),
+        Ok(r) => control_ok(id, coins_by_parent_wire(&r, network_peak)),
         Err(e) => wallet_read_error(METHOD, id, &request.parent_coin_id, e),
     }
 }
@@ -2232,12 +2289,13 @@ async fn wallet_arrivals(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             format!("{METHOD} after_seq must be a non-negative integer"),
         );
     }
+    let tier = replica_tier(ctx).await;
     match ctx
         .wallet
         .wallet_arrivals(after_seq, arrivals_limit(params))
         .await
     {
-        Ok((page, latest)) => control_ok(id, arrivals_wire(after_seq, &page, latest)),
+        Ok((page, latest)) => control_ok(id, arrivals_wire(after_seq, &page, latest, tier)),
         // Only the local wallet DB can fail here — there is no chain call to blame.
         Err(e) => control_error(
             id,
@@ -2282,9 +2340,19 @@ fn arrivals_wire(
     after_seq: i64,
     arrivals: &[dig_wallet::sage::arrivals::Arrival],
     latest: i64,
+    tier: AnswerTier,
 ) -> Value {
     let cursor = arrivals.last().map_or(after_seq, |a| a.seq);
     json!({
+        // The ledger is LOCAL, but it is written from the chain replica, so its freshness is the
+        // replica's freshness (dig-node#490). An empty page is the answer to "did I just get
+        // paid?", and from a replica that is not following the chain it is not evidence that
+        // nobody did. Spelled with the same three field names the chain reads use, because it is
+        // the same claim about the same tier.
+        "synced": tier.synced,
+        "peak_height": tier.peak_height,
+        "network_peak_height": tier.network_peak_height,
+        "stale_by": stale_by(tier.peak_height, tier.network_peak_height),
         "arrivals": arrivals.iter().map(|a| json!({
             "seq": a.seq,
             "coin_id": a.coin_id,
@@ -2300,10 +2368,20 @@ fn arrivals_wire(
 
 /// `control.wallet.peak` (dig_ecosystem#2376) — the node's current chain peak height.
 ///
-/// Its own method rather than a field on a balance: a balance reports `peak_height: null` on every
-/// fallback-tier answer by design (#2233), so a caller bounding a claimed confirmation could not get
-/// one from the very node that most needs to answer. `peak_height: null` here means UNKNOWN — never
-/// height zero, which every block is trivially above.
+/// Its own method rather than a field on a balance. It was introduced when a balance reported
+/// `peak_height: null` on EVERY fallback-tier answer by design (#2233), leaving a caller bounding a
+/// claimed confirmation with nothing from the very node that most needs to answer. Since
+/// `dig-node-control-interface` 0.31.0 a fallback answer CAN carry a peak — the one its own
+/// answering tier produced in that same read (dig-node#290) — so this method is no longer the only
+/// route to a height. It remains the one that is address-independent, and the only one whose height
+/// is settled on the node's own peers AGREEING (NC-12) rather than taken from a single tier.
+///
+/// This endpoint is deliberately UNCHANGED by dig-node#290: [`ChainPeak`] carries no `source`
+/// field, so the answering-tier rule cannot be expressed on it at all — see
+/// <https://github.com/DIG-Network/dig-node-control-interface/issues/46>.
+///
+/// `peak_height: null` here means UNKNOWN — never height zero, which every block is trivially
+/// above.
 async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
     match ctx.wallet.chain_peak().await {
         Ok(peak) => control_ok(
@@ -2311,6 +2389,77 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
             json!({ "peak_height": peak.peak_height, "synced": peak.synced }),
         ),
         Err(e) => wallet_read_error("control.wallet.peak", id, "", e),
+    }
+}
+
+/// `control.wallet.operatorAddress` — where is this node's OWN machine wallet?
+///
+/// # Two wallets, and nothing used to name which
+///
+/// The node holds a machine-custody operator wallet, autoseed-derived, and it is the wallet that
+/// pays mirror-coin collateral. It is not the user's. A node reported three mirror bonds
+/// `unfunded, short 1010` while the operator's own wallet held 1,015,000 base units of $DIG: both
+/// statements were true, each was about a different wallet, and no surface let a person tell which
+/// — nor find the address to fund. This method is that address.
+///
+/// # It cannot reach a signing capability, by construction
+///
+/// It goes through `dig_wallet::operator_wallet::operator_address`, which is built on
+/// `operator_puzzle_hash`. No `WalletSigner` is constructed anywhere on this path, so there is no
+/// signing capability for a control-plane read to reach even in principle. That is a property of
+/// the types rather than of this function's discipline (§908).
+///
+/// # The prefix comes from the wallet backend, not from a constant
+///
+/// Encoding with a hardcoded `xch` would render a MAINNET address on a node reading testnet coins
+/// — one wallet in appearance and two in fact, on a surface whose whole purpose is to end exactly
+/// that confusion.
+fn wallet_operator_address(ctx: &ControlCtx, id: Value) -> Value {
+    match serde_json::to_value(operator_wallet_answer(ctx)) {
+        Ok(v) => control_ok(id, v),
+        Err(e) => control_error(id, ErrorCode::ControlError, e.to_string()),
+    }
+}
+
+/// The node's answer to *which wallet is mine* -- computed ONCE, for every surface that states it.
+///
+/// `control.wallet.operatorAddress` returns it, and `control.mirror.bondStates` carries it beside
+/// the amounts it is about. Two producers would be two answers to one question, and they would
+/// drift in the direction nobody tests: a bond page naming one wallet while the dedicated method
+/// named another is the original defect with an extra layer of confidence on top.
+fn operator_wallet_answer(ctx: &ControlCtx) -> WalletOperatorAddressResult {
+    use dig_wallet::operator_wallet::{operator_address, OperatorAddressUnavailable};
+
+    let paths = dig_wallet::autoseed::default_paths();
+    match operator_address(&paths, ctx.wallet.address_prefix()) {
+        Ok(address) => {
+            // The puzzle hash is re-read rather than decoded back out of the address: decoding an
+            // address to prove what it encodes asserts only that bech32m round-trips.
+            let puzzle_hash = dig_wallet::operator_wallet::operator_puzzle_hash(&paths)
+                .map(|ph| hex::encode(ph.to_bytes()));
+            match puzzle_hash {
+                Some(puzzle_hash) => WalletOperatorAddressResult::Known {
+                    address,
+                    puzzle_hash,
+                },
+                // Unreachable in practice -- the address derived from that same hash a moment ago
+                // -- but reported rather than papered over with a placeholder, because a partial
+                // answer on a funding surface is the failure this method exists to prevent.
+                None => WalletOperatorAddressResult::Unavailable {
+                    reason: WalletOperatorAddressUnavailableReason::Unreadable,
+                },
+            }
+        }
+        Err(reason) => WalletOperatorAddressResult::Unavailable {
+            reason: match reason {
+                OperatorAddressUnavailable::NotInitialized => {
+                    WalletOperatorAddressUnavailableReason::NotInitialized
+                }
+                OperatorAddressUnavailable::Unreadable => {
+                    WalletOperatorAddressUnavailableReason::Unreadable
+                }
+            },
+        },
     }
 }
 
@@ -3176,7 +3325,11 @@ fn no_watchlist(id: Value) -> Value {
 /// The `asset` is echoed onto every coin because dig-app's frozen `CoinRecord` carries one and
 /// filters by it; the read is already scoped to a single asset, so echoing the REQUESTED one is
 /// exactly what the coins are.
-fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset) -> Value {
+fn coins_wire(
+    r: &dig_wallet::sage::rpc::WalletCoinsResult,
+    asset: BalanceAsset,
+    network_peak: Option<u32>,
+) -> Value {
     // Serialized through the published `Asset`, so the echo is spelled exactly as the contract
     // spells it — `"dig"` for $DIG, `{"cat":"<hex>"}` for any other CAT — and never `null`.
     let asset = serde_json::to_value(ControlAsset::from(asset))
@@ -3196,11 +3349,17 @@ fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset)
         })).collect::<Vec<_>>(),
         // Always a concrete boolean. The contract's `null` means "a node too old to page", and
         // emitting it from a node that DOES page would tell a caller its cursor is meaningless.
+        //
+        // It scopes the PAGE, never the chain: `complete: true` says this node handed over
+        // everything it found, and `stale_by` below says how much of the chain that was
+        // (dig-node#490). The two must be read together, which is why they now travel together.
         "complete": r.complete,
         "cursor": r.cursor,
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
 }
 
@@ -3209,7 +3368,10 @@ fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset)
 /// `asset` is ALWAYS `null` here, unlike [`coins_wire`]. A coin id alone does not reveal whether a
 /// coin is XCH, a CAT or a singleton — that needs the puzzle, which this read never inspects — so
 /// naming one would be asserting a classification the node did not verify.
-fn coin_by_id_wire(r: &dig_wallet::sage::rpc::WalletCoinByIdResult) -> Value {
+fn coin_by_id_wire(
+    r: &dig_wallet::sage::rpc::WalletCoinByIdResult,
+    network_peak: Option<u32>,
+) -> Value {
     json!({
         "coin": r.coin.as_ref().map(|c| json!({
             "coin_id": c.coin_id,
@@ -3223,6 +3385,12 @@ fn coin_by_id_wire(r: &dig_wallet::sage::rpc::WalletCoinByIdResult) -> Value {
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
+        // A `null` coin is the sharpest case these fields exist for (dig-node#490): it is a
+        // statement about the CHAIN, made from a replica that may never have reached the height
+        // the coin was created at. Without a freshness bound a caller polling a mint cannot tell
+        // "not seen yet" from "never happened".
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
 }
 
@@ -3253,7 +3421,10 @@ fn unclassified_coin_wire(c: &dig_wallet::sage::rpc::WalletCoin) -> Value {
 /// decodes this field with `required_option`, so an absent key is a decode FAILURE on the client
 /// and not a verdict. That is deliberate on both sides — "no spend" must be something the node
 /// actually said.
-fn coin_spend_wire(r: &dig_wallet::sage::rpc::WalletCoinSpendResult) -> Value {
+fn coin_spend_wire(
+    r: &dig_wallet::sage::rpc::WalletCoinSpendResult,
+    network_peak: Option<u32>,
+) -> Value {
     json!({
         "spend": r.spend.as_ref().map(|s| json!({
             "coin": unclassified_coin_wire(&s.coin),
@@ -3263,6 +3434,8 @@ fn coin_spend_wire(r: &dig_wallet::sage::rpc::WalletCoinSpendResult) -> Value {
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
 }
 
@@ -3272,7 +3445,10 @@ fn coin_spend_wire(r: &dig_wallet::sage::rpc::WalletCoinSpendResult) -> Value {
 /// positively — `complete`, not `truncated` — precisely so that the reading a client falls into when
 /// the field is missing or defaulted is "there may be more", and it decodes `cursor` with
 /// `required_option` so an absent key cannot become a confident "nothing to resume from".
-fn coins_by_parent_wire(r: &dig_wallet::sage::rpc::WalletCoinsByParentResult) -> Value {
+fn coins_by_parent_wire(
+    r: &dig_wallet::sage::rpc::WalletCoinsByParentResult,
+    network_peak: Option<u32>,
+) -> Value {
     json!({
         "coins": r.coins.iter().map(unclassified_coin_wire).collect::<Vec<_>>(),
         "complete": r.complete,
@@ -3280,6 +3456,8 @@ fn coins_by_parent_wire(r: &dig_wallet::sage::rpc::WalletCoinsByParentResult) ->
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
+        "network_peak_height": network_peak,
+        "stale_by": stale_by(r.peak_height, network_peak),
     })
 }
 
@@ -3309,7 +3487,7 @@ fn distinct_store_count(cached: &[dig_node_core::CachedCapsule]) -> usize {
 /// The maximum DECODED body size, taken from the control interface rather than restated, so this
 /// node and every client agree on the bound by construction.
 use base64::Engine as _;
-use dig_node_core::seams::dig_peer::profile_sync::MAX_PROFILE_BODY_BYTES;
+use dig_node_core::seams::dig_peer::profile_sync::{root_standing, MAX_PROFILE_BODY_BYTES};
 
 /// Parse a lowercase, unprefixed 64-hex field into its 32 raw bytes.
 ///
@@ -3466,7 +3644,8 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
     }
 }
 
-/// `control.profile.getBody` — the body this node holds at `(store_id, root)`, if it holds one.
+/// `control.profile.getBody` — the body this node holds at `(store_id, root)`, if it holds one,
+/// and how this node's held bodies stand against the root the chain currently anchors.
 ///
 /// `body_b64: null` means "consulted, holds nothing". A read that FAILED is an error instead: a
 /// caller that cannot tell the two apart renders an existing profile as an empty one, and the
@@ -3474,6 +3653,39 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
 ///
 /// The echoed `root` is always the root the caller asked for — this node never substitutes a newer
 /// body it happens to hold.
+///
+/// # Why `standing` exists (dig-node#294)
+///
+/// `body_b64: null` is one answer for at least four different situations: the store never
+/// published here, the store's on-chain root advanced past everything this node holds, the store
+/// has no confirmed generation at all, and this node cannot read the chain to tell. A publisher
+/// debugging "nobody can see my profile" gets the same `null` in every case, so it cannot tell an
+/// un-published store from an empty one. `standing` names which it is, and names the remedy.
+///
+/// # An unreadable LOCAL store is its own answer, not an empty one
+///
+/// The standing's own disk read can fail too, and it degrades to `state: "held_unreadable"` with
+/// `held_roots: null` -- never `[]`, which means consulted-and-holds-nothing. The chain is not
+/// consulted at all in that case, for the same reason the body read below runs first: a chain read
+/// must never be able to mask a broken disk.
+///
+/// # The chain read is ADDITIVE and never fatal
+///
+/// Every pre-existing field keeps its exact meaning: `body_b64` is still the disk read at the
+/// REQUESTED root, and a failed disk read is still `CONTROL_ERROR`. A chain read that RETURNS an
+/// error degrades to `state: "chain_unreadable"` rather than failing the call, because a node whose
+/// coinset access is down must still be able to answer what it holds. Turning a working disk read
+/// into an error on a chain outage would break every existing caller to add a diagnosis.
+///
+/// # The limitation, named rather than implied
+///
+/// A chain source that is UNRESPONSIVE rather than failing produces no error to degrade on, so it
+/// blocks this call for as long as it blocks. That is not a property this method invented: the
+/// chain read follows the precedent `control.profile.putBody` already sets — same
+/// [`AnchoredRootResolver`], no timeout of its own, and `putBody` performs it as its FIRST action,
+/// before any body validation. Bounding it is therefore one change across both methods; bounding
+/// only this one would make two callers of the same resolver disagree about what a slow chain
+/// means, which is the kind of split that later reads as a bug in whichever one was not touched.
 async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     const METHOD: &str = "control.profile.getBody";
     let store_id = match parse_hex32_param(METHOD, "store_id", &id, params) {
@@ -3484,24 +3696,45 @@ async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
         Ok(v) => v,
         Err(e) => return e,
     };
-    match profile_body_store(ctx).get(&store_id, &root) {
-        Ok(held) => control_ok(
-            id,
-            json!({
-                "store_id": hex::encode(store_id),
-                "root": hex::encode(root),
-                "body_b64": held.as_ref().map(|b| {
-                    base64::engine::general_purpose::STANDARD.encode(b)
-                }),
-                "body_bytes": held.map_or(0u64, |b| b.len() as u64),
+    let store = profile_body_store(ctx);
+    // The disk read FIRST, and its failure still ends the call: a chain read must never be able to
+    // mask a broken disk, which is the one condition whose remedy is on this machine.
+    let held = match store.get(&store_id, &root) {
+        Ok(held) => held,
+        Err(e) => {
+            return control_error(
+                id,
+                ErrorCode::ControlError,
+                format!("{METHOD}: the profile body could not be read from disk: {e}"),
+            )
+        }
+    };
+    let standing = root_standing(&store, &*ctx.node.anchored_root_resolver_arc(), &store_id).await;
+    control_ok(
+        id,
+        json!({
+            "store_id": hex::encode(store_id),
+            "root": hex::encode(root),
+            "body_b64": held.as_ref().map(|b| {
+                base64::engine::general_purpose::STANDARD.encode(b)
             }),
-        ),
-        Err(e) => control_error(
-            id,
-            ErrorCode::ControlError,
-            format!("{METHOD}: the profile body could not be read from disk: {e}"),
-        ),
-    }
+            "body_bytes": held.map_or(0u64, |b| b.len() as u64),
+            "standing": {
+                "state": standing.state(),
+                // `null`, never an all-zero root: a zero root is a value `VerifiedBody::open`
+                // rejects outright, so emitting one would hand a caller a refused sentinel dressed
+                // as an answer.
+                "chain_root": standing.chain_root().map(hex::encode),
+                // `null` when the local store could not be enumerated, and an array otherwise.
+                // An empty array MEANS consulted-and-holds-nothing, so rendering one for a failed
+                // read would answer a question this node could not ask.
+                "held_roots": standing.held().map(|roots| {
+                    roots.iter().map(hex::encode).collect::<Vec<_>>()
+                }),
+                "detail": standing.detail(),
+            },
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3842,6 +4075,7 @@ fn mirror_bond_states(
     >,
     id: Value,
     params: &Value,
+    funding_wallet: WalletOperatorAddressResult,
 ) -> Value {
     use dig_node_control_interface::params::MirrorBondStatesParams;
     use dig_node_control_interface::results::MirrorBondStatesResult;
@@ -3860,6 +4094,7 @@ fn mirror_bond_states(
             &observation,
             params.after.as_ref(),
             params.effective_limit(),
+            funding_wallet,
         ),
         Err(reason) => MirrorBondStatesResult::Unknown { reason },
     };
@@ -3960,6 +4195,19 @@ mod tests {
     /// **Catches:** the empty-page fabrication — a node that cannot read its own mirror coins
     /// returning `{entries: [], complete: true}`, which tells an operator this node holds no bonds
     /// and locks no money. Both halves are asserted, because a producer that emitted the right
+    /// The funding wallet these dispatch tests hand the bond surface.
+    ///
+    /// A fixed KNOWN answer: these tests are about paging, refusal and the unknown reason, so
+    /// varying the wallet would test something else. That the wallet a page names is the wallet
+    /// the lifecycle SPENDS from is pinned in `dig-wallet`, over a real sealed wallet, where the
+    /// two derivations can actually be compared.
+    fn test_funding_wallet() -> WalletOperatorAddressResult {
+        WalletOperatorAddressResult::Known {
+            address: "xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsjqfwvy".into(),
+            puzzle_hash: "7c".repeat(32),
+        }
+    }
+
     /// `state` beside an `entries` key would still hand a lenient client a zero to render.
     #[test]
     fn mirror_bond_states_says_which_fact_it_is_missing_rather_than_returning_an_empty_page() {
@@ -3969,6 +4217,7 @@ mod tests {
             ),
             json!(1),
             &json!({}),
+            test_funding_wallet(),
         );
         let result = &answer["result"];
         assert_eq!(result["state"], "unknown");
@@ -4011,7 +4260,8 @@ mod tests {
             epoch: 4,
         };
 
-        let answer = mirror_bond_states(Ok(observation), json!(1), &json!({}));
+        let answer =
+            mirror_bond_states(Ok(observation), json!(1), &json!({}), test_funding_wallet());
         let result = &answer["result"];
 
         assert_eq!(
@@ -4185,6 +4435,7 @@ mod tests {
                 Err(dig_node_control_interface::results::MirrorBondStatesUnknownReason::ChainUnreadable),
                 json!(1),
                 &json!({ "limit": limit }),
+                test_funding_wallet(),
             );
             assert_eq!(
                 answer["error"]["code"],
@@ -4200,6 +4451,7 @@ mod tests {
             ),
             json!(1),
             &json!({ "limit": 1000 }),
+            test_funding_wallet(),
         );
         assert!(ok.get("error").is_none(), "1000 is in range: {ok}");
     }
@@ -4219,6 +4471,7 @@ mod tests {
             ),
             json!(1),
             &json!({ "after": { "store_id": "not-hex", "root": hex } }),
+            test_funding_wallet(),
         );
         assert_eq!(
             malformed["error"]["code"],
@@ -4232,6 +4485,7 @@ mod tests {
             ),
             json!(1),
             &json!({ "after": { "store_id": format!("0x{hex}"), "root": hex } }),
+            test_funding_wallet(),
         );
         assert!(
             prefixed.get("error").is_none(),
@@ -4595,6 +4849,7 @@ mod tests {
                 peak_height: Some(5_000_000),
             },
             BalanceAsset::DIG,
+            None,
         );
 
         assert_eq!(
@@ -4613,7 +4868,7 @@ mod tests {
                     }
                 ],
                 "complete": true, "cursor": "dd".repeat(32),
-                "source": "db", "synced": true, "peak_height": 5_000_000
+                "source": "db", "synced": true, "peak_height": 5_000_000, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -4658,6 +4913,7 @@ mod tests {
                 peak_height: None,
             },
             asset,
+            None,
         );
         assert_eq!(
             wire["coins"][0]["asset"],
@@ -4720,6 +4976,7 @@ mod tests {
                 peak_height: None,
             },
             BalanceAsset::Xch,
+            None,
         );
 
         assert_eq!(
@@ -4742,6 +4999,113 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("params.address"));
+    }
+
+    /// dig-node#490 — every coin read carries the SAME staleness bound `balance` does, and
+    /// `stale_by: 0` and `stale_by: null` stay OPPOSITE claims on each of them.
+    ///
+    /// # The input that distinguishes this from the nearest wrong implementation
+    ///
+    /// An implementation that merely ADDED the two keys — say, always `null` — passes any test
+    /// that only checks the fields are present. So each read is exercised at all three points:
+    /// level with the network (`0`), a real gap (`8_379`), and unbounded (`null`), with an
+    /// explicit `assert_ne!` between the first and the last. That pair is the whole contract:
+    /// zero says *this answer is as current as the network*, absence says *nothing bounds it*,
+    /// and a caller that cannot tell them apart is back at the reading #416 was filed on.
+    ///
+    /// The three heights are the ticket's own measured numbers, not round ones, so a fixture
+    /// that silently lost a digit would not still arithmetic out.
+    #[test]
+    fn every_coin_read_bounds_its_answer_with_the_null_versus_zero_contract() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::{
+            WalletCoinByIdResult, WalletCoinsByParentResult, WalletCoinsResult,
+        };
+
+        const REPLICA: u32 = 9_211_798;
+        const NETWORK: u32 = 9_220_177;
+        const GAP: u32 = 8_379;
+
+        let coins = |peak: Option<u32>, network: Option<u32>| {
+            coins_wire(
+                &WalletCoinsResult {
+                    coins: vec![],
+                    complete: true,
+                    cursor: None,
+                    source: Source::Fallback,
+                    synced: false,
+                    peak_height: peak,
+                },
+                BalanceAsset::Xch,
+                network,
+            )
+        };
+        let by_id = |peak: Option<u32>, network: Option<u32>| {
+            coin_by_id_wire(
+                &WalletCoinByIdResult {
+                    coin: None,
+                    source: Source::Fallback,
+                    synced: false,
+                    peak_height: peak,
+                },
+                network,
+            )
+        };
+        let by_parent = |peak: Option<u32>, network: Option<u32>| {
+            coins_by_parent_wire(
+                &WalletCoinsByParentResult {
+                    coins: vec![],
+                    complete: true,
+                    cursor: None,
+                    source: Source::Fallback,
+                    synced: false,
+                    peak_height: peak,
+                },
+                network,
+            )
+        };
+        let arrivals = |peak: Option<u32>, network: Option<u32>| {
+            arrivals_wire(
+                0,
+                &[],
+                0,
+                AnswerTier {
+                    synced: false,
+                    peak_height: peak,
+                    network_peak_height: network,
+                },
+            )
+        };
+
+        for (name, read) in [
+            (
+                "coins",
+                &coins as &dyn Fn(Option<u32>, Option<u32>) -> Value,
+            ),
+            ("coinById", &by_id),
+            ("coinsByParent", &by_parent),
+            ("arrivals", &arrivals),
+        ] {
+            let behind = read(Some(REPLICA), Some(NETWORK));
+            assert_eq!(behind["stale_by"], json!(GAP), "{name}: gap must be named");
+            assert_eq!(behind["network_peak_height"], json!(NETWORK), "{name}");
+
+            let level = read(Some(NETWORK), Some(NETWORK));
+            assert_eq!(level["stale_by"], json!(0), "{name}: level is a ZERO gap");
+
+            // No answer height at all — the ticket's measured reading.
+            let unbounded = read(None, Some(NETWORK));
+            assert_eq!(unbounded["stale_by"], json!(null), "{name}");
+            assert_ne!(
+                level["stale_by"], unbounded["stale_by"],
+                "{name}: level-with-the-network and unbounded are OPPOSITE claims"
+            );
+
+            // No held peer has announced a peak: bounded answer, unmeasurable distance.
+            let unmeasurable = read(Some(REPLICA), None);
+            assert_eq!(unmeasurable["stale_by"], json!(null), "{name}");
+            assert_eq!(unmeasurable["network_peak_height"], json!(null), "{name}");
+        }
     }
 
     // ---- control.wallet.arrivals (dig_ecosystem#2548) --------------------------------------
@@ -4773,6 +5137,11 @@ mod tests {
                 },
             ],
             8,
+            AnswerTier {
+                synced: true,
+                peak_height: Some(9_220_177),
+                network_peak_height: Some(9_220_177),
+            },
         );
         assert_eq!(wire["arrivals"][0]["amount"], json!("18446744073709551615"));
         assert_eq!(wire["arrivals"][0]["asset_id"], Value::Null);
@@ -4799,7 +5168,16 @@ mod tests {
             confirmed_height: 100,
         };
         // The page ends at 8; the ledger has since reached 12.
-        let wire = arrivals_wire(0, &[row(7), row(8)], 12);
+        let wire = arrivals_wire(
+            0,
+            &[row(7), row(8)],
+            12,
+            AnswerTier {
+                synced: true,
+                peak_height: Some(9_220_177),
+                network_peak_height: Some(9_220_177),
+            },
+        );
         assert_eq!(
             wire["cursor"],
             json!(8),
@@ -4812,7 +5190,16 @@ mod tests {
     /// first-run client can start from NOW instead of replaying the ledger as a burst of toasts.
     #[test]
     fn an_empty_arrivals_page_holds_the_cursor_and_still_reports_latest() {
-        let wire = arrivals_wire(30, &[], 42);
+        let wire = arrivals_wire(
+            30,
+            &[],
+            42,
+            AnswerTier {
+                synced: true,
+                peak_height: Some(9_220_177),
+                network_peak_height: Some(9_220_177),
+            },
+        );
         assert_eq!(wire["arrivals"], json!([]));
         assert_eq!(wire["cursor"], json!(30));
         assert_eq!(wire["latest"], json!(42));
@@ -4941,19 +5328,22 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::{WalletCoin, WalletCoinByIdResult};
 
-        let wire = coin_by_id_wire(&WalletCoinByIdResult {
-            coin: Some(WalletCoin {
-                coin_id: "aa".repeat(32),
-                parent_coin_info: "bb".repeat(32),
-                puzzle_hash: "cc".repeat(32),
-                amount: 1_000_000_000_000,
-                created_height: Some(5_000_000),
-                spent_height: Some(5_000_042),
-            }),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        });
+        let wire = coin_by_id_wire(
+            &WalletCoinByIdResult {
+                coin: Some(WalletCoin {
+                    coin_id: "aa".repeat(32),
+                    parent_coin_info: "bb".repeat(32),
+                    puzzle_hash: "cc".repeat(32),
+                    amount: 1_000_000_000_000,
+                    created_height: Some(5_000_000),
+                    spent_height: Some(5_000_042),
+                }),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
 
         assert_eq!(
             wire,
@@ -4969,7 +5359,7 @@ mod tests {
                 },
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -4991,19 +5381,22 @@ mod tests {
 
         // A CAT-sized amount on a synced DB-tier answer: deliberately the case most likely to
         // tempt a classification, and the opposite tier/sync combination to the test above.
-        let wire = coin_by_id_wire(&WalletCoinByIdResult {
-            coin: Some(WalletCoin {
-                coin_id: "11".repeat(32),
-                parent_coin_info: "22".repeat(32),
-                puzzle_hash: "33".repeat(32),
-                amount: 1_000,
-                created_height: Some(1),
-                spent_height: None,
-            }),
-            source: Source::Db,
-            synced: true,
-            peak_height: Some(6_000_000),
-        });
+        let wire = coin_by_id_wire(
+            &WalletCoinByIdResult {
+                coin: Some(WalletCoin {
+                    coin_id: "11".repeat(32),
+                    parent_coin_info: "22".repeat(32),
+                    puzzle_hash: "33".repeat(32),
+                    amount: 1_000,
+                    created_height: Some(1),
+                    spent_height: None,
+                }),
+                source: Source::Db,
+                synced: true,
+                peak_height: Some(6_000_000),
+            },
+            None,
+        );
 
         assert_eq!(
             wire["coin"]["asset"],
@@ -5035,19 +5428,22 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletCoinByIdResult;
 
-        let wire = coin_by_id_wire(&WalletCoinByIdResult {
-            coin: None,
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        });
+        let wire = coin_by_id_wire(
+            &WalletCoinByIdResult {
+                coin: None,
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
         assert_eq!(
             wire,
             json!({
                 "coin": null,
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
 
@@ -5088,16 +5484,19 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::{WalletCoinSpend, WalletCoinSpendResult};
 
-        let wire = coin_spend_wire(&WalletCoinSpendResult {
-            spend: Some(WalletCoinSpend {
-                coin: a_spent_coin(),
-                puzzle_reveal: "ff0180".to_string(),
-                solution: "80".to_string(),
-            }),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        });
+        let wire = coin_spend_wire(
+            &WalletCoinSpendResult {
+                spend: Some(WalletCoinSpend {
+                    coin: a_spent_coin(),
+                    puzzle_reveal: "ff0180".to_string(),
+                    solution: "80".to_string(),
+                }),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
 
         assert_eq!(
             wire,
@@ -5117,7 +5516,7 @@ mod tests {
                 },
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -5138,19 +5537,22 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletCoinSpendResult;
 
-        let wire = coin_spend_wire(&WalletCoinSpendResult {
-            spend: None,
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        });
+        let wire = coin_spend_wire(
+            &WalletCoinSpendResult {
+                spend: None,
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
         assert_eq!(
             wire,
             json!({
                 "spend": null,
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
 
@@ -5337,14 +5739,17 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletCoinsByParentResult;
 
-        let wire = coins_by_parent_wire(&WalletCoinsByParentResult {
-            coins: vec![a_spent_coin()],
-            complete: false,
-            cursor: Some("aa".repeat(32)),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        });
+        let wire = coins_by_parent_wire(
+            &WalletCoinsByParentResult {
+                coins: vec![a_spent_coin()],
+                complete: false,
+                cursor: Some("aa".repeat(32)),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
 
         assert_eq!(
             wire,
@@ -5362,7 +5767,7 @@ mod tests {
                 "cursor": "aa".repeat(32),
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -5378,14 +5783,17 @@ mod tests {
         use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletCoinsByParentResult;
 
-        let wire = coins_by_parent_wire(&WalletCoinsByParentResult {
-            coins: vec![],
-            complete: true,
-            cursor: None,
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        });
+        let wire = coins_by_parent_wire(
+            &WalletCoinsByParentResult {
+                coins: vec![],
+                complete: true,
+                cursor: None,
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
 
         assert_eq!(
             wire,
@@ -5395,7 +5803,7 @@ mod tests {
                 "cursor": null,
                 "source": "fallback",
                 "synced": false,
-                "peak_height": null
+                "peak_height": null, "network_peak_height": null, "stale_by": null
             })
         );
     }
@@ -5413,26 +5821,32 @@ mod tests {
             WalletCoinSpend, WalletCoinSpendResult, WalletCoinsByParentResult,
         };
 
-        let spend = coin_spend_wire(&WalletCoinSpendResult {
-            spend: Some(WalletCoinSpend {
-                coin: a_spent_coin(),
-                puzzle_reveal: "01".into(),
-                solution: "80".into(),
-            }),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        });
+        let spend = coin_spend_wire(
+            &WalletCoinSpendResult {
+                spend: Some(WalletCoinSpend {
+                    coin: a_spent_coin(),
+                    puzzle_reveal: "01".into(),
+                    solution: "80".into(),
+                }),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
         assert_eq!(spend["spend"]["coin"]["asset"], Value::Null);
 
-        let children = coins_by_parent_wire(&WalletCoinsByParentResult {
-            coins: vec![a_spent_coin()],
-            complete: true,
-            cursor: Some("aa".repeat(32)),
-            source: Source::Fallback,
-            synced: false,
-            peak_height: None,
-        });
+        let children = coins_by_parent_wire(
+            &WalletCoinsByParentResult {
+                coins: vec![a_spent_coin()],
+                complete: true,
+                cursor: Some("aa".repeat(32)),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            None,
+        );
         assert_eq!(children["coins"][0]["asset"], Value::Null);
     }
 
@@ -5664,7 +6078,10 @@ mod tests {
         assert_eq!(
             actual,
             contract.union(&overlay).copied().collect::<BTreeSet<_>>(),
-            "this node's master tier disagrees with dig-node-control-interface plus the declared              local overlay"
+            concat!(
+                "this node's master tier disagrees with dig-node-control-interface plus the declared ",
+                "local overlay"
+            )
         );
         assert!(
             contract.is_subset(&actual),
@@ -6264,6 +6681,21 @@ mod tests {
         assert!(
             unix.contains("revoke"),
             "a grant with no stated revocation is a permanent one: {unix}"
+        );
+        // dig-node#403 -- this message is rung 3 of the ladder, so the ONLY reader who ever sees
+        // it is one holding neither token: an unprivileged user who by construction cannot run a
+        // `sudo` verb. Naming only the operator's half sends that reader to find an
+        // administrator for a step they can perform themselves. The verb is asserted UNPREFIXED
+        // (`contains("sudo dign pair connect")` would be the same dead end wearing the right
+        // words), and the operator half is asserted above and below rather than replaced -- a fix
+        // that swapped one audience's guidance for the other's is not a fix.
+        assert!(
+            unix.contains("run `dign pair connect`"),
+            "the unprivileged reader must be told the verb THEY can run: {unix}"
+        );
+        assert!(
+            !unix.contains("sudo dign pair connect"),
+            "`pair connect` needs no elevation; prefixing it recreates the dead end: {unix}"
         );
         assert!(
             !unix.contains("uninstall"),

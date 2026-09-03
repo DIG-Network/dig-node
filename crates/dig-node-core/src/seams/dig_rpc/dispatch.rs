@@ -1038,8 +1038,12 @@ impl RpcDispatch for Node {
                 }
                 v
             }
-            Err(e) => json!({"jsonrpc":"2.0","id":id,
-            "error":{"code":-32000,"message":format!("upstream: {e}")}}),
+            // Through the canonical frame builder, so this failure carries `data.code` +
+            // `data.origin` like every other declared code rather than a bare {code,message}
+            // a client cannot branch on (dig-node#496).
+            Err(e) => {
+                crate::seams::dig_rpc::errors::error_frame(&id, -32000, &format!("upstream: {e}"))
+            }
         }
     }
 }
@@ -1162,6 +1166,29 @@ mod holder_claim_tests {
             holder_claim_for_landing(ReadOrigin::Peer, RequestProvenance::CrossSite),
             HolderClaim::Suppress,
             "folding both axes is only ever restrictive"
+        );
+    }
+    /// **Proves (dig-node#450, the same-origin variant):** a request driven by a page THIS NODE
+    /// serves at `/s/` backfills unbonded, even over a loopback socket the browser truthfully
+    /// labels `same-origin`.
+    ///
+    /// This is the variant the two-axis fold could not express. `/s/*path` and `POST /` are the
+    /// same router on the same port, and `STORE_CSP` grants store pages `script-src 'unsafe-inline'`
+    /// with `connect-src 'self'` — where `'self'` IS the RPC endpoint. So a stranger's store page
+    /// scripts a request the browser reports as `same-origin`, which folded to `Local` → `Announce`
+    /// → the operator's $DIG staked on the attacker's chosen capsule. `Announce` also REMOVES an
+    /// existing marker, so the same call could un-suppress a capsule already correctly relayed.
+    ///
+    /// **Catches:** any collapse of `StoreServed` back into `FirstParty`. Every other test in this
+    /// module passes with that collapse present — including the two `#436` ones — which is exactly
+    /// why this one is written against `StoreServed` over a `Local` transport rather than against a
+    /// landed marker further down.
+    #[test]
+    fn a_store_served_read_over_a_local_socket_backfills_suppressed() {
+        assert_eq!(
+            holder_claim_for_landing(ReadOrigin::Local, RequestProvenance::StoreServed),
+            HolderClaim::Suppress,
+            "a stranger's store page must not choose what this operator bonds $DIG against"
         );
     }
 }

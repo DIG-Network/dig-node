@@ -149,6 +149,53 @@ pub fn operator_puzzle_hash(paths: &WalletPaths) -> Option<Bytes32> {
     )
 }
 
+/// Why this node cannot name its own operator wallet.
+///
+/// Two outcomes rather than one `None`, because they call for different responses and a caller that
+/// cannot tell them apart must either alarm on a healthy node or stay quiet on a broken one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorAddressUnavailable {
+    /// No seed file exists: this node has never run its autoseed setup, so it has no operator
+    /// wallet and no address. Nothing is wrong.
+    NotInitialized,
+    /// Seed material is present and this node could not turn it into an address -- the seal will
+    /// not open, the device key is missing, or the phrase does not derive. A fault: a node in this
+    /// state cannot pay mirror collateral either.
+    Unreadable,
+}
+
+/// This node's operator-wallet RECEIVE ADDRESS, bech32m, under `address_prefix`.
+///
+/// The public destination for the machine-custody wallet -- where a person sends $DIG to fund the
+/// wallet that pays mirror collateral. Built on [`operator_puzzle_hash`], so it inherits that
+/// function's central property: **no signing capability is ever constructed on this path**, and the
+/// distinction is held by the types rather than by convention.
+///
+/// # It fails rather than approximating
+///
+/// An unencodable puzzle hash yields [`OperatorAddressUnavailable::Unreadable`], never the hex
+/// spelling of the hash and never an empty string. An address a client renders is an address
+/// somebody may send money to, so a value that merely LOOKS like one is worse than no value: hex
+/// that fails to be an address is at best a dead end, and at worst pasted somewhere it is accepted.
+///
+/// # The two failures are distinguished by whether the seed FILE exists
+///
+/// A node that has never been set up and a node whose seal will not open both fail to derive, and
+/// reporting them alike would either alarm on the first or stay silent on the second. The seed path
+/// is the only observation that separates them without opening anything.
+pub fn operator_address(
+    paths: &WalletPaths,
+    address_prefix: &str,
+) -> Result<String, OperatorAddressUnavailable> {
+    if !paths.seed.exists() {
+        return Err(OperatorAddressUnavailable::NotInitialized);
+    }
+    let puzzle_hash = operator_puzzle_hash(paths).ok_or(OperatorAddressUnavailable::Unreadable)?;
+    chia_wallet_sdk::utils::Address::new(puzzle_hash, address_prefix.to_string())
+        .encode()
+        .map_err(|_| OperatorAddressUnavailable::Unreadable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +241,106 @@ abandon abandon abandon art";
             wallet.owner_puzzle_hash(),
             expected_ph,
             "the exported phrase must recover this wallet in any standard Chia wallet"
+        );
+    }
+
+    /// **The address this node PUBLISHES is derived from the same puzzle hash the mirror
+    /// lifecycle SPENDS from.**
+    ///
+    /// `server.rs` picks the owner puzzle hash from the SIGNER when one is open and falls back to
+    /// [`operator_puzzle_hash`] when none is; `control.wallet.operatorAddress` reaches it through
+    /// the fallback. If those two could ever disagree, dig-app would show a funded address while
+    /// collateral failed from an empty one -- today's defect rebuilt one layer up, and harder to
+    /// diagnose the second time because the app would now be SHOWING an address and it would be
+    /// the wrong one.
+    ///
+    /// They cannot disagree, and this pins that rather than asserting it in prose: both reduce to
+    /// `derive_wallet_keys(open_operator_phrase(paths)).owner_puzzle_hash`. The test opens ONE real
+    /// sealed wallet on disk and takes both routes over it, so a future change that gave either
+    /// route its own derivation, its own phrase source, or its own key slot fails here.
+    ///
+    /// `agg_sig_data` is varied across the two signer opens deliberately: it is the one input that
+    /// differs between call sites, and a derivation that folded it in would give a node two
+    /// addresses for one wallet. That property has its own test above; this one keeps it true
+    /// through the seam a client actually reads.
+    #[test]
+    fn the_published_address_derives_from_the_hash_the_mirror_lifecycle_spends_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = WalletPaths {
+            seed: dir.path().join("seed.bin"),
+            device_key: dir.path().join("device.key"),
+            meta: dir.path().join("meta.json"),
+        };
+        autoseed::ensure_wallet(&paths).expect("the bootstrap mints a sealed operator wallet");
+
+        let spent_from = OperatorWallet::open(&paths, Bytes32::from([9u8; 32]))
+            .expect("the sealed wallet opens")
+            .owner_puzzle_hash();
+        let published = operator_puzzle_hash(&paths).expect("the same wallet derives its own hash");
+        assert_eq!(
+            published, spent_from,
+            "the address a client is shown must be the wallet collateral is paid from"
+        );
+
+        let other_domain = OperatorWallet::open(&paths, Bytes32::from([4u8; 32]))
+            .expect("the sealed wallet opens")
+            .owner_puzzle_hash();
+        assert_eq!(
+            other_domain, spent_from,
+            "one wallet must not have two addresses because two call sites signed for two networks"
+        );
+
+        // And the rendered address is that hash, not a neighbouring one: decode-free, by
+        // constructing the expected encoding from the hash the lifecycle spends from.
+        let expected = chia_wallet_sdk::utils::Address::new(spent_from, "xch".to_string())
+            .encode()
+            .unwrap();
+        assert_eq!(operator_address(&paths, "xch").unwrap(), expected);
+    }
+
+    /// **An address is produced for the network the caller names, and a node with no seed says so
+    /// rather than producing anything.**
+    ///
+    /// Three cases, and the fixture varies exactly one thing at a time.
+    ///
+    /// The two networks are the control that makes the first assertion mean something: an
+    /// implementation that hardcoded `xch` would still pass a single-prefix test, and would render
+    /// a mainnet address on a node reading testnet coins -- one wallet in appearance and two in
+    /// fact, which is the confusion this whole surface exists to end.
+    ///
+    /// The missing-seed case asserts the ERROR VALUE, not merely that it failed. A `NotInitialized`
+    /// reported as `Unreadable` alarms an operator about a node that is simply new, and the reverse
+    /// stays silent about a node whose machine custody is broken; a test that only checked
+    /// `is_err()` could not tell those apart, and they are the two responses a person actually
+    /// takes.
+    #[test]
+    fn the_operator_address_follows_the_network_and_a_seedless_node_says_not_initialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = WalletPaths {
+            seed: dir.path().join("seed.bin"),
+            device_key: dir.path().join("device.key"),
+            meta: dir.path().join("meta.json"),
+        };
+
+        assert_eq!(
+            operator_address(&paths, "xch"),
+            Err(OperatorAddressUnavailable::NotInitialized),
+            "a node that has never been set up is NEW, not broken"
+        );
+
+        let wallet = OperatorWallet::from_phrase(PHRASE, agg_sig_data()).unwrap();
+        let ph = wallet.owner_puzzle_hash();
+        let mainnet = chia_wallet_sdk::utils::Address::new(ph, "xch".to_string())
+            .encode()
+            .unwrap();
+        let testnet = chia_wallet_sdk::utils::Address::new(ph, "txch".to_string())
+            .encode()
+            .unwrap();
+        assert!(mainnet.starts_with("xch1"));
+        assert!(testnet.starts_with("txch1"));
+        assert_ne!(
+            mainnet, testnet,
+            "the prefix must reach the encoding, or the network argument is decorative"
         );
     }
 

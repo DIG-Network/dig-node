@@ -231,15 +231,34 @@ impl ProfileBodyStore {
     }
 
     /// Every root held for `store_id`, in unspecified order.
-    #[must_use]
-    pub fn roots_for_store(&self, store_id: &[u8; 32]) -> Vec<[u8; 32]> {
-        let Ok(entries) = std::fs::read_dir(self.store_dir(store_id)) else {
-            return Vec::new();
+    ///
+    /// `Ok(vec![])` means "consulted, holds nothing"; `Err` means the enumeration itself failed.
+    /// This is the same rule [`get`](Self::get) states two methods up -- the two "need opposite
+    /// remedies from a caller, so they are never collapsed" -- and this method simply did not
+    /// follow it. A bare `Vec` cannot express "I failed", so the failure arrived at the control
+    /// surface wearing the shape of an answer, and `RootStanding::NothingHeld` told a person
+    /// "nothing was ever published here" on the strength of a broken disk.
+    ///
+    /// A `NotFound` directory is deliberately `Ok(vec![])` rather than an error: a store dir is
+    /// created lazily on first write, so its absence is a genuine, positive "nothing was ever
+    /// published here" and is the ONLY thing that keeps that state reachable at all.
+    ///
+    /// Per-ENTRY errors propagate too. Dropping them silently would be the identical collapse one
+    /// level down: a partial listing returned as if it were complete.
+    pub fn roots_for_store(&self, store_id: &[u8; 32]) -> std::io::Result<Vec<[u8; 32]>> {
+        let entries = match std::fs::read_dir(self.store_dir(store_id)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
-        entries
-            .flatten()
-            .filter_map(|e| root_from_file_name(&e.file_name().to_string_lossy()))
-            .collect()
+        let mut roots = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if let Some(root) = root_from_file_name(&entry.file_name().to_string_lossy()) {
+                roots.push(root);
+            }
+        }
+        Ok(roots)
     }
 
     /// Every `(store_id, root)` this node holds a body for, in unspecified order.
@@ -247,23 +266,34 @@ impl ProfileBodyStore {
     /// The re-announce loop's input. Both components are parsed back out of the path with the same
     /// strict 64-lowercase-hex rule that named them, so a stray file, a temp artifact, or a
     /// directory this module did not create is skipped rather than announced as a phantom root.
-    #[must_use]
-    pub fn held_pairs(&self) -> Vec<([u8; 32], [u8; 32])> {
-        let Ok(stores) = std::fs::read_dir(&self.root) else {
-            return Vec::new();
+    ///
+    /// A missing cache root is `Ok(vec![])` -- it is created lazily, so its absence is a real
+    /// "holds nothing". Every other failure, including one store's enumeration failing, is an
+    /// `Err`: a PARTIAL enumeration returned as if it were complete is the identical defect one
+    /// layer up from [`roots_for_store`](Self::roots_for_store).
+    ///
+    /// The cost of that choice is deliberate, and it is NOT bounded to one sweep: while the
+    /// condition persists, a single unreadable store directory withholds the announce for every
+    /// OTHER healthy store too, and goes on doing so until the directory is readable again. The
+    /// loop re-warns each interval rather than degrading quietly, which is the whole reason this
+    /// returns an `Err` a caller must handle instead of an empty set it would silently believe.
+    pub fn held_pairs(&self) -> std::io::Result<Vec<([u8; 32], [u8; 32])>> {
+        let stores = match std::fs::read_dir(&self.root) {
+            Ok(stores) => stores,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
-        stores
-            .flatten()
-            .filter_map(|entry| {
-                let store_id = hex32_from_name(&entry.file_name().to_string_lossy())?;
-                Some(
-                    self.roots_for_store(&store_id)
-                        .into_iter()
-                        .map(move |root| (store_id, root)),
-                )
-            })
-            .flatten()
-            .collect()
+        let mut pairs = Vec::new();
+        for entry in stores {
+            let entry = entry?;
+            let Some(store_id) = hex32_from_name(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+            for root in self.roots_for_store(&store_id)? {
+                pairs.push((store_id, root));
+            }
+        }
+        Ok(pairs)
     }
 
     /// Delete every artifact in `dir` except `keep` and the most recently modified other.
@@ -1017,14 +1047,357 @@ pub async fn announce_held_root(
         .await
 }
 
+// ---------------------------------------------------------------------------------------------
+// Reconciliation: what this node HOLDS, measured against what the chain ANCHORS
+// ---------------------------------------------------------------------------------------------
+
+/// How a store's held profile bodies stand against the root the chain currently anchors.
+///
+/// # Why six states rather than a boolean
+///
+/// Each variant needs a DIFFERENT remedy from whoever reads it, and collapsing any two of them
+/// hands the reader the choice with the evidence removed. [`Superseded`](Self::Superseded) and
+/// [`NothingHeld`](Self::NothingHeld) in particular both mean "no body at the chain's root", and
+/// they are the exact pair dig-node#294 reports as indistinguishable: one says a publisher
+/// published and then moved the store on, the other says nothing was ever published here.
+/// `body_b64: null` is the same answer for both, and for two more besides.
+///
+/// # A held body can never be re-anchored under a new root
+///
+/// A DPB's root is a deterministic function of its own bytes: `VerifiedBody::open` rebuilds the
+/// merkle root from the records and refuses anything that does not match. So "the same body under
+/// a new root" is not a state that can exist. A root that advanced means the CONTENT changed, and
+/// no node but the publisher can produce bytes hashing to the new root.
+///
+/// That is why this type only ever REPORTS the drift and never repairs it. Repair here is
+/// structurally impossible rather than merely out of scope, and §908 would keep the node out of
+/// authoring even if it were not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootStanding {
+    /// The chain anchors `chain_root` and this node holds the body for it. Nothing to do.
+    Current {
+        /// The root the chain currently anchors, and which this node holds.
+        chain_root: [u8; 32],
+        /// Every root this node holds for the store, `chain_root` among them.
+        ///
+        /// Carried even in the healthy state because retention is current-plus-one, so a store in
+        /// step normally holds a superseded predecessor as well. A `held` that reported only the
+        /// current root would make [`held`](Self::held) a different question on this variant than
+        /// on every other one.
+        held: Vec<[u8; 32]>,
+    },
+    /// The chain anchors `chain_root`, this node holds bodies, and NONE of them is that root.
+    ///
+    /// dig-node#294 exactly. The remedy is a `control.profile.putBody` at `chain_root`, and only
+    /// the publisher can perform it.
+    Superseded {
+        /// The root the chain currently anchors, for which no body is held.
+        chain_root: [u8; 32],
+        /// Every root this node does hold for the store. All superseded, never empty.
+        held: Vec<[u8; 32]>,
+    },
+    /// The chain anchors `chain_root` and this node holds nothing at all for the store.
+    ///
+    /// Distinct from [`Superseded`](Self::Superseded) because the diagnosis differs even where the
+    /// remedy reads the same: nothing was ever published to THIS node, so the question is whether
+    /// the publisher ever called `putBody`, not whether it kept up.
+    NothingHeld {
+        /// The root the chain currently anchors.
+        chain_root: [u8; 32],
+    },
+    /// The chain answered and the store has no confirmed generation at all.
+    ///
+    /// An unconfirmed mint, or a store id that names nothing.
+    NoGeneration {
+        /// Every root this node holds for the store, if any. None of them is anchored.
+        held: Vec<[u8; 32]>,
+    },
+    /// The chain could not be read. This says nothing about the body either way.
+    ChainUnreadable {
+        /// Why the resolver could not answer.
+        reason: String,
+        /// Every root this node holds for the store, if any. Their standing is unknown.
+        held: Vec<[u8; 32]>,
+    },
+    /// This node's OWN store directory could not be enumerated, so what it holds is unknown.
+    ///
+    /// The mirror of [`ChainUnreadable`](Self::ChainUnreadable), on the other input. Without this
+    /// variant an I/O failure has nowhere to go but
+    /// [`NothingHeld`](Self::NothingHeld), which tells a person "nothing was ever published here"
+    /// -- a positive claim about a publisher, manufactured from a broken disk. There is no `held`
+    /// field because there is no held set to report: that is precisely what could not be read.
+    HeldUnreadable {
+        /// Why the local store could not be enumerated.
+        reason: String,
+    },
+}
+
+impl RootStanding {
+    /// Whether `held_root` may still be announced in a 223 flood.
+    ///
+    /// True iff the chain either NAMES this root, or has no opinion about the store.
+    ///
+    /// # The failure direction, and why it is not symmetric
+    ///
+    /// A **positive contradiction** silences the announce: the chain answered, and it named a
+    /// different root (or none of the held ones). Continuing to flood a retired root is the half
+    /// of dig-node#294 that makes an un-published store look like a publishing one -- every
+    /// correct receiver drops it, so the traffic buys nothing while looking exactly like
+    /// publishing.
+    ///
+    /// **No opinion** still announces. An announce carries no authority: [`handle_root_announce`]
+    /// makes every receiver resolve the root from chain itself before it asks for anything, so an
+    /// announce the chain cannot confirm costs the network one ignored frame. Silencing a healthy
+    /// node for the duration of a chain outage would cost real availability and buy no safety, so
+    /// the unreadable case deliberately fails OPEN here -- unlike the accept gate, where an
+    /// unreadable chain fails closed because there acceptance is the irreversible act.
+    ///
+    /// [`HeldUnreadable`](Self::HeldUnreadable) fails OPEN for the same reason: the chain has
+    /// stated no contradiction, an announce carries no authority, and silencing a healthy node for
+    /// the duration of a LOCAL disk outage would cost real availability and buy no safety. It
+    /// differs from the accept gate, where acceptance is the irreversible act and so fails closed.
+    #[must_use]
+    pub fn may_announce(&self, held_root: &[u8; 32]) -> bool {
+        match self {
+            Self::Current { chain_root, .. } => held_root == chain_root,
+            Self::Superseded { .. } | Self::NothingHeld { .. } => false,
+            Self::NoGeneration { .. }
+            | Self::ChainUnreadable { .. }
+            | Self::HeldUnreadable { .. } => true,
+        }
+    }
+
+    /// A stable machine token naming the state, for a control-plane answer.
+    #[must_use]
+    pub fn state(&self) -> &'static str {
+        match self {
+            Self::Current { .. } => "current",
+            Self::Superseded { .. } => "superseded",
+            Self::NothingHeld { .. } => "nothing_held",
+            Self::NoGeneration { .. } => "no_generation",
+            Self::ChainUnreadable { .. } => "chain_unreadable",
+            Self::HeldUnreadable { .. } => "held_unreadable",
+        }
+    }
+
+    /// The root the chain anchors, or `None` when the chain named none or could not be read.
+    ///
+    /// `None` is deliberately NOT collapsed onto an all-zero root: a zero root is a value
+    /// `VerifiedBody::open` rejects outright, so emitting one as if it were an answer would put a
+    /// refused sentinel where a caller expects a root.
+    #[must_use]
+    pub fn chain_root(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Current { chain_root, .. }
+            | Self::Superseded { chain_root, .. }
+            | Self::NothingHeld { chain_root } => Some(*chain_root),
+            Self::NoGeneration { .. }
+            | Self::ChainUnreadable { .. }
+            | Self::HeldUnreadable { .. } => None,
+        }
+    }
+
+    /// Every root this node holds for the store, or `None` when the store could not be read.
+    ///
+    /// The `Option` is the whole point. Returning an empty slice for
+    /// [`HeldUnreadable`](Self::HeldUnreadable) would re-collapse the unknown into a zero at the
+    /// accessor -- the control surface would render `held_roots: []`, which means
+    /// consulted-and-holds-nothing -- so the defect this variant exists to remove would simply
+    /// move one layer out.
+    #[must_use]
+    pub fn held(&self) -> Option<&[[u8; 32]]> {
+        match self {
+            Self::HeldUnreadable { .. } => None,
+            Self::NothingHeld { .. } => Some(&[]),
+            Self::Current { held, .. }
+            | Self::Superseded { held, .. }
+            | Self::NoGeneration { held }
+            | Self::ChainUnreadable { held, .. } => Some(held),
+        }
+    }
+
+    /// One sentence naming the state AND the remedy, for a person reading a control answer.
+    ///
+    /// The remedy is the point. "no body" sends a publisher looking at its store id; "you hold a
+    /// superseded root, re-publish at the chain's" sends it to the one action that fixes this.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Current { chain_root, held } => format!(
+                "in step: this node holds the body for the chain's current root {}, alongside {} \
+                 retained predecessor(s)",
+                hex::encode(chain_root),
+                held.len().saturating_sub(1)
+            ),
+            Self::Superseded { chain_root, held } => format!(
+                "SUPERSEDED: the chain has moved this store to root {}, and this node holds no \
+                 body for it -- only {} superseded root(s) ({}). The store is un-published until \
+                 the publisher calls control.profile.putBody at the chain's root; a body cannot \
+                 be re-anchored, because a DPB's root is a hash of its own bytes",
+                hex::encode(chain_root),
+                held.len(),
+                held.iter().map(hex::encode).collect::<Vec<_>>().join(", ")
+            ),
+            Self::NothingHeld { chain_root } => format!(
+                "the chain anchors root {} and this node holds no body for this store at all -- \
+                 nothing was ever published here",
+                hex::encode(chain_root)
+            ),
+            Self::NoGeneration { held } => format!(
+                "the chain reports no confirmed generation for this store (an unconfirmed mint, \
+                 or a store id that names nothing); this node holds {} body/bodies, none anchored",
+                held.len()
+            ),
+            Self::ChainUnreadable { reason, held } => format!(
+                "the chain could not be read, so the standing of the {} body/bodies this node \
+                 holds is UNKNOWN rather than absent: {reason}",
+                held.len()
+            ),
+            Self::HeldUnreadable { reason } => format!(
+                "this node's own store directory could not be read, so what it holds is UNKNOWN \
+                 rather than absent; the remedy is on this machine (disk or permissions): {reason}"
+            ),
+        }
+    }
+}
+
+/// Measure what this node holds for `store_id` against the root the chain currently anchors.
+///
+/// The one place the two halves of dig-node#294 are put together. Both were already knowable --
+/// [`ProfileBodyStore::roots_for_store`] and [`AnchoredRootResolver::anchored_root`] -- and no
+/// surface consulted both, which is why a store that un-published itself produced no signal
+/// anywhere.
+pub async fn root_standing(
+    store: &ProfileBodyStore,
+    resolver: &dyn AnchoredRootResolver,
+    store_id: &[u8; 32],
+) -> RootStanding {
+    // The DISK read first, and its failure short-circuits: a chain read must never be able to mask
+    // a broken disk, which is the one condition whose remedy is on this machine --
+    // `control.profile.getBody` already states that principle for its body read. Short-circuiting
+    // also means there is no both-failed case to invent a rule for.
+    let mut held = match store.roots_for_store(store_id) {
+        Ok(held) => held,
+        Err(e) => {
+            return RootStanding::HeldUnreadable {
+                reason: e.to_string(),
+            }
+        }
+    };
+    // Deterministic order, so a control answer and a log line naming the same set read the same
+    // way twice running. `read_dir` order is unspecified and does vary between platforms.
+    held.sort_unstable();
+    match resolver.anchored_root(store_id).await {
+        Ok(Some(chain_root)) => {
+            let chain_root = chain_root.0;
+            if held.contains(&chain_root) {
+                RootStanding::Current { chain_root, held }
+            } else if held.is_empty() {
+                RootStanding::NothingHeld { chain_root }
+            } else {
+                RootStanding::Superseded { chain_root, held }
+            }
+        }
+        Ok(None) => RootStanding::NoGeneration { held },
+        Err(reason) => RootStanding::ChainUnreadable { reason, held },
+    }
+}
+
+/// What one sweep of the re-announce loop did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnnouncePass {
+    /// Held roots the chain still anchors (or has no opinion on), each flooded once.
+    pub announced: usize,
+    /// Held roots the chain positively contradicts, each withheld rather than flooded.
+    pub withheld: usize,
+}
+
+/// One sweep of the re-announce loop: announce every held root the chain has not retired.
+///
+/// Extracted from [`run_profile_announce_loop`] so the DECISION -- announce this root, or withhold
+/// it -- is reachable by a test without spawning a task and racing a timer.
+///
+/// The chain is resolved **once per store**, not once per held root. Retention is
+/// current-plus-one, so a per-root read would double the lineage walks for no gain, and worse:
+/// two reads spanning a root advance would answer differently, so the two bodies of one store
+/// could be judged against two different chains within a single sweep.
+pub async fn announce_pass(
+    store: &ProfileBodyStore,
+    resolver: &dyn AnchoredRootResolver,
+    transport: &dyn ProfileTransport,
+) -> AnnouncePass {
+    let mut by_store: std::collections::BTreeMap<[u8; 32], Vec<[u8; 32]>> =
+        std::collections::BTreeMap::new();
+    // A failed enumeration announces nothing -- which is what already happened -- but it is no
+    // longer SILENT: an operator whose disk is broken sees why the node went quiet.
+    let pairs = match store.held_pairs() {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            tracing::warn!(
+                reason = %e,
+                "profile-sync: the held-body store could not be enumerated -- this sweep announces \
+                 nothing; it retries at the next interval"
+            );
+            return AnnouncePass::default();
+        }
+    };
+    for (store_id, root) in pairs {
+        by_store.entry(store_id).or_default().push(root);
+    }
+
+    let mut pass = AnnouncePass::default();
+    for (store_id, mut roots) in by_store {
+        roots.sort_unstable();
+        let standing = root_standing(store, resolver, &store_id).await;
+        if let RootStanding::Superseded { .. } = standing {
+            // The ACTIVE detection dig-node#294 asks for. A publisher whose root advanced gets no
+            // error from anywhere -- the failure is the ABSENCE of a later write -- so it is only
+            // ever noticed if something goes looking. This is that something, and it repeats every
+            // interval because the condition persists until someone re-publishes.
+            tracing::warn!(
+                store = %hex::encode(store_id),
+                standing = %standing.detail(),
+                "profile-sync: this store has un-published itself -- withholding its announce"
+            );
+        }
+        for root in roots {
+            if !standing.may_announce(&root) {
+                pass.withheld += 1;
+                tracing::debug!(
+                    store = %hex::encode(store_id),
+                    root = %hex::encode(root),
+                    state = standing.state(),
+                    "profile-sync: withheld the announce for a root the chain does not anchor"
+                );
+                continue;
+            }
+            let reached = announce_held_root(transport, store_id, root).await;
+            pass.announced += 1;
+            tracing::info!(
+                store = %hex::encode(store_id),
+                root = %hex::encode(root),
+                peers = reached,
+                "profile-sync: announced a held profile root (opcode 223)"
+            );
+        }
+    }
+    pass
+}
+
 /// Periodically announce every profile body on disk, so a peer that connects later still learns
 /// about it.
 ///
 /// Announcing carries no authority and costs a receiver nothing it does not choose to spend: a
 /// receiver ignores a store it is not subscribed to, and confirms the root on chain itself before
 /// asking for anything. So this loop is safe to run unconditionally on every node that holds a body.
+///
+/// It is ALSO where a store that has un-published itself is noticed (dig-node#294). Each sweep
+/// measures every held root against the chain and withholds any the chain has retired, so this
+/// node stops flooding a root every correct peer already drops, and the operator gets a warning
+/// naming the remedy. See [`announce_pass`].
 pub async fn run_profile_announce_loop(
     store: ProfileBodyStore,
+    resolver: Arc<dyn AnchoredRootResolver>,
     transport: Arc<dyn ProfileTransport>,
     interval: Duration,
 ) {
@@ -1032,13 +1405,12 @@ pub async fn run_profile_announce_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        for (store_id, root) in store.held_pairs() {
-            let reached = announce_held_root(&*transport, store_id, root).await;
+        let pass = announce_pass(&store, &*resolver, &*transport).await;
+        if pass.withheld > 0 {
             tracing::info!(
-                store = %hex::encode(store_id),
-                root = %hex::encode(root),
-                peers = reached,
-                "profile-sync: announced a held profile root (opcode 223)"
+                announced = pass.announced,
+                withheld = pass.withheld,
+                "profile-sync: re-announce sweep withheld roots the chain no longer anchors"
             );
         }
     }
@@ -1498,7 +1870,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             roots.push(root);
         }
-        let held = store.roots_for_store(&sid);
+        let held = store.roots_for_store(&sid).expect("enumerate");
         assert_eq!(held.len(), 2, "current-plus-one, got {held:?}");
         assert!(store.has(&sid, &roots[2]), "the newest must survive");
         assert!(store.has(&sid, &roots[1]), "so must its predecessor");
@@ -2107,7 +2479,7 @@ mod tests {
         store.put(&store_id(1), &bob_root, &bob).expect("put");
         store.put(&store_id(2), &alice_root, &alice).expect("put");
 
-        let mut held = store.held_pairs();
+        let mut held = store.held_pairs().expect("enumerate");
         held.sort();
         let mut expected = vec![
             (store_id(1), alice_root),
@@ -2138,7 +2510,10 @@ mod tests {
         .expect("dir");
         std::fs::write(root_dir.path().join("README.txt"), b"not a store").expect("file");
 
-        assert_eq!(store.held_pairs(), vec![(store_id(1), root)]);
+        assert_eq!(
+            store.held_pairs().expect("enumerate"),
+            vec![(store_id(1), root)]
+        );
     }
 
     /// An originated announce takes the dedup-exempt LOCAL path and goes to every peer — there is
@@ -2183,5 +2558,430 @@ mod tests {
             announces.iter().all(|(_, path)| *path == AnnouncePath::Local),
             "a re-announce this node originates must never take the deduplicated relay path: {announces:?}"
         );
+    }
+    // -- dig-node#294: a store whose on-chain root advances -----------------------------------
+
+    /// A chain view whose answer can be MOVED, so a fixture can reach the #294 state the way
+    /// production reaches it.
+    ///
+    /// The plain [`Chain`] double is fixed at construction, so a test using it can only ever start
+    /// already-drifted -- and a body persisted through [`accept_local_body`] against an
+    /// already-drifted chain is refused, so that fixture cannot even be built. The bug needs the
+    /// root to ADVANCE after a legitimate publish, which is exactly what this allows and what
+    /// makes these tests capable of seeing it.
+    struct AdvancingChain(Mutex<Result<Option<crate::Bytes32>, String>>);
+    #[async_trait::async_trait]
+    impl AnchoredRootResolver for AdvancingChain {
+        async fn anchored_root(
+            &self,
+            _store_id: &[u8; 32],
+        ) -> Result<Option<crate::Bytes32>, String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+    impl AdvancingChain {
+        fn at(root: [u8; 32]) -> Self {
+            Self(Mutex::new(Ok(Some(crate::Bytes32(root)))))
+        }
+        /// The store's on-chain root moves to `root`, as a publisher committing new content does.
+        fn advance_to(&self, root: [u8; 32]) {
+            *self.0.lock().unwrap() = Ok(Some(crate::Bytes32(root)));
+        }
+        fn goes_unreadable(&self) {
+            *self.0.lock().unwrap() = Err("coinset unreachable".into());
+        }
+        fn reports_no_generation(&self) {
+            *self.0.lock().unwrap() = Ok(None);
+        }
+    }
+
+    /// Persist a body the way a publisher does -- through the SAME gate `control.profile.putBody`
+    /// runs -- while `chain` still anchors that body's root.
+    ///
+    /// Hand-placing the file would skip the gate and prove nothing about a state production can
+    /// reach; a body only ever lands on disk by passing this check, so the fixture passes it too.
+    async fn published(
+        store: &ProfileBodyStore,
+        chain: &AdvancingChain,
+        sid: [u8; 32],
+        display_name: &str,
+    ) -> [u8; 32] {
+        let (bytes, root) = dpb(display_name);
+        accept_local_body(store, chain, sid, root, &bytes)
+            .await
+            .expect("the publisher's own body is accepted while the chain still anchors its root");
+        root
+    }
+
+    /// **Proves (dig-node#294):** once a store's on-chain root advances past the body this node
+    /// holds, the re-announce sweep stops flooding the retired root.
+    ///
+    /// # Why this asserts on the announce and not on the store
+    ///
+    /// The decision under test is "announce this held root, or withhold it". A test one layer down
+    /// -- that `roots_for_store` still returns the old root, or that `has()` is false at the new
+    /// one -- passes identically under the defect, because both of those were already true on the
+    /// machine the ticket was measured on. Only the transport spy can tell the fixed loop from the
+    /// broken one.
+    ///
+    /// # Why the fixture ADVANCES rather than starting advanced
+    ///
+    /// A body can only be on disk at all by having passed [`accept_local_body`] while the chain
+    /// anchored its root. A fixture that started with the chain already at the new root could not
+    /// persist the old body through any production path, so it would be testing a state the node
+    /// cannot occupy. This one publishes at `r0` and then moves the chain to `r1`, which is the
+    /// sequence machine A actually performed.
+    ///
+    /// **Revert-proof:** with `may_announce` returning `true` unconditionally -- the pre-fix
+    /// behaviour, which had no chain read at all -- this fails on the first assertion, having
+    /// announced the retired root.
+    #[tokio::test]
+    async fn a_root_the_chain_has_retired_is_no_longer_announced() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+
+        let chain = AdvancingChain::at(dpb("alice").1);
+        let r0 = published(&store, &chain, sid, "alice").await;
+
+        // The publisher commits new content, so the store's on-chain root moves on. Nothing
+        // persists a body for the new root -- that is the whole of #294.
+        let r1 = dpb("alice, updated").1;
+        assert_ne!(r0, r1, "the fixture must be a genuine advance");
+        chain.advance_to(r1);
+
+        let transport = Transport::default();
+        let pass = announce_pass(&store, &chain, &transport).await;
+
+        assert_eq!(
+            pass,
+            AnnouncePass {
+                announced: 0,
+                withheld: 1
+            },
+            "the one held root is retired, so the sweep must withhold it and announce nothing"
+        );
+        assert!(
+            transport.announces.lock().unwrap().is_empty(),
+            "no 223 may be emitted for a root the chain has retired: {:?}",
+            transport.announces.lock().unwrap()
+        );
+    }
+
+    /// **Proves:** the store's standing names the #294 state, and names it apart from the three
+    /// other ways `getBody` can answer `null`.
+    ///
+    /// This is the half the ticket calls out directly: `body_b64: null` at the chain's root is
+    /// today indistinguishable from "no such profile". Here the two are different values.
+    #[tokio::test]
+    async fn a_superseded_store_is_reported_apart_from_one_that_never_published() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let published_store = store_id(1);
+        let empty_store = store_id(2);
+
+        let chain = AdvancingChain::at(dpb("alice").1);
+        let r0 = published(&store, &chain, published_store, "alice").await;
+        let r1 = dpb("alice, updated").1;
+        chain.advance_to(r1);
+
+        let drifted = root_standing(&store, &chain, &published_store).await;
+        assert_eq!(
+            drifted,
+            RootStanding::Superseded {
+                chain_root: r1,
+                held: vec![r0]
+            },
+            "a store that published and then moved on is SUPERSEDED, naming both roots"
+        );
+
+        let never = root_standing(&store, &chain, &empty_store).await;
+        assert_eq!(
+            never,
+            RootStanding::NothingHeld { chain_root: r1 },
+            "a store this node holds nothing for is a different state, not the same null"
+        );
+        assert_ne!(
+            drifted.state(),
+            never.state(),
+            "the two states must not collapse onto one token -- that collapse IS #294"
+        );
+        assert!(
+            drifted.detail().contains(&hex::encode(r1)) && drifted.detail().contains("putBody"),
+            "the superseded detail must name the chain's root and the remedy: {}",
+            drifted.detail()
+        );
+    }
+
+    /// **Proves:** a body still at the chain's root is announced exactly as before, and the
+    /// superseded predecessor that current-plus-one retention keeps beside it is NOT.
+    ///
+    /// The second half matters on its own: retention deliberately keeps one older artifact, so
+    /// every healthy store holds a retired root too. A fix that only skipped stores with no
+    /// current body would still flood that predecessor forever.
+    #[tokio::test]
+    async fn a_current_root_is_announced_and_its_retained_predecessor_is_not() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+
+        let chain = AdvancingChain::at(dpb("alice").1);
+        let r0 = published(&store, &chain, sid, "alice").await;
+        // The publisher keeps up this time: the root advances AND a body is persisted for it.
+        let r1 = dpb("alice, updated").1;
+        chain.advance_to(r1);
+        let r1_persisted = published(&store, &chain, sid, "alice, updated").await;
+        assert_eq!(r1, r1_persisted);
+
+        assert_eq!(
+            store.roots_for_store(&sid).expect("enumerate").len(),
+            2,
+            "current-plus-one retention must be holding both, or this test proves nothing"
+        );
+
+        let transport = Transport::default();
+        let pass = announce_pass(&store, &chain, &transport).await;
+
+        assert_eq!(
+            pass,
+            AnnouncePass {
+                announced: 1,
+                withheld: 1
+            },
+            "exactly the current root is announced; the retained predecessor is withheld"
+        );
+        let announces = transport.announces.lock().unwrap();
+        assert_eq!(
+            announces
+                .iter()
+                .map(|(r, _)| <[u8; 32]>::from(r.root))
+                .collect::<Vec<_>>(),
+            vec![r1],
+            "the one announce must carry the CHAIN's root, never the predecessor"
+        );
+        assert_ne!(r0, r1);
+    }
+
+    /// **Proves:** a chain this node cannot read does NOT silence its announces.
+    ///
+    /// # Why this direction, stated as an assertion rather than a comment
+    ///
+    /// The accept gate fails CLOSED on an unreadable chain, and copying that reflex here would be
+    /// wrong in a way no other test would catch: it would take a healthy node off the air for the
+    /// duration of a chain outage. An announce carries no authority -- every receiver resolves the
+    /// root itself before asking for anything -- so an unconfirmable announce costs one ignored
+    /// frame, while silence costs real availability. Only a positive contradiction may withhold.
+    #[tokio::test]
+    async fn an_unreadable_chain_withholds_nothing() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+
+        let chain = AdvancingChain::at(dpb("alice").1);
+        let r0 = published(&store, &chain, sid, "alice").await;
+        chain.goes_unreadable();
+
+        let transport = Transport::default();
+        let pass = announce_pass(&store, &chain, &transport).await;
+
+        assert_eq!(
+            pass,
+            AnnouncePass {
+                announced: 1,
+                withheld: 0
+            },
+            "an unreadable chain has no opinion, so it may not take a healthy node off the air"
+        );
+        assert_eq!(
+            store_ids_announced(&transport),
+            vec![(sid, r0)],
+            "the held root is still announced while the chain cannot be read"
+        );
+
+        let standing = root_standing(&store, &chain, &sid).await;
+        assert_eq!(standing.state(), "chain_unreadable");
+        assert_eq!(
+            standing.chain_root(),
+            None,
+            "an unreadable chain names no root -- never a zero one, which VerifiedBody refuses"
+        );
+        assert!(
+            standing.detail().contains("UNKNOWN"),
+            "the detail must say unknown rather than absent: {}",
+            standing.detail()
+        );
+    }
+
+    /// **Proves:** a store the chain reports as having no confirmed generation is a state of its
+    /// own, and it does not silence the announce either.
+    #[tokio::test]
+    async fn a_store_with_no_confirmed_generation_is_its_own_state() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+
+        let chain = AdvancingChain::at(dpb("alice").1);
+        let r0 = published(&store, &chain, sid, "alice").await;
+        chain.reports_no_generation();
+
+        let standing = root_standing(&store, &chain, &sid).await;
+        assert_eq!(
+            standing,
+            RootStanding::NoGeneration { held: vec![r0] },
+            "the chain answering 'no generation' is not the same as it failing to answer"
+        );
+        assert!(
+            standing.may_announce(&r0),
+            "the chain named no root to contradict this one, so the announce stands"
+        );
+    }
+
+    /// **Proves:** a store in step with the chain reports `current` and nothing is withheld.
+    #[tokio::test]
+    async fn a_store_in_step_with_the_chain_reports_current() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+
+        let chain = AdvancingChain::at(dpb("alice").1);
+        let r0 = published(&store, &chain, sid, "alice").await;
+
+        let standing = root_standing(&store, &chain, &sid).await;
+        assert_eq!(
+            standing,
+            RootStanding::Current {
+                chain_root: r0,
+                held: vec![r0]
+            }
+        );
+        assert!(standing.may_announce(&r0));
+        assert!(
+            !standing.may_announce(&dpb("someone else").1),
+            "being in step licenses THIS root, not any other the node might hold"
+        );
+    }
+
+    /// Make `sid`'s store directory genuinely UNREADABLE, portably.
+    ///
+    /// A regular file where the directory would be makes `read_dir` fail with a kind that is NOT
+    /// `NotFound` on every platform this node builds for. A permission bit would not: `chmod 000`
+    /// does not deny directory listing on Windows, so a permissions fixture proves nothing here.
+    /// An empty-but-readable directory would not either -- that is the state this defect is
+    /// indistinguishable from, so a fixture built out of it cannot see the bug.
+    fn make_store_dir_unreadable(store: &ProfileBodyStore, sid: &[u8; 32]) {
+        let path = store.store_dir(sid);
+        std::fs::create_dir_all(path.parent().expect("store dir has a parent")).expect("root dir");
+        std::fs::write(&path, b"a file where a directory belongs").expect("occupy the store dir");
+    }
+
+    /// **Proves:** a store whose directory cannot be enumerated is never reported as one that
+    /// published nothing.
+    ///
+    /// Asserted at the STANDING, not at the enumerator: the defect is a decision, and a test that
+    /// only checks the disk read sits below the decision and passes while the surface still tells
+    /// a person "nothing was ever published here".
+    #[tokio::test]
+    async fn an_unreadable_store_dir_never_claims_nothing_was_ever_published() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+        make_store_dir_unreadable(&store, &sid);
+
+        let chain = AdvancingChain::at(dpb("alice").1);
+        let standing = root_standing(&store, &chain, &sid).await;
+
+        assert_eq!(
+            standing.state(),
+            "held_unreadable",
+            "an I/O failure is its own state, not the state that means consulted-and-empty: {}",
+            standing.detail()
+        );
+        assert!(
+            matches!(standing, RootStanding::HeldUnreadable { .. }),
+            "the unknown must be a state of its own: {standing:?}"
+        );
+        assert!(
+            !standing.detail().contains("nothing was ever published"),
+            "a positive publishing claim must never be manufactured from a failed read: {}",
+            standing.detail()
+        );
+    }
+
+    /// **Proves:** the enumerator itself reports the failure rather than an empty hold.
+    #[test]
+    fn an_unreadable_store_dir_is_an_error_not_an_empty_hold() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let sid = store_id(1);
+        make_store_dir_unreadable(&store, &sid);
+
+        let err = store
+            .roots_for_store(&sid)
+            .expect_err("an unreadable directory is not an empty one");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "the fixture must exercise a REAL read failure, not the never-created case: {err}"
+        );
+    }
+
+    /// **Proves:** the other side of the same bound -- a store nothing was ever written to still
+    /// reports an empty hold rather than an unknown one.
+    ///
+    /// Without this, a lazy `read_dir(...)?` would turn every never-published store into an
+    /// unknown and make `NothingHeld` unreachable, which is a different lie in the same place.
+    #[test]
+    fn a_store_never_written_to_holds_nothing_rather_than_failing() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+
+        assert_eq!(
+            store
+                .roots_for_store(&store_id(7))
+                .expect("a never-created store dir is not an error"),
+            Vec::<[u8; 32]>::new()
+        );
+    }
+
+    /// **Proves:** the accessor the control surface renders keeps the unknown distinguishable from
+    /// the empty one.
+    ///
+    /// This is where the defect would otherwise reappear one layer out: an accessor answering `[]`
+    /// for the unknown makes `held_roots: []` -- consulted-and-holds-nothing -- out of a failed
+    /// read, no matter how carefully the variant below it was built.
+    #[test]
+    fn an_unknown_hold_is_not_reported_as_an_empty_one() {
+        let unknown = RootStanding::HeldUnreadable {
+            reason: "the store directory could not be read".into(),
+        };
+        let empty = RootStanding::NothingHeld {
+            chain_root: dpb("alice").1,
+        };
+
+        assert_eq!(
+            unknown.held(),
+            None,
+            "an unknown hold has no root list to give"
+        );
+        assert_eq!(
+            empty.held(),
+            Some(&[][..]),
+            "an empty hold is an ANSWER, and must stay one"
+        );
+        assert!(
+            unknown.may_announce(&dpb("alice").1),
+            "a local disk outage must not silence a node the chain has not contradicted"
+        );
+    }
+
+    /// Every `(store, root)` the spy was asked to announce, in order.
+    fn store_ids_announced(transport: &Transport) -> Vec<([u8; 32], [u8; 32])> {
+        transport
+            .announces
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(r, _)| (<[u8; 32]>::from(r.store_id), <[u8; 32]>::from(r.root)))
+            .collect()
     }
 }
