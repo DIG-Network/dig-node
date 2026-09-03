@@ -9960,12 +9960,23 @@ mod tests {
         assert_eq!(s, 400, "{resp}");
         assert!(resp.contains("XCH underlying"));
 
-        // exercise_options is a documented follow-on: a clear 500, never a panic.
+        // exercise_options is served. An option this wallet does not track is a 404, and one it
+        // tracks but cannot reconstruct is a 400 naming the limitation -- never a 500, and never
+        // a mis-built spend. This assertion previously pinned the unimplemented 500, so it
+        // encoded the gap rather than the contract.
         let (s, resp) = be
             .dispatch("exercise_options", r#"{"option_ids":["aa"],"fee":0}"#)
             .await;
-        assert_eq!(s, 500, "{resp}");
-        assert!(resp.contains("not yet implemented"));
+        assert_eq!(s, 404, "{resp}");
+        assert!(resp.contains("not tracked"), "{resp}");
+
+        // More than one option per call is refused up front, because each exercise spends its
+        // own strike-funding coin and this backend builds no joint selection.
+        let (s, resp) = be
+            .dispatch("exercise_options", r#"{"option_ids":["aa","bb"],"fee":0}"#)
+            .await;
+        assert_eq!(s, 400, "{resp}");
+        assert!(resp.contains("exactly one option id"), "{resp}");
     }
 
     #[tokio::test]
