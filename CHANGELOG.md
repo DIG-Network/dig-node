@@ -4,6 +4,32 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.254.72] - 2026-09-03
+
+### Features
+- **mirror:** Activate bond promotion on the coin's own peer declaration (#501)- **wallet:** Serve exercise_options through dig-options, bounded and verified (#534)
+
+### Bug Fixes
+- **forwarded-ask:** A hop's absence_established must not strengthen this node's absence claim (#516)- **wallet:** Bound the total hold a repushed bundle can keep on its inputs (#505)- **relay:** Charge the proxy allowance last so a refusal leaves no trace (#512) (#517)- **messages:** Remove baked source indentation from lost string continuations (#531)- **mirror:** Funding-audit residue — skip count, rival FundingObservation, alert-storm latch (#481) (#529)- **rpc:** Reconcile the two machine names dig-node emits at -32000 (#518)- **peer:** Count accepted inbound peers in the connected pool (#402)- **wallet:** Bound a reservation deadline by the observing clock, not only by the first push's (#528)- **release:** Carry the MSI minor-field overflow into the idle major field (#537)- **mirror:** Bond-verification budget hardening (#527) + aggregate authentication budget (#481) (#535)- **wallet:** Discipline reservation liveness against a monotonic clock (#539)- **wallet:** Route wallet_reset_coin_db's now through ClockGovernor (#543)- **release:** Guard the MSI cross-release ordering hazard at a MAJOR bump (#544)
+
+### Performance
+- **collateral:** Bound the cold-start census read budget by seeding the height search (#509)
+
+### Documentation
+- **mirror:** Correct the hint-scan fallback claim and specify unbondable store records (#524)- **spec:** The genesis bring-up gap is closed, name the covering test (#538)- **deps:** Correct the stale dig-gossip pin comment and record the NC-7 publish exception (#536)
+
+### Testing
+- **peer:** Prove bring-up installs the downstream engines on the real genesis (#240) (#533)- **wallet:** A falsifiable CAT+NFT wallet fixture for dig-node#396 (#545)
+
+### Build
+- **deps:** Dig-node-control-interface 0.31, dig-mirror-coin 0.9; #357/#308 measured satisfied (#519)
+
+### CI
+- **release:** Make the MSI version-mapping check a required, fast-failing gate (#542)
+
+### Chores
+- **legacy:** Bounded #242 sweep; partial SPEC honesty fixes for #240/#241 (#530)
+
 ## [0.252.11] - 2026-09-03
 
 ### Features
