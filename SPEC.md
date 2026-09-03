@@ -3881,6 +3881,32 @@ a dig-node release — the installer's pre-rename fallback targets the SEPARATE
 `DIG-Network/dig-companion` repo's own frozen historical releases, not this asset name — so it was
 pure release-noise.
 
+11.2a. **Legacy `dig-companion` naming: the KEEP verdict (#242).** dig-node was formerly
+dig-companion (#209). Every surviving `dig-companion` / `DIG_COMPANION` reference in this repo is
+deliberate and load-bearing, and a future legacy sweep MUST NOT delete them. They fall into exactly
+three classes:
+
+- **A live byte-identical contract** — the shared on-disk cache path. `canonical_cache_dir()` stays
+  byte-identical to dig-companion's `cache_dir()` so the two share one cache; changing it orphans
+  every existing cache. Documented at `crates/dig-node-core/src/lib.rs:598, 608, 643, 726, 745, 921,
+  10158, 10168` and `crates/dig-node-core/src/seams/dig_rpc/dispatch.rs:516`. Deleting the naming
+  here deletes the reason the path may not change.
+- **A frozen historical release name** — `.github/workflows/build-binaries.yml:17-19` and
+  `.github/workflows/release.yml:9`, plus §11.2 above. The dig-installer's pre-rename fallback
+  targets the SEPARATE `DIG-Network/dig-companion` repo's own frozen historical releases, so the
+  name must remain readable here to explain why this repo publishes no such asset.
+- **A guard test asserting the legacy asset is NOT shipped** —
+  `crates/dig-node-service/tests/release_workflow_dign_guard.rs:82`,
+  `release_workflow_no_longer_ships_the_legacy_dig_companion_asset`. It greps the workflows for the
+  staged asset path `dist/dig-companion` (`:90`), so a literal "the grep for `companion` must be
+  clean" sweep would delete the very test that enforces the cleanliness it is checking for.
+
+The bare-word "companion" prose drift in the service test suite was separately swept to zero (#242).
+**`#[deprecated]` attributes in this repo: ZERO** — measured, not assumed. The single grep hit,
+`crates/dig-wallet/src/seed_store.rs:20`, is the word inside a `//!` doc comment explaining why the
+attribute was deliberately NOT applied; it is not an attribute. Stated here so a later audit reads
+the measurement instead of re-deriving it.
+
 11.3. **Matrix + the Linux platform floor (HARD RULE).** Five assets are published:
 `windows-x64` (x86_64-pc-windows-msvc), `linux-x64` (x86_64-unknown-linux-gnu), `linux-arm64`
 (aarch64-unknown-linux-gnu), `macos-arm64` (aarch64-apple-darwin), and `macos-x64`
