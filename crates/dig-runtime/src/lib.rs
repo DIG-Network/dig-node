@@ -95,13 +95,30 @@ fn runtime() -> &'static DigRuntime {
     init_global(true)
 }
 
+/// The message carried by the wallet-only guard frame, kept separate so the frame itself is
+/// BUILT rather than written down.
+const NODE_UNAVAILABLE_MESSAGE: &str = "node engine not available: dig-runtime started wallet-only";
+
 /// A JSON-RPC error returned by [`dig_rpc`] when the runtime was started
 /// WALLET-ONLY (the browser's mode) and therefore has no node engine. The DIG
 /// Browser never calls `dig_rpc` — it consumes an EXTERNAL node over RPC (#44) —
 /// so this only guards a misuse.
-const NODE_UNAVAILABLE_JSONRPC: &str = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"node engine not available: dig-runtime started wallet-only"}}"#;
+///
+/// Built through `dig_node_core::rpc_err` rather than written as a string literal. A literal
+/// frame is invisible to every guard that scans TYPES for taxonomy compliance, and this one had
+/// consequently drifted to a bare `{code, message}` with no `data.code` for a client to branch
+/// on. Deriving it means `-32000` carries the same `data.code` + `data.origin` here as on every
+/// other frame the node emits (dig-node#496).
+fn node_unavailable_jsonrpc() -> String {
+    dig_node_core::rpc_err(
+        &serde_json::Value::Null,
+        -32000,
+        NODE_UNAVAILABLE_MESSAGE,
+    )
+    .to_string()
+}
 
-/// Dispatch one node JSON-RPC request, or return [`NODE_UNAVAILABLE_JSONRPC`] when
+/// Dispatch one node JSON-RPC request, or return [`node_unavailable_jsonrpc`] when
 /// there is no node engine (wallet-only mode). Factored out of [`dig_rpc`] so the
 /// wallet-only guard is testable without the process-global runtime.
 fn dispatch_node_rpc(node: Option<&Node>, rt: &tokio::runtime::Runtime, req: &str) -> String {
@@ -115,7 +132,7 @@ fn dispatch_node_rpc(node: Option<&Node>, rt: &tokio::runtime::Runtime, req: &st
             dig_node_core::download::ReadOrigin::Local,
             dig_node_core::download::RequestProvenance::FirstParty,
         )),
-        None => NODE_UNAVAILABLE_JSONRPC.to_string(),
+        None => node_unavailable_jsonrpc(),
     }
 }
 

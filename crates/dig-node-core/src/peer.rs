@@ -1265,8 +1265,14 @@ fn admission_refused(
         peer = %conn_key.get(..16).unwrap_or(conn_key),
         "peer serve: inbound work refused at admission"
     );
-    json!({"jsonrpc":"2.0","id":id,
-        "error":{"code":-32000,"message":"request refused","data":{"reason":refusal.reason()}}})
+    // Minted through the canonical envelope so the refusal carries `data.code` +
+    // `data.origin` like every other declared code, with `reason` ADDED to that object rather
+    // than replacing it — the same shape `relay_pending_object` uses to attach its progress
+    // field. A frame that carries only `reason` forces a client back to prose for the one
+    // question `data.code` exists to answer (dig-node#496).
+    let mut error = crate::seams::dig_rpc::errors::error_object(-32000, "request refused");
+    error["data"]["reason"] = json!(refusal.reason());
+    json!({"jsonrpc":"2.0","id":id,"error":error})
 }
 
 /// Whether `method` may be answered over the **mTLS peer surface** (other DIG nodes).

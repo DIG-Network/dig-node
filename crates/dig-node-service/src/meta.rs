@@ -664,8 +664,16 @@ pub enum ErrorCode {
     MethodNotFound,
     /// `-32602` — invalid params (e.g. missing store_id / urn). From dig-node.
     InvalidParams,
-    /// `-32000` — the dig-node shell failed to dispatch the request to the node.
-    /// Dig-node-shell error.
+    /// `-32000` — a request failed on the way to, or inside, the read path: the shell
+    /// could not dispatch it (a panicked/failed spawn task, an unclassified wallet-proxy
+    /// failure), or the read path itself failed generically.
+    ///
+    /// ONE condition covering BOTH mints, which is why it carries one name: the shell mints
+    /// it at 2 sites and the embedded read path at 11, on the same port and at the same
+    /// number. Which layer answered is carried by `data.origin`, never by the name — so the
+    /// name is taken from the shared catalogue (`SERVER_ERROR`) rather than restated. The
+    /// Rust variant keeps its condition-describing spelling; that is internal identity, not
+    /// the wire (dig-node#496).
     DispatchFailed,
     /// `-32004` — the requested resource is not available at the requested root (a
     /// genuine content miss for that capsule, distinct from a transport failure).
@@ -791,10 +799,7 @@ impl ErrorCode {
             ErrorCode::InvalidRequest => shared(dig_rpc_protocol::ErrorCode::InvalidRequest),
             ErrorCode::MethodNotFound => shared(dig_rpc_protocol::ErrorCode::MethodNotFound),
             ErrorCode::InvalidParams => shared(dig_rpc_protocol::ErrorCode::InvalidParams),
-            // NOT sourced: the shell mints -32000 under its own `DISPATCH_FAILED`, which the
-            // crate calls `SERVER_ERROR`. That name IS on the wire, so reconciling it is a
-            // shipped-name change of a different kind — tracked separately, never silently.
-            ErrorCode::DispatchFailed => -32000,
+            ErrorCode::DispatchFailed => shared(dig_rpc_protocol::ErrorCode::ServerError),
             ErrorCode::ResourceUnavailable => {
                 shared(dig_rpc_protocol::ErrorCode::ResourceUnavailable)
             }
@@ -835,8 +840,7 @@ impl ErrorCode {
             ErrorCode::InvalidRequest => dig_rpc_protocol::ErrorCode::InvalidRequest.machine_code(),
             ErrorCode::MethodNotFound => dig_rpc_protocol::ErrorCode::MethodNotFound.machine_code(),
             ErrorCode::InvalidParams => dig_rpc_protocol::ErrorCode::InvalidParams.machine_code(),
-            // See `code()` for why -32000 is deliberately not sourced.
-            ErrorCode::DispatchFailed => "DISPATCH_FAILED",
+            ErrorCode::DispatchFailed => dig_rpc_protocol::ErrorCode::ServerError.machine_code(),
             ErrorCode::ResourceUnavailable => {
                 dig_rpc_protocol::ErrorCode::ResourceUnavailable.machine_code()
             }

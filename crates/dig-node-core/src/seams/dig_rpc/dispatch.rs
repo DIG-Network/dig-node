@@ -1038,8 +1038,14 @@ impl RpcDispatch for Node {
                 }
                 v
             }
-            Err(e) => json!({"jsonrpc":"2.0","id":id,
-            "error":{"code":-32000,"message":format!("upstream: {e}")}}),
+            // Through the canonical frame builder, so this failure carries `data.code` +
+            // `data.origin` like every other declared code rather than a bare {code,message}
+            // a client cannot branch on (dig-node#496).
+            Err(e) => crate::seams::dig_rpc::errors::error_frame(
+                &id,
+                -32000,
+                &format!("upstream: {e}"),
+            ),
         }
     }
 }

@@ -291,19 +291,15 @@ fn served_classes_are_well_formed() {
 /// crate's. A hard-coded assertion on one number only ever checks that number; this is
 /// the test that catches the NEXT drift, wherever it appears.
 ///
-/// `DispatchFailed`/-32000 is the one deliberate exclusion: the shell mints it and
-/// publishes it under its own name, so shell and wire AGREE there. Reconciling it with
-/// the crate's generic `SERVER_ERROR` is a genuine shipped-name change with a different
-/// risk profile, tracked separately.
+/// There are NO exclusions: every code the shell shares with the crate is checked. The
+/// set is DRAWN from `ErrorCode::all()` rather than hand-listed, so a gate over it cannot
+/// be narrower than the enumeration it sweeps (dig-node#496).
 #[test]
 fn shell_error_names_match_the_shared_catalogue() {
     let mut checked = 0usize;
     let mut drifted: Vec<String> = Vec::new();
 
     for shell in ErrorCode::all() {
-        if *shell == ErrorCode::DispatchFailed {
-            continue;
-        }
         let Some(shared) = dig_rpc_protocol::ErrorCode::ALL
             .iter()
             .find(|c| i64::from(c.code()) == shell.code())
@@ -322,7 +318,7 @@ fn shell_error_names_match_the_shared_catalogue() {
     }
 
     assert!(
-        checked >= 7,
+        checked >= 8,
         "the shell shares fewer codes with dig-rpc-protocol than expected ({checked}) — \
          this guard may be checking nothing"
     );

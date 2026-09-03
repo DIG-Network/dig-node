@@ -5233,10 +5233,13 @@ mod tests {
     /// ([`RESOURCE_UNAVAILABLE`] and [`RESOURCE_NOT_AVAILABLE`]) are correctly read as one condition
     /// under two names rather than as a collision.
     ///
-    /// Deliberately NOT exhaustive yet: `content_serve::SERVE_UNREADABLE` (`-32000`) specialises the
-    /// canonical `SERVER_ERROR`, and the chat band (`-32050`..`-32052`) is undeclared upstream
-    /// entirely. Both are pre-existing and out of this change; adding them is a follow-up that has to
+    /// Deliberately NOT exhaustive yet: the chat band (`-32050`..`-32052`) is undeclared upstream
+    /// entirely. That is pre-existing and out of this change; adding it is a follow-up that has to
     /// resolve the condition, not the table.
+    ///
+    /// `content_serve::SERVE_UNREADABLE` used to be named here as a second `-32000` gap. It was not
+    /// one: its code field's only sink answered `502` from the message and never read the number, so
+    /// it was a dead const rather than a producer, and it has been deleted (dig-node#496).
     const LOCAL_WIRE_CODES: &[(i64, &str)] = &[
         (
             crate::download::CONTENT_MISS_RATE_LIMITED,
