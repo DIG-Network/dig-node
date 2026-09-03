@@ -85,18 +85,45 @@ pub fn advertised_urls_from_env() -> Advertised {
 /// The warnings are emitted HERE rather than at the call site because this is the only place that
 /// knows WHY an entry was dropped; a caller handed a shortened list could only report that some
 /// entry was missing, which is not something an operator can act on.
+/// Why one configured entry is not advertised, in the words an operator reads.
+///
+/// Split out of [`configured_urls`] so a test can walk EVERY variant and assert over the rendered
+/// text. That is not tidiness: all three of this module's operator-facing lines shipped with 14- to
+/// 18-space runs baked into the middle of a sentence, left behind when a `\` string continuation
+/// lost its backslash. Such a literal compiles, no caller inspects it, and the mangled and correct
+/// forms are indistinguishable in a diff — so only a test over the VALUE can see it, and it has to
+/// reach these literals rather than a neighbouring module's.
+fn rejection_reason(why: &Rejection) -> &'static str {
+    match why {
+        Rejection::NotAbsolute => {
+            "it is not an absolute URL with a scheme and a host, so it names no way to reach anything"
+        }
+        Rejection::ThisMachineOnly => {
+            "its host can only mean this machine, so every reader would resolve it to themselves"
+        }
+    }
+}
+
+/// What this node reports when at least one entry survived and will be published.
+const ADVERTISING_AT_CONFIGURED_URLS: &str =
+    "advertising this node's stores at the operator-configured URLs, in the configured order";
+
+/// What this node reports when no configured entry may be published.
+///
+/// A function rather than a `const` because it names the environment variable, and `concat!` cannot
+/// take a `const`. Spelling the variable a second time as a literal would be a second source of
+/// truth for the same name — exactly the drift this module's tests exist to catch.
+fn nothing_publishable() -> String {
+    format!(
+        "no {ADVERTISE_URLS_ENV} entry is publishable, so this node advertises nothing and creates no mirror coin (SPEC.md 25.10)"
+    )
+}
+
 pub fn configured_urls() -> Vec<String> {
     let advertised = advertised_urls_from_env();
 
     for (entry, why) in &advertised.rejected {
-        let reason = match why {
-            Rejection::NotAbsolute => {
-                "it is not an absolute URL with a scheme and a host, so it names no way to reach anything"
-            }
-            Rejection::ThisMachineOnly => {
-                "its host can only mean this machine, so every reader would resolve it to themselves"
-            }
-        };
+        let reason = rejection_reason(why);
         tracing::warn!(
             target: "mirror",
             entry = %entry,
@@ -108,13 +135,10 @@ pub fn configured_urls() -> Vec<String> {
         tracing::info!(
             target: "mirror",
             urls = ?advertised.accepted,
-            "advertising this node's stores at the operator-configured URLs, in the configured order"
+            "{ADVERTISING_AT_CONFIGURED_URLS}"
         );
     } else {
-        tracing::info!(
-            target: "mirror",
-            "no {ADVERTISE_URLS_ENV} entry is publishable, so this node advertises nothing and creates no mirror coin (SPEC.md 25.10)"
-        );
+        tracing::info!(target: "mirror", "{}", nothing_publishable());
     }
 
     advertised.accepted
@@ -216,6 +240,73 @@ fn is_this_machine_only_v4(ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every operator-facing line this module emits reads as a sentence.**
+    ///
+    /// All three of them shipped corrupted: a `\` string continuation lost its backslash and baked
+    /// 14 to 18 literal spaces into the middle of each sentence. Nothing else can catch that. The
+    /// compiler is happy, no caller inspects the text, the two forms are indistinguishable in a
+    /// diff, and the only witness is an operator reading a line that looks broken at the moment
+    /// they are trying to work out why nothing is being advertised.
+    ///
+    /// The guard walks the whole SET rather than a chosen example, and asserts the count, so
+    /// deleting a message from the walk fails here instead of silently shrinking the sweep. A
+    /// sibling guard over `lifecycle.rs`'s two refusals exists and is NOT a substitute: it cannot
+    /// reach these literals, which is how three corrupted runtime lines sat behind a green test
+    /// that appeared to cover them.
+    #[test]
+    fn every_operator_facing_line_reads_as_a_sentence() {
+        let lines: Vec<(&str, String)> = [Rejection::NotAbsolute, Rejection::ThisMachineOnly]
+            .iter()
+            .map(|why| {
+                // Exhaustive BY CONSTRUCTION, and the name it yields is what a failure prints. A
+                // guard over an enumeration can only check the enumeration it was handed:
+                // `rejection_reason`'s own match forces a new `Rejection` variant to be GIVEN a
+                // message, but nothing would force that message into the sweep meant to check it,
+                // so it would ship unguarded by the very test that exists to guard it. This match
+                // fails to compile until the new variant is named here too.
+                let name = match why {
+                    Rejection::NotAbsolute => "Rejection::NotAbsolute",
+                    Rejection::ThisMachineOnly => "Rejection::ThisMachineOnly",
+                };
+                (name, rejection_reason(why).to_string())
+            })
+            .chain([
+                (
+                    "ADVERTISING_AT_CONFIGURED_URLS",
+                    ADVERTISING_AT_CONFIGURED_URLS.to_string(),
+                ),
+                ("nothing_publishable", nothing_publishable()),
+            ])
+            .collect();
+
+        assert_eq!(
+            lines.len(),
+            4,
+            "every line this module emits must be walked, never a subset: {lines:?}"
+        );
+        for (name, line) in &lines {
+            assert!(
+                !line.contains("  "),
+                "{name}: a run of two spaces is an eaten line continuation, not prose: {line:?}"
+            );
+            assert!(
+                !line.chars().any(char::is_control),
+                "{name}: no control character belongs in an operator-facing line: {line:?}"
+            );
+            // Control: a fixture too empty to exhibit the property must not pass. Both assertions
+            // above are satisfied by "" and by a single word.
+            assert!(
+                line.split_whitespace().count() >= 8,
+                "{name}: control -- each line must still be a sentence saying what happened: {line:?}"
+            );
+        }
+        assert!(
+            lines[3].1.contains(ADVERTISE_URLS_ENV),
+            "control: the no-entry line must name the variable an operator has to set: {:?}",
+            lines[3].1
+        );
+    }
 
     /// The refusal that exists today survives an unset value: no URL means no advertisement, which
     /// is what makes `create` decline rather than publish somewhere unreachable.
