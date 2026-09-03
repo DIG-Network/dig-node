@@ -11395,15 +11395,28 @@ mod tests {
             })
     }
 
-    /// A live chain tier holding one coin, reporting `peak` as its own height while it answers.
+    /// A live chain tier reporting `peak` as its own height while it answers.
+    ///
+    /// FIXTURE DESIGN. It holds TWO coins on purpose, because the five live fallback arms need
+    /// different coin states to produce a NON-EMPTY answer, and an arm answering emptily would
+    /// satisfy a peak assertion without ever having served a figure:
+    ///
+    /// - `c0` is SPENT, because `coin_spend` composes the spend with the coin's record and fails
+    ///   closed on a source that reports a spend of a coin its own record calls unspent. An
+    ///   unspent `c0` makes that arm return an ERROR, so the test would never reach the assertion
+    ///   it was written for.
+    /// - `u1` is UNSPENT, because `balance_for_address` and `coins_for_address` filter to unspent
+    ///   coins. With only a spent coin they answer a zero balance and an empty page — technically
+    ///   still bounded, but a fixture in which the figures are empty cannot show that the bound
+    ///   travels WITH a figure.
+    ///
+    /// Both share the parent `pp`, so `coins_by_parent` answers non-empty too.
     fn oracle_holding_one_coin(peak: Option<u32>) -> MockFallback {
-        let fb = MockFallback::with_coins(vec![fallback_coin(
-            "c0",
-            &"33".repeat(32),
-            1_750,
-            Some(ORACLE_PEAK - 4),
-            None,
-        )])
+        let ph = "33".repeat(32);
+        let fb = MockFallback::with_coins(vec![
+            fallback_coin("c0", &ph, 1_750, Some(ORACLE_PEAK - 4), Some(ORACLE_PEAK - 2)),
+            fallback_coin("u1", &ph, 900, Some(ORACLE_PEAK - 3), None),
+        ])
         .with_spends(vec![fallback_spend("c0")]);
         match peak {
             Some(p) => fb.with_answer_peak(p),
@@ -11511,12 +11524,15 @@ mod tests {
     async fn a_cached_row_is_bounded_by_nothing_even_when_the_tier_has_a_peak() {
         let fb = MockFallback::default()
             .with_cached(
+                // SPENT, for the reason `oracle_holding_one_coin` records: the cached
+                // `coin_spend` arm composes spend with record and fails closed on a coin its own
+                // record calls unspent, so an unspent fixture never reaches the assertion.
                 vec![fallback_coin(
                     "cached",
                     &"33".repeat(32),
                     9,
                     Some(ORACLE_PEAK - 900),
-                    None,
+                    Some(ORACLE_PEAK - 800),
                 )],
                 vec![fallback_spend("cached")],
             )
