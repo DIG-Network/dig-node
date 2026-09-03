@@ -5780,6 +5780,25 @@ thereby return the coins to selection — a second send inside the confirmation 
 reselect the same inputs. The TTL MUST NOT be shortened to compensate for the wider hold: that trades
 a double-select for a lockout, and a lockout is the worse failure.
 
+The TTL bounds ONE hold and MUST NOT be relied on to bound a SEQUENCE of them. A re-push of the same
+transaction renews the hold from the time of that push, so a caller re-pushing more often than the TTL
+would otherwise hold the inputs for as long as it kept retrying — the lockout the previous paragraph
+names as the worse failure, reachable without a single dishonest answer. A node MUST therefore also
+bound the TOTAL hold: the deadline recorded for a transaction MUST NOT exceed the time of its FIRST
+observed push plus `MAX_RESERVATION_HOLD_MS`, which MUST be `6 * RESERVATION_TTL_MS` (one hour).
+
+The first-push time MUST be a stable anchor: a re-push MUST re-arm the deadline subject to the bound
+above — which at or past the cap, or under a clock that has stepped backwards, leaves it unchanged —
+MUST increment the attempt count, and MUST NOT rewrite the anchor. A re-push MUST NOT move a
+recorded deadline EARLIER, so that a clock which steps backwards cannot shorten a hold that is
+already live.
+
+This bound is on CONTINUOUS hold. Once the deadline passes, the reservation and its coin claims are
+released and the inputs become selectable again; a subsequent push of the same transaction is a new
+reservation with a new anchor and MAY hold the inputs for a further full period. A node MUST NOT
+refuse to re-hold a transaction on the grounds that it has already held one, since the transaction may
+still be admitted and refusing would restore the double-select this section exists to close.
+
 The set of bundle-intrinsic reasons MUST be an ALLOWLIST whose default is to HOLD. The reason text is
 supplied by an untrusted source (§13), so an unrecognised reason MUST hold rather than free: the
 enumeration cannot be complete, and a node MUST NOT be made to free a user's inputs by a reason
