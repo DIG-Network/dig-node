@@ -167,7 +167,7 @@ pub(crate) async fn relay_capsule(
     // request; a spawned one outlives it, so a requestor that gives up leaves this node still
     // pulling. The registry's cap is GLOBAL and SHARED with this node's own `spawn_capsule_warm`,
     // so an abandoning peer can hold a warm slot that a local read wanted. Bounded (the cap), opt-in
-    // (gate 2) and allowance-limited (gate 3) — but a real cost of running the leg, recorded on
+    // (gate 2) and allowance-limited (gate 4) — but a real cost of running the leg, recorded on
     // `CapsuleWarmer::warm_relayed` as well so it is visible from either end.
     super::module_reshare::spawn_relayed_capsule_warm(
         std::sync::Arc::clone(&warmer),
