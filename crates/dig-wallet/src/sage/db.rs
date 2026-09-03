@@ -6786,9 +6786,14 @@ mod tests {
         // BELOW the boundary: a re-push at 4 x TTL wants 5 x TTL, which is under the cap, so the
         // clamp does not bind and the full TTL is granted.
         let under = first + 4 * RESERVATION_TTL_MS;
-        db.reserve_spend(&reservation("tx1", &["c1"], first, under + RESERVATION_TTL_MS))
-            .await
-            .unwrap();
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            under + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
         assert_eq!(
             db.pending_transactions().await.unwrap()[0].expires_at,
             under + RESERVATION_TTL_MS,
@@ -6814,9 +6819,14 @@ mod tests {
 
         // PAST it: the next re-push buys strictly less than a TTL — in fact nothing at all.
         let past = first + 5 * RESERVATION_TTL_MS + 60_000;
-        db.reserve_spend(&reservation("tx1", &["c1"], first, past + RESERVATION_TTL_MS))
-            .await
-            .unwrap();
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            past + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
         let row = &db.pending_transactions().await.unwrap()[0];
         assert_eq!(
             row.expires_at,
