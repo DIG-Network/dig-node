@@ -4056,7 +4056,7 @@ channel. This is not a regression — no nightly `.msi` existed before — but i
 host switched from `nightly` back to `stable` on Windows requires an uninstall of the nightly
 package before the stable one installs, until the version scheme distinguishes channels.
 
-**Stable-channel MINOR overflow (dig_ecosystem#521, dig_ecosystem#522).** dig-node's
+**Stable-channel MINOR overflow (#521, #522).** dig-node's
 `0.<minor>.<patch>` scheme puts an ever-incrementing feat/breaking counter (CLAUDE.md §2.4) in
 MINOR, and unlike MAJOR or PATCH that field is not bounded the way MSI's is — it reached Windows
 Installer's 255-value field ceiling first, at `0.256.0`, with every subsequent release otherwise
@@ -4088,16 +4088,32 @@ history. If MAJOR is ever bumped to nonzero (e.g., to 1.0.0) AFTER MINOR has exc
 prior release, releases with the carried encoding (e.g., real `0.600.0` maps to MSI `2.88.0`) can
 compare HIGHER in ProductVersion than the post-bump release with its passthrough encoding (e.g.,
 real `1.0.0` maps to MSI `1.0.0`, which is LOWER than `2.88.0`). This is a cross-release sequencing
-hazard that the in-version `MAJOR==0` guard does not prevent. Any future MAJOR bump occurring AFTER
-MINOR has overflowed requires deriving a new mapping strategy BEFORE that release to avoid a
-downgrade-class collision. This does not affect the current pre-release repo (MINOR has never
-exceeded 255 to date); when it becomes relevant, the decision is a user-call, not something the
-script guesses.
+hazard that the in-version `MAJOR==0` guard does not prevent. Measured 2026-09-03
+(#521, #522): MINOR has never exceeded 255 in any released dig-node
+version to date, so nothing shipped is affected today.
+
+**Cross-release ordering guard (#540).** Rather than leave the MAJOR-bump decision to
+an unchecked human arithmetic call, `scripts/package-version.sh` accepts an OPTIONAL second
+argument — the immediately preceding stable release's bare `X.Y.Z` — and refuses to emit a version
+whose folded MSI tuple compares LOWER than that release's. This is a real machine check, not a
+convention: passing the previous release turns "pick a MAJOR-bump number that happens to be high
+enough" into "the script proves the number you picked is high enough, or refuses." An EQUAL tuple
+is not treated as a hazard (that is the same same-version-upgrade case `AllowSameVersionUpgrades`
+already covers). The second argument is optional and every existing callsite that omits it — the
+three `package.yml` native-package build jobs — behaves byte-for-byte as before; only a caller that
+supplies it (`.github/workflows/ensure-version-increment.yml`'s version-increment job, which already
+checks out both the PR head and `main` and can pass `main`'s version at zero extra checkout cost)
+gets the guard. This does not require deriving a new mapping — the base-256 carry above is unchanged
+— it enforces, at the moment a MAJOR bump is actually cut, that whatever MINOR/PATCH is chosen
+clears the highest tuple ever shipped, which is exactly the "fresh decision" this caveat used to
+defer to an unchecked human call.
 
 Applies identically on both the stable and nightly mapping paths (the BUILD field keeps carrying
 the nightly day-count regardless of whether MINOR has overflowed).
 Verified by `scripts/tests/package-version.test.sh`, including the boundary that used to fail
-closed and a dedicated monotonicity check across the MAJOR==0 regime.
+closed, a dedicated monotonicity check across the MAJOR==0 regime, and the cross-release ordering
+guard's own revert-proof (#540: reverting the guard reproduces the ticket's exact
+`0.511.0` -> `1.0.0` downgrade acceptance, proving the test suite catches it).
 
 11.6. **Reusable build.** The cross-OS build lives once in `.github/workflows/build-binaries.yml`
 (`on: workflow_call`, inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel
