@@ -5751,9 +5751,11 @@ names as the worse failure, reachable without a single dishonest answer. A node 
 bound the TOTAL hold: the deadline recorded for a transaction MUST NOT exceed the time of its FIRST
 observed push plus `MAX_RESERVATION_HOLD_MS`, which MUST be `6 * RESERVATION_TTL_MS` (one hour).
 
-The first-push time MUST be a stable anchor: a re-push MUST update the deadline and the attempt count
-and MUST NOT rewrite it. A re-push MUST NOT move a recorded deadline EARLIER, so that a clock which
-steps backwards cannot shorten a hold that is already live.
+The first-push time MUST be a stable anchor: a re-push MUST re-arm the deadline subject to the bound
+above — which at or past the cap, or under a clock that has stepped backwards, leaves it unchanged —
+MUST increment the attempt count, and MUST NOT rewrite the anchor. A re-push MUST NOT move a
+recorded deadline EARLIER, so that a clock which steps backwards cannot shorten a hold that is
+already live.
 
 This bound is on CONTINUOUS hold. Once the deadline passes, the reservation and its coin claims are
 released and the inputs become selectable again; a subsequent push of the same transaction is a new

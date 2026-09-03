@@ -3079,8 +3079,6 @@ impl WalletDb {
                 submitted_at: r.get("submitted_at"),
                 expires_at: r.get("expires_at"),
                 attempts: r.get("attempts"),
-                // Not a stored column: a row read back describes a bundle, not the push that
-                // produced it. `true` is the conservative answer (see the field's own doc).
                 reserved_coin_ids: coins.into_iter().map(|c| c.get("coin_id")).collect(),
             });
         }
