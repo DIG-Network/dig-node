@@ -127,8 +127,13 @@ pub(crate) fn ask_budget(hops_remaining: u8, fan_out: u8) -> Duration {
 /// keeps them apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AskOutcome {
-    /// The peer looked and reported these providers. **An empty vec here is a real answer** - that
-    /// peer, and everyone it could reach, found nobody.
+    /// The peer looked and reported these providers.
+    ///
+    /// **An empty vec here establishes NOTHING at this node** (dig-node#508). It is a real answer in
+    /// the sense that the peer replied rather than stalled — which is why it scores as an
+    /// `HonestAnswer` for conduct — but it names no holder, and a peer's word that its own subtree
+    /// completed is testimony this node has no way to check. The absence it would assert is the one
+    /// claim in the protocol with no verifier.
     Answered(Vec<ProviderRecord>),
     /// The peer answered, and said SO ITSELF that its own subtree did not finish looking
     /// (`result.absence_established == false`). The providers it did name are real candidates; the
@@ -406,6 +411,17 @@ fn responder_record(content: &ContentId, responder: Responder<'_>) -> Option<Pro
 /// `dig_rpc_protocol::AvailabilityAnswer::absence_established_or_unknown` is an `Option<bool>` and
 /// says there is no safe collapse to `bool`. This enum is that `Option` named, so the three cases
 /// have to be handled where they are read rather than defaulted at the edge.
+///
+/// # The distinction is VACUOUS downstream, and saying so is the point
+///
+/// Since dig-node#508 the three states are parsed and reported but are **not distinguished by any
+/// decision this node makes**: an `Established` claim and a `NoClaim` silence both leave the
+/// forwarded leg inconclusive, because absence has no witness and a peer's self-report is testimony.
+/// The enum is kept because it pins the WIRE READING other implementations emit against, and because
+/// the three states drive the log lines an operator debugs a recursion with.
+///
+/// It is recorded as vacuous rather than left to be re-derived: a state distinction documented as
+/// governing something it no longer governs is exactly the class of defect dig-node#508 was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubtreeClaim {
     /// `Some(true)` — the peer reached everything it meant to reach and asserts the absence.
@@ -434,9 +450,13 @@ pub(crate) enum SubtreeClaim {
 /// DISABLED, so a node that never asks a peer never reaches this function at all, and the cost falls
 /// only on nodes that opted into recursion.
 ///
-/// A hop can of course LIE here, like anything else it tells us (NC-12) — but the value can only
-/// ever WEAKEN the claim this node goes on to make, never strengthen it. There is no direction in
-/// which lying about this field buys reach.
+/// A hop can of course LIE here, like anything else it tells us (NC-12), and this node therefore
+/// PARSES the field but never ADOPTS a peer's establishment as its own: a forwarded ask leaves this
+/// node's answer inconclusive whatever the hop claimed (dig-node#508, and see
+/// [`ForwardedAnswers::asked`](crate::download)). Absence has no witness — content verifies against
+/// the merkle root, "nobody has it" verifies against nothing — so only this node's own completed
+/// search may establish one. The value read here shapes the log line and the record set; it does not
+/// shape the verdict.
 fn subtree_claim(response: &Value) -> SubtreeClaim {
     let items = response
         .get("result")
@@ -1049,20 +1069,15 @@ mod tests {
             "and a peer reporting its own incompleteness is distinct from one that is merely silent"
         );
 
-        // The consequence the three states exist for: only Established may become a conclusive
-        // answer this node is willing to relay as proof.
-        assert!(
-            parsed(&miss_answer(Some(true))).is_conclusive(),
-            "an established absence is the ONE case a not-found may be built on"
-        );
-        assert!(
-            !parsed(&miss_answer(None)).is_conclusive(),
-            "an unknown must not become a proven absence"
-        );
-        assert!(
-            !parsed(&miss_answer(Some(false))).is_conclusive(),
-            "nor may a search the peer itself called incomplete"
-        );
+        // The verdict assertion that used to live here has MOVED, deliberately and not quietly.
+        //
+        // It read "only Established may become a conclusive answer", and dig-node#508 removed that
+        // consequence: no forwarded answer establishes an absence at this node, whatever the hop
+        // claimed, because absence has no witness. The three parse assertions above are still true
+        // and still worth pinning — they are the wire reading — but the verdict is decided in
+        // `download.rs`, so it is asserted there, against a whole engine, by
+        // `a_peers_absence_claim_cannot_move_this_nodes_verdict`. Asserting it here would pin the
+        // plumbing and leave the decision untested.
     }
 
     /// **Proves:** the weakest item in a BATCH decides, so one unproven item cannot ride out on the
