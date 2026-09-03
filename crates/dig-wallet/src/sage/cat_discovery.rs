@@ -1556,7 +1556,11 @@ mod tests {
         // genuinely distinct keys, or every assertion below could pass for a degenerate reason
         // (e.g. one fixture's coin standing in for both). This is the exact check that caught
         // the same-simulator-key collision described above on this test's first run.
-        assert_ne!(cat_asset_id, Bytes32::default(), "the CAT fixture has a real asset id");
+        assert_ne!(
+            cat_asset_id,
+            Bytes32::default(),
+            "the CAT fixture has a real asset id"
+        );
         assert_ne!(
             cat_owner_p2, singleton.owner_p2,
             "the CAT and the singleton are owned by different derived addresses of this wallet"
@@ -1594,7 +1598,10 @@ mod tests {
         ];
         let (believed, staged) =
             route_point_read_rows(&singleton_rows, &ours, &DerivedCats::default(), |_| false);
-        assert!(believed.is_empty(), "no singleton coin ever sits at an owned p2 hash");
+        assert!(
+            believed.is_empty(),
+            "no singleton coin ever sits at an owned p2 hash"
+        );
         db.stage_cat_admissions(&staged).await.unwrap();
 
         let stats = promote_staged_cats(&db, &lineage, &ours).await.unwrap();
@@ -1618,7 +1625,11 @@ mod tests {
         );
         let nfts = db.all_nfts().await.unwrap();
         let dids = db.all_dids().await.unwrap();
-        assert_eq!(nfts.len(), 1, "the NFT reaches the table the wallet reads NFTs from");
+        assert_eq!(
+            nfts.len(),
+            1,
+            "the NFT reaches the table the wallet reads NFTs from"
+        );
         assert_eq!(dids.len(), 1, "and the DID reaches the DID table");
         assert_eq!(nfts[0].launcher_id, hex::encode(singleton.nft_launcher));
         assert_eq!(dids[0].launcher_id, hex::encode(singleton.did_launcher));
