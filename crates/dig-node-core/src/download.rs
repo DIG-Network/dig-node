@@ -2099,6 +2099,17 @@ impl NodeContent {
         &self.ask_routing
     }
 
+    /// This node's first-hand holder cache, so a test can ask what a completed walk LEFT BEHIND.
+    ///
+    /// `FirstHandHolderCache::remember` states that "the caller is responsible for passing first-hand
+    /// records only", which makes the first-hand property a discipline of THIS module rather than an
+    /// invariant the type can enforce. A discipline nothing observes is a discipline one line can
+    /// break, so the cache has to be readable from a test for that line to be catchable.
+    #[cfg(test)]
+    pub(crate) fn holder_cache(&self) -> &FirstHandHolderCache {
+        &self.holder_cache
+    }
+
     /// [`Self::forget_stale_discovery`], reachable from the tests that drive the caches directly.
     #[cfg(test)]
     pub(crate) async fn forget_stale_discovery_for_test(&self, content: &ContentId) {
