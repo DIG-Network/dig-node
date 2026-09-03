@@ -31,6 +31,8 @@ fn env_guard() -> Arc<tokio::sync::Mutex<()>> {
 
 /// RAII release of the env-serialization lock (held for the whole test).
 #[must_use]
+// Held purely for its Drop (RAII release of the serialization lock). The field is
+// never read -- the value's lifetime IS its purpose -- so silence dead_code.
 struct EnvHold(#[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>);
 
 /// A node's temp tree, **owned** — removed when the test's binding drops, including on panic.

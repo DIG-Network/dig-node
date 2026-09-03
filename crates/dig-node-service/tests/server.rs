@@ -1,11 +1,11 @@
-//! End-to-end server tests: spin up the companion's axum app in-process (no OS
+//! End-to-end server tests: spin up the node's axum app in-process (no OS
 //! service, no real network) and exercise `/health`, CORS, the cache.* RPC, and
 //! blind passthrough against a mock upstream DIG RPC.
 //!
 //! These mirror the Node reference server's `rpc-integration` / `server` tests so
 //! the Rust binary's behaviour is verified to match the contract the extension
 //! relies on. The content read path itself (ciphertext + proof + decrypt) lives in
-//! dig-node and is covered by digstore's own tests; here we verify the companion
+//! dig-node and is covered by digstore's own tests; here we verify the node
 //! shell: it serves health, applies CORS, and routes RPC to the node.
 
 use std::net::SocketAddr;
@@ -18,7 +18,7 @@ use dig_wallet::sage::rpc::WalletBackend;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 
-/// Serializes every test that builds a companion server. dig-node reads
+/// Serializes every test that builds a node server. dig-node reads
 /// `DIG_NODE_UPSTREAM` and the cache/config/token paths from the PROCESS-GLOBAL
 /// environment — at construction AND live on each request. Tests run concurrently in
 /// one process, so without serialization one test's `set_var` (+ its dir teardown) is
@@ -73,7 +73,7 @@ async fn start_mock_upstream() -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}"), calls)
 }
 
-/// A held serialization guard returned by the start helpers. The companion server
+/// A held serialization guard returned by the start helpers. The node server
 /// reads the PROCESS-GLOBAL `DIG_NODE_CACHE` (and the config/token paths derived from
 /// it) LIVE on every request — so two tests running concurrently with different cache
 /// dirs race (one test's `set_var` + dir teardown is observed mid-request by another,
@@ -99,23 +99,23 @@ struct EnvHold(
     #[allow(dead_code)] Option<tempfile::TempDir>,
 );
 
-/// Start the companion app on a random loopback port pointed at the given upstream
-/// and an isolated cache dir. Returns the companion's base URL and the [`EnvHold`]
+/// Start the node app on a random loopback port pointed at the given upstream
+/// and an isolated cache dir. Returns the node's base URL and the [`EnvHold`]
 /// serialization guard the caller must keep alive for the test's duration.
-async fn start_companion(upstream: &str) -> (SocketAddr, EnvHold) {
-    let (addr, _token, hold) = start_companion_full(upstream).await;
+async fn start_node(upstream: &str) -> (SocketAddr, EnvHold) {
+    let (addr, _token, hold) = start_node_full(upstream).await;
     (addr, hold)
 }
 
-/// Like [`start_companion`] but also returns the local control token the server
+/// Like [`start_node`] but also returns the local control token the server
 /// generated, so the control-plane tests can authorize `control.*` calls (a same-
 /// host controller reads it from `<config_dir>/control-token`; here the test reads
 /// the same on-disk token the server wrote, mirroring exactly that controller flow).
-async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
-    start_companion_full_inner(upstream, None).await
+async fn start_node_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
+    start_node_full_inner(upstream, None).await
 }
 
-async fn start_companion_full_inner(
+async fn start_node_full_inner(
     upstream: &str,
     chia_peers: Option<u32>,
 ) -> (SocketAddr, String, EnvHold) {
@@ -183,19 +183,19 @@ async fn start_companion_full_inner(
     (addr, token, EnvHold(hold, Some(base)))
 }
 
-/// Like [`start_companion_full`], but with the wallet's Chia peer count pinned to `peers`. No
+/// Like [`start_node_full`], but with the wallet's Chia peer count pinned to `peers`. No
 /// supervisor is started and nothing is dialled — see `AppState::with_chia_peer_count_for_tests`.
-async fn start_companion_full_with_chia_peers(
+async fn start_node_full_with_chia_peers(
     upstream: &str,
     peers: u32,
 ) -> (SocketAddr, String, EnvHold) {
-    start_companion_full_inner(upstream, Some(peers)).await
+    start_node_full_inner(upstream, Some(peers)).await
 }
 
-/// Like [`start_companion`] but ALSO returns this node's loop-probe request (#1997) — the exact
+/// Like [`start_node`] but ALSO returns this node's loop-probe request (#1997) — the exact
 /// body the bring-up probe puts on the wire. A loop-breaker test must be able to stage the probe
 /// COMING BACK, and only the node knows the random id it generated.
-async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
+async fn start_node_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
@@ -227,9 +227,9 @@ async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     (addr, probe, EnvHold(hold, Some(base)))
 }
 
-/// Like [`start_companion_probe`] but ALSO returns the built [`AppState`], so a test can observe
+/// Like [`start_node_probe`] but ALSO returns the built [`AppState`], so a test can observe
 /// the shell's and the ENGINE's relay decisions directly instead of inferring them from a response.
-async fn start_companion_probe_state(
+async fn start_node_probe_state(
     upstream: &str,
 ) -> (
     SocketAddr,
@@ -268,12 +268,10 @@ async fn start_companion_probe_state(
     (addr, probe, state, EnvHold(hold, Some(base)))
 }
 
-/// Like [`start_companion_full`] but ALSO returns the served wallet backend (#368/#369) so a WS
+/// Like [`start_node_full`] but ALSO returns the served wallet backend (#368/#369) so a WS
 /// push test can drive the backend's event bus directly. Same per-call on-disk isolation + env
 /// lock (the wallet DB + seed live under the same per-test config dir).
-async fn start_companion_wallet(
-    upstream: &str,
-) -> (SocketAddr, String, Arc<WalletBackend>, EnvHold) {
+async fn start_node_wallet(upstream: &str) -> (SocketAddr, String, Arc<WalletBackend>, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
@@ -318,7 +316,7 @@ fn client() -> reqwest::Client {
 #[tokio::test]
 async fn health_reports_ok_version_mode_and_cache() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp: Value = client()
         .get(format!("http://{addr}/health"))
@@ -380,7 +378,7 @@ async fn health_reports_ok_version_mode_and_cache() {
 #[tokio::test]
 async fn cors_scopes_app_origins_to_content_reads_only() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     /// The reflected origin for a request, or `None` when CORS refused to reflect it.
     async fn reflected(
@@ -485,7 +483,7 @@ async fn cors_scopes_app_origins_to_content_reads_only() {
 #[tokio::test]
 async fn cors_reflects_tauri_origin_and_exposes_verification_headers() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     // A preflight from a Tauri origin is answered + reflected (not blocked as foreign).
     let preflight = client()
@@ -533,12 +531,12 @@ async fn cors_reflects_tauri_origin_and_exposes_verification_headers() {
 #[tokio::test]
 async fn cache_get_config_reports_dir_and_shared_from_dig_node() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     // #96 additive fields on the dig-node `cache.getConfig` RPC: the effective
-    // resolved cache dir + whether it is the shared canonical one. The companion
+    // resolved cache dir + whether it is the shared canonical one. The node
     // routes this straight to dig_node_core::handle_rpc, so this asserts the new crate
-    // contract reaches clients through the companion unchanged.
+    // contract reaches clients through the node unchanged.
     let resp: Value = client()
         .post(format!("http://{addr}/"))
         .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "cache.getConfig" }))
@@ -556,7 +554,7 @@ async fn cache_get_config_reports_dir_and_shared_from_dig_node() {
 #[tokio::test]
 async fn version_endpoint_reports_build_fingerprint() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp: Value = client()
         .get(format!("http://{addr}/version"))
@@ -578,7 +576,7 @@ async fn version_endpoint_reports_build_fingerprint() {
 #[tokio::test]
 async fn well_known_document_is_a_discovery_surface() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp: Value = client()
         .get(format!("http://{addr}/.well-known/dig-node.json"))
@@ -601,7 +599,7 @@ async fn well_known_document_is_a_discovery_surface() {
 #[tokio::test]
 async fn openrpc_endpoint_serves_the_spec() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp: Value = client()
         .get(format!("http://{addr}/openrpc.json"))
@@ -621,7 +619,7 @@ async fn openrpc_endpoint_serves_the_spec() {
 #[tokio::test]
 async fn rpc_discover_returns_the_openrpc_document() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp: Value = client()
         .post(format!("http://{addr}/"))
@@ -650,7 +648,7 @@ async fn rpc_discover_returns_the_openrpc_document() {
 #[tokio::test]
 async fn host_allowlist_accepts_dig_local_and_localhost() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     // Each canonical local Host (the loopback bind makes the actual socket the
     // same; we override the Host header to prove the allowlist accepts the name).
@@ -678,7 +676,7 @@ async fn host_allowlist_accepts_dig_local_and_localhost() {
 #[tokio::test]
 async fn host_allowlist_rejects_a_foreign_host() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     // A foreign Host (e.g. a public name rebinding-pointed at the loopback bind)
     // is rejected with 421 + a catalogued error body, before any handler runs.
@@ -841,7 +839,7 @@ async fn dual_stack_loopback_serves_both_ipv4_and_ipv6_on_the_same_port() {
 #[tokio::test]
 async fn cors_reflects_chrome_extension_origin() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let origin = "chrome-extension://abcdefghijklmnop";
     let resp = client()
@@ -873,7 +871,7 @@ async fn cors_reflects_chrome_extension_origin() {
 #[tokio::test]
 async fn cors_preflight_emits_pna_header_for_a_private_network_request() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp = client()
         .request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
@@ -904,7 +902,7 @@ async fn cors_preflight_emits_pna_header_for_a_private_network_request() {
 #[tokio::test]
 async fn cors_preflight_omits_pna_header_without_a_private_network_request() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp = client()
         .request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
@@ -933,7 +931,7 @@ async fn cors_preflight_omits_pna_header_without_a_private_network_request() {
 #[tokio::test]
 async fn cache_get_config_reports_cap_and_used() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp: Value = client()
         .post(format!("http://{addr}/"))
@@ -952,7 +950,7 @@ async fn cache_get_config_reports_cap_and_used() {
 #[tokio::test]
 async fn anchored_root_and_passthrough_relay_to_upstream() {
     let (upstream, calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     // Unknown method → blind passthrough to the upstream, relayed verbatim.
     let resp: Value = client()
@@ -985,7 +983,7 @@ async fn anchored_root_and_passthrough_relay_to_upstream() {
 async fn with_no_upstream_an_unimplemented_method_is_answered_locally_and_relayed_nowhere() {
     let (upstream, calls) = start_mock_upstream().await;
     // The upstream exists and is reachable, but is NOT configured on this node.
-    let (addr, _hold) = start_companion("").await;
+    let (addr, _hold) = start_node("").await;
 
     let resp: Value = client()
         .post(format!("http://{addr}/"))
@@ -1019,7 +1017,7 @@ async fn with_no_upstream_an_unimplemented_method_is_answered_locally_and_relaye
 #[tokio::test]
 async fn dig_health_is_answered_locally_with_no_upstream() {
     let (_upstream, calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion("").await;
+    let (addr, _hold) = start_node("").await;
 
     let resp: Value = client()
         .post(format!("http://{addr}/"))
@@ -1050,7 +1048,7 @@ async fn dig_health_is_answered_locally_with_no_upstream() {
 #[tokio::test]
 async fn dig_methods_lists_the_catalogue_locally() {
     let (_upstream, calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion("").await;
+    let (addr, _hold) = start_node("").await;
 
     let resp: Value = client()
         .post(format!("http://{addr}/"))
@@ -1094,7 +1092,7 @@ async fn dig_methods_lists_the_catalogue_locally() {
 #[tokio::test]
 async fn a_returning_loop_probe_disables_passthrough() {
     let (upstream, calls) = start_mock_upstream().await;
-    let (addr, probe, _hold) = start_companion_probe(&upstream).await;
+    let (addr, probe, _hold) = start_node_probe(&upstream).await;
 
     // Before: an unimplemented method relays, and the upstream answers it.
     let before: Value = client()
@@ -1166,7 +1164,7 @@ async fn a_returning_loop_probe_disables_passthrough() {
 #[tokio::test]
 async fn a_proven_loop_latches_the_engine_not_just_the_shell() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, probe, state, _hold) = start_companion_probe_state(&upstream).await;
+    let (addr, probe, state, _hold) = start_node_probe_state(&upstream).await;
 
     assert!(
         state.would_relay(),
@@ -1205,7 +1203,7 @@ async fn a_proven_loop_latches_the_engine_not_just_the_shell() {
 #[tokio::test]
 async fn another_nodes_loop_probe_does_not_disable_our_relay() {
     let (upstream, calls) = start_mock_upstream().await;
-    let (addr, _probe, _hold) = start_companion_probe(&upstream).await;
+    let (addr, _probe, _hold) = start_node_probe(&upstream).await;
 
     let foreign = json!({
         "jsonrpc": "2.0",
@@ -1249,7 +1247,7 @@ async fn another_nodes_loop_probe_does_not_disable_our_relay() {
 /// where the real router is running.
 #[tokio::test]
 async fn every_shell_classified_method_has_a_shell_handler() {
-    let (addr, _hold) = start_companion("").await;
+    let (addr, _hold) = start_node("").await;
 
     let shell_methods: Vec<&str> = dig_node_service::meta::methods()
         .iter()
@@ -1289,7 +1287,7 @@ async fn every_shell_classified_method_has_a_shell_handler() {
 /// loopback-only `GET /health`.
 #[tokio::test]
 async fn public_dig_health_does_not_leak_operational_detail() {
-    let (addr, _hold) = start_companion("").await;
+    let (addr, _hold) = start_node("").await;
 
     let resp: Value = client()
         .post(format!("http://{addr}/"))
@@ -1357,7 +1355,7 @@ async fn public_dig_health_does_not_leak_operational_detail() {
 #[tokio::test]
 async fn non_object_body_returns_jsonrpc_error_not_transport_error() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp = client()
         .post(format!("http://{addr}/"))
@@ -1392,7 +1390,7 @@ async fn post_rpc(addr: &SocketAddr, body: Value, token: Option<&str>) -> Value 
 #[tokio::test]
 async fn control_method_without_token_is_rejected_with_unauthorized() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -1417,7 +1415,7 @@ async fn control_method_without_token_is_rejected_with_unauthorized() {
 #[tokio::test]
 async fn cache_fetch_and_cache_over_http_requires_the_control_token() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let body = json!({
         "jsonrpc": "2.0",
@@ -1462,7 +1460,7 @@ async fn cache_fetch_and_cache_over_http_requires_the_control_token() {
 #[tokio::test]
 async fn cache_list_cached_over_http_requires_the_control_token() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let body = json!({
         "jsonrpc": "2.0",
@@ -1509,7 +1507,7 @@ async fn cache_list_cached_over_http_requires_the_control_token() {
 async fn cache_list_cached_is_not_routable_over_ws() {
     use tokio_tungstenite::tungstenite::Message;
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -1552,7 +1550,7 @@ async fn cache_list_cached_is_not_routable_over_ws() {
 async fn a_trusted_chia_peer_can_be_added_listed_and_removed_over_the_control_plane() {
     use tokio_tungstenite::tungstenite::Message;
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -1683,7 +1681,7 @@ async fn a_trusted_chia_peer_can_be_added_listed_and_removed_over_the_control_pl
 async fn removing_a_chia_peer_the_node_never_had_is_not_reported_as_a_removal() {
     use tokio_tungstenite::tungstenite::Message;
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -1767,7 +1765,7 @@ async fn removing_a_chia_peer_the_node_never_had_is_not_reported_as_a_removal() 
 async fn an_ipv6_chia_peer_is_stored_canonically_so_a_second_spelling_still_matches() {
     use tokio_tungstenite::tungstenite::Message;
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -1865,7 +1863,7 @@ async fn an_ipv6_chia_peer_is_stored_canonically_so_a_second_spelling_still_matc
 async fn a_blank_chia_peer_address_is_refused_before_anything_is_written() {
     use tokio_tungstenite::tungstenite::Message;
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -1927,7 +1925,7 @@ async fn a_blank_chia_peer_address_is_refused_before_anything_is_written() {
 #[tokio::test]
 async fn the_push_and_the_arrival_cursor_are_gated_while_the_chain_reads_are_open() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let call = |method: &str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let address = "xch1up0vfatgtwrcgcvc360jd57t3p2kjskncutvzakh9mhdmlvejj3shn8wln";
@@ -2105,7 +2103,7 @@ async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
 
     let (upstream, _calls) = start_mock_upstream().await;
     let (addr, _token, _hold) =
-        start_companion_full_with_chia_peers(&upstream, OBSERVED_CHIA_PEERS as u32).await;
+        start_node_full_with_chia_peers(&upstream, OBSERVED_CHIA_PEERS as u32).await;
 
     let call = |method: &str| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
 
@@ -2196,7 +2194,7 @@ async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
 #[tokio::test]
 async fn a_malformed_coin_id_is_refused_before_the_chain_is_ever_consulted() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     let coin_by_id = |coin_id: Value| {
         json!({
@@ -2252,7 +2250,7 @@ async fn a_malformed_coin_id_is_refused_before_the_chain_is_ever_consulted() {
 #[tokio::test]
 async fn the_chain_reads_refuse_malformed_ids_before_the_chain_is_ever_consulted() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     let call_with = |method: &'static str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let good = "ab".repeat(32);
@@ -2325,7 +2323,7 @@ async fn the_chain_reads_refuse_malformed_ids_before_the_chain_is_ever_consulted
 #[tokio::test]
 async fn the_chain_reads_are_open_reachable_and_degrade_honestly() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     let call_with = |method: &'static str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let good = "ab".repeat(32);
@@ -2412,7 +2410,7 @@ async fn the_chain_reads_are_open_reachable_and_degrade_honestly() {
 #[tokio::test]
 async fn control_peers_ping_is_reachable_token_gated_and_degrades_honestly() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let ping = |params: Value| {
         json!({
@@ -2469,7 +2467,7 @@ async fn control_peers_ping_is_reachable_token_gated_and_degrades_honestly() {
 #[tokio::test]
 async fn chat_methods_over_http_require_the_control_token() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     for method in ["chat.send", "chat.poll"] {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
@@ -2513,7 +2511,7 @@ async fn chat_methods_over_http_require_the_control_token() {
 #[tokio::test]
 async fn control_method_with_wrong_token_is_rejected() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -2581,7 +2579,7 @@ async fn poll_pairing(addr: &SocketAddr, pairing_id: &str) -> Value {
 #[tokio::test]
 async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, master, _hold) = start_companion_full(&upstream).await;
+    let (addr, master, _hold) = start_node_full(&upstream).await;
 
     // A control MUTATION with no token is rejected (the extension can't read the file) — on the
     // ordinary tier too, so the rejection is about the missing token and not about the tier.
@@ -2670,7 +2668,7 @@ async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
 #[tokio::test]
 async fn a_paired_token_cannot_grant_itself_a_trusted_chia_peer() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, master, _hold) = start_companion_full(&upstream).await;
+    let (addr, master, _hold) = start_node_full(&upstream).await;
 
     // Pair, exactly as the extension does, to obtain a genuine scoped token.
     let req = post_rpc(
@@ -2746,7 +2744,7 @@ async fn a_paired_token_cannot_grant_itself_a_trusted_chia_peer() {
 #[tokio::test]
 async fn control_status_with_token_returns_rich_status() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -2770,7 +2768,7 @@ async fn control_status_with_token_returns_rich_status() {
 #[tokio::test]
 async fn control_token_via_params_is_also_accepted() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     // No header — present the token in params._control_token instead.
     let resp = post_rpc(
@@ -2791,7 +2789,7 @@ async fn control_token_via_params_is_also_accepted() {
 #[tokio::test]
 async fn read_methods_are_unaffected_by_the_control_gate() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     // A read method with NO token must still work (the gate is control.* only).
     let resp = post_rpc(
@@ -2807,7 +2805,7 @@ async fn read_methods_are_unaffected_by_the_control_gate() {
 #[tokio::test]
 async fn control_config_get_reports_addr_upstream_and_cache() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -2825,7 +2823,7 @@ async fn control_config_get_reports_addr_upstream_and_cache() {
 #[tokio::test]
 async fn control_pin_unpin_roundtrips_in_hosted_stores() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let store = "a1".repeat(32); // 64-hex
     let cap = format!("{store}:{}", "b2".repeat(32));
@@ -2885,7 +2883,7 @@ async fn control_pin_unpin_roundtrips_in_hosted_stores() {
 #[tokio::test]
 async fn control_pin_rejects_a_malformed_store_ref() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -2902,7 +2900,7 @@ async fn control_pin_rejects_a_malformed_store_ref() {
 #[tokio::test]
 async fn control_sync_status_reports_availability() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -2936,7 +2934,7 @@ async fn control_sync_status_reports_availability() {
 #[tokio::test]
 async fn control_updater_methods_without_token_are_rejected() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     for method in ["control.updater.status", "control.updater.checkNow"] {
         let resp = post_rpc(
@@ -2959,7 +2957,7 @@ async fn control_updater_methods_without_token_are_rejected() {
 #[tokio::test]
 async fn control_updater_status_and_mutation_wired_over_http() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     // -- status: absent (no beacon installed on this runner) is a normal, non-error result.
     // Owned by the guard: removed on drop and on an unwind (dig-node#370). The node reads
@@ -3031,7 +3029,7 @@ async fn control_updater_status_and_mutation_wired_over_http() {
 #[tokio::test]
 async fn control_unknown_method_is_method_not_found() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     // A control method the shell does not own is delegated to the node's own control
     // surface (control.peerStatus / control.subscribe / …); a genuinely unknown one
@@ -3051,7 +3049,7 @@ async fn control_methods_are_not_passed_through_to_upstream() {
     // A control.* method without a token must be rejected by the SHELL, never
     // relayed to the upstream (it is not a read method).
     let (upstream, calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     let _ = post_rpc(
         &addr,
@@ -3072,7 +3070,7 @@ async fn control_methods_are_not_passed_through_to_upstream() {
 #[tokio::test]
 async fn control_cors_preflight_allows_the_control_token_header() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     let resp = client()
         .request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
@@ -3115,7 +3113,7 @@ async fn control_cors_preflight_allows_the_control_token_header() {
 #[tokio::test]
 async fn control_status_emits_the_extension_consumed_field_names() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -3159,7 +3157,7 @@ async fn control_status_emits_the_extension_consumed_field_names() {
 #[tokio::test]
 async fn control_unauthorized_matches_the_extension_error_contract() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_node_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -3178,7 +3176,7 @@ async fn control_unauthorized_matches_the_extension_error_contract() {
 #[tokio::test]
 async fn health_carries_the_open_status_probe_contract() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let resp: Value = client()
         .get(format!("http://{addr}/health"))
@@ -3381,7 +3379,7 @@ async fn serve_with_gate_off_disables_the_peer_network_but_still_serves_reads() 
 #[tokio::test]
 async fn ws_status_sends_snapshot_on_connect() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/status"))
         .await
@@ -3413,7 +3411,7 @@ async fn ws_status_sends_snapshot_on_connect() {
 #[tokio::test]
 async fn ws_status_sends_heartbeat_after_snapshot() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/status"))
         .await
@@ -3447,7 +3445,7 @@ async fn ws_status_sends_heartbeat_after_snapshot() {
 #[tokio::test]
 async fn ws_status_closes_cleanly_on_client_close() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/status"))
         .await
@@ -3479,7 +3477,7 @@ async fn ws_status_rejects_a_disallowed_origin() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let mut request = format!("ws://{addr}/ws/status")
         .into_client_request()
@@ -3504,7 +3502,7 @@ async fn ws_status_accepts_a_chrome_extension_origin() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _hold) = start_companion(&upstream).await;
+    let (addr, _hold) = start_node(&upstream).await;
 
     let mut request = format!("ws://{addr}/ws/status")
         .into_client_request()
@@ -3540,7 +3538,7 @@ async fn ws_status_accepts_a_chrome_extension_origin() {
 #[tokio::test]
 async fn wallet_rpc_answers_core_reads_on_loopback() {
     let (upstream, calls) = start_mock_upstream().await;
-    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, _token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     for (method, body) in [
         ("get_version", "{}"),
@@ -3573,7 +3571,7 @@ async fn wallet_rpc_answers_core_reads_on_loopback() {
 #[tokio::test]
 async fn wallet_rpc_rejects_unauthorized_mutation() {
     let (upstream, calls) = start_mock_upstream().await;
-    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, _token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     let resp = client()
         .post(format!("http://{addr}/send_xch"))
@@ -3620,7 +3618,7 @@ where
 async fn ws_wallet_pushes_status_and_correlates_a_request() {
     use tokio_tungstenite::tungstenite::Message;
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, _token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -3649,7 +3647,7 @@ async fn ws_wallet_pushes_status_and_correlates_a_request() {
 #[tokio::test]
 async fn ws_wallet_pushes_events_and_disconnected_on_stop() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, _token, backend, _hold) = start_node_wallet(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -3681,7 +3679,7 @@ async fn ws_wallet_pushes_events_and_disconnected_on_stop() {
 async fn ws_wallet_rejects_unauthorized_mutation_and_control() {
     use tokio_tungstenite::tungstenite::Message;
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, _token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -3715,7 +3713,7 @@ async fn ws_wallet_rejects_unauthorized_mutation_and_control() {
 async fn ws_wallet_rejects_a_disallowed_origin() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+    let (addr, _token, _backend, _hold) = start_node_wallet(&upstream).await;
 
     let mut request = format!("ws://{addr}/ws")
         .into_client_request()
@@ -3760,7 +3758,7 @@ async fn a_client_can_register_and_deregister_the_addresses_the_node_follows() {
     }
 
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_node_full(&upstream).await;
     let (first, second) = (key_hex(11), key_hex(12));
 
     let watch = |keys: Vec<String>, method: &str| {
