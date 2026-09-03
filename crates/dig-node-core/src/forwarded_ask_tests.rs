@@ -1835,3 +1835,176 @@ async fn the_identity_a_hop_received_is_the_identity_it_emits() {
          mint a fresh one, and the diamond dedup this whole mechanism rests on never fires"
     );
 }
+
+/// A [`ForwardedAsk`] double that answers every peer with a literal JSON-RPC FRAME, read through the
+/// production parser.
+///
+/// The other doubles here hand back an [`AskOutcome`] directly, which is the right shape for tests
+/// about the fold. It is the wrong shape for dig-node#508: the question there is whether a field a
+/// PEER controls on the wire can move this node's verdict, and a double that skips the parse cannot
+/// vary that field at all. This one varies exactly the bytes a hostile peer would.
+struct FrameAsk {
+    frame: serde_json::Value,
+}
+
+impl FrameAsk {
+    /// A miss answer from a peer that names nobody, claiming `absence_established` as given. `None`
+    /// OMITS the key entirely - the compatibility case, and a different thing from `Some(false)`.
+    fn missing(absence_established: Option<bool>) -> Arc<Self> {
+        let mut item = serde_json::json!({ "available": false });
+        if let Some(claim) = absence_established {
+            item["absence_established"] = serde_json::json!(claim);
+        }
+        Arc::new(Self {
+            frame: serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "result": { "items": [item] }
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl ForwardedAsk for FrameAsk {
+    async fn ask(
+        &self,
+        peer: &str,
+        addrs: &[SocketAddr],
+        content: &ContentId,
+        _next_depth: u64,
+        _budget: Duration,
+        _ask_id: AskId,
+    ) -> AskOutcome {
+        crate::seams::dig_peer::forwarded_ask::parse_forwarded_answer(
+            content,
+            &self.frame,
+            crate::seams::dig_peer::forwarded_ask::Responder {
+                peer_hex: peer,
+                addrs,
+            },
+        )
+    }
+}
+
+/// **Proves (dig-node#508):** a peer's own `absence_established` claim CANNOT move this node's
+/// verdict. Whatever the hop asserts about its own search, this node's answer is the same.
+///
+/// **Why this is the shape of the fix, not a stricter reading of it: absence has no witness.**
+/// Content from a stranger is safe to accept because the merkle root verifies it. There is no
+/// verifier for "nobody has it", so a node may establish an absence only from its OWN completed
+/// search. Adopting a peer's establishment is adopting testimony, and
+/// [`crate::Node::availability_answer`] then RE-EMITS it downstream - an honest node laundering a
+/// stranger's assertion and passing it on at full strength. dig-node#273 closed the sibling case
+/// (silence read as an assertion, via `unwrap_or(true)`); this closes the last door in the same class.
+///
+/// **Fixture design - three frames, and the FOURTH engine is what stops the test being vacuous.**
+/// Pinning only "all three are inconclusive" would pass against an implementation that never proves
+/// any absence, which is a worse lie in the opposite direction. So the equality across the three
+/// hostile-to-honest frames is paired with an INEQUALITY against a node that installed no asker at
+/// all, whose miss must still be a plain, proven absence. Two distinguishable inputs and a pinned
+/// difference: a single-value fixture could not tell threading from ignoring.
+#[tokio::test]
+async fn a_peers_absence_claim_cannot_move_this_nodes_verdict() {
+    let cid = content();
+
+    // Fixture precondition, asserted rather than assumed: the three frames genuinely differ in the
+    // field under test, and the absent one OMITS the key rather than carrying a null.
+    let claimed = FrameAsk::missing(Some(true));
+    let disclaimed = FrameAsk::missing(Some(false));
+    let silent = FrameAsk::missing(None);
+    assert_eq!(
+        claimed.frame.pointer("/result/items/0/absence_established"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        disclaimed.frame.pointer("/result/items/0/absence_established"),
+        Some(&serde_json::json!(false))
+    );
+    assert!(
+        silent
+            .frame
+            .pointer("/result/items/0/absence_established")
+            .is_none(),
+        "the absent arm must omit the key, not carry a null - otherwise it exercises the same path \
+         as the disclaiming arm and the middle case goes untested"
+    );
+
+    let mut verdicts = Vec::new();
+    for (label, ask) in [
+        ("claims a proven absence", claimed as Arc<dyn ForwardedAsk>),
+        ("admits its search was incomplete", disclaimed),
+        ("says nothing about its search", silent),
+    ] {
+        let (pc, _dir) = engine(Vec::new(), &[1], Some(ask));
+        let located = pc
+            .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+            .await;
+        assert!(
+            located.is_empty(),
+            "{label}: the peer named nobody in every arm"
+        );
+        assert!(
+            !located.establishes_absence(),
+            "{label}: a hop's testimony about its own search may not become this node's \
+             establishment - absence has no witness, so only this node's own completed search can \
+             prove one (dig-node#508)"
+        );
+        verdicts.push(located.establishes_absence());
+    }
+    assert!(
+        verdicts.windows(2).all(|pair| pair[0] == pair[1]),
+        "and the verdict is EQUAL across all three frames: a peer that changes this field changes \
+         nothing this node reports"
+    );
+
+    // The inequality. Without it every assertion above is satisfied by a node that never proves an
+    // absence at all.
+    let (unasking, _dir) = engine(Vec::new(), &[1], None);
+    let plain = unasking
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert!(
+        plain.establishes_absence(),
+        "a node that asked NOBODY still answers a plain absence on its own DHT leg - the fix must \
+         not make every miss on every stock node inconclusive"
+    );
+}
+
+/// **Proves (dig-node#508):** an answer whose records are ALL dropped downstream is not an absence.
+///
+/// **The second route into the same defect, and it does not go through `absence_established` at
+/// all.** The forwarded fold's `Answered` arm preserved conclusiveness on the strength of the peer
+/// having answered; the merge then legitimately removes records - here the self-filter, because a
+/// peer is perfectly free to ANSWER with a record naming us and `retain_excluding_self_tagged` drops
+/// it. Emptiness arrived AFTER the flag was decided, and the result was a proven absence resting on
+/// an answer that named a holder.
+///
+/// **Fixture design - the removal is a production-reachable one, and one actor varies.** The peer
+/// answers with exactly one record, naming this node; the node knows its own identity, which is the
+/// precondition the self-filter needs. A fixture whose records were dropped by something only a test
+/// can arrange would prove nothing about production.
+#[tokio::test]
+async fn a_holder_answer_whose_records_are_all_dropped_is_not_an_absence() {
+    let cid = content();
+    let me = mock_peer_hex(0xEE);
+    let ask = Arc::new(PerPeerAsk::new(vec![(
+        mock_peer_hex(1),
+        // The peer ANSWERED, and named a holder: this node itself.
+        AskOutcome::Answered(vec![provider(0xEE, &cid)]),
+    )]));
+    let (pc, _dir) = engine_identified(Vec::new(), &[1], Some(ask), Some(me));
+
+    let located = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert!(
+        located.is_empty(),
+        "fixture precondition: the only record the peer named is this node, so the self-filter \
+         removes it and the answer arrives at the caller empty"
+    );
+    assert!(
+        !located.establishes_absence(),
+        "an emptiness produced by FILTERING is not a search that found nobody - the peer named a \
+         holder, and no leg of this node ever proved an absence (dig-node#508)"
+    );
+}
