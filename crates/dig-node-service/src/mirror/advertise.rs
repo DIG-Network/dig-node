@@ -75,16 +75,6 @@ pub fn advertised_urls_from_env() -> Advertised {
     parse_advertised_urls(&std::env::var(ADVERTISE_URLS_ENV).unwrap_or_default())
 }
 
-/// The URLs this node will publish, with every rejected entry reported to the operator.
-///
-/// This is the whole operator surface as the mirror scheduler consumes it: one call, at bring-up,
-/// yielding the list `create` advertises. An empty answer is the honest default rather than an
-/// error — `NodeMirrorEffects::create` refuses by name on it, before any chain read, so a node with
-/// nothing to advertise stakes nothing.
-///
-/// The warnings are emitted HERE rather than at the call site because this is the only place that
-/// knows WHY an entry was dropped; a caller handed a shortened list could only report that some
-/// entry was missing, which is not something an operator can act on.
 /// Why one configured entry is not advertised, in the words an operator reads.
 ///
 /// Split out of [`configured_urls`] so a test can walk EVERY variant and assert over the rendered
@@ -119,6 +109,16 @@ fn nothing_publishable() -> String {
     )
 }
 
+/// The URLs this node will publish, with every rejected entry reported to the operator.
+///
+/// This is the whole operator surface as the mirror scheduler consumes it: one call, at bring-up,
+/// yielding the list `create` advertises. An empty answer is the honest default rather than an
+/// error — `NodeMirrorEffects::create` refuses by name on it, before any chain read, so a node with
+/// nothing to advertise stakes nothing.
+///
+/// The warnings are emitted HERE rather than at the call site because this is the only place that
+/// knows WHY an entry was dropped; a caller handed a shortened list could only report that some
+/// entry was missing, which is not something an operator can act on.
 pub fn configured_urls() -> Vec<String> {
     let advertised = advertised_urls_from_env();
 
