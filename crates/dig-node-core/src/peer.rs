@@ -3163,7 +3163,8 @@ async fn bring_up_dht(
     // tested, and fed by nothing but a test double.
     //
     // `None` remains fully supported: the FFI path and any node without a mirror lifecycle announce
-    // exactly as before, and a verifier falls back to the hint scan.
+    // exactly as before, and a verifier that cannot fetch a pointer withholds credit rather than
+    // demoting the holder.
     let dht = crate::dht::DhtHandle::with_mirror_pointers(
         service,
         initial_ids,
