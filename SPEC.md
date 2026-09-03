@@ -3496,8 +3496,10 @@ can point at it. No new verb, address struct or result type is introduced — th
   the crate is authoritative if the two ever differ. A repo SPEC that re-declares a contract it does
   not own is how the two silently drift apart.
 
-  **WHICH unasked path it was decides whether the absence may still be claimed.** A node that
-  consulted no peer is not one case but two, and they carry opposite answers:
+  **WHICH unasked path it was decides whether the absence may still be claimed** — and an ASKED path
+  is likewise unproven (dig-node#508). A node that consulted no peer is not one case but two, and they
+  carry opposite answers; a node that DID consult peers is a third case, and it is unproven in every
+  instance, whatever those peers answered:
 
   - **Recursion is DISABLED on this node** (including: no forwarded leg installed at all) — the plain
     not-found. Asking was never part of this node's answer, so nothing was withheld and the answer
@@ -3511,6 +3513,14 @@ can point at it. No new verb, address struct or result type is introduced — th
     the reader to stop looking because this node ran out of budget, which is a fact about this node
     and not about the content. Under a burst the saturation cases are the COMMON path, so collapsing
     them would turn load into manufactured not-founds exactly when the network is busiest.
+  - **Peers WERE asked** — `CONTENT_MISS_INCONCLUSIVE`, always. Once a node has delegated part of its
+    search it cannot know that part completed, and the peers' own word for it is testimony it has no
+    way to check: **absence has no witness.** Content relayed by a stranger is safe to accept because
+    the merkle root verifies it; "nobody has it" verifies against nothing. Corroboration does not
+    repair this — the peers asked are selected from the connected pool, which discovery and PEX can
+    shape, so N corroborators an attacker influenced is one answer wearing a hat, and an eclipsed pool
+    collapses any k-of-n to 1. NC-12's agreement model survives eclipse only because the thing agreed
+    on is CONTENT, which verifies independently of who said it.
 
   The DHT leg is subject to the same rule: a provider walk that FAILED (no reachable DHT peer, a
   transport error) is not a walk that found nobody, and the absence is unproven. `absence_established`
@@ -3545,9 +3555,24 @@ can point at it. No new verb, address struct or result type is introduced — th
 
   | state | meaning | dig-node's reading |
   |---|---|---|
-  | `true` | the responder reached everything it meant to reach | the absence is established |
+  | `true` | the responder reached everything it meant to reach | unproven at the reader; keep looking — a responder's self-report cannot establish an absence about the content |
   | `false` | the responder looked and its own search was incomplete | unproven; keep looking |
   | ABSENT | the responder makes NO claim — it cannot describe its search at all | unproven; keep looking |
+
+  **The MEANING column is the emitter's claim about its OWN search and is unchanged; only the reading
+  moved (dig-node#508).** A node emitting `true` is still saying something true and useful about
+  itself, and other implementations MUST keep emitting it. What a reader may do with it is the narrow
+  thing that changed: adopting a hop's establishment as its own made an honest node LAUNDER a
+  stranger's assertion and re-emit it downstream at full strength, so one lying peer manufactured a
+  not-found for every reader behind it. Absence has no witness (above), so the establishment stays
+  with the node whose own search produced it.
+
+  **The consequence, stated so it is not re-derived as a defect: the three states are now VACUOUS at a
+  dig-node reader.** All three produce the same verdict. The distinction survives because it pins the
+  wire reading other implementations emit against, and because it drives the diagnostics an operator
+  debugs a recursion with — not because any decision turns on it. Lying about the field is
+  correspondingly free and always was: an empty answer and an admitted-incomplete answer are scored
+  identically for routing and for conduct.
 
   ABSENT is **not** `false` and MUST NOT be defaulted. Reading it as `true` turns an unknown into an
   assertion of absence, which is the manufactured not-found this clause exists to prevent, arriving
@@ -5754,6 +5779,25 @@ under §13 every dialled peer is untrusted, so a source that denies a relay it p
 thereby return the coins to selection — a second send inside the confirmation window could otherwise
 reselect the same inputs. The TTL MUST NOT be shortened to compensate for the wider hold: that trades
 a double-select for a lockout, and a lockout is the worse failure.
+
+The TTL bounds ONE hold and MUST NOT be relied on to bound a SEQUENCE of them. A re-push of the same
+transaction renews the hold from the time of that push, so a caller re-pushing more often than the TTL
+would otherwise hold the inputs for as long as it kept retrying — the lockout the previous paragraph
+names as the worse failure, reachable without a single dishonest answer. A node MUST therefore also
+bound the TOTAL hold: the deadline recorded for a transaction MUST NOT exceed the time of its FIRST
+observed push plus `MAX_RESERVATION_HOLD_MS`, which MUST be `6 * RESERVATION_TTL_MS` (one hour).
+
+The first-push time MUST be a stable anchor: a re-push MUST re-arm the deadline subject to the bound
+above — which at or past the cap, or under a clock that has stepped backwards, leaves it unchanged —
+MUST increment the attempt count, and MUST NOT rewrite the anchor. A re-push MUST NOT move a
+recorded deadline EARLIER, so that a clock which steps backwards cannot shorten a hold that is
+already live.
+
+This bound is on CONTINUOUS hold. Once the deadline passes, the reservation and its coin claims are
+released and the inputs become selectable again; a subsequent push of the same transaction is a new
+reservation with a new anchor and MAY hold the inputs for a further full period. A node MUST NOT
+refuse to re-hold a transaction on the grounds that it has already held one, since the transaction may
+still be admitted and refusing would restore the double-select this section exists to close.
 
 The set of bundle-intrinsic reasons MUST be an ALLOWLIST whose default is to HOLD. The reason text is
 supplied by an untrusted source (§13), so an unrecognised reason MUST hold rather than free: the
@@ -8375,6 +8419,20 @@ The node MUST obtain the three census inputs from `dig_mirror_coin::census`, at 
 the epoch's start instant — and MUST derive the record with
 `dig_mirror_collateral::EpochRecord::advance`. It MUST NOT restate either. A census height chosen
 any other way is a fork, because every node must reach the same height without coordinating.
+
+The node MUST locate that height with `dig_mirror_coin::census_height_seeded`, which returns exactly
+what `census_height` returns for the same instant under every seed and differs only in how many
+chain reads it pays. The seed MUST be the predecessor record's `census_height` when and only when
+that record carries `censused` provenance; a record whose height was adopted from peers, or which
+carries no provenance, MUST yield an unseeded search. A peer-supplied height comes from a trust
+domain the chain source cannot check, and the seed's verification probe is a single uncorroborated
+`block_timestamp` read, so accepting one would let a peer cohort and a stale or forked source
+together prune the true height from below.
+
+Corroborating the height search itself is a NAMED LIMITATION, not a claim: the corroborated chain
+surface answers by coin id and does not serve `block_timestamp`, so every probe of the search comes
+from one source whether it is seeded or not. Seeding therefore reduces the reads inside that trust
+boundary and does not widen it.
 
 The chain reads MUST be served through a `dig_chainsource_interface::ChainSource`. The node MUST NOT
 open a second connection to the chain for this purpose: it takes a `ChainSource` view of the one
