@@ -3586,9 +3586,28 @@ struct InboundPoolSlot {
 /// slot is already gone from the pool, so there is nothing left for this session to deregister.
 ///
 /// A narrow race REMAINS and is stated rather than hidden: a supersede can land between the load below
-/// and `disconnect` completing, and that window still evicts the newer slot. Closing it needs a
-/// compare-and-remove (slot-token) API in dig-gossip — a release-first change to that crate, out of
-/// scope here.
+/// and `disconnect` completing, and that window still evicts the newer slot. Two further dig-gossip
+/// paths remove a slot WITHOUT going through `retire_slot` -- the only setter of `superseded` -- so the
+/// flag this function reads can be stale for reasons besides the timing window above:
+///
+/// 1. **The ban path.** `enforce_timed_ban_and_disconnect` (dig-gossip's service/state.rs:1184-1216)
+///    does an unconditional `peers.remove(&peer_id)` but gates teardown on
+///    `if let Some(PeerSlot::Live(l)) = removed`, so an `Observed` slot loses its accounting with no
+///    close and no notice. Currently UNREACHABLE from dig-node: nothing here calls
+///    `GossipHandle::ban_peer` or `::penalize_peer` (the one unrelated hit is a Chia peer-DB test at
+///    `dig-wallet/src/sage/db.rs:5976`), and the only automatic caller,
+///    `apply_inbound_rate_limit_violation` (state.rs:1391-1424), always passes `Some(generation)`,
+///    whose match arm (state.rs:1195-1201) matches only `PeerSlot::Live` and returns otherwise. This
+///    becomes reachable the day a ban surface is added to `dign` or `penalize_peer` is wired into
+///    dig-node's abuse detection. Tracked: <https://github.com/DIG-Network/dig-gossip/issues/86>.
+/// 2. **The departed-peer reaper.** `reap_departed_peers` (state.rs:1270-1296, 30s cadence) `retain`s
+///    on `slot_is_departed` and removes without calling `retire_slot`. This is narrower than it sounds:
+///    it reaps only slots whose transport is ALREADY closed. The residual window is a reaped-then-
+///    reconnected identity whose first serve loop has not yet returned -- the flag still reads `false`
+///    for that identity, and this function can then `disconnect` the reconnected identity's newer slot.
+///
+/// Closing all of this needs a compare-and-remove (slot-token) API in dig-gossip — a release-first
+/// change to that crate, out of scope here.
 async fn release_inbound_pool_slot(
     gossip: Option<&dig_gossip::GossipHandle>,
     adopted: Option<InboundPoolSlot>,

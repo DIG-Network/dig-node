@@ -413,12 +413,13 @@ async fn the_accepted_direct_cap_still_binds_after_a_supersede_and_stale_release
     )
     .await;
 
-    // End the STALE session and let its release run. This wait is load-bearing, not cosmetic: without
-    // it, step 6 below could race ahead of the stale release and refuse peer B for the wrong reason
-    // (the cap correctly still holding peer A's original session), passing the assertion vacuously
-    // whether or not the fix at `peer.rs:3597` is present. Giving the release a full second to fire
-    // means a subsequent refusal of B is caused by the cap seeing A's (single) survived slot, not by
-    // timing luck.
+    // End the STALE session and let its release run. This wait is a best-effort settle, not a
+    // guarantee: measured over 8 mutated runs (mutation: peer.rs:3597's `superseded` load forced to
+    // `false`), the release did not reliably fire within this second, so a single check taken right
+    // here cannot be trusted either way -- that is why the assertions below are held in a loop rather
+    // than checked once. A fully deterministic version needs a synchronization point that does not
+    // exist today: under the FIX there is no observable state transition to wait on (the pool count
+    // stays 1 whether or not the stale release has run), so there is nothing to poll for completion.
     drop(first);
     tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -432,9 +433,16 @@ async fn the_accepted_direct_cap_still_binds_after_a_supersede_and_stale_release
             "B's transport-level connect succeeds even though the pool refuses to ADOPT it -- \n             adoption is best-effort accounting (see the file-level doc comment), and a refused \n             adoption must never refuse the underlying connection",
         );
 
-    // Hold the assertions in a loop rather than checking once: under the defect, the stale release
-    // (from `first` above) can land late and evict A's surviving slot AFTER B has already been let in
-    // by the now-appearing headroom — a single-shot check taken too early would miss that.
+    // Hold the assertions in a loop rather than checking once: under the defect the stale release
+    // (from `first` above) can land late and evict A's SURVIVING slot -- measured over 8 mutated runs
+    // (mutation: peer.rs:3597's `superseded` load forced to `false`), every run observed
+    // `a_in_pool=false, b_in_pool=false, count=0` at the first iteration and then panicked on the
+    // survival assertion below, never on the cap assertion. B is never wrongly admitted: adoption is a
+    // synchronous one-shot snapshot taken under the `peers` lock (dig-gossip's
+    // service/gossip_handle.rs:2044-2068) with no retry, so at the instant B connects A's identity
+    // still holds the slot and B's adoption is correctly refused there and then; A's stale release
+    // fires only afterwards and, under the defect, evicts A's own surviving slot. The loop exists to
+    // catch that LATE eviction, not a late admission.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         let a_pool_id = dig_gossip::PeerId::from(*a_peer_id.as_bytes());
