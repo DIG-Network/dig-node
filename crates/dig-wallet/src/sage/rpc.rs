@@ -747,10 +747,17 @@ impl WalletBackend {
 
     /// The disciplined "now" for reservation-lifecycle bookkeeping (dig-node#532). Every write and
     /// read in the reservation lifecycle (`reserve_coins`, `reserve_pushed_bundle`,
-    /// `prune_reservations`) MUST read the clock through here rather than calling
-    /// [`super::custody::now_ms`] directly, or it steps outside the discipline this exists to
-    /// provide — see [`super::custody::ClockGovernor`] for the reasoning and the failure it closes.
-    fn reservation_now_ms(&self) -> i64 {
+    /// `prune_reservations`, and the control plane's `wallet_reset_coin_db`, dig-node#541) MUST
+    /// read the clock through here rather than calling [`super::custody::now_ms`] directly, or it
+    /// steps outside the discipline this exists to provide — see
+    /// [`super::custody::ClockGovernor`] for the reasoning and the failure it closes.
+    ///
+    /// `pub` because the reset control method lives in `dig-node-service`, a different crate: the
+    /// reservation lifecycle it prunes before resetting (see
+    /// [`WalletDb::reset_chain_cache`](super::db::WalletDb::reset_chain_cache)'s `SpendInFlight`
+    /// refusal) must be judged against the SAME shared, jump-disciplined timeline every other
+    /// reservation call site uses, never a second, independent wall-clock read.
+    pub fn reservation_now_ms(&self) -> i64 {
         let wall_now_ms = super::custody::now_ms() as i64;
         self.reservation_clock.lock().unwrap().observe(wall_now_ms)
     }
@@ -11089,6 +11096,59 @@ mod tests {
             be.db.unspent_coins(None).await.unwrap().len(),
             2,
             "reserving a coin must not remove it from what the wallet owns"
+        );
+    }
+
+    /// **The decision point dig-node#541 fixes.** `control.wallet.resetCoinDb`
+    /// (`dig-node-service::control::wallet_reset_coin_db`) must read its `now_ms` through
+    /// [`WalletBackend::reservation_now_ms`], never through an independent `SystemTime::now()`
+    /// read — the two disagree the instant a wall clock jumps forward mid-hold, and only the
+    /// disciplined one keeps a live reservation's `SpendInFlight` refusal honest.
+    ///
+    /// Built from a REAL `reserve_coins` call — dig-node#528's own lesson was that a hand-placed
+    /// row in a state production cannot reach passes under the defect — so the reservation's
+    /// `expires_at_ms` is exactly what the disciplined clock itself would have written.
+    #[tokio::test]
+    async fn reset_coin_db_now_must_come_from_the_disciplined_clock_not_a_fresh_read() {
+        let be = backend_with(vec![], true).await;
+
+        // A real 60s hold, established through the disciplined path exactly as
+        // `control.wallet.reservations.reserve` would create one.
+        be.reserve_coins(&["c1".to_string()], Some(60))
+            .await
+            .expect("reserving a fresh coin id never clashes");
+
+        // The wall clock jumps two minutes forward — an NTP step, a VM pause/resume — while
+        // barely any REAL time has elapsed since the reservation was written. `observe` is the
+        // exact production method `reservation_now_ms()` calls; only the wall reading is
+        // fabricated, so the jump is deterministic instead of waiting on a real clock.
+        let jumped_wall_ms = super::super::custody::now_ms() as i64 + 120_000;
+        let disciplined_after_jump = be.reservation_clock.lock().unwrap().observe(jumped_wall_ms);
+
+        // THE FIX: reading through the disciplined clock, the reservation is still judged live —
+        // almost no real time passed, so the clamp refuses to let "now" run ahead of it.
+        let fixed = be
+            .db
+            .reset_chain_cache(disciplined_after_jump)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                fixed,
+                Err(super::super::db::ResetRefusal::SpendInFlight { .. })
+            ),
+            "the disciplined clock must still see the 60s hold as live seconds after it was              taken, jumped wall clock notwithstanding — got {fixed:?}"
+        );
+
+        // THE DEFECT this ticket closes: had `wallet_reset_coin_db` instead fed the raw, jumped
+        // wall reading straight in — exactly what `SystemTime::now()` would have returned at this
+        // same real instant, pre-#541 — the still-live hold reads as already expired and the
+        // reset proceeds: the #348/#497 double-spend direction, no attacker required, just an
+        // ordinary clock step.
+        let undisciplined = be.db.reset_chain_cache(jumped_wall_ms).await.unwrap();
+        assert!(
+            undisciplined.is_ok(),
+            "sanity: an undisciplined jumped reading DOES bypass the refusal, which is exactly              why the control-plane call site must never use one"
         );
     }
     /// A bundle spending exactly the coin `spendable_row(id_byte, amount)` describes, in the hex
