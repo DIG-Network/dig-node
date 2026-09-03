@@ -3024,6 +3024,9 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         stun_server,
     );
 
+    // #3124: the listener registers every peer it ACCEPTS in this same pool, so clone the handle
+    // before the responder takes ownership of it.
+    let handle_for_pool = handle.clone();
     let mut node_responder = NodeResponder::with_pool(node, handle);
     if let Some(dht) = dht {
         node_responder = node_responder.with_dht(dht);
@@ -3043,7 +3046,14 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         );
     }
 
-    serve_peer_rpc_listener_with(listener, identity, responder, Some(pex)).await
+    serve_peer_rpc_listener_with(
+        listener,
+        identity,
+        responder,
+        Some(pex),
+        Some(handle_for_pool),
+    )
+    .await
 }
 
 /// Bring up the content-location DHT (#163) for a running node: build a [`crate::dht::NatDhtTransport`]
@@ -3388,7 +3398,7 @@ pub async fn serve_peer_rpc_listener(
     node: Arc<dig_nat::NodeCert>,
     responder: Arc<dyn PeerRpcResponder>,
 ) -> Result<(), String> {
-    serve_peer_rpc_listener_with(listener, node, responder, None).await
+    serve_peer_rpc_listener_with(listener, node, responder, None, None).await
 }
 
 /// Like [`serve_peer_rpc_listener`] but additionally running the node↔node **PEX** peer-sharing layer
@@ -3396,11 +3406,17 @@ pub async fn serve_peer_rpc_listener(
 /// stream (handshake→snapshot→deltas) and serves the peer's incoming PEX stream, feeding discovered
 /// peers into the pool as dial candidates. `None` disables PEX (the FFI/base path + existing callers),
 /// leaving the serve path byte-identical to before.
+///
+/// `gossip` is the connected pool every accepted peer is registered in for the life of its serve loop
+/// (**dig_ecosystem#3124**). `None` leaves the peer unregistered — correct for the test and FFI
+/// callers below, which run no pool — and is why the 3-argument
+/// [`serve_peer_rpc_listener`] keeps its signature.
 pub async fn serve_peer_rpc_listener_with(
     listener: tokio::net::TcpListener,
     node: Arc<dig_nat::NodeCert>,
     responder: Arc<dyn PeerRpcResponder>,
     pex: Option<Arc<crate::pex::PexServing>>,
+    gossip: Option<dig_gossip::GossipHandle>,
 ) -> Result<(), String> {
     let server_config = build_server_tls_config(&node)?;
     let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
@@ -3423,6 +3439,7 @@ pub async fn serve_peer_rpc_listener_with(
         let acceptor = acceptor.clone();
         let responder = responder.clone();
         let pex = pex.clone();
+        let gossip = gossip.clone();
         let spawned = spawn_with_permit(&conn_permits, async move {
             // mTLS handshake (client cert required by build_server_tls_config; a peer with no cert or
             // a failed handshake is dropped here — no unauthenticated peer traffic reaches the RPC).
@@ -3435,8 +3452,39 @@ pub async fn serve_peer_rpc_listener_with(
                     // body. `None` if (defensively) no client cert is present, which the verifier
                     // should already have rejected.
                     let caller = caller_from_tls(&tls, peer_addr);
+                    // #3124: the identity the pool slot is keyed on comes from the CERTIFICATE the
+                    // handshake just verified — the same derivation `caller_from_tls` uses — never
+                    // from the wire body and never from the DHT contact (whose `peer_id` is a
+                    // display-hex String, not this type). Read before the stream is consumed by the
+                    // mux. `None` when no client cert parsed: there is then no authenticated identity
+                    // to key a slot on, and serving uncounted is safer than inventing one.
+                    let authenticated = peer_id_from_tls(&tls);
                     let mut session = dig_nat::mux::PeerSession::server(tls);
+
+                    // COUNT the peer for as long as we serve it. `peer_addr` is its EPHEMERAL SOURCE
+                    // port, which is why this goes through the direct-INBOUND entry point — the pool
+                    // records the address for observability and never offers it as a dial target. The
+                    // tier is `Direct`: this connection arrived over TCP with no relay.
+                    let adopted = match authenticated {
+                        Some(peer_id) => {
+                            adopt_inbound_peer_in_pool(
+                                gossip.as_ref(),
+                                &peer_id,
+                                peer_addr,
+                                dig_nat::TraversalKind::Direct,
+                                &session,
+                            )
+                            .await
+                        }
+                        None => None,
+                    };
+
                     serve_peer_session_from_with(caller, &mut session, responder, pex).await;
+
+                    // The serve loop has returned, so this node is no longer serving the peer and must
+                    // stop counting it. `disconnect` only ends the ACCOUNTING — the session is ours and
+                    // is closed by dropping it here.
+                    release_inbound_pool_slot(gossip.as_ref(), adopted).await;
                 }
                 Err(e) => tracing::debug!(error = %e, "peer mTLS handshake failed; dropped"),
             }
@@ -3450,6 +3498,159 @@ pub async fn serve_peer_rpc_listener_with(
     }
 }
 
+/// Register an ACCEPTED inbound peer in the dig-gossip connected pool for as long as this node serves
+/// it, and stop counting it when the serve loop ends (**dig_ecosystem#3124**).
+///
+/// # Why this exists
+///
+/// The pool is what every subsystem reads to answer "am I connected", and until this call the node
+/// registered NOTHING it accepted — only peers it dialed. A node serving inbound peers perfectly well
+/// reported `connected_peers` as if it had none.
+///
+/// # Why it registers by HANDLE
+///
+/// The serve loop below needs `&mut PeerSession` to answer the peer's L7 RPC, and `PeerSession` is not
+/// `Clone`. Handing the session to the pool would buy the count and stop serving the peer — strictly
+/// worse than being uncounted. `adopt_direct_inbound_handle` takes a `ClosedHandle` instead, so
+/// ownership stays here and the peer is both counted and served.
+///
+/// Adoption is best-effort by design: it is ACCOUNTING, and every refusal the pool can return (the
+/// accepted-direct cap, a ban, a full pool, a peer already holding a dialable slot) is a decision this
+/// node made on purpose. None of them is a reason to refuse SERVICE to a peer whose handshake already
+/// succeeded, so a refusal is logged and the connection is served uncounted — the behaviour that
+/// shipped before this call existed.
+///
+/// Returns the `PeerId` to deregister once serving ends, or `None` when nothing was registered.
+async fn adopt_inbound_peer_in_pool(
+    gossip: Option<&dig_gossip::GossipHandle>,
+    peer_id: &dig_nat::PeerId,
+    remote: std::net::SocketAddr,
+    method: dig_nat::TraversalKind,
+    session: &dig_nat::mux::PeerSession,
+) -> Option<InboundPoolSlot> {
+    let gossip = gossip?;
+    // dig-nat reports the identity as its own `PeerId`; the pool keys on the gossip `PeerId` (chia
+    // `Bytes32`) over the SAME 32 bytes the mTLS handshake proved.
+    let pool_id = dig_gossip::PeerId::from(*peer_id.as_bytes());
+    let superseded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&superseded);
+    let observed = dig_gossip::ObservedSession::new(session.closed_handle(), move || {
+        // A newer connection for this identity displaced the slot. This session is now obsolete to the
+        // pool, but it is still OURS to end, and the serve loop below ends it on return — so there is
+        // nothing to do here but RECORD it, which is what `release_inbound_pool_slot` reads to keep
+        // its release session-scoped. Dropping the observer silently is what #71 forbids, and tearing
+        // the transport down here would take teardown away from the caller that
+        // `adopt_direct_inbound_handle` documents as owning it. A notice must not block (dig-gossip
+        // fires it inline while finishing an admission), so this is one relaxed store.
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(peer_id = %pool_id, "inbound pool slot superseded by a newer connection");
+    });
+
+    // No broadcast sink (the 5th argument), and `None` is the HONEST state of this layer rather than
+    // a shortcut taken here. Three measured facts, each checkable at the cited symbol:
+    //
+    // 1. There is no wire FRAME for a broadcast. dig-node's only stream codec is `write_framed`
+    //    (`serde_json::to_vec`), while a broadcast carries a `DigMessage` — an opaque chia-protocol
+    //    payload re-exported from `chia-sdk-client` through dig-gossip. There is no encoding of it
+    //    this transport can put on the wire.
+    // 2. Even if one existed, the receiving side would misroute it. `classify_request` in this file
+    //    dispatches on `method`/`length`/`items`; a broadcast frame matches none of those and falls
+    //    to `PeerRequestKind::Unknown`.
+    // 3. There is no ingest path in the other direction either. dig-gossip's `inbound_tx` is
+    //    crate-private (`dig-gossip/src/service/state.rs`) and fed only by its own legacy DigLink
+    //    listener (`dig-gossip/src/connection/listener.rs`); `set_nat_broadcast_sink` covers the send
+    //    direction only.
+    //
+    // So NO dig-nat adoption site in this repo supplies a broadcast sink today. This one passes `None`
+    // explicitly; `seams/dig_peer/bootstrap.rs` and `seams/dig_peer/pex.rs` adopt through
+    // `adopt_nat_connection`, which takes no sink parameter at all; and `serve_accepted_relay_conn`
+    // adopts nothing. Passing `None` makes dig-gossip report such a peer as unreachable for broadcast, which is true;
+    // supplying a sink that cannot deliver would make it report a delivery that never happens.
+    let broadcast_sink = None;
+
+    match gossip
+        .adopt_direct_inbound_handle(pool_id, remote, method, observed, broadcast_sink)
+        .await
+    {
+        Ok(peer_id) => Some(InboundPoolSlot {
+            peer_id,
+            superseded,
+        }),
+        Err(e) => {
+            tracing::debug!(peer_id = %pool_id, error = %e, "inbound peer not adopted into the pool; serving it uncounted");
+            None
+        }
+    }
+}
+
+/// A pool slot this connection adopted, and the flag that says whether it is still THIS session's.
+///
+/// The two travel together because they are only meaningful together: `disconnect` keys on the
+/// IDENTITY, so the identity alone cannot say which SESSION's slot it would remove.
+struct InboundPoolSlot {
+    peer_id: dig_gossip::PeerId,
+    /// Set by the supersede notice when a newer connection for this identity took the slot over.
+    superseded: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Stop counting an inbound peer once its serve loop has ended — but ONLY if the slot is still this
+/// session's.
+///
+/// `disconnect` only stops ACCOUNTING for a slot registered by handle — it does not close the
+/// transport, which is this side's to end and is ended by the serve loop returning.
+///
+/// # Why the supersede check is load-bearing
+///
+/// dig-gossip exposes exactly one removal API and it is `peers.remove(peer_id)` — keyed on IDENTITY,
+/// not on the session that adopted the slot. A peer that reconnects therefore gets a second slot which
+/// supersedes the first (newest-wins), and an UNCONDITIONAL release from the first session's serve loop
+/// would delete the LIVE second slot. Two real harms follow: the peer becomes served-but-uncounted
+/// again — the exact defect this adoption exists to fix, and repeating the cycle drives the accounted
+/// count below the served count, making `max_direct_inbound` / `max_inbound_total` /
+/// `max_direct_inbound_per_group` bypassable — and, if this node later DIALS the same peer, the stale
+/// release would remove an `Owned` slot, whose drop closes the transport with it (the #1717 mux
+/// invariant). Skipping the release when the notice has fired is correct in both cases: a superseded
+/// slot is already gone from the pool, so there is nothing left for this session to deregister.
+///
+/// A narrow race REMAINS and is stated rather than hidden: a supersede can land between the load below
+/// and `disconnect` completing, and that window still evicts the newer slot. Two further dig-gossip
+/// paths remove a slot WITHOUT going through `retire_slot` -- the only setter of `superseded` -- so the
+/// flag this function reads can be stale for reasons besides the timing window above:
+///
+/// 1. **The ban path.** `enforce_timed_ban_and_disconnect` (dig-gossip's service/state.rs:1184-1216)
+///    does an unconditional `peers.remove(&peer_id)` but gates teardown on
+///    `if let Some(PeerSlot::Live(l)) = removed`, so an `Observed` slot loses its accounting with no
+///    close and no notice. Currently UNREACHABLE from dig-node: nothing here calls
+///    `GossipHandle::ban_peer` or `::penalize_peer` (the one unrelated hit is a Chia peer-DB test at
+///    `dig-wallet/src/sage/db.rs:5976`), and the only automatic caller,
+///    `apply_inbound_rate_limit_violation` (state.rs:1391-1424), always passes `Some(generation)`,
+///    whose match arm (state.rs:1195-1201) matches only `PeerSlot::Live` and returns otherwise. This
+///    becomes reachable the day a ban surface is added to `dign` or `penalize_peer` is wired into
+///    dig-node's abuse detection. Tracked: <https://github.com/DIG-Network/dig-gossip/issues/86>.
+/// 2. **The departed-peer reaper.** `reap_departed_peers` (state.rs:1270-1296, 30s cadence) `retain`s
+///    on `slot_is_departed` and removes without calling `retire_slot`. This is narrower than it sounds:
+///    it reaps only slots whose transport is ALREADY closed. The residual window is a reaped-then-
+///    reconnected identity whose first serve loop has not yet returned -- the flag still reads `false`
+///    for that identity, and this function can then `disconnect` the reconnected identity's newer slot.
+///
+/// Closing all of this needs a compare-and-remove (slot-token) API in dig-gossip — a release-first
+/// change to that crate, out of scope here.
+async fn release_inbound_pool_slot(
+    gossip: Option<&dig_gossip::GossipHandle>,
+    adopted: Option<InboundPoolSlot>,
+) {
+    if let (Some(gossip), Some(slot)) = (gossip, adopted) {
+        if slot.superseded.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!(
+                peer_id = %slot.peer_id,
+                "inbound pool slot already superseded; leaving the newer session's slot alone"
+            );
+            return;
+        }
+        let _ = gossip.disconnect(&slot.peer_id).await;
+    }
+}
+
 /// Build the authenticated caller [`dig_dht::Contact`] from an accepted mTLS server connection: read
 /// the client's leaf certificate, derive its `peer_id = SHA-256(SPKI DER)` (the SAME derivation
 /// dig-nat enforces), and pair it with the remote socket address. Returns `None` if no client cert is
@@ -3458,10 +3659,25 @@ fn caller_from_tls(
     tls: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     remote_addr: std::net::SocketAddr,
 ) -> Option<dig_dht::Contact> {
+    let peer_id = peer_id_from_tls(tls)?;
+    Some(crate::dht::caller_contact(&peer_id, remote_addr))
+}
+
+/// The AUTHENTICATED `peer_id = SHA-256(SPKI DER)` of an accepted mTLS peer, read from the leaf
+/// certificate rustls verified during the handshake (**dig_ecosystem#3124**).
+///
+/// Split out of [`caller_from_tls`] because the pool keys a slot on the identity itself, while the DHT
+/// contact carries it as display hex — the two are not interchangeable, and deriving both from this
+/// ONE function is what keeps them from drifting onto different sources.
+///
+/// `None` when the peer presented no certificate or it does not parse; the client-cert verifier should
+/// already have rejected such a peer.
+fn peer_id_from_tls(
+    tls: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> Option<dig_nat::PeerId> {
     let (_io, conn) = tls.get_ref();
     let leaf = conn.peer_certificates()?.first()?;
-    let peer_id = dig_nat::peer_id_from_leaf_cert_der(leaf.as_ref())?;
-    Some(crate::dht::caller_contact(&peer_id, remote_addr))
+    dig_nat::peer_id_from_leaf_cert_der(leaf.as_ref())
 }
 
 /// Build the rustls `ServerConfig` for the mTLS peer-RPC listener from the node's CA-signed

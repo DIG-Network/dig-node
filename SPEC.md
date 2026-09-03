@@ -4008,7 +4008,8 @@ build passes its version through `scripts/package-version.sh` before it reaches 
 `pkgbuild --version`, or the WiX `-d Version=` argument — all of which end up inside a package that
 runs with elevated privilege. The script accepts, by whitelist, ONLY `X.Y.Z` or
 `X.Y.Z-nightly.YYYYMMDD.<shortsha>`, and rejects everything else with a non-zero exit; it MUST also
-reject a component exceeding Windows Installer's field limits (major/minor > 255, patch > 65535).
+reject MAJOR > 255 or PATCH > 65535 outright, and MINOR > 65535 — the ceiling past which even the
+§11.5c overflow carry can no longer map MINOR into a legal MSI `(major, minor)` pair.
 
 It emits two values, which differ on purpose:
 
@@ -4054,6 +4055,49 @@ number, so `0.96.<days>` outranks every stable `0.96.z`: `msiexec` aborts on
 channel. This is not a regression — no nightly `.msi` existed before — but it is newly reachable. A
 host switched from `nightly` back to `stable` on Windows requires an uninstall of the nightly
 package before the stable one installs, until the version scheme distinguishes channels.
+
+**Stable-channel MINOR overflow (dig_ecosystem#521, dig_ecosystem#522).** dig-node's
+`0.<minor>.<patch>` scheme puts an ever-incrementing feat/breaking counter (CLAUDE.md §2.4) in
+MINOR, and unlike MAJOR or PATCH that field is not bounded the way MSI's is — it reached Windows
+Installer's 255-value field ceiling first, at `0.256.0`, with every subsequent release otherwise
+unable to build any native package at all. `scripts/package-version.sh` folds MINOR into a legal
+MSI `(major, minor)` pair once it exceeds 255, reusing the MSI MAJOR field, which is otherwise idle
+at 0 for this repo's entire pre-1.0 lifetime:
+
+- **`MINOR <= 255`:** `MSI_MAJOR, MSI_MINOR = MAJOR, MINOR` — an unchanged passthrough.
+- **`MINOR > 255`:** `MSI_MAJOR, MSI_MINOR = MINOR div 256, MINOR mod 256` — a base-256 split that
+  ACTIVATES only above the old ceiling, and requires the real MAJOR to be `0` while it is active.
+  Should MAJOR ever become nonzero (a deliberate 1.0.0 decision) at the same time MINOR is ALSO
+  over 255, the two would collide in the same MSI field, so the script fails closed rather than
+  guess — that combination needs a fresh mapping decision, not this one.
+
+This is a STRICT BACKWARD-COMPATIBLE EXTENSION of the accepted range, never a behaviour change to
+an already-legal version: every version released before this carry existed has `MINOR <= 255`, so
+it maps identically under the new rule as it did under the old one. The carry preserves the
+invariant this section opened with — msiexec compares ProductVersion as a numeric
+`(major, minor, build)` tuple in that priority order. Within a single version and at the MINOR
+boundary where the carry activates, a base-256 split into MSI MAJOR then MSI MINOR preserves
+monotonicity: `1.0.0` (real MINOR 256) compares greater than `0.255.9` (real MINOR 255) purely
+because MSI MAJOR alone already decides it. This raises the effective ceiling from MINOR 255 to
+MINOR 65535 (`256*255+255`, a ~257x increase) with no new state and no change to how engineers
+choose MAJOR/MINOR/PATCH day to day.
+
+CRITICAL CAVEAT — strict monotonicity DOES NOT extend to sequences of releases across a MAJOR bump.
+Monotonicity holds ONLY while the real MAJOR version component remains 0 throughout the release
+history. If MAJOR is ever bumped to nonzero (e.g., to 1.0.0) AFTER MINOR has exceeded 255 in any
+prior release, releases with the carried encoding (e.g., real `0.600.0` maps to MSI `2.88.0`) can
+compare HIGHER in ProductVersion than the post-bump release with its passthrough encoding (e.g.,
+real `1.0.0` maps to MSI `1.0.0`, which is LOWER than `2.88.0`). This is a cross-release sequencing
+hazard that the in-version `MAJOR==0` guard does not prevent. Any future MAJOR bump occurring AFTER
+MINOR has overflowed requires deriving a new mapping strategy BEFORE that release to avoid a
+downgrade-class collision. This does not affect the current pre-release repo (MINOR has never
+exceeded 255 to date); when it becomes relevant, the decision is a user-call, not something the
+script guesses.
+
+Applies identically on both the stable and nightly mapping paths (the BUILD field keeps carrying
+the nightly day-count regardless of whether MINOR has overflowed).
+Verified by `scripts/tests/package-version.test.sh`, including the boundary that used to fail
+closed and a dedicated monotonicity check across the MAJOR==0 regime.
 
 11.6. **Reusable build.** The cross-OS build lives once in `.github/workflows/build-binaries.yml`
 (`on: workflow_call`, inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel
@@ -5819,6 +5863,35 @@ above — which at or past the cap, or under a clock that has stepped backwards,
 MUST increment the attempt count, and MUST NOT rewrite the anchor. A re-push MUST NOT move a
 recorded deadline EARLIER, so that a clock which steps backwards cannot shorten a hold that is
 already live.
+
+The anchor and the deadline are both recorded from a wall clock, so a single bad clock reading can
+record a deadline no honest push could have produced. A recorded deadline that exceeds the current
+instant by more than `MAX_RESERVATION_HOLD_MS` MUST be treated as CONTRADICTING the clock, because a
+deadline recorded honestly never exceeds its own anchor by more than that bound and an anchor never
+follows the present moment. Such a reservation MUST be re-anchored to the current instant and granted
+a fresh reservation lifetime — as though pushed now — before any expiry is evaluated, and the same
+treatment MUST be applied to a client build-window hold, which MUST be re-granted its own maximum
+lifetime from the current instant. Without this, a deadline recorded far in the future never
+arrives, no re-push can move it inwards, and the coin is withheld from selection permanently with no
+recovery available inside the product -- the lockout this section names as the worse failure, in its
+unrecoverable form.
+
+**The residual bound, stated exactly.** This repair does NOT reduce the worst case to
+`MAX_RESERVATION_HOLD_MS`, and a node MUST NOT claim that it does. A forward clock glitch smaller
+than `MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS` is invisible to the test above by construction:
+the first push records `expires_at = submitted_at + RESERVATION_TTL_MS`, so while the anchor leads
+true time by at most that difference the recorded deadline never exceeds the observing instant by
+more than the cap, and every later re-push carries a deadline drawn from the true clock, which
+cannot exceed it either. The anchor therefore survives, and the total-hold cap pins the deadline at
+`submitted_at + MAX_RESERVATION_HOLD_MS`. **A node MUST NOT hold a reservation beyond
+`2 * MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS` (110 minutes) measured from an instant the node
+has actually observed**, and that bound is TIGHT: it is attained exactly when the forward glitch
+equals `MAX_RESERVATION_HOLD_MS - RESERVATION_TTL_MS` and the caller keeps re-pushing.
+
+That same difference is the bound seen from its other side: it is also the smallest BACKWARDS clock
+step that can make the test fire on a reservation recorded honestly. The evasion window for a
+forward glitch and the false-fire floor for a backwards step are one constant, and neither can be
+narrowed without widening the other.
 
 This bound is on CONTINUOUS hold. Once the deadline passes, the reservation and its coin claims are
 released and the inputs become selectable again; a subsequent push of the same transaction is a new
@@ -9220,16 +9293,30 @@ Two limits are required, because they answer two different attacks:
   process, so any narrower scope would be several budgets against one resource;
 - a **per-claimant** limit on DISTINCT coin ids the claimant has caused reads for without ever
   proving a bond, which bounds the fabricated-coin-id case. A coin id the claimant has already been
-  read about MUST NOT count again: that is a cache entry expiring and being refreshed, not a new
-  question. A claimant that proves a bond MUST have this ledger forgiven; the process-wide budget
-  MUST NOT be refunded, since a proven bond says the claimant is honest and says nothing about this
-  node's chain access.
+  read about MUST NOT count AGAIN TOWARD THE DISTINCT-ID CAP, but a REPEAT of that same coin id
+  MUST itself be rate-limited, independently of the process-wide budget: a coin whose owner never
+  declares this claimant produces `unverified` forever, which by design is never cached, so without
+  a repeat-specific bound one such pair could re-enter admission at the process-wide refill rate
+  indefinitely and, sustained, hold the ENTIRE process-wide budget at zero for every other
+  claimant — a single fabricated coin silencing the whole node's bond promotion. A repeated pair
+  MUST be re-admitted no more often than the cadence an honest re-ask (a cache entry expiring) would
+  cost for free — never on every attempt. A claimant that proves a bond MUST have this ledger
+  forgiven; the process-wide budget MUST NOT be refunded, since a proven bond says the claimant is
+  honest and says nothing about this node's chain access.
 
 Exhausting either limit yields `unverified` having read nothing. **This is a degradation and never a
 refusal of service**: `unverified` and `unbonded` share a rank, the sort is stable, and the located
 slate is returned unchanged — precisely the behaviour of a node with no verifier installed. The read
 path is never blocked and no holder is ever ranked below where it started, so an adversary who
 exhausts the budget denies promotion, not content.
+
+**A node MUST also skip the read when its own currently-held peer sample cannot possibly meet the
+corroboration floor a bond verdict requires**, using only a cheap, non-dialling peek at whatever the
+last draw already held — never forcing a fresh dial round purely to answer this question, since a
+network that cannot supply enough peers would then pay a full dial attempt on every claim it can
+never resolve, which is worse than the wasted read it replaces. An unknown sample (nothing drawn
+yet) MUST NOT be read as a refusal — it fails open into the real read, which is what discovers peers
+in the first place.
 
 Both limits are keyed on the claiming peer id LOWERCASED before use. A peer id is fixed-length hex,
 so its two spellings denote one identity, and every check that GRANTS promotion already treats them

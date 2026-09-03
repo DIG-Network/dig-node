@@ -91,6 +91,21 @@ impl CorroboratedChainSource {
         self
     }
 
+    /// The floor a caller raised via [`Self::requiring_corroboration`] must actually meet.
+    #[must_use]
+    pub fn required_floor(&self) -> usize {
+        self.floor
+    }
+
+    /// [`PeerSample::live_count_hint`] for the peers this source reads through — a cheap,
+    /// non-dialling peek, `None` when unknown. A caller with a strict [`Self::required_floor`]
+    /// uses this to skip a query round the CURRENTLY held sample cannot possibly satisfy
+    /// (dig-node#527, item 4), without forcing an extra dial round of its own to find out.
+    #[must_use]
+    pub fn live_peer_hint(&self) -> Option<usize> {
+        self.reads.live_count_hint()
+    }
+
     /// Drives one corroborated read to completion from a synchronous caller.
     ///
     /// The same three-way shape `chia-query`'s own facade uses (its `run_blocking` is
