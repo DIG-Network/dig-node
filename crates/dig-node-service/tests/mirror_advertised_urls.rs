@@ -246,6 +246,11 @@ fn the_configured_urls_reach_the_coin_in_the_operators_order() {
         Ok(PER_COIN),
         Ok(HashSet::new()),
         urls,
+        // A well-formed peer id, because `create` now refuses without one: a coin naming no peer
+        // locks collateral no reader could credit. This fixture is about URL ORDER, so it must
+        // reach the advertisement rather than stop at the identity guard. `repeat` rather than a
+        // 64-character literal so the length is right by construction instead of by counting.
+        Some("a1".repeat(32)),
         &chain,
         signer.owner_puzzle_hash(),
         Some(&signer),
@@ -311,6 +316,11 @@ fn an_all_rejected_value_refuses_and_spends_nothing() {
         Ok(PER_COIN),
         Ok(HashSet::new()),
         urls,
+        // Deliberately absent, and deliberately UNREACHED: the advertisement guard returns before
+        // `declaration_for_create` is consulted, so this row still refuses for the URL reason. It
+        // is left as `None` so that a future reordering putting the identity guard first changes
+        // the REASON, which the assertion below now names explicitly.
+        None,
         &chain,
         signer.owner_puzzle_hash(),
         Some(&signer),
@@ -319,10 +329,18 @@ fn an_all_rejected_value_refuses_and_spends_nothing() {
         runtime.handle().clone(),
     );
 
-    let refused = effects.create(&bond(0xB2, 0xD4), EPOCH, PER_COIN);
+    let reason = effects
+        .create(&bond(0xB2, 0xD4), EPOCH, PER_COIN)
+        .expect_err(
+            "a mirror with nowhere to fetch from is not a mirror, so the create must refuse",
+        );
+    // WHICH refusal, not merely that one happened. `create` now has a second early return -- the
+    // peer-identity guard -- and this fixture carries no declaration, so a bare `is_err()` would
+    // pass just as happily if the identity guard were reordered ahead of the advertisement one,
+    // leaving the URL guard this test exists for completely unexercised.
     assert!(
-        refused.is_err(),
-        "a mirror with nowhere to fetch from is not a mirror, so the create must refuse"
+        reason.to_string().contains("at least one URL"),
+        "the refusal must name the missing advertisement rather than any other cause: {reason}"
     );
     assert!(
         broadcast_bytes(&broadcaster).is_empty(),
