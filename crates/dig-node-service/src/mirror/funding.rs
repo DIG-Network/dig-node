@@ -42,7 +42,8 @@
 //! non-terminal record's funding coins may still be consumed, so they are withheld. See
 //! [`committed_funding_coin_ids`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use chia_protocol::Bytes32;
 use chia_puzzle_types::cat::CatArgs;
@@ -511,12 +512,32 @@ pub fn select_operator_dig_cats_detailed<S: ChainSource>(
     let mut attempts: usize = 0;
     let mut walked_whole_pool = true;
 
+    // Every coin id genuinely still a candidate for THIS selection. Pruning the shared memo to
+    // this set, once, is what bounds it without a time-based expiry: a coin absent here is spent
+    // and can never be authenticated again (dig-node#481, item 1).
+    let memo = AuthMemo::shared();
+    memo.retain_only(&pool.iter().map(|r| r.coin.coin_id().to_bytes()).collect());
+
     for record in &pool {
         // Enough of this operator's own money is proven spendable. Every further authentication is
         // a chain read that cannot change the answer.
         if authenticated_total >= need_dig_base_units {
             break;
         }
+
+        let coin_id_bytes = record.coin.coin_id().to_bytes();
+
+        // A coin this OR an earlier call already proved can never authenticate costs no chain read
+        // and no budget: the ledger's own creating spend does not change, so re-asking would only
+        // reproduce the same refusal at the price of another read (dig-node#481, item 1).
+        if let Some(reason) = memo.recall(coin_id_bytes) {
+            skipped.push(SkippedCandidate {
+                coin_id: hex::encode(coin_id_bytes),
+                reason,
+            });
+            continue;
+        }
+
         if attempts >= MAX_AUTHENTICATION_ATTEMPTS {
             walked_whole_pool = false;
             break;
@@ -531,11 +552,14 @@ pub fn select_operator_dig_cats_detailed<S: ChainSource>(
             // `MAX_AUTHENTICATION_ATTEMPTS` lines per selection per create per pass, and the
             // count is chosen by whoever planted the coins -- an attacker-driven log volume in a
             // module with no rate limit anywhere. The whole walk is reported ONCE below.
-            Err(FundingError::Unauthenticated { coin_id, reason }) => {
+            Err((FundingError::Unauthenticated { coin_id, reason }, verdict)) => {
+                if verdict == AuthVerdict::Final {
+                    memo.remember(coin_id_bytes, reason.clone());
+                }
                 skipped.push(SkippedCandidate { coin_id, reason });
             }
             // A source that cannot answer is not a verdict about the coin.
-            Err(fatal) => return Err(fatal),
+            Err((fatal, _)) => return Err(fatal),
         }
     }
 
@@ -1052,15 +1076,104 @@ fn whole_dig(base_units: u64) -> String {
 /// resolved CAT AGREES about both. They can only ever fire if the CAT construction and this module's
 /// derivation have drifted apart, and that is precisely the condition under which a selection would
 /// otherwise hand the builder coins it cannot spend.
+/// Whether an [`authenticate`] refusal is safe to remember FOREVER for this exact coin id, or
+/// might resolve differently on a later read and MUST NOT be cached (dig-node#481, item 1).
+///
+/// A coin id commits to `(parent_coin_info, puzzle_hash, amount)`, and a parent's creating spend,
+/// once on chain, never changes — so a refusal that is a pure function of that immutable data plus
+/// the parent's ALREADY-EXECUTED spend can never legitimately flip for the same coin id. The one
+/// exception is *"its creating spend is not on chain"*: that reads a possibly lagging or reorging
+/// source, which can answer `Ok(None)` for a spend that will exist a moment later. Caching THAT
+/// would permanently blacklist a coin the node genuinely owns — a money defect strictly worse than
+/// the unbounded-read drain this type exists to fix.
+///
+/// Deliberately has no `#[non_exhaustive]` escape and no `Default`: every call site that produces
+/// one names a variant explicitly, so a future refusal reason `authenticate` grows cannot silently
+/// inherit `Final` (permanent blacklist) by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthVerdict {
+    /// Provably permanent for this coin id. Safe to remember.
+    Final,
+    /// May resolve differently on a later read. MUST NEVER be cached.
+    Transient,
+}
+
+/// Coin ids [`authenticate`] has FINALLY refused, so a repeat walk of the same operator address
+/// never re-pays a chain read for a coin that can never authenticate (dig-node#481, item 1).
+///
+/// Process-wide, matching [`select_operator_dig_cats_detailed`]'s own scope: every `create()` in
+/// one pass, and every pass, scans the SAME operator address, so a coin's authentication history is
+/// a property of that address, not of any one call. Bounded independently of elapsed time —
+/// [`Self::retain_only`] prunes to the caller's own current pool once per selection, giving
+/// `len() <= pool.len()` for free, with [`Self::MAX_ENTRIES`] as a hard backstop against a pool
+/// this module has not yet seen shrink.
+struct AuthMemo {
+    refused: Mutex<HashMap<[u8; 32], String>>,
+}
+
+impl AuthMemo {
+    /// Costs an attacker 50,000 on-chain spends to fill even before [`Self::retain_only`] ever
+    /// runs — chosen the same way `bond_verify`'s own verdict cache is (dig-node#527): a real
+    /// ceiling on attacker-controlled growth, not a number expected to be reached in practice.
+    const MAX_ENTRIES: usize = 50_000;
+
+    fn shared() -> &'static AuthMemo {
+        static SHARED: std::sync::OnceLock<AuthMemo> = std::sync::OnceLock::new();
+        SHARED.get_or_init(Self::empty)
+    }
+
+    /// A fresh, empty memo — the constructor [`Self::shared`] wraps, and the one a test uses
+    /// directly so its assertions can never depend on, or be polluted by, another test's use of
+    /// the process-wide singleton.
+    fn empty() -> AuthMemo {
+        AuthMemo {
+            refused: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The remembered FINAL refusal for `coin_id`, if this exact coin was ever refused for a
+    /// reason that cannot change.
+    fn recall(&self, coin_id: [u8; 32]) -> Option<String> {
+        self.refused.lock().ok()?.get(&coin_id).cloned()
+    }
+
+    /// Remember a FINAL refusal. A poisoned lock or a full memo simply forgets nothing new rather
+    /// than panicking or evicting — the cost of a missed memoisation is one re-paid chain read,
+    /// never a correctness defect, so failing open into "ask again" is the safe direction here.
+    fn remember(&self, coin_id: [u8; 32], reason: String) {
+        let Ok(mut refused) = self.refused.lock() else {
+            return;
+        };
+        if refused.len() >= Self::MAX_ENTRIES && !refused.contains_key(&coin_id) {
+            return;
+        }
+        refused.insert(coin_id, reason);
+    }
+
+    /// Forget every entry not in `live`. A coin absent from the operator's current unspent pool is
+    /// spent and can never be a fresh candidate again, so dropping it costs nothing and keeps the
+    /// memo's real-world size tied to the pool this selection just scanned.
+    fn retain_only(&self, live: &HashSet<[u8; 32]>) {
+        if let Ok(mut refused) = self.refused.lock() {
+            refused.retain(|coin_id, _| live.contains(coin_id));
+        }
+    }
+}
+
 fn authenticate<S: ChainSource>(
     source: &S,
     record: &dig_chainsource_interface::CoinRecord,
     owner_puzzle_hash: Bytes32,
-) -> Result<Cat, FundingError> {
+) -> Result<Cat, (FundingError, AuthVerdict)> {
     let coin_id = hex::encode(record.coin.coin_id());
-    let refuse = |reason: &str| FundingError::Unauthenticated {
-        coin_id: coin_id.clone(),
-        reason: reason.to_string(),
+    let refuse = |reason: &str, verdict: AuthVerdict| {
+        (
+            FundingError::Unauthenticated {
+                coin_id: coin_id.clone(),
+                reason: reason.to_string(),
+            },
+            verdict,
+        )
     };
 
     let creating = source
@@ -1068,8 +1181,8 @@ fn authenticate<S: ChainSource>(
         // An `Err` is the source failing to answer, which is a CHAIN failure and not a verdict about
         // the coin. Kept distinct so an operator is not told their coin is forged when the truth is
         // that the read timed out.
-        .map_err(|e| FundingError::Chain(e.to_string()))?
-        .ok_or_else(|| refuse("its creating spend is not on chain"))?;
+        .map_err(|e| (FundingError::Chain(e.to_string()), AuthVerdict::Transient))?
+        .ok_or_else(|| refuse("its creating spend is not on chain", AuthVerdict::Transient))?;
 
     let parent = ParentSpend {
         coin: creating.coin,
@@ -1077,15 +1190,26 @@ fn authenticate<S: ChainSource>(
         solution: creating.solution.into(),
     };
     let cat = resolve_cat(&parent, record.coin)
-        .map_err(|e| refuse(&format!("its lineage could not be executed: {e}")))?
-        .ok_or_else(|| refuse("its creating spend produced no matching CAT child"))?;
+        .map_err(|e| {
+            refuse(
+                &format!("its lineage could not be executed: {e}"),
+                AuthVerdict::Final,
+            )
+        })?
+        .ok_or_else(|| {
+            refuse(
+                "its creating spend produced no matching CAT child",
+                AuthVerdict::Final,
+            )
+        })?;
 
     if cat.info.asset_id != DIG_ASSET_ID {
-        return Err(refuse("the resolved CAT is not $DIG"));
+        return Err(refuse("the resolved CAT is not $DIG", AuthVerdict::Final));
     }
     if cat.info.p2_puzzle_hash != owner_puzzle_hash {
         return Err(refuse(
             "the resolved CAT is owned by a different puzzle hash",
+            AuthVerdict::Final,
         ));
     }
     Ok(cat)
@@ -1094,6 +1218,85 @@ fn authenticate<S: ChainSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Proves (dig-node#481, item 1, HIGH):** a coin remembered as FINALLY refused is recalled
+    /// without re-deciding, and pruning to the live pool forgets exactly what left it — never more,
+    /// never less.
+    ///
+    /// Uses [`AuthMemo::empty`] rather than [`AuthMemo::shared`] so this assertion can never
+    /// depend on, or be polluted by, another test's use of the process-wide singleton.
+    #[test]
+    fn a_finally_refused_coin_is_recalled_and_pruned_with_the_pool() {
+        let memo = AuthMemo::empty();
+        let refused = [0xAAu8; 32];
+        let still_pending = [0xBBu8; 32];
+        let spent = [0xCCu8; 32];
+
+        assert_eq!(
+            memo.recall(refused),
+            None,
+            "nothing is remembered before the first refusal"
+        );
+
+        memo.remember(refused, "the resolved CAT is not $DIG".to_string());
+        assert_eq!(
+            memo.recall(refused),
+            Some("the resolved CAT is not $DIG".to_string()),
+            "a remembered FINAL refusal must be recallable by coin id"
+        );
+
+        memo.remember(spent, "the resolved CAT is not $DIG".to_string());
+        memo.retain_only(&[refused, still_pending].into_iter().collect());
+        assert_eq!(
+            memo.recall(refused),
+            Some("the resolved CAT is not $DIG".to_string()),
+            "a coin still in the live pool must survive pruning"
+        );
+        assert_eq!(
+            memo.recall(spent),
+            None,
+            "a coin no longer in the live pool is spent and must be forgotten -- keeping it would \
+             grow the memo without bound against a pool that only ever shrinks"
+        );
+    }
+
+    /// **Proves (dig-node#481, item 1, HIGH):** the memo's own bound refuses a NEW coin id once
+    /// full, but never evicts an entry already held to make room for one.
+    #[test]
+    fn the_memo_bound_refuses_new_entries_rather_than_evicting_held_ones() {
+        let memo = AuthMemo::empty();
+        for i in 0..AuthMemo::MAX_ENTRIES {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            memo.remember(id, "the resolved CAT is not $DIG".to_string());
+        }
+
+        let held = {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&0u64.to_be_bytes());
+            id
+        };
+        assert!(
+            memo.recall(held).is_some(),
+            "an entry held before the memo filled must still be there"
+        );
+
+        let mut overflow = [0u8; 32];
+        overflow[..8].copy_from_slice(&(AuthMemo::MAX_ENTRIES as u64).to_be_bytes());
+        memo.remember(overflow, "the resolved CAT is not $DIG".to_string());
+
+        assert_eq!(
+            memo.recall(overflow),
+            None,
+            "a full memo must refuse a genuinely NEW coin id rather than evict for it -- an \
+             evict-on-overflow policy is exactly the amplifier this bound exists to prevent \
+             (dig-node#527's `VerdictCache` records the same failure mode for the same reason)"
+        );
+        assert!(
+            memo.recall(held).is_some(),
+            "the overflowing insert must not have evicted the entry that was already there"
+        );
+    }
 
     /// A short pass, repeated. The operator hears about it ONCE.
     fn short(have: u64) -> FundingObservation {

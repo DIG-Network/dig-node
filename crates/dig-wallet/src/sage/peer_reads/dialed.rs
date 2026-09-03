@@ -310,4 +310,18 @@ impl PeerSample for DialedPeerSample {
             })
             .unwrap_or_default()
     }
+
+    /// A non-blocking peek: `try_lock` rather than `lock`, so a caller that only wants a hint never
+    /// waits behind a concurrent [`Self::draw`] — and a lock momentarily held by one is exactly the
+    /// case where `None` (unknown) is the honest answer, not a stale count.
+    fn live_count_hint(&self) -> Option<usize> {
+        let slot = self.held.try_lock().ok()?;
+        let held = slot.as_ref()?;
+        Some(
+            held.peers
+                .iter()
+                .filter(|p| !p.failed.load(Ordering::Relaxed))
+                .count(),
+        )
+    }
 }
