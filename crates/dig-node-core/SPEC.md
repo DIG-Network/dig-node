@@ -738,8 +738,13 @@ Steps 3–8 are best-effort and gated on the P2P layer coming up; step 2 (autono
 DIG network genesis is a REAL, non-zero value — `dig_constants::DIG_MAINNET.genesis_challenge()`, the
 Chia mainnet header hash at height 9,021,277 — so the gossip config is ACCEPTED and steps 3–8 do
 start. `dig-gossip` rejects only an all-zero `network_id`, and no code path can produce one (see the
-override below), so bring-up is not gated on the genesis. Acceptance means the bring-up PROCEEDS; it
-does not by itself mean the pool reaches any peer, which depends on discovery and reachability.
+override below), so bring-up is not gated on the genesis. Proven by
+`tests/genesis_bringup.rs`, `default_genesis_brings_up_the_pool_dht_content_engine_and_peer_rpc_listener`:
+with the default genesis and no override, gossip starts, the DHT comes up, the p2p content engine and
+inventory refresher are installed, and the mTLS peer-RPC listener binds and accepts. Acceptance means
+the bring-up PROCEEDS; it does not mean the pool reaches any peer. That test is hermetic (loopback,
+relay off, zero peers), so pool CONVERGENCE and PEX exchange are NOT proven by it — the DHT comes up,
+it does not converge.
 
 **`DIG_NETWORK_GENESIS` override (#285).** Step 3's `GossipConfig.network_id` is resolved by
 `peer::genesis_challenge_from_env`: when the env var `DIG_NETWORK_GENESIS` is set to a valid
