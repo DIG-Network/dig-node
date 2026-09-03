@@ -1198,6 +1198,14 @@ impl WalletBackend {
         &self,
         now_ms: i64,
     ) -> sqlx::Result<std::result::Result<super::db::ResetReport, super::db::ResetRefusal>> {
+        // Prune FIRST, unlike the other reservation-sensitive entry points only by accident of
+        // history: every one of them already does this, and this one did not (dig-node#525).
+        //
+        // Without it a user whose first action after correcting a bad clock is a reset gets
+        // `ResetRefusal::SpendInFlight`, whose message tells them to wait for the reservations to
+        // expire - and waiting alone triggers no prune, so the deadline is never repaired and the
+        // wait never ends. Pruning here is what makes that sentence true.
+        self.db.prune_reservations(now_ms).await?;
         self.db.reset_chain_cache(now_ms).await
     }
 
