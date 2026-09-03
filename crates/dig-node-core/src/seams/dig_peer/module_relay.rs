@@ -37,16 +37,35 @@
 //!   `(store, root)`. Verified load-bearing: threading `params["retrieval_key"]` into this function
 //!   leaves all 988 other tests in the crate green and fails only that one.
 //!
-//! # The three gates, each independently sufficient to refuse
+//! # The four gates, each independently sufficient to refuse — and their ORDER is load-bearing
 //!
 //! 1. **The requestor asked.** `params.proxy == true`. Automatic relaying is off; a requestor that
 //!    can reach holders itself should, and does.
 //! 2. **The operator opted in.** [`crate::download::ONION_RELAY_ENV`], default OFF. This leg spends a
 //!    THIRD party's bandwidth, so it is not gated more loosely than the legs that spend only this
 //!    node's.
-//! 3. **The requestor is within its PROXY allowance** — the separate, tighter bucket
+//! 3. **This build has a capsule warmer.** The FFI/base path wires none, so there is no
+//!    whole-capsule pull to drive and no relay to authorise.
+//! 4. **The requestor is within its PROXY allowance** — the separate, tighter bucket
 //!    (dig_ecosystem#2189), never the cheap-lookup one. Relaying a whole capsule is the costliest
 //!    thing a stranger can ask this node to do.
+//!
+//! **The allowance is charged LAST because a refusal must not leave evidence of how far it got**
+//! (dig-node#512). Gates 1-3 are pure reads; gate 4 is the only one with a side effect, because
+//! admitting SPENDS a token from a bucket [`crate::download::NodeContent::miss_outcome`]'s second leg
+//! also reads. Charged earlier, a token was consumed exactly when gates 1 and 2 had passed — and
+//! gate 1 is the requestor's own flag, so consumption reported the OPERATOR'S OPT-IN to a stranger
+//! who could then watch a later `dig.fetchRange` flip from fetch-through to redirect. In this order
+//! the invariant is exact and total: **every path returning [`RelayStatus::Refused`] consumes
+//! nothing** — a refused acquire decrements nothing either
+//! (`rate_limit::TokenBucket::try_acquire`) — so a spend implies this call returns
+//! [`RelayStatus::Landed`] or [`RelayStatus::Pending`], a frame that already tells the requestor
+//! relaying is on. Guarded by `a_refused_relay_leaves_no_trace_in_the_proxy_allowance`
+//! (`crate::tests`), which varies ONLY the opt-in and reads the bucket through the OTHER method.
+//!
+//! WALL-CLOCK timing is explicitly NOT equalised and is a non-goal here: the gates are cheap reads
+//! whose cost differences are far below network noise, and defending against a timing adversary is a
+//! separate design with a separate cost.
 //!
 //! A refusal at any gate leaves the pre-existing `RESOURCE_UNAVAILABLE` answer exactly as it was, so
 //! the requestor stays free to ask a different hop — a hop's "not found" may always be a lie (NC-12).
@@ -74,9 +93,11 @@ pub(crate) enum RelayStatus {
     /// correctness: every one of those bytes still has to pass the requestor's merkle verification
     /// against the chain-anchored root, exactly as a direct holder's would (NC-12).
     Pending { staged_bytes: u64 },
-    /// No relay: the requestor did not ask, the operator did not opt in, the requestor is outside its
-    /// proxy allowance, or this build has no capsule warmer. Indistinguishable to the requestor from
-    /// a plain miss, deliberately — a refusal must not narrate which gate refused.
+    /// No relay: the requestor did not ask, the operator did not opt in, this build has no capsule
+    /// warmer, or the requestor is outside its proxy allowance. Indistinguishable to the requestor
+    /// from a plain miss, deliberately — a refusal must not narrate which gate refused, and it must
+    /// not leave a TRACE of which gate refused either: no path to this variant consumes a rate-limit
+    /// token (dig-node#512, see the module doc's gate ordering).
     Refused,
 }
 
@@ -120,15 +141,20 @@ pub(crate) async fn relay_capsule(
     if !content.onion_relay_enabled() {
         return RelayStatus::Refused;
     }
-    // (3) The requestor must be inside its PROXY-class allowance — the expensive-egress bucket.
+    // (3) This build must HAVE a whole-capsule pull to drive. Checked before the allowance because
+    //     it costs nothing and consumes nothing: on the FFI/base path there is no relay to pay for,
+    //     and charging a requestor for one would be both wrong and legible (dig-node#512).
+    let Some(warmer) = content.capsule_warmer().cloned() else {
+        return RelayStatus::Refused;
+    };
+    // (4) LAST, and last for a reason: the requestor must be inside its PROXY-class allowance — the
+    //     expensive-egress bucket. This is the only gate with a SIDE EFFECT (it spends a token), so
+    //     it runs once the relay is otherwise certain to proceed. Admitting here therefore implies
+    //     this call returns `Landed` or `Pending`, a frame that already tells the requestor relaying
+    //     is on — so the spend reveals nothing the answer did not.
     if !content.allow_proxy_fetch(requestor) {
         return RelayStatus::Refused;
     }
-    let Some(warmer) = content.capsule_warmer().cloned() else {
-        // No warmer wired (the FFI/base path): there is no whole-capsule pull to drive, so there is
-        // no relay. A read behaves identically with or without the leg.
-        return RelayStatus::Refused;
-    };
     tracing::debug!(
         store = %super::serve_log::SafeId::new(store_hex),
         root = %super::serve_log::SafeId::new(root_hex),
@@ -141,7 +167,7 @@ pub(crate) async fn relay_capsule(
     // request; a spawned one outlives it, so a requestor that gives up leaves this node still
     // pulling. The registry's cap is GLOBAL and SHARED with this node's own `spawn_capsule_warm`,
     // so an abandoning peer can hold a warm slot that a local read wanted. Bounded (the cap), opt-in
-    // (gate 2) and allowance-limited (gate 3) — but a real cost of running the leg, recorded on
+    // (gate 2) and allowance-limited (gate 4) — but a real cost of running the leg, recorded on
     // `CapsuleWarmer::warm_relayed` as well so it is visible from either end.
     super::module_reshare::spawn_relayed_capsule_warm(
         std::sync::Arc::clone(&warmer),
