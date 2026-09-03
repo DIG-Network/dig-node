@@ -3719,7 +3719,7 @@ prove peers are ordered by observed answer quality, never excluded by it.
 no requirement that the peer be re-dialled or prove anything to recover. The penalty MUST be a
 function of elapsed ticks ALONE and never of how often this node happened to observe the peer:
 `decay` carries the unspent remainder of a period forward rather than restamping the record
-(`conduct.rs:158-178`), so a peer this node talks to often cannot be held un-decayed by the
+(dig-sex `src/conduct.rs`, `decay`), so a peer this node talks to often cannot be held un-decayed by the
 observation traffic itself. This is what stops an attacker
 who can degrade an honest peer — load, connection-slot exhaustion, a partition — from evicting it
 from every reader's dial set merely by making it slow. `conduct.rs:217`
