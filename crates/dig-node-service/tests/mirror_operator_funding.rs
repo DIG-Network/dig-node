@@ -28,8 +28,8 @@ use chia_protocol::{Bytes32, CoinSpend};
 use chia_sha2::Sha256;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_node_service::mirror::funding::{
-    dig_cat_puzzle_hash, select_operator_dig_cats, select_operator_dig_cats_detailed, FundingError,
-    FundingObservation, FundingRemedy,
+    dig_cat_puzzle_hash, select_operator_dig_cats, select_operator_dig_cats_detailed, skip_report,
+    FundingError, FundingObservation, FundingRemedy, SKIP_SAMPLE,
 };
 use support::{ordinary_dig_coins, wallet, Wallet};
 
@@ -604,6 +604,88 @@ fn coins_a_stranger_paid_in_cannot_turn_a_top_up_into_a_consolidation() {
         concat!(
             "an attacker chose the remedy: `Consolidate` tells an operator who is genuinely short ",
             "that adding more $DIG will not help, which is the exact opposite of what they must do"
+        )
+    );
+}
+
+/// **A FUNDED create still reports what it passed over, and reports it in O(1).**
+///
+/// Two properties, and the fixture is built so that the nearest wrong implementation of each fails
+/// it.
+///
+/// * **The success path speaks.** `FundingSelection::skipped` was computed and had no production
+///   consumer at all, so "a skip is counted and reported" was true of the tests and false of the
+///   shipped node (dig-node#481). The selection here SUCCEEDS -- the operator's own coins cover the
+///   requirement -- because a report emitted only on the refusal paths satisfies a fixture that
+///   refuses, and this is the half that was invisible.
+/// * **The line is bounded.** The skipped count is chosen by whoever plants the coins, and there is
+///   no rate limit in this module, so a report that named every id would move an attacker-driven
+///   volume from the line count to the line length rather than removing it. Two runs differing only
+///   in how many coins the stranger planted must name the same number of ids.
+///
+/// The report must also frame the total as a floor: the same path that passes over a stranger's
+/// coin passes over one of this node's own under a lineage bug, so "you have X" would be a
+/// confident understatement of the operator's money.
+#[test]
+fn a_funded_selection_reports_what_it_passed_over_in_one_bounded_line() {
+    let report_for = |planted: u64| -> String {
+        let operator = operator();
+        let mut chain = Chain::default();
+        chain.fund(&operator, &[REQUIRED], salt(1));
+        // Every planted coin is larger than the honest one, so all of them are walked first.
+        let dust: Vec<u64> = (1..=planted).map(|n| REQUIRED * 10 + n).collect();
+        chain.fund_without_lineage(&operator, &dust, salt(5));
+
+        let selection = select_operator_dig_cats_detailed(
+            &chain,
+            operator.puzzle_hash,
+            REQUIRED,
+            &HashSet::new(),
+        )
+        .expect("the operator's own coin covers the requirement, so this pass FUNDS");
+        assert_eq!(
+            selection.skipped.len(),
+            planted as usize,
+            "every planted coin should have been walked and passed over"
+        );
+        skip_report(&selection.skipped).expect("a selection that passed candidates over must speak")
+    };
+
+    let few = report_for((SKIP_SAMPLE + 4) as u64);
+    let many = report_for((SKIP_SAMPLE * 5) as u64);
+
+    assert!(
+        few.contains(&format!("{} coin(s)", SKIP_SAMPLE + 4)),
+        "the report must state how many were passed over: {few}"
+    );
+    assert!(
+        few.contains("AT LEAST"),
+        concat!(
+            "a total from a walk that skipped candidates is a FLOOR; a report that does not say ",
+            "so leaves the operator acting on an understated figure as though it were exact: "
+        )
+    );
+
+    let ids = |report: &str| {
+        report.split("Coin ids: ").nth(1).map(|tail| {
+            tail.trim_end_matches(", ...")
+                .split(", ")
+                .filter(|id| !id.is_empty())
+                .count()
+        })
+    };
+    assert_eq!(
+        ids(&few),
+        Some(SKIP_SAMPLE),
+        "the id list is capped at the sample bound: {few}"
+    );
+    assert_eq!(
+        ids(&many),
+        ids(&few),
+        concat!(
+            "five times as many planted coins named five times as many ids, so the line length is ",
+            "still a figure the attacker chooses -- the aggregation moved the volume rather than ",
+            "bounding it"
         )
     );
 }

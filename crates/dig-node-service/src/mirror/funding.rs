@@ -331,6 +331,54 @@ pub struct SkippedCandidate {
     pub reason: String,
 }
 
+/// How many skipped coin ids one report names before it stops listing them.
+///
+/// Coin ids are public, so listing them leaks nothing, and a handful is what makes a report
+/// actionable rather than merely alarming -- an operator can look them up on chain. The bound is
+/// what keeps the line O(1) in a figure an attacker chooses: without it the aggregation would just
+/// move the attacker-driven volume from the line COUNT to the line LENGTH.
+pub const SKIP_SAMPLE: usize = 8;
+
+/// The one operator-facing sentence for a whole selection's passed-over candidates.
+///
+/// `None` when nothing was passed over, so a healthy pass says nothing at all.
+///
+/// # Why it says "at least"
+///
+/// The same path that passes over a stranger's coin passes over one of this node's OWN coins when
+/// lineage handling has a bug. Any total derived from a walk that skipped candidates is therefore a
+/// FLOOR on what the operator can spend, not the total -- and a confident understated figure is the
+/// money lie this module exists to refuse (dig-node#481). An operator told "you have X" acts on X;
+/// an operator told "you have at least X, and N coins here could not be proven yours" knows both
+/// what they can do and what to investigate.
+pub fn skip_report(skipped: &[SkippedCandidate]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let sample: Vec<&str> = skipped
+        .iter()
+        .take(SKIP_SAMPLE)
+        .map(|candidate| candidate.coin_id.as_str())
+        .collect();
+    let ellipsis = if skipped.len() > SKIP_SAMPLE {
+        ", ..."
+    } else {
+        ""
+    };
+    Some(format!(
+        concat!(
+            "{count} coin(s) at the operator's $DIG address could not be proven spendable and ",
+            "were passed over, so any total this pass reports is a FLOOR -- the operator can ",
+            "spend AT LEAST that much, not exactly that much. If any of these is one of this ",
+            "node's own coins, its lineage is not readable from the chain and the shortfall is ",
+            "not real. Coin ids: {sample}{ellipsis}"
+        ),
+        count = skipped.len(),
+        sample = sample.join(", "),
+        ellipsis = ellipsis
+    ))
+}
+
 /// The outcome of a funding selection: the coins to spend, and the candidates passed over.
 #[derive(Debug, Clone)]
 pub struct FundingSelection {
@@ -342,8 +390,14 @@ pub struct FundingSelection {
 
 /// Select spendable $DIG `Cat`s of the OPERATOR wallet covering `need_dig_base_units`.
 ///
-/// The `Vec<Cat>` half of [`select_operator_dig_cats_detailed`], for callers that fund a spend and
-/// have nothing to say about the candidates that were passed over.
+/// The `Vec<Cat>` half of [`select_operator_dig_cats_detailed`], for callers whose only question is
+/// which coins to spend.
+///
+/// NOT the funding route. Discarding [`FundingSelection::skipped`] is what made "a skip is counted
+/// and reported" true of tests and false of the shipped node (dig-node#481), so the mirror
+/// lifecycle calls [`select_operator_dig_cats_detailed`] and consumes the skips. This remains for
+/// the many tests that assert on the coins alone; the aggregated operator report is emitted by the
+/// selection itself, so nothing is silenced by choosing it.
 pub fn select_operator_dig_cats<S: ChainSource>(
     source: &S,
     owner_puzzle_hash: Bytes32,
@@ -379,9 +433,12 @@ pub fn select_operator_dig_cats<S: ChainSource>(
 ///
 /// Two properties keep the skip from becoming a different failure:
 ///
-/// * **A skip is counted and reported**, never swallowed. The same path covers a genuine defect in
-///   lineage handling, and a selection that quietly discarded the operator's own coins while
-///   reporting a shortfall would be indistinguishable from an empty wallet.
+/// * **A skip is counted and reported**, never swallowed -- counted into
+///   [`FundingSelection::skipped`], which the funding caller consumes, and reported once per
+///   selection through [`skip_report`], whose wording makes any total this pass quotes a FLOOR
+///   rather than a figure. The same path covers a genuine defect in lineage handling, and a
+///   selection that quietly discarded the operator's own coins while reporting a shortfall would
+///   be indistinguishable from an empty wallet.
 /// * **A skip costs no selection budget.** Candidates are authenticated BEFORE anything is
 ///   selected, so a candidate that fails is never in a selection, never occupies an input slot and
 ///   never contributes to a total. An attacker who could spend an input slot per dust coin would
@@ -470,21 +527,23 @@ pub fn select_operator_dig_cats_detailed<S: ChainSource>(
                 authenticated_total = authenticated_total.saturating_add(record.coin.amount);
                 authenticated.push((record.clone(), cat));
             }
+            // Collected, not logged. One line per skipped candidate is up to
+            // `MAX_AUTHENTICATION_ATTEMPTS` lines per selection per create per pass, and the
+            // count is chosen by whoever planted the coins -- an attacker-driven log volume in a
+            // module with no rate limit anywhere. The whole walk is reported ONCE below.
             Err(FundingError::Unauthenticated { coin_id, reason }) => {
-                tracing::warn!(
-                    coin_id = %coin_id,
-                    reason = %reason,
-                    concat!(
-                        "a coin at the operator's $DIG address could not be proven spendable ",
-                        "and was passed over; if it is one of this node's own coins, its ",
-                        "lineage is not readable from the chain"
-                    )
-                );
                 skipped.push(SkippedCandidate { coin_id, reason });
             }
             // A source that cannot answer is not a verdict about the coin.
             Err(fatal) => return Err(fatal),
         }
+    }
+
+    // ONE line for the whole walk, whatever this selection goes on to do. Placed before the
+    // refusals below rather than after the `Ok`, because a truncated or uncovered walk is exactly
+    // when an operator most needs to know their address is carrying coins that are not theirs.
+    if let Some(report) = skip_report(&skipped) {
+        tracing::warn!(target: "mirror", skipped = skipped.len(), "{report}");
     }
 
     // The walk was truncated and the requirement is uncovered, so the honest total is UNKNOWN
