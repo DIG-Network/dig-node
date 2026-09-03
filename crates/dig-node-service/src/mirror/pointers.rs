@@ -122,8 +122,9 @@ impl MirrorCoinPointers for SnapshotMirrorPointers {
 ///
 /// A malformed id yields `None` — no pointer — never a panic and never a truncated guess. The ids in
 /// an observation are canonicalised by the mirror pass, so this failing at all would mean a producer
-/// changed; answering `None` degrades discovery to the hint scan, which is the same fully supported
-/// state a node with no coins is in.
+/// changed; answering `None` publishes a pointer-less record, which is the same fully supported
+/// state a node with no coins is in — a verifier withholds credit for it rather than demoting the
+/// holder.
 fn hex32(id: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(id).ok()?;
     <[u8; 32]>::try_from(bytes.as_slice()).ok()

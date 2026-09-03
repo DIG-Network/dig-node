@@ -564,7 +564,8 @@ pub struct Node {
     /// network, and must keep constructing a `Node` without either.
     ///
     /// `None` is an ORDINARY configuration, never a degraded one — a node with no pointer source
-    /// announces exactly as it always did, and the verifier's fallback is the hint scan.
+    /// announces exactly as it always did, and a verifier that cannot fetch a pointer withholds
+    /// credit rather than demoting the holder.
     mirror_pointers: OnceLock<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>>,
 }
 
