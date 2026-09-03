@@ -507,13 +507,31 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
 
         let dig_coins = {
             let committed = committed.borrow();
-            funding::select_operator_dig_cats(
+            // `_detailed`, so the skips are CONSUMED rather than dropped on the floor. The plain
+            // wrapper discards `FundingSelection::skipped`, which made "a skip is counted and
+            // reported" true of the tests and false of the shipped node: the same path that passes
+            // over a stranger's coin passes over one of this node's own under a lineage bug, and
+            // the create then refuses with a confident understated total (dig-node#481).
+            let selection = funding::select_operator_dig_cats_detailed(
                 self.source,
                 self.owner_puzzle_hash,
                 amount_dig_base_units,
                 &committed,
             )
-            .map_err(funding_refusal)?
+            .map_err(funding_refusal)?;
+            // Named with the store, which the selector cannot know. Even a FUNDED create says so:
+            // a pass that covered its requirement while passing over candidates has still only
+            // established a floor, and staying quiet about that on the success path is how the
+            // condition goes unnoticed until it is a shortfall.
+            if let Some(report) = funding::skip_report(&selection.skipped) {
+                tracing::warn!(
+                    target: "mirror",
+                    store_id = %bond.store_id,
+                    skipped = selection.skipped.len(),
+                    "{report}"
+                );
+            }
+            selection.cats
         };
 
         let signer = self

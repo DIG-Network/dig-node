@@ -2833,21 +2833,21 @@ fn spawn_mirror_passes(
             // This pass is the observation point because it already reads the operator wallet's
             // own balance on a timer, so the latch costs no extra chain read and cannot drift from
             // the figure the node acts on. `synced` gates ONLY the zero case (see
-            // `FundingObservation::should_latch`), so a stale or fallback answer showing money
+            // `EverFundedEvidence::should_latch`), so a stale or fallback answer showing money
             // still latches immediately.
             {
-                use crate::wallet_funded::FundingObservation;
+                use crate::wallet_funded::EverFundedEvidence;
                 let synced = wallet
                     .wallet_sync_status()
                     .await
                     .is_ok_and(|s| s.phase == dig_wallet::sage::sync_supervisor::SyncPhase::Synced);
                 let observation = match &dig_balance {
                     Ok(base_units) => {
-                        FundingObservation::classify(u128::from(*base_units), 0, synced)
+                        EverFundedEvidence::classify(u128::from(*base_units), 0, synced)
                     }
                     // An unreadable balance is not a zero balance. It says nothing, and the latch
                     // is monotonic, so the next pass that CAN read decides.
-                    Err(_) => FundingObservation::CannotSay,
+                    Err(_) => EverFundedEvidence::CannotSay,
                 };
                 crate::wallet_funded::observe(&paths, observation);
             }
