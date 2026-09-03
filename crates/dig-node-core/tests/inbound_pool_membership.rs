@@ -82,8 +82,21 @@ impl PeerRpcResponder for TestResponder {
     }
 }
 
-/// Start a real gossip service with an EMPTY pool, on its own ephemeral port.
+/// Start a real gossip service with an EMPTY pool and the default `max_connections`, on its own
+/// ephemeral port.
 async fn running_gossip() -> (
+    dig_gossip::GossipService,
+    dig_gossip::GossipHandle,
+    tempfile::TempDir,
+) {
+    running_gossip_with_max_connections(dig_gossip::GossipConfig::default().max_connections).await
+}
+
+/// Same as [`running_gossip`], with `max_connections` set explicitly so a test can put the
+/// accepted-direct-inbound cap somewhere small enough to hit deliberately.
+async fn running_gossip_with_max_connections(
+    max_connections: usize,
+) -> (
     dig_gossip::GossipService,
     dig_gossip::GossipHandle,
     tempfile::TempDir,
@@ -96,6 +109,11 @@ async fn running_gossip() -> (
         peers_file_path: dir.path().join("peers.json"),
         peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
         listen_addr: "127.0.0.1:0".parse().expect("listen addr"),
+        max_connections,
+        // GossipConfig::new/validate refuses target_outbound_count > max_connections (this node
+        // never dials in this test, so the outbound target is irrelevant to what's under test).
+        target_outbound_count: max_connections
+            .min(dig_gossip::GossipConfig::default().target_outbound_count),
         ..Default::default()
     };
     let service = dig_gossip::GossipService::new(cfg).expect("gossip config");
@@ -314,6 +332,154 @@ async fn a_reconnect_does_not_let_the_stale_session_evict_the_live_one() {
     assert_eq!(
         resp["result"]["served_method"], "dig.getNetworkInfo",
         "the surviving connection must still be answered"
+    );
+
+    server.abort();
+    service.stop().await.expect("stop");
+}
+
+/// **The accepted-direct-inbound CAP still binds after a supersede + stale-release cycle.**
+///
+/// `a_reconnect_does_not_let_the_stale_session_evict_the_live_one` (above) proves the SURVIVOR's slot
+/// is not evicted by the stale release. This test proves the more serious consequence named in that
+/// test's own doc comment: if the stale release COULD evict a live slot, the accounted count would
+/// fall below the served count, and the accepted-direct cap that `max_direct_inbound` /
+/// `max_inbound_total` enforce would be bypassable by any peer willing to reconnect. This test drives
+/// exactly that cycle once, then asks a NET-NEW peer to connect and checks the cap actually refuses
+/// it — the discriminating question `a_reconnect_...` does not ask.
+///
+/// ## Why `max_connections: 2`
+///
+/// The caps are derived (crate-private, `dig-gossip/src/service/peer_pool.rs`) as:
+///
+/// * `reserving_a_quarter(n) = n - max(n/4, 1)`
+/// * `max_inbound_total(2)   = reserving_a_quarter(2)                = 1`
+/// * `max_direct_inbound(2)  = reserving_a_quarter(max_inbound_total(2)).max(1).min(max_inbound_total(2))`
+///                           `= reserving_a_quarter(1).max(1).min(1) = 1`
+/// * `max_direct_inbound_per_group(2) = max_direct_inbound(2).div_ceil(4).max(2) = 1.div_ceil(4).max(2) = 2`
+///
+/// So at `max_connections = 2` the accepted-direct cap is exactly **1**, and it is `max_direct_inbound`
+/// / `max_inbound_total` doing the refusing — the per-source-group cap is 2 and is NOT what binds here,
+/// so this fixture does not (and must not be read to) exercise that cap. `max_connections: 1` is not
+/// usable instead: `max_inbound_total(1) = 0`, which denies the accepted-direct tier outright rather
+/// than reserving it a single slot.
+#[tokio::test]
+async fn the_accepted_direct_cap_still_binds_after_a_supersede_and_stale_release() {
+    dig_node_core::peer::install_crypto_provider();
+
+    let (service, gossip, _gdir) = running_gossip_with_max_connections(2).await;
+
+    let server_identity = test_identity("3124-cap-server");
+    let server_peer_id = server_identity.peer_id();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let listen_addr = listener.local_addr().expect("local addr");
+
+    let responder: Arc<dyn PeerRpcResponder> = Arc::new(TestResponder);
+    let server = tokio::spawn(serve_peer_rpc_listener_with(
+        listener,
+        server_identity,
+        responder,
+        None,
+        Some(gossip.clone()),
+    ));
+
+    let config = dig_nat::NatConfig::builder()
+        .enabled_methods(vec![dig_nat::TraversalKind::Direct])
+        .per_method_timeout(Duration::from_secs(5))
+        .build();
+
+    // Peer A takes the single accepted-direct slot the cap allows.
+    let a_identity = test_identity("3124-cap-peer-a");
+    let a_peer_id = a_identity.peer_id();
+    let target = dig_nat::PeerTarget::with_addr(server_peer_id, listen_addr, "DIG_MAINNET");
+    let first = dig_nat::connect(&target, &a_identity, &config)
+        .await
+        .expect("peer A connects");
+    await_peer_count(&gossip, 1, "after peer A's first connection").await;
+
+    // A reconnects with the SAME identity. This is admitted for FREE — `replaces_accepted_direct`
+    // (gossip_handle.rs:2054) exempts a slot that is itself an accepted-direct peer — so the cap is
+    // never charged twice and the count stays at 1. The first session is now superseded but still
+    // running; its serve loop has not yet noticed its socket is dead.
+    let mut second = dig_nat::connect(&target, &a_identity, &config)
+        .await
+        .expect("peer A reconnects");
+    await_peer_count(
+        &gossip,
+        1,
+        "a same-identity reconnect supersedes rather than adds a slot",
+    )
+    .await;
+
+    // End the STALE session and let its release run. This wait is load-bearing, not cosmetic: without
+    // it, step 6 below could race ahead of the stale release and refuse peer B for the wrong reason
+    // (the cap correctly still holding peer A's original session), passing the assertion vacuously
+    // whether or not the fix at `peer.rs:3597` is present. Giving the release a full second to fire
+    // means a subsequent refusal of B is caused by the cap seeing A's (single) survived slot, not by
+    // timing luck.
+    drop(first);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Peer B is a NET-NEW identity asking for the accepted-direct slot the cap says is full.
+    let b_identity = test_identity("3124-cap-peer-b");
+    let b_peer_id = b_identity.peer_id();
+    let b_pool_id = dig_gossip::PeerId::from(*b_peer_id.as_bytes());
+    let mut b_conn = dig_nat::connect(&target, &b_identity, &config)
+        .await
+        .expect(
+            "B's transport-level connect succeeds even though the pool refuses to ADOPT it -- \n             adoption is best-effort accounting (see the file-level doc comment), and a refused \n             adoption must never refuse the underlying connection",
+        );
+
+    // Hold the assertions in a loop rather than checking once: under the defect, the stale release
+    // (from `first` above) can land late and evict A's surviving slot AFTER B has already been let in
+    // by the now-appearing headroom — a single-shot check taken too early would miss that.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let a_pool_id = dig_gossip::PeerId::from(*a_peer_id.as_bytes());
+        assert!(
+            gossip.is_pool_peer(&a_pool_id),
+            "peer A's surviving session must keep its slot — the stale session's release must not \
+             evict the live one"
+        );
+        assert!(
+            !gossip.is_pool_peer(&b_pool_id),
+            "the accepted-direct cap is exactly 1 at max_connections=2 (see the doc comment above); \
+             a net-new peer must be refused while A still holds the only slot, or the cap is \
+             bypassable by reconnect-then-release"
+        );
+        assert_eq!(
+            gossip.peer_count().await,
+            1,
+            "one accepted-direct slot is held; driving the count above the cap is the bypass this \
+             test exists to catch"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Both A and B must still be SERVED -- this is the anti-vacuity check. Without it,
+    // `is_pool_peer(B) == false` is equally satisfied by B never having connected at all, which would
+    // prove nothing about the CAP specifically. Confirming B's RPC still answers while B stays outside
+    // the pool demonstrates the real contract named in the file-level doc comment: adoption is
+    // best-effort accounting, and a refused adoption must never cost the caller a working connection
+    // to the peer it already holds.
+    let mut a_stream = second.session.open_stream().await.expect("open stream");
+    let a_req = json!({"jsonrpc":"2.0","id":11,"method":"dig.getNetworkInfo"});
+    write_framed(&mut a_stream, &a_req).await.expect("write");
+    let a_resp = read_one_frame(&mut a_stream).await;
+    assert_eq!(
+        a_resp["result"]["served_method"], "dig.getNetworkInfo",
+        "A's surviving connection must still be answered while B sits outside the pool"
+    );
+
+    let mut b_stream = b_conn.session.open_stream().await.expect("open stream");
+    let b_req = json!({"jsonrpc":"2.0","id":13,"method":"dig.getNetworkInfo"});
+    write_framed(&mut b_stream, &b_req).await.expect("write");
+    let b_resp = read_one_frame(&mut b_stream).await;
+    assert_eq!(
+        b_resp["result"]["served_method"], "dig.getNetworkInfo",
+        "B's connection must still be served even though the pool refused to count it"
     );
 
     server.abort();
