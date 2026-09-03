@@ -50,6 +50,22 @@ pub enum Rejection {
     ThisMachineOnly,
 }
 
+impl Rejection {
+    /// Every variant, so the operator-message guard can walk the set rather than a chosen example.
+    ///
+    /// Declared beside the enum, not spelled inside the test. A walk built from an array literal in
+    /// the test would still compile, still be the same length, and still pass after a variant was
+    /// added — so the new variant's message would ship unguarded by the very test written to guard
+    /// it, which is the shape of gap this module already shipped once.
+    ///
+    /// **What is and is not enforced, stated precisely because the looser claim was wrong.** The
+    /// `match` in [`rejection_reason`] is exhaustive, so a new variant CANNOT compile without a
+    /// developer editing this module and giving it a message. Nothing in Rust then forces that
+    /// variant into this array — but the guard asserts its walk against `ALL.len()`, so the walk and
+    /// this list cannot drift apart, and this is the one place to add it.
+    pub const ALL: [Rejection; 2] = [Rejection::NotAbsolute, Rejection::ThisMachineOnly];
+}
+
 /// What [`parse_advertised_urls`] made of the operator's value.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Advertised {
@@ -94,6 +110,15 @@ fn rejection_reason(why: &Rejection) -> &'static str {
     }
 }
 
+/// The whole line an operator sees when one entry is dropped, the reason included.
+///
+/// The wrapper around the reason is operator-facing prose too, so it belongs in the guard's walk.
+/// Checking only the reason would leave the sentence it is embedded in unchecked while the guard
+/// claims to cover every line this module emits.
+fn not_advertised(reason: &str) -> String {
+    format!("{ADVERTISE_URLS_ENV} entry is not advertised: {reason}")
+}
+
 /// What this node reports when at least one entry survived and will be published.
 const ADVERTISING_AT_CONFIGURED_URLS: &str =
     "advertising this node's stores at the operator-configured URLs, in the configured order";
@@ -123,11 +148,11 @@ pub fn configured_urls() -> Vec<String> {
     let advertised = advertised_urls_from_env();
 
     for (entry, why) in &advertised.rejected {
-        let reason = rejection_reason(why);
         tracing::warn!(
             target: "mirror",
             entry = %entry,
-            "{ADVERTISE_URLS_ENV} entry is not advertised: {reason}"
+            "{}",
+            not_advertised(rejection_reason(why))
         );
     }
 
@@ -256,20 +281,22 @@ mod tests {
     /// that appeared to cover them.
     #[test]
     fn every_operator_facing_line_reads_as_a_sentence() {
-        let lines: Vec<(&str, String)> = [Rejection::NotAbsolute, Rejection::ThisMachineOnly]
+        // Driven from `Rejection::ALL`, and the expected count is DERIVED from it rather than
+        // written as a literal. A hard-coded `4` would actively cement a subset: add a variant,
+        // give it a message, leave it out of `ALL`, and a literal count still matches while the new
+        // line ships unchecked. The `match` below only forces the variant to be NAMED — that is
+        // what makes it visible, not what makes it walked — so the derived length is what actually
+        // ties the two together.
+        let lines: Vec<(&str, String)> = Rejection::ALL
             .iter()
             .map(|why| {
-                // Exhaustive BY CONSTRUCTION, and the name it yields is what a failure prints. A
-                // guard over an enumeration can only check the enumeration it was handed:
-                // `rejection_reason`'s own match forces a new `Rejection` variant to be GIVEN a
-                // message, but nothing would force that message into the sweep meant to check it,
-                // so it would ship unguarded by the very test that exists to guard it. This match
-                // fails to compile until the new variant is named here too.
                 let name = match why {
                     Rejection::NotAbsolute => "Rejection::NotAbsolute",
                     Rejection::ThisMachineOnly => "Rejection::ThisMachineOnly",
                 };
-                (name, rejection_reason(why).to_string())
+                // The wrapper, not the bare reason: that is the line an operator actually reads,
+                // and it contains the reason, so this covers both.
+                (name, not_advertised(rejection_reason(why)))
             })
             .chain([
                 (
@@ -282,7 +309,7 @@ mod tests {
 
         assert_eq!(
             lines.len(),
-            4,
+            Rejection::ALL.len() + 2,
             "every line this module emits must be walked, never a subset: {lines:?}"
         );
         for (name, line) in &lines {
