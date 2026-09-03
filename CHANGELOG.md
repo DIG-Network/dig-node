@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.252.11] - 2026-09-03
+
+### Features
+- **digsex:** Wire the dig-sex economic layer into the node (#456)- **digsex:** Produce real conduct evidence and persist the reward ledger (#515)
+
+### Bug Fixes
+- **wallet:** Say when a wallet-isolating override was not honoured (#489)- **wallet:** The coins reads say when their answer is not current (#490) (#492)- **wallet:** A peer-local refusal must not free inputs another destination may hold (#497)- **rpc:** Source the shell error catalogue from dig-rpc-protocol so -32004 carries one name (#494)- **wallet:** A synced phase must carry the height that bounds it (#500)- **profile-sync:** An unreadable body directory is unknown, not "nothing was ever published" (#507)- **wallet:** Anchor the service wallet seed instead of resolving it relative to cwd (#491) (#499)- **pairing:** Give a user-run client the client half of the pairing handshake (#498)- **mirror:** A Bonded verdict must not rest on one uncorroborated chain read (#506)- **wallet:** A fallback answer is bounded by the peak from its own read (#514)
+
+### Testing
+- **nc-12:** Measure the NC-12 doc claims in seams/dig_peer, guard 2 (#504)
+
 ## [0.236.0] - 2026-09-02
 
 ### Features
