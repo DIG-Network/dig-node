@@ -1073,6 +1073,37 @@ impl WalletBackend {
         }
     }
 
+    /// The freshness bound a LIVE fallback-tier answer carries: `(peak_height, synced)`
+    /// (dig-node#290, `dig-node-control-interface` 0.31.0).
+    ///
+    /// The contract defines `synced` on a `fallback` answer exactly: it is `true` if and only if
+    /// the reported `peak_height` is the height the tier that ANSWERED reported in the same read
+    /// that produced the figures. So the two are produced together, here, from the answering tier
+    /// alone — and a node MUST NOT bound a fallback answer by a peak from a different read or a
+    /// different tier.
+    ///
+    /// That rules out all three heights within easy reach at these call sites, each of which is a
+    /// measurement some other party took of something else:
+    ///
+    /// - the **replica's** peak, which describes a local database this answer did not come from;
+    /// - the **peer tier's** peak, which is the high-water mark of the node's held Chia peers —
+    ///   the bound dig-node#510 proposed and dig-node#290 REFUTED. It is a monotone `fetch_max`
+    ///   that nothing clears, so it outlives the peers that produced it and would stamp a
+    ///   departed peer's height onto a figure the oracle served;
+    /// - any **carried-over** value from an earlier read, which by construction bounds an earlier
+    ///   answer.
+    ///
+    /// `None` is returned unchanged as `(None, false)` rather than substituted, because a node
+    /// that cannot bind the figures to a height has no freshness claim to make. The figures are
+    /// still SERVED — an unobtainable bound is not a failed read — they are merely labelled
+    /// unbounded, exactly as a stale replica answer is served and labelled.
+    ///
+    /// A CACHED answer never calls this: no live read produced that row, so nothing bounds it.
+    async fn fallback_answer_bound(&self) -> (Option<u32>, bool) {
+        let peak = self.fallback.answer_peak_height().await;
+        (peak, peak.is_some())
+    }
+
     /// Whether a figure taken from the replica AT `peak_height` may be reported as CURRENT.
     ///
     /// `db_synced` — which chose the replica in the first place — cannot answer this. It is
@@ -1568,15 +1599,18 @@ impl WalletBackend {
                         pending += u128::from(c.amount);
                     }
                 }
+                // The bound, taken from the answering tier while it serves this read
+                // (dig-node#290). See `fallback_answer_bound`.
+                let (peak_height, synced) = self.fallback_answer_bound().await;
                 Ok(WalletBalanceResult {
                     balance,
                     pending,
                     source,
-                    // The DB neither produced this figure nor bounds its freshness, so its
-                    // flag and its peak say nothing about it. `false` / `null` is the truth
-                    // about a coinset-served answer, whatever the local replica's state.
-                    synced: false,
-                    peak_height: None,
+                    // The DB neither produced this figure nor bounds its freshness, so neither its
+                    // flag nor its peak says anything about it. The bound comes from the tier that
+                    // ANSWERED, in this read.
+                    synced,
+                    peak_height,
                 })
             }
         }
@@ -1716,14 +1750,18 @@ impl WalletBackend {
                 // per request either way.
                 let complete = remaining.len() <= page_size;
                 let coins: Vec<WalletCoin> = remaining.into_iter().take(page_size).collect();
+                // The bound, taken from the answering tier while it serves this read
+                // (dig-node#290). See `fallback_answer_bound`.
+                let (peak_height, synced) = self.fallback_answer_bound().await;
                 Ok(WalletCoinsResult {
                     cursor: coins.last().map(|c| c.coin_id.clone()),
                     complete,
                     coins,
                     source,
-                    // The replica neither produced these coins nor bounds their freshness (#2233).
-                    synced: false,
-                    peak_height: None,
+                    // The replica neither produced these coins nor bounds their freshness (#2233);
+                    // the answering tier's own height does (dig-node#290).
+                    synced,
+                    peak_height,
                 })
             }
         }
@@ -1854,11 +1892,14 @@ impl WalletBackend {
             .coin_record_by_id(coin_id)
             .await
             .map_err(|e| BalanceError::ReadFailed(e.to_string()))?;
+        // The bound, taken from the answering tier while it serves this read (dig-node#290).
+        // See `fallback_answer_bound`.
+        let (peak_height, synced) = self.fallback_answer_bound().await;
         Ok(WalletCoinByIdResult {
             coin: coin.as_ref().map(coin_from_fallback),
             source: Source::Fallback,
-            synced: false,
-            peak_height: None,
+            synced,
+            peak_height,
         })
     }
 
@@ -1999,11 +2040,14 @@ impl WalletBackend {
                 Some(composed_spend(&spend, &record, coin_id)?)
             }
         };
+        // The bound, taken from the answering tier while it serves this read (dig-node#290).
+        // See `fallback_answer_bound`.
+        let (peak_height, synced) = self.fallback_answer_bound().await;
         Ok(WalletCoinSpendResult {
             spend,
             source: Source::Fallback,
-            synced: false,
-            peak_height: None,
+            synced,
+            peak_height,
         })
     }
 
@@ -2081,13 +2125,16 @@ impl WalletBackend {
         let page_size = limit as usize;
         let complete = remaining.len() <= page_size;
         let coins: Vec<WalletCoin> = remaining.into_iter().take(page_size).collect();
+        // The bound, taken from the answering tier while it serves this read (dig-node#290).
+        // See `fallback_answer_bound`.
+        let (peak_height, synced) = self.fallback_answer_bound().await;
         Ok(WalletCoinsByParentResult {
             cursor: coins.last().map(|c| c.coin_id.clone()),
             complete,
             coins,
             source: Source::Fallback,
-            synced: false,
-            peak_height: None,
+            synced,
+            peak_height,
         })
     }
 
@@ -11406,6 +11453,311 @@ mod tests {
             be.spendable_coins(None).await.unwrap().len(),
             1,
             "a lapsed reservation stranded the coin"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A fallback answer is bounded by the peak from its OWN read (dig-node#290,
+    // dig-node-control-interface 0.31.0)
+    // -----------------------------------------------------------------------
+
+    /// The oracle's own peak in these fixtures.
+    const ORACLE_PEAK: u32 = 9_171_004;
+
+    /// How far the node's HELD PEERS sit above the oracle.
+    ///
+    /// The whole discriminating question is which of the two numbers an implementation reaches
+    /// for, so the fixtures must be able to tell them apart. A gap of 12 blocks is far outside
+    /// `FOLLOWING_TOLERANCE`, so a test asserting `Some(ORACLE_PEAK)` fails loudly against an
+    /// implementation that binds the answer by the peer tier — which is precisely what dig-node#510
+    /// did and what its suite could not see.
+    const PEERS_ABOVE_THE_ORACLE: u32 = 12;
+
+    /// A backend whose replica holds nothing, so every read routes to the chain tier.
+    ///
+    /// The peer tier is OBSERVABLE and AHEAD of the oracle in every fixture built here. That is the
+    /// truthful control: a node with live, corroborating peers is the state in which binding the
+    /// answer by the peers' high-water mark looks most defensible, so it is the state that must
+    /// still produce the oracle's number.
+    async fn chain_tier_backend(fb: MockFallback) -> WalletBackend {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        WalletBackend::new(db, Arc::new(fb), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(super::super::fallback::ChainPeerTier {
+                peer_count: Some(5),
+                peak_height: Some(ORACLE_PEAK + PEERS_ABOVE_THE_ORACLE),
+            })
+    }
+
+    /// A live chain tier reporting `peak` as its own height while it answers.
+    ///
+    /// FIXTURE DESIGN. It holds TWO coins on purpose, because the five live fallback arms need
+    /// different coin states to produce a NON-EMPTY answer, and an arm answering emptily would
+    /// satisfy a peak assertion without ever having served a figure:
+    ///
+    /// - `c0` is SPENT, because `coin_spend` composes the spend with the coin's record and fails
+    ///   closed on a source that reports a spend of a coin its own record calls unspent. An
+    ///   unspent `c0` makes that arm return an ERROR, so the test would never reach the assertion
+    ///   it was written for.
+    /// - `u1` is UNSPENT, because `balance_for_address` and `coins_for_address` filter to unspent
+    ///   coins. With only a spent coin they answer a zero balance and an empty page — technically
+    ///   still bounded, but a fixture in which the figures are empty cannot show that the bound
+    ///   travels WITH a figure.
+    ///
+    /// Both share the parent `pp`, so `coins_by_parent` answers non-empty too.
+    fn oracle_holding_one_coin(peak: Option<u32>) -> MockFallback {
+        let ph = "33".repeat(32);
+        let fb = MockFallback::with_coins(vec![
+            fallback_coin(
+                "c0",
+                &ph,
+                1_750,
+                Some(ORACLE_PEAK - 4),
+                Some(ORACLE_PEAK - 2),
+            ),
+            fallback_coin("u1", &ph, 900, Some(ORACLE_PEAK - 3), None),
+        ])
+        .with_spends(vec![fallback_spend("c0")]);
+        match peak {
+            Some(p) => fb.with_answer_peak(p),
+            None => fb,
+        }
+    }
+
+    /// **T1 — the ticket's own bar.** A node that HELD peers and then LOST them must not report a
+    /// fallback answer as current.
+    ///
+    /// FIXTURE DESIGN. `peer_count: None` beside `peak_height: Some(..)` is the state production
+    /// actually reaches — the peers are gone, and the high-water mark they left behind is a
+    /// monotone `fetch_max` that nothing clears. dig-node#510 bound the answer by exactly that
+    /// leftover number, so this is the input that separates the adopted rule from the refuted one.
+    /// The peer peak is left PRESENT on purpose: an implementation that reaches for it would find
+    /// a number here, and pass a test that only removed it.
+    #[tokio::test]
+    async fn a_peak_left_behind_by_departed_peers_never_bounds_a_fallback_answer() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(oracle_holding_one_coin(None)),
+            WalletConfig::default(),
+        )
+        .with_chain_peer_tier_for_tests(super::super::fallback::ChainPeerTier {
+            peer_count: None,
+            peak_height: Some(ORACLE_PEAK + PEERS_ABOVE_THE_ORACLE),
+        });
+
+        let r = be.coin_by_id("c0").await.unwrap();
+        assert_eq!(r.source, Source::Fallback);
+        assert_eq!(
+            r.peak_height, None,
+            "a height the departed peers left behind is not this answer's bound"
+        );
+        assert!(
+            !r.synced,
+            "and nothing about it can make the answer current"
+        );
+        assert!(
+            r.coin.is_some(),
+            "the figure is still SERVED, merely unbounded"
+        );
+    }
+
+    /// **T1b — zero peers, freshly observed.** The same fixture with `peer_count: Some(0)`, which
+    /// is what a live client holding no peers actually reports, and which re-arms the liveness
+    /// window rather than falling out of it. The gate proposed during review
+    /// (`peer_count.and(peak_height)`) passes on this input; the adopted rule does not.
+    #[tokio::test]
+    async fn zero_peers_held_and_freshly_observed_still_bounds_nothing() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(oracle_holding_one_coin(None)),
+            WalletConfig::default(),
+        )
+        .with_chain_peer_tier_for_tests(super::super::fallback::ChainPeerTier {
+            peer_count: Some(0),
+            peak_height: Some(ORACLE_PEAK + PEERS_ABOVE_THE_ORACLE),
+        });
+
+        let r = be.coin_by_id("c0").await.unwrap();
+        assert_eq!(r.peak_height, None);
+        assert!(!r.synced);
+    }
+
+    /// **T2 — the discriminator.** The oracle answers AND reports its own height in that read, so
+    /// the answer carries THAT height and says it is current — while the node's peers sit 12 blocks
+    /// higher.
+    ///
+    /// This is the test that fails an implementation reaching for the peer tier, for the replica,
+    /// or for a carried-over value: all three would emit `ORACLE_PEAK + 12` or `None` here.
+    #[tokio::test]
+    async fn a_fallback_answer_carries_the_peak_from_its_own_read() {
+        let be = chain_tier_backend(oracle_holding_one_coin(Some(ORACLE_PEAK))).await;
+
+        let r = be.coin_by_id("c0").await.unwrap();
+        assert_eq!(r.source, Source::Fallback);
+        assert_eq!(
+            r.peak_height,
+            Some(ORACLE_PEAK),
+            "the answering tier's own height, not the peers' high-water mark"
+        );
+        assert!(
+            r.synced,
+            "figures and peak from one read of one tier is exactly what `synced` now asserts"
+        );
+    }
+
+    /// **T3 — a tier that tracks no peak.** `false` / `null` stays the honest answer, and it is the
+    /// DEFAULT, so a tier that never learned this rule cannot accidentally claim currency.
+    #[tokio::test]
+    async fn a_tier_that_tracks_no_peak_of_its_own_claims_nothing() {
+        let be = chain_tier_backend(oracle_holding_one_coin(None)).await;
+
+        let r = be.coin_by_id("c0").await.unwrap();
+        assert_eq!(r.peak_height, None);
+        assert!(!r.synced);
+        assert!(r.coin.is_some(), "still served, still honest");
+    }
+
+    /// **T4 — the over-application guard.** A CACHED row reports `null` / `false` even though the
+    /// tier would happily report a peak, because no live read produced that row and nothing bounds
+    /// it.
+    ///
+    /// FIXTURE DESIGN. The oracle's `answer_peak` is SET here. Without that the test would pass
+    /// against an implementation that simply had no peak to stamp, which proves nothing about the
+    /// cached arm.
+    #[tokio::test]
+    async fn a_cached_row_is_bounded_by_nothing_even_when_the_tier_has_a_peak() {
+        let fb = MockFallback::default()
+            .with_cached(
+                // SPENT, for the reason `oracle_holding_one_coin` records: the cached
+                // `coin_spend` arm composes spend with record and fails closed on a coin its own
+                // record calls unspent, so an unspent fixture never reaches the assertion.
+                vec![fallback_coin(
+                    "cached",
+                    &"33".repeat(32),
+                    9,
+                    Some(ORACLE_PEAK - 900),
+                    Some(ORACLE_PEAK - 800),
+                )],
+                vec![fallback_spend("cached")],
+            )
+            .with_answer_peak(ORACLE_PEAK);
+        let be = chain_tier_backend(fb).await;
+
+        let r = be.coin_by_id("cached").await.unwrap();
+        assert_eq!(r.source, Source::Fallback);
+        assert!(r.coin.is_some(), "the cached row is still served");
+        assert_eq!(r.peak_height, None, "no live read bounds a cached row");
+        assert!(!r.synced);
+
+        let s = be.coin_spend("cached").await.unwrap();
+        assert!(s.spend.is_some());
+        assert_eq!(s.peak_height, None);
+        assert!(!s.synced);
+    }
+
+    /// **T5 — the pairing invariant, across EVERY live fallback arm.**
+    ///
+    /// `synced` and `peak_height` must agree on every arm, in BOTH directions: a bounded answer is
+    /// current, an unbounded one is not. Run twice — once with a peak, once without — because a
+    /// one-sided sweep is satisfied by an arm that hardcodes either literal.
+    #[tokio::test]
+    async fn every_live_fallback_arm_pairs_its_peak_with_its_currency_claim() {
+        let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
+        for peak in [Some(ORACLE_PEAK), None] {
+            let be = chain_tier_backend(oracle_holding_one_coin(peak)).await;
+
+            let pairs: Vec<(&str, Option<u32>, bool)> = vec![
+                {
+                    let r = be
+                        .balance_for_address(&arbitrary, BalanceAsset::Xch)
+                        .await
+                        .unwrap();
+                    ("balance_for_address", r.peak_height, r.synced)
+                },
+                {
+                    let r = be
+                        .coins_for_address(&arbitrary, BalanceAsset::Xch, None, TEST_PAGE)
+                        .await
+                        .unwrap();
+                    ("coins_for_address", r.peak_height, r.synced)
+                },
+                {
+                    let r = be.coin_by_id("c0").await.unwrap();
+                    ("coin_by_id", r.peak_height, r.synced)
+                },
+                {
+                    let r = be.coin_spend("c0").await.unwrap();
+                    ("coin_spend", r.peak_height, r.synced)
+                },
+                {
+                    let r = be.coins_by_parent("pp", None, TEST_PAGE).await.unwrap();
+                    ("coins_by_parent", r.peak_height, r.synced)
+                },
+            ];
+
+            for (arm, got_peak, synced) in pairs {
+                assert_eq!(
+                    got_peak, peak,
+                    "{arm} reported a height its own read did not produce"
+                );
+                assert_eq!(
+                    synced,
+                    peak.is_some(),
+                    "{arm} disagreed with its own peak about whether it is current"
+                );
+            }
+        }
+    }
+
+    /// **T6 — the replica tier is UNCHANGED, and `control.wallet.peak` with it.**
+    ///
+    /// A `db` answer is still measured against the peers, which is the second opinion the replica's
+    /// own peak cannot be. A wrong version of this change would apply the new rule everywhere and
+    /// silently swap the replica's bound for the oracle's, so the oracle here reports a peak that
+    /// the replica answer must ignore.
+    ///
+    /// `control.wallet.peak` returns [`ChainPeak`], which carries NO `source` field, so the
+    /// answering-tier rule cannot be EXPRESSED on it — see
+    /// <https://github.com/DIG-Network/dig-node-control-interface/issues/46>. It stays
+    /// replica-defined, and this pins that it did not drift.
+    #[tokio::test]
+    async fn the_replica_tier_and_the_peak_endpoint_are_untouched_by_this_rule() {
+        let db = db_with_owned_derivation(true, Some(ORACLE_PEAK)).await;
+        db.upsert_coin(&coin_at_ph("own", &owned_ph(), 42, Some(1), None))
+            .await
+            .unwrap();
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![owned_ph()],
+            ..Default::default()
+        };
+        let be = WalletBackend::new(
+            db,
+            Arc::new(oracle_holding_one_coin(Some(ORACLE_PEAK - 5_000))),
+            cfg,
+        )
+        .with_chain_peer_tier_for_tests(super::super::fallback::ChainPeerTier {
+            peer_count: Some(5),
+            peak_height: Some(ORACLE_PEAK),
+        });
+
+        let r = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(r.source, Source::Db);
+        assert_eq!(
+            r.peak_height,
+            Some(ORACLE_PEAK),
+            "the replica's own height, unchanged by the oracle's"
+        );
+        assert!(r.synced, "measured against the peers, exactly as before");
+
+        let p = be.chain_peak().await.unwrap();
+        assert_eq!(p.peak_height, Some(ORACLE_PEAK));
+        assert!(
+            p.synced,
+            "still the replica's claim, still measured the same way"
         );
     }
 }
