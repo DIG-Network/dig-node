@@ -252,7 +252,11 @@ mod tests {
                 assert_eq!(
                     code.name(),
                     *diga_name,
-                    "exit {} is `{}` here and `{}` in the dig-app gateway -- a shared number                      must carry the SAME meaning on both command lines, or a caller branching                      on it is reading two different failures as one",
+                    concat!(
+                        "exit {} is `{}` here and `{}` in the dig-app gateway -- a shared number ",
+                        "must carry the SAME meaning on both command lines, or a caller branching ",
+                        "on it is reading two different failures as one"
+                    ),
                     code.code(),
                     code.name(),
                     diga_name
