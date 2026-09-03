@@ -914,7 +914,12 @@ impl ErrorCode {
             }
             ErrorCode::MethodNotFound => "Method is not resolved locally or by the upstream.",
             ErrorCode::InvalidParams => "Invalid or missing method parameters.",
-            ErrorCode::DispatchFailed => "The node failed to dispatch the request.",
+            ErrorCode::DispatchFailed => {
+                concat!(
+                    "A generic server error — the shell failed to dispatch the request, or ",
+                    "the embedded read path failed internally, whichever layer answered.",
+                )
+            }
             ErrorCode::ResourceUnavailable => {
                 concat!(
                     "The requested resource is not available at the requested root — ",
