@@ -1587,7 +1587,7 @@ impl PeerRpcResponder for NodeResponder {
         // MISS -> the RELAY leg (dig-node#276). This is the peer-facing half: a requestor that cannot
         // reach the holder itself asks US, with `proxy: true`, and — if the operator opted in and the
         // requestor is inside its proxy allowance — this node pulls the whole capsule from a holder
-        // and serves the window from its own cache. All three gates live in `relay_capsule`; a refusal
+        // and serves the window from its own cache. All four gates live in `relay_capsule`; a refusal
         // leaves the not-held frame below exactly as it was, so the requestor stays free to ask
         // another hop (NC-12: a hop's "not found" may be a lie, including ours).
         let mut relay = crate::seams::dig_peer::module_relay::RelayStatus::Refused;
