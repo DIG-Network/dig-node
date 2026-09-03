@@ -30,7 +30,7 @@ name = "dig-node-core"
 # dig-node#276/#296). Changing a public return type is BREAKING for an out-of-workspace implementor;
 # this crate is consumed in-workspace only and is pre-1.0, so it is a MINOR bump under SemVer's 0.x
 # rule -- recorded here rather than letting the number imply the locator surface held still.
-version = "0.68.0"
+version = "0.68.1"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -290,22 +290,21 @@ zeroize = "1"
 # an outright compile error on those seams rather than merely two mTLS stacks. See
 # `seams/dig_peer/dht.rs::stage_failed` for this crate's side of the adoption.
 dig-nat = "0.21"
-# dig-gossip is the ONE peer-stack exception: not yet published to crates.io (its publish is guarded
-# pending dig-peer-protocol, #681), so it stays a git dependency PINNED to a release commit — here
-# v0.17.12 (rev 3e352d91).
+# dig-gossip is the ONE peer-stack exception: it stays a git dependency PINNED to a release commit
+# (dig_ecosystem#2647, NC-7 exception) — here v0.32.0 (rev 1a3391662ecce1a3cbe8b74122a52bbb1b28d3ee).
+# It cannot be published to crates.io while its `native-tls` [patch.crates-io] fork stands, because
+# `cargo publish` strips the patch from published metadata, leaving a consumer building against upstream
+# native-tls (which accepts peers with no client certificate) instead of the mTLS-required pinned version.
 #
-# v0.17.12 is REQUIRED, not merely current (#1771): it carries all THREE duplicate-connection fixes,
-# and until it landed here the node's pool refused connections that would have worked. Every pool-add
-# path now supersedes a stale slot for an already-authenticated `peer_id` instead of refusing the newer
-# session — inbound (#1691), `connect_to` (#1703), and `adopt_nat_connection` (#1762), the last being
-# the path EVERY dig-nat connection is adopted through, where a dead relay circuit's leftover slot
-# refused the direct dial while the peer reported zero connections. `DuplicateConnection` still exists
-# as an error variant but is no longer raised on those paths. Consequence for this crate: `PeerAdded` is
-# REPUBLISHED on a supersede, so every consumer of it must be keyed by `peer_id` and idempotent (the DHT
-# routing feed, the selector registry, and the download-side connected pool all are — see
-# `download.rs::on_pool_event`), and `GossipStats::total_connections` is a LIFETIME counter that a
-# supersede increments, so it must never be read as a count of unique peers (this crate reads
-# `connected_peers` / `pool_stats().connected`, which are the live keyed-map sizes).
+# This rev carries all THREE duplicate-connection fixes (#1691/#1703/#1762), and every pool-add path now
+# supersedes a stale slot for an already-authenticated `peer_id` instead of refusing the newer session.
+# `DuplicateConnection` still exists as an error variant but is no longer raised on those paths.
+# Consequence for this crate: `PeerAdded` is REPUBLISHED on a supersede, so every consumer of it must be
+# keyed by `peer_id` and idempotent (the DHT routing feed, the selector registry, and the
+# download-side connected pool all are — see `download.rs::on_pool_event`), and
+# `GossipStats::total_connections` is a LIFETIME counter that a supersede increments, so it must never
+# be read as a count of unique peers (this crate reads `connected_peers` / `pool_stats().connected`,
+# which are the live keyed-map sizes).
 #
 # Also on 0.17: the outbound /16+AS diversity caps (#1710/#1716) apply to the adoption path, so a
 # test fixture adopting two peers must place them in DIFFERENT /16 groups.

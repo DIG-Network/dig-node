@@ -61,10 +61,11 @@ const MAX_CACHED_VERDICTS: usize = 1024;
 
 /// The most locate-triggered verifications this PROCESS will pay for in one burst.
 ///
-/// Each one costs up to two blocking HTTPS reads through the node's ONE shared `ChiaQuery` client —
-/// the same client the wallet, the collateral census and the mirror spends read through. So this
+/// Each one reads through `corroborated_chain_source` (dig-node#503, dig-node#527 item 3) —
+/// `api.coinset.org` first, falling back to a `BOND_CORROBORATION_FLOOR`-peer corroborated round
+/// only when that read fails, never a bare uncorroborated read from a single shared client. So this
 /// ceiling is not about fairness between requestors; it is about this node keeping its own chain
-/// access when a stranger directs traffic at it.
+/// access — and its peers' attention on a fallback round — when a stranger directs traffic at it.
 ///
 /// The inbound admission gate (`allow_miss_lookup`, burst 16 at 4/sec) is PER REQUESTOR over up to
 /// 4,096 self-minted identities and has no aggregate cap, so it cannot bound this. Sixteen is
@@ -105,6 +106,23 @@ const MAX_UNPROVEN_COINS_PER_CLAIMANT: usize = 4;
 /// How long a claimant's unproven-coin ledger is remembered. Matched to [`VERDICT_TTL`] so a peer
 /// that genuinely rotates coins is forgiven on the same clock a cached verdict expires on.
 const CLAIMANT_LEDGER_WINDOW: Duration = VERDICT_TTL;
+
+/// How often the SAME unproven `(claimant, coin_id)` pair may re-enter admission (dig-node#527,
+/// item 1).
+///
+/// A coin that does not declare its claimant produces [`BondVerdict::Unverified`], and
+/// [`VerdictCache::remember`] deliberately never caches `Unverified` — so without this bound, a
+/// repeat of that exact pair paid only the process-wide token bucket, refilling at
+/// [`VERIFICATION_REFILL_PER_SEC`]. That let one `(peer_id, coin_id)` pair a stranger controls hold
+/// [`ReadAdmission::shared`]'s ENTIRE budget at zero forever, sustained at roughly one request per
+/// second — silencing every other claimant's verification, not just this one's.
+///
+/// Matched to [`VERDICT_TTL`] rather than given its own tuning knob: an honest re-ask of a coin
+/// whose cached verdict genuinely expired is indistinguishable, from this ledger's point of view,
+/// from an attacker repeating a coin that will never declare them. Both are bounded to the exact
+/// cadence a cache hit would have given the honest case for free, which costs the honest claimant
+/// nothing it wasn't already going to wait for.
+const UNPROVEN_COIN_RETRY_COOLDOWN: Duration = VERDICT_TTL;
 
 /// The most claimants tracked in that ledger at once.
 ///
@@ -403,6 +421,12 @@ struct ReadAdmission {
     state: Mutex<AdmissionState>,
 }
 
+/// Per claimant: when its ledger window opened, and the distinct coin ids it has spent reads on
+/// without proving a bond, each mapped to WHEN it was last admitted — so a repeat of the same coin
+/// id can be throttled to [`UNPROVEN_COIN_RETRY_COOLDOWN`] independently of the process-wide
+/// bucket.
+type ClaimantLedger = HashMap<[u8; 32], (Instant, HashMap<[u8; 32], Instant>)>;
+
 /// [`ReadAdmission`]'s interior, held under one lock so the two limits are decided atomically —
 /// a token spent on a claim the ledger was about to refuse would be a leak.
 struct AdmissionState {
@@ -412,11 +436,10 @@ struct AdmissionState {
     refilled_at: Instant,
     burst: f64,
     refill_per_sec: f64,
-    /// Per claimant: when its window opened, and the distinct coin ids it has spent reads on
-    /// without proving a bond. Keyed on the SHA-256 of the lowercased peer id, for the reason
-    /// [`VerdictKey`] hashes it — the key must be fixed-size against an attacker-chosen string, and
-    /// two hex spellings must be one identity.
-    unproven: HashMap<[u8; 32], (Instant, std::collections::HashSet<[u8; 32]>)>,
+    /// Keyed on the SHA-256 of the lowercased peer id, for the reason [`VerdictKey`] hashes it —
+    /// the key must be fixed-size against an attacker-chosen string, and two hex spellings must be
+    /// one identity.
+    unproven: ClaimantLedger,
 }
 
 impl ReadAdmission {
@@ -470,11 +493,20 @@ impl ReadAdmission {
             return false;
         }
         if let Some((_, coins)) = state.unproven.get(&claimant) {
-            // A coin id this claimant has already been read about is not a new question: the cache
-            // entry for it has simply expired, and re-asking is what keeps a verdict fresh. Only
-            // DISTINCT unproven ids count against the ledger.
-            if !coins.contains(&claimed_coin_id) && coins.len() >= MAX_UNPROVEN_COINS_PER_CLAIMANT {
-                return false;
+            match coins.get(&claimed_coin_id) {
+                // A repeat of a coin this claimant already spent a read on. Bounded to the SAME
+                // cadence a cache hit would have given an honest re-ask — never a fresh admission
+                // every attempt, which is what let one unprovable pair hold the whole process-wide
+                // bucket at zero (dig-node#527, item 1).
+                Some(last_admitted) if last_admitted.elapsed() < UNPROVEN_COIN_RETRY_COOLDOWN => {
+                    return false;
+                }
+                // Genuinely new to this claimant: only DISTINCT unproven ids count against the
+                // ledger cap.
+                None if coins.len() >= MAX_UNPROVEN_COINS_PER_CLAIMANT => {
+                    return false;
+                }
+                _ => {}
             }
         }
 
@@ -485,9 +517,9 @@ impl ReadAdmission {
         state
             .unproven
             .entry(claimant)
-            .or_insert_with(|| (now, std::collections::HashSet::new()))
+            .or_insert_with(|| (now, HashMap::new()))
             .1
-            .insert(claimed_coin_id);
+            .insert(claimed_coin_id, now);
         true
     }
 
@@ -520,11 +552,18 @@ fn claimant_key(claiming_peer_id: &str) -> [u8; 32] {
 /// ordering rather than re-deriving it: the budget is consulted BEFORE the source is touched, so a
 /// refused claim reads nothing, and a proven bond forgives its claimant's ledger.
 ///
-/// The parameter list is `verdict_for`'s, in `verdict_for`'s order, with the budget in front. That
-/// is deliberate and is why the lint is allowed here rather than satisfied by grouping: four of the
-/// arguments are opaque 32-byte values, so the one mistake this wrapper could make is transposing
-/// two of them, and a signature that mirrors the wrapped function exactly makes such a transposition
-/// visible at the call site below instead of hiding it inside a re-packing struct.
+/// **`required_collateral` is a THUNK, not a value, and that is load-bearing (dig-node#527, item
+/// 2).** `current_requirement()` — the production caller — is a synchronous file read plus a JSON
+/// parse; if it were an already-evaluated `Option<u64>` argument, Rust would run it while building
+/// this call's argument list, which happens BEFORE `admit()` below ever runs. A claim `admit()` was
+/// always going to refuse would still have paid the read. Taking a closure defers that cost to
+/// exactly the branch that needs it: only a claim that survives admission ever calls it.
+///
+/// The parameter list is otherwise `verdict_for`'s, in `verdict_for`'s order, with the budget in
+/// front. That is deliberate and is why the lint is allowed here rather than satisfied by grouping:
+/// four of the arguments are opaque 32-byte values, so the one mistake this wrapper could make is
+/// transposing two of them, and a signature that mirrors the wrapped function exactly makes such a
+/// transposition visible at the call site below instead of hiding it inside a re-packing struct.
 #[allow(clippy::too_many_arguments)]
 fn admitted_verdict_for<S: ChainSource>(
     admission: &ReadAdmission,
@@ -532,7 +571,7 @@ fn admitted_verdict_for<S: ChainSource>(
     store_launcher_id: Bytes32,
     root_hash: Bytes32,
     epoch: &BigInt,
-    required_collateral: Option<u64>,
+    required_collateral: impl FnOnce() -> Option<u64>,
     claiming_peer_id: &str,
     claimed_coin_id: Bytes32,
 ) -> BondVerdict {
@@ -544,7 +583,7 @@ fn admitted_verdict_for<S: ChainSource>(
         store_launcher_id,
         root_hash,
         epoch,
-        required_collateral,
+        required_collateral(),
         claiming_peer_id,
         claimed_coin_id,
     );
@@ -628,6 +667,11 @@ impl ChainBondVerifier {
     }
 
     /// The chain half: one bounded read, memoised.
+    ///
+    /// Takes no `required_collateral` parameter, deliberately (dig-node#527, item 2): the epoch
+    /// requirement is a synchronous file read, and computing it here — before `admit()` — would
+    /// pay that read for a claim the budget was always going to refuse. `admitted_verdict_for`
+    /// receives [`current_requirement`] itself as a thunk and calls it only past that gate.
     #[allow(clippy::too_many_arguments)]
     async fn verify_against_chain(
         &self,
@@ -635,7 +679,6 @@ impl ChainBondVerifier {
         store: Bytes32,
         root: Bytes32,
         epoch: u64,
-        required: Option<u64>,
         claiming_peer_id: &str,
         coin_id: [u8; 32],
     ) -> BondVerdict {
@@ -669,6 +712,21 @@ impl ChainBondVerifier {
             return BondVerdict::Unverified;
         };
 
+        // Peer-availability pre-check (dig-node#527, item 4): a sample too small to ever meet
+        // `source.required_floor()` makes `Bonded` unreachable exactly as surely as
+        // `declaration_source_is_readable()` does above, so the read below is skipped rather than
+        // paid for a verdict `tally_with_floor` cannot produce.
+        //
+        // `live_peer_hint` is a non-dialling PEEK at whatever the last draw already held, never a
+        // reason to dial ourselves: forcing a fresh redraw for every claim a thin network cannot
+        // satisfy would trade one honest `Unverified` for a redial storm against that same thin
+        // network, which is the worse defect (§2.6 -- report the truth, do not manufacture load).
+        // `None` (nothing drawn yet) fails OPEN into the real read, which is what discovers peers
+        // in the first place.
+        if sample_cannot_meet_floor(source.live_peer_hint(), source.required_floor()) {
+            return BondVerdict::Unverified;
+        }
+
         // The concurrency ceiling, and `try_acquire` rather than `acquire`: a queue of tasks
         // waiting for a permit is an unbounded backlog of attacker-directed work held on this
         // node's heap, and the honest answer when the budget is saturated is available immediately
@@ -690,7 +748,7 @@ impl ChainBondVerifier {
                 store,
                 root,
                 &epoch_big,
-                required,
+                current_requirement,
                 claiming_peer_id,
                 Bytes32::new(coin_id),
             )
@@ -699,6 +757,20 @@ impl ChainBondVerifier {
         self.cache.remember(key, verdict);
         verdict
     }
+}
+
+/// Whether a chain read would be spent on a sample too small to ever produce `Bonded`
+/// (dig-node#527, item 4).
+///
+/// A pure predicate over the two inputs [`ChainBondVerifier::verify_against_chain`] gathers, kept
+/// separate from the caller so the decision is unit-testable without a real chain transport or any
+/// network dial.
+///
+/// `live_hint` is `None` whenever nothing is known yet (no draw has happened) — that fails OPEN
+/// into the real read, which is what discovers peers in the first place, never into a refusal a
+/// caller could mistake for the network having none.
+fn sample_cannot_meet_floor(live_hint: Option<usize>, required_floor: usize) -> bool {
+    live_hint.is_some_and(|live| live < required_floor)
 }
 
 /// The `(store, root)` a bond could be checked against, or `None` for a store-granularity id.
@@ -774,16 +846,8 @@ impl MirrorBondVerifier for ChainBondVerifier {
             return hit;
         }
 
-        self.verify_against_chain(
-            key,
-            store,
-            root,
-            epoch,
-            current_requirement(),
-            claiming_peer_id,
-            coin_id,
-        )
-        .await
+        self.verify_against_chain(key, store, root, epoch, claiming_peer_id, coin_id)
+            .await
     }
 }
 
@@ -1165,7 +1229,7 @@ mod tests {
                 Bytes32::new(STORE),
                 Bytes32::new(ROOT),
                 &BigInt::from(7u64),
-                Some(1),
+                || Some(1),
                 // A fresh claimant per row, each a well-formed 64-hex id.
                 &format!("{claim:064x}"),
                 Bytes32::new([0x33; 32]),
@@ -1223,7 +1287,7 @@ mod tests {
                 Bytes32::new(STORE),
                 Bytes32::new(ROOT),
                 &BigInt::from(7u64),
-                Some(1),
+                || Some(1),
                 &claimant,
                 Bytes32::new([invented; 32]),
             );
@@ -1243,7 +1307,7 @@ mod tests {
             Bytes32::new(STORE),
             Bytes32::new(ROOT),
             &BigInt::from(7u64),
-            Some(1),
+            || Some(1),
             &"bb".repeat(32),
             Bytes32::new([0x01; 32]),
         );
@@ -1251,6 +1315,73 @@ mod tests {
             reads.load(AtomicOrdering::Relaxed),
             MAX_UNPROVEN_COINS_PER_CLAIMANT + 1,
             "the ledger is per claimant; one peer exhausting its allowance must not silence another"
+        );
+    }
+
+    /// **Proves (dig-node#527, item 4, HIGH):** a sample too small for the bond floor is detected
+    /// WITHOUT dialling, and a not-yet-known sample never falsely refuses.
+    #[test]
+    fn a_sample_below_the_required_floor_is_recognised_without_a_read() {
+        assert!(
+            sample_cannot_meet_floor(Some(2), 3),
+            "two live peers can never satisfy a floor of three -- `tally_with_floor` would return \
+             `Insufficient` every time, so the read is skippable"
+        );
+        assert!(
+            !sample_cannot_meet_floor(Some(3), 3),
+            "a sample that exactly meets the floor must still be tried"
+        );
+        assert!(
+            !sample_cannot_meet_floor(Some(4), 3),
+            "a sample above the floor must still be tried"
+        );
+        assert!(
+            !sample_cannot_meet_floor(None, 3),
+            "an unknown sample (nothing drawn yet) fails OPEN into the real read -- that is what \
+             discovers peers in the first place, and a hint must never be read as a refusal"
+        );
+    }
+
+    /// **Proves (dig-node#527, item 1, HIGH):** repeating the SAME unproven coin id does not buy a
+    /// fresh chain read every attempt.
+    ///
+    /// **Catches:** the ledger bypass the distinct-coin cap left open. A coin that does not declare
+    /// its claimant returns [`BondVerdict::Unverified`], which [`VerdictCache::remember`]
+    /// deliberately never caches — so before this fix, re-asking about the identical
+    /// `(claimant, coin_id)` pair spent only the process-wide token bucket, never the ledger. At
+    /// [`VERIFICATION_REFILL_PER_SEC`] that is a sustainable ~1 request/sec that holds
+    /// [`ReadAdmission::shared`]'s entire budget at zero, forever, off ONE fabricated coin.
+    ///
+    /// The budget here is deliberately enormous (`1_000` burst, `1_000.0`/sec refill) so the token
+    /// bucket can never be what stops the 50th attempt — only the per-pair cooldown this fix adds.
+    #[test]
+    fn a_repeated_unproven_coin_id_stops_costing_a_fresh_read_every_attempt() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingChain {
+            reads: Arc::clone(&reads),
+        };
+        let admission = ReadAdmission::new(1_000, 1_000.0);
+        let claimant = "cc".repeat(32);
+        let same_coin = Bytes32::new([0x42; 32]);
+
+        for _ in 0..50 {
+            admitted_verdict_for(
+                &admission,
+                &source,
+                Bytes32::new(STORE),
+                Bytes32::new(ROOT),
+                &BigInt::from(7u64),
+                || Some(1),
+                &claimant,
+                same_coin,
+            );
+        }
+
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            1,
+            "a claimant repeating ONE unproven coin id must be bounded to the SAME cadence a cache \
+             hit would give an honest re-ask, never a fresh chain read every attempt"
         );
     }
 

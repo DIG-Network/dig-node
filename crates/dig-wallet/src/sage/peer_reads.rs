@@ -139,6 +139,21 @@ pub trait PeerSample: Send + Sync {
     /// The peers for one round. An empty or single-peer draw is a legitimate answer — the tally
     /// refuses it as [`quorum::Verdict::Insufficient`] rather than the draw pretending otherwise.
     async fn draw(&self) -> Vec<Arc<dyn CoinPeer>>;
+
+    /// A CHEAP, non-dialling peek at how many peers the LAST draw held live, or `None` when that
+    /// is unknown (nothing drawn yet, or an implementor that keeps no such state).
+    ///
+    /// This exists so a caller with a stricter-than-default corroboration floor
+    /// (dig-node#527, item 4) can tell, before paying for a query round, that the CURRENTLY held
+    /// sample cannot possibly meet it — the sample this trait's default `draw()` reuses is sized
+    /// for [`quorum::CORROBORATION_FLOOR`], never for a stricter caller's floor, and no cache
+    /// design changes that without forcing a fresh dial round on every such call. A hint is
+    /// deliberately conservative in the OTHER direction too: it never causes a dial, so it can
+    /// only ever be stale-low, never stale-high — a caller that trusts it skips work it could not
+    /// have won, and never skips work that might have succeeded.
+    fn live_count_hint(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Reads the clock the cache ages entries against. A seam so a cache test pins an explicit `NOW`
@@ -181,6 +196,11 @@ impl PeerCorroboratedReads {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// [`PeerSample::live_count_hint`] for whichever sample this instance draws through.
+    pub fn live_count_hint(&self) -> Option<usize> {
+        self.sample.live_count_hint()
     }
 
     /// The coin record the CACHE can serve for `coin_id`, dialling nothing (dig_ecosystem#3044).
