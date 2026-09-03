@@ -320,6 +320,14 @@ pub struct OptionDbRow {
     pub coin_id: String,
     /// The underlying-lock coin's id (hex) — what the option, once exercised, releases.
     pub underlying_coin_id: String,
+    /// The underlying-lock coin's PARENT coin id (hex), recorded at mint.
+    ///
+    /// `None` means UNKNOWN, never "no parent": the row predates this column, or the option was
+    /// acquired by transfer rather than minted here. Exercise needs the whole underlying `Coin`,
+    /// and the coin sits at a derived puzzle hash the replica does not subscribe to, so without
+    /// this the coin cannot be rebuilt locally. A `None` MUST produce the documented 400 --
+    /// substituting any other value builds a spend against a different coin.
+    pub underlying_parent_coin_id: Option<String>,
     /// The underlying delegated-puzzle tree hash (hex) — part of the option's on-chain info.
     pub underlying_delegated_puzzle_hash: String,
     /// The current p2 (owner) puzzle hash (hex).
@@ -669,6 +677,13 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     // on what it said (dig-node#383). NULL means "not examined yet", which is the right reading
     // for every row written before this column existed: they are re-examined once and then settle.
     "ALTER TABLE coins ADD COLUMN attribution_examined INTEGER",
+    // The underlying-lock coin's PARENT id, recorded at mint so `exercise_options` can rebuild
+    // the full underlying `Coin` (parent + puzzle hash + amount) with no chain read. The coin
+    // sits at a derived puzzle hash outside the wallet's ordinary subscription set, so the
+    // replica never holds a row for it. NULL means UNKNOWN -- an option minted before this
+    // column existed, or one acquired by transfer -- and MUST route to the documented 400,
+    // never to a guessed value.
+    "ALTER TABLE options ADD COLUMN underlying_parent_coin_id TEXT",
     // dig-node#454. Counts the coin-database RESETS this replica has undergone, so a catch-up
     // that began before one cannot mark the emptied replica synced afterwards. An existing DB
     // arrives at the `0` default, which is right: it has been reset zero times, and the first
@@ -4001,12 +4016,14 @@ impl WalletDb {
     pub async fn upsert_option(&self, o: &OptionDbRow) -> sqlx::Result<()> {
         sqlx::query(
             "INSERT INTO options
-                (option_id, coin_id, underlying_coin_id, underlying_delegated_puzzle_hash,
+                (option_id, coin_id, underlying_coin_id, underlying_parent_coin_id,
+                 underlying_delegated_puzzle_hash,
                  p2_puzzle_hash, visible, created_height, record_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(option_id) DO UPDATE SET
                 coin_id = excluded.coin_id,
                 underlying_coin_id = excluded.underlying_coin_id,
+                underlying_parent_coin_id = excluded.underlying_parent_coin_id,
                 underlying_delegated_puzzle_hash = excluded.underlying_delegated_puzzle_hash,
                 p2_puzzle_hash = excluded.p2_puzzle_hash,
                 created_height = excluded.created_height,
@@ -4015,6 +4032,7 @@ impl WalletDb {
         .bind(&o.option_id)
         .bind(&o.coin_id)
         .bind(&o.underlying_coin_id)
+        .bind(&o.underlying_parent_coin_id)
         .bind(&o.underlying_delegated_puzzle_hash)
         .bind(&o.p2_puzzle_hash)
         .bind(o.visible)
@@ -4030,6 +4048,7 @@ impl WalletDb {
             option_id: r.get("option_id"),
             coin_id: r.get("coin_id"),
             underlying_coin_id: r.get("underlying_coin_id"),
+            underlying_parent_coin_id: r.get("underlying_parent_coin_id"),
             underlying_delegated_puzzle_hash: r.get("underlying_delegated_puzzle_hash"),
             p2_puzzle_hash: r.get("p2_puzzle_hash"),
             visible: r.get::<i64, _>("visible") != 0,
@@ -5950,6 +5969,7 @@ mod tests {
             option_id: "opt1".into(),
             coin_id: "c1".into(),
             underlying_coin_id: "u1".into(),
+            underlying_parent_coin_id: None,
             underlying_delegated_puzzle_hash: "dph".into(),
             p2_puzzle_hash: "p2".into(),
             visible: true,
