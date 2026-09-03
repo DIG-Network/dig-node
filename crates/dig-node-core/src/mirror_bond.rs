@@ -127,9 +127,24 @@ pub enum BondVerdict {
 /// holder that never published this record. An implementation owes the pair exactly one chain lookup
 /// and no retry loop.
 ///
-/// The parameter is an `Option` rather than a requirement so an implementation that can establish a
-/// holder's owner puzzle hash by some other route may fall back to `dig-mirror-coin`'s hint scan
-/// without a change to this seam.
+/// The parameter is an `Option` because absence is ORDINARY, not because a cheaper lookup covers
+/// it. A record legitimately carries no pointer -- an unbonded holder, a publisher that predates its
+/// coin, a record republished across an epoch rollover -- and a STORE-granularity record carries
+/// none by construction, since a mirror coin bonds `(store, root, owner, epoch)` while
+/// `ContentId::Store` names no root.
+///
+/// Nothing in `dig-mirror-coin` stands in for the missing pointer as things are shaped today.
+/// `dig_mirror_coin::discover` and `list` both take `owner_puzzle_hash` as a REQUIRED parameter,
+/// because the hint is morphed from the owner, and a [`ProviderRecord`] carries no owner and no
+/// route to one. An owner-less walk of the shared mirror puzzle hash is expressible one level down
+/// at the chain source, but it would need a soundness argument this seam does not have: it is
+/// bounded at `dig_mirror_coin::MAX_CANDIDATES` over a list anyone may extend for the price of a
+/// dust coin, so its "not found" is not a negative a verifier may act on, and it turns one free
+/// inbound record into an unbounded outbound read.
+///
+/// So an implementation that has no pointer to fetch answers [`BondVerdict::Unverified`]: it
+/// withholds credit and leaves the holder exactly where a slate with no pointers would have left
+/// it. It does not demote, and it does not treat the absence as a fault.
 #[async_trait]
 pub trait MirrorBondVerifier: Send + Sync {
     /// Whether `claimed_coin_id` bonds `content` for the current collateral epoch **on behalf of

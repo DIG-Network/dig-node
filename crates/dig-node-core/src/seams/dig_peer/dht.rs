@@ -432,14 +432,15 @@ pub async fn announce_inventory_ids(
 /// claims were drawn for (#422).
 ///
 /// The claim is **UNTRUSTED** (NC-12). Publishing it tells a verifier WHERE TO LOOK — one coin to
-/// fetch instead of a scan of the mirror puzzle hash — and never WHAT THE COIN IS. A verifier
+/// fetch instead of searching for it — and never WHAT THE COIN IS. A verifier
 /// accepts a coin only on the coin's own evidence: found at the mirror puzzle hash, genuinely $DIG
 /// with the asset id re-derived from the creating spend, carrying the declared collateral, and
 /// `MirrorCoin::advertises(store, root, epoch)` passing. Nothing published here enters that
 /// judgement, so a lying peer buys itself a wasted lookup and nothing else.
 ///
 /// **Absence is a normal, fully supported state.** A node with no coin for a capsule — or no
-/// pointer source at all — announces exactly as before; the verifier's fallback is the hint scan.
+/// pointer source at all — announces exactly as before, and a verifier that cannot fetch a pointer
+/// withholds credit rather than demoting the holder.
 /// An implementation MUST NOT treat `None` as a fault, and MUST NOT let it suppress the announce.
 ///
 /// [`epoch`](Self::epoch) exists because a mirror coin bonds a `(store, root, owner, epoch)` tuple
