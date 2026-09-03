@@ -752,11 +752,11 @@ Chia mainnet header hash at height 9,021,277 — so the gossip config is ACCEPTE
 start. `dig-gossip` rejects only an all-zero `network_id`, and `genesis_challenge_from`'s own unit
 tests (`peer.rs`, `genesis_challenge_env_override`) prove every invalid/unset/zero override still
 falls back to that non-zero default, so no code path can produce an all-zero id (see the override
-below) and bring-up is not gated on the genesis. **Open**: no test in this crate yet exercises the
-full bring-up (gossip start, DHT up, content engine + inventory refresher installed, mTLS peer-RPC
-listener bound and accepting) against the default genesis, and none exercises pool convergence or PEX
-exchange against a real peer — tracked as
-https://github.com/DIG-Network/dig-node/issues/240 item 1.
+below) and bring-up is not gated on the genesis. The full bring-up — gossip pool start, DHT up,
+content engine + inventory refresher installed, mTLS peer-RPC listener bound and accepting — against
+the default genesis is exercised in `crates/dig-node-core/tests/genesis_bringup.rs`
+(`default_genesis_brings_up_the_pool_dht_content_engine_and_peer_rpc_listener()`). **Open**: pool
+convergence and PEX exchange against real peers — tracked separately, requires multi-node e2e.
 
 **`DIG_NETWORK_GENESIS` override (#285).** Step 3's `GossipConfig.network_id` is resolved by
 `peer::genesis_challenge_from_env`: when the env var `DIG_NETWORK_GENESIS` is set to a valid
