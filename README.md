@@ -356,7 +356,7 @@ distinguishing node-shell errors from upstream/boundary ones), beside the numeri
 | -32600 | `INVALID_REQUEST` | shell | Not a single JSON-RPC object (batch arrays unsupported). |
 | -32601 | `METHOD_NOT_FOUND` | boundary | Not resolved locally or by the upstream. |
 | -32602 | `INVALID_PARAMS` | upstream | Invalid or missing method parameters. |
-| -32000 | `DISPATCH_FAILED` | shell | The node failed to dispatch the request. |
+| -32000 | `SERVER_ERROR` | shell | The request failed on the way to, or inside, the read path. Minted by both the shell and the node library; `data.origin` says which. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay to the upstream failed. |
 | -32030 | `UNAUTHORIZED` | shell | A `control.*` method was called without a valid local control token. |
 | -32031 | `NOT_SUPPORTED` | shell | A control op the node build can't perform (e.g. §21 sync with no identity). |

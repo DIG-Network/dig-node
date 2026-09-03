@@ -564,7 +564,8 @@ pub struct Node {
     /// network, and must keep constructing a `Node` without either.
     ///
     /// `None` is an ORDINARY configuration, never a degraded one — a node with no pointer source
-    /// announces exactly as it always did, and the verifier's fallback is the hint scan.
+    /// announces exactly as it always did, and a verifier that cannot fetch a pointer withholds
+    /// credit rather than demoting the holder.
     mirror_pointers: OnceLock<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>>,
 }
 
@@ -4573,7 +4574,11 @@ pub async fn handle_rpc_json(
 /// Every frame is minted through [`seams::dig_rpc::errors::error_frame`], so a declared code
 /// carries `data.code` + `data.origin` from `dig-rpc-protocol` by construction rather than by
 /// each call site remembering to add them (dig-node#340).
-fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
+///
+/// PUBLIC so a consumer that also mints frames at the same numbers — the dig-node shell — can be
+/// tested against the frame this crate actually emits, rather than against a restatement of it.
+/// Two producers of one wire shape are one edit away from disagreeing (dig-node#496).
+pub fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
     crate::seams::dig_rpc::errors::error_frame(id, code, message)
 }
 
@@ -5238,10 +5243,13 @@ mod tests {
     /// ([`RESOURCE_UNAVAILABLE`] and [`RESOURCE_NOT_AVAILABLE`]) are correctly read as one condition
     /// under two names rather than as a collision.
     ///
-    /// Deliberately NOT exhaustive yet: `content_serve::SERVE_UNREADABLE` (`-32000`) specialises the
-    /// canonical `SERVER_ERROR`, and the chat band (`-32050`..`-32052`) is undeclared upstream
-    /// entirely. Both are pre-existing and out of this change; adding them is a follow-up that has to
+    /// Deliberately NOT exhaustive yet: the chat band (`-32050`..`-32052`) is undeclared upstream
+    /// entirely. That is pre-existing and out of this change; adding it is a follow-up that has to
     /// resolve the condition, not the table.
+    ///
+    /// `content_serve::SERVE_UNREADABLE` used to be named here as a second `-32000` gap. It was not
+    /// one: its code field's only sink answered `502` from the message and never read the number, so
+    /// it was a dead const rather than a producer, and it has been deleted (dig-node#496).
     const LOCAL_WIRE_CODES: &[(i64, &str)] = &[
         (
             crate::download::CONTENT_MISS_RATE_LIMITED,
