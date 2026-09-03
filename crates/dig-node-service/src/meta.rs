@@ -1740,7 +1740,10 @@ mod tests {
             .collect();
         assert!(
             control_wallet_reads.len() >= 2,
-            "expected the light-client chain reads in CONTROL_METHODS; found {} - this guard              would otherwise pass vacuously",
+            concat!(
+                "expected the light-client chain reads in CONTROL_METHODS; found {} - this guard ",
+                "would otherwise pass vacuously"
+            ),
             control_wallet_reads.len()
         );
 
@@ -1748,7 +1751,12 @@ mod tests {
             for prefix in RETIRED_CUSTODY_PREFIXES {
                 assert!(
                     !name.starts_with(prefix),
-                    "`{name}` is a light-client chain read and must stay discoverable, but the                      retired prefix `{prefix}` matches it"
+                    concat!(
+                        "`{name}` is a light-client chain read and must stay discoverable, but the ",
+                        "retired prefix `{prefix}` matches it"
+                    ),
+                    name = name,
+                    prefix = prefix
                 );
             }
         }
