@@ -3715,8 +3715,12 @@ prove peers are ordered by observed answer quality, never excluded by it.
 
 **Non-performance MUST NEVER exclude.** `dig_sex::dial_share` returns `0.0` only when a record's
 `proven_faults > 0`; every non-performance penalty is floored at `MIN_NON_PERFORMANCE_DIAL_SHARE`
-(0.1) and decays one `NON_PERFORMANCE_DECAY_TICKS`-sized step (600 ticks) per elapsed tick, with no
-requirement that the peer be re-dialled or prove anything to recover. This is what stops an attacker
+(0.1) and one unit of it decays for every `NON_PERFORMANCE_DECAY_TICKS` (600) of elapsed time, with
+no requirement that the peer be re-dialled or prove anything to recover. The penalty MUST be a
+function of elapsed ticks ALONE and never of how often this node happened to observe the peer:
+`decay` carries the unspent remainder of a period forward rather than restamping the record
+(`conduct.rs:158-178`), so a peer this node talks to often cannot be held un-decayed by the
+observation traffic itself. This is what stops an attacker
 who can degrade an honest peer — load, connection-slot exhaustion, a partition — from evicting it
 from every reader's dial set merely by making it slow. `conduct.rs:217`
 (`sustained_non_performance_never_silences_a_peer_completely`) and `conduct.rs:277`
