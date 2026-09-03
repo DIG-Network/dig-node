@@ -232,9 +232,10 @@ fn two_creates_in_one_pass_select_disjoint_coins() {
         // Non-empty: `create` refuses before any chain read without one, and a probe that tripped
         // that refusal would assert nothing about coin selection.
         vec!["https://mirror.example/dig".to_string()],
-        // No peer declaration: this fixture is about URLs and reservations, not about the
-        // coin naming a peer. `None` is what a node writes before its peer network is up.
-        None,
+        // A well-formed peer id, for the same reason the URL list is non-empty: `create` refuses
+        // before selecting any coin without one, and a probe that stopped at the identity guard
+        // would assert nothing about DISJOINTNESS, which is the property under test.
+        Some("a1".repeat(32)),
         &chain,
         signer.owner_puzzle_hash(),
         Some(&signer),
@@ -288,9 +289,10 @@ fn the_only_coin_funds_one_create_and_the_second_refuses() {
         Ok(PER_COIN),
         Ok(HashSet::new()),
         vec!["https://mirror.example/dig".to_string()],
-        // No peer declaration: this fixture is about URLs and reservations, not about the
-        // coin naming a peer. `None` is what a node writes before its peer network is up.
-        None,
+        // A well-formed peer id: `create` refuses before selecting any coin without one, and this
+        // fixture needs the FIRST create to genuinely reach coin selection so that the second one
+        // has something already reserved to collide with.
+        Some("a1".repeat(32)),
         &chain,
         signer.owner_puzzle_hash(),
         Some(&signer),
