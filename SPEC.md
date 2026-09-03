@@ -4075,15 +4075,29 @@ This is a STRICT BACKWARD-COMPATIBLE EXTENSION of the accepted range, never a be
 an already-legal version: every version released before this carry existed has `MINOR <= 255`, so
 it maps identically under the new rule as it did under the old one. The carry preserves the
 invariant this section opened with — msiexec compares ProductVersion as a numeric
-`(major, minor, build)` tuple in that priority order, so a base-256 split into MSI MAJOR then MSI
-MINOR is monotonic across the boundary by construction: `1.0.0` (real MINOR 256) compares greater
-than `0.255.9` (real MINOR 255) purely because MSI MAJOR alone already decides it, before MSI MINOR
-or BUILD are even read. This raises the effective ceiling from MINOR 255 to MINOR 65535
-(`256*255+255`, a ~257x increase) with no new state and no change to how engineers choose
-MAJOR/MINOR/PATCH day to day. Applies identically on both the stable and nightly mapping paths
-(the BUILD field keeps carrying the nightly day-count regardless of whether MINOR has overflowed).
+`(major, minor, build)` tuple in that priority order. Within a single version and at the MINOR
+boundary where the carry activates, a base-256 split into MSI MAJOR then MSI MINOR preserves
+monotonicity: `1.0.0` (real MINOR 256) compares greater than `0.255.9` (real MINOR 255) purely
+because MSI MAJOR alone already decides it. This raises the effective ceiling from MINOR 255 to
+MINOR 65535 (`256*255+255`, a ~257x increase) with no new state and no change to how engineers
+choose MAJOR/MINOR/PATCH day to day.
+
+CRITICAL CAVEAT — strict monotonicity DOES NOT extend to sequences of releases across a MAJOR bump.
+Monotonicity holds ONLY while the real MAJOR version component remains 0 throughout the release
+history. If MAJOR is ever bumped to nonzero (e.g., to 1.0.0) AFTER MINOR has exceeded 255 in any
+prior release, releases with the carried encoding (e.g., real `0.600.0` maps to MSI `2.88.0`) can
+compare HIGHER in ProductVersion than the post-bump release with its passthrough encoding (e.g.,
+real `1.0.0` maps to MSI `1.0.0`, which is LOWER than `2.88.0`). This is a cross-release sequencing
+hazard that the in-version `MAJOR==0` guard does not prevent. Any future MAJOR bump occurring AFTER
+MINOR has overflowed requires deriving a new mapping strategy BEFORE that release to avoid a
+downgrade-class collision. This does not affect the current pre-release repo (MINOR has never
+exceeded 255 to date); when it becomes relevant, the decision is a user-call, not something the
+script guesses.
+
+Applies identically on both the stable and nightly mapping paths (the BUILD field keeps carrying
+the nightly day-count regardless of whether MINOR has overflowed).
 Verified by `scripts/tests/package-version.test.sh`, including the boundary that used to fail
-closed and a dedicated monotonicity check across it.
+closed and a dedicated monotonicity check across the MAJOR==0 regime.
 
 11.6. **Reusable build.** The cross-OS build lives once in `.github/workflows/build-binaries.yml`
 (`on: workflow_call`, inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel

@@ -56,6 +56,17 @@
 # decision) while MINOR is ALSO over 255, the two would collide in the same field, so that
 # combination fails closed rather than guessing. See SPEC §11.5c.
 #
+# CRITICAL CAVEAT — monotonicity holds ONLY while real MAJOR remains 0 throughout this repo's
+# release history. If MAJOR is ever bumped to nonzero (e.g., to 1.0.0) AFTER MINOR has exceeded
+# 255 at any point in prior releases, the pre-bump release with a carried encoding (e.g., 0.600.0
+# mapping to MSI 2.88.0) can compare HIGHER under msiexec's numeric comparison than the post-bump
+# release's passthrough encoding (e.g., 1.0.0 mapping to MSI 1.0.0). This is a cross-release
+# sequencing hazard, not caught by the in-version MAJOR==0 guard. Any future MAJOR bump that
+# occurs after MINOR has overflowed requires re-deriving this mapping BEFORE that release to avoid
+# the downgrade-class collision. This does not affect the current pre-release repo (MINOR has never
+# exceeded 255 as of this PR); when it becomes relevant, the decision is a user-call, not something
+# this script guesses.
+#
 # Usage: package-version.sh <version>
 # Emits (stdout, `key=value` lines suitable for appending to $GITHUB_OUTPUT):
 #   file_version=<version verbatim>
