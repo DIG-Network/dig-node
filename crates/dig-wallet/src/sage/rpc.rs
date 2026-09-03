@@ -1027,6 +1027,37 @@ impl WalletBackend {
         }
     }
 
+    /// The freshness bound a LIVE fallback-tier answer carries: `(peak_height, synced)`
+    /// (dig-node#290, `dig-node-control-interface` 0.31.0).
+    ///
+    /// The contract defines `synced` on a `fallback` answer exactly: it is `true` if and only if
+    /// the reported `peak_height` is the height the tier that ANSWERED reported in the same read
+    /// that produced the figures. So the two are produced together, here, from the answering tier
+    /// alone — and a node MUST NOT bound a fallback answer by a peak from a different read or a
+    /// different tier.
+    ///
+    /// That rules out all three heights within easy reach at these call sites, each of which is a
+    /// measurement some other party took of something else:
+    ///
+    /// - the **replica's** peak, which describes a local database this answer did not come from;
+    /// - the **peer tier's** peak, which is the high-water mark of the node's held Chia peers —
+    ///   the bound dig-node#510 proposed and dig-node#290 REFUTED. It is a monotone `fetch_max`
+    ///   that nothing clears, so it outlives the peers that produced it and would stamp a
+    ///   departed peer's height onto a figure the oracle served;
+    /// - any **carried-over** value from an earlier read, which by construction bounds an earlier
+    ///   answer.
+    ///
+    /// `None` is returned unchanged as `(None, false)` rather than substituted, because a node
+    /// that cannot bind the figures to a height has no freshness claim to make. The figures are
+    /// still SERVED — an unobtainable bound is not a failed read — they are merely labelled
+    /// unbounded, exactly as a stale replica answer is served and labelled.
+    ///
+    /// A CACHED answer never calls this: no live read produced that row, so nothing bounds it.
+    async fn fallback_answer_bound(&self) -> (Option<u32>, bool) {
+        let peak = self.fallback.answer_peak_height().await;
+        (peak, peak.is_some())
+    }
+
     /// Whether a figure taken from the replica AT `peak_height` may be reported as CURRENT.
     ///
     /// `db_synced` — which chose the replica in the first place — cannot answer this. It is
@@ -1522,15 +1553,18 @@ impl WalletBackend {
                         pending += u128::from(c.amount);
                     }
                 }
+                // The bound, taken from the answering tier while it serves this read
+                // (dig-node#290). See `fallback_answer_bound`.
+                let (peak_height, synced) = self.fallback_answer_bound().await;
                 Ok(WalletBalanceResult {
                     balance,
                     pending,
                     source,
-                    // The DB neither produced this figure nor bounds its freshness, so its
-                    // flag and its peak say nothing about it. `false` / `null` is the truth
-                    // about a coinset-served answer, whatever the local replica's state.
-                    synced: false,
-                    peak_height: None,
+                    // The DB neither produced this figure nor bounds its freshness, so neither its
+                    // flag nor its peak says anything about it. The bound comes from the tier that
+                    // ANSWERED, in this read.
+                    synced,
+                    peak_height,
                 })
             }
         }
@@ -1670,14 +1704,18 @@ impl WalletBackend {
                 // per request either way.
                 let complete = remaining.len() <= page_size;
                 let coins: Vec<WalletCoin> = remaining.into_iter().take(page_size).collect();
+                // The bound, taken from the answering tier while it serves this read
+                // (dig-node#290). See `fallback_answer_bound`.
+                let (peak_height, synced) = self.fallback_answer_bound().await;
                 Ok(WalletCoinsResult {
                     cursor: coins.last().map(|c| c.coin_id.clone()),
                     complete,
                     coins,
                     source,
-                    // The replica neither produced these coins nor bounds their freshness (#2233).
-                    synced: false,
-                    peak_height: None,
+                    // The replica neither produced these coins nor bounds their freshness (#2233);
+                    // the answering tier's own height does (dig-node#290).
+                    synced,
+                    peak_height,
                 })
             }
         }
@@ -1808,11 +1846,14 @@ impl WalletBackend {
             .coin_record_by_id(coin_id)
             .await
             .map_err(|e| BalanceError::ReadFailed(e.to_string()))?;
+        // The bound, taken from the answering tier while it serves this read (dig-node#290).
+        // See `fallback_answer_bound`.
+        let (peak_height, synced) = self.fallback_answer_bound().await;
         Ok(WalletCoinByIdResult {
             coin: coin.as_ref().map(coin_from_fallback),
             source: Source::Fallback,
-            synced: false,
-            peak_height: None,
+            synced,
+            peak_height,
         })
     }
 
@@ -1953,11 +1994,14 @@ impl WalletBackend {
                 Some(composed_spend(&spend, &record, coin_id)?)
             }
         };
+        // The bound, taken from the answering tier while it serves this read (dig-node#290).
+        // See `fallback_answer_bound`.
+        let (peak_height, synced) = self.fallback_answer_bound().await;
         Ok(WalletCoinSpendResult {
             spend,
             source: Source::Fallback,
-            synced: false,
-            peak_height: None,
+            synced,
+            peak_height,
         })
     }
 
@@ -2035,13 +2079,16 @@ impl WalletBackend {
         let page_size = limit as usize;
         let complete = remaining.len() <= page_size;
         let coins: Vec<WalletCoin> = remaining.into_iter().take(page_size).collect();
+        // The bound, taken from the answering tier while it serves this read (dig-node#290).
+        // See `fallback_answer_bound`.
+        let (peak_height, synced) = self.fallback_answer_bound().await;
         Ok(WalletCoinsByParentResult {
             cursor: coins.last().map(|c| c.coin_id.clone()),
             complete,
             coins,
             source: Source::Fallback,
-            synced: false,
-            peak_height: None,
+            synced,
+            peak_height,
         })
     }
 
@@ -11414,7 +11461,13 @@ mod tests {
     fn oracle_holding_one_coin(peak: Option<u32>) -> MockFallback {
         let ph = "33".repeat(32);
         let fb = MockFallback::with_coins(vec![
-            fallback_coin("c0", &ph, 1_750, Some(ORACLE_PEAK - 4), Some(ORACLE_PEAK - 2)),
+            fallback_coin(
+                "c0",
+                &ph,
+                1_750,
+                Some(ORACLE_PEAK - 4),
+                Some(ORACLE_PEAK - 2),
+            ),
             fallback_coin("u1", &ph, 900, Some(ORACLE_PEAK - 3), None),
         ])
         .with_spends(vec![fallback_spend("c0")]);
@@ -11452,8 +11505,14 @@ mod tests {
             r.peak_height, None,
             "a height the departed peers left behind is not this answer's bound"
         );
-        assert!(!r.synced, "and nothing about it can make the answer current");
-        assert!(r.coin.is_some(), "the figure is still SERVED, merely unbounded");
+        assert!(
+            !r.synced,
+            "and nothing about it can make the answer current"
+        );
+        assert!(
+            r.coin.is_some(),
+            "the figure is still SERVED, merely unbounded"
+        );
     }
 
     /// **T1b — zero peers, freshly observed.** The same fixture with `peer_count: Some(0)`, which
@@ -11650,7 +11709,9 @@ mod tests {
 
         let p = be.chain_peak().await.unwrap();
         assert_eq!(p.peak_height, Some(ORACLE_PEAK));
-        assert!(p.synced, "still the replica's claim, still measured the same way");
+        assert!(
+            p.synced,
+            "still the replica's claim, still measured the same way"
+        );
     }
-
 }
