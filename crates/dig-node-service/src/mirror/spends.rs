@@ -170,6 +170,7 @@ pub fn build_create(
     root_hash: Bytes32,
     epoch: BigInt,
     urls: Vec<String>,
+    declared_peer: dig_mirror_coin::PeerDeclaration,
     collateral_dig_base_units: u64,
     dig_coins: Vec<Cat>,
     synthetic_key: PublicKey,
@@ -178,17 +179,18 @@ pub fn build_create(
 ) -> Result<MirrorSpends, MirrorError> {
     let spends = dig_mirror_coin::create(
         MirrorAdvertisement {
+            // The peer this collateral stands behind, and NOT an `Option`. A coin that names
+            // nobody bonds content for no one in particular: no reader can credit it to this node,
+            // so the collateral is locked for an epoch and buys discovery weight it will never
+            // receive. Taking a declaration by value is what makes that unspendable rather than
+            // merely discouraged -- `dig_mirror_coin::create` accepts `None`, so a signature that
+            // passed the `Option` through would leave the money decision to whichever caller
+            // remembered it. `lifecycle::declaration_for_create` is where the refusal is decided.
+            declared_peer: Some(declared_peer),
             store_launcher_id,
             root_hash,
             epoch: epoch.clone(),
             urls,
-            // No peer declaration: this reproduces exactly what dig-mirror-coin 0.7 wrote, which
-            // had no declared_peer concept at all, so the bump changes nothing about the coins this
-            // node creates. It is a deliberate choice rather than a default -- the crate made the
-            // field required precisely so a consumer cannot inherit one silently. Binding this
-            // collateral to the node's own DIG peer id is dig-node#473, which owns that decision and
-            // the signature change it needs.
-            declared_peer: None,
             collateral: collateral_dig_base_units,
         },
         dig_coins,

@@ -926,3 +926,65 @@ fn a_thinner_round_is_measurably_easier_to_capture() {
          floor={at_floor} sample={at_sample} hold={at_hold}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// dig-node#513 item 1 -- a caller-chosen, strictly tighter corroboration floor
+// ---------------------------------------------------------------------------
+
+/// PROPERTY: `tally_with_floor` refuses a round of two at a floor of three, and accepts the round
+/// of three -- the bound pinned from BOTH sides, so it cannot pass by refusing everything.
+#[test]
+fn the_bond_floor_is_pinned_from_both_sides() {
+    let two = responses(&[("a", 1), ("b", 1)]);
+    let three = responses(&[("a", 1), ("b", 1), ("c", 1)]);
+
+    assert_eq!(
+        tally_with_floor(&two, BOND_CORROBORATION_FLOOR),
+        Verdict::Insufficient {
+            answered: 2,
+            required: BOND_CORROBORATION_FLOOR,
+        },
+        "one under the bond floor must not corroborate"
+    );
+    assert!(
+        tally_with_floor(&three, BOND_CORROBORATION_FLOOR)
+            .corroborated()
+            .is_some(),
+        "at the bond floor exactly, a unanimous round must still corroborate"
+    );
+}
+
+/// PROPERTY: the floor binds the AGREEING count, not merely how many peers answered.
+///
+/// NEAREST WRONG IMPLEMENTATION: enforcing `floor` only on `responses.len()`. Under that, twelve
+/// answers of which two agree clears a floor of three -- two colluding peers plus noise, which is
+/// precisely the round the floor exists to refuse. `required_agreement(3)` is 3 already, so the
+/// fixture is widened to a size where the ratio alone would permit two.
+#[test]
+fn a_wide_round_does_not_buy_its_way_past_the_bond_floor() {
+    let scattered = responses(&[("a", 1), ("b", 1), ("c", 2), ("d", 3), ("e", 4), ("f", 5)]);
+
+    assert!(
+        matches!(
+            tally_with_floor(&scattered, BOND_CORROBORATION_FLOOR),
+            Verdict::Split { .. }
+        ),
+        "two agreeing voices in a six-peer round cleared a floor of three"
+    );
+}
+
+/// PROPERTY: the floor can only TIGHTEN. A caller asking for one source is given
+/// `CORROBORATION_FLOOR` anyway -- the never-one-source rule is not a caller's to relax.
+#[test]
+fn a_floor_below_the_shared_one_is_not_honoured() {
+    let one = responses(&[("a", 1)]);
+
+    assert_eq!(
+        tally_with_floor(&one, 1),
+        Verdict::Insufficient {
+            answered: 1,
+            required: CORROBORATION_FLOOR,
+        },
+        "a caller talked the tally down to a single source"
+    );
+}
