@@ -411,3 +411,148 @@ fn a_coin_that_passes_every_chain_check_is_still_not_promoted_to_a_claimant() {
         "a bond proven on chain must not promote a peer the coin does not name"
     );
 }
+
+/// The world for the promotion rows: two honestly published, fully collateralised mirror coins of
+/// `store_a()` at `root_1()`, differing in **which peer each one declares** — plus one that declares
+/// the holder but bonds `root_2()`.
+///
+/// **Two different wallets rather than two coins of one wallet, and that is a fixture requirement
+/// with a reason.** `creating_spend` derives a coin's parent from `(owner, asset, amount)`, so two
+/// same-amount advertisements by one wallet are the SAME coin and the second silently overwrites
+/// the first's creating spend. Using distinct owners keeps the collateral, the store, the root and
+/// the epoch identical across the two rows, so the only thing the promotion decision can see
+/// differing between them is the declared peer id. Each coin's hint is recomputed from its own
+/// lineage owner, so both are honest publications.
+fn declaring_bonds(holder: &str, stranger: &str) -> (Chain, Bytes32, Bytes32, Bytes32) {
+    let declares_holder = wallet(3);
+    let declares_stranger = wallet(4);
+    let wrong_root = wallet(5);
+
+    let (spend_holder, coin_holder) = creating_spend(
+        &declares_holder,
+        &mirror_memos(
+            &declares_holder,
+            store_a(),
+            root_1(),
+            &["https://holder.example", &format!("dig-peer:{holder}")],
+        ),
+    );
+    let (spend_stranger, coin_stranger) = creating_spend(
+        &declares_stranger,
+        &mirror_memos(
+            &declares_stranger,
+            store_a(),
+            root_1(),
+            &["https://holder.example", &format!("dig-peer:{stranger}")],
+        ),
+    );
+    let (spend_wrong, coin_wrong) = creating_spend(
+        &wrong_root,
+        &mirror_memos(
+            &wrong_root,
+            store_a(),
+            root_2(),
+            &["https://holder.example", &format!("dig-peer:{holder}")],
+        ),
+    );
+
+    let chain = Chain::holding(&[
+        (spend_holder, coin_holder),
+        (spend_stranger, coin_stranger),
+        (spend_wrong, coin_wrong),
+    ]);
+    (
+        chain,
+        coin_holder.coin_id(),
+        coin_stranger.coin_id(),
+        coin_wrong.coin_id(),
+    )
+}
+
+/// **Proves (dig-node#466 / #473, review round 2, finding 3):** promotion through `verdict_for`
+/// requires BOTH bindings — the coin bonds the requested content, and the coin's own owner-written
+/// declaration names the peer claiming it — against a chain holding real coins.
+///
+/// **Catches:** exactly what the suite could not see at `59a0331`. Every `Bonded` in the unit tests
+/// arrives through a double that builds the declaration term FROM the claiming peer id, so it
+/// returns `Bonded` for every claimant by construction and cannot represent a coin that declares
+/// someone else. A `verdict_for` that promoted on "some coin bonds this content" — the weaker
+/// question a stranger republishing a public coin id passes — would have satisfied that suite in
+/// full.
+///
+/// The three rows share store, root, epoch, collateral and required collateral, and are asked with
+/// the same claimant. Row 2 differs from row 1 in the declared peer id, and row 3 in the generation
+/// the coin bonds. Row 3 also exercises `advertises` against a coin that EXISTS, which no prior
+/// test did: the existing negative names a coin the chain does not hold, which returns before that
+/// step.
+///
+/// **Each negative carries a control, because a negative verdict alone is not evidence.**
+/// `verdict_for` reaches `Unverified` from two disjoint places — the chain half producing no coin,
+/// and `PeerDeclaration::Silent` at the final match — and reaches `Unbonded` from a coin that is
+/// merely unverifiable as easily as from one that genuinely bonds elsewhere. So rows 2 and 3 are
+/// each followed by a row proving that the SAME coin verifies completely when asked the question it
+/// should answer positively. Without those, either negative would be satisfied by a fixture too
+/// broken to verify, and the test would measure nothing while appearing to measure the decision.
+/// Note that rows 1 and 2 are necessarily minted by different wallets: `creating_spend` derives a
+/// coin's parent from `(owner, asset, amount)`, so one wallet cannot publish two same-amount
+/// advertisements. "Differs only in the declared peer id" is therefore a statement about what the
+/// DECISION can see, which row 2's control is what actually establishes.
+#[test]
+fn only_a_coin_that_declares_the_claimant_promotes_it() {
+    let holder = "aa".repeat(32);
+    let stranger = "bb".repeat(32);
+    let (chain, declares_holder, declares_stranger, bonds_another_root) =
+        declaring_bonds(&holder, &stranger);
+
+    let promote_as = |coin, root, claimant: &str| {
+        verdict_for(
+            &chain,
+            store_a(),
+            root,
+            &epoch(),
+            Some(COLLATERAL),
+            claimant,
+            coin,
+        )
+    };
+    let promote = |coin, root| promote_as(coin, root, &holder);
+
+    assert_eq!(
+        promote(declares_holder, root_1()),
+        BondVerdict::Bonded,
+        "the coin bonds this content and its owner named this claimant, so both halves hold"
+    );
+    assert_eq!(
+        promote(declares_stranger, root_1()),
+        BondVerdict::Unverified,
+        "an equally valid bond that names a DIFFERENT peer promotes nobody: credit is withheld, \
+         never subtracted, because this record may be a lie about that coin's real holder"
+    );
+    assert_eq!(
+        promote(bonds_another_root, root_1()),
+        BondVerdict::Unbonded,
+        "a real coin that declares the claimant but advertises another generation disproves the \
+         claim -- the step that catches it is `advertises`, on a coin that exists"
+    );
+    assert_eq!(
+        promote(bonds_another_root, root_2()),
+        BondVerdict::Bonded,
+        "control: that same coin promotes this claimant for the generation it actually bonds, so \
+         the row above is attributable to the triple and not to a fixture too broken to verify"
+    );
+    // Control for row 2, and it is load-bearing for the same reason row 4 is. `verdict_for`
+    // reaches `Unverified` from TWO disjoint places: the chain half failing to produce a coin
+    // (unreadable source, hint or lineage mismatch, admission exhausted), and `PeerDeclaration::
+    // Silent` at the final match. Row 2's coin is minted by a DIFFERENT wallet from row 1's --
+    // unavoidably, since `creating_spend` derives the parent from `(owner, asset, amount)` and one
+    // wallet cannot publish two same-amount advertisements -- so "differs only in the declared
+    // peer id" is a claim about the DECISION's inputs, not about the fixture's construction.
+    // Without this row, a `declares_stranger` coin broken anywhere in the chain half would satisfy
+    // row 2 while proving nothing whatever about the declaration.
+    assert_eq!(
+        promote_as(declares_stranger, root_1(), &stranger),
+        BondVerdict::Bonded,
+        "control: row 2's coin passes the ENTIRE chain half and promotes the peer it actually \
+         names, so row 2's Unverified is attributable to the declaration and to nothing else"
+    );
+}

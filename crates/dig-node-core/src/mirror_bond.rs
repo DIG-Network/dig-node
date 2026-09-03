@@ -5,19 +5,36 @@
 //! at no cost, bonding nothing. Until this module existed nothing anywhere read that field against a
 //! chain, so the collateral economy's one economic guarantee was unenforced end to end.
 //!
-//! # This layer is INERT today, and that is the safe posture
+//! # This layer is LIVE, and what makes promotion sound
 //!
-//! No [`MirrorBondVerifier`] this node can build returns `Bonded` yet, because a coin proves that
-//! *a* bond exists and never that the *claimant* holds it, and nothing here can yet bind a mirror
-//! coin's owner to a DHT peer id. So every holder receives the same verdict and the ranking below is
-//! a no-op on every slate: no reordering, and the host's implementation declines the chain read
-//! rather than paying for an answer this module would discard.
+//! Promotion requires TWO independent bindings, and neither is sufficient alone.
 //!
-//! Promoting on the chain half alone is the alternative, and it is an attack: coin ids travel the
-//! DHT in cleartext by design, so a stranger republishing an honest holder's id would rank first at
-//! zero collateral. Withholding credit from everyone is the only posture that is neither exploitable
-//! nor expensive. The binding is <https://github.com/DIG-Network/dig-node/issues/473>; when it lands
-//! this module needs no change.
+//! 1. **coin -> content**, from `MirrorCoin::advertises`: the coin declares exactly this
+//!    `(store, root, epoch)`, with the hint recomputed from the coin's own lineage proof.
+//! 2. **coin -> peer id**, from the coin's owner-written `dig-peer:` declaration
+//!    (`dig-mirror-coin` 0.8.0, its `SPEC.md` §5.1). Memos are written by the spend that creates the
+//!    coin and only the owner's key can produce that spend, so the term is an owner attestation
+//!    carried by executed on-chain code.
+//!
+//! Without (2), promotion is itself an attack: coin ids travel the DHT in cleartext by design, so a
+//! stranger republishing an honest holder's id would rank first at zero collateral. That is why this
+//! module shipped inert until dig-node#473 supplied the declaration.
+//!
+//! # The binding this module does NOT make, and who does
+//!
+//! (2) binds a coin to a `peer_id`. It does **not** bind that `peer_id` to the addresses beside it
+//! in the provider record, and no chain read can: a provider record is unsigned, and dig-dht says so
+//! outright. A record carrying an honest holder's peer id, that holder's real coin id, and an
+//! ATTACKER's addresses therefore satisfies everything above and IS promoted here.
+//!
+//! It is refused one layer down, by the transport, which pins the claimed `peer_id` against the
+//! certificate the far end actually presents — `dig-download`'s `provider_peer_id` becomes the
+//! `PeerTarget` pin, enforced in `dig-tls`'s verifier as `peer_id mismatch: expected …, got …`, with
+//! `dig-peer` re-checking it after connect. So the attacker buys a failed handshake, not a served
+//! byte, and the content is merkle-verified against the caller's own requested root regardless.
+//!
+//! What this layer owes in return is a BOUND: at most one record is promoted per claimed peer id, so
+//! a single stolen identity cannot occupy every promoted slot. See `SPEC.md` §25.6a.
 //!
 //! # What lives here, and what deliberately does not
 //!
@@ -146,6 +163,30 @@ pub type BondVerifierSlot = Arc<OnceLock<Arc<dyn MirrorBondVerifier>>>;
 pub const MAX_VERIFIED_PER_LOCATE: usize = 8;
 
 /// Promotion tier for a verdict — `Bonded` first, everything else in one baseline tier.
+/// A peer id from an untrusted provider record, in a shape that is safe to put in a log field.
+///
+/// `provider_peer_id` is a bare `String` carried off an unsigned provider record with no
+/// wire-boundary normalisation, so it may be any length and hold any UTF-8 — newlines and control
+/// characters included, which is what makes an unbounded log field a log-INJECTION surface rather
+/// than merely a noisy one: a peer that spells its id with an embedded newline writes a second line
+/// into this node's log, and an operator reading that log cannot tell it from one this node wrote.
+///
+/// An honest peer id is exactly 64 hex characters, so keeping only hex digits, lowercasing them and
+/// taking the first [`PEER_ID_HEX_LEN`] discards nothing real. The lowercasing matches the
+/// normalisation the promotion bound above applies for the same reason: two spellings are one
+/// identity, so two log lines about them should read as one peer.
+fn peer_id_for_log(provider_peer_id: &str) -> String {
+    provider_peer_id
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|c| c.to_ascii_lowercase())
+        .take(PEER_ID_HEX_LEN)
+        .collect()
+}
+
+/// The length of a peer id in hex characters — 32 bytes, so 64.
+const PEER_ID_HEX_LEN: usize = 64;
+
 fn credit_rank(verdict: BondVerdict) -> u8 {
     match verdict {
         BondVerdict::Bonded => 0,
@@ -193,6 +234,16 @@ impl ProviderLocator for BondRankingLocator {
         // not to: a comparison-driven lookup would read the same coin O(n log n) times.
         let mut ranked: Vec<(u8, ProviderRecord)> = Vec::with_capacity(found.len());
         let mut verified = 0usize;
+        // Keyed on the ASCII-LOWERCASED peer id, never the raw wire string. A peer id is fixed-length
+        // hex, so its two spellings denote one identity -- and every check that GRANTS the promotion
+        // already knows that: the coin's declaration compares 32 decoded bytes, and the TLS pin
+        // compares 32 bytes of certificate hash. A set keyed on the text would therefore admit the
+        // same peer once per hex spelling, and one stolen identity could fill every promoted slot at
+        // zero collateral by varying case alone. dig-dht applies exactly this normalisation to the
+        // neighbouring `unverified_mirror_coin_id` field, for the reason its own doc gives: without
+        // it "dedup and equality would split on presentation".
+        let mut promoted_peers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for record in found {
             let claimed = record.unverified_mirror_coin_id_bytes();
             // A holder that claims nothing, and every record past the budget, keeps its place with
@@ -205,16 +256,33 @@ impl ProviderLocator for BondRankingLocator {
             let verdict = verifier
                 .verify(content, &record.provider_peer_id, claimed)
                 .await;
+            let mut rank = credit_rank(verdict);
+            // At most ONE record is promoted per claimed peer id. A coin declares one peer and a
+            // peer needs its own collateralised coin, so promotion is meant to cost collateral --
+            // but nothing stops a stranger republishing one honest holder's peer id and coin id
+            // across the whole slate with addresses of its choosing. Each copy satisfies the
+            // declaration check on the strength of the same single bond, and without this the
+            // budget's worth of promoted slots could all be spent on one stolen identity.
+            //
+            // This is a BOUND, not a punishment: a duplicate falls back to the baseline tier it
+            // would have occupied with no verifier at all, never below it, so the lattice stays
+            // credit-only. It also costs an honest holder nothing -- a peer that legitimately
+            // announces twice keeps its first record promoted.
+            if rank == credit_rank(BondVerdict::Bonded)
+                && !promoted_peers.insert(record.provider_peer_id.to_ascii_lowercase())
+            {
+                rank = credit_rank(BondVerdict::Unverified);
+            }
             if verdict == BondVerdict::Unbonded {
                 // Worth an operator's attention and nobody's ban list: this record's own pointer
                 // disproves its own claim. Logged and NOT demoted — the record may be a stranger's
                 // lie ABOUT an honest holder, and demoting on it is what would make that lie pay.
                 tracing::debug!(
-                    peer = %record.provider_peer_id,
+                    peer = %peer_id_for_log(&record.provider_peer_id),
                     "located holder's claimed mirror coin does not bond this content; no promotion"
                 );
             }
-            ranked.push((credit_rank(verdict), record));
+            ranked.push((rank, record));
         }
 
         // STABLE, so holders sharing a tier keep the order their source gave them. The download
@@ -232,6 +300,47 @@ mod tests {
     use dig_dht::{CandidateAddr, PeerId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    /// **Proves (dig-node#501, security round 1, LOW 5):** peer-supplied text reaching a log field
+    /// is bounded and normalised.
+    ///
+    /// **Catches:** log injection through an unsigned field. `provider_peer_id` is a bare `String`
+    /// with no wire-boundary normalisation, so a peer that spells its id with an embedded newline
+    /// writes a whole second line into this node's log, and an operator reading it cannot tell that
+    /// line from one the node wrote itself. The fixture carries a newline, a carriage return, an
+    /// ANSI escape and 200 characters of padding — each a separate thing the old field would have
+    /// emitted verbatim — and the honest row is the control, so a function that simply returned the
+    /// empty string would not pass.
+    #[test]
+    fn a_peer_id_in_a_log_field_is_bounded_and_normalised() {
+        let honest = "aa".repeat(32);
+        assert_eq!(
+            peer_id_for_log(&honest),
+            honest,
+            "control: an honest 64-hex id must survive unchanged, or the field says nothing"
+        );
+        assert_eq!(
+            peer_id_for_log(&honest.to_uppercase()),
+            honest,
+            "two spellings are one identity, exactly as the promotion bound treats them"
+        );
+
+        let hostile = format!("dead\nbeef\r\u{1b}[31m peer=trusted {}", "f".repeat(200));
+        let logged = peer_id_for_log(&hostile);
+        assert!(
+            !logged.chars().any(char::is_control),
+            "a control character would forge a log line: {logged:?}"
+        );
+        assert!(
+            logged.chars().all(|c| c.is_ascii_hexdigit()),
+            "only hex digits can be part of a peer id: {logged:?}"
+        );
+        assert!(
+            logged.len() <= PEER_ID_HEX_LEN,
+            "the field is bounded at one peer id's worth, got {} characters",
+            logged.len()
+        );
+    }
 
     const STORE: [u8; 32] = [0x11; 32];
     const ROOT: [u8; 32] = [0x22; 32];

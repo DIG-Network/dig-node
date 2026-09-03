@@ -228,12 +228,34 @@ impl PeerCorroboratedReads {
     /// `Ok(None)` means the peers AGREED there is no such coin. Failing to assemble agreement is
     /// an `Err`.
     pub async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
+        self.coin_record_by_id_at_floor(coin_id, quorum::CORROBORATION_FLOOR)
+            .await
+    }
+
+    /// [`Self::coin_record_by_id`], demanding `floor` corroborating peers instead of the default
+    /// [`quorum::CORROBORATION_FLOOR`].
+    ///
+    /// # The cache is not consulted above the default floor
+    ///
+    /// A cached row records the ANSWER a past round settled on and not how many peers settled it,
+    /// so serving one to a caller that asked for stronger corroboration would answer a question
+    /// the cache cannot answer -- and would make the stricter floor vacuous, since the ordinary
+    /// sync path fills that cache at the default floor. The stricter caller therefore always asks
+    /// the peers. It still WRITES what it learns, because a row corroborated by more peers is not
+    /// less true for the readers that wanted fewer.
+    pub async fn coin_record_by_id_at_floor(
+        &self,
+        coin_id: &str,
+        floor: usize,
+    ) -> Result<Option<FallbackCoin>> {
         let id = normalized(coin_id);
         let parsed = parse_coin_id(&id)?;
 
         let now = self.clock.now_unix();
-        if let Some(coin) = self.cached_coin_record_by_id(coin_id).await? {
-            return Ok(Some(coin));
+        if floor <= quorum::CORROBORATION_FLOOR {
+            if let Some(coin) = self.cached_coin_record_by_id(coin_id).await? {
+                return Ok(Some(coin));
+            }
         }
 
         let peers = self.sample.draw().await;
@@ -249,7 +271,7 @@ impl PeerCorroboratedReads {
             }
         }
 
-        let verdict = quorum::tally(&responses);
+        let verdict = quorum::tally_with_floor(&responses, floor);
         let Some(answer) = verdict.corroborated() else {
             return Err(no_corroboration("coin record", &id, &verdict));
         };
@@ -333,12 +355,28 @@ impl PeerCorroboratedReads {
     /// `Ok(None)` means the peers AGREED the coin is unspent or unknown. Failing to assemble
     /// agreement is an `Err`, because a lineage walk reads absence as *this is the tip*.
     pub async fn coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+        self.coin_spend_at_floor(coin_id, quorum::CORROBORATION_FLOOR)
+            .await
+    }
+
+    /// [`Self::coin_spend`], demanding `floor` corroborating peers.
+    ///
+    /// The cache is bypassed above the default floor for the reason
+    /// [`Self::coin_record_by_id_at_floor`] states, and it applies with more force here: a spend
+    /// row has no TTL, so one written by a thin round would answer every stricter caller forever.
+    pub async fn coin_spend_at_floor(
+        &self,
+        coin_id: &str,
+        floor: usize,
+    ) -> Result<Option<FallbackCoinSpend>> {
         let id = normalized(coin_id);
         let parsed = parse_coin_id(&id)?;
 
         let now = self.clock.now_unix();
-        if let Some(spend) = self.cached_coin_spend(coin_id).await? {
-            return Ok(Some(spend));
+        if floor <= quorum::CORROBORATION_FLOOR {
+            if let Some(spend) = self.cached_coin_spend(coin_id).await? {
+                return Ok(Some(spend));
+            }
         }
 
         let peers = self.sample.draw().await;
@@ -352,7 +390,7 @@ impl PeerCorroboratedReads {
             }
         }
 
-        let verdict = quorum::tally(&responses);
+        let verdict = quorum::tally_with_floor(&responses, floor);
         let Some(answer) = verdict.corroborated() else {
             return Err(no_corroboration("coin spend", &id, &verdict));
         };

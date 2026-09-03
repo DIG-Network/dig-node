@@ -177,6 +177,13 @@ async fn source_over(views: Vec<Option<ChainView>>) -> CorroboratedChainSource {
     CorroboratedChainSource::new(reads, tokio::runtime::Handle::current())
 }
 
+/// The same source, asked at the BOND floor -- what `ChainBondVerifier` actually uses.
+async fn bond_floor_source_over(views: Vec<Option<ChainView>>) -> CorroboratedChainSource {
+    source_over(views)
+        .await
+        .requiring_corroboration(dig_wallet::sage::quorum::BOND_CORROBORATION_FLOOR)
+}
+
 // ---------------------------------------------------------------------------
 // The fixtures
 // ---------------------------------------------------------------------------
@@ -468,5 +475,97 @@ fn a_single_source_bonds_the_fabricated_coin() {
         ),
         BondVerdict::Bonded,
         "the fabricated coin passes every internal-consistency check; only corroboration catches it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// dig-node#513 item 1 -- the bond path's own corroboration floor
+// ---------------------------------------------------------------------------
+
+/// **Proves (dig-node#513 item 1):** a round only TWO peers answered does not bond, because the
+/// bond path demands `BOND_CORROBORATION_FLOOR` and not the sync path's
+/// `CORROBORATION_FLOOR = 2`.
+///
+/// **Catches:** the floor being inherited rather than chosen. `CORROBORATION_FLOOR` is two for a
+/// liveness reason that belongs to the SYNC path -- a refused round stalls the wallet's replica --
+/// and at two a pair of colluding peers is a full quorum, so a promotion costs an attacker two
+/// voices. On this path a refusal costs nothing, so the floor can be higher and must be.
+///
+/// **Why the fixture is shaped this way:** four peers are drawn and two are silent, so the round
+/// is *thin* rather than *dishonest*; the two that speak hold the GENUINE bond and agree with each
+/// other perfectly. Nothing but the floor can refuse it. The control below is the identical
+/// fixture at the default floor, differing in exactly one dimension -- the floor -- so this pair
+/// cannot be satisfied by a harness that simply never bonds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_two_peer_round_does_not_bond_at_the_bond_floor() {
+    let honest = honest_bond();
+    let view = ChainView::holding(std::slice::from_ref(&honest));
+
+    let source = bond_floor_source_over(vec![Some(view.clone()), Some(view), None, None]).await;
+
+    assert_eq!(
+        verdict(&source, honest.1.coin_id()),
+        BondVerdict::Unverified,
+        "two agreeing peers bonded a coin on the path where refusing is free"
+    );
+}
+
+/// **Proves:** the control for the case above -- the SAME two-peer round DOES bond at the default
+/// floor, so the refusal there is the bond floor and not the thinness of the fixture.
+///
+/// It also pins the sync path's floor from the other side: `CORROBORATION_FLOOR` must stay at two,
+/// because raising it is what froze a user's replica, and a change that raised the shared constant
+/// to satisfy the case above would turn this control red.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_two_peer_round_still_bonds_at_the_default_floor() {
+    let honest = honest_bond();
+    let view = ChainView::holding(std::slice::from_ref(&honest));
+
+    let source = source_over(vec![Some(view.clone()), Some(view), None, None]).await;
+
+    assert_eq!(
+        verdict(&source, honest.1.coin_id()),
+        BondVerdict::Bonded,
+        "fixture: a two-peer round must bond at the default floor, or the case above proves nothing"
+    );
+}
+
+/// **Proves:** the bond floor is not bought by DIALLING wider. Three peers answer, but only two of
+/// them agree, and the round is refused.
+///
+/// **Catches:** a floor enforced only on how many peers ANSWERED. Under that reading a round of
+/// twelve in which two voices agree clears a floor of three, which is the exact shape -- two
+/// colluding peers plus noise -- the floor exists to refuse. `tally_with_floor` therefore applies
+/// it to the AGREEING count too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wide_round_in_which_only_two_peers_agree_does_not_bond() {
+    let honest = honest_bond();
+    let forged = fabricated_bond();
+    let view = ChainView::holding(std::slice::from_ref(&honest));
+    let dissent = ChainView::holding(std::slice::from_ref(&forged));
+
+    let source = bond_floor_source_over(vec![Some(view.clone()), Some(view), Some(dissent)]).await;
+
+    assert_eq!(
+        verdict(&source, honest.1.coin_id()),
+        BondVerdict::Unverified,
+        "two agreeing voices among three answers cleared a floor of three"
+    );
+}
+
+/// **Proves:** the control for the whole floor -- at the bond floor, a round of THREE agreeing
+/// peers still bonds a genuine coin. The floor is a floor, not a wall.
+#[tokio::test(flavor = "multi_thread")]
+async fn three_agreeing_peers_do_bond_at_the_bond_floor() {
+    let honest = honest_bond();
+    let view = ChainView::holding(std::slice::from_ref(&honest));
+
+    let source =
+        bond_floor_source_over(vec![Some(view.clone()), Some(view.clone()), Some(view)]).await;
+
+    assert_eq!(
+        verdict(&source, honest.1.coin_id()),
+        BondVerdict::Bonded,
+        "the bond floor refused a round that met it exactly"
     );
 }
