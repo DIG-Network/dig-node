@@ -96,9 +96,7 @@ shell's HTTP control surface — pairing/control.status/hostedStores/updater —
 ties its node-surface method names + the peer-reachable set to the crate. The shell keeps its own
 `ErrorCode` enum, but every code it shares with the crate now SOURCES its number and machine string
 from `dig_rpc_protocol::ErrorCode` rather than restating them, and a guard asserts that equality
-across the whole shared set. One shell-specific string remains: `DISPATCH_FAILED` at `-32000`, where
-the crate says `SERVER_ERROR`. That name is minted and published by the shell alone, so reconciling
-it is a separate, wire-visible decision. Not yet adopted: the crate's `RpcError` envelope type and
+across the whole shared set, with no exclusions. Not yet adopted: the crate's `RpcError` envelope type and
 the `dig-rpc` server framework. The numeric error codes remain guaranteed
 identical by the conformance vectors.
 
@@ -971,9 +969,12 @@ truth shared with `rpc.dig.net`. This node MUST NOT diverge from it.
 - **The shell (`dig-node-service`) sources every code it shares with the contract crate from
   `dig_rpc_protocol::ErrorCode` rather than restating it**, so a shell-catalogued number and its name
   cannot disagree with the crate either. `-32004` is `RESOURCE_UNAVAILABLE` on both sides and on every
-  frame the node emits. The single remaining shell-specific string is `DISPATCH_FAILED` at `-32000`,
-  which the shell alone mints and publishes; the crate's generic name for that number is
-  `SERVER_ERROR`, and reconciling the two is tracked separately.
+  frame the node emits, and `-32000` is `SERVER_ERROR` on both sides — the shell and the read path
+  both mint that number, and a client branching on `data.code` cannot see which layer answered, so
+  they publish ONE name. Which layer answered is carried by `data.origin`.
+
+  `dig-node-control-interface` declares the same number as `DISPATCH_FAILED` for its control
+  surface, which dig-node does not mint.
 - **The ONE exception, stated rather than left silent:** a code this node emits that
   `dig-rpc-protocol` does not declare carries NO `data` object at all. Today that is `-32001`
   alone (the push-authority refusal, §21.9), which `SYSTEM.md` records as reserved-by-occupancy.
@@ -990,7 +991,7 @@ For each request, in order:
 1. `rpc.discover` → answered by the shell with the OpenRPC document (§6.3) as `result`.
 2. `control.*` → the control plane (§7): authorization gate, then `dispatch_control`.
 3. Everything else → normalized (§5.3), then dispatched to `dig_node_core::handle_rpc` on a
-   spawned task. A panicked/failed dispatch task yields `DISPATCH_FAILED` (`-32000`); the server
+   spawned task. A panicked/failed dispatch task yields `SERVER_ERROR` (`-32000`); the server
    MUST survive it.
 4. If the read path returns `-32601` (method not found), the shell relays the **original,
    un-normalized** request to the upstream (§5.4).
@@ -3274,7 +3275,7 @@ method runs, and it MUST NOT be conflated with the wallet's own `-32043` egress 
 | -32600 | `INVALID_REQUEST` | shell | Not a single JSON-RPC object (batch arrays unsupported); also the 421 Host-rejection body. |
 | -32601 | `METHOD_NOT_FOUND` | boundary | Not resolved locally or by the upstream (internally: the passthrough cue). |
 | -32602 | `INVALID_PARAMS` | node | Invalid/missing method parameters (also minted by the control plane for bad control params). |
-| -32000 | `DISPATCH_FAILED` | shell | The shell failed to dispatch the request to the read path. |
+| -32000 | `SERVER_ERROR` | shell | The request failed on the way to, or inside, the read path: a failed dispatch task, an unclassified wallet-proxy failure, or a generic read-path failure. Minted by BOTH the shell and the node library; `data.origin` says which. |
 | -32004 | `RESOURCE_UNAVAILABLE` | node | Genuine content miss at the requested root; distinct from transport failure. Minted by the node library for a LOCAL miss — `dig.fetchRange` ("resource not held") and `dig.getManifest` ("capsule not held locally") — and relayed with `origin: upstream` when a passthrough upstream returns it. Never a fabricated result. |
 | -32005 | `ROOT_NOT_ANCHORED` | node | The node's mandatory read-path anchored-root pin (§14.4) fails closed: the requested root does not match the chain-anchored tip, the store has no confirmed on-chain generation, the chain is unreachable, or a rootless request cannot be resolved under enforcement. Minted by the node library on `dig.getContent`. |
 | -32008 | `CONTENT_REDIRECT` | node | The node does not (or, under §17's throttle, will not right now) serve the requested content itself, but the DHT located peer(s) that hold it — `error.data.redirect` names them (`content`, `providers[].peer_id`/`addresses`, `redirect_depth`, `max_redirects`) so the caller re-requests there. The candidate set is CAPPED at `MAX_REDIRECT_PROVIDERS` (= dig-dht's `MAX_ADDRESSES_PER_RECORD`): a redirect NAMES holders (the requestor dials them over its own §5.2 reachability ladder — this node does NOT dial/probe them), so a few candidates suffice and probing-on-miss would itself be an amplification vector. Minted on a content miss (`dig.getContent`/`dig.fetchRange`/the peer range-stream) and on outgoing-bandwidth saturation (§17), bounded by the same redirect-hop cap either way. |

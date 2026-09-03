@@ -291,19 +291,15 @@ fn served_classes_are_well_formed() {
 /// crate's. A hard-coded assertion on one number only ever checks that number; this is
 /// the test that catches the NEXT drift, wherever it appears.
 ///
-/// `DispatchFailed`/-32000 is the one deliberate exclusion: the shell mints it and
-/// publishes it under its own name, so shell and wire AGREE there. Reconciling it with
-/// the crate's generic `SERVER_ERROR` is a genuine shipped-name change with a different
-/// risk profile, tracked separately.
+/// There are NO exclusions: every code the shell shares with the crate is checked. The
+/// set is DRAWN from `ErrorCode::all()` rather than hand-listed, so a gate over it cannot
+/// be narrower than the enumeration it sweeps (dig-node#496).
 #[test]
 fn shell_error_names_match_the_shared_catalogue() {
     let mut checked = 0usize;
     let mut drifted: Vec<String> = Vec::new();
 
     for shell in ErrorCode::all() {
-        if *shell == ErrorCode::DispatchFailed {
-            continue;
-        }
         let Some(shared) = dig_rpc_protocol::ErrorCode::ALL
             .iter()
             .find(|c| i64::from(c.code()) == shell.code())
@@ -322,7 +318,7 @@ fn shell_error_names_match_the_shared_catalogue() {
     }
 
     assert!(
-        checked >= 7,
+        checked >= 8,
         "the shell shares fewer codes with dig-rpc-protocol than expected ({checked}) — \
          this guard may be checking nothing"
     );
@@ -374,5 +370,43 @@ async fn the_catalogued_name_for_32004_is_the_name_the_node_emits() {
         entry["name"],
         json!(emitted),
         "the discovery document names -32004 differently from the frame the node emits"
+    );
+}
+
+/// THE TWO FRAMES, not the two catalogues: `-32000` has TWO producers on one port — the
+/// dig-node shell (`rpc::rpc_error(DispatchFailed, ..)`, 2 sites) and the embedded read path
+/// (`dig_node_core::rpc_err(.., -32000, ..)`, 11 sites) — and a client branching on
+/// `data.code` cannot see which layer answered. So the two frames MUST publish one name.
+///
+/// Asserting either producer against the catalogue would pass on a catalogue that agrees
+/// with itself; asserting the two EMITTED frames against EACH OTHER is what makes this a
+/// decision test. The third assertion pins which name won, so a future edit cannot satisfy
+/// the equality by reconciling both onto a third string nobody publishes (dig-node#496).
+#[test]
+fn the_shell_and_the_read_path_publish_one_name_for_32000() {
+    let shell = dig_node_service::rpc::rpc_error(json!(1), ErrorCode::DispatchFailed, "x");
+    let read_path = dig_node_core::rpc_err(&json!(1), -32000, "x");
+
+    assert_eq!(
+        shell["error"]["code"], read_path["error"]["code"],
+        "the two producers must be compared at the SAME number"
+    );
+
+    let shell_name = shell["error"]["data"]["code"]
+        .as_str()
+        .expect("the shell frame carries a machine name in data.code");
+    let read_path_name = read_path["error"]["data"]["code"]
+        .as_str()
+        .expect("the read-path frame carries a machine name in data.code");
+
+    assert_eq!(
+        shell_name, read_path_name,
+        "-32000 reaches one client under TWO machine names: the shell says {shell_name:?}, \
+         the read path says {read_path_name:?}"
+    );
+    assert_eq!(
+        shell_name,
+        dig_rpc_protocol::ErrorCode::ServerError.machine_code(),
+        "the reconciled name must be the one the shared catalogue declares at -32000"
     );
 }

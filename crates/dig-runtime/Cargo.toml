@@ -1,6 +1,6 @@
 [package]
 name = "dig-runtime"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG browser native in-process runtime: a cdylib (dig_runtime.dll) the browser loads at startup. Exposes the built-in Chia wallet FFI (dig_wallet_rpc) and the digstore Rust read-crypto FFI (dig_read_verify_decrypt) — the SAME Rust the webpage wasm wraps — plus, for other consumers, the full node RPC (dig_rpc). The browser starts it WALLET-ONLY (no node engine); the read-crypto FFI needs no runtime at all."
