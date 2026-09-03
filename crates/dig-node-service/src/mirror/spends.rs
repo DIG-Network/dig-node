@@ -191,13 +191,6 @@ pub fn build_create(
             root_hash,
             epoch: epoch.clone(),
             urls,
-            // No peer declaration: this reproduces exactly what dig-mirror-coin 0.7 wrote, which
-            // had no declared_peer concept at all, so the bump changes nothing about the coins this
-            // node creates. It is a deliberate choice rather than a default -- the crate made the
-            // field required precisely so a consumer cannot inherit one silently. Binding this
-            // collateral to the node's own DIG peer id is dig-node#473, which owns that decision and
-            // the signature change it needs.
-            declared_peer: None,
             collateral: collateral_dig_base_units,
         },
         dig_coins,
