@@ -39,6 +39,8 @@ jobs:
   check-version:
     name: Check version increment
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout PR branch
         uses: actions/checkout@v4
@@ -164,6 +166,53 @@ jobs:
 
           exit $fail
 
+      - name: Resolve the latest stable release version
+        # Feeds `scripts/package-version.sh`'s optional PREV_VERSION argument (dig-node#540 added the
+        # check; dig-node#548 wires it in here -- until this step existed, PREV_VERSION was a tested,
+        # documented parameter that no caller ever supplied, so the cross-release guard could not fire).
+        #
+        # `releases/latest` is GitHub's own "most recent published release, excluding prereleases and
+        # drafts" endpoint, so nightlies (always `prerelease: true` on this repo's release process,
+        # dig_ecosystem CLAUDE.md §3.6-A) are excluded by construction -- belt-and-suspenders alongside
+        # PREV_VERSION's own grammar, which separately refuses anything but a bare X.Y.Z.
+        #
+        # Two failure shapes, deliberately NOT collapsed into one: a 404 means no stable release has
+        # EVER been published -- a real, unbounded state with nothing to compare against, not a broken
+        # read -- so it is skipped with a plain informational line. Any OTHER failure (rate limit,
+        # network blip, a non-404 HTTP error) is ALSO skipped rather than hard-failing every PR on a
+        # transient read, but as a `::warning::` so an actual API outage stays visible in the run
+        # instead of being silently read as "no releases exist" (dig_ecosystem CLAUDE.md §1.10 --
+        # "I could not read X" must never be treated as "X is bad").
+        id: prev_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repo="${{ github.repository }}"
+          if resp="$(gh api "repos/$repo/releases/latest" 2>/tmp/prev_release_err.log)"; then
+            tag="$(printf '%s' "$resp" | jq -r '.tag_name // empty')"
+            if [ -z "$tag" ]; then
+              echo "::warning::releases/latest for $repo returned no tag_name -- skipping the #540 guard."
+              echo "prev_version=" >> "$GITHUB_OUTPUT"
+            else
+              version="${tag#v}"
+              echo "Latest stable release: $tag (PREV_VERSION=$version)"
+              echo "prev_version=$version" >> "$GITHUB_OUTPUT"
+            fi
+          elif grep -qi 'HTTP 404' /tmp/prev_release_err.log; then
+            echo "No stable (non-draft, non-prerelease) release has ever been published for $repo --"
+            echo "nothing to compare against yet. Skipping the #540 cross-release guard."
+            echo "prev_version=" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not resolve the latest stable release from the GitHub API."
+            echo "::warning::Skipping the #540 cross-release guard for this run rather than blocking"
+            echo "::warning::every PR on a transient API read. See the raw error below."
+            cat /tmp/prev_release_err.log
+            echo "prev_version=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Validate the head version can produce a legal MSI ProductVersion
         # Runs only when the increment check above passed (default `if:` -- a step is skipped once
         # a prior step in the job has failed), and only when this branch's Cargo.toml carries a
@@ -171,7 +220,13 @@ jobs:
         # repo's OWN increment check already rejected, have nothing here to validate). Calls the
         # SAME script package.yml calls -- a second copy of its limits is exactly the kind of drift
         # dig_ecosystem CLAUDE.md 2.4b exists to prevent.
+        #
+        # PREV_VERSION (dig-node#548) comes from the step above; an empty value (the bootstrap or
+        # API-failure case) is exactly what every OTHER callsite already passes, so the script's
+        # behaviour degrades to today's single-argument check rather than failing.
         shell: bash
+        env:
+          PREV_VERSION: ${{ steps.prev_release.outputs.prev_version }}
         run: |
           set -euo pipefail
 
@@ -187,10 +242,16 @@ jobs:
             exit 0
           fi
 
-          echo "Validating '$HC' against $SCRIPT (the same check package.yml's native-package jobs run)..."
-          if ! bash "$SCRIPT" "$HC" >/dev/null; then
-            echo "::error::Cargo.toml version '$HC' cannot produce a legal MSI ProductVersion -- every"
-            echo "::error::native-package build (.deb amd64/arm64, .msi, .pkg) would fail on it. See"
+          if [ -n "$PREV_VERSION" ]; then
+            echo "Validating '$HC' against $SCRIPT, against previous stable release '$PREV_VERSION'..."
+          else
+            echo "Validating '$HC' against $SCRIPT (the same check package.yml's native-package jobs run)..."
+          fi
+          if ! bash "$SCRIPT" "$HC" "$PREV_VERSION" >/dev/null; then
+            echo "::error::Cargo.toml version '$HC' cannot produce a legal MSI ProductVersion, or its MSI"
+            echo "::error::tuple regresses against the previous stable release '$PREV_VERSION' -- every"
+            echo "::error::native-package build (.deb amd64/arm64, .msi, .pkg) would fail on it, or a real"
+            echo "::error::install of it would abort with DowngradeErrorMessage. See"
             echo "::error::scripts/package-version.sh's own error above for the specific limit hit."
             exit 1
           fi
