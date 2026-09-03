@@ -12,6 +12,18 @@
 # "already upstream". This gate is the only thing that holds both numbers, so it is the only place
 # the comparison can be surfaced -- and being able to read it WHILE the gate is green is what turns
 # a merge-time surprise into something a long-lived review round can notice.
+#
+# Also validates that the head Cargo.toml version can produce a legal MSI ProductVersion
+# (dig_ecosystem#521, dig_ecosystem#522). `scripts/package-version.sh` already enforces that
+# whitelist, but it previously ran ONLY inside `Native install packages` (package.yml), which is
+# NOT a required check -- a red package build never blocked a merge. Six PRs merged carrying an
+# unbuildable version before anyone noticed. This job IS required, so folding the same validation
+# in here (reusing the checkout this job already does, calling the real script rather than a second
+# copy of its limits) makes an unbuildable version fail fast, on a required check, in ~1s -- instead
+# of discovering it tens of minutes later in a build job nobody is blocked on. package.yml's build
+# jobs stay non-required on purpose: they can legitimately flake on build infra (an apt mirror
+# timeout has failed `build .deb` with the version itself perfectly valid), and a flaky multi-minute
+# job has no business gating every merge.
 name: Check Version Increment
 
 on:
@@ -151,3 +163,35 @@ jobs:
           } >> "$SUMMARY"
 
           exit $fail
+
+      - name: Validate the head version can produce a legal MSI ProductVersion
+        # Runs only when the increment check above passed (default `if:` -- a step is skipped once
+        # a prior step in the job has failed), and only when this branch's Cargo.toml carries a
+        # bare `X.Y.Z` this script's grammar accepts (package.json-only repos, or a version this
+        # repo's OWN increment check already rejected, have nothing here to validate). Calls the
+        # SAME script package.yml calls -- a second copy of its limits is exactly the kind of drift
+        # dig_ecosystem CLAUDE.md 2.4b exists to prevent.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCRIPT="branch-repo/scripts/package-version.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "No scripts/package-version.sh on this branch -- nothing to validate."
+            exit 0
+          fi
+
+          HC="$(python3 -c 'import sys,tomllib; d=tomllib.load(open("branch-repo/Cargo.toml","rb")); v=d.get("package",{}).get("version") or d.get("workspace",{}).get("package",{}).get("version") or ""; print(v if isinstance(v,str) else "")' 2>/dev/null || echo "")"
+          if [ -z "$HC" ]; then
+            echo "No Cargo.toml version on this branch -- nothing to validate."
+            exit 0
+          fi
+
+          echo "Validating '$HC' against $SCRIPT (the same check package.yml's native-package jobs run)..."
+          if ! bash "$SCRIPT" "$HC" >/dev/null; then
+            echo "::error::Cargo.toml version '$HC' cannot produce a legal MSI ProductVersion -- every"
+            echo "::error::native-package build (.deb amd64/arm64, .msi, .pkg) would fail on it. See"
+            echo "::error::scripts/package-version.sh's own error above for the specific limit hit."
+            exit 1
+          fi
+          echo "'$HC' maps to a legal MSI ProductVersion."
