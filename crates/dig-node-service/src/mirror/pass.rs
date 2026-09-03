@@ -791,7 +791,7 @@ mod tests {
                 epoch: NOW_EPOCH,
                 amount_dig_base_units: REQUIRED,
             },
-            "the coin is still on chain and still locking money, switch or no switch -- and the              reclaim carrying it home is the more precise thing to say than `Bonded`"
+            "the coin is still on chain and still locking money, switch or no switch -- and the reclaim carrying it home is the more precise thing to say than `Bonded`"
         );
         assert_eq!(
             state("bb", "22"),
@@ -1064,7 +1064,7 @@ mod tests {
         assert_eq!(
             d.states,
             vec![(bond("aa", "11"), BondState::Pending)],
-            "not `Bonded` -- nothing is advertising it yet -- and not `Reclaiming`, which would              describe last epoch's money while the question is about this epoch's capsule"
+            "not `Bonded` -- nothing is advertising it yet -- and not `Reclaiming`, which would describe last epoch's money while the question is about this epoch's capsule"
         );
     }
 }

@@ -12,13 +12,29 @@
 
 use dig_wallet::autoseed::{self, WalletPaths};
 
-/// What a balance observation lets the node conclude about funding.
+/// What a balance observation lets the node conclude about the wallet ever having held money.
+///
+/// # Not to be confused with [`crate::mirror::funding::FundingObservation`]
+///
+/// The two were both called `FundingObservation` and are different concepts, which is why this one
+/// was renamed rather than merged (dig-node#481). Merging them would collapse the distinction
+/// `mirror::funding` exists to protect:
+///
+/// | | this type | `mirror::funding::FundingObservation` |
+/// |---|---|---|
+/// | subject | the NODE-custodied wallet | the OPERATOR wallet |
+/// | question | has it EVER held money | what is spendable THIS pass |
+/// | decides | [`dig_wallet::autoseed::latch_ever_funded`] | the operator alert gate |
+/// | lifetime | monotonic, permanent | per-pass |
+///
+/// The name says what it decides: this is evidence about ever having been funded, not a
+/// measurement of funding.
 ///
 /// The three variants exist because a balance read has THREE outcomes, not two, and collapsing
 /// the middle one is the defect this whole batch is about: a zero from a node that cannot see is
 /// not the same claim as a zero from a node that can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FundingObservation {
+pub enum EverFundedEvidence {
     /// A non-zero figure was observed. The wallet holds, or has held, money.
     Funded,
     /// A CURRENT read from an authoritative tier reported zero. This is a real claim of
@@ -29,7 +45,7 @@ pub enum FundingObservation {
     CannotSay,
 }
 
-impl FundingObservation {
+impl EverFundedEvidence {
     /// Classify a balance reading.
     ///
     /// `balance`/`pending` are summed deliberately: value in flight is value the wallet has held.
@@ -82,7 +98,7 @@ impl FundingObservation {
 /// A latch write that FAILS is logged and swallowed. This runs inside a periodic pass whose job is
 /// something else, and a sidecar write failure must not take that pass down — the next observation
 /// retries, and the flag defaults to the safe answer meanwhile.
-pub fn observe(paths: &WalletPaths, observation: FundingObservation) {
+pub fn observe(paths: &WalletPaths, observation: EverFundedEvidence) {
     if !observation.should_latch() {
         return;
     }
@@ -106,27 +122,27 @@ mod tests {
     #[test]
     fn a_current_zero_is_evidence_of_emptiness_and_an_unsynced_zero_is_not() {
         assert_eq!(
-            FundingObservation::classify(0, 0, true),
-            FundingObservation::ObservedEmpty
+            EverFundedEvidence::classify(0, 0, true),
+            EverFundedEvidence::ObservedEmpty
         );
         assert_eq!(
-            FundingObservation::classify(0, 0, false),
-            FundingObservation::CannotSay
+            EverFundedEvidence::classify(0, 0, false),
+            EverFundedEvidence::CannotSay
         );
         // The control that makes the pair load-bearing: a real figure classifies as funded from
         // EITHER tier, so `synced` is a gate on the zero case only, never on the money case.
         assert_eq!(
-            FundingObservation::classify(1, 0, true),
-            FundingObservation::Funded
+            EverFundedEvidence::classify(1, 0, true),
+            EverFundedEvidence::Funded
         );
         assert_eq!(
-            FundingObservation::classify(1, 0, false),
-            FundingObservation::Funded
+            EverFundedEvidence::classify(1, 0, false),
+            EverFundedEvidence::Funded
         );
         // Value in flight is value held.
         assert_eq!(
-            FundingObservation::classify(0, 1, true),
-            FundingObservation::Funded
+            EverFundedEvidence::classify(0, 1, true),
+            EverFundedEvidence::Funded
         );
     }
 
@@ -136,14 +152,14 @@ mod tests {
     /// unconditionally and one that never latched would each satisfy a single-direction test.
     #[test]
     fn only_evidence_of_money_latches() {
-        assert!(FundingObservation::Funded.should_latch());
+        assert!(EverFundedEvidence::Funded.should_latch());
         assert!(
-            !FundingObservation::CannotSay.should_latch(),
+            !EverFundedEvidence::CannotSay.should_latch(),
             "an unknown DEFERS: every node is in this state on its first pass, so latching here \
              would make `is_disposable` vacuously false forever — see `should_latch`'s doc"
         );
         assert!(
-            !FundingObservation::ObservedEmpty.should_latch(),
+            !EverFundedEvidence::ObservedEmpty.should_latch(),
             "a current zero is real evidence of emptiness and must not latch"
         );
     }
@@ -163,13 +179,13 @@ mod tests {
         );
 
         // A current zero must NOT latch, or the test below could not fail.
-        observe(&paths, FundingObservation::ObservedEmpty);
+        observe(&paths, EverFundedEvidence::ObservedEmpty);
         assert!(
             autoseed::is_disposable(&paths),
             "a measured empty wallet stays disposable"
         );
 
-        observe(&paths, FundingObservation::Funded);
+        observe(&paths, EverFundedEvidence::Funded);
 
         // Re-read from the filesystem rather than from memory: this is the restart.
         assert!(

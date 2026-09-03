@@ -171,6 +171,25 @@ const _: () = assert!(
 /// of this node may reasonably overturn it in either direction.
 pub const CORROBORATION_FLOOR: usize = 2;
 
+/// The corroboration floor a **bond verdict** demands, above [`CORROBORATION_FLOOR`].
+///
+/// Three, and the reason it may be higher here is that the two paths pay opposite prices for
+/// refusing. [`CORROBORATION_FLOOR`] is pinned at two because the sync path writes the wallet's
+/// replica: a round it refuses is a round the replica does not advance, and demanding more peers
+/// than a thin network offers is how a user's node froze for hours. **The bond path writes
+/// nothing.** A refused round there yields `unverified`, which shares a rank with `unbonded` and
+/// leaves the located slate exactly as a node with no verifier installed would return it, so the
+/// cost of refusing is zero and the cost of believing a thin round is a promotion an attacker
+/// bought for the price of two voices.
+///
+/// It is deliberately a SEPARATE constant rather than a raised [`CORROBORATION_FLOOR`]: raising
+/// the shared one would re-create the frozen replica, which is the incident that fixed it at two.
+///
+/// Applied through [`tally_with_floor`], which enforces it in BOTH dimensions — at least this many
+/// peers must answer, and at least this many must give the same answer — so it cannot be satisfied
+/// by a wide round in which only two voices agree.
+pub const BOND_CORROBORATION_FLOOR: usize = 3;
+
 /// How many distinct peers one round DIALS before narrowing (dig_ecosystem#2827).
 ///
 /// Over-subscribing then pulling back is what makes a round resilient to the ordinary case that
@@ -760,14 +779,32 @@ pub struct Response<A> {
 /// cheaper for an attacker to capture, and [`sybil_success_probability`] will tell you by how
 /// much.
 pub fn tally<A: Clone + Eq + Hash>(responses: &[Response<A>]) -> Verdict<A> {
+    tally_with_floor(responses, CORROBORATION_FLOOR)
+}
+
+/// [`tally`], against a caller-chosen corroboration floor.
+///
+/// `floor` is applied in BOTH dimensions: fewer than `floor` answers is
+/// [`Verdict::Insufficient`], and an answer given by fewer than `floor` peers is
+/// [`Verdict::Split`] however wide the round was. Enforcing only the first would let a
+/// twelve-peer round in which two voices agree pass a floor of three, which is the shape the
+/// stricter floor exists to refuse.
+///
+/// A floor BELOW [`CORROBORATION_FLOOR`] is not honoured -- the never-one-source rule is not a
+/// caller's to relax -- so this can only ever be stricter than [`tally`], never weaker.
+pub fn tally_with_floor<A: Clone + Eq + Hash>(
+    responses: &[Response<A>],
+    floor: usize,
+) -> Verdict<A> {
+    let floor = floor.max(CORROBORATION_FLOOR);
     let answered = responses.len();
-    if answered < CORROBORATION_FLOOR {
+    if answered < floor {
         return Verdict::Insufficient {
             answered,
-            required: CORROBORATION_FLOOR,
+            required: floor,
         };
     }
-    let required = required_agreement(answered);
+    let required = required_agreement(answered).max(floor);
 
     let mut counts: HashMap<&A, usize> = HashMap::new();
     for r in responses {
