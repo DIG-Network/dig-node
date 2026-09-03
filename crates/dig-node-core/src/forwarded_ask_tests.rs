@@ -312,6 +312,61 @@ async fn a_holder_only_a_peer_knows_about_reaches_the_answer() {
     );
 }
 
+/// **Proves (NC-12, `seams::dig_peer::holder_cache` module doc):** a peer's HEARSAY never enters the
+/// first-hand holder cache, even though it is perfectly welcome in the answer.
+///
+/// **Why this is the sharpest thing to pin about that cache.** `FirstHandHolderCache::remember` says
+/// in its own doc that "the caller is responsible for passing first-hand records only", so the
+/// property is a discipline of `locate_holders` rather than an invariant the type enforces. The
+/// module doc names exactly what it buys: a cache that stored hearsay would let one lying hop plant a
+/// fabricated holder that this node then re-serves as its OWN knowledge for the whole TTL -- "a far
+/// better attack than lying once", because it converts a single lie into an hour of this node
+/// repeating it to everyone who asks.
+///
+/// **Fixture design -- two DISTINGUISHABLE records, one per leg, and the inequality is the test.**
+/// The DHT names peer 1 and the forwarded leg names peer 9. Both are required: with an empty DHT the
+/// cache would be empty because `remember` declines an empty slate, which is a DIFFERENT reason and
+/// would let this test pass under an implementation that cached hearsay happily. With one shared
+/// record there would be nothing to tell "cached mine" from "cached theirs" apart. So the answer must
+/// contain BOTH and the cache must contain ONLY the first-hand one.
+///
+/// **On the revert:** add `self.holder_cache.remember(content, &forwarded.records);` after the
+/// forwarded leg in `NodeContent::locate_holders` -- one line -- and the cache assertion fires.
+#[tokio::test]
+async fn a_peers_hearsay_reaches_the_answer_but_never_the_first_hand_cache() {
+    let cid = content();
+    let ask = RecordingAsk::answering(vec![provider(9, &cid)]);
+    let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(ask.clone()));
+
+    let found = pc
+        .locate_holder_candidates(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
+        .await;
+
+    // The control: BOTH legs genuinely contributed, so the cache assertion below is comparing two
+    // populated sources rather than observing one empty one.
+    assert_eq!(
+        peer_ids(&found),
+        vec![mock_peer_hex(1), mock_peer_hex(9)],
+        "fixture precondition: the answer must carry this node's own finding AND the peer's \
+         hearsay, first-hand ahead of hearsay"
+    );
+
+    let cached = pc
+        .holder_cache()
+        .get(&cid)
+        .expect("a completed walk that found a holder is remembered");
+    assert_eq!(
+        peer_ids(&cached),
+        vec![mock_peer_hex(1)],
+        "only THIS node's own lookup may be remembered; caching the peer's hearsay would let one \
+         lying hop plant a holder this node re-serves as its own for the whole TTL"
+    );
+}
+
 /// **Proves:** with no forwarded-ask leg installed — the FFI/base path — the answer is exactly this
 /// node's own DHT findings, unchanged.
 ///
