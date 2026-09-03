@@ -110,12 +110,7 @@ const NODE_UNAVAILABLE_MESSAGE: &str = "node engine not available: dig-runtime s
 /// on. Deriving it means `-32000` carries the same `data.code` + `data.origin` here as on every
 /// other frame the node emits (dig-node#496).
 fn node_unavailable_jsonrpc() -> String {
-    dig_node_core::rpc_err(
-        &serde_json::Value::Null,
-        -32000,
-        NODE_UNAVAILABLE_MESSAGE,
-    )
-    .to_string()
+    dig_node_core::rpc_err(&serde_json::Value::Null, -32000, NODE_UNAVAILABLE_MESSAGE).to_string()
 }
 
 /// Dispatch one node JSON-RPC request, or return [`node_unavailable_jsonrpc`] when

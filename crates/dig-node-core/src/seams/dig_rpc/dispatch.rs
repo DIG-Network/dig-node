@@ -1041,11 +1041,9 @@ impl RpcDispatch for Node {
             // Through the canonical frame builder, so this failure carries `data.code` +
             // `data.origin` like every other declared code rather than a bare {code,message}
             // a client cannot branch on (dig-node#496).
-            Err(e) => crate::seams::dig_rpc::errors::error_frame(
-                &id,
-                -32000,
-                &format!("upstream: {e}"),
-            ),
+            Err(e) => {
+                crate::seams::dig_rpc::errors::error_frame(&id, -32000, &format!("upstream: {e}"))
+            }
         }
     }
 }
