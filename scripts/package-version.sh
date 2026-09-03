@@ -37,7 +37,7 @@
 # install as a second product. Neither half is sufficient alone — see SPEC §11.5c, asserted by
 # scripts/tests/package-version.test.sh.
 #
-# STABLE-CHANNEL MINOR OVERFLOW (dig_ecosystem#521, dig_ecosystem#522). This repo's `0.<minor>.<patch>`
+# STABLE-CHANNEL MINOR OVERFLOW (#521, #522). This repo's `0.<minor>.<patch>`
 # scheme puts an ever-incrementing feat/breaking counter (CLAUDE.md §2.4) in MINOR, which is not
 # bounded the way MSI's field is — it ran out at 0.255.x. Rather than reset MAJOR to 1 (a public
 # maturity signal this pre-release repo should not make as a side effect of a packaging limit) or
@@ -63,18 +63,29 @@
 # release's passthrough encoding (e.g., 1.0.0 mapping to MSI 1.0.0). This is a cross-release
 # sequencing hazard, not caught by the in-version MAJOR==0 guard. Any future MAJOR bump that
 # occurs after MINOR has overflowed requires re-deriving this mapping BEFORE that release to avoid
-# the downgrade-class collision. This does not affect the current pre-release repo (MINOR has never
-# exceeded 255 as of this PR); when it becomes relevant, the decision is a user-call, not something
-# this script guesses.
+# the downgrade-class collision.
 #
-# Usage: package-version.sh <version>
+# CROSS-RELEASE GUARD (#540). An in-version guard cannot see this hazard -- 1.0.0 alone
+# is perfectly legal, and only compares badly against a SPECIFIC earlier release. So an optional
+# second argument, PREV_VERSION (the previous stable release's bare X.Y.Z), lets a caller prove the
+# ordering holds across one specific transition: this script folds PREV_VERSION with the same
+# mapping and refuses to emit unless the new version's MSI tuple compares strictly HIGHER. Omitting
+# it (every existing callsite) skips the check exactly as before -- this is additive, not a
+# behaviour change to any caller that does not opt in. See the guard's own comment below and
+# SPEC.md §11.5c for the full reasoning; measured 2026-09-03 (#540): MINOR has never
+# exceeded 255 in any released dig-node version, so nothing shipped today needs this check to fire,
+# but a future MAJOR bump does.
+#
+# Usage: package-version.sh <version> [<prev_stable_version>]
 # Emits (stdout, `key=value` lines suitable for appending to $GITHUB_OUTPUT):
 #   file_version=<version verbatim>
 #   msi_product_version=<numeric major.minor.build>
-# Exits non-zero, with the reason on stderr, for any version outside the accepted grammar.
+# Exits non-zero, with the reason on stderr, for any version outside the accepted grammar, or (when
+# PREV_VERSION is given) for a version whose MSI tuple would not exceed PREV_VERSION's.
 set -euo pipefail
 
 VERSION="${1-}"
+PREV_VERSION="${2-}"
 
 die() {
   printf 'package-version: %s\n' "$1" >&2
@@ -100,14 +111,14 @@ NIGHTLY_DATE="${BASH_REMATCH[5]-}"
 #
 # MINOR's ceiling is 65535, not 255: it is the field this repo's ever-incrementing counter lives in,
 # and above 255 it is mapped into the MSI major field rather than emitted directly (see the header
-# comment and dig_ecosystem#521/#522) — 65535 = 256*255+255 is the largest value that mapping can
+# comment and #521/#522) — 65535 = 256*255+255 is the largest value that mapping can
 # still express as a legal (major<=255, minor<=255) MSI pair.
 [ "$MAJOR" -le 255 ] || die "major version $MAJOR exceeds the MSI ProductVersion limit of 255"
-[ "$MINOR" -le 65535 ] || die "minor version $MINOR exceeds the MSI-mappable limit of 65535 (256*255+255 -- the overflow-carry ceiling from dig_ecosystem#521/#522)"
+[ "$MINOR" -le 65535 ] || die "minor version $MINOR exceeds the MSI-mappable limit of 65535 (256*255+255 -- the overflow-carry ceiling from #521/#522)"
 [ "$PATCH" -le 65535 ] || die "patch version $PATCH exceeds the MSI ProductVersion limit of 65535"
 
 # Fold MINOR into a legal (<=255, <=255) MSI major/minor pair. Below the old ceiling this is a pure
-# passthrough — identical to every version released before dig_ecosystem#521/#522 existed. Above it,
+# passthrough — identical to every version released before #521/#522 existed. Above it,
 # the overflow carries into MSI's MAJOR field, which is otherwise idle at 0 for this repo's whole
 # pre-1.0 lifetime; that only has a defined answer while the REAL major is 0; a real major bump
 # combined with an overflowed minor is a fresh decision, not a guess, so it fails closed.
@@ -116,13 +127,74 @@ if [ "$MINOR" -le 255 ]; then
   MSI_MINOR="$MINOR"
 else
   if [ "$MAJOR" -ne 0 ]; then
-    CARRY_COLLISION_MSG="minor version $MINOR needs the overflow-carry MSI mapping (dig_ecosystem#521/#522), "
+    CARRY_COLLISION_MSG="minor version $MINOR needs the overflow-carry MSI mapping (#521/#522), "
     CARRY_COLLISION_MSG+="which is only defined for MAJOR==0 — got MAJOR=$MAJOR; this combination needs a "
     CARRY_COLLISION_MSG+="fresh decision, not a guess"
     die "$CARRY_COLLISION_MSG"
   fi
   MSI_MAJOR=$(( MINOR / 256 ))
   MSI_MINOR=$(( MINOR % 256 ))
+fi
+
+# ── Cross-release ordering guard (#540) ─────────────────────────────────────────────
+#
+# Everything above catches a COLLISION inside a single version string. It cannot catch the
+# sequencing hazard #540 exists for: a version that already carried into the MSI major field (e.g.
+# 0.511.0 -> MSI 1.255.0) can compare HIGHER, under msiexec's numeric (major, minor, build) order,
+# than a LATER real-major release with no carry active (e.g. 1.0.0 -> MSI 1.0.0). Nothing about
+# 1.0.0 in isolation is illegal, so this can only be caught by comparing against what actually
+# shipped before it -- which is exactly what PREV_VERSION supplies.
+#
+# `.github/workflows/ensure-version-increment.yml`'s version-increment job already checks out both
+# the PR head and `main`, so it can pass `main`'s Cargo.toml version here at zero extra checkout cost;
+# every other callsite (the three package.yml build jobs) leaves PREV_VERSION empty and this block
+# is skipped entirely, so their behaviour is byte-for-byte unchanged.
+if [ -n "$PREV_VERSION" ]; then
+  if [[ ! $PREV_VERSION =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    die "PREV_VERSION '$PREV_VERSION' must be a bare X.Y.Z stable release (no nightly suffix)"
+  fi
+  PREV_MAJOR="${BASH_REMATCH[1]}"
+  PREV_MINOR="${BASH_REMATCH[2]}"
+  PREV_PATCH="${BASH_REMATCH[3]}"
+  [ "$PREV_MINOR" -le 65535 ] \
+    || die "PREV_VERSION minor $PREV_MINOR exceeds the MSI-mappable limit of 65535"
+
+  # Fold PREV_VERSION with the identical rule used above. A previously-EMITTED version can only
+  # have MAJOR != 0 with MINOR <= 255 (the collision guard above already refuses any other
+  # combination at emit time), so this repeats the same two-branch fold rather than re-deriving it.
+  if [ "$PREV_MINOR" -le 255 ]; then
+    PREV_MSI_MAJOR="$PREV_MAJOR"
+    PREV_MSI_MINOR="$PREV_MINOR"
+  else
+    PREV_MSI_MAJOR=$(( PREV_MINOR / 256 ))
+    PREV_MSI_MINOR=$(( PREV_MINOR % 256 ))
+  fi
+
+  # Compare (msi_major, msi_minor, patch) exactly as msiexec does: field by field, numerically, in
+  # that priority order -- the same rule scripts/tests/package-version.test.sh's `msi_compared`
+  # helper checks. Only a strict LOWER comparison is the #540 hazard (a genuine DowngradeError); an
+  # EQUAL tuple between two distinct file versions is the same case SPEC.md §11.5c already covers
+  # for same-day nightlies (packaging/windows/dig-node.wxs's `AllowSameVersionUpgrades="yes"` makes
+  # it upgrade in place), so it is not rejected here.
+  new_is_lower=0
+  if [ "$MSI_MAJOR" -lt "$PREV_MSI_MAJOR" ]; then
+    new_is_lower=1
+  elif [ "$MSI_MAJOR" -eq "$PREV_MSI_MAJOR" ] && [ "$MSI_MINOR" -lt "$PREV_MSI_MINOR" ]; then
+    new_is_lower=1
+  elif [ "$MSI_MAJOR" -eq "$PREV_MSI_MAJOR" ] && [ "$MSI_MINOR" -eq "$PREV_MSI_MINOR" ] \
+       && [ "$PATCH" -lt "$PREV_PATCH" ]; then
+    new_is_lower=1
+  fi
+
+  if [ "$new_is_lower" -eq 1 ]; then
+    CROSS_MSG="'$VERSION' (MSI ${MSI_MAJOR}.${MSI_MINOR}.${PATCH}) compares LOWER than the previous "
+    CROSS_MSG+="release '$PREV_VERSION' (MSI ${PREV_MSI_MAJOR}.${PREV_MSI_MINOR}.${PREV_PATCH}) under "
+    CROSS_MSG+="msiexec's numeric ordering -- installing this over a host already at '$PREV_VERSION' "
+    CROSS_MSG+="would abort on DowngradeErrorMessage. This is the #540 cross-release "
+    CROSS_MSG+="ordering hazard: pick a MINOR/PATCH for '$VERSION' whose folded MSI tuple is at least "
+    CROSS_MSG+="${PREV_MSI_MAJOR}.${PREV_MSI_MINOR}.${PREV_PATCH}, or derive a fresh mapping (SPEC.md §11.5c)"
+    die "$CROSS_MSG"
+  fi
 fi
 
 # Days from 2020-01-01 to YYYYMMDD, via Howard Hinnant's days_from_civil. Computed in awk rather

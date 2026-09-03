@@ -196,7 +196,7 @@ rejects 'major one over the MSI ceiling' '256.0.0'
 ok 'patch at the MSI ceiling' '0.1.65535' '0.1.65535' '0.1.65535'
 rejects 'patch one over the MSI ceiling' '0.1.65536'
 
-# ── MINOR exceeding 255 carries into the otherwise-idle MSI major field (dig_ecosystem#521/#522) ──
+# ── MINOR exceeding 255 carries into the otherwise-idle MSI major field (#521/#522) ──
 #
 # dig-node's `0.<minor>.<patch>` scheme puts an ever-incrementing feat/breaking counter in MINOR
 # (CLAUDE.md §2.4), which ran out at 0.255.x — `0.256.0` used to `die` here, which made every native
@@ -205,7 +205,7 @@ rejects 'patch one over the MSI ceiling' '0.1.65536'
 # idle at 0 for this repo's whole pre-1.0 lifetime. This must stay a byte-identical passthrough for
 # every already-released version (MINOR <= 255) and must newly SUCCEED, not die, the instant it
 # crosses 255.
-printf '\n== minor exceeding 255 carries into the otherwise-idle MSI major field (dig_ecosystem#521/#522) ==\n'
+printf '\n== minor exceeding 255 carries into the otherwise-idle MSI major field (#521/#522) ==\n'
 ok 'last value before the carry activates' '0.255.9' '0.255.9' '0.255.9'
 ok 'first carried value -- this used to die' '0.256.0' '0.256.0' '1.0.0'
 ok 'carry mid-range' '0.511.0' '0.511.0' '1.255.0'
@@ -249,6 +249,84 @@ for i in $(seq 1 $((${#carry_boundary_versions[@]} - 1))); do
     printf 'FAIL %s -> %s does not compare greater under msiexec (%s vs %s, order=%s)\n' \
       "$earlier" "$later" "$a" "$b" "$order"
     failures=$((failures + 1))
+  fi
+done
+
+# ── Cross-release ordering guard (#540) ─────────────────────────────────────────────
+#
+# The checks above catch a COLLISION inside a single version string (a real nonzero MAJOR sharing a
+# version with an overflowed MINOR). They cannot catch the sequencing hazard #540 exists for: a
+# version that already carried into the MSI major field (e.g. 0.511.0 -> MSI 1.255.0) can compare
+# HIGHER, under msiexec's numeric order, than a LATER real-major release with no carry active (e.g.
+# 1.0.0 -> MSI 1.0.0). Nothing about 1.0.0 alone is illegal -- only a specific prior release makes
+# it a downgrade -- so this can only be proven by supplying that prior release as PREV_VERSION.
+printf '\n== an optional PREV_VERSION proves the transition across a MAJOR bump (#540) ==\n'
+
+# okp <name> <version> <prev_version> <expected-msi_product_version>
+okp() {
+  local name="$1" version="$2" prev="$3" want_msi="$4"
+  local out status
+  out="$(bash "$MAP" "$version" "$prev" 2>&1)"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    printf 'FAIL %s: exited %s, want 0\n%s\n' "$name" "$status" "$out"
+    failures=$((failures + 1))
+    return
+  fi
+  local got_msi
+  got_msi="$(printf '%s\n' "$out" | sed -n 's/^msi_product_version=//p')"
+  if [ "$got_msi" != "$want_msi" ]; then
+    printf 'FAIL %s: msi_product_version=%s, want %s\n' "$name" "$got_msi" "$want_msi"
+    failures=$((failures + 1))
+  else
+    printf 'ok   %s\n' "$name"
+  fi
+}
+
+# rejects_cross <name> <version> <prev_version>
+rejects_cross() {
+  local name="$1" version="$2" prev="$3"
+  local out status
+  out="$(bash "$MAP" "$version" "$prev" 2>&1)"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    printf 'FAIL %s: accepted %q over prev %q (exit 0) -- this is the #540 downgrade hazard, it\n' \
+      "$name" "$version" "$prev"
+    printf '     must be refused\n%s\n' "$out"
+    failures=$((failures + 1))
+  elif ! printf '%s' "$out" | grep -q '#540'; then
+    printf 'FAIL %s: rejected but not with the #540 cross-release message:\n%s\n' "$name" "$out"
+    failures=$((failures + 1))
+  else
+    printf 'ok   %s (rejected)\n' "$name"
+  fi
+}
+
+# The exact hazard the ticket names: a carried 0.511.0 (MSI 1.255.0) outranks a naive 1.0.0.
+rejects_cross 'the ticket'"'"'s own example -- 0.511.0 outranks a naive 1.0.0' '1.0.0' '0.511.0'
+# A MAJOR bump when the previous release never carried is always safe -- covers today's actual
+# state (measured 2026-09-03: dig-node's highest-ever shipped MINOR is 252, well under the carry
+# threshold), so this must keep succeeding.
+okp 'a MAJOR bump over an uncarried prev is safe' '1.0.0' '0.252.11' '1.0.0'
+# A MAJOR bump numbered high enough to clear the carried prev is accepted -- option 1 from the
+# ticket, machine-checked rather than trusted to a human's arithmetic.
+okp 'a MAJOR bump numbered past the carried prev is accepted' '2.0.0' '0.511.0' '2.0.0'
+# Ordinary same-MAJOR increments must not spuriously trip the guard.
+okp 'an ordinary patch bump against its own predecessor is unaffected' '0.252.12' '0.252.11' '0.252.12'
+okp 'a minor bump that itself carries, against an uncarried prev, is unaffected' \
+  '0.256.0' '0.252.11' '1.0.0'
+# An equal MSI tuple is exactly the WiX same-version-upgrade case, not a downgrade -- must not be
+# treated as a #540 hazard (a distinct FILE version producing an identical MSI tuple is legal; see
+# the nightly same-day case above).
+okp 'an equal MSI tuple is not itself a #540 rejection' '0.252.11' '0.252.11' '0.252.11'
+# A malformed PREV_VERSION is a caller bug (nightly suffix, garbage, etc.) and must fail closed
+# rather than silently skip the check.
+for bad_prev in 'garbage' '0.93.9-nightly.20260804.603187a' '1.0'; do
+  if bash "$MAP" '1.0.0' "$bad_prev" >/dev/null 2>&1; then
+    printf 'FAIL malformed PREV_VERSION %q: accepted (exit 0) -- must fail closed\n' "$bad_prev"
+    failures=$((failures + 1))
+  else
+    printf 'ok   malformed PREV_VERSION %q (rejected)\n' "$bad_prev"
   fi
 done
 
