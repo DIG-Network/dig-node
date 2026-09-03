@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use chia_bls::PublicKey;
-use chia_wallet_sdk::driver::Cat;
+use chia_wallet_sdk::driver::{Cat, OptionType};
 use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
 
 use super::chain::PushOutcome;
@@ -694,7 +694,10 @@ pub struct WalletBackend {
 /// The connected client's PUBLIC identity for a session (#407). Scoping data only — no key.
 #[derive(Debug, Clone, Default)]
 struct SessionIdentity {
-    /// The logged-in wallet fingerprint (informational; scoping is by puzzle hash).
+    /// The logged-in wallet fingerprint, recorded at login (`rpc.rs` login arm) and
+    /// deliberately never read: authorization scopes by PUZZLE HASH, never by fingerprint, so a
+    /// read here would be a second, weaker identity for the same session. Kept because it is the
+    /// value any per-session diagnostic or audit line must name to be attributable to a wallet.
     #[allow(dead_code)]
     fingerprint: u32,
     /// The client's PUBLIC puzzle hashes (normalized lowercase hex, no `0x`). Reads are
@@ -4299,6 +4302,11 @@ impl WalletBackend {
                 option_id: option_id.clone(),
                 coin_id: option_id.clone(),
                 underlying_coin_id: underlying_coin_hex,
+                // Recorded so `exercise_options` can rebuild the whole underlying coin with no
+                // chain read: it sits at a derived puzzle hash the replica never subscribes to.
+                underlying_parent_coin_id: underlying_inputs
+                    .first()
+                    .map(|c| hex::encode(c.coin_id())),
                 underlying_delegated_puzzle_hash: hex::encode(
                     info.underlying_delegated_puzzle_hash,
                 ),
@@ -4352,9 +4360,92 @@ impl WalletBackend {
         self.finalize_spend(coin_spends, req.auto_submit).await
     }
 
-    /// `exercise_options` — a documented follow-on; see `crate::sage::options` module docs.
-    async fn exercise_options(&self, _req: &ExerciseOptions) -> Result<TransactionResponse> {
-        Err(options::exercise_options_unimplemented())
+    /// `exercise_options` -- pay the strike, unlock the underlying to the holder.
+    ///
+    /// Bounded to what this wallet can reconstruct WITHOUT replaying chain history: an
+    /// XCH-underlying, XCH-strike option it minted, still owns, and recorded the underlying
+    /// parent for. Everything else is a 400 naming the limitation (see `crate::sage::options`
+    /// module docs) -- never a mis-built spend.
+    async fn exercise_options(&self, req: &ExerciseOptions) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let signer = signer.as_ref();
+        let fee = amount_u64(&req.fee)?;
+        if req.option_ids.len() != 1 {
+            return Err(Error::api(
+                "exercise_options: exactly one option id per call is supported; each exercise \
+                 spends its own strike-funding coin, and batching them would need a joint \
+                 selection this backend does not build",
+            ));
+        }
+        let launcher = normalize_singleton_id(&req.option_ids[0]);
+        let row = self
+            .db
+            .option(&launcher)
+            .await?
+            .ok_or_else(|| Error::not_found("option not tracked in the wallet"))?;
+        let (underlying_coin, terms) = options::underlying_from_row(&row)?.ok_or_else(|| {
+            Error::api(
+                "exercise_options: this option's underlying cannot be reconstructed by this \
+                 wallet -- it was acquired by transfer, or minted before the underlying parent \
+                 was recorded. Reconstructing it would require replaying the mint launcher \
+                 spend from chain history, which this backend does not do",
+            )
+        })?;
+        let option = self.option_parent_child(&launcher).await?;
+
+        // The strike is funded from a coin at the option's OWN owner address, so a single owner
+        // layer authorizes both the singleton spend and the funding spend. Any excess over the
+        // strike is left as an implicit fee by the builder, so the coin is chosen as the
+        // smallest that covers it rather than by ordinary change-producing selection.
+        let strike_amount = match terms.strike_type {
+            OptionType::Xch { amount } => amount,
+            _ => {
+                return Err(Error::api(
+                    "exercise_options: only an XCH strike can be exercised (see \
+                     crate::sage::options module docs)",
+                ))
+            }
+        };
+        let owner_ph = options::p2_hash_of(&row)?;
+        let mut candidates: Vec<Coin> = self
+            .spendable_coins(None)
+            .await?
+            .into_iter()
+            .filter(|c| c.puzzle_hash == owner_ph && c.amount >= strike_amount)
+            .collect();
+        candidates.sort_by_key(|c| c.amount);
+        let strike_funding = *candidates.first().ok_or_else(|| {
+            Error::api(format!(
+                "exercise_options: no spendable XCH coin of at least {strike_amount} mojos at \
+                 the option's owner address to fund the strike"
+            ))
+        })?;
+
+        let mut coin_spends = options::build_exercise_option(
+            signer,
+            &option,
+            underlying_coin,
+            &terms,
+            strike_funding,
+        )?;
+        if fee > 0 {
+            let fee_coins = spend::select_coins(
+                self.spendable_coins(None)
+                    .await?
+                    .into_iter()
+                    .filter(|c| c.coin_id() != strike_funding.coin_id())
+                    .collect(),
+                fee,
+            )?;
+            coin_spends.extend(options::build_fee_only(
+                signer,
+                &fee_coins,
+                self.change_ph()?,
+                fee,
+                Some(option.1.coin_id()),
+            )?);
+        }
+        self.finalize_spend(coin_spends, req.auto_submit).await
     }
 
     // ---- record-update actions (#205 PR4) ----------------------------------
@@ -9923,12 +10014,23 @@ mod tests {
         assert_eq!(s, 400, "{resp}");
         assert!(resp.contains("XCH underlying"));
 
-        // exercise_options is a documented follow-on: a clear 500, never a panic.
+        // exercise_options is served. An option this wallet does not track is a 404, and one it
+        // tracks but cannot reconstruct is a 400 naming the limitation -- never a 500, and never
+        // a mis-built spend. This assertion previously pinned the unimplemented 500, so it
+        // encoded the gap rather than the contract.
         let (s, resp) = be
             .dispatch("exercise_options", r#"{"option_ids":["aa"],"fee":0}"#)
             .await;
-        assert_eq!(s, 500, "{resp}");
-        assert!(resp.contains("not yet implemented"));
+        assert_eq!(s, 404, "{resp}");
+        assert!(resp.contains("not tracked"), "{resp}");
+
+        // More than one option per call is refused up front, because each exercise spends its
+        // own strike-funding coin and this backend builds no joint selection.
+        let (s, resp) = be
+            .dispatch("exercise_options", r#"{"option_ids":["aa","bb"],"fee":0}"#)
+            .await;
+        assert_eq!(s, 400, "{resp}");
+        assert!(resp.contains("exactly one option id"), "{resp}");
     }
 
     #[tokio::test]

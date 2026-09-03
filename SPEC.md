@@ -6256,7 +6256,8 @@ redirect chasing, unbounded bodies, content-type confusion). Serving it requires
 post-resolution private-range refusal re-checked across redirects, a streamed size cap, total and idle
 timeouts, a scheme and content-type allowlist, and execution out of process from the signing path —
 and is out of scope for this backend. Real image-derived theme content is likewise intentionally
-unserved (§18.16). `exercise_options` (§18.15 — a documented, non-silent follow-on) remains deferred. The point-read live sync above populates the DB for the spend path;
+unserved (§18.16). `exercise_options` (§18.15) is now served for a bounded envelope; it is no longer
+in this deferred set. The point-read live sync above populates the DB for the spend path;
 the richer live direct-peer SUBSCRIPTION sync loop (§18.6) — feeding the shared `EventBus` from real
 chain `coin_state_update` pushes for continuous wallet-data reads — remains the follow-on integration
 (until it is spawned, wallet-data reads outside a live spend use the fallback tier / point-read sync).
@@ -6285,11 +6286,24 @@ sorted/filtered like `get_nfts`), `mint_option`/`transfer_options` (real `chia-w
 `mint_option` in this backend mints an **XCH-underlying** option only (the underlying lock coin holds
 plain XCH); the strike may be XCH or a CAT (a pure enum tag with no extra coin-construction cost at mint
 time — the exerciser funds it later). A CAT/NFT-underlying mint returns a clear `400` naming the
-limitation, never a mis-built spend. `exercise_options` is accepted on the wire but returns a clear,
-named `500` (`crate::sage::options::exercise_options_unimplemented`) — exercising requires tracking the
-underlying-lock coin's OWN lineage (a derived, non-HD puzzle hash outside the wallet's ordinary
-subscription set) plus the `MipsSpend`/merkle-proof machinery `OptionUnderlying::exercise_spend` needs; a
-tracked follow-on, not a silent gap. The `OptionRecord` wire shape (`launcher_id`/`amount`/
+limitation, never a mis-built spend. `exercise_options` is served through **`dig-options`** (`modules/crates/00-foundation/dig-options`,
+Appendix B), never re-derived here, for a BOUNDED envelope: an XCH-underlying, XCH-strike option this
+wallet minted, still owns, and recorded the underlying-lock coin's parent for at mint time (a new
+`options.underlying_parent_coin_id` DB column — the underlying sits at a derived, non-HD puzzle hash
+the wallet's ordinary subscription set does not cover, so the parent id is what lets the coin be
+rebuilt with no chain read). Exactly one option id per call is accepted (each exercise spends its own
+strike-funding coin; this backend builds no joint selection across several). Every reconstructed field
+is verified by `dig_options::rehydrate` against three independent on-chain commitments (the 1-of-2
+path hash, the delegated-puzzle hash, and the underlying coin id) before a spend is built, so a wrong
+creator puzzle hash is rejected rather than producing a spend against a different merkle root. An
+option acquired by TRANSFER (reconstruction would need replaying the mint launcher spend from chain
+history), a CAT strike, or a row predating the parent-id column each return a clear `400` naming the
+limitation — never a `500`, and never a mis-built spend; an option id this wallet does not track
+returns a `404`. `dig_options::exercise` emits both settlement legs in one bundle (the strike to the
+creator AND the underlying-claim leg that pays the unlocked underlying to the holder) — omitting the
+claim leg would strand the underlying on a publicly-claimable settlement coin, which is why the two
+legs are never split. The transfer-acquired case is a tracked follow-on, not a silent gap. The
+`OptionRecord` wire shape (`launcher_id`/`amount`/
 `underlying_asset`/`strike_asset`/`name`/`created_timestamp` alongside the coin/visibility/expiration
 fields) is verified field-name-identical against the pinned v0.12.11 generated OpenAPI (§18.19) — an
 initial guess used `option_id` instead of the real `launcher_id`, caught and fixed by that vector.
