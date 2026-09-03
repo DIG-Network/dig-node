@@ -9309,16 +9309,30 @@ Two limits are required, because they answer two different attacks:
   process, so any narrower scope would be several budgets against one resource;
 - a **per-claimant** limit on DISTINCT coin ids the claimant has caused reads for without ever
   proving a bond, which bounds the fabricated-coin-id case. A coin id the claimant has already been
-  read about MUST NOT count again: that is a cache entry expiring and being refreshed, not a new
-  question. A claimant that proves a bond MUST have this ledger forgiven; the process-wide budget
-  MUST NOT be refunded, since a proven bond says the claimant is honest and says nothing about this
-  node's chain access.
+  read about MUST NOT count AGAIN TOWARD THE DISTINCT-ID CAP, but a REPEAT of that same coin id
+  MUST itself be rate-limited, independently of the process-wide budget: a coin whose owner never
+  declares this claimant produces `unverified` forever, which by design is never cached, so without
+  a repeat-specific bound one such pair could re-enter admission at the process-wide refill rate
+  indefinitely and, sustained, hold the ENTIRE process-wide budget at zero for every other
+  claimant — a single fabricated coin silencing the whole node's bond promotion. A repeated pair
+  MUST be re-admitted no more often than the cadence an honest re-ask (a cache entry expiring) would
+  cost for free — never on every attempt. A claimant that proves a bond MUST have this ledger
+  forgiven; the process-wide budget MUST NOT be refunded, since a proven bond says the claimant is
+  honest and says nothing about this node's chain access.
 
 Exhausting either limit yields `unverified` having read nothing. **This is a degradation and never a
 refusal of service**: `unverified` and `unbonded` share a rank, the sort is stable, and the located
 slate is returned unchanged — precisely the behaviour of a node with no verifier installed. The read
 path is never blocked and no holder is ever ranked below where it started, so an adversary who
 exhausts the budget denies promotion, not content.
+
+**A node MUST also skip the read when its own currently-held peer sample cannot possibly meet the
+corroboration floor a bond verdict requires**, using only a cheap, non-dialling peek at whatever the
+last draw already held — never forcing a fresh dial round purely to answer this question, since a
+network that cannot supply enough peers would then pay a full dial attempt on every claim it can
+never resolve, which is worse than the wasted read it replaces. An unknown sample (nothing drawn
+yet) MUST NOT be read as a refusal — it fails open into the real read, which is what discovers peers
+in the first place.
 
 Both limits are keyed on the claiming peer id LOWERCASED before use. A peer id is fixed-length hex,
 so its two spellings denote one identity, and every check that GRANTS promotion already treats them
