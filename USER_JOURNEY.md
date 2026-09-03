@@ -166,7 +166,7 @@ every subcommand (machine output to stdout, prose to stderr).
   `2 USAGE`, `3 PERMISSION_DENIED`, `4 SERVICE_FAILED`, `5 BIND_FAILED`, `6 IO_ERROR`, `12 NODE_UNREACHABLE`.
 - **Stable JSON-RPC error codes** (UPPER_SNAKE in `error.data.code`): `PARSE_ERROR` (-32700),
   `INVALID_REQUEST` (-32600), `METHOD_NOT_FOUND` (-32601), `INVALID_PARAMS` (-32602),
-  `DISPATCH_FAILED` (-32000, shell), `UPSTREAM_ERROR` (-32010, shell), and the control-plane codes
+  `SERVER_ERROR` (-32000, shell and node), `UPSTREAM_ERROR` (-32010, shell), and the control-plane codes
   `UNAUTHORIZED` (-32020), `NOT_SUPPORTED` (-32021), `CONTROL_ERROR` (-32022). The `data.origin`
   field distinguishes node-shell errors from upstream/boundary ones.
 - **`rpc.discover`**: returns the OpenRPC document over the wire, so an agent can introspect the
