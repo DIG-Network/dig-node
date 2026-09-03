@@ -252,8 +252,10 @@ impl NatModuleTransport {
 /// # What it does NOT change
 ///
 /// This decides WHEN gate (1) of [`module_relay::relay_capsule`](super::module_relay::relay_capsule)
-/// is satisfied — never WHETHER it is checked. All three gates (the requestor asked, the operator
-/// opted in, the requestor is inside its proxy-class allowance) run exactly as before on the far end.
+/// is satisfied — never WHETHER it is checked. All four gates (the requestor asked, the operator
+/// opted in, this build has a capsule warmer, the requestor is inside its proxy-class allowance) are
+/// still checked in full on the far end. Their ORDER changed in dig-node#512 — the allowance is
+/// charged last, so a refusal consumes nothing — but nothing here relaxes any of them.
 ///
 /// # The bound
 ///
