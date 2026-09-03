@@ -2762,6 +2762,39 @@ impl WalletDb {
     ///
     /// Idempotent on the transaction id: re-pushing the same bundle updates its expiry and attempt
     /// count rather than duplicating it, because a resubmission is the same transaction.
+    ///
+    /// # The re-arm is BOUNDED, and the bound is in the SQL (dig-node#502)
+    ///
+    /// The expiry used to be taken straight from the incoming row, which is `now + TTL`. That
+    /// bounds ONE hold and not a SEQUENCE of them: a caller re-pushing the same bundle more often
+    /// than the TTL renewed its hold forever, and the inputs never returned — the lockout failure
+    /// `rpc::RESERVATION_TTL_MS`'s own doc names as the worse of the two.
+    ///
+    /// Two rules compose to bound it without shortening the TTL:
+    ///
+    /// 1. **Clamped to the FIRST push.** `submitted_at` is not in the `DO UPDATE SET` list, so the
+    ///    stored value is a stable anchor, and the new deadline may not exceed
+    ///    `submitted_at + MAX_RESERVATION_HOLD_MS`.
+    /// 2. **A re-push may never move the deadline EARLIER.** The incoming `expires_at` is
+    ///    `now + TTL`, so under a MONOTONIC clock the outer `MAX` never binds. It exists for the
+    ///    non-monotonic one: an NTP step or a manual clock change moves `now` backwards, and
+    ///    without the `MAX` that re-push would SHORTEN a live hold — returning the inputs of a
+    ///    bundle that may still land, which is the direction #348/#497 exist to close. It also
+    ///    keeps a second, later-anchored view of the same transaction from shortening a live hold.
+    ///
+    /// The clamp is expressed in SQL rather than computed in the caller because it must be atomic
+    /// against the STORED anchor: a read-then-write above this layer would race two concurrent
+    /// pushes of the same bundle. `MIN`/`MAX` are the two-argument SCALAR forms (the one-argument
+    /// forms are aggregates), which `the_clamp_uses_the_scalar_two_argument_min_and_max` pins.
+    ///
+    /// The clamp fails OPEN, not closed, under an absurd `submitted_at`: SQLite does not trap
+    /// `INTEGER` overflow on `+` but promotes the result to `REAL`, so an anchor near `i64::MAX`
+    /// makes `submitted_at + MAX_RESERVATION_HOLD_MS` exceed any plausible incoming deadline and
+    /// the cap stops binding. `submitted_at` comes from `custody::now_ms()` and is never
+    /// caller-supplied, so reaching it needs a wildly wrong system clock rather than an attacker.
+    ///
+    /// `coin_reservations`' `ON CONFLICT(coin_id) DO NOTHING` below is untouched: a coin still
+    /// backs exactly one bundle and the FIRST claim still wins.
     pub async fn reserve_spend(&self, tx: &PendingTransactionRow) -> sqlx::Result<()> {
         let mut conn = self.pool.begin().await?;
         sqlx::query(
@@ -2769,7 +2802,10 @@ impl WalletDb {
                 (transaction_id, bundle_hex, fee, submitted_at, expires_at, attempts)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(transaction_id) DO UPDATE SET
-                expires_at = excluded.expires_at,
+                expires_at = MAX(
+                    pending_transactions.expires_at,
+                    MIN(excluded.expires_at, pending_transactions.submitted_at + ?)
+                ),
                 attempts = pending_transactions.attempts + 1",
         )
         .bind(&tx.transaction_id)
@@ -2778,6 +2814,7 @@ impl WalletDb {
         .bind(tx.submitted_at)
         .bind(tx.expires_at)
         .bind(tx.attempts)
+        .bind(super::rpc::MAX_RESERVATION_HOLD_MS)
         .execute(&mut *conn)
         .await?;
         for coin_id in &tx.reserved_coin_ids {
@@ -4690,6 +4727,7 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::rpc::{MAX_RESERVATION_HOLD_MS, RESERVATION_TTL_MS};
     use super::*;
 
     /// **Proves (dig-node#462):** the only public write of `initial_sync_complete` that production
@@ -6474,6 +6512,432 @@ mod tests {
         );
         assert_eq!(db.unreserved_unspent_coins(None).await.unwrap().len(), 1);
         assert!(db.pending_transactions().await.unwrap().is_empty());
+    }
+
+    /// **The defect of dig-node#502, at the DB layer.** A caller that re-pushes the same bundle
+    /// more often than the TTL used to renew its hold forever: `expires_at` was recomputed as
+    /// `now + RESERVATION_TTL_MS` on every upsert, with no anchor to the FIRST push. The inputs
+    /// never came back, which is the lockout failure the TTL's own doc names as the worse of the
+    /// two.
+    ///
+    /// The fixture has to outlive a single TTL to see it: a one- or two-push fixture is satisfied
+    /// by the unfixed code, because the first hold has not lapsed yet. So the loop steps by less
+    /// than a TTL, past the cap, and the iteration count is asserted rather than assumed.
+    #[tokio::test]
+    async fn a_bundle_repushed_forever_still_releases_its_coins_at_the_total_cap() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let first_push = 1_000;
+        let step = 8 * 60 * 1000; // less than the TTL, so every re-push re-arms under the old rule
+        let deadline = first_push + MAX_RESERVATION_HOLD_MS;
+
+        let mut pushes = 0;
+        let mut at = first_push;
+        while at <= deadline {
+            db.reserve_spend(&reservation(
+                "tx1",
+                &["c1"],
+                first_push,
+                at + RESERVATION_TTL_MS,
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                db.prune_reservations(at).await.unwrap(),
+                0,
+                "the hold must survive while the caller is actively re-pushing (t={at})"
+            );
+            pushes += 1;
+            at += step;
+        }
+        assert!(
+            pushes >= 8,
+            "a fixture that pushes {pushes} times cannot outlive one TTL, so it cannot see this \
+             defect"
+        );
+
+        assert_eq!(
+            db.prune_reservations(deadline).await.unwrap(),
+            1,
+            "total hold is capped at submitted_at + MAX_RESERVATION_HOLD_MS however many re-pushes \
+             arrive"
+        );
+        assert_eq!(
+            db.unreserved_unspent_coins(None).await.unwrap().len(),
+            1,
+            "the coins must come back to selection at the cap"
+        );
+    }
+
+    /// The cap must not break the property it is bolted onto: INSIDE the cap a re-push still
+    /// re-arms from `now`, which is what dig-node#348 and #497 rely on to keep a genuinely
+    /// in-flight bundle's inputs held for a full TTL after its LAST honest transmission.
+    #[tokio::test]
+    async fn a_repush_inside_the_cap_still_rearms_from_now() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let first = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let again = first + 9 * 60 * 1000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            again + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.expires_at,
+            again + RESERVATION_TTL_MS,
+            "a re-push inside the cap must extend the deadline, not pin it to the first push"
+        );
+    }
+
+    /// The cap is anchored on `submitted_at`, so the whole bound rests on the upsert never
+    /// rewriting it. It is not in the `DO UPDATE SET` list today; this pins that, because a later
+    /// edit adding it there would silently restore the unbounded renewal with every test above
+    /// still green.
+    #[tokio::test]
+    async fn a_repush_never_rewrites_the_first_push_anchor() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            1_000,
+            1_000 + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            500_000,
+            500_000 + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.submitted_at, 1_000,
+            "submitted_at is the first-push anchor and a re-push must never move it"
+        );
+        assert_eq!(row.attempts, 2, "the attempt count still counts re-pushes");
+    }
+
+    /// SQLite's `MIN`/`MAX` are AGGREGATES in their one-argument form and scalars only with two or
+    /// more arguments. The clamp is written with the two-argument scalar forms; a change that left
+    /// one argument would parse, and would silently mean something else. This drives the clamp
+    /// through both of its arms at once.
+    #[tokio::test]
+    async fn the_clamp_uses_the_scalar_two_argument_min_and_max() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let first = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        // A re-push far beyond the cap: MIN picks the cap, MAX keeps it above the stored value.
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + 100 * RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.expires_at,
+            first + MAX_RESERVATION_HOLD_MS,
+            "an over-cap re-push must clamp to the cap exactly"
+        );
+    }
+
+    /// **The SAWTOOTH the cap deliberately leaves open (dig-node#502).** `prune_reservations`
+    /// DELETEs the row at the cap, so `submitted_at` anchors the clamp only while the row exists.
+    /// A re-push after the prune INSERTs a fresh row with a NEW anchor and a full new hour.
+    ///
+    /// Pinned as known, intended behaviour rather than left as an unmeasured surprise: the bound
+    /// is on CONTINUOUS hold, not aggregate hold. Closing it would mean permanently declining to
+    /// re-hold a bundle that already had its hour, which is the double-spend direction, and it
+    /// would need the per-bundle history this ticket deliberately avoided.
+    #[tokio::test]
+    async fn a_repushed_bundle_gets_a_fresh_anchor_after_the_cap_prunes_its_row() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        // The clamp lives in the `ON CONFLICT` arm, so it binds on RE-push. The first INSERT takes
+        // its deadline verbatim, which in production is always `now + TTL`.
+        let first = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + 100 * RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            db.pending_transactions().await.unwrap()[0].expires_at,
+            first + MAX_RESERVATION_HOLD_MS,
+            "a retrying caller's hold is clamped to the cap"
+        );
+
+        let capped_at = first + MAX_RESERVATION_HOLD_MS;
+        assert_eq!(
+            db.prune_reservations(capped_at).await.unwrap(),
+            1,
+            "the cap must actually release the coins"
+        );
+        assert_eq!(db.unreserved_unspent_coins(None).await.unwrap().len(), 1);
+
+        // The same bundle, pushed again after the release: a NEW row, so a NEW anchor.
+        let second = capped_at + 1;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            second,
+            second + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.submitted_at, second,
+            "the pruned row is gone, so the re-push anchors on its own push time"
+        );
+        assert_eq!(
+            row.attempts, 1,
+            "a fresh row starts its attempt count over: this is an INSERT, not the upsert path"
+        );
+        assert_eq!(
+            row.expires_at,
+            second + RESERVATION_TTL_MS,
+            "and it may accumulate a full new hour from the new anchor"
+        );
+    }
+
+    /// **The clamp's boundary (dig-node#502).** Inside the last TTL before the cap the clamp binds,
+    /// so a re-push extends the deadline by strictly LESS than a full TTL, shrinking to nothing
+    /// exactly at the cap. Correct and intended — it is what a clamp does — but asserted from BOTH
+    /// sides, because a bound tested only from below can only confirm itself.
+    #[tokio::test]
+    async fn a_repush_inside_the_last_ttl_before_the_cap_buys_less_than_a_full_ttl() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let first = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        // BELOW the boundary: a re-push at 4 x TTL wants 5 x TTL, which is under the cap, so the
+        // clamp does not bind and the full TTL is granted.
+        let under = first + 4 * RESERVATION_TTL_MS;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            under + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            db.pending_transactions().await.unwrap()[0].expires_at,
+            under + RESERVATION_TTL_MS,
+            "under the boundary the clamp must not bind: a full TTL is granted"
+        );
+
+        // OVER the boundary: a re-push half a TTL later wants 5.5 x TTL past the anchor. The cap
+        // is 6 x TTL, so it is granted in full — the last push that still buys everything it asks.
+        let at_edge = first + 5 * RESERVATION_TTL_MS;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            at_edge + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            db.pending_transactions().await.unwrap()[0].expires_at,
+            first + MAX_RESERVATION_HOLD_MS,
+            "a push at 5 x TTL asks for exactly the cap and gets exactly the cap"
+        );
+
+        // PAST it: the next re-push buys strictly less than a TTL — in fact nothing at all.
+        let past = first + 5 * RESERVATION_TTL_MS + 60_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            past + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.expires_at,
+            first + MAX_RESERVATION_HOLD_MS,
+            "past the boundary a re-push buys strictly less than a TTL, and at the cap it buys zero"
+        );
+        assert!(
+            row.expires_at < past + RESERVATION_TTL_MS,
+            "the granted deadline must be short of what the push asked for"
+        );
+    }
+
+    /// **Why the clamp keeps its outer `MAX` (dig-node#502).** With the deadline written as
+    /// `MIN(excluded.expires_at, submitted_at + cap)` alone, the incoming value is `now + TTL` and
+    /// a MONOTONIC clock can never make that smaller than a deadline already stored. A
+    /// non-monotonic one can: an NTP step or a manual clock change moves `now` backwards, and the
+    /// re-push then carries an EARLIER deadline than the live hold.
+    ///
+    /// Shortening a live hold is the dangerous direction — it returns the inputs of a bundle that
+    /// may still land, which is the double-select #348/#497 exist to close — so the outer `MAX`
+    /// makes a re-push able only ever to move the deadline outwards, never inwards.
+    #[tokio::test]
+    async fn a_repush_under_a_clock_that_stepped_backwards_never_shortens_a_live_hold() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let first = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let extended_at = first + 9 * 60 * 1000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            extended_at + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        // The clock steps backwards, so this re-push carries an EARLIER deadline than the live one.
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+
+        let row = &db.pending_transactions().await.unwrap()[0];
+        assert_eq!(
+            row.expires_at,
+            extended_at + RESERVATION_TTL_MS,
+            "a backwards clock step must leave an already-granted deadline alone, never shorten it"
+        );
+    }
+
+    /// The asymmetry the ticket requires to SURVIVE the fix: a coin backs exactly one in-flight
+    /// bundle and the FIRST claim wins. No path added for the cap may let a second bundle take a
+    /// coin already reserved, or shorten the first bundle's hold on it.
+    #[tokio::test]
+    async fn a_second_bundle_can_neither_take_nor_shorten_a_first_claim() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        let first = 1_000;
+        db.reserve_spend(&reservation(
+            "tx1",
+            &["c1"],
+            first,
+            first + RESERVATION_TTL_MS,
+        ))
+        .await
+        .unwrap();
+        // A second bundle claiming the same coin, lapsing immediately.
+        db.reserve_spend(&reservation("tx2", &["c1"], first, first + 1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.prune_reservations(first + 1).await.unwrap(),
+            1,
+            "only the second bundle lapses; the first still holds its coin"
+        );
+        assert!(
+            db.unreserved_unspent_coins(None).await.unwrap().is_empty(),
+            "the first claim must keep the coin out of selection"
+        );
+
+        let held: Vec<String> = db
+            .pending_transactions()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| !r.reserved_coin_ids.is_empty())
+            .map(|r| r.transaction_id)
+            .collect();
+        assert_eq!(
+            held,
+            vec!["tx1".to_string()],
+            "the coin must still be reserved by the FIRST bundle"
+        );
     }
 
     /// Settlement retires the reservation without anything having to remember to release it: the
