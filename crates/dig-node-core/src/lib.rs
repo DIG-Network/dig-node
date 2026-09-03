@@ -4951,6 +4951,15 @@ impl Node {
     ) -> Option<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>> {
         self.mirror_pointers.get().cloned()
     }
+
+    /// This node's own `peer_id`, once its peer network has started.
+    ///
+    /// The mirror lifecycle needs it to write the peer declaration into a coin it creates: a coin
+    /// that names no peer bonds content for nobody in particular and can never be promoted, so a
+    /// node creating one is paying collateral for a claim no reader can credit to it.
+    pub fn own_peer_id(&self) -> Option<String> {
+        self.peer_status.peer_id()
+    }
 }
 
 /// The COMPOSITION-ROOT upcasts (#1285 W1c — the locked "Option A" shape). `Node` stays ONE

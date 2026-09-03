@@ -11,11 +11,10 @@
 
 use std::path::Path;
 
-/// Files under `mirror/` are owned by dig-node#501 (a separate open PR repairs six
-/// sites of this same class there). Scanning them here would either duplicate that
-/// fix or fail this branch on work this PR does not own. Delete this exclusion once
-/// #501 merges.
-const EXCLUDED_DIRS: &[&str] = &["mirror"];
+/// No directory under `src` is exempt from the crate-wide scan (dig-node#501 closed
+/// the exclusion this list used to carry for `mirror/`, once that directory's own
+/// six lost-continuation sites were fixed).
+const EXCLUDED_DIRS: &[&str] = &[];
 
 /// `service.rs`'s `sc qc` parser test pins a byte-identical copy of real `sc.exe`
 /// output; its fixed-width `LABEL   : value` columns are deliberate alignment the

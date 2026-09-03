@@ -8675,24 +8675,24 @@ itself (SYSTEM.md §4.1).
 >   by name BEFORE any chain read (dig-node#426). **RECLAIMS are implemented** and are supported at `fee = 0` with
 >   no fee coins, which is §25.4.4 — and are never gated on any funding read, including the
 >   committed-coin read.
-> * **§25.10's verification of OTHER peers' claims is BUILT BUT INERT — no claim is verified on a
->   running node today.** The mechanism is present and wired: `dig-node-core`'s `mirror_bond` (the
+> * **§25.10's verification of OTHER peers' claims is LIVE.** `dig-node-core`'s `mirror_bond` (the
 >   three verdicts and the ranking locator, installed inside `NodeContent::new`) and
->   `dig-node-service`'s `mirror/bond_verify.rs` (the chain read, installed on the running node by
->   `spawn_bond_verifier_install`). But this node has no sound source for the coin-to-peer binding
->   §25.6a requires, so `bonded` is unreachable for every input, the chain read is short-circuited
->   before it is paid, and every holder receives the same verdict — the ranking is a no-op on every
->   slate. **A reader must not take this bullet as saying collateral is enforced; it is not.** The
->   binding is tracked as <https://github.com/DIG-Network/dig-node/issues/473>, and promotion
->   becomes reachable the moment it lands, with no further change here. What is verified once it does
->   is a peer's claim; this node still attaches no pointer of its own, per the next bullet.
-> * **§25.6's DHT pointer is not attached.** `ProviderRecord::unverified_mirror_coin_id` lives in
->   dig-dht 0.15, and `dig-download` 0.21.0 and `dig-peer-selector` 0.10.0 both require
->   `dig-dht ^0.13` — semver-incompatible on a `0.x` line, so taking 0.15 here would resolve two
->   dig-dht lines. Tracked as <https://github.com/DIG-Network/dig-node/issues/422>.
+>   `dig-node-service`'s `mirror/bond_verify.rs` (the chain read, installed by
+>   `spawn_bond_verifier_install`) are wired, and `peer_declaration` now reads `dig-mirror-coin`
+>   0.8.0's typed `dig-peer:` accessor, so `bonded` is reachable and a promoted holder has proven both
+>   halves §25.6a requires. **What a reader MUST NOT infer is that any coin on chain carries a
+>   declaration yet.** The format is new, and a coin acquires one only when its owner recreates it at
+>   an epoch boundary; until an owner does, that holder is `unverified` and sits at baseline. That is a
+>   stated degradation and not a lie about enforcement: no honest holder is ranked below where no
+>   verifier at all would put it.
+> * **§25.6's DHT pointer IS attached.** This bullet previously said it was not, blocked on a
+>   `dig-dht ^0.13` / `0.15` semver split; that split is resolved, `dig-node-core` takes dig-dht 0.15,
+>   and the announce passes a coin id (`seams/dig_peer/dht.rs:493`,
+>   `announce_provider_with_collateral`). The production pointer source is
+>   `mirror/pointers.rs`'s `SnapshotMirrorPointers`, installed at `server.rs:2169`. A reader MUST still
+>   treat the field as the untrusted claim its name says it is.
 >
-> So a reader MUST NOT infer that any coin is CREATED at this head, and MUST NOT infer that a mirror
-> coin id reaches the DHT.
+> So a reader MUST NOT infer that any coin is CREATED at this head.
 >
 > **A clause not named in the list above MUST be read as pending, whatever its grammatical voice**,
 > and the list is to be read NARROWLY: where an entry names a file or a function, it satisfies the
@@ -9111,17 +9111,73 @@ to an address, and a provider record's `peer_id`-to-address association is unaut
 that no chain read can settle. Such a record satisfies the declaration check and would be promoted on
 the strength of somebody else's bond.
 
-Closing that requires a separate restriction, which a node performing promotion MUST apply: promote
-only from a record whose `peer_id`-to-address association is itself authoritative — a first-hand
-announce from the peer being ranked, not a slate forwarded by a third party — or defer the credit
-until the dialled identity has been checked against the claimed `peer_id`. A dialler is not by itself
-a backstop, because peer ids are derived from the presented certificate rather than pinned against
-the dialled identity; the residual an unrestricted implementation carries is traffic redirection, not
-a stolen bond.
+Closing that requires the promoted address to be checked against the promoted identity. **A node
+performing promotion MUST dial with the claimed `peer_id` PINNED**, refusing the connection when the
+certificate the far end presents hashes to anything else. This is the operative remedy here and it
+holds: the download path makes a record's own `provider_peer_id` the dial target's pinned id, the
+NAT dialler passes it into the TLS client config, and the verifier fails the handshake with
+`peer_id mismatch`. So the attacker in the paragraph above buys a refused connection rather than a
+redirected reader, and the content a reader does accept is merkle-verified against the root it asked
+for regardless.
+
+**An earlier version of this clause said a dialler is not by itself a backstop, "because peer ids are
+derived from the presented certificate rather than pinned against the dialled identity". That was
+false**, and is recorded here because a reader reasoning from it would over-trust the alternative. It
+generalised one true fact — `dig-gossip`'s legacy rustls outbound does not pin, and every
+`expected_peer_id` in that crate is test-only — into a claim about every dial. A node MUST NOT rank on
+a declaration if its own transport lacks the pin; a node whose transport has it MUST NOT be required
+to do more.
+
+The alternative that clause offered — promote only from a record whose `peer_id`-to-address
+association is authoritative, a first-hand announce rather than a forwarded slate — is **NOT
+available at the layer that ranks, and a specification MUST NOT require it as though it were.** A DHT
+keeps attributed and hearsay records apart, but flattens them into one untagged list when answering a
+lookup, and the records a reader holds for content it actually wants are overwhelmingly the hearsay
+ones: the attributed store is populated for the keys a node is closest to, not for what it fetches. A
+locator restricted to attributed records would return almost nothing, which degrades discovery
+without improving safety the pin already provides.
+
+What the ranking layer MUST do instead is BOUND the credit: **at most one record is promoted per
+claimed `peer_id` in one locate.** The declaration binds a coin to a peer id and cannot distinguish an
+honest holder's record from a stranger's copy of it, so without this a single stolen identity could
+occupy every promoted slot on the strength of one bond. A record refused promotion by this bound
+takes the baseline tier it would have had with no verifier at all, never below it — the credit-only
+rule above is not weakened by it.
 
 **One locate is bounded work.** The size of a located set is chosen by whoever answered the lookup,
 so a node MUST bound the number of bonds it reads against a chain per locate, verifying in source
 order and leaving the remainder at baseline.
+
+**A per-locate bound is not by itself sufficient, and a node MUST NOT rely on one.** The gate that
+admits a locate is per-requestor over self-minted identities, so it bounds nothing in aggregate: an
+adversary spreads its locates across fresh identities and multiplies the per-locate ceiling by as
+many as it cares to mint. A node performing promotion therefore MUST additionally hold an
+AGGREGATE bound on the chain reads promotion causes, and that bound MUST be consulted BEFORE the
+chain is touched, so that a refused claim costs nothing.
+
+Two limits are required, because they answer two different attacks:
+
+- a **process-wide** budget on verifications, which bounds this node's total outbound read volume
+  however many identities the traffic is spread across. It is process-wide rather than per-verifier
+  because the resource being protected — the node's shared chain client — is a property of the
+  process, so any narrower scope would be several budgets against one resource;
+- a **per-claimant** limit on DISTINCT coin ids the claimant has caused reads for without ever
+  proving a bond, which bounds the fabricated-coin-id case. A coin id the claimant has already been
+  read about MUST NOT count again: that is a cache entry expiring and being refreshed, not a new
+  question. A claimant that proves a bond MUST have this ledger forgiven; the process-wide budget
+  MUST NOT be refunded, since a proven bond says the claimant is honest and says nothing about this
+  node's chain access.
+
+Exhausting either limit yields `unverified` having read nothing. **This is a degradation and never a
+refusal of service**: `unverified` and `unbonded` share a rank, the sort is stable, and the located
+slate is returned unchanged — precisely the behaviour of a node with no verifier installed. The read
+path is never blocked and no holder is ever ranked below where it started, so an adversary who
+exhausts the budget denies promotion, not content.
+
+Both limits are keyed on the claiming peer id LOWERCASED before use. A peer id is fixed-length hex,
+so its two spellings denote one identity, and every check that GRANTS promotion already treats them
+as one — the coin's declaration compares decoded bytes and the TLS pin compares certificate-hash
+bytes. A limit keyed on the raw wire text would hand a stranger a fresh allowance per spelling.
 
 **A `bonded` verdict MUST rest on AGREEMENT across independently drawn, concurrently-held untrusted
 peers -- never on one source.** The §25.6 checks establish that a coin and its creating spend are
@@ -9169,8 +9225,18 @@ to be remembered.
 Only DEFINITE verdicts are
 cached: `unverified` records this node's own momentary inability to look, and holding it would keep
 an outage in force after it had ended. The cache is keyed partly on attacker-chosen input, so it MUST
-be bounded, and overflow MUST evict rather than clear — clearing would let a stranger discard every
-verdict a node has earned by rotating coin ids.
+be bounded, and overflow MUST NOT clear — clearing would let a stranger discard every verdict a node
+has earned by rotating coin ids.
+
+**Nor may overflow evict indiscriminately.** Reclaiming already-expired entries first is always
+correct. But when the cache is full of LIVE entries, admitting a new one costs an honest verdict, and
+only `bonded` is worth that trade: `bonded` is expensive to obtain — it requires a coin that exists,
+is fully collateralised, and declares its claimant — whereas `unbonded` is the verdict a stranger
+elicits for FREE by naming coin ids that do not exist. A policy of evicting one arbitrary entry per
+insert reads as conservative but is paced by the attacker, who at a chosen insert rate turns the
+whole cache over in well under a minute and discards every earned verdict. An `unbonded` MUST
+therefore be refused admission to a cache full of live entries rather than allowed to displace a
+`bonded`.
 
 ### 25.7. Consent, the switch, and revocation
 

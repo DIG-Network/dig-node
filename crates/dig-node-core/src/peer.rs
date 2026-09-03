@@ -229,6 +229,16 @@ impl PeerStatus {
         Arc::new(PeerStatus::default())
     }
 
+    /// This node's own `peer_id`, once the peer network has started.
+    ///
+    /// `None` before start-up. A caller that must NAME this node — writing the peer declaration into
+    /// a mirror coin, say — has to tolerate that: the identity exists on disk from the first boot,
+    /// but this status only learns it when the network comes up, so an early caller MUST treat
+    /// `None` as "not yet" rather than as "this node has no identity".
+    pub fn peer_id(&self) -> Option<String> {
+        self.peer_id.lock().unwrap().clone()
+    }
+
     /// Mark the peer network running under `peer_id` (clears the last error).
     pub fn set_running(&self, peer_id: String) {
         self.running.store(true, Ordering::Relaxed);
@@ -860,12 +870,19 @@ pub use crate::shared::identity::{install_crypto_provider, load_or_generate_node
 /// peer-RPC server, the DHT dials, and the gossip pool). Without this the pool would present a cert
 /// hashing to a different peer_id than the one this node advertises (#1532).
 ///
-/// **A dialler is not guaranteed to notice.** `dig-gossip` DERIVES a peer id from the presented SPKI
-/// and does not compare it against the one it dialled — every `expected_peer_id` occurrence in that
-/// crate is inside `#[cfg(test)]` (DIG-Network/dig-gossip#85). So a split identity is not caught by a
-/// fail-closed handshake in the general case; where pinning does happen it is the dialler's own
-/// (`dig-tls::pin_and_bind`, used by the ping path). Do not rely on a mismatch being refused. dig-gossip only READS these files (`dig_peer_protocol::load_ssl_cert`), so pointing at the
-/// canonical identity files can never clobber them.
+/// **A dialler DOES notice, on every path this node is dialled over.** An earlier version of this
+/// note said the opposite, and it was wrong in a way worth stating: it generalised one true fact
+/// about `dig-gossip` into a claim about every dial. The true fact is narrow — `dig-gossip`'s legacy
+/// rustls outbound derives a peer id from the presented SPKI without comparing it to the one it
+/// dialled, and every `expected_peer_id` in that crate is inside `#[cfg(test)]`
+/// (DIG-Network/dig-gossip#85). But dig-node never dials on that path. Its dials go through
+/// `dig-nat`, which passes the expected id to `dig-tls`; the verifier compares it against the leaf
+/// the far end presents and fails the handshake with `peer_id mismatch: expected <..>, got <..>`,
+/// and `dig-peer` re-checks it after connect. The download path pins the same way, from a provider
+/// record's own `provider_peer_id`. So a split identity IS caught fail-closed here, which is exactly
+/// why keeping these files canonical matters. dig-gossip only READS them
+/// (`dig_peer_protocol::load_ssl_cert`), so pointing at the canonical identity files can never
+/// clobber them.
 ///
 /// [`node_cert_dir`]: crate::seams::key_mgmt::key_manager::KeyManager::node_cert_dir
 fn gossip_identity_paths(node_cert_dir: &std::path::Path) -> (String, String) {
@@ -2534,8 +2551,11 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     //    pool's cert/key at the persisted `NodeCert` files themselves (dig-gossip only READS them);
     //    letting the GossipService mint its OWN throwaway cert would hash to a DIFFERENT peer_id and
     //    a dial to this node can reach a DIFFERENT identity than the one advertised (#1532 — the
-    //    identity split). Not every dialler refuses that: dig-gossip derives the peer id and does not
-    //    pin it (DIG-Network/dig-gossip#85), so this must be right at the source rather than caught.
+    //    identity split). A pinning dialler DOES refuse that -- dig-gossip's production dials go
+    //    through dig-nat, which pins the expected id in dig-tls -- but getting it right at the source
+    //    is still what this does, because a caught mismatch is a refused connection rather than a
+    //    working one. (dig-gossip's own legacy rustls outbound does not pin, DIG-Network/dig-gossip#85,
+    //    but nothing here dials on it.)
     //    `cfg.peer_id` is set to that same identity so the pool's self-dial guard + handshake agree.
     //    The address book (`peers.json`) stays under `peer-net/`; only the identity is shared.
     let gossip_dir = node.peer_cert_dir();
