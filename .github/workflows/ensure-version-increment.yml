@@ -184,20 +184,34 @@ jobs:
         # instead of being silently read as "no releases exist" (dig_ecosystem CLAUDE.md §1.10 --
         # "I could not read X" must never be treated as "X is bad").
         id: prev_release
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          # >>> TEMPORARY TEST COMMIT (dig-node#548) <<<
-          # Hardcoded to prove the #540 cross-release guard fires through the REAL workflow path.
-          # The real `gh api repos/OWNER/REPO/releases/latest` resolves to v0.252.11 today, which has
-          # never overflowed MINOR past 255 -- so no legal version bump can organically violate it
-          # (proven: any head version that is semver-greater than main's 0.254.72 necessarily has a
-          # real MINOR >= 254, which folds to an MSI tuple >= (0,254,x) > (0,252,11)). Fabricating a
-          # real GitHub Release just to test CI would pollute this repo's actual release history and
-          # the update feed it drives, so this step is hardcoded for ONE commit instead, using the
-          # exact worked example from scripts/package-version.sh's own header comment
-          # (0.511.0 -> MSI 1.255.0). REVERTED to the real gh api call in the very next commit.
-          echo "TEST: hardcoding PREV_VERSION=0.511.0 to prove the #540 guard fires. This step is temporary."
-          echo "prev_version=0.511.0" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          repo="${{ github.repository }}"
+          if resp="$(gh api "repos/$repo/releases/latest" 2>/tmp/prev_release_err.log)"; then
+            tag="$(printf '%s' "$resp" | jq -r '.tag_name // empty')"
+            if [ -z "$tag" ]; then
+              echo "::warning::releases/latest for $repo returned no tag_name -- skipping the #540 guard."
+              echo "prev_version=" >> "$GITHUB_OUTPUT"
+            else
+              version="${tag#v}"
+              echo "Latest stable release: $tag (PREV_VERSION=$version)"
+              echo "prev_version=$version" >> "$GITHUB_OUTPUT"
+            fi
+          elif grep -qi 'HTTP 404' /tmp/prev_release_err.log; then
+            echo "No stable (non-draft, non-prerelease) release has ever been published for $repo --"
+            echo "nothing to compare against yet. Skipping the #540 cross-release guard."
+            echo "prev_version=" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not resolve the latest stable release from the GitHub API."
+            echo "::warning::Skipping the #540 cross-release guard for this run rather than blocking"
+            echo "::warning::every PR on a transient API read. See the raw error below."
+            cat /tmp/prev_release_err.log
+            echo "prev_version=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Validate the head version can produce a legal MSI ProductVersion
         # Runs only when the increment check above passed (default `if:` -- a step is skipped once
