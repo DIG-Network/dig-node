@@ -172,25 +172,6 @@ pub struct PushOutcome {
     pub verdict: String,
 }
 
-/// Chia error names that are a property of the BUNDLE, not of the answering node's own view.
-///
-/// **Re-exported, never redefined.** The list and its whole exclusion rationale were written here
-/// (dig-node#460) and moved DOWN into [`chia_query::mempool_refusal`] byte-identical, so that this
-/// crate and `chia-query` cannot drift into rival definitions of the same split (CLAUDE.md §2.0,
-/// centralize rivals; dig-node#556). Two copies would not merely duplicate work: they would
-/// disagree about whether a refusal is final, on the money path, and one of them would be wrong.
-///
-/// Read the rationale at the definition. Do not restate it here, and do not add a name here — a
-/// name added on this side only would be exactly the drift the move removed.
-///
-/// # The two crates apply the SAME list with OPPOSITE defaults, deliberately
-///
-/// This crate asks *may I release this bundle's reserved inputs?* and `chia-query` asks *should I
-/// try one more peer?*. The safe side of *free the inputs* is to HOLD and the safe side of *send
-/// again once* is to RETRY, so an unrecognised reason falls to hold here and to retry there.
-/// Unifying the two defaults would make one of the callers fail in its dangerous direction.
-pub(crate) use chia_query::mempool_refusal::BUNDLE_INTRINSIC_REFUSALS;
-
 /// The bare reason out of a composed [`PushOutcome::rejection`].
 ///
 /// `ChainTransport::stated_rejection` composes `"{verdict}: {reason}"` so an operator reading one
@@ -213,10 +194,32 @@ fn refusal_reason(stated: &str) -> &str {
 /// (dig-node#460).
 ///
 /// This is what [`super::rpc::WalletBackend::push_signed_bundle`] keys its reservation release on.
-/// The match is EXACT against [`BUNDLE_INTRINSIC_REFUSALS`], case-insensitively and after trimming
-/// — never a substring or prefix test. A source that embeds an allowlisted name in wider text
-/// (`"MEMPOOL_CONFLICT (see BAD_AGGREGATE_SIGNATURE)"`) does not match, and lands in the hold
-/// class, which is the direction an unparseable answer belongs in.
+/// The match is EXACT against
+/// [`BUNDLE_INTRINSIC_REFUSALS`](chia_query::mempool_refusal::BUNDLE_INTRINSIC_REFUSALS),
+/// case-insensitively and after trimming — never a substring or prefix test. A source that embeds
+/// an allowlisted name in wider text (`"MEMPOOL_CONFLICT (see BAD_AGGREGATE_SIGNATURE)"`) does not
+/// match, and lands in the hold class, which is the direction an unparseable answer belongs in.
+///
+/// # The list is NOT defined here, and must never be again (dig-node#556)
+///
+/// It and its whole exclusion rationale were written in this file (dig-node#460) and moved DOWN
+/// into [`chia_query::mempool_refusal`] byte-identical, so this crate and `chia-query` cannot
+/// drift into rival definitions of the same split (CLAUDE.md §2.0, centralize rivals). Two copies
+/// would not merely duplicate work: they would disagree about whether a refusal is FINAL, on the
+/// money path, and one of them would be wrong. Read the rationale at the definition; do not
+/// restate it here, and do not add a name on this side.
+///
+/// What stays here is the SPLIT — [`refusal_reason`] — because this crate builds the
+/// `"{verdict}: {reason}"` composition and `chia-query` classifies a bare reason. Whoever builds a
+/// composition owns taking it apart; re-deriving that split upstream would let the two drift in
+/// silence.
+///
+/// # The two crates apply the SAME list with OPPOSITE defaults, deliberately
+///
+/// This crate asks *may I release this bundle's reserved inputs?* and `chia-query` asks *should I
+/// try one more peer?*. The safe side of *free the inputs* is to HOLD and the safe side of *send
+/// again once* is to RETRY, so an unrecognised reason falls to hold here and to retry there.
+/// Unifying the two defaults would make one of the callers fail in its dangerous direction.
 pub(crate) fn refusal_is_bundle_intrinsic(stated: &str) -> bool {
     chia_query::mempool_refusal::is_bundle_intrinsic_refusal(refusal_reason(stated))
 }
@@ -986,6 +989,65 @@ mod tests {
                  destination may be holding this very bundle"
             );
         }
+    }
+
+    /// CONFORMANCE (dig-node#556/#557): this crate's COMPOSED-form classifier agrees with
+    /// `chia-query`'s BARE-form one on every name in the canonical list, and on a name that is not
+    /// in it.
+    ///
+    /// # What this pins, and what it deliberately does not
+    ///
+    /// It does NOT assert that two copies of a list are equal — there is only one list now, and a
+    /// test comparing a re-export with itself would pass for any content whatsoever. What survives
+    /// the move is this crate's own remaining logic: `refusal_reason`, the `"{verdict}: {reason}"`
+    /// split. `chia-query` documents that the split belongs to whoever built the composition, and
+    /// this is the only place it is exercised against the membership question it feeds.
+    ///
+    /// So the loop is driven FROM
+    /// [`BUNDLE_INTRINSIC_REFUSALS`](chia_query::mempool_refusal::BUNDLE_INTRINSIC_REFUSALS)
+    /// rather than from names written
+    /// here: a name added upstream is tested here the day it lands, without anybody remembering to
+    /// copy it. Each name is asked in both forms, and the composed form is the one that can fail —
+    /// a split that stopped stripping the verdict would leave `"FAILED: MINTING_COIN"` unmatched
+    /// while the bare form still matched, which is a silent move to the HOLD side on a spend no
+    /// node will ever admit.
+    ///
+    /// The negative row is not decoration. Without it, a `refusal_reason` that returned the empty
+    /// string and an `is_bundle_intrinsic_refusal` that answered `true` for everything would both
+    /// satisfy the positive rows.
+    ///
+    /// **Catches:** a broken composed-form split; the two crates' classifiers diverging on
+    /// membership; and the local copy being resurrected alongside the re-export.
+    #[test]
+    fn the_composed_split_agrees_with_chia_querys_bare_classifier_on_the_canonical_list() {
+        let canonical = chia_query::mempool_refusal::BUNDLE_INTRINSIC_REFUSALS;
+        assert!(
+            !canonical.is_empty(),
+            "the canonical list is empty, so every row below would pass vacuously"
+        );
+
+        for name in canonical {
+            assert!(
+                chia_query::mempool_refusal::is_bundle_intrinsic_refusal(name),
+                "{name} is on the canonical list and its own crate does not recognise it"
+            );
+            assert!(
+                super::refusal_is_bundle_intrinsic(&format!("FAILED: {name}")),
+                "{name} is on the canonical list, but this crate did not recognise it once                  composed as `FAILED: {name}` — the verdict split has stopped stripping the                  verdict, and a spend no node will ever admit now holds its inputs for the full                  TTL"
+            );
+        }
+
+        // The control: a name deliberately absent from the list, asked in both forms. `DOUBLE_SPEND`
+        // is the #460 refusal itself — one node's report of its OWN mempool, which on the
+        // multi-destination push path means the bundle IS in flight.
+        assert!(
+            !chia_query::mempool_refusal::is_bundle_intrinsic_refusal("DOUBLE_SPEND"),
+            "a view-dependent refusal was classified as a property of the bundle"
+        );
+        assert!(
+            !super::refusal_is_bundle_intrinsic("FAILED: DOUBLE_SPEND"),
+            "the composed form freed the inputs of a bundle another destination may be holding"
+        );
     }
 
     /// **Proves (dig-node#460):** a peer's error string reaches the classifier VERBATIM, all the way

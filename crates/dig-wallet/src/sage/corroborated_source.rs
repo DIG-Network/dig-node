@@ -341,6 +341,76 @@ mod tests {
     use super::*;
     use crate::sage::db::WalletDb;
     use crate::sage::peer_reads::{CoinPeer, PeerSample};
+    use crate::sage::quorum::{PeakClaim, SETTLED_LAG};
+
+    /// A peer that announces one tip and answers no coin question.
+    ///
+    /// Coin silence isolates the peak round: nothing below can pass because of a coin answer.
+    struct PeakOnlyPeer {
+        id: String,
+        claim: PeakClaim,
+    }
+
+    #[async_trait::async_trait]
+    impl CoinPeer for PeakOnlyPeer {
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+
+        async fn peak_claim(&self) -> Option<PeakClaim> {
+            Some(self.claim)
+        }
+
+        async fn coin_record(
+            &self,
+            _coin_id: Bytes32,
+        ) -> crate::sage::Result<Option<FallbackCoin>> {
+            Err(crate::sage::Error::internal("this peer answers no coin questions"))
+        }
+
+        async fn coin_spend(
+            &self,
+            _coin_id: Bytes32,
+        ) -> crate::sage::Result<Option<FallbackCoinSpend>> {
+            Err(crate::sage::Error::internal("this peer answers no coin questions"))
+        }
+    }
+
+    /// A draw of peers all claiming `height`, each with a distinct id and the SAME header hash.
+    ///
+    /// Distinct ids because independence is a property of the draw; one header hash because the
+    /// point of the control is peers that AGREE.
+    struct AgreeingTips {
+        peers: usize,
+        height: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerSample for AgreeingTips {
+        async fn draw(&self) -> Vec<Arc<dyn CoinPeer>> {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&self.height.to_be_bytes());
+            (0..self.peers)
+                .map(|i| {
+                    Arc::new(PeakOnlyPeer {
+                        id: format!("10.0.0.{i}:8444"),
+                        claim: PeakClaim {
+                            height: self.height,
+                            header_hash: Bytes32::from(hash),
+                        },
+                    }) as Arc<dyn CoinPeer>
+                })
+                .collect()
+        }
+    }
+
+    async fn source_over(sample: Arc<dyn PeerSample>) -> CorroboratedChainSource {
+        let db = WalletDb::open_in_memory()
+            .await
+            .expect("in-memory wallet db");
+        let reads = Arc::new(PeerCorroboratedReads::new(sample, db));
+        CorroboratedChainSource::new(reads, tokio::runtime::Handle::current())
+    }
 
     /// A sample that holds no peers -- enough to build a source, since these cases never read.
     struct NoPeers;
@@ -391,6 +461,64 @@ mod tests {
     async fn an_ordinary_read_still_returns_its_value_through_the_guard() {
         let source = source().await;
         assert_eq!(source.block_on(async { 7u32 }).ok(), Some(7));
+    }
+
+    /// PROPERTY (NC-12 plurality): *"the peers did not agree, or too few of them spoke"* stays
+    /// distinguishable from *"this source exposes no peak"*. The unknown is an `Err`; it is NEVER
+    /// `Ok(None)`.
+    ///
+    /// NEAREST WRONG IMPLEMENTATION, and it is a tidy-looking one: `Ok(self.reads.peak_height()
+    /// .await?)` -- pass the inner `Option` straight through. It compiles, it reads as a
+    /// simplification, and it silently converts an unanswered question into a settled fact. A
+    /// caller may act on `Ok(None)` from a [`ChainSource`], because that arm means the source has
+    /// no peak to give; it must not act on the node's peers having failed to reach one.
+    ///
+    /// This is the invariant a set-agreement adoption flattens by accident (dig-node#557).
+    /// `chia-query` 0.22.0 replaced first-source-wins with corroboration across sources, and the
+    /// same instinct that unifies those tiers unifies these two `None`s. Collapsing concurrently
+    /// queried peers into a single voice is a regression that looks like a refactor, so the
+    /// distinction is pinned here rather than left to the doc comment that has described it since
+    /// dig_ecosystem#3032 without any test holding it.
+    ///
+    /// **Catches:** returning `Ok(None)` for an unsettled peak; mapping the unknown to a
+    /// corroborated absence; and any adoption that routes this read through a tier able to
+    /// overrule the peers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsettled_peak_is_an_error_and_never_a_corroborated_absence() {
+        let source = source_over(Arc::new(NoPeers)).await;
+
+        let outcome = source.peak_height();
+
+        assert!(
+            matches!(outcome, Err(ChainSourceError::Transport(_))),
+            "no peer spoke, so this node does not know where the chain is; reporting that as              Ok(None) tells a caller the source HAS no peak, which is a fact it may act on              (got {outcome:?})"
+        );
+    }
+
+    /// PROPERTY: the CONTROL for the case above -- peers that DO agree still yield a peak.
+    ///
+    /// Without this, the assertion above is satisfied by a `peak_height` that errs
+    /// unconditionally, which is the shape of a "fix" that trades one lie for another. The two
+    /// tests differ by exactly one thing -- whether any peer spoke -- so together they prove the
+    /// method discriminates on the settlement rather than on nothing.
+    ///
+    /// The height is `min(claim) - SETTLED_LAG`, not the claimed tip: the answer is deliberately a
+    /// height every peer reached some time ago rather than one it is mid-applying. Asserting the
+    /// LAGGED value is what stops a later "just return the max claim" from passing here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peers_that_agree_still_yield_a_peak_through_the_same_boundary() {
+        const CLAIMED: u32 = 9_000_000;
+        let source = source_over(Arc::new(AgreeingTips {
+            peers: super::super::quorum::QUORUM_SAMPLE,
+            height: CLAIMED,
+        }))
+        .await;
+
+        assert_eq!(
+            source.peak_height().ok().flatten(),
+            Some(CLAIMED - SETTLED_LAG),
+            "four peers agreed on a tip and the source still would not name a height"
+        );
     }
 
     /// PROPERTY: the bond floor is a caller's choice and can only TIGHTEN.
