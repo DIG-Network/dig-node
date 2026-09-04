@@ -365,14 +365,18 @@ mod tests {
             &self,
             _coin_id: Bytes32,
         ) -> crate::sage::Result<Option<FallbackCoin>> {
-            Err(crate::sage::Error::internal("this peer answers no coin questions"))
+            Err(crate::sage::Error::internal(
+                "this peer answers no coin questions",
+            ))
         }
 
         async fn coin_spend(
             &self,
             _coin_id: Bytes32,
         ) -> crate::sage::Result<Option<FallbackCoinSpend>> {
-            Err(crate::sage::Error::internal("this peer answers no coin questions"))
+            Err(crate::sage::Error::internal(
+                "this peer answers no coin questions",
+            ))
         }
     }
 
