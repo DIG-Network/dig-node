@@ -3810,16 +3810,23 @@ copied from the reference `dig-updater`). One orchestrator, `.github/workflows/n
 triggers ONLY on `schedule: cron '0 0 * * *'` (midnight UTC — GitHub cron is always UTC, and a
 top-of-hour cron MAY be delayed under load, which is acceptable since both channels are idempotent)
 and `workflow_dispatch` (inputs `channel` = `both`|`stable`|`nightly`, default `both`; `force`
-boolean, default `false`). It MUST NOT trigger on `push` to `main`.
+boolean, default `false`). It MUST NOT trigger on `push` to `main`. The two triggers are NOT
+equivalent at the JOB level: the `schedule` event MUST reach the nightly channel only.
 
-- **Stable channel:** cuts a `vX.Y.Z` release when — and only when — the `[workspace.package].version`
-  in the root `Cargo.toml` has advanced beyond the newest `vX.Y.Z` tag (the skip-if-already-tagged
-  check IS the version-changed check). Cutting = `git-cliff` regenerates `CHANGELOG.md`, commits it
-  to `main` as `chore(release): vX.Y.Z`, tags THAT commit, and pushes commit + tag with
-  `RELEASE_TOKEN`. The pushed `v*` tag fires `release.yml` (§11.2/§11.3), which publishes a GitHub
-  Release with `prerelease: false`. A stable release is the ONLY release that may move `latest`, and
-  it moves it in a separate PROMOTION step gated on the asset verification below — never as a side
-  effect of attaching assets (§11.1b).
+- **Stable channel — MANUAL DISPATCH ONLY.** The `stable` job MUST require
+  `github.event_name == 'workflow_dispatch'`, and the `schedule` event MUST NOT satisfy its
+  condition. The cron cuts nightlies and nothing else, so a merged version bump becomes a published
+  release only when a maintainer deliberately dispatches one (CLAUDE.md §3.6-A). A cron that can cut
+  a stable `vX.Y.Z` makes the merge gate the last line of defence rather than the first of two, and
+  has already shipped a version whose own security gate had failed (dig_ecosystem#698). Given a
+  dispatch selecting `stable` or `both`, the job cuts a `vX.Y.Z` release when — and only when — the
+  `[workspace.package].version` in the root `Cargo.toml` has advanced beyond the newest `vX.Y.Z` tag
+  (the skip-if-already-tagged check IS the version-changed check). Cutting = `git-cliff` regenerates
+  `CHANGELOG.md`, commits it to `main` as `chore(release): vX.Y.Z`, tags THAT commit, and pushes
+  commit + tag with `RELEASE_TOKEN`. The pushed `v*` tag fires `release.yml` (§11.2/§11.3), which
+  publishes a GitHub Release with `prerelease: false`. A stable release is the ONLY release that may
+  move `latest`, and it moves it in a separate PROMOTION step gated on the asset verification below
+  — never as a side effect of attaching assets (§11.1b).
 - **Force re-cut (guarded).** `force: true` bypasses skip-if-tagged and re-cuts the current version
   (moving the tag onto a fresh changelog commit; `main` is never force-pushed). It MUST be refused
   — non-zero exit, clear error — when BOTH: (a) a PUBLISHED (non-draft) Release exists at the tag,

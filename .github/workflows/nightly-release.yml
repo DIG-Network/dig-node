@@ -70,14 +70,26 @@ jobs:
   # → commit + tag + push (RELEASE_TOKEN). The pushed `v*` tag fires release.yml (the binary build).
   stable:
     name: Stable — changelog + tag
-    # Run on the schedule (both channels) or when dispatch selects stable/both. The
-    # `!startsWith(...chore(release):...)` guard is preserved from the on-merge era: it is INERT on
-    # schedule/dispatch (there is no `head_commit`), but it keeps the release changelog commit
+    # MANUAL DISPATCH ONLY (CLAUDE.md 3.6-A; dig_ecosystem#698 / #552). The midnight cron cuts
+    # NIGHTLIES and nothing else. A stable `vX.Y.Z` is permanent, and it reaches every installed host
+    # through the signed update feed, so cutting one is a decision somebody makes -- never something a
+    # timer does. This condition used to accept `github.event_name == 'schedule'` as an ALTERNATIVE to
+    # the dispatch inputs, which meant a merged version bump became a published release at the next
+    # midnight with no human step and no gate beyond ordinary CI: `main` could reach users overnight,
+    # making the merge gate the last line of defence rather than the first of two.
+    #
+    # The consequence to know is that after a merge NOTHING releases until someone dispatches, and
+    # that silence is the intended trade, not a fault -- see runbooks/release.md for how to spot an
+    # overdue cut.
+    #
+    # The `!startsWith(...chore(release):...)` guard is preserved from the on-merge era: it is INERT
+    # on dispatch (there is no `head_commit`), but it keeps the release changelog commit
     # self-labelled so the loop stays safe even if a push trigger is ever re-introduced.
     if: >-
       ${{
         !startsWith(github.event.head_commit.message, 'chore(release):') &&
-        (github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel == 'both')
+        github.event_name == 'workflow_dispatch' &&
+        (inputs.channel == 'stable' || inputs.channel == 'both')
       }}
     runs-on: ubuntu-latest
     # Consumed by `stable-verify-assets` below, which must know WHETHER a tag was actually cut
