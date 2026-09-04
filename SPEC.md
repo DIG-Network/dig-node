@@ -6378,7 +6378,10 @@ wallet minted, still owns, and recorded the underlying-lock coin's parent for at
 `options.underlying_parent_coin_id` DB column — the underlying sits at a derived, non-HD puzzle hash
 the wallet's ordinary subscription set does not cover, so the parent id is what lets the coin be
 rebuilt with no chain read). Exactly one option id per call is accepted (each exercise spends its own
-strike-funding coin; this backend builds no joint selection across several). Every reconstructed field
+strike-funding coin; this backend builds no joint selection across several). The strike-funding
+coin's excess over the strike is RETURNED as change to that coin's own puzzle hash, so the exercise
+bundle conserves value and the builder takes no fee of its own; a requested `fee` is reserved from a
+separate coin and appended as its own leg. Every reconstructed field
 is verified by `dig_options::rehydrate` against three independent on-chain commitments (the 1-of-2
 path hash, the delegated-puzzle hash, and the underlying coin id) before a spend is built, so a wrong
 creator puzzle hash is rejected rather than producing a spend against a different merkle root. An
