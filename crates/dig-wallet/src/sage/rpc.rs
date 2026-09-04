@@ -4422,8 +4422,13 @@ impl WalletBackend {
 
         // The strike is funded from a coin at the option's OWN owner address, so a single owner
         // layer authorizes both the singleton spend and the funding spend. Any excess over the
-        // strike is left as an implicit fee by the builder, so the coin is chosen as the
-        // smallest that covers it rather than by ordinary change-producing selection.
+        // strike is RETURNED by the builder as change to that same coin's puzzle hash
+        // (`dig-options` 0.5.0), so an oversized coin costs the holder nothing.
+        //
+        // Until 0.5.0 the excess was instead left as an implicit fee -- burned. The smallest
+        // covering coin is still the one selected, but the reason is now ordinary spend hygiene
+        // (a smaller change coin, a smaller spend) rather than loss-limitation, and this
+        // selection is no longer load-bearing for correctness (dig-node#550).
         let strike_amount = match terms.strike_type {
             OptionType::Xch { amount } => amount,
             _ => {

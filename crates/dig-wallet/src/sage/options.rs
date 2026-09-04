@@ -800,6 +800,128 @@ mod tests {
         );
     }
 
+    /// An oversized strike-funding coin must have its excess RETURNED, not burned (#550).
+    ///
+    /// Every other exercise test in this module funds the strike with EXACTLY the strike amount,
+    /// which is the one case where the defect this test exists to catch is invisible. Through
+    /// `dig-options` 0.4.1 the builder spent the whole funding coin and emitted only the
+    /// settlement output, so the difference left the spend as an implicit network fee. It was
+    /// never a deliberate fee: `sage::rpc::exercise_options` picks the SMALLEST spendable coin at
+    /// the owner address that covers the strike, and the smallest coin that covers a 0.1 XCH
+    /// strike is routinely 5 XCH, so the loss was silent, unbounded, and reached real funds.
+    ///
+    /// The assertion is value conservation rather than the mere presence of a change coin,
+    /// because those fail differently. `additions` containing `(owner, excess)` proves change was
+    /// built; `fee == 0` proves nothing ALSO leaked out some other leg. A future change that
+    /// returns the excess and burns an equal amount elsewhere would pass the first and fail the
+    /// second.
+    #[test]
+    fn an_oversized_strike_funding_coin_returns_its_excess_instead_of_burning_it() {
+        use chia_traits::Streamable;
+        use chia_wallet_sdk::driver::SpendContext as Ctx;
+
+        const UNDERLYING: u64 = 1_000;
+        const STRIKE: u64 = 500;
+        // The whole point of the test: the funding coin is LARGER than the strike.
+        const EXCESS: u64 = 4_500;
+        const FUNDING: u64 = STRIKE + EXCESS;
+        const EXPIRY: u64 = 4_000_000_000;
+        // The option singleton's own amount, burned by the melt (see the doc comment).
+        const SINGLETON_AMOUNT: u64 = 1;
+
+        let mut sim = Simulator::new();
+        let alice = sim.bls(1);
+        let signer = signer_for(alice.sk.clone());
+        let alice_p2 = StandardLayer::new(alice.pk);
+
+        let ctx = &mut Ctx::new();
+        let underlying_funding = sim.new_coin(alice.puzzle_hash, UNDERLYING);
+        let strike_funding = sim.new_coin(alice.puzzle_hash, FUNDING);
+
+        let launcher = OptionLauncher::new(
+            ctx,
+            alice.coin.coin_id(),
+            OptionLauncherInfo::new(
+                alice.puzzle_hash,
+                alice.puzzle_hash,
+                EXPIRY,
+                UNDERLYING,
+                OptionType::Xch { amount: STRIKE },
+            ),
+            1,
+        )
+        .unwrap();
+        let p2_option = launcher.p2_puzzle_hash();
+        alice_p2
+            .spend(
+                ctx,
+                underlying_funding,
+                Conditions::new().create_coin(p2_option, UNDERLYING, Memos::None),
+            )
+            .unwrap();
+        let underlying_coin = Coin::new(underlying_funding.coin_id(), p2_option, UNDERLYING);
+        let launcher = launcher.with_underlying(underlying_coin.coin_id());
+        let (mint_option, option) = launcher.mint(ctx).unwrap();
+        alice_p2.spend(ctx, alice.coin, mint_option).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
+
+        let eve_id = option.coin.parent_coin_info;
+        let parent = ParentSpend {
+            coin: sim.coin_state(eve_id).unwrap().coin,
+            puzzle_reveal: sim.puzzle_reveal(eve_id).unwrap().to_bytes().unwrap(),
+            solution: sim.solution(eve_id).unwrap().to_bytes().unwrap(),
+        };
+
+        let terms = RehydratedTerms {
+            creator_puzzle_hash: alice.puzzle_hash,
+            expiry_seconds: EXPIRY,
+            strike_type: OptionType::Xch { amount: STRIKE },
+        };
+        let coin_spends = build_exercise_option(
+            &signer,
+            &(parent, option.coin),
+            underlying_coin,
+            &terms,
+            strike_funding,
+        )
+        .expect("the exercise must build");
+
+        // Run the spends through `dig-clvm` to read what they actually create. `SpendResult::fee`
+        // IS the burn: the amount consumed that no output claims.
+        let result = spend::run_and_validate(&coin_spends).expect("the exercise must validate");
+
+        assert!(
+            result
+                .additions
+                .iter()
+                .any(|c| c.puzzle_hash == alice.puzzle_hash && c.amount == EXCESS),
+            "the {EXCESS} mojos above the strike must come back as a coin at the funding \
+             coin's OWN puzzle hash; additions were {:?}",
+            result
+                .additions
+                .iter()
+                .map(|c| (c.puzzle_hash, c.amount))
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            result.fee,
+            SINGLETON_AMOUNT,
+            "the ONLY mojo this bundle may burn is the melted option singleton's own. \
+             Anything above that is the strike-funding coin's excess being burned -- on \
+             dig-options 0.4.1 this read {} ({SINGLETON_AMOUNT} + {EXCESS} over a \
+             {STRIKE} strike)",
+            SINGLETON_AMOUNT + EXCESS
+        );
+
+        // And it must still be a spend the network accepts -- returning change is worthless if it
+        // breaks the exercise.
+        let sig = signer.sign(&coin_spends).unwrap();
+        sim.new_transaction(chia_protocol::SpendBundle::new(coin_spends, sig))
+            .expect("the simulator must accept an exercise that returns strike change");
+    }
+
     /// A row with no recorded underlying parent is UNKNOWN, and unknown must refuse rather than
     /// default. A default here would build a spend against a different coin.
     #[test]
