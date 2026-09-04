@@ -96,6 +96,45 @@ fn job_block(workflow: &str, name: &str) -> String {
     lines.join("\n")
 }
 
+/// Extract ONE job's `if:` condition — the `if:` line plus every line indented DEEPER than it (the
+/// continuation of a `>-` block scalar), with comment lines dropped.
+///
+/// Scoping to the condition rather than to the whole job block is what makes a NEGATIVE assertion
+/// trustworthy here: the job block also carries the prose above the condition and every step below
+/// it, so `!block.contains("schedule")` would be decided by a comment rather than by the trigger the
+/// job actually answers to.
+fn job_condition(workflow: &str, name: &str) -> String {
+    let block = job_block(workflow, name);
+    let mut lines: Vec<&str> = Vec::new();
+    let mut if_indent = 0usize;
+    for line in block.lines() {
+        let trimmed = line.trim_start();
+        if lines.is_empty() {
+            if trimmed.starts_with("if:") {
+                if_indent = line.len() - trimmed.len();
+                lines.push(line);
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        // A line at or left of the `if:` key is the next job key (`runs-on:`), not the condition.
+        if line.len() - trimmed.len() <= if_indent {
+            break;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        lines.push(line);
+    }
+    assert!(
+        !lines.is_empty(),
+        "the `{name}` job declares no `if:` condition, so it is gated by nothing at all"
+    );
+    lines.join("\n")
+}
+
 #[test]
 fn tagger_no_longer_triggers_on_push_to_main() {
     let on = triggers_block(&nightly_release());
@@ -152,6 +191,34 @@ fn stable_job_keeps_the_skip_if_already_tagged_guard() {
     assert!(
         wf.contains("skip=true"),
         "the stable job must still short-circuit (skip=true) when the version's tag already exists"
+    );
+}
+
+/// CLAUDE.md 3.6-A: *the cron MUST NEVER cut a stable `vX.Y.Z`; a stable release is cut ONLY by a
+/// manual `workflow_dispatch(channel: stable|both)`.*
+///
+/// The condition used to carry `github.event_name == 'schedule'` as an ALTERNATIVE to the dispatch
+/// inputs, so every midnight the cron satisfied this job and published a real, tagged, permanent
+/// release for whatever version `main` happened to carry — no human, no dispatch, and no gate beyond
+/// ordinary CI. That is a release-integrity defect rather than a cosmetic one: it is how a version
+/// whose own security gate had already FAILED once reached users (dig_ecosystem#698, #552).
+///
+/// Both halves are load-bearing. Asserting only that the dispatch event appears would still pass on
+/// a condition that ORs the schedule back in, and asserting only that `schedule` is absent would
+/// pass on a job that requires no particular event at all.
+#[test]
+fn stable_job_is_reachable_only_from_a_manual_dispatch() {
+    let cond = job_condition(&nightly_release(), "stable");
+    assert!(
+        cond.contains("github.event_name == 'workflow_dispatch'"),
+        "the stable job must REQUIRE `github.event_name == 'workflow_dispatch'` — a stable \
+         `vX.Y.Z` is cut only by a deliberate human dispatch. `stable` condition:\n{cond}"
+    );
+    assert!(
+        !cond.contains("'schedule'"),
+        "the stable job condition still names the `schedule` event, so the midnight cron can cut a \
+         real stable release unattended (CLAUDE.md 3.6-A: the cron cuts ONLY nightlies). \
+         `stable` condition:\n{cond}"
     );
 }
 
