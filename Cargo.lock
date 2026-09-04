@@ -911,9 +911,9 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca14bd0378d87105a2173d7f74e05408e90dba4b91cc60c08865d0e7c53f01df"
+checksum = "1472f00b8a310a1af09530fbdc8f4ea8c49bc8892cf081446bad731235b608cc"
 dependencies = [
  "async-trait",
  "chia-bls 0.36.1",
@@ -2592,9 +2592,9 @@ dependencies = [
 
 [[package]]
 name = "dig-clvm"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c970094656ed627ee5328f02eca77d6d468324fc694237af7e23aaf26da988d"
+checksum = "a874743a2de5ff9bec09058ca264f437b86e66e335839fc24496b5108d6bbf11"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-consensus 0.36.1",
@@ -2791,9 +2791,9 @@ dependencies = [
 
 [[package]]
 name = "dig-keystore"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a239e32ed5a36f36623eda490613598328ee336ff21c2ddca1a0492ca6632fbc"
+checksum = "b0d27e7884b62452ca1a13c5d7a5c1e9fac629a0f45b534b9bece5b2bd9cbe24"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3089,9 +3089,9 @@ dependencies = [
 
 [[package]]
 name = "dig-offers"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cd492131e55517e035972caf64c72079045f75b175c5909041f335f911213c0"
+checksum = "209695b1687e5480c5b3e6ccaba38b638d94c637ae5a7394d009892e23637276"
 dependencies = [
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
@@ -3105,9 +3105,23 @@ dependencies = [
 
 [[package]]
 name = "dig-options"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b4962ca3ee718e01e0c61c3554416316e423f3751f6ae6e371ab83da4fc10ef"
+checksum = "66dea8ab4d502136a51b4015daa667748d6164d4825695611286f974e200d129"
+dependencies = [
+ "chia-protocol 0.36.1",
+ "chia-puzzle-types 0.36.1",
+ "chia-puzzles",
+ "chia-wallet-sdk 0.36.0",
+ "clvmr 0.16.4",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "dig-options"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b79f96a96c0abe140d6eaf53f7f5457ac495d43a0cb1b446218d05e4cdd3c8c"
 dependencies = [
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
@@ -3359,7 +3373,7 @@ dependencies = [
  "dig-node-control-interface",
  "dig-node-core",
  "dig-offers",
- "dig-options",
+ "dig-options 0.5.0",
  "digstore-chain",
  "digstore-core 0.29.0",
  "futures-core",
@@ -3405,7 +3419,7 @@ dependencies = [
  "dig-events-protocol",
  "dig-nft",
  "dig-offers",
- "dig-options",
+ "dig-options 0.4.1",
  "dig-tips",
  "enumset",
  "futures-core",
