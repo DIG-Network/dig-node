@@ -5,12 +5,13 @@ How this repo's `dig-node` binary (+ the `dign` alias) is built and released. Th
 
 ## TL;DR
 
-- Releases are **NOT cut on merge to `main`**. They are batched to a **nightly cron at midnight UTC**
-  plus **manual dispatch**.
-- **Stable** (`vX.Y.Z`): cut automatically when the `[workspace.package].version` in the root
-  `Cargo.toml` was bumped (detected as "the `vX.Y.Z` tag doesn't exist yet"), or on demand.
-  `prerelease: false`, marked `latest`. Every per-OS/arch binary ships under the canonical
-  `dig-node-*` name, plus the `dign-*` alias.
+- Releases are **NOT cut on merge to `main`**. Nightlies are batched to a **cron at midnight UTC**; a
+  **stable release is cut ONLY by a manual dispatch** (CLAUDE.md §3.6-A — the cron must never cut a
+  stable `vX.Y.Z`).
+- **Stable** (`vX.Y.Z`): cut on demand via `workflow_dispatch(channel: stable|both)`, and then only
+  when the `[workspace.package].version` in the root `Cargo.toml` was bumped (detected as "the
+  `vX.Y.Z` tag doesn't exist yet"). `prerelease: false`, marked `latest`. Every per-OS/arch binary
+  ships under the canonical `dig-node-*` name, plus the `dign-*` alias.
 - **Nightly**: built every night from `main` HEAD as a **pre-release** under a dated tag
   `nightly-YYYYMMDD` + a rolling `nightly` tag. `prerelease: true`, never `latest`. Keeps 14.
 - **BOTH channels also publish the three native install packages** — `dig-node_<ver>_amd64.deb`,
@@ -48,8 +49,9 @@ warnings is the expected steady state.
 ## If nightlies silently stop — check for the 60-day cron auto-disable
 
 GitHub disables a `schedule:` trigger after **60 days of no repo activity** on a public repo, with
-**no automatic re-enable** — and since this cron is the *only* automatic release trigger, a quiet
-repo can go dark with no error. If nightlies (or a long-overdue stable release) stop appearing:
+**no automatic re-enable** — and since this cron is the only thing that publishes a nightly, a
+quiet repo can go dark with no error. (Stable is unaffected: it is dispatched by hand, and a
+dispatch also resets the 60-day counter.) If nightlies stop appearing:
 
 ```bash
 gh api repos/DIG-Network/dig-node/actions/workflows/nightly-release.yml --jq .state
@@ -63,20 +65,26 @@ Any repo activity (a merged PR, a manual dispatch) resets the 60-day counter.
 
 1. In your feature PR, bump `[workspace.package].version` in the root `Cargo.toml` per SemVer and run
    `cargo update --workspace` so `Cargo.lock` matches. Merge the PR (squash).
-2. Nothing releases on merge. At the next **midnight UTC** the `nightly-release.yml` cron runs its
-   **stable** job: it sees the new version has no `vX.Y.Z` tag, regenerates `CHANGELOG.md`, commits
-   `chore(release): vX.Y.Z` to `main`, tags it, and pushes with `RELEASE_TOKEN`.
+2. Nothing releases on merge, and **the midnight cron will not release it either** — the `stable` job
+   requires `workflow_dispatch`. When you want the release: Actions → **Nightly + stable release** →
+   **Run workflow** → `channel: stable` (or `both`) → Run. The job sees the new version has no
+   `vX.Y.Z` tag, regenerates `CHANGELOG.md`, commits `chore(release): vX.Y.Z` to `main`, tags it, and
+   pushes with `RELEASE_TOKEN`. An already-tagged version is a no-op, so re-dispatching is safe.
 3. The pushed `v*` tag fires `release.yml`, which builds every OS/arch and publishes the stable
    GitHub Release (dual-named binaries + the `dign` alias, changelog as notes).
 
-### Cut a stable release NOW / re-cut
+> **Nothing reminds you to do step 2.** A merged version bump sits on `main` untagged until someone
+> dispatches, and the failure mode is silent — `releases/latest` keeps serving the previous version
+> and no check goes red. Compare the root `Cargo.toml` version against
+> `git describe --tags --abbrev=0 --match 'v*'`: if they differ, a stable cut is overdue.
 
-- Now: Actions → **Nightly + stable release** → **Run workflow** → `channel: stable` (or `both`).
-- Re-cut (failed build): same, with **`force: true`**. `force` REFUSES (non-zero exit) when the tag
-  already has a PUBLISHED release AND points at a different commit than this run would build — it
-  only proceeds for a same-commit retry or a tag with no published release. To ship new code, bump
-  the version instead. (A force-moved tag breaks tag-immutability; the dig-updater signed feed, not
-  the tag, is dig-node's integrity anchor — SPEC §11.1.)
+### Re-cut a stable release (failed build)
+
+The same dispatch, with **`force: true`**. `force` REFUSES (non-zero exit) when the tag already has a
+PUBLISHED release AND points at a different commit than this run would build — it only proceeds for a
+same-commit retry or a tag with no published release. To ship new code, bump the version instead. (A
+force-moved tag breaks tag-immutability; the dig-updater signed feed, not the tag, is dig-node's
+integrity anchor — SPEC §11.1.)
 
 ## Cut a NIGHTLY on demand
 
@@ -140,7 +148,7 @@ a bug in the beacon:
 
 | File | Trigger | Role |
 |---|---|---|
-| `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator: stable (changelog + tag) + nightly (build + pre-release + prune). |
+| `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator. The cron runs the NIGHTLY channel only (build + pre-release + prune); the STABLE channel (changelog + tag) requires `workflow_dispatch` and is never cut by the cron. |
 | `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag, then verifies the asset set and promotes it to `latest`. Attaching assets never moves `latest` by itself. |
 | `build-binaries.yml` | `workflow_call` | Reusable cross-OS build, dual-named + `dign` (both channels call it). |
 | `package.yml` | PR + `push: tags: v*` + `workflow_call` | Builds the `.deb`/`.pkg`/`.msi`. Attaches them itself on a `v*` tag; on a `workflow_call` (the nightly channel) it leaves them as run artifacts for the caller to publish. |

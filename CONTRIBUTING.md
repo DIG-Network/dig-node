@@ -115,30 +115,34 @@ Not required, but will run and should stay green if your change touches the file
 ### What merging actually does — read this before you merge
 
 dig-node releases on **two channels**, both driven by `.github/workflows/nightly-release.yml`, and
-the stable one is **not purely manual**:
+only one of them is automatic:
 
 - **Nightly** — every night at 00:00 UTC, a cron builds `main` HEAD and publishes it as a GitHub
   **pre-release** under a dated `nightly-YYYYMMDD` tag plus a rolling `nightly` tag. This always
   happens, whether or not the version changed.
-- **Stable** — the same job resolves `Cargo.toml`'s version and cuts a real `vX.Y.Z` tag (which
-  fires the binary build + publish in `release.yml`) whenever that tag doesn't already exist yet —
-  i.e. whenever the version has been bumped since the last stable release. The workflow's own
-  `stable` job condition, verbatim:
+- **Stable** — cut ONLY by a deliberate `workflow_dispatch`. The `stable` job's condition requires
+  the dispatch event, verbatim:
 
   ```yaml
   if: >-
     ${{
       !startsWith(github.event.head_commit.message, 'chore(release):') &&
-      (github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel == 'both')
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.channel == 'stable' || inputs.channel == 'both')
     }}
   ```
 
-  `github.event_name == 'schedule'` is the same midnight cron that cuts nightlies — **it is not
-  gated to manual dispatch**. So merging a PR that bumped the version means the next midnight UTC
-  cron cuts a real stable release automatically, with no separate approval step. There is no
-  "merge now, decide when to release later" — the version bump you make on this PR IS the release
-  decision. (A manual `workflow_dispatch(channel: stable)` can also cut it immediately, or
-  `channel: nightly`/`both` to control which channel runs on demand.)
+  The midnight cron cannot satisfy that condition, so **merging a version bump releases nothing**.
+  When someone dispatches `channel: stable` (or `both`), the job resolves `Cargo.toml`'s version and
+  cuts a real `vX.Y.Z` tag — which fires the binary build + publish in `release.yml` — whenever that
+  tag doesn't already exist yet. An unchanged version is a no-op, so re-dispatching is safe.
 
-This is worth internalizing before merging anything: get the gate green, get the version bump
-right, and know that main's next merge cycle through this workflow ships it.
+So the version bump on your PR decides **what** the next stable release will be, not **when** it
+happens. Two consequences worth internalizing before you merge:
+
+- **Get the bump right anyway.** It is the number the release will carry, and it is the same root
+  `Cargo.toml` value the version-increment gate reads.
+- **A merged bump sits unreleased until somebody dispatches**, and the failure mode is silent:
+  `releases/latest` keeps serving the previous version and no check goes red. If `main`'s version has
+  moved past the newest `vX.Y.Z` tag, a stable cut is overdue — Actions → **Nightly + stable
+  release** → **Run workflow** → `channel: stable`. See `runbooks/release.md`.
