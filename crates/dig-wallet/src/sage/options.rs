@@ -826,6 +826,8 @@ mod tests {
         const EXCESS: u64 = 4_500;
         const FUNDING: u64 = STRIKE + EXCESS;
         const EXPIRY: u64 = 4_000_000_000;
+        // The option singleton's own amount, burned by the melt (see the doc comment).
+        const SINGLETON_AMOUNT: u64 = 1;
 
         let mut sim = Simulator::new();
         let alice = sim.bls(1);
@@ -889,24 +891,27 @@ mod tests {
         // IS the burn: the amount consumed that no output claims.
         let result = spend::run_and_validate(&coin_spends).expect("the exercise must validate");
 
-        assert_eq!(
-            result.fee, 0,
-            "the exercise builder must take NO fee of its own; a non-zero fee here is the \
-             funding coin's excess being burned ({EXCESS} mojos over a {STRIKE} strike)"
-        );
-
         assert!(
             result
                 .additions
                 .iter()
                 .any(|c| c.puzzle_hash == alice.puzzle_hash && c.amount == EXCESS),
-            "the {EXCESS} mojos above the strike must come back as a coin at the funding coin's \
-             OWN puzzle hash; additions were {:?}",
+            "the {EXCESS} mojos above the strike must come back as a coin at the funding \
+             coin's OWN puzzle hash; additions were {:?}",
             result
                 .additions
                 .iter()
                 .map(|c| (c.puzzle_hash, c.amount))
                 .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            result.fee, SINGLETON_AMOUNT,
+            "the ONLY mojo this bundle may burn is the melted option singleton's own. \
+             Anything above that is the strike-funding coin's excess being burned -- on \
+             dig-options 0.4.1 this read {} ({SINGLETON_AMOUNT} + {EXCESS} over a \
+             {STRIKE} strike)",
+            SINGLETON_AMOUNT + EXCESS
         );
 
         // And it must still be a spend the network accepts -- returning change is worthless if it
