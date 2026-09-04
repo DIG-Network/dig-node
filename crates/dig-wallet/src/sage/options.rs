@@ -906,7 +906,8 @@ mod tests {
         );
 
         assert_eq!(
-            result.fee, SINGLETON_AMOUNT,
+            result.fee,
+            SINGLETON_AMOUNT,
             "the ONLY mojo this bundle may burn is the melted option singleton's own. \
              Anything above that is the strike-funding coin's excess being burned -- on \
              dig-options 0.4.1 this read {} ({SINGLETON_AMOUNT} + {EXCESS} over a \
