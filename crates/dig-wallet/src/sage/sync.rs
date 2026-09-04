@@ -871,6 +871,48 @@ impl CatAttributor<'_> {
     }
 }
 
+/// Drain `arrival_pending`/newly-confirmed coins into `arrivals` for `session`, through
+/// `through_height` — logging a failure rather than propagating it.
+///
+/// # Two call sites in one frame (dig-node#546)
+///
+/// [`handle_coin_state_update`] calls this once, right after a frame's coin writes land — but a
+/// CAT staged in THIS SAME frame is not in `coins` yet at that point; it is only promoted
+/// afterwards, when [`run_update_loop`] runs the [`CatAttributor`] pass. That ordering is
+/// #479/#480's own fix (a coin must be judged news-or-history at the moment it is first STAGED,
+/// never re-asked after the watermark has moved onto its own height), so it cannot simply be
+/// reversed. Its corollary is the hold `promote_cat_admission` leaves in `arrival_pending`:
+/// nothing examines that hold until this function runs again, and without a second call in the
+/// SAME frame, that only ever happened on the NEXT `coin_state_update` — which a wallet that
+/// receives once and then falls quiet may never get. [`run_update_loop`] calls this a second
+/// time, right after attribution, to close that gap at its source rather than trust a frame that
+/// may never arrive to close it.
+///
+/// # Safe to call twice, unconditionally
+///
+/// [`WalletDb::record_arrivals`] is idempotent — an already-recorded coin id is `INSERT OR
+/// IGNORE`d, and its baseline only ever advances (`MAX`) — so a second call at the same height
+/// re-examines rather than re-announces: it changes nothing the first call already settled, and
+/// only newly catches what attribution just promoted.
+///
+/// # Why a failure here is logged, not propagated
+///
+/// Chain sync is the critical path and a notification ledger is not: returning an error would
+/// drop a live peer session over a NOTIFICATION write, which is a strictly worse outcome than a
+/// delayed toast. Nothing is lost by continuing — the ledger insert and the baseline advance
+/// share one transaction, so a failed pass leaves the watermark where it was and the next call
+/// (the next frame's, if not this frame's own second one) re-examines the same coins.
+async fn record_arrivals_or_log(db: &WalletDb, session: &SessionState<'_>, through_height: u32) {
+    let watched: Vec<String> = session.subscribed.iter().map(hex::encode).collect();
+    if let Err(e) = db.record_arrivals(&watched, through_height).await {
+        tracing::warn!(
+            error = %e,
+            height = through_height,
+            "wallet sync: recording incoming-funds arrivals failed; retrying on the next update"
+        );
+    }
+}
+
 /// Handle a `coin_state_update` push: on a reorg (`fork_height` below the current peak)
 /// roll the DB back above the fork first (design B.3), then apply the update's coin states
 /// and advance the synced peak. Publishes [`SyncEvent::CoinState`] on `events` once applied
@@ -962,19 +1004,9 @@ pub async fn handle_coin_state_update(
     // The recorder is fail-closed on its own: with no baseline (no completed catch-up) it records
     // nothing, so the history this same function replays on every reconnect is never announced.
     //
-    // A recorder failure is LOGGED, not propagated. Chain sync is the critical path and a
-    // notification ledger is not: returning `?` here would drop a live peer session over a
-    // NOTIFICATION write, which is a strictly worse outcome than a delayed toast. Nothing is lost
-    // by continuing — the ledger insert and the baseline advance share one transaction, so a failed
-    // pass leaves the watermark where it was and the next update re-examines the same coins.
-    let watched: Vec<String> = session.subscribed.iter().map(hex::encode).collect();
-    if let Err(e) = db.record_arrivals(&watched, update.height).await {
-        tracing::warn!(
-            error = %e,
-            height = update.height,
-            "wallet sync: recording incoming-funds arrivals failed; retrying on the next update"
-        );
-    }
+    // This is the FIRST of this frame's two drain attempts — see [`record_arrivals_or_log`] for
+    // why a second one runs later, after attribution (dig-node#546).
+    record_arrivals_or_log(db, session, update.height).await;
     events.publish(SyncEvent::CoinState);
     Ok(FrameApplied::Applied)
 }
@@ -1254,6 +1286,13 @@ pub async fn run_update_loop(
                     if applied == FrameApplied::Applied {
                         if let Some(a) = attributor {
                             a.attribute(db).await?;
+                            // dig-node#546 — the second of this frame's two drain attempts. See
+                            // [`record_arrivals_or_log`] for why one call inside
+                            // `handle_coin_state_update` is not enough: attribution can only
+                            // promote a staged CAT AFTER that call already ran, so without this,
+                            // the promoted coin's hold is examined only on the NEXT frame — which
+                            // may never come.
+                            record_arrivals_or_log(db, session, update.height).await;
                         }
                     }
                 }
@@ -2944,6 +2983,112 @@ mod tests {
             hits.load(Ordering::SeqCst),
             1,
             "attributor fetched the candidate coin's parent spend"
+        );
+    }
+
+    /// **Proves (dig-node#546):** a $DIG arrival attributed WITHIN a frame is announced by the
+    /// end of that SAME frame — it must not wait for a second `CoinStateUpdate` that may never
+    /// arrive.
+    ///
+    /// # The bug, and why the fixture must drive `run_update_loop` itself
+    ///
+    /// `handle_coin_state_update` runs `record_arrivals` **before** the attribution pass promotes
+    /// a staged CAT into `coins` — that ordering is #479/#480's own fix (see
+    /// `a_cat_promoted_after_the_watermark_advanced_is_still_announced` in `db.rs`), so the hold
+    /// `promote_cat_admission` leaves in `arrival_pending` is only ever examined by the NEXT
+    /// frame's `record_arrivals` call. A wallet that receives once and then falls quiet never gets
+    /// a second frame, so the row waits forever — confirmed live on mainnet in #546 across ~50
+    /// minutes, two restarts, and a second watched address.
+    ///
+    /// A test that manually called `record_arrivals` again after promoting would prove only that
+    /// the DB layer is idempotent — already covered by the #479 test above — and it would pass
+    /// identically on the UNFIXED code, because the manual call substitutes for the very
+    /// production behaviour under test instead of exercising it. So this drives the real glue,
+    /// `run_update_loop`, over exactly ONE inbound message, with a REAL CAT parent spend so
+    /// attribution genuinely promotes it, and the test itself never calls `record_arrivals`.
+    #[tokio::test]
+    async fn a_cat_attributed_within_one_frame_is_announced_in_that_same_frame() {
+        use crate::sage::cat_discovery::tests::real_cat;
+        use crate::sage::singleton::LineageAnswer;
+
+        let f = real_cat();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        // Already synced with nothing news yet — exactly the "receives once, then goes quiet"
+        // wallet #546 reports: one completed catch-up, then a single live arrival.
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 9, "hh", &[]).unwrap())
+            .await
+            .unwrap();
+        let derived = DerivedCats::derive(&[f.owner_p2], &[f.asset_id]);
+
+        // The ONE frame: the $DIG coin lands at its derived outer hash, above the baseline, and
+        // nothing else ever arrives after it.
+        let update = CoinStateUpdate {
+            height: 10,
+            fork_height: 9,
+            peak_hash: Bytes32::new([2; 32]),
+            items: vec![state(f.child, Some(10), None)],
+        };
+        let events = EventBus::with_capacity(8);
+        let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(4);
+        tx.send(Message {
+            msg_type: ProtocolMessageTypes::CoinStateUpdate,
+            id: None,
+            data: chia_traits::Streamable::to_bytes(&update).unwrap().into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        /// A [`LineageSource`] that answers `Found` for exactly one parent, real CLVM bytes and
+        /// all — a fake reconstruction cannot exist, since `singleton::reconstruct` uncurries the
+        /// actual puzzle/solution rather than trusting anything this double asserts.
+        struct FixedLineage {
+            parent_id: String,
+            spend: crate::sage::singleton::ParentSpend,
+        }
+        #[async_trait::async_trait]
+        impl LineageSource for FixedLineage {
+            async fn parent_spend(
+                &self,
+                parent_coin_id: &str,
+                _spent_height: u32,
+            ) -> crate::sage::Result<LineageAnswer> {
+                if parent_coin_id.eq_ignore_ascii_case(&self.parent_id) {
+                    Ok(LineageAnswer::Found(Box::new(self.spend.clone())))
+                } else {
+                    Ok(LineageAnswer::Unavailable)
+                }
+            }
+        }
+        let lineage = FixedLineage {
+            parent_id: hex::encode(f.child.parent_coin_info),
+            spend: f.parent,
+        };
+        let plain = HashSet::new();
+        let attributor = CatAttributor {
+            lineage: &lineage,
+            prefix: "xch",
+            plain_puzzle_hashes: &plain,
+        };
+        let subscribed = subscribed_owned();
+        let mut session = operator(&subscribed).following_derived_cats(&derived);
+
+        run_update_loop(&db, receiver, &events, Some(&attributor), &mut session)
+            .await
+            .unwrap();
+
+        let ids: Vec<String> = db
+            .arrivals_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.coin_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![hex::encode(f.child.coin_id())],
+            "a CAT attributed within this frame must be announced by the end of the SAME frame, \
+             not left waiting in arrival_pending for a frame that may never come"
         );
     }
 
