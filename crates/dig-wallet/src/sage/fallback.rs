@@ -852,6 +852,25 @@ mod chain_failure_tests {
     /// The coin record for [`KNOWN_COIN_ID`], which is what the repair read must recover.
     const REPAIR_RECORD: &str = KNOWN_COIN_RECORD;
 
+    /// A `get_blockchain_state` answer carrying a peak, which every coinset-only POPULATION read
+    /// now needs before it will answer at all.
+    ///
+    /// # Why a set read asks for a peak (chia-query#47, adopted in dig-node#557)
+    ///
+    /// Since chia-query 0.22.0 a set answer is a true statement about a HEIGHT, not about "now".
+    /// Coinset states no as-of height with its answers, so `coinset_only_set` reads the tier's own
+    /// peak and holds the answer to it. A source that cannot be dated cannot be compared to
+    /// anything, so a tier that will not name a peak gets no answer accepted from it — which is
+    /// the fail-closed direction, and the reason this fixture has to serve a second endpoint that
+    /// the pre-0.22 one did not.
+    ///
+    /// The height is far above every fixture record so the normalisation is a no-op here: an
+    /// as-of height BELOW a record's `spent_block_index` would drop that spend, and a test about
+    /// mapping would then be silently testing normalisation instead.
+    const PEAK_STATE: &str = r#"{"success":true,"blockchain_state":{"peak":{
+                "height":1000,
+                "header_hash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#;
+
     async fn lineage_against(base_url: String) -> ChiaQueryLineage {
         let query = chia_query::ChiaQuery::new(chia_query::ChiaQueryConfig {
             coinset_base_url: base_url,
@@ -1364,7 +1383,14 @@ mod chain_failure_tests {
     /// would make an unspent parent unreadable.
     #[tokio::test]
     async fn a_parent_with_no_children_is_an_empty_ok_not_an_error() {
-        let base = serve_json(r#"{"success":true,"coin_records":[]}"#).await;
+        let base = serve_routed(&[
+            ("get_blockchain_state", PEAK_STATE),
+            (
+                "get_coin_records_by_parent_ids",
+                r#"{"success":true,"coin_records":[]}"#,
+            ),
+        ])
+        .await;
         let fallback = fallback_against(base).await;
 
         let children = fallback
@@ -1373,6 +1399,63 @@ mod chain_failure_tests {
             .expect("a chain that answered is not an error");
 
         assert!(children.is_empty(), "got {children:?}");
+    }
+
+    /// **A tier that serves records but will not name a PEAK is an error, never an empty set**
+    /// (the chia-query 0.22.0 adoption, dig-node#557).
+    ///
+    /// # This is the delta the compiler could not report
+    ///
+    /// `get_coin_records_by_parent_ids` still returns `Result<Vec<CoinRecord>, _>`, so nothing
+    /// about this call site changed shape. What changed is behind it: a population answer is now a
+    /// true statement about a HEIGHT rather than about "now", and coinset states no height with
+    /// its answers. So the tier's own peak is read first and the records are held to it. A source
+    /// that cannot be dated cannot be corroborated against anything, and an answer nobody can date
+    /// is refused.
+    ///
+    /// **On the pre-0.22 line this test fails**, because the records here are perfectly well
+    /// formed and the old router returned them from whichever source answered first, with no peak
+    /// read at all. That is precisely the property being adopted.
+    ///
+    /// # Failure direction, which is the whole reason a WALLET wants this
+    ///
+    /// The refusal costs an error a caller retries. The alternative — serving the records
+    /// undated — costs a set treated as current that is not, on the path the wallet discovers the
+    /// user's coins through. `sage::fallback` maps this to an internal error, so the surface says
+    /// "the read failed" and never "you have no coins": a visible failure is survivable, a silent
+    /// zero balance is not.
+    ///
+    /// FIXTURE DESIGN. The coin-records route is IDENTICAL to the passing test above and the
+    /// records are genuine children. The ONLY difference is the missing `get_blockchain_state`
+    /// route, so nothing here can fail because of a malformed record — which is what makes the
+    /// peak read, rather than the records, the thing under test.
+    ///
+    /// **Catches:** an adoption that reaches back for the ungraded pre-0.22 behaviour, and any
+    /// mapping that turns an undatable answer into `Ok(vec![])`.
+    #[tokio::test]
+    async fn records_a_tier_will_not_date_are_refused_rather_than_served_undated() {
+        let base = serve_routed(&[(
+            "get_coin_records_by_parent_ids",
+            r#"{"success":true,"coin_records":[
+                {"coin":{"parent_coin_info":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                         "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
+                         "amount":7},
+                 "confirmed_block_index":100,"spent_block_index":140,"spent":true,
+                 "coinbase":false,"timestamp":1700000000}]}"#,
+        )])
+        .await;
+        let fallback = fallback_against(base).await;
+
+        let result = fallback.coin_records_by_parent(SOME_COIN_ID).await;
+
+        assert!(
+            result.is_err(),
+            "a set nothing can date was served as current chain state: got {result:?}"
+        );
+        assert!(
+            !matches!(result, Ok(ref v) if v.is_empty()),
+            "an undatable answer must NEVER be reported as a childless parent — that terminates a              lineage walk on a branch the caller never actually read"
+        );
     }
 
     /// **A "child" that names a different parent is a read failure — the whole page, not just that
@@ -1422,8 +1505,11 @@ mod chain_failure_tests {
     /// the SPENT children, since those are the ones with a next hop.
     #[tokio::test]
     async fn genuine_children_are_mapped_through_spent_and_unspent_alike() {
-        let base = serve_json(
-            r#"{"success":true,"coin_records":[
+        let base = serve_routed(&[
+            ("get_blockchain_state", PEAK_STATE),
+            (
+                "get_coin_records_by_parent_ids",
+                r#"{"success":true,"coin_records":[
                 {"coin":{"parent_coin_info":"0x1111111111111111111111111111111111111111111111111111111111111111",
                          "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
                          "amount":7},
@@ -1434,7 +1520,8 @@ mod chain_failure_tests {
                          "amount":9},
                  "confirmed_block_index":101,"spent_block_index":0,"spent":false,
                  "coinbase":false,"timestamp":1700000001}]}"#,
-        )
+            ),
+        ])
         .await;
         let fallback = fallback_against(base).await;
 

@@ -2326,14 +2326,30 @@ impl WalletBackend {
     ///
     /// # Why the presence of a reason was not enough (dig-node#460)
     ///
-    /// One push is not one transmission. `chia_query`'s `push_tx` runs
-    /// `peer_then_coinset(peer, peer_retry, coinset)` and only the LAST answer arrives here, so a
-    /// refusal from destination B can free the inputs of a bundle destination A already admitted.
-    /// The first attempt fails as `Err` on a `request timed out` raised AFTER the bundle bytes went
-    /// out, and the peer that answers next has by then SEEN the gossip — so the reason it states is
-    /// `DOUBLE_SPEND`, `MEMPOOL_CONFLICT` or `ALREADY_INCLUDING_TRANSACTION`. Those are one node's
-    /// report of its OWN mempool, and on this path they mean the bundle IS in flight. Keying on the
-    /// mere PRESENCE of a reason therefore freed the coins precisely when they were least free.
+    /// One push is not one transmission, and `chia-query` 0.24.0 SPLIT it into two paths that
+    /// behave differently. Which one ran decides what arrives here, so both are stated
+    /// (dig-node#557):
+    ///
+    /// - **A peer ANSWERED and refused.** `push_tx` classifies the refusal against the shared
+    ///   [`chia_query::mempool_refusal`] list. A bundle-intrinsic reason is FINAL and returned as
+    ///   it stands; anything else costs exactly ONE more transmission to one other held peer, and
+    ///   the second answer wins only when it too is final. **Coinset is never consulted about a
+    ///   refusal.** So on this path the answer reaching this crate is either genuinely final or is
+    ///   the caller's OWN first transmission's verdict — not an unrelated destination's.
+    /// - **The transport FAILED before any answer.** The old
+    ///   `peer_then_coinset(peer, peer_retry, coinset)` ladder runs unchanged, and only the LAST
+    ///   answer arrives here.
+    ///
+    /// **That second path is exactly the one this guard exists for, and it was left unchanged
+    /// deliberately.** A `request timed out` is raised AFTER the bundle bytes went out, so peer A
+    /// may have admitted and gossiped it; the peer that answers next has by then SEEN the gossip,
+    /// and the reason it states is `DOUBLE_SPEND`, `MEMPOOL_CONFLICT` or
+    /// `ALREADY_INCLUDING_TRANSACTION`. Those are one node's report of its OWN mempool, and on this
+    /// path they mean the bundle IS in flight. Keying on the mere PRESENCE of a reason therefore
+    /// freed the coins precisely when they were least free.
+    ///
+    /// The upstream retry narrows the window; it does not close it, and this classifier must not be
+    /// relaxed on the strength of it.
     ///
     /// One peer's refusal is one peer's opinion; the network has no verdict this code can read.
     /// What CAN be read is whether the stated reason is one every honest node would reach from the
@@ -11402,7 +11418,8 @@ mod tests {
     /// **Proves (dig-node#460):** a refusal that is a property of ONE peer's VIEW does not return
     /// the inputs to selection, because another destination may be holding the very bundle.
     ///
-    /// **The defect this catches.** `chia_query`'s `push_tx` is not one transmission. It runs
+    /// **The defect this catches.** `chia_query`'s `push_tx` is not one transmission. When the
+    /// transport FAILS before any peer answers it still runs
     /// `peer_then_coinset(peer, peer_retry, coinset)`: peer A, then a DIFFERENT peer B, then
     /// coinset, and only the LAST answer reaches this crate. Attempt 1 fails as `Err` on a
     /// `request timed out` raised AFTER the bundle bytes went out, so peer A may have admitted it
@@ -11412,6 +11429,10 @@ mod tests {
     /// `ALREADY_INCLUDING_TRANSACTION`, `MEMPOOL_CONFLICT`) are precisely the ones that mean the
     /// bundle IS in flight. The race does not merely reach the unsafe branch occasionally; when it
     /// happens, the unsafe branch is the EXPECTED one.
+    ///
+    /// `chia-query` 0.24.0 added a bounded retry on the path where a peer DOES answer, and left
+    /// this one alone on purpose (dig-node#557). The window narrowed; it did not close, so this
+    /// test still describes reachable behaviour rather than history.
     ///
     /// FIXTURE DESIGN. The refusal is AMBIGUOUS, which is the only kind that can see this bug: an
     /// unambiguous refusal (`BAD_AGGREGATE_SIGNATURE`, the sibling below) is refused identically

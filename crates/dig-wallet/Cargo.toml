@@ -124,13 +124,60 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 # dig-wallet -> dig-node-core boundary on ONE line (0.36.1). So 0.19 needs no shim and none was
 # added. Verify from `Cargo.lock`, never from this comment.
 #
-# 0.21.0 (chia-query#52) changes `peer::PeerPool::peak_height` and `peer::PeerBackend::peak_height`
+# 0.21.0 (chia-query#52) changed `peer::PeerPool::peak_height` and `peer::PeerBackend::peak_height`
 # from sync to async. NEITHER type is referenced anywhere in this workspace -- the `peak_height`
 # calls in `sage::chain` and `sage::corroborated_source` resolve to
 # `sage::peer_reads::PeerCorroboratedReads::peak_height`, which is OUR type and was already async.
 # The chia-query surface this crate takes a peak from is `ChiaQuery::peak_height_opt`, a different
-# method, unchanged. So this is a bump with zero call-site work (dig-node#553).
-chia-query = "0.21.0"
+# method, unchanged. So that was a bump with zero call-site work (dig-node#553).
+#
+# 0.22.0 -> 0.24.0 (dig-node#557) is NOT that, and the compiler will not tell you so. Three
+# minors land here and TWO of them change what a caller SEES without changing a single signature:
+#
+#   0.22.0  the `Vec`-returning router methods became fail-closed wrappers over `_graded` twins.
+#           `get_coin_records_by_puzzle_hashes` / `_by_hints` / `_by_parent_ids` -- this crate's
+#           coin-DISCOVERY path (`sage::fallback`) -- still return `Result<Vec<CoinRecord>, _>`,
+#           but the set behind them is now corroborated across sources at a settled height.
+#           Disagreement is `Err(SourcesDisagree)` and a set only one source will vouch for is
+#           `Err(UncorroboratedPresence)`; an empty `Vec` is never manufactured. That is the
+#           direction a WALLET needs: `sage::fallback` maps every `Err` to an internal error, so a
+#           read this crate cannot corroborate surfaces as a failed read and never as "you have no
+#           coins".
+#   0.23.0  `ChiaQueryProvider::resolve_singleton_lineage` delegates to
+#           `dig_chainsource_interface::resolve_singleton_lineage_via_walk`; chia-query's own copy
+#           is deleted. The canonical walk reads `coin_record` as well as `coin_spend`, so a coin
+#           it cannot account for FAILS CLOSED instead of authenticating a derived successor the
+#           chain may never have created.
+#   0.24.0  `mempool_refusal` arrives, and `sage::chain` adopts it by re-export rather than
+#           keeping the second copy (dig-node#556). The unscoped `FrameFanout::subscribe` is
+#           removed; this workspace never called it -- grep for `FrameFanout`, `FrameSubscription`
+#           and `subscribe_frames` and you will find nothing. `TxStatus` gains no field, which is
+#           what keeps the struct literal at `sage::chain::tests::status` compiling.
+#
+# The chia family does NOT move. chia-query 0.24.x declares the same `chia-protocol`/`chia-bls`/
+# `chia-consensus` `0.36` line and the same `chia-wallet-sdk 0.36` as 0.21.0 did, so this crate's
+# `0.36.1` pins are untouched and the graph stays on ONE chia line. Verify from `Cargo.lock`,
+# never from this comment.
+#
+# THE PATCH FLOOR IS LOAD-BEARING AND MUST NOT BE RELAXED TO `"0.24"` (chia-query#59).
+# 0.24.0 shipped a light-client drive loop that could WEDGE on a superseded session: a peer that
+# went quiet after one failed subscribing read held the loop indefinitely, at no cost to itself,
+# and `needs_rearm()` -- the crate's own documented staleness signal -- never fired. The coin-state
+# cache then froze with NOTHING to distinguish it from a quiet chain. On this crate that is a
+# wallet that silently stops seeing money arrive, which is the worst shape a wallet defect can
+# take: the surface looks healthy while serving nothing.
+#
+# `"0.24.1"` is a FLOOR, not a pin: cargo reads it as `>=0.24.1, <0.25.0`, so 0.24.0 becomes
+# unresolvable while every later patch still flows. `"0.24"` would re-admit the wedge, and
+# `=0.24.1` would block the next security patch. Both are wrong for opposite reasons.
+#
+# ONE WINDOW REMAINS OPEN and is disclosed rather than assumed away (chia-query#61): `reconnect()`
+# lowers the rearm flag AFTER re-arming, so a failed read that unpins the anchor DURING that
+# re-arm has its signal cleared. Narrow and pre-existing, but this crate is the consumer it would
+# affect, so a stale coin-state cache should be checked against #61 before it is treated as a
+# mystery. Unrelated, also open: chia-query#62, `eject_peer` leaking the ejected peer's reader
+# task and socket.
+chia-query = "0.24.1"
 # Diagnostics MUST go through `tracing`, never stderr. dig-node installs the `dig-logging`
 # subscriber process-globally (dig-node-service::logging), and a Windows service has no stderr
 # to discard to — an `eprintln!` here reaches nobody, which is why a chain-source failure stayed

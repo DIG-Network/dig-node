@@ -172,86 +172,6 @@ pub struct PushOutcome {
     pub verdict: String,
 }
 
-/// Chia error names that are a property of the BUNDLE, not of the answering node's own view.
-///
-/// A node refusing for one of these has looked at the bundle's own contents and found them
-/// invalid: the signature does not verify, the outputs exceed the inputs, the puzzle reveal does
-/// not hash to the coin. Every honest node reaches the same verdict from the same bytes, so no
-/// other destination can be holding the bundle and its inputs are safe to return to selection.
-///
-/// # This is an ALLOWLIST, and that is the whole design (dig-node#460)
-///
-/// The reason text is supplied by an untrusted source (§13 / NC-12), so the guard cannot trust it
-/// to make a POSITIVE safety claim. It does not have to. Freeing early is the dangerous direction
-/// and holding is the safe one, so the default is HOLD and this list is the only exception to it.
-/// Three consequences follow, and each is a property the code would lose as a denylist:
-///
-/// - **An incomplete list is safe.** A Chia error name added after this was written, a source with
-///   its own vocabulary, a peer inventing text — all land in the hold class and cost at most one
-///   bounded `RESERVATION_TTL_MS`. The same names written as "free unless one of these" would free
-///   on every string nobody foresaw.
-/// - **The free set strictly SHRANK**, which removes the ACCIDENTAL free: a source that denies a
-///   relay it performed, or answers with its own conflict, no longer frees. It does NOT raise the bar
-///   against a DELIBERATE attacker in the answering position — these names are public constants, so
-///   emitting one is a lookup rather than a feat. This guard fixes the honest-race defect; it is not
-///   a defence against a hostile last destination, and must not be described as one.
-/// - **The other direction is unchanged.** A source wanting the inputs HELD could already achieve
-///   that by stating no reason at all, which dig-node#348 made a hold. This adds no new lockout
-///   capability, and the TTL that bounds it MUST NOT be shortened to compensate.
-///
-/// # What is deliberately absent
-///
-/// Everything whose answer depends on WHO was asked. `DOUBLE_SPEND`, `MEMPOOL_CONFLICT` and
-/// `ALREADY_INCLUDING_TRANSACTION` are a node's report of its OWN mempool, and on the multi-
-/// destination push path they are what a peer says when it has already seen the bundle another
-/// destination admitted — the exact refusal that must never free. `UNKNOWN_UNSPENT` is a node that
-/// has not caught up. The fee names (`INVALID_FEE_LOW_FEE`, `INVALID_FEE_TOO_CLOSE_TO_ZERO`) are
-/// per-node relay POLICY. The timelock assertions (`ASSERT_HEIGHT_*`, `ASSERT_SECONDS_*`,
-/// `ASSERT_BEFORE_*`) are evaluated against the asked node's PEAK, so a node behind the tip refuses
-/// what a node at the tip admits.
-///
-/// `TOO_MANY_ANNOUNCEMENTS` is the subtle one and the reason this paragraph names it explicitly. It
-/// reads as a pure property of the bundle — a bundle either carries too many announcements or it does
-/// not — and it is NOT: `chia_consensus::conditions` decrements the per-spend announcement countdown
-/// only `if (flags & COST_CONDITIONS) == 0`, and `COST_CONDITIONS` is derived from the answering
-/// node's height. So a node below `hard_fork2_height` refuses an announcement-heavy bundle that a node
-/// above it admits. It is absent, so it holds, and it is written down HERE because it is the entry a
-/// future reader is most likely to add believing it intrinsic.
-///
-/// **The CLVM-EXECUTION names are absent for the SAME reason, which is not obvious and was got
-/// wrong once.** `GENERATOR_RUNTIME_ERROR`, `BLOCK_COST_EXCEEDS_MAX`, `INVALID_BLOCK_COST` and
-/// `INVALID_SPEND_BUNDLE` look like pure properties of the bytes and are not. Bundle validation is
-/// parameterised by the answering node's HEIGHT and by a caller-supplied cost budget:
-/// `chia_consensus::spendbundle_validation::get_flags_for_height_and_constants` derives
-/// `COST_CONDITIONS` / `ENABLE_KECCAK_OPS_OUTSIDE_GUARD` / `SIMPLE_GENERATOR` from `prev_tx_height`,
-/// and `run_spendbundle(.., max_cost, flags, ..)` runs under both. So a node above a hard fork and a
-/// node below it can reach DIFFERENT verdicts on identical bytes — the same property that excludes
-/// the timelocks. Do not re-add them.
-///
-/// The list is also kept SHORT on purpose: a name is added only when every node is certain to
-/// refuse it identically. The announcement-consumption names are omitted for that reason, not
-/// because they are believed view-dependent. Omission costs a bounded hold; a wrong inclusion costs
-/// a double-select window.
-///
-/// **The one acknowledged residue.** `BAD_AGGREGATE_SIGNATURE` is verified against messages built
-/// with the node's own `AGG_SIG_ME_ADDITIONAL_DATA`, so it is a property of the bundle only for
-/// nodes on the same network. The peer handshake's `network_id` check is what makes that hold in
-/// practice; it is stated rather than left implicit, because it is the assumption this entry rests
-/// on.
-const BUNDLE_INTRINSIC_REFUSALS: &[&str] = &[
-    "BAD_AGGREGATE_SIGNATURE",
-    "COIN_AMOUNT_NEGATIVE",
-    "COIN_AMOUNT_EXCEEDS_MAXIMUM",
-    "DUPLICATE_OUTPUT",
-    "MINTING_COIN",
-    "RESERVE_FEE_CONDITION_FAILED",
-    "WRONG_PUZZLE_HASH",
-    "ASSERT_MY_COIN_ID_FAILED",
-    "ASSERT_MY_PARENT_ID_FAILED",
-    "ASSERT_MY_PUZZLEHASH_FAILED",
-    "ASSERT_MY_AMOUNT_FAILED",
-];
-
 /// The bare reason out of a composed [`PushOutcome::rejection`].
 ///
 /// `ChainTransport::stated_rejection` composes `"{verdict}: {reason}"` so an operator reading one
@@ -274,15 +194,34 @@ fn refusal_reason(stated: &str) -> &str {
 /// (dig-node#460).
 ///
 /// This is what [`super::rpc::WalletBackend::push_signed_bundle`] keys its reservation release on.
-/// The match is EXACT against [`BUNDLE_INTRINSIC_REFUSALS`], case-insensitively and after trimming
-/// — never a substring or prefix test. A source that embeds an allowlisted name in wider text
-/// (`"MEMPOOL_CONFLICT (see BAD_AGGREGATE_SIGNATURE)"`) does not match, and lands in the hold
-/// class, which is the direction an unparseable answer belongs in.
+/// The match is EXACT against
+/// [`BUNDLE_INTRINSIC_REFUSALS`](chia_query::mempool_refusal::BUNDLE_INTRINSIC_REFUSALS),
+/// case-insensitively and after trimming — never a substring or prefix test. A source that embeds
+/// an allowlisted name in wider text (`"MEMPOOL_CONFLICT (see BAD_AGGREGATE_SIGNATURE)"`) does not
+/// match, and lands in the hold class, which is the direction an unparseable answer belongs in.
+///
+/// # The list is NOT defined here, and must never be again (dig-node#556)
+///
+/// It and its whole exclusion rationale were written in this file (dig-node#460) and moved DOWN
+/// into [`chia_query::mempool_refusal`] byte-identical, so this crate and `chia-query` cannot
+/// drift into rival definitions of the same split (CLAUDE.md §2.0, centralize rivals). Two copies
+/// would not merely duplicate work: they would disagree about whether a refusal is FINAL, on the
+/// money path, and one of them would be wrong. Read the rationale at the definition; do not
+/// restate it here, and do not add a name on this side.
+///
+/// What stays here is the SPLIT — [`refusal_reason`] — because this crate builds the
+/// `"{verdict}: {reason}"` composition and `chia-query` classifies a bare reason. Whoever builds a
+/// composition owns taking it apart; re-deriving that split upstream would let the two drift in
+/// silence.
+///
+/// # The two crates apply the SAME list with OPPOSITE defaults, deliberately
+///
+/// This crate asks *may I release this bundle's reserved inputs?* and `chia-query` asks *should I
+/// try one more peer?*. The safe side of *free the inputs* is to HOLD and the safe side of *send
+/// again once* is to RETRY, so an unrecognised reason falls to hold here and to retry there.
+/// Unifying the two defaults would make one of the callers fail in its dangerous direction.
 pub(crate) fn refusal_is_bundle_intrinsic(stated: &str) -> bool {
-    let reason = refusal_reason(stated);
-    BUNDLE_INTRINSIC_REFUSALS
-        .iter()
-        .any(|intrinsic| reason.eq_ignore_ascii_case(intrinsic))
+    chia_query::mempool_refusal::is_bundle_intrinsic_refusal(refusal_reason(stated))
 }
 
 /// Pushes an ALREADY-SIGNED bundle to the network.
@@ -1050,6 +989,65 @@ mod tests {
                  destination may be holding this very bundle"
             );
         }
+    }
+
+    /// CONFORMANCE (dig-node#556/#557): this crate's COMPOSED-form classifier agrees with
+    /// `chia-query`'s BARE-form one on every name in the canonical list, and on a name that is not
+    /// in it.
+    ///
+    /// # What this pins, and what it deliberately does not
+    ///
+    /// It does NOT assert that two copies of a list are equal — there is only one list now, and a
+    /// test comparing a re-export with itself would pass for any content whatsoever. What survives
+    /// the move is this crate's own remaining logic: `refusal_reason`, the `"{verdict}: {reason}"`
+    /// split. `chia-query` documents that the split belongs to whoever built the composition, and
+    /// this is the only place it is exercised against the membership question it feeds.
+    ///
+    /// So the loop is driven FROM
+    /// [`BUNDLE_INTRINSIC_REFUSALS`](chia_query::mempool_refusal::BUNDLE_INTRINSIC_REFUSALS)
+    /// rather than from names written
+    /// here: a name added upstream is tested here the day it lands, without anybody remembering to
+    /// copy it. Each name is asked in both forms, and the composed form is the one that can fail —
+    /// a split that stopped stripping the verdict would leave `"FAILED: MINTING_COIN"` unmatched
+    /// while the bare form still matched, which is a silent move to the HOLD side on a spend no
+    /// node will ever admit.
+    ///
+    /// The negative row is not decoration. Without it, a `refusal_reason` that returned the empty
+    /// string and an `is_bundle_intrinsic_refusal` that answered `true` for everything would both
+    /// satisfy the positive rows.
+    ///
+    /// **Catches:** a broken composed-form split; the two crates' classifiers diverging on
+    /// membership; and the local copy being resurrected alongside the re-export.
+    #[test]
+    fn the_composed_split_agrees_with_chia_querys_bare_classifier_on_the_canonical_list() {
+        let canonical = chia_query::mempool_refusal::BUNDLE_INTRINSIC_REFUSALS;
+        assert!(
+            !canonical.is_empty(),
+            "the canonical list is empty, so every row below would pass vacuously"
+        );
+
+        for name in canonical {
+            assert!(
+                chia_query::mempool_refusal::is_bundle_intrinsic_refusal(name),
+                "{name} is on the canonical list and its own crate does not recognise it"
+            );
+            assert!(
+                super::refusal_is_bundle_intrinsic(&format!("FAILED: {name}")),
+                "{name} is on the canonical list, but this crate did not recognise it once                  composed as `FAILED: {name}` — the verdict split has stopped stripping the                  verdict, and a spend no node will ever admit now holds its inputs for the full                  TTL"
+            );
+        }
+
+        // The control: a name deliberately absent from the list, asked in both forms. `DOUBLE_SPEND`
+        // is the #460 refusal itself — one node's report of its OWN mempool, which on the
+        // multi-destination push path means the bundle IS in flight.
+        assert!(
+            !chia_query::mempool_refusal::is_bundle_intrinsic_refusal("DOUBLE_SPEND"),
+            "a view-dependent refusal was classified as a property of the bundle"
+        );
+        assert!(
+            !super::refusal_is_bundle_intrinsic("FAILED: DOUBLE_SPEND"),
+            "the composed form freed the inputs of a bundle another destination may be holding"
+        );
     }
 
     /// **Proves (dig-node#460):** a peer's error string reaches the classifier VERBATIM, all the way

@@ -911,9 +911,9 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.21.0"
+version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1472f00b8a310a1af09530fbdc8f4ea8c49bc8892cf081446bad731235b608cc"
+checksum = "d82677c6aba0319eafe8808f253bc0aa34539bfcef8b82c9eb35339bfe71dfcc"
 dependencies = [
  "async-trait",
  "chia-bls 0.36.1",
@@ -2575,6 +2575,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4651ba42e276da1b91ddb33a7f97c6b9784dd6d25d4d5877a232dfe8c7e0d49"
 dependencies = [
  "chia-protocol 0.36.1",
+ "chia-puzzle-types 0.36.1",
+ "chia-puzzles",
+ "chia-sdk-driver 0.36.0",
+ "chia-sdk-types 0.36.0",
+ "clvm-traits 0.36.1",
+ "clvm-utils 0.36.1",
+ "clvmr 0.16.4",
  "thiserror 2.0.20",
 ]
 
@@ -3031,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.254.77"
+version = "0.254.78"
 dependencies = [
  "async-trait",
  "axum",
