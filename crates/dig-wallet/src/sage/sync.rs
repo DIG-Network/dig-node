@@ -871,6 +871,48 @@ impl CatAttributor<'_> {
     }
 }
 
+/// Drain `arrival_pending`/newly-confirmed coins into `arrivals` for `session`, through
+/// `through_height` — logging a failure rather than propagating it.
+///
+/// # Two call sites in one frame (dig-node#546)
+///
+/// [`handle_coin_state_update`] calls this once, right after a frame's coin writes land — but a
+/// CAT staged in THIS SAME frame is not in `coins` yet at that point; it is only promoted
+/// afterwards, when [`run_update_loop`] runs the [`CatAttributor`] pass. That ordering is
+/// #479/#480's own fix (a coin must be judged news-or-history at the moment it is first STAGED,
+/// never re-asked after the watermark has moved onto its own height), so it cannot simply be
+/// reversed. Its corollary is the hold `promote_cat_admission` leaves in `arrival_pending`:
+/// nothing examines that hold until this function runs again, and without a second call in the
+/// SAME frame, that only ever happened on the NEXT `coin_state_update` — which a wallet that
+/// receives once and then falls quiet may never get. [`run_update_loop`] calls this a second
+/// time, right after attribution, to close that gap at its source rather than trust a frame that
+/// may never arrive to close it.
+///
+/// # Safe to call twice, unconditionally
+///
+/// [`WalletDb::record_arrivals`] is idempotent — an already-recorded coin id is `INSERT OR
+/// IGNORE`d, and its baseline only ever advances (`MAX`) — so a second call at the same height
+/// re-examines rather than re-announces: it changes nothing the first call already settled, and
+/// only newly catches what attribution just promoted.
+///
+/// # Why a failure here is logged, not propagated
+///
+/// Chain sync is the critical path and a notification ledger is not: returning an error would
+/// drop a live peer session over a NOTIFICATION write, which is a strictly worse outcome than a
+/// delayed toast. Nothing is lost by continuing — the ledger insert and the baseline advance
+/// share one transaction, so a failed pass leaves the watermark where it was and the next call
+/// (the next frame's, if not this frame's own second one) re-examines the same coins.
+async fn record_arrivals_or_log(db: &WalletDb, session: &SessionState<'_>, through_height: u32) {
+    let watched: Vec<String> = session.subscribed.iter().map(hex::encode).collect();
+    if let Err(e) = db.record_arrivals(&watched, through_height).await {
+        tracing::warn!(
+            error = %e,
+            height = through_height,
+            "wallet sync: recording incoming-funds arrivals failed; retrying on the next update"
+        );
+    }
+}
+
 /// Handle a `coin_state_update` push: on a reorg (`fork_height` below the current peak)
 /// roll the DB back above the fork first (design B.3), then apply the update's coin states
 /// and advance the synced peak. Publishes [`SyncEvent::CoinState`] on `events` once applied
@@ -962,19 +1004,9 @@ pub async fn handle_coin_state_update(
     // The recorder is fail-closed on its own: with no baseline (no completed catch-up) it records
     // nothing, so the history this same function replays on every reconnect is never announced.
     //
-    // A recorder failure is LOGGED, not propagated. Chain sync is the critical path and a
-    // notification ledger is not: returning `?` here would drop a live peer session over a
-    // NOTIFICATION write, which is a strictly worse outcome than a delayed toast. Nothing is lost
-    // by continuing — the ledger insert and the baseline advance share one transaction, so a failed
-    // pass leaves the watermark where it was and the next update re-examines the same coins.
-    let watched: Vec<String> = session.subscribed.iter().map(hex::encode).collect();
-    if let Err(e) = db.record_arrivals(&watched, update.height).await {
-        tracing::warn!(
-            error = %e,
-            height = update.height,
-            "wallet sync: recording incoming-funds arrivals failed; retrying on the next update"
-        );
-    }
+    // This is the FIRST of this frame's two drain attempts — see [`record_arrivals_or_log`] for
+    // why a second one runs later, after attribution (dig-node#546).
+    record_arrivals_or_log(db, session, update.height).await;
     events.publish(SyncEvent::CoinState);
     Ok(FrameApplied::Applied)
 }
@@ -1254,6 +1286,13 @@ pub async fn run_update_loop(
                     if applied == FrameApplied::Applied {
                         if let Some(a) = attributor {
                             a.attribute(db).await?;
+                            // dig-node#546 — the second of this frame's two drain attempts. See
+                            // [`record_arrivals_or_log`] for why one call inside
+                            // `handle_coin_state_update` is not enough: attribution can only
+                            // promote a staged CAT AFTER that call already ran, so without this,
+                            // the promoted coin's hold is examined only on the NEXT frame — which
+                            // may never come.
+                            record_arrivals_or_log(db, session, update.height).await;
                         }
                     }
                 }
