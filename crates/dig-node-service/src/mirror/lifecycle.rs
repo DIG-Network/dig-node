@@ -145,8 +145,12 @@ pub struct NodeMirrorEffects<'a, S: ChainSource> {
     /// selection at all (§25.4.4), so gating it on a funding read would reintroduce the legacy
     /// defect where a node that could not fund could not recover either.
     committed_coin_ids: Result<std::cell::RefCell<std::collections::HashSet<String>>, PassError>,
-    /// Where this node advertises its stores can be fetched from. Empty means it cannot advertise.
-    advertised_urls: Vec<String>,
+    /// Where this node advertises its stores can be fetched from, AND why that is the answer.
+    ///
+    /// The state travels with the list rather than being re-derived at the refusal, because the
+    /// four ways of having no URL have four different remedies and only the decision knows which
+    /// one holds (`super::advertise::AdvertiseState`).
+    advertised: super::advertise::Effective,
     /// This node's own `peer_id`, written into every coin it creates so a reader can credit the bond
     /// to it. `None` before the peer network has started.
     own_peer_id: Option<String>,
@@ -218,7 +222,7 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
         capsules: Vec<ObservedCapsule>,
         dig_balance: Result<u64, PassError>,
         committed_coin_ids: Result<std::collections::HashSet<String>, PassError>,
-        advertised_urls: Vec<String>,
+        advertised: super::advertise::Effective,
         own_peer_id: Option<String>,
         source: &'a S,
         owner_puzzle_hash: Bytes32,
@@ -233,7 +237,7 @@ impl<'a, S: ChainSource> NodeMirrorEffects<'a, S> {
             // Wrapped here rather than at the call site: the scheduler's job is to take ONE reading
             // of the audit record, and within-pass accumulation is this type's business.
             committed_coin_ids: committed_coin_ids.map(std::cell::RefCell::new),
-            advertised_urls,
+            advertised,
             own_peer_id,
             source,
             owner_puzzle_hash,
@@ -471,12 +475,17 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         // The advertisement is checked FIRST, ahead of every chain read. `dig_mirror_coin::create`
         // refuses an advertisement with no URL, so selecting coins before knowing there is somewhere
         // to advertise spends a chain scan to reach a refusal that was decidable for free.
-        if self.advertised_urls.is_empty() {
+        if !self.advertised.can_advertise() {
+            // The STATE's own sentence, not a fixed "none is configured". Since the list is derived
+            // by default, the commonest reason a node has no URL is that it does not yet know its
+            // own public address — a blocker no configuration can clear, and one an operator sent
+            // to `DIG_MIRROR_ADVERTISE_URLS` would chase for ever.
             return Err(PassError::Wallet(format!(
                 "creating the {} bond needs at least one URL this node's stores can be fetched \
-                 from, and none is configured; a mirror with nowhere to fetch from is not a \
-                 mirror, so no coin was selected and no spend was attempted",
-                bond.store_id
+                 from, and it has none: {}. A mirror with nowhere to fetch from is not a mirror, \
+                 so no coin was selected and no spend was attempted",
+                bond.store_id,
+                self.advertised.state.reason()
             )));
         }
 
@@ -545,7 +554,7 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
             store_launcher_id,
             root_hash,
             num_bigint::BigInt::from(epoch),
-            self.advertised_urls.clone(),
+            self.advertised.urls.clone(),
             declaration,
             amount_dig_base_units,
             dig_coins,

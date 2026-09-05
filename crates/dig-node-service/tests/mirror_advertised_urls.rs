@@ -1,23 +1,35 @@
-//! **The operator's advertised URLs reach the coin** (`SPEC.md` §25.10, dig-node#426).
+//! **What this node advertises reaches the coin** (`SPEC.md` §25.10, dig-node#426,
+//! `dig_ecosystem#3197`).
 //!
 //! A mirror coin publishes where its store can be fetched from, and those URLs are fixed at create
 //! for the whole epoch. Until dig-node#426 the node parsed the operator's value and then handed
 //! `create` an EMPTY list, so every create refused and no coin was ever made. This file drives the
-//! real composition the scheduler performs — environment → [`configured_urls`] → the real
-//! `NodeMirrorEffects::create` → a signed bundle — and reads the answer off the broadcast bundle.
+//! real composition the scheduler performs — environment and this node's own public address →
+//! [`effective_urls_from_env`] → the real `NodeMirrorEffects::create` → a signed bundle — and reads
+//! the answer off the broadcast bundle.
 //!
 //! # Why the assertion is on the BUNDLE, not on the list
 //!
-//! Asserting that `configured_urls()` returns the right strings would pass identically while the
-//! scheduler kept passing `Vec::new()` beside it — the exact defect this work removes. The bundle
-//! is the only artifact that can distinguish "parsed" from "published", because it is what a
-//! stranger eventually reads.
+//! Asserting that the decision returns the right strings would pass identically while the scheduler
+//! kept passing `Vec::new()` beside it — the exact defect this work removes. The bundle is the only
+//! artifact that can distinguish "parsed" from "published", because it is what a stranger eventually
+//! reads.
 //!
-//! # The fixture keeps a truthful control
+//! # Every fixture keeps a truthful control
 //!
 //! The configured value mixes a this-machine entry among two publishable ones. A fixture of only
 //! good entries cannot see a filter that drops too much, and a fixture of only bad entries cannot
 //! see one that drops too little; varying one entry against two honest survivors sees both.
+//!
+//! The same discipline decides the ADDRESS each fixture is given. Every probe about the operator's
+//! value hands the node a perfectly derivable address of its own, so that "the operator's value
+//! wins" is proven rather than inherited from there being no alternative.
+//!
+//! # The addresses here are SYNTHETIC, and that is the design
+//!
+//! `dig-node-core` hard-codes `reflexive_addr` to `null` (`dig_ecosystem#3198` is adding the
+//! producer), so no real host can supply one yet. What is under test is the plumbing between an
+//! address and the coin, which a supplied address exercises exactly.
 
 mod support;
 
@@ -27,7 +39,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use chia_sha2::Sha256;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
-use dig_node_service::mirror::advertise::{configured_urls, ADVERTISE_URLS_ENV};
+use dig_node_service::mirror::advertise::{
+    effective_urls_from_env, AdvertiseState, PublicAddress, Reflexive, ADVERTISE_URLS_ENV,
+};
 use dig_node_service::mirror::lifecycle::{mirror_agg_sig_data, NodeMirrorEffects};
 use dig_node_service::mirror::plan::Bond;
 use dig_node_service::mirror::runner::MirrorEffects;
@@ -209,6 +223,42 @@ fn bond(store: u8, root: u8) -> Bond {
     Bond::new(hex::encode([store; 32]), hex::encode([root; 32]))
 }
 
+/// The global-unicast address this node's two STUN sources agree on.
+///
+/// NOT `198.51.100.x`: that is RFC 5737 documentation space, which the derived path refuses, so
+/// the obvious test address would make every fixture here pass for the wrong reason.
+const DERIVED_ADDR: &str = "93.184.216.34:9444";
+
+/// This node's own peer id, as every fixture here writes it.
+///
+/// `repeat` rather than a 64-character literal so the length is right by construction instead of by
+/// counting. `create` refuses without a well-formed one, so every fixture that must reach the
+/// advertisement carries it.
+fn own_peer_id() -> String {
+    "a1".repeat(32)
+}
+
+/// A node that knows its public address and holds a path to the network.
+///
+/// The address is SYNTHETIC and that is deliberate: `dig-node-core` hard-codes `reflexive_addr` to
+/// `null` (`dig_ecosystem#3198` is adding the producer), so no real host can supply one yet. The
+/// composition under test is the plumbing between the address and the coin, which is exactly what a
+/// supplied address exercises.
+/// TWO sources, because one is never enough: `relay.dig.net` answers STUN with its own load
+/// balancer's address (`relay.dig.net#11`), well-formed every time, and dig-node prefers the
+/// relay tier — so a single-source fixture would model the one case that must never reach a coin.
+fn a_live_node_with_a_public_address() -> PublicAddress {
+    let seen = |source: &str| Reflexive {
+        source: source.to_string(),
+        addr: DERIVED_ADDR.parse().expect("a socket address"),
+    };
+    PublicAddress {
+        reflexive: vec![seen("relay.dig.net"), seen("stun.example")],
+        relay_reserved: true,
+        direct_mapping: false,
+    }
+}
+
 /// The whole composition, end to end: the operator's value becomes the coin's advertisement, in the
 /// operator's own order, with the this-machine entry dropped and its honest siblings kept.
 ///
@@ -236,21 +286,28 @@ fn the_configured_urls_reach_the_coin_in_the_operators_order() {
     // two apart.
     let first = "https://mirror-b.example/dig";
     let second = "https://[2001:db8::1]/dig";
-    let urls = with_advertise_env(
+    // The node is given a PERFECTLY GOOD address of its own, so this also proves the override wins
+    // rather than merely being the only candidate. A fixture with no derivable address would be
+    // satisfied identically by an implementation that had no override at all.
+    let advertised = with_advertise_env(
         &format!("{first}, http://127.0.0.1:4161/, {second}"),
-        configured_urls,
+        || effective_urls_from_env(&a_live_node_with_a_public_address()),
+    );
+    assert_eq!(
+        advertised.state,
+        AdvertiseState::Override,
+        "the operator's value must beat a derivable address: {advertised:?}"
     );
 
     let effects = NodeMirrorEffects::new(
         Vec::new(),
         Ok(PER_COIN),
         Ok(HashSet::new()),
-        urls,
+        advertised,
         // A well-formed peer id, because `create` now refuses without one: a coin naming no peer
         // locks collateral no reader could credit. This fixture is about URL ORDER, so it must
-        // reach the advertisement rather than stop at the identity guard. `repeat` rather than a
-        // 64-character literal so the length is right by construction instead of by counting.
-        Some("a1".repeat(32)),
+        // reach the advertisement rather than stop at the identity guard.
+        Some(own_peer_id()),
         &chain,
         signer.owner_puzzle_hash(),
         Some(&signer),
@@ -279,6 +336,161 @@ fn the_configured_urls_reach_the_coin_in_the_operators_order() {
         index_of(wire, b"127.0.0.1").is_none(),
         "a loopback entry can only mean this machine, so it must never be advertised"
     );
+    assert!(
+        index_of(wire, b"93.184.216.34").is_none(),
+        "the derived address must not ALSO be published: the operator's value is an override, not \
+         an addition, and a coin carrying both stakes their money on a place they did not name"
+    );
+}
+
+/// **The derived reflexive address reaches the coin, beside the peer declaration.**
+///
+/// This is the property `dig_ecosystem#3197` exists for. With no operator value, a node that knows
+/// its public address and holds a path to the network publishes that address — and the assertion is
+/// on the BROADCAST BUNDLE rather than on the decision, because a decision returning the right
+/// strings would pass identically while the scheduler kept handing `create` an empty list.
+///
+/// Both terms are asserted together. The declaration pins WHO the collateral stands behind and the
+/// URL says WHERE that peer is; a coin carrying only one of them is either uncreditable or
+/// unfetchable, so a test that checked one would let the other be dropped silently.
+#[test]
+fn the_derived_address_reaches_the_coin_beside_the_peer_declaration() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (signer, address) = operator(dir.path());
+
+    let mut chain = Chain::default();
+    chain.fund(&address, &[PER_COIN], salt(3));
+
+    let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+    let journal = SpendJournal::new(log);
+    let broadcaster = MockBroadcaster::default();
+    let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
+
+    // Explicitly UNSET, which is the whole point: the derived default is what an operator who has
+    // configured nothing gets.
+    let advertised = with_advertise_env("", || {
+        effective_urls_from_env(&a_live_node_with_a_public_address())
+    });
+    assert_eq!(advertised.state, AdvertiseState::Derived, "{advertised:?}");
+
+    let effects = NodeMirrorEffects::new(
+        Vec::new(),
+        Ok(PER_COIN),
+        Ok(HashSet::new()),
+        advertised,
+        Some(own_peer_id()),
+        &chain,
+        signer.owner_puzzle_hash(),
+        Some(&signer),
+        &journal,
+        Some(&broadcaster),
+        runtime.handle().clone(),
+    );
+
+    effects
+        .create(&bond(0xC3, 0xE5), EPOCH, PER_COIN)
+        .expect("a derived advertisement and a funding coin are both present");
+
+    let bundles = broadcast_bytes(&broadcaster);
+    assert_eq!(bundles.len(), 1, "the create must have reached the mempool");
+    let wire = &bundles[0];
+
+    // The dig-peer wire, not the HTTP content port. `DIG_NODE_PORT` (9778) is loopback-bound by
+    // default and no relay mediates it, so a coin naming it would advertise somewhere no stranger
+    // can reach — which is why the SCHEME and the PORT are both asserted rather than just the host.
+    let expected = format!("dig://{DERIVED_ADDR}");
+    assert!(
+        index_of(wire, expected.as_bytes()).is_some(),
+        "the derived reflexive peer address must appear in the coin: {expected}"
+    );
+    // The declaration `create` already wrote (`lifecycle.rs`), still there. The URL adds WHERE; it
+    // must not have displaced WHO.
+    let declaration = format!("dig-peer:{}", own_peer_id());
+    assert!(
+        index_of(wire, declaration.as_bytes()).is_some(),
+        "the peer declaration must survive alongside the derived URL: {declaration}"
+    );
+}
+
+/// **A node that does not know its public address creates NOTHING, and says why in the operator's
+/// own terms.**
+///
+/// This is every host's state today — `reflexive_addr` is hard-coded `null` — so the sentence this
+/// produces is the one an operator actually reads. The assertion is on the WORDING as much as on
+/// the refusal: a node that cannot know its own address has no configuration to fix, and sending
+/// them to `DIG_MIRROR_ADVERTISE_URLS` would be sending them to a remedy that cannot work.
+#[test]
+fn no_public_address_creates_nothing_and_does_not_blame_the_operators_configuration() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (signer, address) = operator(dir.path());
+
+    let mut chain = Chain::default();
+    // Funded deliberately: a refusal on an EMPTY wallet would be indistinguishable from a funding
+    // refusal and would assert nothing about the advertisement.
+    chain.fund(&address, &[PER_COIN], salt(4));
+
+    let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+    let journal = SpendJournal::new(log);
+    let broadcaster = MockBroadcaster::default();
+    let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
+
+    // No operator value AND no address: `PublicAddress::default()` is exactly what
+    // `from_network_info` reads off the shipped `dig.getNetworkInfo` answer today.
+    let advertised = with_advertise_env("", || effective_urls_from_env(&PublicAddress::default()));
+    assert_eq!(
+        advertised.state,
+        AdvertiseState::NoPublicAddress,
+        "{advertised:?}"
+    );
+
+    let effects = NodeMirrorEffects::new(
+        Vec::new(),
+        Ok(PER_COIN),
+        Ok(HashSet::new()),
+        advertised,
+        Some(own_peer_id()),
+        &chain,
+        signer.owner_puzzle_hash(),
+        Some(&signer),
+        &journal,
+        Some(&broadcaster),
+        runtime.handle().clone(),
+    );
+
+    let reason = effects
+        .create(&bond(0xD4, 0xF6), EPOCH, PER_COIN)
+        .expect_err("a node that does not know where it is must not stake an epoch on a guess");
+
+    assert!(
+        reason
+            .to_string()
+            .contains("does not know its public address"),
+        "the refusal must name the missing address: {reason}"
+    );
+    assert!(
+        !reason.to_string().contains(ADVERTISE_URLS_ENV),
+        "a blocker no configuration can clear must not be described as configuration: {reason}"
+    );
+    // The refusal's RUNTIME VALUE, because nothing else can see this defect. `create` composes its
+    // sentence from a `\` string continuation, and `cargo fmt` has been observed collapsing one
+    // while keeping the indentation — leaving a literal run of spaces baked into the middle of a
+    // sentence. `cargo fmt --check` is SATISFIED by that, since the formatter produced it, and a
+    // source grep misses it because the backslash is already gone. Only the composed string tells.
+    assert!(
+        !reason.to_string().contains("  "),
+        "a run of two spaces mid-sentence is an eaten line continuation, not prose: {reason}"
+    );
+    assert!(
+        broadcast_bytes(&broadcaster).is_empty(),
+        "no spend may be attempted for an advertisement no stranger could act on"
+    );
+    assert_eq!(
+        chain
+            .address_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refusal must be reached before any chain read, so no coin is selected or reserved"
+    );
 }
 
 /// A value whose every entry is rejected advertises nothing, refuses, and spends NOTHING.
@@ -302,20 +514,24 @@ fn an_all_rejected_value_refuses_and_spends_nothing() {
     let broadcaster = MockBroadcaster::default();
     let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
 
-    let urls = with_advertise_env(
-        "http://localhost:4161/, mirror.example.net",
-        configured_urls,
-    );
-    assert!(
-        urls.is_empty(),
-        "every entry names this machine or no scheme, so none may be published: {urls:?}"
+    // The node is given a perfectly good address of its own, so this also proves the value does
+    // NOT silently fall back to the derived one. The operator named a place; staking their money
+    // somewhere else because their value had a typo is a surprise about money.
+    let advertised = with_advertise_env("http://localhost:4161/, mirror.example.net", || {
+        effective_urls_from_env(&a_live_node_with_a_public_address())
+    });
+    assert_eq!(
+        advertised.state,
+        AdvertiseState::Off,
+        "every entry names this machine or no scheme, so none may be published, and the derived \
+         address must not stand in for them: {advertised:?}"
     );
 
     let effects = NodeMirrorEffects::new(
         Vec::new(),
         Ok(PER_COIN),
         Ok(HashSet::new()),
-        urls,
+        advertised,
         // Deliberately absent, and deliberately UNREACHED: the advertisement guard returns before
         // `declaration_for_create` is consulted, so this row still refuses for the URL reason. It
         // is left as `None` so that a future reordering putting the identity guard first changes

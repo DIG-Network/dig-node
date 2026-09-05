@@ -9479,8 +9479,8 @@ The lifecycle exposes, per `(store, root)`, over the control plane and with a `d
 CLI parity): the bond state — `bonded { coin_id, epoch, amount }`, `pending` (in-flight create),
 `unfunded { short_dig_base_units }`, `deferred { requirement reason }` (§25.3), `withheld`
 (`Relayed` provenance — deliberately not advertised), `disabled` (the node-wide switch, §25.7),
-`unadvertised` (that switch ON, but no entry in `DIG_MIRROR_ADVERTISE_URLS` is publishable, so this
-node advertises nothing and a coin would bond nothing — §25.10), or
+`unadvertised` (that switch ON, but this node has no publishable URL — neither an operator entry nor
+a derived one — so it advertises nothing and a coin would bond nothing — §25.10), or
 `reclaiming { coin_id, epoch, amount }` — so a client can distinguish "out of funds" from "withheld
 on purpose" without guessing from the store list. Conflating those two produces hourly alarms about
 a healthy node (dig-app#300). The method is declared in `dig-node-control-interface` (release-first)
@@ -9508,8 +9508,11 @@ never a constant, so a node reading testnet coins cannot render a mainnet addres
 row read the same token together and neither has a coin. They differ in whether the operator already
 knows: `disabled` is that operator's own switch (§25.7) and MUST NOT be presented as a fault, while
 `unadvertised` is the switch ON and the node silently unable to honour it because
-`mirror::advertise::configured_urls` accepted no entry — the list is empty, or every entry was rejected
-as non-absolute or reachable only from this machine, which is the same condition `MirrorEffects::create`
+`mirror::advertise::effective_urls` produced no entry — the operator's entries were all rejected as
+non-absolute or reachable only from this machine, or there was no operator value and this node knows
+no public address, holds only one source's unconfirmed word for one, or holds no path to itself
+(§25.10's `off`, `no_public_address`, `uncorroborated_address` and `no_relay`),
+which is the same condition `MirrorEffects::create`
 refuses every bond on (§25.10). The node MUST report `unadvertised` for that condition and MUST NOT
 report it as `disabled`, which would oblige a conforming client to stay silent about the only reason
 this node bonds nothing, nor as `unfunded`, which would name a figure and demand $DIG that would create
@@ -9553,18 +9556,74 @@ The surface MUST hold four properties, each of which is a money statement:
   and chain, and §23.5's reconcile plus in-flight suppression prevent both double-creates and
   silent losses.
 
-### 25.10. What the node advertises, and why it is configured
+### 25.10. What the node advertises: derived by default, overridden by the operator
 
 A mirror coin publishes, in its memos, the URLs its store can be fetched from. `dig-mirror-coin`
 requires at least one and imposes no other rule on them: they are advisory fetch hints, and the
 crate's reader accepts any UTF-8 entry. This node therefore decides for itself what it is honest to
 publish about itself.
 
-The advertised URLs are **operator-configured and MUST NOT be derived**. A coin's URLs are fixed at
-create for the whole epoch, so an address the node inferred about itself — a STUN reflexive address,
-a resolver answer — may be unreachable from outside or may simply change, leaving collateral staked
-on a claim the node cannot keep, which this section penalises. The operator sets them in
-`DIG_MIRROR_ADVERTISE_URLS`, separated by commas or whitespace.
+**When the operator has not set a value, the node MUST advertise its reflexive peer address, and
+MUST do so only while it holds a relay reservation or a confirmed direct mapping.** An operator-set
+value overrides the derived one. The operator sets it in `DIG_MIRROR_ADVERTISE_URLS`, separated by
+commas or whitespace.
+
+**Reachability is enforced economically, not predictively.** A coin's URLs are fixed at create for
+the whole epoch, so a mapping the node derives may lapse before the epoch does. The node MUST NOT
+probe itself back, and MUST NOT require the operator to confirm before staking: a node that cannot
+be reached simply earns nothing for that epoch. **Its collateral is never at risk.** `dig-mirror-coin`
+§3 rules 4 and 5 place reclaim behind the owner's own key alone, require it to recreate the full
+locked amount, and give no path that reduces $DIG supply; the only penalty this node's code applies
+is credit denial (§25.9's `unverified`, which earns nothing). So a wrong address costs that epoch's
+rewards, capital locked until the operator reclaims it, and a reclaim fee — never principal — which
+is the same cost as advertising nothing. Wherever this section says a claim is *penalised*, it means
+that forfeiture. No surface may describe it as losing a stake.
+
+The derived form:
+
+* The derived URL MUST name the transport a stranger genuinely reaches: the **dig-peer wire**, as
+  `dig://<host>:<port>` over the reflexive mapping of the peer socket. It MUST NOT be derived over
+  `DIG_NODE_PORT`, which is the HTTP content port and is loopback-bound by default, so no relay
+  mediates it. Where the node has a mapping per address family it SHOULD publish IPv6 first (§5.2).
+* A derived entry is subject to every rule below, exactly as an operator's entry is. A reflexive
+  address is a reading, not a promise, and a seam reporting a this-machine mapping MUST NOT put one
+  into a coin merely because the node derived it.
+
+**A derived address MUST be CORROBORATED before it is published: two DIFFERENT sources MUST report
+the same address.** A single source cannot be checked. A STUN server that answers promptly, with the
+correct magic cookie, a matching transaction id and a well-formed `XOR-MAPPED-ADDRESS` can still be
+reporting the wrong address, and nothing in the exchange says so — `relay.dig.net` did exactly this
+for IPv4 callers, reporting its load balancer's address because the balancer SNATs an IPv4 caller's
+UDP flow. Since the node prefers the relay tier, that is the answer it gets. This value is written
+into a coin permanently with collateral behind it, so it takes NC-12's discipline: sources are
+untrusted and must AGREE, never trusted individually. Readings that disagree corroborate neither.
+
+**The address FAMILY MUST NOT be a rejection criterion.** That defect is an address-family CROSSING,
+not an IPv6 one: the same server answers an IPv6 caller correctly. IPv6 is both the working case and
+the §5.2-preferred one, so a rule distrusting IPv6 answers would discard correct discovery while
+keeping incorrect answers. The node MAY order derived entries by family and MUST NOT judge them by
+it.
+
+**A node SHOULD additionally verify that a STUN answer DESCRIBES THE CALLER** — the reported port
+equal to the querying socket's own source port, and the reported family matching the transport
+queried over. That check belongs to the STUN client, which knows its own socket, and MUST NOT be
+applied where the source port is unknown: a NAT'd node's reflexive port legitimately differs from its
+local source port, so the comparison made anywhere else would refuse the very nodes reflexive
+discovery exists for.
+
+**A derived address MUST be global unicast.** A private, shared/CGNAT, link-local, loopback,
+documentation, benchmarking, discard-only, unique-local or otherwise reserved address MUST NOT be
+published when the node derived it. This is STRICTER than the rule on an operator's entry, and
+deliberately: an operator's LAN address is a deliberate choice risking only their own stake, while a
+derived one is a broken reading of where this node sits. An IPv6 address embedding an IPv4 one is
+judged by the address it embeds.
+
+**No provider or operator address range may be special-cased, in either direction.** The rule is on
+what an address denotes, never on who owns it. Excluding the range a misconfigured server happens to
+report would paper over one instance of a general defect and would refuse every node legitimately
+hosted in that range. Corroboration is the mechanism that catches a wrong-but-routable answer.
+
+The rules on any entry, however it was obtained:
 
 * The list MAY carry several entries; the memo layout is built for that. IPv6 entries SHOULD be
   listed first, and the node publishes the operator's order verbatim rather than sorting it.
@@ -9576,13 +9635,39 @@ on a claim the node cannot keep, which this section penalises. The operator sets
   A private or LAN address MAY be published: it is a deliberate operator choice and risks only that
   operator's own stake.
 * A rejected entry is dropped with a warning naming the reason; the surviving entries are published.
-* When no entry survives, **the node advertises nothing and creates no mirror coin**. That refusal
-  is the correct default: publishing a URL nobody can fetch from is worse than publishing none,
-  because it locks collateral against a claim that will be penalised.
+* When no entry survives, **the node advertises nothing and creates no mirror coin**.
+
+**An operator value that yields no publishable entry MUST NOT fall back to the derived address.**
+They named a place; staking their collateral on a different one because their value had a typo is a
+surprise about money, and the warning naming the typo is something they can act on.
+
+The node MUST report which of six states it is in, because the four that publish nothing have four
+different remedies and telling an operator the wrong one sends them somewhere no action helps:
+
+| state | meaning |
+|---|---|
+| `advertising_override` | publishing the operator's own list |
+| `advertising_derived` | publishing this node's own reflexive peer address |
+| `off` | the operator set a value and no entry in it is publishable |
+| `no_public_address` | no operator value, and this node does not know a public address — nothing reported one, or what was reported is not a public address |
+| `uncorroborated_address` | exactly one source reported an address and nothing has confirmed it |
+| `no_relay` | a public address is known, but no path to this node is currently held |
+
+`uncorroborated_address` MUST be distinct from `no_public_address`: the node is not missing an
+answer, it is missing a SECOND one, and neither condition is cleared by what would clear the other.
+The node SHOULD additionally report WHY a derived address was refused, since the state alone cannot
+distinguish "nothing reported one" from "a private address was reported".
+
+**`no_public_address` MUST NOT be described as unset configuration.** Setting a value the operator
+cannot know is not a remedy, and a blocker no configuration can clear must never be presented as
+one. The node's own reachability posture (`dig.getNetworkInfo`'s `reachability`) MUST NOT be read as
+the confirmed direct mapping the liveness gate asks for: it reports `direct` whenever no relay is in
+use, which is the absence of a relay rather than evidence of reachability, and reading it would make
+the gate vacuously true for exactly the nodes it exists to stop advertising.
 
 Changing the value affects only coins created after the change. Bringing an existing coin into line
 means reclaiming and re-creating it — a round trip and a fee — and the node MUST NOT reclaim in
-response to a configuration edit.
+response to a configuration edit, nor in response to the derived address changing.
 
 
 ### 25.11. Funding a create — authentication precedes every figure the operator is told
