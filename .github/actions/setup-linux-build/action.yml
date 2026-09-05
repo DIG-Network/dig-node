@@ -41,11 +41,25 @@ runs:
       # `openssl-sys` builds vendored OpenSSL from source (needs perl + make) and several other
       # -sys crates in the Chia-wallet-SDK graph want cmake/clang. `binutils` provides the
       # `readelf` the floor gate reads.
+      #
+      # Retry the WHOLE update+install as a unit (same fix as the `Bootstrap the container for
+      # checkout` step in every caller): bullseye-security's pool prunes superseded `.deb` files
+      # as point releases land, so the Packages index served by one mirror/edge can briefly
+      # disagree with the pool state served by another, 404ing on whichever package most recently
+      # rotated. `update` already runs immediately before `install`, so a fresh index alone does
+      # not fix it — a retried attempt gets an independent shot at an index+pool pair that agree.
       run: |
         set -eux
-        apt-get update -qq
-        apt-get install -y --no-install-recommends \
-          ca-certificates curl git build-essential pkg-config perl make cmake clang binutils
+        for attempt in 1 2 3 4 5; do
+          if apt-get update -qq && apt-get install -y --no-install-recommends -o Acquire::Retries=3 --fix-missing \
+            ca-certificates curl git build-essential pkg-config perl make cmake clang binutils; then
+            exit 0
+          fi
+          echo "apt bootstrap attempt $attempt/5 failed (stale bullseye-security mirror/edge index vs pool) -- retrying" >&2
+          sleep $(( attempt * 5 ))
+        done
+        echo "::error::apt bootstrap failed after 5 attempts" >&2
+        exit 1
 
     - name: Verify the container glibc IS the declared floor
       shell: bash

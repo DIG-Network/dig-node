@@ -182,10 +182,26 @@ jobs:
       # (and the floor assertion) comes from the local composite action, which cannot run until the
       # repository is on disk.
       - name: Bootstrap the container for checkout
+        # bullseye-security's pool prunes superseded `.deb` files as point releases land, and the
+        # Packages index served by one mirror/edge can briefly disagree with the pool state
+        # served by another — so a single apt-get update+install can 404 on whichever package
+        # most recently rotated (confirmed on dig-node CI run 33948322114, the identical
+        # bootstrap in package.yml: a DIFFERENT package 404'd on each arch — libexpat1 arm64,
+        # libperl5.32 amd64 — ruling out a fixed broken URL). `update` already runs immediately
+        # before `install` in this same step, so Docker-layer caching is not the gap; retrying
+        # the WHOLE sequence is, because each attempt gets an independent shot at an index+pool
+        # pair that agree.
         run: |
           set -eux
-          apt-get update -qq
-          apt-get install -y --no-install-recommends ca-certificates curl git
+          for attempt in 1 2 3 4 5; do
+            if apt-get update -qq && apt-get install -y --no-install-recommends -o Acquire::Retries=3 --fix-missing ca-certificates curl git; then
+              exit 0
+            fi
+            echo "apt bootstrap attempt $attempt/5 failed (stale bullseye-security mirror/edge index vs pool) -- retrying" >&2
+            sleep $(( attempt * 5 ))
+          done
+          echo "::error::apt bootstrap failed after 5 attempts" >&2
+          exit 1
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
