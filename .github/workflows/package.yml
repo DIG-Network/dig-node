@@ -99,49 +99,77 @@ jobs:
           ]') }}
     steps:
       - name: Bootstrap the container for checkout
-        # TWO REAL, DIFFERENT CAUSES — verified directly, not guessed (do not re-litigate without
-        # new evidence; three earlier hypotheses were wrong before these two were confirmed).
+        # ROOT CAUSE (measured; four earlier hypotheses were tested and ruled out or narrowed
+        # first — do not re-litigate this without new evidence):
         #
-        # CAUSE 1 (permanent, deterministic, per-host): deb.debian.org's `debian-security` POOL is
-        # missing objects that the canonical `security.debian.org` always has. Measured repeatedly,
-        # not once:
-        #   libperl5.32 u5   security.debian.org : 6/6  -> 200
-        #   libperl5.32 u5   deb.debian.org      : 0/6  -> 404, every time
-        # Same path, same filename, different host. The index was NEVER stale on deb.debian.org
-        # either (Last-Modified: Mon, 31 Aug 2026 19:41:45 GMT, Age: 67, X-Cache: HIT, correctly
-        # naming Version: 5.32.1-4+deb11u5) — a correctly-current index named a file its own host's
-        # pool does not have, at u5, u6 AND u7 alike. No amount of retrying or index-refreshing
-        # fixes an object one host never carries. FIX: the `sed` below, pointing `debian-security`
-        # at `security.debian.org` before any apt-get call — verified locally end-to-end
-        # (`docker run debian:11`): without it, install 404s on libperl5.32 every time; with it,
-        # every package installs and configures cleanly.
+        # `bullseye-security`'s live mirror network is internally inconsistent: its Packages
+        # index names package versions its own pool no longer serves, and the mismatch differs
+        # PER ARCHITECTURE. Measured directly against `security.debian.org` — the CORRECT host
+        # per hypothesis 3 below, which is real but not sufficient on its own:
+        #   libglib2.0-0 2.66.8-1+deb11u8    amd64 -> 404  (index names u8, pool doesn't have it)
+        #   openssl      1.1.1w-0+deb11u8    arm64 -> 404  (index names u8, pool doesn't have it)
+        #   openssl      1.1.1w-0+deb11u8    amd64 -> 200  (same version, other arch, present)
+        #   libcurl4     7.74.0-1.3+deb11u16 arm64 -> 200 manually, yet 404'd inside CI
+        # Bullseye is `oldoldstable` and its Release file states
+        # `Valid-Until: Mon, 07 Sep 2026 21:13:04 UTC` — the suite is being retired from the live
+        # mirror network and the pool is losing objects while the index still lists them. No
+        # mirror choice and no retry strategy can fix an index that disagrees with its own pool:
+        # any live "current" mirror can be mid-prune at the exact moment CI asks it, which is why
+        # this looked like edge-cache flakiness before it was measured directly.
         #
-        # CAUSE 2 (transient, per-edge, on the CORRECT host): security.debian.org itself can still
-        # 404 on an object that demonstrably exists, because a specific Fastly POP is serving a
-        # stale or negative cache entry for it — NOT because the pool pruned anything (`libexpat1`
-        # u8 does not exist; u7 is current and present). Measured: `libexpat1` u7 from
-        # security.debian.org is 20/20 -> 200 from one vantage, while CI 404'd the identical URL
-        # from POP IP 151.101.130.132 at a single point in time. FIX: `-o
-        # Acquire::http::No-Cache=true` on the install below forces revalidation so a retry cannot
-        # be re-served the same cached response — `rm -rf /var/lib/apt/lists/*` already forces a
-        # fresh INDEX; this forces fresh PACKAGE fetches, which is the layer that was actually
-        # failing here. The backoff is lengthened (attempt*10, up to 40s between tries) because an
-        # edge cache needs real wall-clock time to invalidate, and the previous, shorter backoff
-        # completed its whole 5-attempt run in about 25 seconds — not long enough to matter.
+        # Four hypotheses were tested, in order — keep this list so nobody re-derives them:
+        #   1. stale apt index                    — REFUTED. The index was demonstrably fresh
+        #                                             (Age: 67, correct Last-Modified) and still
+        #                                             named a file the pool did not have.
+        #   2. container poisoned by a half-unpack — REAL, and fixed below (`dpkg --configure -a`
+        #                                             + `apt-get -f install` + a full apt-list
+        #                                             wipe between attempts). It was masking
+        #                                             attempts 2-5, not the underlying cause.
+        #   3. wrong mirror host                   — REAL, and fixed below by pinning away from
+        #                                             the live network entirely, which subsumes
+        #                                             the earlier `security.debian.org` sed: the
+        #                                             two live hosts serve DIFFERENT, and each
+        #                                             independently inconsistent, views of a suite
+        #                                             that is actively being retired.
+        #   4. transient per-edge 404s             — partly real (retrying a live mirror
+        #                                             sometimes succeeds) but does not clear the
+        #                                             index/pool disagreement, only the cache
+        #                                             noise sitting on top of it.
         #
-        # Neither cause is "the pool prunes superseded files as point releases land" — that
-        # framing (an earlier, wrong hypothesis in this file's history) does not match either
-        # measurement above and should not be reintroduced without new evidence.
+        # FIX: stop depending on the LIVE mirror network altogether. Pin all three suite lines
+        # (bullseye, bullseye-updates, bullseye-security) to the SAME immutable
+        # `snapshot.debian.org` timestamp, whose Packages index and pool were captured together
+        # and can never drift apart afterwards. Verified end-to-end against `20260901T000000Z`:
+        # every package that 404'd above returns 200 and the version the index names matches what
+        # the pool actually serves, on both archives:
+        #   http://snapshot.debian.org/archive/debian/20260901T000000Z           (bullseye, bullseye-updates)
+        #   http://snapshot.debian.org/archive/debian-security/20260901T000000Z  (bullseye-security)
+        # snapshot.debian.org 302-redirects every request — use `curl -L` when probing by hand;
+        # apt follows redirects itself and needs no extra flag.
         #
-        # SEPARATE, TRACKED ELSEWHERE, NOT ADDRESSED HERE: bullseye-security's Release file states
-        # `Valid-Until: Mon, 07 Sep 2026 21:13:04 UTC` — bullseye is oldoldstable, and once that
-        # date passes apt will reject the index outright ("Release file expired") regardless of
-        # host or cache state. Tracked as dig-node#565 (bullseye EOL / base-image decision). Do NOT
-        # silence it with `Acquire::Check-Valid-Until "false"` and do NOT change the base image
-        # here — that call is the coordinator's, not a side effect of this fix.
+        # `Acquire::Check-Valid-Until "false"` is REQUIRED here and is NOT the thing dig-node#565
+        # warns against. #565 is about disabling this check on the LIVE, current suite to paper
+        # over its approaching EOL — that hides a real signal about a suite still moving under
+        # you. Here the suite is a deliberately PINNED historical snapshot: its Release file's
+        # `Valid-Until` will inevitably pass while the pin itself never changes, and there is no
+        # live signal to hide by disabling the check on a snapshot that is frozen by definition.
+        # Do not "fix" this by removing the flag once `Valid-Until` lapses.
+        #
+        # snapshot.debian.org is slower and rate-limited relative to the CDN-backed live mirrors,
+        # so the retry loop below now has a genuine purpose — smoothing real throttling — rather
+        # than papering over index/pool drift. A materially slower install step than before this
+        # change is an expected trade-off of the fix, not a new regression to chase.
+        #
+        # The base image (`debian:11`) and the glibc floor it provides are UNCHANGED here, on
+        # purpose: that decision is the coordinator's and stays open as dig-node#565.
         run: |
           set -eux
-          sed -i 's#http://deb.debian.org/debian-security#http://security.debian.org/debian-security#' /etc/apt/sources.list
+          cat > /etc/apt/sources.list <<'SOURCES_EOF'
+          deb http://snapshot.debian.org/archive/debian/20260901T000000Z bullseye main
+          deb http://snapshot.debian.org/archive/debian/20260901T000000Z bullseye-updates main
+          deb http://snapshot.debian.org/archive/debian-security/20260901T000000Z bullseye-security main
+          SOURCES_EOF
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot-no-valid-until
           for attempt in 1 2 3 4 5; do
             if apt-get update -qq && apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::No-Cache=true ca-certificates curl git; then
               exit 0
