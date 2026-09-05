@@ -9623,6 +9623,17 @@ AGREE, never trusted individually. The node MUST NOT implement this rule itself:
 ecosystem's one home for it, so this node and every other consumer of reflexive-address agreement can
 never disagree about what "agree" means.
 
+**Unanimity is evaluated per family BEFORE routability, and a degenerate reading is NOT excluded from
+it** — this is `dig-stun`'s own documented order (its `SPEC.md` §7.3: unanimity is step 3, global
+unicast is step 5), not a choice this node makes. A loopback, private, or link-local reading from a
+source unrelated to the ones agreeing on a genuinely public address is treated as an ordinary
+dissenting IP, and discards the WHOLE family — the properly-agreed address included — exactly as a
+dissenting public address would. This is a real availability/griefing cost (one misbehaving or
+misconfigured source can indefinitely deny establishment for an otherwise-legitimate address in the
+same family) that the node accepts DELIBERATELY: weakening it to a majority vote would let an
+attacker who can cheaply add sources outvote the honest ones, which is not a security property.
+`mirror::advertise::PublicAddress::established`'s own doc comment carries the fuller reasoning.
+
 **`dig.getNetworkInfo`'s `reflexive_addr` field carries provenance, because agreement cannot be
 checked without it.** The node MUST publish `null` when no STUN tier has ever answered — never a
 fabricated, stale, or last-known value, since a visible `null` is harmless and a wrong address is

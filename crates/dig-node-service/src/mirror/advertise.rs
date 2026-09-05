@@ -222,10 +222,16 @@ const DERIVED_SCHEME: &str = "dig";
 /// well-formed; the same server answers an IPv6 caller correctly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reflexive {
-    /// An opaque label for whoever reported it — a relay endpoint, a public STUN server.
+    /// The independence CLASS of whoever reported it, ideally rendered by
+    /// `dig_stun::establish::SourceClass`'s `Display` impl (e.g. `relay:relay.dig.net`,
+    /// `public:stun.l.google.com`) — not merely which TIER answered, since two configured operator
+    /// servers or two public hosts share a tier but are different classes (dig-node#566).
     ///
-    /// Compared only for INEQUALITY, so this module never has to know what the labels mean. Two
-    /// readings corroborate each other exactly when their sources differ and their addresses match.
+    /// This module never validates the grammar: [`Self::established`] hands every string straight
+    /// to `dig_stun::establish`, which needs only INEQUALITY to count classes and treats an
+    /// unparseable string as "not a `peer:*` class" (a safe default, never a hard failure). A bare
+    /// tier label like `"relay"` still corroborates correctly against a different bare label, it
+    /// merely cannot ever render as a `peer:*` class for the escalated three-class floor.
     pub source: String,
     /// The address that source said this node appears at.
     pub addr: SocketAddr,
@@ -304,6 +310,27 @@ impl PublicAddress {
     /// range is: blocking `2600:1f00::/24` would paper over one instance of a general defect and
     /// would be wrong for every node legitimately running on EC2, which many will (`dig_stun`'s own
     /// rule, not re-derived here).
+    ///
+    /// # The availability trade this makes, recorded rather than left implicit
+    ///
+    /// A DEGENERATE reading — loopback, private, link-local, from a source unrelated to the ones
+    /// that agree on a genuinely public address — is NOT excluded before the unanimity check. It
+    /// counts as an ordinary dissenting IP, which per `dig-stun` `SPEC.md` §7.3 step 3 discards the
+    /// WHOLE family, the properly-agreed address included, not merely the degenerate one. This is
+    /// `dig-stun`'s own documented behaviour (confirmed by reading its SPEC, not an artifact of how
+    /// this crate feeds it): step 3 (unanimity) runs BEFORE step 5 (global-unicast scope), so a
+    /// reading is never given the benefit of "obviously broken, so it must not count as dissent" —
+    /// dig-stun's own words are "a node behind a multi-egress NAT, a misconfigured relay, and a
+    /// lying peer all look the same from here, and in every one of those cases advertising is
+    /// wrong." One misbehaving or misconfigured source (a bad relay, a bad operator-configured
+    /// entry, or — once the peer tier of `dig_ecosystem#3199` lands — a single dishonest peer) can
+    /// therefore indefinitely deny establishment for an otherwise-legitimate address in the same
+    /// family, with no requirement that ITS OWN reading be corroborated by anyone. This is the
+    /// correct, SAFE direction for a value staked on chain (§7.5: a wrong `Established` costs
+    /// collateral permanently; a wrong non-establishment costs one epoch's rewards and is visible in
+    /// `dign network-info`) — never weaken it to a majority vote to buy back availability, since a
+    /// majority over sources an attacker can cheaply add is not a security property. It is
+    /// nonetheless a real availability/griefing cost, and this paragraph is that decision recorded.
     pub fn established(&self) -> dig_stun::establish::Established {
         let readings: Vec<dig_stun::establish::Reading> = self
             .reflexive
