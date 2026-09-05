@@ -336,6 +336,19 @@ impl PublicAddress {
         .collect()
     }
 
+    /// Whether either address family reached agreement on a non-global-unicast address --
+    /// `dig_stun::establish::FamilyVerdict::NotGlobal` for IPv6 or IPv4. Distinct from
+    /// [`Self::established_addresses`] being empty: THAT is also true for a genuine disagreement or
+    /// too few classes, which [`effective_urls`] must report as [`AdvertiseState::Uncorroborated`]
+    /// rather than [`AdvertiseState::NoPublicAddress`] -- the two have different remedies, and only
+    /// this method tells them apart.
+    pub fn any_family_not_global(&self) -> bool {
+        use dig_stun::establish::FamilyVerdict;
+        let established = self.established();
+        matches!(established.ipv6, FamilyVerdict::NotGlobal { .. })
+            || matches!(established.ipv4, FamilyVerdict::NotGlobal { .. })
+    }
+
     /// Reads one pass's view out of `dig.getNetworkInfo`'s answer.
     ///
     /// The `reflexive_addr` key is accepted in three shapes, and anything that does not parse is
@@ -566,11 +579,19 @@ pub fn effective_urls(operator: &Advertised, address: &PublicAddress) -> Effecti
 
     let agreed = address.established_addresses();
     if agreed.is_empty() {
-        // WHICH kind of nothing. "No source has spoken" and "one source has spoken and nothing
-        // confirms it" are different conditions with different remedies, and the second is the one
-        // a node sits in while a broken STUN server answers it confidently.
+        // WHICH kind of nothing. Three conditions land here, with two different remedies:
+        //
+        // 1. Nothing has ever reported an address (`address.reflexive.is_empty()`).
+        // 2. Something reported an address that is not a public one at all -- a loopback, private,
+        //    or documentation reading `dig_stun::establish` classifies `NotGlobal` regardless of how
+        //    well the sources otherwise agreed. This is `NoPublicAddress` too, by that state's OWN
+        //    documented contract ("what was reported is not a public address"): a broken reading of
+        //    this node's position is not knowledge of where a stranger reaches it, agreement or not.
+        // 3. Sources genuinely disagree, or too few independent classes answered
+        //    (`address.reflexive` non-empty, no family `NotGlobal`) -- the one case that is missing
+        //    a SECOND source rather than a valid one, `Uncorroborated`.
         return Effective {
-            state: if address.reflexive.is_empty() {
+            state: if address.reflexive.is_empty() || address.any_family_not_global() {
                 AdvertiseState::NoPublicAddress
             } else {
                 AdvertiseState::Uncorroborated
@@ -1292,8 +1313,12 @@ mod tests {
     /// many others agree.
     #[test]
     fn a_dissenting_third_reading_blocks_establishment_even_though_two_others_agree() {
-        const AGREED: &str = "203.0.113.10:9444";
-        const DISSENT: &str = "203.0.113.99:9444";
+        // AGREED is genuinely global-unicast (PUBLIC_V4, the module's own convention) so the
+        // revert-proof for this test fails for the INTENDED reason (the retired rival wrongly
+        // ESTABLISHES the majority address) rather than being incidentally caught by the routability
+        // check first — a documentation-range AGREED would confound the two.
+        const AGREED: &str = PUBLIC_V4;
+        const DISSENT: &str = "1.1.1.1:9444";
         let majority_but_not_unanimous = PublicAddress {
             reflexive: vec![
                 seen("relay", AGREED),
@@ -1587,25 +1612,47 @@ mod tests {
         );
     }
 
-    /// A this-machine mapping is dropped while its genuinely public sibling survives.
+    /// A this-machine mapping is dropped while its genuinely public sibling, in the OTHER address
+    /// family, survives.
     ///
-    /// A reading is not a promise: a seam reporting a loopback or link-local mapping must be
-    /// refused exactly as an operator typing one is. The honest sibling in the same fixture is what
-    /// separates this from a blanket refusal of every derived address.
+    /// A reading is not a promise: a seam reporting a loopback mapping must be refused exactly as
+    /// an operator typing one is. The honest sibling in the same fixture is what separates this
+    /// from a blanket refusal of every derived address.
+    ///
+    /// # Why exactly ONE bad address, in the family PUBLIC_V4 is not in
+    ///
+    /// A prior version of this fixture put THREE bad IPv4 addresses beside `PUBLIC_V4` — all four
+    /// in the same family, all "agreed" by the same two source labels. Under
+    /// `dig_stun::establish` (dig-node#566) that is not "three bad readings the filter drops while
+    /// the good one survives" — it is four DISTINCT IPs reported for one family, which is
+    /// `FamilyVerdict::Disagreement` and refuses ALL FOUR, the good one included: a source that
+    /// reports several different addresses for what it claims is the same query is treated as
+    /// evidence something is wrong, not as several independent claims to filter individually. That
+    /// is the correct, intended behaviour — the old fixture tested a shape that can no longer occur
+    /// bug-free. One bad address, alone in its family, still proves a this-machine reading is
+    /// refused even with full agreement; it is just `established`'s own routability gate that
+    /// catches it now; not `derived_urls`'s.
+    ///
+    /// # Why `fe80::1` (link-local) rather than `::1` (loopback)
+    ///
+    /// `::1` is the IPv4-COMPATIBLE encoding of `0.0.0.1` (`Ipv6Addr::to_ipv4`), and `dig_stun`
+    /// folds it there BEFORE bucketing by family (`SPEC.md` §5.3) precisely so an on-path STUN
+    /// server cannot smuggle a rejected IPv4 range past a v6-only classifier. Using `::1` here would
+    /// silently land it in PUBLIC_V4's OWN family and manufacture the exact disagreement this
+    /// fixture exists to avoid. `fe80::1` has non-zero upper bits, does not fold, and stays
+    /// genuinely IPv6 — still refused (link-local is `Scope::NeverDialable`), still isolated in its
+    /// own family.
     #[test]
     fn a_this_machine_reflexive_address_is_never_derived_into_a_coin() {
-        let mut readings = Vec::new();
-        for bad in ["127.0.0.1:9444", "[::1]:9444", "169.254.10.4:9444"] {
-            readings.push(seen("relay", bad));
-            readings.push(seen("stun.example", bad));
-        }
-        readings.push(seen("relay", PUBLIC_V4));
-        readings.push(seen("stun.example", PUBLIC_V4));
-
         let got = effective_urls(
             &Advertised::default(),
             &PublicAddress {
-                reflexive: readings,
+                reflexive: vec![
+                    seen("relay", "[fe80::1]:9444"),
+                    seen("stun.example", "[fe80::1]:9444"),
+                    seen("relay", PUBLIC_V4),
+                    seen("stun.example", PUBLIC_V4),
+                ],
                 relay_reserved: true,
                 direct_mapping: false,
             },

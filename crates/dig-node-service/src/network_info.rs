@@ -255,14 +255,18 @@ mod tests {
     /// permanently bad news.
     #[test]
     fn two_agreeing_classes_render_as_established() {
+        // Genuinely global-unicast, unlike the other two fixtures above: THIS is the one path that
+        // reaches `dig_stun::establish`'s routability check (unanimity and class-count are checked
+        // first and are satisfied here), so a documentation-range address would be refused as
+        // `NotGlobal` instead of rendering ESTABLISHED — testing the wrong branch entirely.
         let s = format_network_info(&json!({
             "peer_id": "aa77",
             "reflexive_addr": [
-                { "source": "relay:relay.example", "addr": "203.0.113.7:9444" },
-                { "source": "public:stun.example", "addr": "203.0.113.7:9444" },
+                { "source": "relay:relay.example", "addr": "93.184.216.34:9444" },
+                { "source": "public:stun.example", "addr": "93.184.216.34:9444" },
             ],
         }));
-        assert!(s.contains("ESTABLISHED at 203.0.113.7"), "{s}");
+        assert!(s.contains("ESTABLISHED at 93.184.216.34"), "{s}");
         assert!(s.contains("2 independent classes agree"), "{s}");
     }
 }
