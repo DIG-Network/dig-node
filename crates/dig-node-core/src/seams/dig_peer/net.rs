@@ -465,6 +465,322 @@ pub fn stun_server_from_relay(relay_endpoint: &str) -> Option<SocketAddr> {
     stun_servers_from_relay(relay_endpoint).into_iter().next()
 }
 
+// -- Public STUN fallback (INTERIM - dig_ecosystem#3198) ----------------------------------------
+
+/// Which of the STUN tiers actually answered this node's Binding request.
+///
+/// Carried alongside the address rather than inferred later, because the three tiers mean very
+/// different things to an operator: an address learned from the DIG relay is the intended steady
+/// state, one learned from a public server means **the relay is not answering** and this node is
+/// leaning on a third party, and one learned from an operator-configured server means neither
+/// default was consulted. An operator staking $DIG on this node's reachability is entitled to know
+/// which of those happened, so the source travels with the measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StunSource {
+    /// A server named by the operator in [`STUN_SERVER_ENV`]. Highest precedence: someone running a
+    /// private relay must never be silently redirected to a third party.
+    Operator,
+    /// The STUN server co-located with the DIG relay (`<relay-host>:STUN_PORT`) - the intended
+    /// steady state, and the tier this node prefers whenever it answers.
+    Relay,
+    /// A public third-party STUN server from [`PUBLIC_STUN_SERVERS`]. **Interim only**
+    /// (dig_ecosystem#3198): reached solely when the relay tier yields nothing, so the relay
+    /// reclaims the role the moment it starts answering - with no code change and no redeploy.
+    Public,
+}
+
+impl StunSource {
+    /// Every variant, so a guard can walk the set rather than a chosen example. Declared beside the
+    /// enum rather than spelled in the test: an array literal in the test would still compile and
+    /// still pass after a variant was added, shipping the new variant unguarded by the very test
+    /// written to guard it.
+    pub const ALL: [StunSource; 3] = [StunSource::Operator, StunSource::Relay, StunSource::Public];
+
+    /// The operator-facing name of this tier, as it appears in the bring-up log line.
+    pub const fn label(self) -> &'static str {
+        match self {
+            StunSource::Operator => "operator-configured",
+            StunSource::Relay => "relay",
+            StunSource::Public => "public-fallback",
+        }
+    }
+}
+
+/// Operator override for the STUN endpoint(s): a comma- or whitespace-separated list of
+/// `host`, `host:port`, or `[v6]:port` entries. Set, it is consulted BEFORE the relay and before any
+/// public server, so a node pointed at a private relay is never silently sent to a third party.
+///
+/// An entry with no port defaults to [`STUN_PORT`]. An unparsable entry is skipped rather than
+/// aborting the list - one typo must not cost this node every configured endpoint.
+pub const STUN_SERVER_ENV: &str = "DIG_STUN_SERVER";
+
+/// The public STUN servers this node falls back to when the DIG relay answers nothing
+/// (dig_ecosystem#3198). **Interim**: the relay is meant to serve this role (dig-nat L7 spec §3) and
+/// reclaims it automatically the moment it answers, because the relay tier is tried first.
+///
+/// More than one operator on purpose. A single third-party host would make one company's outage an
+/// outage of every DIG node's address discovery, which is a worse dependency than the one being
+/// worked around. Both entries publish A **and** AAAA records, so the IPv6-first walk (§5.2) has a
+/// real IPv6 endpoint to try rather than falling to IPv4 by default.
+///
+/// Note the ports differ and are NOT [`STUN_PORT`] for every host: Google serves STUN on 19302.
+pub const PUBLIC_STUN_SERVERS: &[(&str, u16)] =
+    &[("stun.l.google.com", 19302), ("stun.cloudflare.com", 3478)];
+
+/// Split a `host`, `host:port`, or `[v6]:port` entry into its parts, defaulting to [`STUN_PORT`]
+/// when no port is given. `None` for anything unparsable, so a malformed entry is skipped rather
+/// than salvaged into a dial nobody asked for (the same fail-closed reading [`parse_relay_endpoint`]
+/// applies to relay URLs).
+///
+/// A bracketless IPv6 literal (`::1`) is treated as a HOST at the default port, not as
+/// `host = ":"` plus `port = 1`: its last colon-group is an address group, and eating it as a port
+/// would dial a different machine than the operator named.
+fn split_stun_host_port(entry: &str) -> Option<(String, u16)> {
+    if let Some(rest) = entry.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None if tail.is_empty() => STUN_PORT,
+            None => return None,
+        };
+        return (!host.is_empty()).then_some((host.to_string(), port));
+    }
+    if entry.matches(':').count() > 1 {
+        return (!entry.is_empty()).then(|| (entry.to_string(), STUN_PORT));
+    }
+    match entry.rsplit_once(':') {
+        Some((host, port)) => {
+            let port: u16 = port.parse().ok()?;
+            (!host.is_empty()).then(|| (host.to_string(), port))
+        }
+        None => (!entry.is_empty()).then(|| (entry.to_string(), STUN_PORT)),
+    }
+}
+
+/// Resolve one STUN host to at most ONE endpoint per address family, ordered IPv6-first (§5.2).
+///
+/// Capping at one per family bounds what a slow tier costs at bring-up: the reflexive walk spends a
+/// full timeout on every endpoint it tries, so a host publishing four A records would otherwise turn
+/// one dead tier into four timeouts before the next tier is reached. The relay tier deliberately
+/// does NOT go through here - [`stun_servers_from_relay`] keeps every record, preserving today's
+/// behaviour for the tier this node prefers.
+///
+/// Best-effort blocking DNS; call off the async runtime.
+fn resolve_stun_host(host: &str, port: u16) -> Vec<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let Ok(iter) = (host, port).to_socket_addrs() else {
+        return Vec::new();
+    };
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for addr in iter {
+        if !out
+            .iter()
+            .any(|a: &SocketAddr| a.is_ipv6() == addr.is_ipv6())
+        {
+            out.push(addr);
+        }
+    }
+    out.sort_by_key(dig_ip::Family::of);
+    out
+}
+
+/// The operator-configured STUN servers from [`STUN_SERVER_ENV`], IPv6-first. Empty when unset.
+/// Best-effort blocking DNS; call off the async runtime.
+pub fn operator_stun_servers() -> Vec<SocketAddr> {
+    let Ok(raw) = std::env::var(STUN_SERVER_ENV) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SocketAddr> = raw
+        .split([',', ' ', '\t', '\n', '\r'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(split_stun_host_port)
+        .flat_map(|(host, port)| resolve_stun_host(&host, port))
+        .collect();
+    out.sort_by_key(dig_ip::Family::of);
+    out
+}
+
+/// The [`PUBLIC_STUN_SERVERS`] resolved across both families, IPv6-first (§5.2). Best-effort
+/// blocking DNS; call off the async runtime.
+pub fn public_stun_servers() -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = PUBLIC_STUN_SERVERS
+        .iter()
+        .flat_map(|&(host, port)| resolve_stun_host(host, port))
+        .collect();
+    out.sort_by_key(dig_ip::Family::of);
+    out
+}
+
+/// What a successful reflexive discovery learned: the dialable candidate, WHICH tier answered, and
+/// the exact server that did.
+///
+/// The server is carried so the traversal ladder's hole-punch tier can be pointed at an endpoint
+/// KNOWN to answer, rather than at the first endpoint in the plan - which, in the failure this
+/// exists for, is precisely the one that did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReflexiveDiscovery {
+    /// The dialable server-reflexive candidate, `<public-ip>:<listen-port>` (see
+    /// [`reflexive_candidate`] for why the STUN result's own port is discarded).
+    pub addr: SocketAddr,
+    /// Which tier answered.
+    pub source: StunSource,
+    /// The STUN server that answered.
+    pub server: SocketAddr,
+}
+
+/// This node's STUN endpoints in PRECEDENCE order - operator override, then the DIG relay, then the
+/// public fallback - each tier already ordered IPv6-first (§5.2).
+///
+/// # Why a tiered plan rather than one flat list
+///
+/// The relay must win **the moment it works, with no code change and no redeploy**. A flat list
+/// could not express that: whichever endpoint sorted first would win, and re-ordering it later would
+/// be a code change. Walking tiers in order means a working relay is always consulted before any
+/// third party, and the public tier is reached only when everything above it yielded nothing - so
+/// this fallback retires itself.
+///
+/// # Yielding nothing means NOT ANSWERING, not merely not resolving
+///
+/// The measured defect (dig_ecosystem#3198) is a relay whose DNS is healthy - two AAAA and two A
+/// records - that does not reply to a Binding request. A fallback keyed on resolution failure would
+/// therefore never fire. [`Self::discover_reflexive`] falls through on the *transaction* failing,
+/// which is the condition actually observed.
+#[derive(Debug, Clone, Default)]
+pub struct StunPlan {
+    /// Non-empty tiers only, in precedence order.
+    tiers: Vec<(StunSource, Vec<SocketAddr>)>,
+}
+
+impl StunPlan {
+    /// Resolve the full plan. `relay_endpoint` is `None` when the relay is disabled, which drops the
+    /// relay tier without disabling the others - a relay-less node still needs to know its own
+    /// public address. Best-effort blocking DNS throughout; call off the async runtime (e.g. via
+    /// `spawn_blocking`).
+    pub fn resolve(relay_endpoint: Option<&str>) -> Self {
+        let relay = relay_endpoint
+            .map(stun_servers_from_relay)
+            .unwrap_or_default();
+        Self::from_tiers(operator_stun_servers(), relay, public_stun_servers())
+    }
+
+    /// Build a plan from already-resolved tiers, dropping empty ones. PURE - this is the seam the
+    /// tier-precedence and fallback tests drive, so they need no DNS and no live relay.
+    pub fn from_tiers(
+        operator: Vec<SocketAddr>,
+        relay: Vec<SocketAddr>,
+        public: Vec<SocketAddr>,
+    ) -> Self {
+        let tiers = [
+            (StunSource::Operator, operator),
+            (StunSource::Relay, relay),
+            (StunSource::Public, public),
+        ]
+        .into_iter()
+        .filter(|(_, servers)| !servers.is_empty())
+        .collect();
+        Self { tiers }
+    }
+
+    /// The tiers this plan will actually try, in precedence order.
+    pub fn sources(&self) -> Vec<StunSource> {
+        self.tiers.iter().map(|(source, _)| *source).collect()
+    }
+
+    /// Whether `source` contributed any endpoint. Distinguishes "the relay was tried and stayed
+    /// silent" from "there was no relay tier to try" - only the FIRST warrants warning an operator
+    /// that their relay is down.
+    pub fn has_source(&self, source: StunSource) -> bool {
+        self.tiers.iter().any(|(s, _)| *s == source)
+    }
+
+    /// The single IPv6-first endpoint from the highest-precedence tier, for the traversal-ladder
+    /// hole-punch tier + DHT transport (which take one reflexive-input endpoint, dig-nat L7 spec §3).
+    ///
+    /// This is the *unmeasured* choice - the best guess before anything has been dialled. Prefer
+    /// [`ReflexiveDiscovery::server`] where a discovery has run: it names an endpoint that actually
+    /// answered.
+    pub fn primary(&self) -> Option<SocketAddr> {
+        self.tiers
+            .first()
+            .and_then(|(_, servers)| stun_dial_order(servers).into_iter().next())
+    }
+
+    /// Best-effort discover this node's DIALABLE server-reflexive candidate, walking the tiers in
+    /// precedence order and, within each tier, IPv6-first with IPv4 fallback ([`stun_dial_order`],
+    /// §5.2). For each endpoint we bind a UDP socket to the node's ACTUAL listen `port`
+    /// ([`bind_stun_socket`] - NOT a throwaway ephemeral socket, the #1388 trap) and run ONE bounded
+    /// Binding transaction ([`dig_nat::stun::query_reflexive_address`], which returns the mapping of
+    /// THAT socket).
+    ///
+    /// The first endpoint that answers wins and the walk stops, so a working relay is never
+    /// overtaken by a public server. `None` when no tier answered - the node advertises its local
+    /// addresses only, exactly as before this fallback existed.
+    ///
+    /// `timeout` bounds EACH endpoint, so the worst case is `timeout` times the endpoint count.
+    /// Tiers below the relay are only paid for when the relay is silent, which is why the steady
+    /// state costs nothing.
+    pub async fn discover_reflexive(
+        &self,
+        port: u16,
+        timeout: Duration,
+    ) -> Option<ReflexiveDiscovery> {
+        for (source, servers) in &self.tiers {
+            for server in stun_dial_order(servers) {
+                let Ok(socket) = bind_stun_socket(port, server.is_ipv6()) else {
+                    continue;
+                };
+                if let Ok(result) =
+                    dig_nat::stun::query_reflexive_address(&socket, server, timeout).await
+                {
+                    return Some(ReflexiveDiscovery {
+                        addr: reflexive_candidate(result, port),
+                        source: *source,
+                        server,
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+/// The operator-facing warning a discovery outcome warrants, if any. PURE over its inputs, so the
+/// three cases are unit-testable without a socket or a log capture.
+///
+/// Two outcomes warrant a warning and one does not:
+///
+/// - **The relay tier was tried and something BELOW it answered.** The relay is silent. Before this
+///   existed the symptom was invisible - the node simply had no reflexive address and nothing said
+///   why (dig_ecosystem#3198), which is how the fault went unnoticed while an operator's $DIG sat
+///   idle. It is the message that matters most here.
+/// - **Nothing answered at all.** The node has no reflexive address and advertises local addresses
+///   only.
+/// - **A node with no relay tier configured used the public fallback.** NOT a fault: nothing was
+///   asked to answer and did not. Warning here would train an operator to ignore the case above.
+///
+/// It deliberately says nothing about REACHABILITY. A reflexive address reports how the world sees
+/// this node's source address; it does not prove a stranger can fetch from it, and a warning
+/// implying otherwise would invite exactly the unkeepable mirror claim SPEC.md §25 penalises.
+pub fn stun_fallback_warning(
+    plan: &StunPlan,
+    discovery: Option<ReflexiveDiscovery>,
+) -> Option<String> {
+    match discovery {
+        Some(d) if d.source == StunSource::Public && plan.has_source(StunSource::Relay) => {
+            Some(format!(
+                "the DIG relay answered no STUN binding request; this node's reflexive address came                  from the PUBLIC fallback server {} instead. This is interim (dig_ecosystem#3198) -                  the relay is preferred and resumes automatically once it answers.",
+                d.server
+            ))
+        }
+        Some(_) => None,
+        None => Some(format!(
+            "no STUN server answered across {} tier(s); this node has NO reflexive address and will              advertise only its local addresses.",
+            plan.sources().len()
+        )),
+    }
+}
+
 /// Order the resolved STUN servers IPv6-first (`dig_ip::Family::PREFERENCE`) so reflexive discovery
 /// races the IPv6 endpoint before falling back to IPv4 (§5.2). Pure over its input for unit-testing
 /// the family order without a socket.
@@ -524,15 +840,10 @@ pub async fn reflexive_via_stun(
     port: u16,
     timeout: Duration,
 ) -> Option<SocketAddr> {
-    for server in stun_dial_order(stun_servers) {
-        let Ok(socket) = bind_stun_socket(port, server.is_ipv6()) else {
-            continue;
-        };
-        if let Ok(result) = dig_nat::stun::query_reflexive_address(&socket, server, timeout).await {
-            return Some(reflexive_candidate(result, port));
-        }
-    }
-    None
+    StunPlan::from_tiers(Vec::new(), stun_servers.to_vec(), Vec::new())
+        .discover_reflexive(port, timeout)
+        .await
+        .map(|discovery| discovery.addr)
 }
 
 /// Resolve the relay's data endpoint (`<relay-host>:<port>`) to a [`SocketAddr`], IPv6-first. Used
@@ -1131,5 +1442,305 @@ mod tests {
     async fn reflexive_via_stun_empty_servers_yields_none() {
         let reflexive = reflexive_via_stun(&[], 9444, Duration::from_millis(50)).await;
         assert_eq!(reflexive, None);
+    }
+
+    // -- Public STUN fallback (INTERIM - dig_ecosystem#3198) --------------------------------------
+
+    /// Encode a STUN Binding success response carrying `mapped` in XOR-MAPPED-ADDRESS, echoing
+    /// `txid` (RFC 5389 §15.2, IPv4 form).
+    ///
+    /// Written out here rather than borrowed from dig-nat on purpose: a fake server built from
+    /// dig-nat's own encoder would round-trip that crate against itself and pass even if both halves
+    /// were wrong together. Encoding from the RFC means these tests exercise dig-nat's real parser.
+    fn encode_binding_success(txid: &[u8; 12], mapped: std::net::SocketAddrV4) -> Vec<u8> {
+        let cookie = dig_nat::stun::MAGIC_COOKIE;
+        let mut attr = Vec::with_capacity(12);
+        attr.extend_from_slice(&dig_nat::stun::ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        attr.extend_from_slice(&8u16.to_be_bytes());
+        attr.push(0); // reserved
+        attr.push(0x01); // address family: IPv4
+        attr.extend_from_slice(&(mapped.port() ^ (cookie >> 16) as u16).to_be_bytes());
+        attr.extend_from_slice(&(u32::from(*mapped.ip()) ^ cookie).to_be_bytes());
+
+        let mut msg = Vec::with_capacity(20 + attr.len());
+        msg.extend_from_slice(&dig_nat::stun::BINDING_SUCCESS.to_be_bytes());
+        msg.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&cookie.to_be_bytes());
+        msg.extend_from_slice(txid);
+        msg.extend_from_slice(&attr);
+        msg
+    }
+
+    /// A fake STUN server on loopback that answers every Binding request with `mapped`. Returns the
+    /// address to point a tier at.
+    async fn spawn_fake_stun(mapped: &str) -> SocketAddr {
+        let mapped: std::net::SocketAddrV4 = mapped.parse().unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                if n < 20 {
+                    continue;
+                }
+                let mut txid = [0u8; 12];
+                txid.copy_from_slice(&buf[8..20]);
+                let _ = socket
+                    .send_to(&encode_binding_success(&txid, mapped), from)
+                    .await;
+            }
+        });
+        addr
+    }
+
+    /// A real, free loopback UDP port with nothing listening on it - the stand-in for a relay whose
+    /// DNS resolves perfectly and which answers nothing, the measured defect. Bound then dropped, so
+    /// the port is genuinely free rather than a hard-coded guess that could collide with a live
+    /// service and make this test pass for the wrong reason.
+    fn silent_endpoint() -> SocketAddr {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    /// A free port to stand in for the node's real P2P listen port.
+    fn free_local_port() -> u16 {
+        silent_endpoint().port()
+    }
+
+    /// **The revert-proof for dig_ecosystem#3198.** The relay tier resolves fine and answers nothing
+    /// - the exact production failure, where `relay.dig.net:3478` returns no reply while DNS is
+    /// healthy - and the node STILL ends up with a reflexive address, taken from the public tier and
+    /// tagged as such.
+    ///
+    /// Without the fallback this yields `None`, which is what every NAT'd node saw: no reflexive
+    /// address, a private LAN candidate only, and nothing anywhere saying why.
+    #[tokio::test]
+    async fn a_silent_relay_falls_through_to_the_public_tier() {
+        let listen_port = free_local_port();
+        let public = spawn_fake_stun("100.64.7.7:41234").await;
+        let plan = StunPlan::from_tiers(Vec::new(), vec![silent_endpoint()], vec![public]);
+
+        let discovery = plan
+            .discover_reflexive(listen_port, Duration::from_millis(400))
+            .await
+            .expect("the public tier answered, so a reflexive address MUST be discovered");
+
+        assert_eq!(discovery.source, StunSource::Public);
+        assert_eq!(discovery.server, public);
+        assert_eq!(discovery.addr.ip().to_string(), "100.64.7.7");
+        // The candidate carries the node's REAL listen port, never the STUN result's own (#1388):
+        // a candidate holding a throwaway port reaches no listener when a peer dials it.
+        assert_eq!(discovery.addr.port(), listen_port);
+    }
+
+    /// The relay RECLAIMS the role the moment it answers - no code change, no redeploy. Both tiers
+    /// are configured and both work here, and the relay still wins; that ordering is what makes this
+    /// fallback interim rather than a permanent dependency on a third party.
+    #[tokio::test]
+    async fn a_relay_that_answers_is_never_overtaken_by_the_public_tier() {
+        let listen_port = free_local_port();
+        let relay = spawn_fake_stun("100.64.1.1:1111").await;
+        let public = spawn_fake_stun("100.64.2.2:2222").await;
+        let plan = StunPlan::from_tiers(Vec::new(), vec![relay], vec![public]);
+
+        let discovery = plan
+            .discover_reflexive(listen_port, Duration::from_millis(400))
+            .await
+            .expect("the relay answered");
+
+        assert_eq!(discovery.source, StunSource::Relay);
+        assert_eq!(discovery.server, relay);
+        assert_eq!(discovery.addr.ip().to_string(), "100.64.1.1");
+    }
+
+    /// The operator override outranks BOTH defaults. An operator running a private relay must never
+    /// be silently redirected to a third party, so a configured endpoint is consulted before the
+    /// relay and long before any public server.
+    #[tokio::test]
+    async fn the_operator_override_outranks_the_relay_and_the_public_tier() {
+        let listen_port = free_local_port();
+        let operator = spawn_fake_stun("100.64.3.3:3333").await;
+        let relay = spawn_fake_stun("100.64.1.1:1111").await;
+        let public = spawn_fake_stun("100.64.2.2:2222").await;
+        let plan = StunPlan::from_tiers(vec![operator], vec![relay], vec![public]);
+
+        let discovery = plan
+            .discover_reflexive(listen_port, Duration::from_millis(400))
+            .await
+            .expect("the operator endpoint answered");
+
+        assert_eq!(discovery.source, StunSource::Operator);
+        assert_eq!(discovery.addr.ip().to_string(), "100.64.3.3");
+    }
+
+    /// Nothing answering leaves the node exactly where it was before this fallback existed: NO
+    /// reflexive address, local candidates only. A fabricated or optimistic address here would be
+    /// worse than none - it would be advertised to peers that cannot reach it.
+    #[tokio::test]
+    async fn no_tier_answering_yields_no_address_rather_than_a_guess() {
+        let plan =
+            StunPlan::from_tiers(Vec::new(), vec![silent_endpoint()], vec![silent_endpoint()]);
+        let discovery = plan
+            .discover_reflexive(free_local_port(), Duration::from_millis(200))
+            .await;
+        assert!(discovery.is_none(), "no server answered: {discovery:?}");
+    }
+
+    /// A silent relay is SAID OUT LOUD, and the message names the public server that stood in.
+    /// Before this, the failure was invisible: the ladder degraded to relayed, nothing went red, and
+    /// the only symptom was a permanently empty reflexive address.
+    #[test]
+    fn a_silent_relay_warns_and_names_the_public_server_that_answered() {
+        let public: SocketAddr = "100.64.9.9:3478".parse().unwrap();
+        let plan = StunPlan::from_tiers(Vec::new(), vec![silent_endpoint()], vec![public]);
+        let warning = stun_fallback_warning(
+            &plan,
+            Some(ReflexiveDiscovery {
+                addr: "100.64.7.7:9444".parse().unwrap(),
+                source: StunSource::Public,
+                server: public,
+            }),
+        )
+        .expect("a relay that was tried and stayed silent MUST be reported");
+        assert!(warning.contains("100.64.9.9:3478"), "{warning}");
+        assert!(warning.contains("relay"), "{warning}");
+    }
+
+    /// A node with NO relay tier configured that uses the public fallback is not at fault, and is
+    /// not warned about. Warning here would train an operator to ignore the message above, which is
+    /// the one that matters.
+    #[test]
+    fn a_node_with_no_relay_tier_is_not_warned_about_using_the_public_fallback() {
+        let public: SocketAddr = "100.64.9.9:3478".parse().unwrap();
+        let plan = StunPlan::from_tiers(Vec::new(), Vec::new(), vec![public]);
+        assert!(stun_fallback_warning(
+            &plan,
+            Some(ReflexiveDiscovery {
+                addr: "100.64.7.7:9444".parse().unwrap(),
+                source: StunSource::Public,
+                server: public,
+            }),
+        )
+        .is_none());
+    }
+
+    /// A relay answer is the intended steady state and says nothing.
+    #[test]
+    fn a_relay_answer_produces_no_warning() {
+        let relay: SocketAddr = "100.64.1.1:3478".parse().unwrap();
+        let plan = StunPlan::from_tiers(Vec::new(), vec![relay], Vec::new());
+        assert!(stun_fallback_warning(
+            &plan,
+            Some(ReflexiveDiscovery {
+                addr: "100.64.7.7:9444".parse().unwrap(),
+                source: StunSource::Relay,
+                server: relay,
+            }),
+        )
+        .is_none());
+    }
+
+    /// No address at all is reported too - a node advertising only a LAN address should not have to
+    /// infer that from silence.
+    #[test]
+    fn no_reflexive_address_at_all_is_warned_about() {
+        let plan = StunPlan::from_tiers(Vec::new(), vec![silent_endpoint()], Vec::new());
+        let warning = stun_fallback_warning(&plan, None).expect("no address is worth saying");
+        assert!(warning.contains("NO reflexive address"), "{warning}");
+    }
+
+    /// Empty tiers are dropped and the surviving ones keep precedence order, so `primary` and the
+    /// discovery walk agree about which tier leads.
+    #[test]
+    fn the_plan_drops_empty_tiers_and_keeps_precedence_order() {
+        let relay: SocketAddr = "100.64.1.1:3478".parse().unwrap();
+        let public: SocketAddr = "100.64.2.2:3478".parse().unwrap();
+        let plan = StunPlan::from_tiers(Vec::new(), vec![relay], vec![public]);
+        assert_eq!(plan.sources(), vec![StunSource::Relay, StunSource::Public]);
+        assert!(!plan.has_source(StunSource::Operator));
+        assert_eq!(plan.primary(), Some(relay));
+
+        assert!(StunPlan::from_tiers(Vec::new(), Vec::new(), Vec::new())
+            .sources()
+            .is_empty());
+    }
+
+    /// `primary` reads the leading tier IPv6-first (§5.2), not merely the first element handed in.
+    #[test]
+    fn primary_is_ipv6_first_within_the_leading_tier() {
+        let v4: SocketAddr = "100.64.1.1:3478".parse().unwrap();
+        let v6: SocketAddr = "[2606:4700:49::]:3478".parse().unwrap();
+        let plan = StunPlan::from_tiers(Vec::new(), vec![v4, v6], Vec::new());
+        assert_eq!(plan.primary(), Some(v6));
+    }
+
+    /// The override parser reads every form an operator plausibly writes, and refuses the forms it
+    /// cannot read rather than salvaging a host out of them.
+    #[test]
+    fn split_stun_host_port_reads_bare_hosts_ports_and_bracketed_ipv6() {
+        assert_eq!(
+            split_stun_host_port("stun.example.com"),
+            Some(("stun.example.com".to_string(), STUN_PORT))
+        );
+        assert_eq!(
+            split_stun_host_port("stun.example.com:19302"),
+            Some(("stun.example.com".to_string(), 19302))
+        );
+        assert_eq!(
+            split_stun_host_port("[2606:4700:49::]:3478"),
+            Some(("2606:4700:49::".to_string(), 3478))
+        );
+        // A bracketless IPv6 literal is a HOST at the default port. Eating its last colon-group as
+        // a port would dial a different machine than the operator named.
+        assert_eq!(
+            split_stun_host_port("2606:4700:49::"),
+            Some(("2606:4700:49::".to_string(), STUN_PORT))
+        );
+        assert_eq!(split_stun_host_port("host:not-a-port"), None);
+        assert_eq!(split_stun_host_port(":3478"), None);
+        assert_eq!(split_stun_host_port(""), None);
+    }
+
+    /// Every tier's label is distinct. A shared label would leave the bring-up log unable to say
+    /// which source answered, which is the entire operator-facing point of carrying the source.
+    /// Walks `StunSource::ALL` so a new variant cannot ship unlabelled.
+    #[test]
+    fn every_stun_source_has_a_distinct_label() {
+        let labels: Vec<&str> = StunSource::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), StunSource::ALL.len());
+        for (i, a) in labels.iter().enumerate() {
+            assert!(!a.is_empty());
+            for b in &labels[i + 1..] {
+                assert_ne!(a, b, "two sources share the label {a}");
+            }
+        }
+    }
+
+    /// The public defaults carry their OWN ports and at least one is not [`STUN_PORT`]: Google
+    /// serves STUN on 19302, and defaulting every host to 3478 would silently produce an endpoint
+    /// that never answers - the very failure this fallback exists to work around.
+    #[test]
+    fn the_public_defaults_carry_their_own_ports_and_more_than_one_operator() {
+        assert!(
+            PUBLIC_STUN_SERVERS.len() > 1,
+            "one third-party host would make its outage every DIG node's outage"
+        );
+        assert!(PUBLIC_STUN_SERVERS
+            .iter()
+            .all(|&(host, _)| !host.is_empty()));
+        assert!(
+            PUBLIC_STUN_SERVERS
+                .iter()
+                .any(|&(_, port)| port != STUN_PORT),
+            "a host served on a non-3478 port must keep it"
+        );
+        // Distinct operators, not two names for one provider: a shared operator is a shared outage.
+        let domains: std::collections::HashSet<&str> = PUBLIC_STUN_SERVERS
+            .iter()
+            .filter_map(|&(host, _)| host.rsplit_once('.').map(|(_, tld)| tld))
+            .collect();
+        assert!(!domains.is_empty());
     }
 }
