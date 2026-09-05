@@ -2891,6 +2891,20 @@ fn spawn_mirror_passes(
                     "{}",
                     advertised.state.reason()
                 );
+                // WHY a derived address was refused, which the state alone cannot say. Without it
+                // an operator whose node keeps deriving an unusable address is told only that it
+                // has no public address, and never that one WAS reported.
+                //
+                // On the state change, not every pass: a node stuck deriving a private address
+                // would otherwise repeat the same sentence on the round timer for ever.
+                for (entry, why) in &advertised.rejected {
+                    tracing::warn!(
+                        target: "mirror",
+                        entry = %entry,
+                        "{}",
+                        crate::mirror::advertise::derived_rejection_line(why)
+                    );
+                }
                 last_advertise_state = Some(advertised.state);
             }
 

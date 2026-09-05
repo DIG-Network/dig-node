@@ -40,7 +40,7 @@ use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use chia_sha2::Sha256;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_node_service::mirror::advertise::{
-    effective_urls_from_env, AdvertiseState, PublicAddress, ADVERTISE_URLS_ENV,
+    effective_urls_from_env, AdvertiseState, PublicAddress, Reflexive, ADVERTISE_URLS_ENV,
 };
 use dig_node_service::mirror::lifecycle::{mirror_agg_sig_data, NodeMirrorEffects};
 use dig_node_service::mirror::plan::Bond;
@@ -223,6 +223,12 @@ fn bond(store: u8, root: u8) -> Bond {
     Bond::new(hex::encode([store; 32]), hex::encode([root; 32]))
 }
 
+/// The global-unicast address this node's two STUN sources agree on.
+///
+/// NOT `198.51.100.x`: that is RFC 5737 documentation space, which the derived path refuses, so
+/// the obvious test address would make every fixture here pass for the wrong reason.
+const DERIVED_ADDR: &str = "93.184.216.34:9444";
+
 /// This node's own peer id, as every fixture here writes it.
 ///
 /// `repeat` rather than a 64-character literal so the length is right by construction instead of by
@@ -238,9 +244,16 @@ fn own_peer_id() -> String {
 /// `null` (`dig_ecosystem#3198` is adding the producer), so no real host can supply one yet. The
 /// composition under test is the plumbing between the address and the coin, which is exactly what a
 /// supplied address exercises.
+/// TWO sources, because one is never enough: `relay.dig.net` answers STUN with its own load
+/// balancer's address (`relay.dig.net#11`), well-formed every time, and dig-node prefers the
+/// relay tier — so a single-source fixture would model the one case that must never reach a coin.
 fn a_live_node_with_a_public_address() -> PublicAddress {
+    let seen = |source: &str| Reflexive {
+        source: source.to_string(),
+        addr: DERIVED_ADDR.parse().expect("a socket address"),
+    };
     PublicAddress {
-        reflexive: vec!["198.51.100.7:9444".parse().expect("a socket address")],
+        reflexive: vec![seen("relay.dig.net"), seen("stun.example")],
         relay_reserved: true,
         direct_mapping: false,
     }
@@ -324,7 +337,7 @@ fn the_configured_urls_reach_the_coin_in_the_operators_order() {
         "a loopback entry can only mean this machine, so it must never be advertised"
     );
     assert!(
-        index_of(wire, b"198.51.100.7").is_none(),
+        index_of(wire, b"93.184.216.34").is_none(),
         "the derived address must not ALSO be published: the operator's value is an override, not \
          an addition, and a coin carrying both stakes their money on a place they did not name"
     );
@@ -385,9 +398,10 @@ fn the_derived_address_reaches_the_coin_beside_the_peer_declaration() {
     // The dig-peer wire, not the HTTP content port. `DIG_NODE_PORT` (9778) is loopback-bound by
     // default and no relay mediates it, so a coin naming it would advertise somewhere no stranger
     // can reach — which is why the SCHEME and the PORT are both asserted rather than just the host.
+    let expected = format!("dig://{DERIVED_ADDR}");
     assert!(
-        index_of(wire, b"dig://198.51.100.7:9444").is_some(),
-        "the derived reflexive peer address must appear in the coin"
+        index_of(wire, expected.as_bytes()).is_some(),
+        "the derived reflexive peer address must appear in the coin: {expected}"
     );
     // The declaration `create` already wrote (`lifecycle.rs`), still there. The URL adds WHERE; it
     // must not have displaced WHO.

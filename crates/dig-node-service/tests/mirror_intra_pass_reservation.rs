@@ -235,6 +235,7 @@ fn two_creates_in_one_pass_select_disjoint_coins() {
         Effective {
             urls: vec!["https://mirror.example/dig".to_string()],
             state: AdvertiseState::Override,
+            ..Default::default()
         },
         // A well-formed peer id, for the same reason the URL list is non-empty: `create` refuses
         // before selecting any coin without one, and a probe that stopped at the identity guard
@@ -295,6 +296,7 @@ fn the_only_coin_funds_one_create_and_the_second_refuses() {
         Effective {
             urls: vec!["https://mirror.example/dig".to_string()],
             state: AdvertiseState::Override,
+            ..Default::default()
         },
         // A well-formed peer id: `create` refuses before selecting any coin without one, and this
         // fixture needs the FIRST create to genuinely reach coin selection so that the second one
