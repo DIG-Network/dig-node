@@ -221,6 +221,21 @@ pub struct PeerStatus {
     peer_id: std::sync::Mutex<Option<String>>,
     /// The most recent peer-network error (best-effort diagnostics).
     last_error: std::sync::Mutex<Option<String>>,
+    /// This node's discovered server-reflexive address — the NAT mapping of its dig-peer socket a
+    /// stranger actually dials — paired with the label of whichever STUN tier reported it
+    /// ([`crate::net::StunSource::label`]). `None` is a real, standing state, not an unset default:
+    /// no tier has answered (yet, or ever, on a relay-less offline host), and `dig.getNetworkInfo`
+    /// must say so rather than guess (dig-node#567).
+    ///
+    /// Set ONCE, by [`Self::set_reflexive`] from the peer-network bring-up's STUN walk
+    /// (`StunPlan::discover_reflexive`), and never cleared: there is no periodic re-probe today, so
+    /// clearing it on some other signal would trade a real reading for a worse one — an
+    /// unconditional `None` — rather than a better one. Downstream reachability-over-time is a
+    /// SEPARATE fact already tracked by `relay_reserved` above; this field only ever answers "what
+    /// did the STUN walk see". Whether that reading may be STAKED on (agreement with a second
+    /// source, global routability, a currently-held path) is a mirror-crate concern applied
+    /// downstream, never decided here.
+    reflexive: std::sync::Mutex<Option<(std::net::SocketAddr, &'static str)>>,
 }
 
 impl PeerStatus {
@@ -272,6 +287,23 @@ impl PeerStatus {
     /// Record a peer-network error (best-effort; does not stop the node).
     pub fn set_error(&self, error: String) {
         *self.last_error.lock().unwrap() = Some(error);
+    }
+
+    /// Record this node's discovered server-reflexive address and the label of whichever STUN
+    /// tier reported it (`StunSource::label()`), called once from the peer-network bring-up after
+    /// `StunPlan::discover_reflexive` answers. A later call overwrites the reading — the bring-up
+    /// runs this exactly once today, so overwriting vs. first-write-wins is not yet a live
+    /// question, but overwrite is the correct choice if a second caller is ever added: the newer
+    /// STUN transaction is the better measurement of the node's CURRENT mapping.
+    pub fn set_reflexive(&self, addr: std::net::SocketAddr, source: &'static str) {
+        *self.reflexive.lock().unwrap() = Some((addr, source));
+    }
+
+    /// This node's discovered server-reflexive address and its reporting tier, or `None` when no
+    /// STUN tier has ever answered. Read by [`crate::Node::network_info`] to populate
+    /// `reflexive_addr` and to fold the address into the advertised candidate set (dig-node#567).
+    pub fn reflexive(&self) -> Option<(std::net::SocketAddr, &'static str)> {
+        *self.reflexive.lock().unwrap()
     }
 
     /// Whether the peer network is running.
@@ -2683,6 +2715,11 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         .map(|d| d.server)
         .or_else(|| stun_plan.primary());
     if let Some(d) = stun_discovery {
+        // Publish the reading onto the shared status so `dig.getNetworkInfo`'s `reflexive_addr`
+        // stops reporting a hard-coded `null` once something has actually answered (dig-node#567) —
+        // the whole reason a discovered address never reached a mirror-bond advertisement despite
+        // #561 shipping the discovery itself.
+        status.set_reflexive(d.addr, d.source.label());
         println!(
             "dig-node peer network: STUN server for reflexive discovery: {} (source: {})",
             d.server,
