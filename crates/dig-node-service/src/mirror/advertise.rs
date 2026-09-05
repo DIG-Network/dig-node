@@ -345,10 +345,8 @@ pub fn effective_urls(operator: &Advertised, address: &PublicAddress) -> Effecti
 /// mapping must not be able to put one into a coin merely because this node derived it rather than
 /// an operator typing it.
 fn derived_urls(address: &PublicAddress) -> Advertised {
-    let (v6, v4): (Vec<_>, Vec<_>) = address
-        .reflexive
-        .iter()
-        .partition(|addr| matches!(addr, SocketAddr::V6(_)));
+    let (v6, v4): (Vec<&SocketAddr>, Vec<&SocketAddr>) =
+        address.reflexive.iter().partition(|addr| addr.is_ipv6());
 
     let mut out = Advertised::default();
     for addr in v6.into_iter().chain(v4) {
@@ -358,7 +356,7 @@ fn derived_urls(address: &PublicAddress) -> Advertised {
         match classify(&url) {
             Some(reason) => out.rejected.push((url, reason)),
             None => {
-                if !out.accepted.iter().any(|seen| *seen == url) {
+                if !out.accepted.contains(&url) {
                     out.accepted.push(url);
                 }
             }
