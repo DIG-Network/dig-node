@@ -42,59 +42,60 @@ runs:
       # -sys crates in the Chia-wallet-SDK graph want cmake/clang. `binutils` provides the
       # `readelf` the floor gate reads.
       #
-      # ROOT CAUSE, verified directly, not guessed (do not re-litigate without new evidence):
-      # deb.debian.org's `debian-security` POOL is missing objects for this suite that the
-      # canonical `security.debian.org` serves. Same path, same filename, different host:
-      #   404  http://deb.debian.org/debian-security/pool/updates/main/p/perl/libperl5.32_5.32.1-4+deb11u5_amd64.deb
-      #   200  http://security.debian.org/debian-security/pool/updates/main/p/perl/libperl5.32_5.32.1-4+deb11u5_amd64.deb
-      # Reproduces specifically on amd64 because GitHub's ubuntu-latest pool is routed (by
-      # deb.debian.org's anycast/CDN) to an edge (146.75.30.132) with this gap; other network
-      # paths reach a working edge, which is what made this look like mirror/CDN skew rather than
-      # a persistent gap on one host.
+      # TWO REAL, DIFFERENT CAUSES — verified directly, not guessed (do not re-litigate without
+      # new evidence; three earlier hypotheses were wrong before these two were confirmed).
       #
-      # THE INDEX WAS NEVER STALE — checked directly, which rules out re-fetching as a fix:
-      #   Last-Modified: Mon, 31 Aug 2026 19:41:45 GMT   Age: 67   X-Cache: HIT
-      #   Package: libperl5.32   Version: 5.32.1-4+deb11u5
-      # A correctly-current index named this exact file, on a host whose pool does not have it.
-      # `libperl5.32` u5, u6 AND u7 all 404 the same way on deb.debian.org — a persistent gap, not
-      # a point-in-time rotation. No amount of retrying or index-refreshing fixes a file the pool
-      # never has (confirmed on dig-node CI run 33948322114, the identical bootstrap in
-      # package.yml: a DIFFERENT package 404'd on each arch — libexpat1 arm64, libperl5.32 amd64 —
-      # consistent with each arch's runner pool being routed to a different bad edge, not with a
-      # shared transient blip).
+      # CAUSE 1 (permanent, deterministic, per-host): deb.debian.org's `debian-security` POOL is
+      # missing objects that the canonical `security.debian.org` always has. Measured repeatedly,
+      # not once:
+      #   libperl5.32 u5   security.debian.org : 6/6  -> 200
+      #   libperl5.32 u5   deb.debian.org      : 0/6  -> 404, every time
+      # Same path, same filename, different host. The index was NEVER stale on deb.debian.org
+      # either (Last-Modified: Mon, 31 Aug 2026 19:41:45 GMT, Age: 67, X-Cache: HIT, correctly
+      # naming Version: 5.32.1-4+deb11u5) — a correctly-current index named a file its own host's
+      # pool does not have, at u5, u6 AND u7 alike. No amount of retrying or index-refreshing
+      # fixes an object one host never carries. FIX: the `sed` below, pointing `debian-security`
+      # at `security.debian.org` before any apt-get call — verified locally end-to-end
+      # (`docker run debian:11`): without it, install 404s on libperl5.32 every time; with it,
+      # every package installs and configures cleanly.
       #
-      # THE FIX: point `debian-security` at the canonical `security.debian.org` host, once,
-      # before any apt-get call. Verified locally (`docker run debian:11` with this exact `sed`):
-      # without it, `apt-get install` 404s on libperl5.32 every time; with it, every package
-      # installs and configures cleanly.
+      # CAUSE 2 (transient, per-edge, on the CORRECT host): security.debian.org itself can still
+      # 404 on an object that demonstrably exists, because a specific Fastly POP is serving a
+      # stale or negative cache entry for it — NOT because the pool pruned anything (`libexpat1`
+      # u8 does not exist; u7 is current and present). Measured: `libexpat1` u7 from
+      # security.debian.org is 20/20 -> 200 from one vantage, while CI 404'd the identical URL
+      # from POP IP 151.101.130.132 at a single point in time. FIX: `-o
+      # Acquire::http::No-Cache=true` on the install below forces revalidation so a retry cannot
+      # be re-served the same cached response — `rm -rf /var/lib/apt/lists/*` already forces a
+      # fresh INDEX; this forces fresh PACKAGE fetches, which is the layer that was actually
+      # failing here. The backoff is lengthened (attempt*10, up to 40s between tries) because an
+      # edge cache needs real wall-clock time to invalidate, and the previous, shorter backoff
+      # completed its whole 5-attempt run in about 25 seconds — not long enough to matter.
       #
-      # The retry loop + state reset below are KEPT — cheap and correct for genuine transients —
-      # but are NOT what fixes this failure and were never load-bearing for it: five independent,
-      # verified-fresh re-fetches all returned the identical (correct) 404, because the file is
-      # not on this host's pool at any index generation.
+      # Neither cause is "the pool prunes superseded files as point releases land" — that framing
+      # (an earlier, wrong hypothesis in this file's history) does not match either measurement
+      # above and should not be reintroduced without new evidence.
       #
-      # SEPARATE, NOT ADDRESSED HERE: bullseye-security's Release file states
+      # SEPARATE, TRACKED ELSEWHERE, NOT ADDRESSED HERE: bullseye-security's Release file states
       # `Valid-Until: Mon, 07 Sep 2026 21:13:04 UTC` — bullseye is oldoldstable, and once that
-      # date passes apt will reject the index outright ("Release file expired"), failing every leg
-      # again for a different reason regardless of host. Do NOT silence that with
-      # `Acquire::Check-Valid-Until "false"` — it is a real signal that the base image is past end
-      # of life, and papering over it invites more breakage rather than fixing it. This is the
-      # glibc-floor base-image decision from the family's original brief, now with a concrete
-      # two-day deadline; it is reported to the coordinator as its own decision, not resolved here.
+      # date passes apt will reject the index outright ("Release file expired") regardless of host
+      # or cache state. Tracked as dig-node#565 (bullseye EOL / base-image decision). Do NOT
+      # silence it with `Acquire::Check-Valid-Until "false"` and do NOT change the base image
+      # here — that call is the coordinator's, not a side effect of this fix.
       run: |
         set -eux
         sed -i 's#http://deb.debian.org/debian-security#http://security.debian.org/debian-security#' /etc/apt/sources.list
         for attempt in 1 2 3 4 5; do
-          if apt-get update -qq && apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
+          if apt-get update -qq && apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::No-Cache=true \
             ca-certificates curl git build-essential pkg-config perl make cmake clang binutils; then
             exit 0
           fi
-          echo "apt bootstrap attempt $attempt/5 failed (stale bullseye-security mirror/edge index vs pool) -- resetting apt/dpkg state and retrying" >&2
+          echo "apt bootstrap attempt $attempt/5 failed -- resetting apt/dpkg state and retrying" >&2
           dpkg --configure -a || true
           apt-get -f install -y || true
           apt-get clean
           rm -rf /var/lib/apt/lists/*
-          sleep $(( attempt * 5 ))
+          sleep $(( attempt * 10 ))
         done
         echo "::error::apt bootstrap failed after 5 attempts" >&2
         exit 1
