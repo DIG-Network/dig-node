@@ -27,9 +27,11 @@
 //!
 //! # The addresses here are SYNTHETIC, and that is the design
 //!
-//! `dig-node-core` hard-codes `reflexive_addr` to `null` (`dig_ecosystem#3198` is adding the
-//! producer), so no real host can supply one yet. What is under test is the plumbing between an
-//! address and the coin, which a supplied address exercises exactly.
+//! `dig-node-core` now publishes a real `reflexive_addr` once a STUN tier answers (dig-node#567),
+//! but this file still hands `effective_urls_from_env` a hand-built [`PublicAddress`] rather than a
+//! live one: what is under test is the plumbing between an address and the coin, which a supplied,
+//! DETERMINISTIC address exercises exactly, without depending on a real STUN round trip succeeding
+//! in CI.
 
 mod support;
 
@@ -240,10 +242,10 @@ fn own_peer_id() -> String {
 
 /// A node that knows its public address and holds a path to the network.
 ///
-/// The address is SYNTHETIC and that is deliberate: `dig-node-core` hard-codes `reflexive_addr` to
-/// `null` (`dig_ecosystem#3198` is adding the producer), so no real host can supply one yet. The
-/// composition under test is the plumbing between the address and the coin, which is exactly what a
-/// supplied address exercises.
+/// The address is SYNTHETIC and that is deliberate: a hand-built [`PublicAddress`] is a
+/// deterministic fixture, independent of whether a real STUN round trip succeeds on the machine
+/// running this test. The composition under test is the plumbing between the address and the coin,
+/// which is exactly what a supplied address exercises.
 /// TWO sources, because one is never enough: `relay.dig.net` answers STUN with its own load
 /// balancer's address (`relay.dig.net#11`), well-formed every time, and dig-node prefers the
 /// relay tier — so a single-source fixture would model the one case that must never reach a coin.
@@ -415,10 +417,12 @@ fn the_derived_address_reaches_the_coin_beside_the_peer_declaration() {
 /// **A node that does not know its public address creates NOTHING, and says why in the operator's
 /// own terms.**
 ///
-/// This is every host's state today — `reflexive_addr` is hard-coded `null` — so the sentence this
-/// produces is the one an operator actually reads. The assertion is on the WORDING as much as on
-/// the refusal: a node that cannot know its own address has no configuration to fix, and sending
-/// them to `DIG_MIRROR_ADVERTISE_URLS` would be sending them to a remedy that cannot work.
+/// `reflexive_addr` still reports `null` on a relay-less/offline host, or before the peer-network
+/// bring-up's STUN walk has ever answered (dig-node#567) — a real, reachable state, not merely a
+/// startup default — so the sentence this produces is one an operator can actually read. The
+/// assertion is on the WORDING as much as on the refusal: a node that cannot know its own address
+/// has no configuration to fix, and sending them to `DIG_MIRROR_ADVERTISE_URLS` would be sending
+/// them to a remedy that cannot work.
 #[test]
 fn no_public_address_creates_nothing_and_does_not_blame_the_operators_configuration() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -435,7 +439,8 @@ fn no_public_address_creates_nothing_and_does_not_blame_the_operators_configurat
     let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
 
     // No operator value AND no address: `PublicAddress::default()` is exactly what
-    // `from_network_info` reads off the shipped `dig.getNetworkInfo` answer today.
+    // `from_network_info` reads off a `dig.getNetworkInfo` answer on a host no STUN tier has
+    // ever answered (a relay-less/offline node, or one still mid-bring-up).
     let advertised = with_advertise_env("", || effective_urls_from_env(&PublicAddress::default()));
     assert_eq!(
         advertised.state,

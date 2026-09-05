@@ -4312,26 +4312,47 @@ impl Node {
     }
 
     /// `dig.getNetworkInfo` — this node's own network posture: its `peer_id`, network id, listen
-    /// address, candidate addresses, reachability, and relay-reservation state. Reads the shared
-    /// [`peer::PeerStatus`] so it reflects the live pool/relay state (or "not running" in the FFI
-    /// path). Never touches the chain or an upstream.
+    /// address, candidate addresses, discovered reflexive address, reachability, and
+    /// relay-reservation state. Reads the shared [`peer::PeerStatus`] so it reflects the live
+    /// pool/relay/reflexive state (or "not running"/`null` in the FFI path, before bring-up, or on a
+    /// host no STUN tier has ever answered). Never touches the chain or an upstream.
     pub fn network_info(&self) -> Value {
         let peer_id = self.peer_id_hex();
         let network_id = peer::effective_network_label_from_env();
         let genesis = hex::encode(peer::genesis_challenge_from_env());
         let endpoint = peer::relay_url_from_env();
         let port = peer::peer_port_from_env();
+        // This node's own server-reflexive reading, if the peer-network bring-up's STUN walk has
+        // ever answered (dig-node#567) — `None` on a not-yet-started or relay-less offline node,
+        // which `reflexive_addr` below reports honestly as `null` rather than guessing.
+        let reflexive = self.peer_status.reflexive();
         // The node's REAL advertised candidate addresses, ordered IPv6-first (ecosystem HARD RULE):
-        // a routable IPv6 address (when discoverable) precedes the IPv4 fallback. `listen_addr` reports
-        // the primary (IPv6-preferred) advertised endpoint — a dialable address, NOT the wildcard bind
+        // a routable IPv6 address (when discoverable) precedes the IPv4 fallback, and the reflexive
+        // address — when known — leads its family group ahead of the local-only fallback, because it
+        // is the one a stranger behind a DIFFERENT NAT can actually dial. `listen_addr` reports the
+        // primary (IPv6-preferred) advertised endpoint — a dialable address, NOT the wildcard bind
         // address (`[::]` / `0.0.0.0`) the listener binds. (The listener itself binds `[::]` dual-stack;
         // that wildcard is a bind target, never a dialable candidate to report to peers.)
-        let candidates = net::advertised_socket_addrs(port, net::advertise_loopback_from_env());
+        let candidates = net::advertised_socket_addrs_with_reflexive(
+            port,
+            net::advertise_loopback_from_env(),
+            reflexive.map(|(addr, _)| addr),
+        );
         let candidate_addresses: Vec<String> = candidates.iter().map(|a| a.to_string()).collect();
         let listen = candidate_addresses
             .first()
             .cloned()
             .unwrap_or_else(|| format!("[::]:{port}"));
+        // The shape `PublicAddress::from_network_info` (dig-node-service) reads back out: `null`
+        // when nothing has answered, else a ONE-element array naming the reporting tier as `source`
+        // — never a bare string or a bare list, both of which that adapter reads as carrying NO
+        // provenance and therefore incapable of ever corroborating a second, independent reading
+        // (dig-node#566). Fail closed: a `null` here is visible and harmless; inventing a value
+        // this node never actually measured is not — see dig-node#567.
+        let reflexive_addr = match reflexive {
+            Some((addr, source)) => json!([{ "source": source, "addr": addr.to_string() }]),
+            None => Value::Null,
+        };
         let snap = self
             .peer_status
             .snapshot_json(&endpoint, &network_id, &genesis);
@@ -4349,7 +4370,7 @@ impl Node {
             // (#1372). Byte-identical to the canonical mainnet genesis when unconfigured.
             "genesis": genesis,
             "listen_addr": listen,
-            "reflexive_addr": Value::Null,
+            "reflexive_addr": reflexive_addr,
             "candidate_addresses": candidate_addresses,
             "reachability": reachability,
             "relay": snap["relay"],
@@ -16790,5 +16811,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Before any STUN tier has ever answered, `reflexive_addr` MUST stay `null` — the fail-closed
+    /// default dig-node#567 requires (a fabricated or last-known value here would be staked into a
+    /// mirror coin's memo on chain, so guessing is strictly worse than reporting nothing).
+    #[test]
+    fn network_info_reports_null_reflexive_addr_before_any_stun_tier_answers() {
+        let (node, _td) = test_node(Some([6u8; 32]));
+        let info = node.network_info();
+        assert_eq!(
+            info["reflexive_addr"],
+            Value::Null,
+            "an undiscovered reflexive address must read as null, never a guess: {info}"
+        );
+    }
+
+    /// Once the peer-network bring-up's STUN walk answers, the reading MUST reach BOTH surfaces
+    /// dig-node#567 names: `reflexive_addr` (what the mirror-advertise pass parses back out via
+    /// `PublicAddress::from_network_info`) and `candidate_addresses` (what `dign network-info`
+    /// renders as `candidates:` — the exact line the bug was measured against on a real host).
+    ///
+    /// `reflexive_addr` is asserted by STRUCTURE, not merely "is not null": a bare string or a bare
+    /// list would also read as "populated" but carries no provenance, and
+    /// `PublicAddress::from_network_info` treats that as un-corroboratable — silently defeating the
+    /// ticket's requirement that the source travel with the address. Only the one-element
+    /// `[{"source", "addr"}]` shape satisfies both surfaces at once.
+    #[test]
+    fn network_info_publishes_a_discovered_reflexive_address_with_its_source_and_folds_it_into_candidates(
+    ) {
+        let (node, _td) = test_node(Some([7u8; 32]));
+        // A documentation-range address (RFC 5737) so it can never collide with a real address this
+        // test host happens to own — the assertion below must hold on every machine, not just one
+        // lucky one.
+        let discovered: std::net::SocketAddr = "203.0.113.7:9444".parse().unwrap();
+        node.peer_status.set_reflexive(discovered, "relay");
+
+        let info = node.network_info();
+
+        let reflexive = info["reflexive_addr"]
+            .as_array()
+            .expect("reflexive_addr must be an array once a tier has answered");
+        assert_eq!(
+            reflexive.len(),
+            1,
+            "exactly one reading has been recorded: {info}"
+        );
+        assert_eq!(reflexive[0]["source"], json!("relay"), "{info}");
+        assert_eq!(
+            reflexive[0]["addr"],
+            json!(discovered.to_string()),
+            "{info}"
+        );
+
+        let candidates: Vec<std::net::SocketAddr> = info["candidate_addresses"]
+            .as_array()
+            .expect("candidate_addresses array")
+            .iter()
+            .map(|v| v.as_str().unwrap().parse().expect("a socket addr"))
+            .collect();
+        assert!(
+            candidates.contains(&discovered),
+            "the discovered reflexive address must reach the candidate list an operator reads via \
+             `dign network-info`, not only the new field: {candidates:?}"
+        );
     }
 }

@@ -275,9 +275,10 @@ impl PublicAddress {
     /// Reads one pass's view out of `dig.getNetworkInfo`'s answer.
     ///
     /// The `reflexive_addr` key is accepted in three shapes, and anything that does not parse is
-    /// dropped. That tolerance is deliberate: the key is hard-coded `null` in `dig-node-core` today
-    /// (`dig_ecosystem#3198` is adding the producer), so this adapter is written against a shape
-    /// that does not exist yet, and it must not dictate one to the lane building it.
+    /// dropped. `dig-node-core` publishes the `[{"source", "addr"}]` shape once a STUN tier has
+    /// answered (dig-node#567); the tolerance for the other two shapes stays regardless, since a
+    /// future producer — or a hand-built test fixture — is still free to use them, and every one
+    /// of the three is handled identically here: only the named-source array can corroborate.
     ///
     /// | shape | read as |
     /// |---|---|
@@ -481,7 +482,9 @@ impl Effective {
 ///    of every already-configured node exactly as it shipped.
 /// 3. **No known public address is reported BEFORE the liveness gate**, because it is the more
 ///    fundamental answer and it is the one true on a node whose relay is held but reports no
-///    reflexive address — the state every host is in until `dig_ecosystem#3198` lands.
+///    reflexive address — still reachable on a relay-less/offline host, or one whose STUN walk
+///    (`dig_ecosystem#3198`/#561) has never answered (dig-node#567 wires that discovery into
+///    `dig.getNetworkInfo`; it does not guarantee a tier answers).
 pub fn effective_urls(operator: &Advertised, address: &PublicAddress) -> Effective {
     if operator.can_advertise() {
         return Effective {
@@ -1210,9 +1213,10 @@ mod tests {
     /// No reflexive address at all means no advertisement — and the reason names the ADDRESS, never
     /// the operator's configuration.
     ///
-    /// This is every host's state until `dig_ecosystem#3198` lands a producer, so the sentence it
-    /// yields is the one an operator actually reads today. Telling them to configure something
-    /// would send them to a remedy that cannot work.
+    /// This remains a real state on a relay-less/offline host, or one whose STUN walk has never
+    /// answered (dig-node#567 wires the discovery `dig_ecosystem#3198`/#561 already produces into
+    /// `dig.getNetworkInfo`; it does not make discovery infallible). Telling an operator in that
+    /// state to configure something would send them to a remedy that cannot work.
     #[test]
     fn no_known_address_advertises_nothing_and_blames_the_address_not_the_operator() {
         let unknown = PublicAddress {
@@ -1404,11 +1408,11 @@ mod tests {
 
     /// The adapter reads the snapshot `dig.getNetworkInfo` actually returns, in all three shapes.
     ///
-    /// `reflexive_addr` is hard-coded `null` in `dig-node-core` today, so the null case is the
-    /// SHIPPED one and the rest are written against the shape `dig_ecosystem#3198` will produce.
-    /// The producer does not exist yet to settle which, so all three are accepted and the two that
-    /// carry no provenance can never corroborate — a bare list is one reporter repeating itself,
-    /// not two reporters agreeing.
+    /// `null` remains a real, shipped state (a relay-less/offline host, or one no STUN tier has
+    /// ever answered); `dig-node-core` publishes the named-source array once a tier does answer
+    /// (dig-node#567). All three shapes stay accepted here regardless, and the two that carry no
+    /// provenance can never corroborate — a bare list is one reporter repeating itself, not two
+    /// reporters agreeing.
     #[test]
     fn the_network_info_adapter_reads_the_address_the_provenance_and_the_relay() {
         let null = serde_json::json!({

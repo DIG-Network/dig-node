@@ -9598,6 +9598,15 @@ UDP flow. Since the node prefers the relay tier, that is the answer it gets. Thi
 into a coin permanently with collateral behind it, so it takes NC-12's discipline: sources are
 untrusted and must AGREE, never trusted individually. Readings that disagree corroborate neither.
 
+**`dig.getNetworkInfo`'s `reflexive_addr` field carries provenance, because agreement cannot be
+checked without it.** The node MUST publish `null` when no STUN tier has ever answered — never a
+fabricated, stale, or last-known value, since a visible `null` is harmless and a wrong address is
+not. Once a tier has answered, the node MUST publish a JSON array of one object per reading, each
+naming its reporting tier as `source` and the mapping as `addr` (`[{"source": "relay", "addr":
+"203.0.113.7:9444"}]`). A bare string or a bare list of strings MUST NOT be used for a reading the
+node wants eligible for corroboration: neither carries a reporter identity, so two such entries are
+indistinguishable from one reporter repeating itself, and can never satisfy the paragraph above.
+
 **The address FAMILY MUST NOT be a rejection criterion.** That defect is an address-family CROSSING,
 not an IPv6 one: the same server answers an IPv6 caller correctly. IPv6 is both the working case and
 the §5.2-preferred one, so a rule distrusting IPv6 answers would discard correct discovery while
