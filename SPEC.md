@@ -9510,7 +9510,8 @@ knows: `disabled` is that operator's own switch (§25.7) and MUST NOT be present
 `unadvertised` is the switch ON and the node silently unable to honour it because
 `mirror::advertise::effective_urls` produced no entry — the operator's entries were all rejected as
 non-absolute or reachable only from this machine, or there was no operator value and this node knows
-no public address or holds no path to itself (§25.10's `off`, `no_public_address` and `no_relay`),
+no public address, holds only one source's unconfirmed word for one, or holds no path to itself
+(§25.10's `off`, `no_public_address`, `uncorroborated_address` and `no_relay`),
 which is the same condition `MirrorEffects::create`
 refuses every bond on (§25.10). The node MUST report `unadvertised` for that condition and MUST NOT
 report it as `disabled`, which would oblige a conforming client to stay silent about the only reason
@@ -9588,6 +9589,28 @@ The derived form:
   address is a reading, not a promise, and a seam reporting a this-machine mapping MUST NOT put one
   into a coin merely because the node derived it.
 
+**A derived address MUST be CORROBORATED before it is published: two DIFFERENT sources MUST report
+the same address.** A single source cannot be checked. A STUN server that answers promptly, with the
+correct magic cookie, a matching transaction id and a well-formed `XOR-MAPPED-ADDRESS` can still be
+reporting the wrong address, and nothing in the exchange says so — `relay.dig.net` did exactly this,
+reporting its load balancer's address because the balancer SNATs the UDP flow, ten well-formed
+answers out of ten. Since the node prefers the relay tier, that is the answer it gets. This value is
+written into a coin permanently with collateral behind it, so it takes NC-12's discipline: sources
+are untrusted and must AGREE, never trusted individually. Readings that disagree corroborate
+neither.
+
+**A derived address MUST be global unicast.** A private, shared/CGNAT, link-local, loopback,
+documentation, benchmarking, discard-only, unique-local or otherwise reserved address MUST NOT be
+published when the node derived it. This is STRICTER than the rule on an operator's entry, and
+deliberately: an operator's LAN address is a deliberate choice risking only their own stake, while a
+derived one is a broken reading of where this node sits. An IPv6 address embedding an IPv4 one is
+judged by the address it embeds.
+
+**No provider or operator address range may be special-cased, in either direction.** The rule is on
+what an address denotes, never on who owns it. Excluding the range a misconfigured server happens to
+report would paper over one instance of a general defect and would refuse every node legitimately
+hosted in that range. Corroboration is the mechanism that catches a wrong-but-routable answer.
+
 The rules on any entry, however it was obtained:
 
 * The list MAY carry several entries; the memo layout is built for that. IPv6 entries SHOULD be
@@ -9606,7 +9629,7 @@ The rules on any entry, however it was obtained:
 They named a place; staking their collateral on a different one because their value had a typo is a
 surprise about money, and the warning naming the typo is something they can act on.
 
-The node MUST report which of five states it is in, because the four that publish nothing have four
+The node MUST report which of six states it is in, because the four that publish nothing have four
 different remedies and telling an operator the wrong one sends them somewhere no action helps:
 
 | state | meaning |
@@ -9614,8 +9637,14 @@ different remedies and telling an operator the wrong one sends them somewhere no
 | `advertising_override` | publishing the operator's own list |
 | `advertising_derived` | publishing this node's own reflexive peer address |
 | `off` | the operator set a value and no entry in it is publishable |
-| `no_public_address` | no operator value, and this node does not know a public address |
+| `no_public_address` | no operator value, and this node does not know a public address — nothing reported one, or what was reported is not a public address |
+| `uncorroborated_address` | exactly one source reported an address and nothing has confirmed it |
 | `no_relay` | a public address is known, but no path to this node is currently held |
+
+`uncorroborated_address` MUST be distinct from `no_public_address`: the node is not missing an
+answer, it is missing a SECOND one, and neither condition is cleared by what would clear the other.
+The node SHOULD additionally report WHY a derived address was refused, since the state alone cannot
+distinguish "nothing reported one" from "a private address was reported".
 
 **`no_public_address` MUST NOT be described as unset configuration.** Setting a value the operator
 cannot know is not a remedy, and a blocker no configuration can clear must never be presented as
