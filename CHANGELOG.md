@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.254.85] - 2026-09-05
+
+### Features
+- **peer:** Harden reflexive discovery (cross-family reject, stun host, mirror-advertise control) (#569)
+
+### Bug Fixes
+- **peer:** Wire the discovered reflexive address into dig.getNetworkInfo (#568)- **peer:** Require agreement between independent sources before a reflexive address is believed (#571)
+
 ## [0.254.82] - 2026-09-05
 
 ### Features
