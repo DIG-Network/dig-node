@@ -9608,23 +9608,44 @@ The derived form:
   address is a reading, not a promise, and a seam reporting a this-machine mapping MUST NOT put one
   into a coin merely because the node derived it.
 
-**A derived address MUST be CORROBORATED before it is published: two DIFFERENT sources MUST report
-the same address.** A single source cannot be checked. A STUN server that answers promptly, with the
-correct magic cookie, a matching transaction id and a well-formed `XOR-MAPPED-ADDRESS` can still be
-reporting the wrong address, and nothing in the exchange says so — `relay.dig.net` did exactly this
-for IPv4 callers, reporting its load balancer's address because the balancer SNATs an IPv4 caller's
-UDP flow. Since the node prefers the relay tier, that is the answer it gets. This value is written
-into a coin permanently with collateral behind it, so it takes NC-12's discipline: sources are
-untrusted and must AGREE, never trusted individually. Readings that disagree corroborate neither.
+**A derived address MUST be ESTABLISHED before it is published, per `dig-stun`'s `establish` rule
+(dig-node#566): every reading in an address family MUST agree UNANIMOUSLY on one IP, reported by at
+least two INDEPENDENT source classes (three when every agreeing class is a `peer:*` class — two peer
+classes is exactly two cheap VMs in two provider blocks).** A single dissenting reading is treated as
+proof something is wrong, however many others agree with each other — a majority is not unanimity. A
+single source cannot be checked at all. A STUN server that answers promptly, with the correct magic
+cookie, a matching transaction id and a well-formed `XOR-MAPPED-ADDRESS` can still be reporting the
+wrong address, and nothing in the exchange says so — `relay.dig.net` did exactly this for IPv4
+callers, reporting its load balancer's address because the balancer SNATs an IPv4 caller's UDP flow.
+Since the node prefers the relay tier, that is the answer it gets. This value is written into a coin
+permanently with collateral behind it, so it takes NC-12's discipline: sources are untrusted and must
+AGREE, never trusted individually. The node MUST NOT implement this rule itself: `dig-stun` is the
+ecosystem's one home for it, so this node and every other consumer of reflexive-address agreement can
+never disagree about what "agree" means.
+
+**Unanimity is evaluated per family BEFORE routability, and a degenerate reading is NOT excluded from
+it** — this is `dig-stun`'s own documented order (its `SPEC.md` §7.3: unanimity is step 3, global
+unicast is step 5), not a choice this node makes. A loopback, private, or link-local reading from a
+source unrelated to the ones agreeing on a genuinely public address is treated as an ordinary
+dissenting IP, and discards the WHOLE family — the properly-agreed address included — exactly as a
+dissenting public address would. This is a real availability/griefing cost (one misbehaving or
+misconfigured source can indefinitely deny establishment for an otherwise-legitimate address in the
+same family) that the node accepts DELIBERATELY: weakening it to a majority vote would let an
+attacker who can cheaply add sources outvote the honest ones, which is not a security property.
+`mirror::advertise::PublicAddress::established`'s own doc comment carries the fuller reasoning.
 
 **`dig.getNetworkInfo`'s `reflexive_addr` field carries provenance, because agreement cannot be
 checked without it.** The node MUST publish `null` when no STUN tier has ever answered — never a
 fabricated, stale, or last-known value, since a visible `null` is harmless and a wrong address is
 not. Once a tier has answered, the node MUST publish a JSON array of one object per reading, each
-naming its reporting tier as `source` and the mapping as `addr` (`[{"source": "relay", "addr":
-"203.0.113.7:9444"}]`). A bare string or a bare list of strings MUST NOT be used for a reading the
-node wants eligible for corroboration: neither carries a reporter identity, so two such entries are
-indistinguishable from one reporter repeating itself, and can never satisfy the paragraph above.
+naming its reporting CLASS as `source` (`dig_stun::establish::SourceClass`'s rendered form — e.g.
+`relay:relay.dig.net`, `public:stun.l.google.com`, `operator:203.0.113.9:19305` — not merely which
+TIER answered, since two configured operator servers or two public hosts are different classes even
+though they share a tier) and the mapping as `addr`
+(`[{"source": "relay:relay.dig.net", "addr": "203.0.113.7:9444"}]`). A bare string or a bare list of
+strings MUST NOT be used for a reading the node wants eligible for corroboration: neither carries a
+reporter identity, so two such entries are indistinguishable from one reporter repeating itself, and
+can never satisfy the paragraph above.
 
 **The address FAMILY MUST NOT be a rejection criterion.** That defect is an address-family CROSSING,
 not an IPv6 one: the same server answers an IPv6 caller correctly. IPv6 is both the working case and

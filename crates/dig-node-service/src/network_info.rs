@@ -74,7 +74,77 @@ fn format_network_info(result: &Value) -> String {
             if reserved { "held" } else { "none" }
         ));
     }
+
+    // Every reflexive-address READING this node has gathered, plus the ESTABLISH verdict each
+    // family reaches over them (dig-node#566). An operator debugging "why is my node
+    // uncorroborated" needs to see which sources answered and what each said, not only the final
+    // bond-state label `dign mirror bond-states` reports — that label says the address was refused;
+    // this is where the operator learns WHY (one source, a dissenting source, too few independent
+    // classes, or a private/CGNAT reading).
+    out.push_str(&format_reflexive_readings(result));
     out
+}
+
+/// Render the `reflexive_addr` readings and the [`dig_stun::establish`] verdict each address family
+/// reaches over them. PURE over the RPC result, reusing
+/// [`crate::mirror::advertise::PublicAddress::from_network_info`]/`established` rather than
+/// re-parsing the wire shape or re-deriving agreement here.
+fn format_reflexive_readings(result: &Value) -> String {
+    let address = crate::mirror::advertise::PublicAddress::from_network_info(result);
+    if address.reflexive.is_empty() {
+        return "\n  reflexive    none (no STUN tier has ever answered)".to_string();
+    }
+
+    let mut out = String::from("\n  reflexive readings:");
+    for reading in &address.reflexive {
+        out.push_str(&format!("\n    • {} -> {}", reading.source, reading.addr));
+    }
+    let established = address.established();
+    out.push_str(&format!(
+        "\n  reflexive verdict:\n    ipv6  {}\n    ipv4  {}",
+        describe_family_verdict(&established.ipv6),
+        describe_family_verdict(&established.ipv4),
+    ));
+    out
+}
+
+/// One [`dig_stun::establish::FamilyVerdict`], in a sentence an operator can act on without reading
+/// `dig-stun`'s source — each variant names both what happened and, where there is one, the remedy.
+fn describe_family_verdict(verdict: &dig_stun::establish::FamilyVerdict) -> String {
+    use dig_stun::establish::FamilyVerdict;
+    match verdict {
+        FamilyVerdict::NoReadings => "no reading in this family".to_string(),
+        FamilyVerdict::Disagreement { addrs } => format!(
+            "DISAGREEMENT among {} reported addresses ({}) — a dissenting source blocks \
+             establishment regardless of how many others agree",
+            addrs.len(),
+            addrs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        FamilyVerdict::Insufficient { classes, peer_only } => format!(
+            "agreed, but only {classes} independent source class(es) reported it (needs {} \
+             {})",
+            if *peer_only {
+                dig_stun::establish::PEER_ONLY_MIN_CLASSES
+            } else {
+                dig_stun::establish::MIN_INDEPENDENT_CLASSES
+            },
+            if *peer_only {
+                "since every agreeing class is a peer"
+            } else {
+                "independent classes"
+            }
+        ),
+        FamilyVerdict::NotGlobal { ip, scope } => {
+            format!("{ip} agreed, but is not globally routable ({scope:?})")
+        }
+        FamilyVerdict::Established { ip, classes } => {
+            format!("ESTABLISHED at {ip} ({classes} independent classes agree)")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +200,73 @@ mod tests {
             !s.contains("direct"),
             "a missing reachability must not read as direct: {s}"
         );
+    }
+
+    /// No STUN tier has ever answered — the CLI says so plainly rather than printing an empty
+    /// readings block, which would read as "gathered zero readings and moved on" rather than "never
+    /// asked at all".
+    #[test]
+    fn no_reflexive_reading_is_stated_plainly() {
+        let s = format_network_info(&json!({ "peer_id": "dd44" }));
+        assert!(s.contains("no STUN tier has ever answered"), "{s}");
+    }
+
+    /// **The property: an operator sees WHY a family did not establish, not merely THAT it did
+    /// not.** One source alone must print as `Insufficient` (naming the floor), never merely
+    /// "not established" — that is the exact debugging information dig-node#566 exists to surface.
+    #[test]
+    fn one_source_prints_as_insufficient_not_merely_unestablished() {
+        let s = format_network_info(&json!({
+            "peer_id": "ee55",
+            "reflexive_addr": [
+                { "source": "relay:relay.example", "addr": "203.0.113.7:9444" },
+            ],
+        }));
+        assert!(s.contains("relay:relay.example -> 203.0.113.7:9444"), "{s}");
+        assert!(
+            s.contains("only 1 independent source class(es)"),
+            "must name the count and the floor, not just fail silently: {s}"
+        );
+    }
+
+    /// **The distinguishing property: a DISSENTING third reading renders as DISAGREEMENT, never as
+    /// a quiet pass for the majority.** Two classes agree on one address, a third reports a
+    /// different one — the majority must NOT be reported as established, and the operator must see
+    /// BOTH addresses named as the source of the conflict.
+    #[test]
+    fn a_dissenting_reading_renders_as_disagreement_naming_both_addresses() {
+        let s = format_network_info(&json!({
+            "peer_id": "ff66",
+            "reflexive_addr": [
+                { "source": "relay:relay.example", "addr": "203.0.113.7:9444" },
+                { "source": "operator:198.51.100.1:19305", "addr": "203.0.113.7:9444" },
+                { "source": "public:stun.example", "addr": "203.0.113.9:9444" },
+            ],
+        }));
+        assert!(s.contains("DISAGREEMENT"), "{s}");
+        assert!(
+            s.contains("203.0.113.7") && s.contains("203.0.113.9"),
+            "{s}"
+        );
+    }
+
+    /// Two independent classes agreeing on a global-unicast address renders as ESTABLISHED, naming
+    /// the address and the class count — the positive case, so the verdict line is never read as
+    /// permanently bad news.
+    #[test]
+    fn two_agreeing_classes_render_as_established() {
+        // Genuinely global-unicast, unlike the other two fixtures above: THIS is the one path that
+        // reaches `dig_stun::establish`'s routability check (unanimity and class-count are checked
+        // first and are satisfied here), so a documentation-range address would be refused as
+        // `NotGlobal` instead of rendering ESTABLISHED — testing the wrong branch entirely.
+        let s = format_network_info(&json!({
+            "peer_id": "aa77",
+            "reflexive_addr": [
+                { "source": "relay:relay.example", "addr": "93.184.216.34:9444" },
+                { "source": "public:stun.example", "addr": "93.184.216.34:9444" },
+            ],
+        }));
+        assert!(s.contains("ESTABLISHED at 93.184.216.34"), "{s}");
+        assert!(s.contains("2 independent classes agree"), "{s}");
     }
 }

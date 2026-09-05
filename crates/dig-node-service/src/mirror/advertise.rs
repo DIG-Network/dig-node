@@ -23,14 +23,20 @@
 //! This value goes **into a coin, on chain, permanently**, with collateral locked behind it for an
 //! epoch, so it faces two gates an operator's typed value does not:
 //!
-//! 1. **AGREEMENT** — [`PublicAddress::corroborated_addresses`]. Two DIFFERENT sources must report
-//!    the same address. `relay.dig.net` answers STUN, and for an **IPv4** caller it returns its load
-//!    balancer's SNAT'd IPv6 address with a synthetic port rather than the caller's own
-//!    (`relay.dig.net#11`, fixed by `relay.dig.net#12`) — well-formed every time, correct magic
-//!    cookie, matching transaction id, a routable address that serves nothing. Nothing errors, so no
-//!    amount of checking ONE answer sees it, and dig-node prefers the relay tier. It is NC-12's
-//!    shape (untrusted sources that must agree, never one that is trusted) applied to the node's
-//!    reading of itself.
+//! 1. **AGREEMENT** — [`PublicAddress::established`], which delegates to `dig_stun::establish`
+//!    (dig-node#566) rather than this module deriving its own rule: per address family, every
+//!    reading must agree on ONE ip UNANIMOUSLY (a single dissenting source is treated as proof
+//!    something is wrong, however many others agree with each other), reported by at least two
+//!    INDEPENDENT source classes (three when every agreeing class is a `peer:*` one — two peer
+//!    classes is exactly two cheap VMs in two provider blocks). `relay.dig.net` answers STUN, and
+//!    for an **IPv4** caller it returns its load balancer's SNAT'd IPv6 address with a synthetic
+//!    port rather than the caller's own (`relay.dig.net#11`, fixed by `relay.dig.net#12`) —
+//!    well-formed every time, correct magic cookie, matching transaction id, a routable address that
+//!    serves nothing. Nothing errors, so no amount of checking ONE answer sees it, and dig-node
+//!    prefers the relay tier. It is NC-12's shape (untrusted sources that must agree, never one that
+//!    is trusted) applied to the node's reading of itself — implemented ONCE, in `dig-stun`, so this
+//!    module and every other consumer of reflexive-address agreement can never disagree about what
+//!    "agree" means.
 //! 2. **ROUTABILITY** — [`is_globally_routable`]. A derived private, CGNAT, documentation,
 //!    benchmarking or reserved address is a broken reading rather than a choice, and is refused.
 //!    An operator's LAN address is still accepted, because that IS a choice (§25.10).
@@ -49,7 +55,7 @@
 //! paper over one instance of a general defect and would be wrong for every node legitimately
 //! running on EC2. Agreement catches a wrong-but-routable answer; an allowlist would not.
 //!
-//! # What this layer deliberately does NOT check — dig-node#566
+//! # What this layer deliberately does NOT check
 //!
 //! The sharpest discriminator is **whether the answer describes the caller**: a reported port equal
 //! to the querying socket's own source port, and a reported family matching the transport queried
@@ -83,7 +89,7 @@
 //! Nothing here reclaims on a config change — spending money in response to a text edit is not a
 //! behaviour an operator asked for.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// The operator-set list of URLs this node advertises. Entries are separated by commas or
 /// whitespace, so both `a,b` and a shell-quoted `"a b"` work.
@@ -216,10 +222,16 @@ const DERIVED_SCHEME: &str = "dig";
 /// well-formed; the same server answers an IPv6 caller correctly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reflexive {
-    /// An opaque label for whoever reported it — a relay endpoint, a public STUN server.
+    /// The independence CLASS of whoever reported it, ideally rendered by
+    /// `dig_stun::establish::SourceClass`'s `Display` impl (e.g. `relay:relay.dig.net`,
+    /// `public:stun.l.google.com`) — not merely which TIER answered, since two configured operator
+    /// servers or two public hosts share a tier but are different classes (dig-node#566).
     ///
-    /// Compared only for INEQUALITY, so this module never has to know what the labels mean. Two
-    /// readings corroborate each other exactly when their sources differ and their addresses match.
+    /// This module never validates the grammar: [`Self::established`] hands every string straight
+    /// to `dig_stun::establish`, which needs only INEQUALITY to count classes and treats an
+    /// unparseable string as "not a `peer:*` class" (a safe default, never a hard failure). A bare
+    /// tier label like `"relay"` still corroborates correctly against a different bare label, it
+    /// merely cannot ever render as a `peer:*` class for the escalated three-class floor.
     pub source: String,
     /// The address that source said this node appears at.
     pub addr: SocketAddr,
@@ -228,7 +240,7 @@ pub struct Reflexive {
 /// What this node knows about where a stranger could reach it, as one pass reads it.
 ///
 /// A plain value with no behaviour of its own beyond [`Self::is_live`] and
-/// [`Self::corroborated_addresses`], so the decision below is pure over it and a test supplies a
+/// [`Self::established_addresses`], so the decision below is pure over it and a test supplies a
 /// whole world in three fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PublicAddress {
@@ -268,45 +280,100 @@ impl PublicAddress {
         self.relay_reserved || self.direct_mapping
     }
 
-    /// The addresses at least TWO DIFFERENT sources reported, in first-seen order.
+    /// This node's own address, per family, as `dig_stun::establish` verdicts (dig-node#566).
     ///
-    /// # Why agreement, and not a better single source
+    /// # Why delegate rather than derive
     ///
-    /// Because a wrong answer from one source is indistinguishable from a right one. `relay.dig.net`
+    /// A hand-rolled agreement check here would be a SECOND implementation of a security primitive
+    /// dig-stun already owns, and where two implementations of the same rule disagree, one of them
+    /// is wrong (CLAUDE.md "centralize rival implementations"). This module's own PRIOR check
+    /// (`corroborated_addresses`, retired by this change) was exactly such a rival: it treated any
+    /// PAIR of differently-sourced readings that agreed as sufficient, which is not what `establish`
+    /// requires — a single dissenting THIRD reading is proof something is wrong, and pairwise
+    /// agreement cannot see a dissenter that only disagrees with one of the two.
+    ///
+    /// # Why agreement at all
+    ///
+    /// A wrong answer from one source is indistinguishable from a right one. `relay.dig.net`
     /// answers STUN, and for an IPv4 caller returns its own load balancer's address rather than the
     /// caller's (`relay.dig.net#11`): well-formed every time, correct magic cookie, matching
     /// transaction id, a routable global-unicast address that serves nothing. Nothing errors, so no
-    /// amount of checking ONE answer catches it. A second, independent source disagrees immediately.
-    ///
-    /// Agreement is the right shape precisely BECAUSE it does not depend on knowing what is wrong.
-    /// The first diagnosis of that defect was "the relay reports its balancer's address"; the real
-    /// one is narrower — an address-family crossing that leaves IPv6 callers correctly served. A
-    /// guard aimed at the first reading would have rejected good answers and kept bad ones.
-    /// Agreement is indifferent to which reading was right.
-    ///
-    /// This matters here more than anywhere else in the node, because this value is written **into
-    /// a coin, on chain, permanently**, with collateral locked behind it for an epoch.
-    ///
-    /// It is the shape NC-12 already asks for — untrusted sources that must AGREE, never one that is
-    /// trusted — applied to the node's reading of its own address.
+    /// amount of checking ONE answer catches it. This matters here more than anywhere else in the
+    /// node, because this value is written **into a coin, on chain, permanently**, with collateral
+    /// locked behind it for an epoch. It is the shape NC-12 already asks for — untrusted sources
+    /// that must AGREE, never one that is trusted — applied to the node's reading of its own
+    /// address.
     ///
     /// # What this deliberately does NOT do
     ///
     /// It does not know what any source IS. No range is special-cased, and in particular no AWS
     /// range is: blocking `2600:1f00::/24` would paper over one instance of a general defect and
-    /// would be wrong for every node legitimately running on EC2, which many will.
-    pub fn corroborated_addresses(&self) -> Vec<SocketAddr> {
-        let mut agreed: Vec<SocketAddr> = Vec::new();
-        for reading in &self.reflexive {
-            let confirmed = self
-                .reflexive
-                .iter()
-                .any(|other| other.addr == reading.addr && other.source != reading.source);
-            if confirmed && !agreed.contains(&reading.addr) {
-                agreed.push(reading.addr);
-            }
-        }
-        agreed
+    /// would be wrong for every node legitimately running on EC2, which many will (`dig_stun`'s own
+    /// rule, not re-derived here).
+    ///
+    /// # The availability trade this makes, recorded rather than left implicit
+    ///
+    /// A DEGENERATE reading — loopback, private, link-local, from a source unrelated to the ones
+    /// that agree on a genuinely public address — is NOT excluded before the unanimity check. It
+    /// counts as an ordinary dissenting IP, which per `dig-stun` `SPEC.md` §7.3 step 3 discards the
+    /// WHOLE family, the properly-agreed address included, not merely the degenerate one. This is
+    /// `dig-stun`'s own documented behaviour (confirmed by reading its SPEC, not an artifact of how
+    /// this crate feeds it): step 3 (unanimity) runs BEFORE step 5 (global-unicast scope), so a
+    /// reading is never given the benefit of "obviously broken, so it must not count as dissent" —
+    /// dig-stun's own words are "a node behind a multi-egress NAT, a misconfigured relay, and a
+    /// lying peer all look the same from here, and in every one of those cases advertising is
+    /// wrong." One misbehaving or misconfigured source (a bad relay, a bad operator-configured
+    /// entry, or — once the peer tier of `dig_ecosystem#3199` lands — a single dishonest peer) can
+    /// therefore indefinitely deny establishment for an otherwise-legitimate address in the same
+    /// family, with no requirement that ITS OWN reading be corroborated by anyone. This is the
+    /// correct, SAFE direction for a value staked on chain (§7.5: a wrong `Established` costs
+    /// collateral permanently; a wrong non-establishment costs one epoch's rewards and is visible in
+    /// `dign network-info`) — never weaken it to a majority vote to buy back availability, since a
+    /// majority over sources an attacker can cheaply add is not a security property. It is
+    /// nonetheless a real availability/griefing cost, and this paragraph is that decision recorded.
+    pub fn established(&self) -> dig_stun::establish::Established {
+        let readings: Vec<dig_stun::establish::Reading> = self
+            .reflexive
+            .iter()
+            .map(|r| dig_stun::establish::Reading::new(r.source.clone(), r.addr))
+            .collect();
+        dig_stun::establish::establish(&readings)
+    }
+
+    /// The addresses [`Self::established`] verdicts as ESTABLISHED, across both families, IPv6
+    /// first (§5.2) — empty when neither family establishes.
+    ///
+    /// Every reading a pass gathers already carries the SAME port (this node's own listen port; see
+    /// `dig-node-core`'s `net.rs::reflexive_candidate`, which pairs every STUN result with it rather
+    /// than the ephemeral port STUN itself observed), so re-pairing an established IP with that port
+    /// is exact, not a guess — `dig_stun::establish::FamilyVerdict::Established` carries only the IP
+    /// because agreement never compares ports (`SPEC.md` §7.3), but a URL still needs one.
+    pub fn established_addresses(&self) -> Vec<SocketAddr> {
+        let Some(port) = self.reflexive.first().map(|r| r.addr.port()) else {
+            return Vec::new();
+        };
+        let established = self.established();
+        [
+            established.ipv6_addr().map(IpAddr::V6),
+            established.ipv4_addr().map(IpAddr::V4),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect()
+    }
+
+    /// Whether either address family reached agreement on a non-global-unicast address --
+    /// `dig_stun::establish::FamilyVerdict::NotGlobal` for IPv6 or IPv4. Distinct from
+    /// [`Self::established_addresses`] being empty: THAT is also true for a genuine disagreement or
+    /// too few classes, which [`effective_urls`] must report as [`AdvertiseState::Uncorroborated`]
+    /// rather than [`AdvertiseState::NoPublicAddress`] -- the two have different remedies, and only
+    /// this method tells them apart.
+    pub fn any_family_not_global(&self) -> bool {
+        use dig_stun::establish::FamilyVerdict;
+        let established = self.established();
+        matches!(established.ipv6, FamilyVerdict::NotGlobal { .. })
+            || matches!(established.ipv4, FamilyVerdict::NotGlobal { .. })
     }
 
     /// Reads one pass's view out of `dig.getNetworkInfo`'s answer.
@@ -386,7 +453,7 @@ pub enum AdvertiseState {
     /// Exactly one source reported an address, and nothing has confirmed it.
     ///
     /// Distinct from [`Self::NoPublicAddress`] because the remedy differs: this node is not missing
-    /// an answer, it is missing a SECOND one. See [`PublicAddress::corroborated_addresses`] for why
+    /// an answer, it is missing a SECOND one. See [`PublicAddress::established_addresses`] for why
     /// one is not enough.
     Uncorroborated,
     /// A public address is known, but no path to this node is currently held.
@@ -537,13 +604,21 @@ pub fn effective_urls(operator: &Advertised, address: &PublicAddress) -> Effecti
         };
     }
 
-    let agreed = address.corroborated_addresses();
+    let agreed = address.established_addresses();
     if agreed.is_empty() {
-        // WHICH kind of nothing. "No source has spoken" and "one source has spoken and nothing
-        // confirms it" are different conditions with different remedies, and the second is the one
-        // a node sits in while a broken STUN server answers it confidently.
+        // WHICH kind of nothing. Three conditions land here, with two different remedies:
+        //
+        // 1. Nothing has ever reported an address (`address.reflexive.is_empty()`).
+        // 2. Something reported an address that is not a public one at all -- a loopback, private,
+        //    or documentation reading `dig_stun::establish` classifies `NotGlobal` regardless of how
+        //    well the sources otherwise agreed. This is `NoPublicAddress` too, by that state's OWN
+        //    documented contract ("what was reported is not a public address"): a broken reading of
+        //    this node's position is not knowledge of where a stranger reaches it, agreement or not.
+        // 3. Sources genuinely disagree, or too few independent classes answered
+        //    (`address.reflexive` non-empty, no family `NotGlobal`) -- the one case that is missing
+        //    a SECOND source rather than a valid one, `Uncorroborated`.
         return Effective {
-            state: if address.reflexive.is_empty() {
+            state: if address.reflexive.is_empty() || address.any_family_not_global() {
                 AdvertiseState::NoPublicAddress
             } else {
                 AdvertiseState::Uncorroborated
@@ -587,7 +662,7 @@ pub fn effective_urls(operator: &Advertised, address: &PublicAddress) -> Effecti
 ///   not render as a parseable URL at all.
 ///
 /// A reflexive address is a reading, not a promise. That is why it arrives here already agreed
-/// between two sources ([`PublicAddress::corroborated_addresses`]) and still has to clear both.
+/// between two sources ([`PublicAddress::established_addresses`]) and still has to clear both.
 fn derived_urls(agreed: &[SocketAddr]) -> Advertised {
     let (v6, v4): (Vec<&SocketAddr>, Vec<&SocketAddr>) =
         agreed.iter().partition(|addr| addr.is_ipv6());
@@ -619,7 +694,7 @@ fn derived_urls(agreed: &[SocketAddr]) -> Advertised {
 /// special-cased and none ever should be** — blocking the AWS block that `relay.dig.net#11`
 /// produced would paper over one instance of a general defect and would be wrong for every node
 /// legitimately running on EC2, which many will. That defect is caught by AGREEMENT
-/// ([`PublicAddress::corroborated_addresses`]), which is where it belongs; this function catches the
+/// ([`PublicAddress::established_addresses`]), which is where it belongs; this function catches the
 /// different and simpler class of a reading that is not a public address at all.
 ///
 /// An IPv6 address that merely WRAPS an IPv4 one is judged by the address it embeds, for the same
@@ -1255,6 +1330,105 @@ mod tests {
         );
     }
 
+    /// **A single dissenting THIRD reading blocks establishment even though two OTHER classes agree
+    /// with each other.** This is the property that distinguishes `dig_stun::establish`
+    /// (dig-node#566) from this module's OWN prior pairwise check, which this fixture would have
+    /// defeated: two readings from different sources agreeing on `AGREED` each had "another reading
+    /// with a different source and the same address", so the retired `corroborated_addresses` would
+    /// have returned `[AGREED]` and staked a coin on it — a majority vote, not agreement. `establish`
+    /// requires UNANIMITY per family: one dissenter is treated as proof something is wrong, however
+    /// many others agree.
+    #[test]
+    fn a_dissenting_third_reading_blocks_establishment_even_though_two_others_agree() {
+        // AGREED is genuinely global-unicast (PUBLIC_V4, the module's own convention) so the
+        // revert-proof for this test fails for the INTENDED reason (the retired rival wrongly
+        // ESTABLISHES the majority address) rather than being incidentally caught by the routability
+        // check first — a documentation-range AGREED would confound the two.
+        const AGREED: &str = PUBLIC_V4;
+        const DISSENT: &str = "1.1.1.1:9444";
+        let majority_but_not_unanimous = PublicAddress {
+            reflexive: vec![
+                seen("relay", AGREED),
+                seen("stun.example", AGREED),
+                seen("operator", DISSENT),
+            ],
+            relay_reserved: true,
+            direct_mapping: false,
+        };
+        let got = effective_urls(&Advertised::default(), &majority_but_not_unanimous);
+
+        assert_eq!(
+            got.state,
+            AdvertiseState::Uncorroborated,
+            "a dissenter must block establishment, not merely fail to join it: {got:?}"
+        );
+        assert!(
+            got.urls.is_empty(),
+            "the two-source majority must NOT be published despite agreeing with each other: {got:?}"
+        );
+    }
+
+    /// **Two readings from the SAME class do not establish, however many there are.** The floor
+    /// counts independent CLASSES, not readings — ten repeats of one relay is still one voice.
+    /// (Same property `one_source_is_never_enough_however_confident_it_is` already covers with a
+    /// literal string comparison; this fixture instead proves it survives the `dig_stun::establish`
+    /// integration specifically, using class-grammar-shaped source strings rather than bare labels.)
+    #[test]
+    fn two_readings_from_the_same_class_do_not_establish() {
+        let same_class_twice = PublicAddress {
+            reflexive: vec![
+                seen("relay:relay.dig.net", PUBLIC_V4),
+                seen("relay:relay.dig.net", PUBLIC_V4),
+            ],
+            relay_reserved: true,
+            direct_mapping: false,
+        };
+        let got = effective_urls(&Advertised::default(), &same_class_twice);
+
+        assert_eq!(got.state, AdvertiseState::Uncorroborated, "{got:?}");
+        assert!(got.urls.is_empty(), "{got:?}");
+    }
+
+    /// **Two `peer:*` classes are insufficient; three establish** — the escalated floor
+    /// `dig_stun::establish` applies when EVERY agreeing class is a peer class (`SPEC.md` §7.4),
+    /// because two peer classes is exactly two cheap VMs in two provider blocks. dig-node has no
+    /// peer tier yet (`dig_ecosystem#3199`), so this proves the INTEGRATION forwards class strings
+    /// to `dig_stun` verbatim rather than dig-node silently normalising or filtering them — a wrong
+    /// integration here would go undetected until the peer tier lands and quietly under- or
+    /// over-establish.
+    #[test]
+    fn two_peer_classes_are_insufficient_but_three_establish() {
+        let two_peers = PublicAddress {
+            reflexive: vec![
+                seen("peer:v4:203.0", PUBLIC_V4),
+                seen("peer:v4:198.51", PUBLIC_V4),
+            ],
+            relay_reserved: true,
+            direct_mapping: false,
+        };
+        assert_eq!(
+            effective_urls(&Advertised::default(), &two_peers).state,
+            AdvertiseState::Uncorroborated,
+            "two peer classes must not meet the peer-only floor of three"
+        );
+
+        let three_peers = PublicAddress {
+            reflexive: vec![
+                seen("peer:v4:203.0", PUBLIC_V4),
+                seen("peer:v4:198.51", PUBLIC_V4),
+                seen("peer:v4:192.0", PUBLIC_V4),
+            ],
+            relay_reserved: true,
+            direct_mapping: false,
+        };
+        let got = effective_urls(&Advertised::default(), &three_peers);
+        assert_eq!(
+            got.state,
+            AdvertiseState::Derived,
+            "a third independent peer class must clear the escalated floor: {got:?}"
+        );
+    }
+
     /// **No provider range is special-cased.** An address inside AWS's block is published like any
     /// other once two sources agree on it.
     ///
@@ -1465,25 +1639,47 @@ mod tests {
         );
     }
 
-    /// A this-machine mapping is dropped while its genuinely public sibling survives.
+    /// A this-machine mapping is dropped while its genuinely public sibling, in the OTHER address
+    /// family, survives.
     ///
-    /// A reading is not a promise: a seam reporting a loopback or link-local mapping must be
-    /// refused exactly as an operator typing one is. The honest sibling in the same fixture is what
-    /// separates this from a blanket refusal of every derived address.
+    /// A reading is not a promise: a seam reporting a loopback mapping must be refused exactly as
+    /// an operator typing one is. The honest sibling in the same fixture is what separates this
+    /// from a blanket refusal of every derived address.
+    ///
+    /// # Why exactly ONE bad address, in the family PUBLIC_V4 is not in
+    ///
+    /// A prior version of this fixture put THREE bad IPv4 addresses beside `PUBLIC_V4` — all four
+    /// in the same family, all "agreed" by the same two source labels. Under
+    /// `dig_stun::establish` (dig-node#566) that is not "three bad readings the filter drops while
+    /// the good one survives" — it is four DISTINCT IPs reported for one family, which is
+    /// `FamilyVerdict::Disagreement` and refuses ALL FOUR, the good one included: a source that
+    /// reports several different addresses for what it claims is the same query is treated as
+    /// evidence something is wrong, not as several independent claims to filter individually. That
+    /// is the correct, intended behaviour — the old fixture tested a shape that can no longer occur
+    /// bug-free. One bad address, alone in its family, still proves a this-machine reading is
+    /// refused even with full agreement; it is just `established`'s own routability gate that
+    /// catches it now; not `derived_urls`'s.
+    ///
+    /// # Why `fe80::1` (link-local) rather than `::1` (loopback)
+    ///
+    /// `::1` is the IPv4-COMPATIBLE encoding of `0.0.0.1` (`Ipv6Addr::to_ipv4`), and `dig_stun`
+    /// folds it there BEFORE bucketing by family (`SPEC.md` §5.3) precisely so an on-path STUN
+    /// server cannot smuggle a rejected IPv4 range past a v6-only classifier. Using `::1` here would
+    /// silently land it in PUBLIC_V4's OWN family and manufacture the exact disagreement this
+    /// fixture exists to avoid. `fe80::1` has non-zero upper bits, does not fold, and stays
+    /// genuinely IPv6 — still refused (link-local is `Scope::NeverDialable`), still isolated in its
+    /// own family.
     #[test]
     fn a_this_machine_reflexive_address_is_never_derived_into_a_coin() {
-        let mut readings = Vec::new();
-        for bad in ["127.0.0.1:9444", "[::1]:9444", "169.254.10.4:9444"] {
-            readings.push(seen("relay", bad));
-            readings.push(seen("stun.example", bad));
-        }
-        readings.push(seen("relay", PUBLIC_V4));
-        readings.push(seen("stun.example", PUBLIC_V4));
-
         let got = effective_urls(
             &Advertised::default(),
             &PublicAddress {
-                reflexive: readings,
+                reflexive: vec![
+                    seen("relay", "[fe80::1]:9444"),
+                    seen("stun.example", "[fe80::1]:9444"),
+                    seen("relay", PUBLIC_V4),
+                    seen("stun.example", PUBLIC_V4),
+                ],
                 relay_reserved: true,
                 direct_mapping: false,
             },
@@ -1521,7 +1717,7 @@ mod tests {
         assert_eq!(read.reflexive.len(), 1, "{read:?}");
         assert!(!read.relay_reserved, "{read:?}");
         assert!(
-            read.corroborated_addresses().is_empty(),
+            read.established_addresses().is_empty(),
             "one unnamed reading is not two reporters agreeing: {read:?}"
         );
 
@@ -1536,7 +1732,7 @@ mod tests {
             "an unparseable entry is dropped, not fatal: {read:?}"
         );
         assert!(
-            read.corroborated_addresses().is_empty(),
+            read.established_addresses().is_empty(),
             "a list of bare strings carries no provenance, so it can never corroborate: {read:?}"
         );
 
@@ -1550,7 +1746,7 @@ mod tests {
         });
         let read = PublicAddress::from_network_info(&attributed);
         assert_eq!(
-            read.corroborated_addresses(),
+            read.established_addresses(),
             vec![PUBLIC_V6.parse::<SocketAddr>().expect("a socket address")],
             "two named sources agreeing is the one shape that corroborates: {read:?}"
         );

@@ -24,6 +24,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use dig_stun::establish::SourceClass;
+
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 
@@ -669,6 +671,260 @@ pub fn public_stun_servers() -> Vec<SocketAddr> {
     out
 }
 
+// -- Multi-source gather for AGREEMENT (dig-node#566) --------------------------------------------
+//
+// Everything above this point answers "give me ONE endpoint" and stops at the first tier that
+// answers - correct for the hole-punch tier / DHT transport ([`StunPlan::discover_reflexive`]),
+// which needs exactly one server to feed its traversal ladder. It is NOT correct for deciding what
+// this node believes its own address to be: `relay.dig.net` answered every IPv4 caller with its own
+// load balancer's address, well-formed and confidently, and a first-answer-wins reader has no way to
+// see that (`relay.dig.net#11`). NC-12's rule applies here as much as anywhere else in this
+// codebase - untrusted sources must AGREE, never be trusted individually - so what follows GATHERS
+// every reading it can, rather than stopping at the first.
+
+/// One independence CLASS of STUN source ([`dig_stun::establish::SourceClass`]), paired with every
+/// endpoint that speaks for it.
+///
+/// The class has to be attached at the HOST, before DNS resolution collapses it into a bare
+/// [`SocketAddr`]: the relay's dedicated `stun.<host>` endpoint and its bare host answer for the
+/// SAME class ("one class per relay host"), but `stun.l.google.com` and `stun.cloudflare.com` are
+/// DIFFERENT classes - they are different operators, and collapsing them the way
+/// [`public_stun_servers`] does for the first-answer-wins path would let one third party count as
+/// two independent voices.
+#[derive(Debug, Clone)]
+struct StunClassEndpoint {
+    /// Which tier this class belongs to - carried only for the operator-facing log; agreement
+    /// itself looks solely at `class`.
+    source: StunSource,
+    /// The label [`dig_stun::establish::Reading::source`] carries, e.g. `relay:relay.dig.net` or
+    /// `public:stun.l.google.com`. Rendered by [`dig_stun::establish::SourceClass`]'s `Display` impl
+    /// so this crate never hand-formats the grammar `establish` parses back out.
+    class: String,
+    /// This class's resolved endpoints, in whatever order DNS returned them
+    /// ([`stun_dial_order`] sorts IPv6-first when a caller walks them).
+    endpoints: Vec<SocketAddr>,
+}
+
+/// The operator-configured STUN servers from [`STUN_SERVER_ENV`], one class PER CONFIGURED ENTRY -
+/// "each configured endpoint is its own class, the operator vouched for it specifically"
+/// ([`dig_stun::establish::SourceClass::Operator`]). Empty when unset. Best-effort blocking DNS;
+/// call off the async runtime.
+fn operator_stun_classes() -> Vec<StunClassEndpoint> {
+    let Ok(raw) = std::env::var(STUN_SERVER_ENV) else {
+        return Vec::new();
+    };
+    raw.split([',', ' ', '\t', '\n', '\r'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(split_stun_host_port)
+        .map(|(host, port)| StunClassEndpoint {
+            source: StunSource::Operator,
+            class: SourceClass::operator(host.clone(), port).to_string(),
+            endpoints: resolve_stun_host(&host, port),
+        })
+        .filter(|group| !group.endpoints.is_empty())
+        .collect()
+}
+
+/// The relay's co-located STUN server as ONE class - "one class per relay host", so its dedicated
+/// `stun.<host>` endpoint and its bare host answer for the SAME class regardless of which resolved
+/// or which address family answered. `None` when relay-less or nothing resolves. Best-effort
+/// blocking DNS; call off the async runtime.
+fn relay_stun_class(relay_endpoint: &str) -> Option<StunClassEndpoint> {
+    let host = parse_relay_host(relay_endpoint)?;
+    let endpoints = stun_servers_from_relay(relay_endpoint);
+    if endpoints.is_empty() {
+        return None;
+    }
+    Some(StunClassEndpoint {
+        source: StunSource::Relay,
+        class: SourceClass::relay(host).to_string(),
+        endpoints,
+    })
+}
+
+/// [`PUBLIC_STUN_SERVERS`], one class PER HOST - `public:stun.l.google.com` and
+/// `public:stun.cloudflare.com` are DIFFERENT classes (dig-node#566) because they are different
+/// operators. Best-effort blocking DNS; call off the async runtime.
+fn public_stun_classes() -> Vec<StunClassEndpoint> {
+    PUBLIC_STUN_SERVERS
+        .iter()
+        .map(|&(host, port)| StunClassEndpoint {
+            source: StunSource::Public,
+            class: SourceClass::public(host).to_string(),
+            endpoints: resolve_stun_host(host, port),
+        })
+        .filter(|group| !group.endpoints.is_empty())
+        .collect()
+}
+
+/// Resolve every input [`gather_reflexive_readings`] needs, mirroring [`StunPlan::resolve`]'s
+/// relay-optional shape: `(operator classes, relay class, public classes)`. Best-effort blocking
+/// DNS throughout; call off the async runtime.
+fn resolve_stun_classes(
+    relay_endpoint: Option<&str>,
+) -> (
+    Vec<StunClassEndpoint>,
+    Vec<StunClassEndpoint>,
+    Vec<StunClassEndpoint>,
+) {
+    let relay = relay_endpoint
+        .and_then(relay_stun_class)
+        .into_iter()
+        .collect();
+    (operator_stun_classes(), relay, public_stun_classes())
+}
+
+/// One reading gathered toward establishing this node's reflexive address (dig-node#566).
+#[derive(Debug, Clone)]
+pub struct GatheredReading {
+    /// Which tier this reading's class belongs to.
+    pub source: StunSource,
+    /// The class label, e.g. `relay:relay.dig.net` - what [`dig.getNetworkInfo`]'s `reflexive_addr`
+    /// publishes as `source`, and what [`dig_stun::establish::Reading::source`] agreement compares.
+    pub class: String,
+    /// The dialable candidate this reading reported, `<public-ip>:<listen-port>`.
+    pub addr: SocketAddr,
+    /// The STUN server that answered.
+    pub server: SocketAddr,
+}
+
+/// Run ONE bounded Binding transaction against `server` and, if it answers HONESTLY, append the
+/// resulting [`GatheredReading`] to `readings`. Shares [`StunPlan::discover_reflexive`]'s bind-to-
+/// the-real-listen-port (#1388) and cross-family-discard (`relay.dig.net#11`) discipline exactly -
+/// an answer whose family differs from the family queried over is not about THIS query and must be
+/// dropped rather than believed just because the transaction otherwise completed.
+async fn query_one_into(
+    group: &StunClassEndpoint,
+    server: SocketAddr,
+    port: u16,
+    timeout: Duration,
+    readings: &mut Vec<GatheredReading>,
+) {
+    let Ok(socket) = bind_stun_socket(port, server.is_ipv6()) else {
+        return;
+    };
+    let Ok(result) = dig_nat::stun::query_reflexive_address(&socket, server, timeout).await else {
+        return;
+    };
+    if dig_ip::Family::of(&result) != dig_ip::Family::of(&server) {
+        return;
+    }
+    readings.push(GatheredReading {
+        source: group.source,
+        class: group.class.clone(),
+        addr: reflexive_candidate(result, port),
+        server,
+    });
+}
+
+/// Query every endpoint in `group`, IPv6-first, appending a [`GatheredReading`] for each one that
+/// answers. Unlike [`StunPlan::discover_reflexive`]'s first-answer-wins walk, this does NOT stop at
+/// the first success: agreement needs every reading this class can offer, not just enough to move
+/// on to the next one.
+async fn query_class_into(
+    group: &StunClassEndpoint,
+    port: u16,
+    timeout: Duration,
+    readings: &mut Vec<GatheredReading>,
+) {
+    for server in stun_dial_order(&group.endpoints) {
+        query_one_into(group, server, port, timeout, readings).await;
+    }
+}
+
+/// How many DISTINCT classes have reported an address in the family `ipv6` selects, among
+/// `readings` gathered so far.
+///
+/// A plain `addr.is_ipv6()` bucket, not [`dig_stun`]'s fold-aware one: every reading here already
+/// SURVIVED [`query_one_into`]'s cross-family discard, which rejects a v4-mapped answer to a v6
+/// query the same way `dig_stun::establish` would fold it, so the two bucketings agree on every
+/// reading that reaches this count. Where they could ever disagree, this function's job is only to
+/// decide whether ANOTHER query is worth making: undercounting costs one extra query the public
+/// tier didn't need to answer, and can never let a reading through that `establish` would refuse -
+/// the safe failure direction (CLAUDE.md §1.10).
+fn classes_for_family(readings: &[GatheredReading], ipv6: bool) -> usize {
+    let mut classes: Vec<&str> = readings
+        .iter()
+        .filter(|r| r.addr.is_ipv6() == ipv6)
+        .map(|r| r.class.as_str())
+        .collect();
+    classes.sort_unstable();
+    classes.dedup();
+    classes.len()
+}
+
+/// Gather every reading this node's reflexive address needs to be ESTABLISHED (dig-node#566):
+/// query the operator + relay tiers in FULL, then consult the public tier ONLY for whichever
+/// address family still has fewer than [`dig_stun::establish::MIN_INDEPENDENT_CLASSES`] distinct
+/// classes without it.
+///
+/// # Why gather rather than stop at the first answer
+///
+/// [`StunPlan::discover_reflexive`] answers a different question - one endpoint for the hole-punch
+/// tier / DHT transport, where first-answer-wins is correct and stays unchanged
+/// (`stun_server` in `bring_up_dht`/`run_peer_network` keeps using it). This function answers
+/// "what does this node believe its own address to be", which a single untrusted answer can never
+/// settle.
+///
+/// # The privacy trade this makes explicit
+///
+/// The operator and relay tiers are this node's OWN configured infrastructure; querying them in
+/// full costs nothing extra in disclosure. The public tier is the ONLY tier that tells a third party
+/// this node's address, so it is engaged per-family and only until that family's class floor is
+/// met - never queried at all once operator+relay alone reach it. The actual verdict (unanimous IP,
+/// enough independent classes, global-unicast scope) is [`dig_stun::establish::establish`]'s, not
+/// this function's: `mirror::advertise::PublicAddress` (dig-node-service) re-derives it from the
+/// readings [`crate::peer::PeerStatus`] publishes through `dig.getNetworkInfo`, rather than this
+/// function deciding anything for itself.
+///
+/// Resolution (DNS for the operator/relay/public hosts) is best-effort and blocking, so — exactly
+/// like [`StunPlan::resolve`] — it runs via [`tokio::task::spawn_blocking`] rather than on the
+/// caller's async task; a resolution failure yields empty tiers rather than propagating an error.
+pub async fn gather_reflexive_readings(
+    relay_endpoint: Option<String>,
+    port: u16,
+    timeout: Duration,
+) -> Vec<GatheredReading> {
+    let (operator, relay, public) =
+        tokio::task::spawn_blocking(move || resolve_stun_classes(relay_endpoint.as_deref()))
+            .await
+            .unwrap_or_default();
+    gather_from_classes(operator, relay, public, port, timeout).await
+}
+
+/// The pure-over-already-resolved-classes core of [`gather_reflexive_readings`] — the seam the
+/// tier-precedence / public-skip tests below drive with fake loopback endpoints, mirroring how
+/// [`StunPlan::from_tiers`] lets the existing tier-precedence tests avoid live DNS.
+async fn gather_from_classes(
+    operator: Vec<StunClassEndpoint>,
+    relay: Vec<StunClassEndpoint>,
+    public: Vec<StunClassEndpoint>,
+    port: u16,
+    timeout: Duration,
+) -> Vec<GatheredReading> {
+    let mut readings: Vec<GatheredReading> = Vec::new();
+
+    // 1. This node's own infrastructure, queried in full - no third party learns anything here.
+    for group in operator.iter().chain(relay.iter()) {
+        query_class_into(group, port, timeout, &mut readings).await;
+    }
+
+    // 2. The public tier: per-family, and ONLY while that family is still short of the
+    //    corroboration floor.
+    for group in &public {
+        for server in stun_dial_order(&group.endpoints) {
+            let short = classes_for_family(&readings, server.is_ipv6())
+                < dig_stun::establish::MIN_INDEPENDENT_CLASSES;
+            if short {
+                query_one_into(group, server, port, timeout, &mut readings).await;
+            }
+        }
+    }
+
+    readings
+}
+
 /// What a successful reflexive discovery learned: the dialable candidate, WHICH tier answered, and
 /// the exact server that did.
 ///
@@ -836,7 +1092,7 @@ pub fn stun_fallback_warning(
     match discovery {
         Some(d) if d.source == StunSource::Public && plan.has_source(StunSource::Relay) => {
             Some(format!(
-                "the DIG relay answered no STUN binding request; this node's reflexive address came from the PUBLIC fallback server {} instead. The relay is preferred and this node will use it again automatically the next time it answers, with no restart needed; dig_ecosystem#3198 tracks requiring a second source to agree before this reading is used durably.",
+                "the DIG relay answered no STUN binding request; this node's reflexive address came from the PUBLIC fallback server {} instead. The relay is preferred and this node will use it again automatically the next time it answers, with no restart needed; a durable/on-chain advertisement still requires a SECOND independent source to agree before this reading is believed (dig-node#566).",
                 d.server
             ))
         }
@@ -2007,6 +2263,122 @@ mod tests {
         assert!(
             after.is_some(),
             "no STUN tier answered on this host; check outbound UDP before reading this as a defect"
+        );
+    }
+
+    // -- Multi-source gather for AGREEMENT (dig-node#566) -----------------------------------------
+
+    /// One class endpoint over a fake STUN server that answers with `mapped`, for the gather tests
+    /// below - a thin wrapper so each test states only what varies (the class label and the answer).
+    async fn fake_class(source: StunSource, class: &str, mapped: &str) -> StunClassEndpoint {
+        StunClassEndpoint {
+            source,
+            class: class.to_string(),
+            endpoints: vec![spawn_fake_stun(mapped).await],
+        }
+    }
+
+    /// **The property: the public tier is never consulted once a family already has enough
+    /// independent classes without it.** Two DIFFERENT operator classes alone already meet
+    /// [`dig_stun::establish::MIN_INDEPENDENT_CLASSES`], so a public class that WOULD answer with a
+    /// dissenting address must never be asked at all.
+    ///
+    /// The distinguishing fixture is the dissenting public answer, not merely its absence: if the
+    /// gather queried public regardless of sufficiency (the wrong implementation this guards
+    /// against), that dissenting reading would appear in the result and this test would see 3
+    /// readings instead of 2, with the dissenting IP among them.
+    #[tokio::test]
+    async fn public_tier_is_skipped_once_operator_alone_reaches_the_class_floor() {
+        // Genuinely global-unicast, NOT a documentation range: dig-nat's own
+        // `is_usable_reflexive_addr` rejects `203.0.113.0/24` et al. as `StunError::NoMappedAddress`
+        // regardless of family (see `a_cross_family_stun_answer_is_discarded_the_other_direction_too`
+        // above for the same trap), which would make every reading here silently vanish before the
+        // property under test is ever exercised.
+        const AGREED: &str = "93.184.216.34:9444";
+        const DISSENT: &str = "1.1.1.1:9444";
+        let port = free_local_port();
+
+        let operator = vec![
+            fake_class(StunSource::Operator, "operator:one", AGREED).await,
+            fake_class(StunSource::Operator, "operator:two", AGREED).await,
+        ];
+        let public = vec![fake_class(StunSource::Public, "public:would-dissent", DISSENT).await];
+
+        let readings =
+            gather_from_classes(operator, Vec::new(), public, port, Duration::from_secs(2)).await;
+
+        assert_eq!(
+            readings.len(),
+            2,
+            "public must not have been queried once operator alone gave 2 classes: {readings:?}"
+        );
+        assert!(
+            readings.iter().all(|r| r.class.starts_with("operator:")),
+            "no public-tier reading may appear here: {readings:?}"
+        );
+        assert!(
+            readings
+                .iter()
+                .all(|r| r.addr.ip().to_string() == "93.184.216.34"),
+            "every surviving reading must be the operator-agreed address: {readings:?}"
+        );
+    }
+
+    /// **The companion property: public IS consulted, and its reading kept, when a family is
+    /// genuinely short of classes.** A single relay class alone cannot meet the floor, so the public
+    /// tier must be engaged - and here it agrees, giving the family its second independent class.
+    #[tokio::test]
+    async fn public_tier_is_queried_and_kept_when_the_family_is_short() {
+        // Global-unicast, not a documentation range - see the comment on the sibling test above.
+        const AGREED: &str = "93.184.216.34:9444";
+        let port = free_local_port();
+
+        let relay = vec![fake_class(StunSource::Relay, "relay:relay.example", AGREED).await];
+        let public = vec![fake_class(StunSource::Public, "public:stun.example", AGREED).await];
+
+        let readings =
+            gather_from_classes(Vec::new(), relay, public, port, Duration::from_secs(2)).await;
+
+        assert_eq!(
+            readings.len(),
+            2,
+            "public must have been queried - relay alone is only one class: {readings:?}"
+        );
+        assert!(
+            readings.iter().any(|r| r.class.starts_with("public:")),
+            "the public reading must survive into the result: {readings:?}"
+        );
+    }
+
+    /// Operator and relay are queried in FULL regardless of sufficiency - they are this node's own
+    /// infrastructure, so there is no third party to protect by skipping them. Two operator classes
+    /// both answer even though the first alone would already leave IPv4 no shorter than IPv6 (this
+    /// gather has no notion of "enough" for anything but the public tier).
+    #[tokio::test]
+    async fn operator_and_relay_are_always_queried_in_full() {
+        // Global-unicast, not a documentation range - see the comment two tests above.
+        const A: &str = "93.184.216.34:9444";
+        const B: &str = "1.1.1.1:9444";
+        let port = free_local_port();
+
+        let operator = vec![
+            fake_class(StunSource::Operator, "operator:one", A).await,
+            fake_class(StunSource::Operator, "operator:two", B).await,
+        ];
+
+        let readings = gather_from_classes(
+            operator,
+            Vec::new(),
+            Vec::new(),
+            port,
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(
+            readings.len(),
+            2,
+            "both operator endpoints must have been queried: {readings:?}"
         );
     }
 }

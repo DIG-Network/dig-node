@@ -221,21 +221,26 @@ pub struct PeerStatus {
     peer_id: std::sync::Mutex<Option<String>>,
     /// The most recent peer-network error (best-effort diagnostics).
     last_error: std::sync::Mutex<Option<String>>,
-    /// This node's discovered server-reflexive address — the NAT mapping of its dig-peer socket a
-    /// stranger actually dials — paired with the label of whichever STUN tier reported it
-    /// ([`crate::net::StunSource::label`]). `None` is a real, standing state, not an unset default:
-    /// no tier has answered (yet, or ever, on a relay-less offline host), and `dig.getNetworkInfo`
-    /// must say so rather than guess (dig-node#567).
+    /// Every reading this node's reflexive address gather has collected — the NAT mapping(s) of its
+    /// dig-peer socket a stranger actually dials, each paired with the CLASS label of whoever
+    /// reported it (`dig_stun::establish::SourceClass`'s rendered form, e.g. `relay:relay.dig.net`;
+    /// see [`crate::net::gather_reflexive_readings`]). An empty `Vec` is a real, standing state, not
+    /// an unset default: no tier has ever answered (yet, or ever, on a relay-less offline host), and
+    /// `dig.getNetworkInfo` must say so rather than guess (dig-node#567).
     ///
-    /// Set ONCE, by [`Self::set_reflexive`] from the peer-network bring-up's STUN walk
-    /// (`StunPlan::discover_reflexive`), and never cleared: there is no periodic re-probe today, so
-    /// clearing it on some other signal would trade a real reading for a worse one — an
-    /// unconditional `None` — rather than a better one. Downstream reachability-over-time is a
-    /// SEPARATE fact already tracked by `relay_reserved` above; this field only ever answers "what
-    /// did the STUN walk see". Whether that reading may be STAKED on (agreement with a second
-    /// source, global routability, a currently-held path) is a mirror-crate concern applied
-    /// downstream, never decided here.
-    reflexive: std::sync::Mutex<Option<(std::net::SocketAddr, &'static str)>>,
+    /// **A single reading is never enough to STAKE anything on** — `relay.dig.net` once answered
+    /// every IPv4 caller with its own load balancer's address, well-formed and unerroring
+    /// (`relay.dig.net#11`) — so this field carries every reading gathered, plural, and leaves the
+    /// AGREEMENT decision (unanimous IP, independent source classes, global routability) to
+    /// `dig_stun::establish`, applied downstream by `mirror::advertise::PublicAddress` against what
+    /// [`crate::Node::network_info`] publishes from this field (dig-node#566). This field only ever
+    /// answers "what did the gather see", never "what may be believed".
+    ///
+    /// Set ONCE per gather, by [`Self::set_reflexive`], and never cleared: there is no periodic
+    /// re-probe today, so clearing it on some other signal would trade real readings for a worse
+    /// state — an unconditional empty `Vec` — rather than a better one. Downstream
+    /// reachability-over-time is a SEPARATE fact already tracked by `relay_reserved` above.
+    reflexive: std::sync::Mutex<Vec<(std::net::SocketAddr, String)>>,
 }
 
 impl PeerStatus {
@@ -289,21 +294,24 @@ impl PeerStatus {
         *self.last_error.lock().unwrap() = Some(error);
     }
 
-    /// Record this node's discovered server-reflexive address and the label of whichever STUN
-    /// tier reported it (`StunSource::label()`), called once from the peer-network bring-up after
-    /// `StunPlan::discover_reflexive` answers. A later call overwrites the reading — the bring-up
-    /// runs this exactly once today, so overwriting vs. first-write-wins is not yet a live
-    /// question, but overwrite is the correct choice if a second caller is ever added: the newer
-    /// STUN transaction is the better measurement of the node's CURRENT mapping.
-    pub fn set_reflexive(&self, addr: std::net::SocketAddr, source: &'static str) {
-        *self.reflexive.lock().unwrap() = Some((addr, source));
+    /// Record every reading this node's reflexive-address gather collected
+    /// ([`crate::net::gather_reflexive_readings`]), called once from the peer-network bring-up.
+    /// A later call REPLACES the whole set — the bring-up runs this exactly once today, so
+    /// replace-vs-merge is not yet a live question, but replace is the correct choice if a second
+    /// caller (a periodic re-probe) is ever added: the newer gather is the better measurement of
+    /// the node's CURRENT mapping, and merging stale readings into a fresh gather would let an old
+    /// answer keep voting after the world it described has changed.
+    pub fn set_reflexive(&self, readings: Vec<(std::net::SocketAddr, String)>) {
+        *self.reflexive.lock().unwrap() = readings;
     }
 
-    /// This node's discovered server-reflexive address and its reporting tier, or `None` when no
-    /// STUN tier has ever answered. Read by [`crate::Node::network_info`] to populate
-    /// `reflexive_addr` and to fold the address into the advertised candidate set (dig-node#567).
-    pub fn reflexive(&self) -> Option<(std::net::SocketAddr, &'static str)> {
-        *self.reflexive.lock().unwrap()
+    /// Every reading this node's reflexive-address gather has collected, each with its reporting
+    /// class — empty when no STUN tier has ever answered. Read by [`crate::Node::network_info`] to
+    /// populate `reflexive_addr` and to fold an address into the advertised candidate set
+    /// (dig-node#567); AGREEMENT over these readings (dig-node#566) is decided downstream by
+    /// `mirror::advertise::PublicAddress`, never here.
+    pub fn reflexive(&self) -> Vec<(std::net::SocketAddr, String)> {
+        self.reflexive.lock().unwrap().clone()
     }
 
     /// Whether the peer network is running.
@@ -2715,11 +2723,6 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         .map(|d| d.server)
         .or_else(|| stun_plan.primary());
     if let Some(d) = stun_discovery {
-        // Publish the reading onto the shared status so `dig.getNetworkInfo`'s `reflexive_addr`
-        // stops reporting a hard-coded `null` once something has actually answered (dig-node#567) —
-        // the whole reason a discovered address never reached a mirror-bond advertisement despite
-        // #561 shipping the discovery itself.
-        status.set_reflexive(d.addr, d.source.label());
         println!(
             "dig-node peer network: STUN server for reflexive discovery: {} (source: {})",
             d.server,
@@ -2731,6 +2734,39 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     if let Some(warning) = crate::net::stun_fallback_warning(&stun_plan, stun_discovery) {
         tracing::warn!("dig-node peer network: {warning}");
     }
+    // Gather EVERY reading toward the address this node ADVERTISES (dig-node#566) — a separate,
+    // additional walk from `stun_discovery` above: that one answers "one endpoint for the
+    // hole-punch tier", first-answer-wins, correctly, and stays untouched. Deciding what this node
+    // BELIEVES its own address to be needs every reading agreement can consider (operator + relay in
+    // full, public only while a family is still short of independent classes — see
+    // `gather_reflexive_readings`'s own doc), never just the first tier that answered.
+    let reflexive_readings = crate::net::gather_reflexive_readings(
+        relay_enabled().then(|| relay_endpoint.clone()),
+        peer_port_from_env(),
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    if !reflexive_readings.is_empty() {
+        println!(
+            "dig-node peer network: reflexive address gather collected {} reading(s): {}",
+            reflexive_readings.len(),
+            reflexive_readings
+                .iter()
+                .map(|r| format!("{}={}", r.class, r.addr))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // Publish every reading onto the shared status so `dig.getNetworkInfo`'s `reflexive_addr` stops
+    // reporting a hard-coded `null` once something has actually answered (dig-node#567) — and, once
+    // there is more than one, so `mirror::advertise::PublicAddress` downstream has enough to run
+    // `dig_stun::establish` over (dig-node#566) instead of being structurally stuck at one reading.
+    status.set_reflexive(
+        reflexive_readings
+            .iter()
+            .map(|r| (r.addr, r.class.clone()))
+            .collect(),
+    );
     // The resolved relay socket address, shared by the relayed dialer (Leg B initiator) AND the relay
     // accept loop below (Leg B responder, observability-only remote addr on accepted circuits).
     let relay_socket_addr: Option<std::net::SocketAddr> = if relay_enabled() {

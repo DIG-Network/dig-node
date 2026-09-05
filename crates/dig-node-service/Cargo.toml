@@ -109,6 +109,13 @@ dig-mirror-collateral = "0.3"
 # Without it a node could only ever record epoch 1, which is derivable from nothing.
 dig-mirror-coin = "0.9"
 
+# The agreement rule this node believes a reflexive address BY (dig-node#566): `establish` combines
+# several untrusted readings into a per-family verdict (unanimous IP, >=2 independent source
+# classes, global-unicast) before `mirror::advertise::PublicAddress` will let one reach a coin.
+# Replaces this crate's own pairwise `corroborated_addresses` check, which could not fail closed on
+# a dissenting THIRD source and did not distinguish source CLASSES from bare source strings.
+dig-stun = "0.1"
+
 # The canonical `ChainSource` trait `dig-mirror-coin`'s census is generic over. Declared, not
 # implemented: `chia-query` already provides the implementation this node uses
 # (`ChiaQueryProvider`), reached through `dig-wallet`'s one shared chain transport. Caret-matched
