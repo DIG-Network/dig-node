@@ -246,6 +246,13 @@ enum ConfigCommand {
         /// The upstream RPC URL (blank clears the override).
         url: String,
     },
+    /// Override (or clear) the URLs this node advertises in its own mirror-coin memos,
+    /// effective on next node start.
+    SetMirrorAdvertiseUrls {
+        /// Absolute URL(s) to advertise. Omit entirely to CLEAR the override and revert to this
+        /// node's derived (self-discovered) address.
+        urls: Vec<String>,
+    },
 }
 
 /// `dig-node cache` sub-actions. With none, prints the cache config.
@@ -1028,6 +1035,14 @@ fn config_action(cmd: Option<ConfigCommand>) -> ControlAction {
     match cmd {
         None | Some(ConfigCommand::Get) => ControlAction::ConfigGet,
         Some(ConfigCommand::SetUpstream { url }) => ControlAction::ConfigSetUpstream { url },
+        Some(ConfigCommand::SetMirrorAdvertiseUrls { urls }) => {
+            // An empty CLI invocation clears the override, exactly like an omitted `urls` on the
+            // wire (`SetMirrorAdvertiseUrlsParams`'s own `None` case) — never an explicit `[]`,
+            // which the node refuses as ambiguous.
+            ControlAction::ConfigSetMirrorAdvertiseUrls {
+                urls: (!urls.is_empty()).then_some(urls),
+            }
+        }
     }
 }
 

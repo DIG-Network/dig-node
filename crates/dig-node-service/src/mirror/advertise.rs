@@ -155,9 +155,46 @@ impl Advertised {
     }
 }
 
-/// Reads the operator's advertised-URL list from the environment.
+/// The precedence [`advertised_urls_from_env`] applies, pure over already-read inputs so it is
+/// unit-testable without process env mutation or a real config path — the same "drive the pure
+/// decision with fixture data, let the impure wrapper do the reading" split this module's own
+/// [`effective_urls`] already uses:
+///
+/// 1. **The live environment variable, when non-blank.** A deploy/CI export must never be
+///    silently shadowed by a saved control-plane choice — the same precedence `Config::from_env`'s
+///    upstream resolution already uses.
+/// 2. **Else the persisted override**, written by `control.config.setMirrorAdvertiseUrls`
+///    (dig-node#570). This is what makes that call's `requires_restart: true` promise genuine:
+///    nothing can rewrite a running process's own environment, but the NEXT process start reads
+///    this precedence fresh and picks the persisted value up.
+/// 3. **Else nothing.**
+fn advertised_urls_precedence(
+    env_value: Option<String>,
+    persisted: Option<Vec<String>>,
+) -> Advertised {
+    if let Some(v) = env_value.filter(|v| !v.trim().is_empty()) {
+        return parse_advertised_urls(&v);
+    }
+    match persisted {
+        Some(urls) => parse_advertised_urls(&urls.join(",")),
+        None => Advertised::default(),
+    }
+}
+
+/// [`advertised_urls_from_env`] for an explicit config path (tests) — see that function for the
+/// precedence this implements.
+pub fn advertised_urls_effective_from(config_path: &std::path::Path) -> Advertised {
+    advertised_urls_precedence(
+        std::env::var(ADVERTISE_URLS_ENV).ok(),
+        crate::control::read_mirror_advertise_urls_override_from(config_path),
+    )
+}
+
+/// Reads the operator's advertised-URL list: the live environment variable when set, else the
+/// persisted `control.config.setMirrorAdvertiseUrls` override (dig-node#570) — see
+/// [`advertised_urls_precedence`] for the exact rule and why the override is honoured here at all.
 pub fn advertised_urls_from_env() -> Advertised {
-    parse_advertised_urls(&std::env::var(ADVERTISE_URLS_ENV).unwrap_or_default())
+    advertised_urls_effective_from(&dig_node_core::config_path())
 }
 
 /// The URL scheme a derived entry is published under.
@@ -827,6 +864,59 @@ fn is_this_machine_only_v4(ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Persisted mirror-advertise-URLs override precedence (dig-node#570) -------------------
+    // Pure over already-read inputs (no env mutation, no filesystem), the same testing style
+    // every other decision in this module uses.
+
+    /// The live environment variable wins outright when non-blank, regardless of what a
+    /// persisted override holds — a deploy/CI export must never be silently shadowed by a saved
+    /// control-plane choice.
+    #[test]
+    fn the_env_value_wins_over_a_persisted_override_when_present() {
+        let result = advertised_urls_precedence(
+            Some("https://env.example".to_string()),
+            Some(vec!["https://persisted.example".to_string()]),
+        );
+        assert_eq!(result.accepted, vec!["https://env.example".to_string()]);
+    }
+
+    /// No env value at all: the persisted override is used — this is what makes
+    /// `control.config.setMirrorAdvertiseUrls`'s `requires_restart: true` promise become true the
+    /// next time the process starts.
+    #[test]
+    fn a_persisted_override_is_used_when_the_env_var_is_absent() {
+        let result =
+            advertised_urls_precedence(None, Some(vec!["https://persisted.example".to_string()]));
+        assert_eq!(
+            result.accepted,
+            vec!["https://persisted.example".to_string()]
+        );
+    }
+
+    /// A BLANK env value (set but empty/whitespace) counts as absent, not as an explicit "advertise
+    /// nothing" — matching `SetMirrorAdvertiseUrlsParams::validated`'s own refusal of an explicit
+    /// empty list: this module has no way to tell "unset" from "set to nothing" through a bare env
+    /// string, so it reads a blank the same permissive way it always has.
+    #[test]
+    fn a_blank_env_value_falls_back_to_the_persisted_override_too() {
+        let result = advertised_urls_precedence(
+            Some("   ".to_string()),
+            Some(vec!["https://persisted.example".to_string()]),
+        );
+        assert_eq!(
+            result.accepted,
+            vec!["https://persisted.example".to_string()]
+        );
+    }
+
+    /// Neither present: nothing to advertise, exactly `Advertised::default()` — the situation
+    /// every real dig-node is in before this override was ever set.
+    #[test]
+    fn neither_env_nor_persisted_yields_nothing() {
+        let result = advertised_urls_precedence(None, None);
+        assert_eq!(result, Advertised::default());
+    }
 
     /// **Every operator-facing line this module emits reads as a sentence.**
     ///

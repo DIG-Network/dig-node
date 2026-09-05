@@ -1684,8 +1684,9 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | Method | Params | Result (essentials) |
 |---|---|---|
 | `control.status` | — | `running`, `service`, `version`, `commit`, `protocol`, `uptime_secs`, `addr`, `upstream`, `cache`, `hosted_store_count`, `cached_capsule_count`, `pinned_store_count`, `sync.available`, `logging` (`initialized`, `dir`, `file_logging`, `file_error` — a START-UP verdict; see §20.1) |
-| `control.config.get` | — | `addr`, `port`, `upstream`, `upstream_override`, `cache_dir`, `cache_shared`, `config_path`, `sync_available` |
+| `control.config.get` | — | `addr`, `port`, `upstream`, `upstream_override`, `cache_dir`, `cache_shared`, `config_path`, `sync_available`, `mirror_advertise` (dig-node-control-interface 0.33.0's `MirrorAdvertiseView`: `urls`, `operator_override`, `state`) |
 | `control.config.setUpstream` | `upstream` (URL string; blank clears) | `upstream` (normalized), `requires_restart: true` — persisted, effective on next start (§3.4) |
+| `control.config.setMirrorAdvertiseUrls` | `urls` (non-empty list of absolute URLs to override with; omitted/`null` clears; an explicit empty list is `INVALID_PARAMS`) | `mirror_advertise` (`MirrorAdvertiseView`: the effective `urls`/`operator_override`/`state` THIS write produced), `requires_restart: true` — persisted to config.json and consulted by `advertised_urls_from_env`'s env-else-persisted precedence on the NEXT start; the currently-running mirror task already captured its operator URLs once at bring-up and cannot observe this write live. Ordinary tier (installs no principal). `INVALID_PARAMS` on an explicit empty list or a non-absolute URL. |
 | `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
 | `control.cache.get` | — | `cap_bytes`, `used_bytes`, `capsule_bytes`, `response_bytes`, `dir`, `shared` |
 | `control.profile.putBody` | `store_id`, `root` (64-hex), `body_b64` (standard padded base64 of the DPB bytes) | `stored: true`, `store_id`, `root`, `body_bytes`, `announced_to_peers`, `unreachable_peers`. `announced_to_peers` is a TRUE delivery count — peers the 223 announce was actually sent to, excluding lazy and NAT-bound peers that are connected but cannot be pushed to — so `0` does NOT mean failure and MUST NOT be treated as one: the body is persisted either way and the periodic re-announce reaches whoever connects later. `unreachable_peers` reports that connected-but-unreachable remainder, so a caller can distinguish "no peers exist" from "peers exist and none could be reached". The node MUST independently resolve the root on chain and refuse unless the chain confirms exactly that root AND the bytes hash to it (§22.3). A refusal is an ERROR, never an `Ok` carrying `stored: false`. A decoded body above `MAX_BODY_BYTES` (4 MiB) is `INVALID_PARAMS` before anything is persisted. |
@@ -2618,7 +2619,9 @@ token-free by design; it is not a control-parity subcommand and this rule does n
 - `info` → `control.status` — the rich node status (version, uptime, cache, hosted-store +
   cached-capsule counts, §21 sync availability). DISTINCT from `status` (§8.3), which is an
   unauthenticated `/health` liveness probe; `info` is the token-gated detailed view.
-- `config [get]` → `control.config.get`; `config set-upstream <url>` → `control.config.setUpstream`.
+- `config [get]` → `control.config.get`; `config set-upstream <url>` → `control.config.setUpstream`;
+  `config set-mirror-advertise-urls [<url>...]` → `control.config.setMirrorAdvertiseUrls` (no
+  arguments clears the override).
 - `cache [get]` → `control.cache.get`; `cache set-cap <bytes>` → `control.cache.setCap`;
   `cache clear` → `control.cache.clear`.
 - `stores [list]` → `control.hostedStores.list`; `stores pin|unpin|status <store>` →
@@ -6998,12 +7001,28 @@ per-method timeout so a dial never hangs.
 
 ### 19.2. STUN reflexive-address discovery
 
-The node discovers its server-reflexive (public) transport address via STUN (RFC 5389) against the STUN
-server co-located with the relay (`<relay-host>:3478`, derived from `DIG_RELAY_URL`). The STUN endpoints
-are resolved across **both address families** (every A + AAAA record) and the Binding transaction is run
-**IPv6-first with IPv4 fallback** (§5.2): the IPv6 STUN server is attempted first and IPv4 is used only
-when the IPv6 server is absent/unreachable — the reflexive address is never nulled merely because IPv6
-failed.
+The node discovers its server-reflexive (public) transport address via STUN (RFC 5389), walking a
+precedence-ordered plan (`StunPlan`, dig_ecosystem#3198) of up to three tiers, each already IPv6-first
+within itself: an **operator override** (`DIG_STUN_SERVER`, when set — never silently bypassed in favor
+of a default), the **DIG relay's co-located STUN endpoint** (the intended steady state), and a **public
+third-party fallback** (Google + Cloudflare) reached only when the relay tier answers nothing. The relay
+reclaims the role automatically the moment it answers again — no code change, no redeploy. Within the
+relay tier, the node derives the endpoint from `DIG_RELAY_URL`'s host and PREFERS a dedicated
+`stun.<relay-host>` DNS name over the bare relay host when it resolves; an unresolvable `stun.` name is
+skipped silently, never an error, so a relay operator who has not adopted the convention keeps working
+exactly as before, and one who has activates the dedicated endpoint by DNS alone. Every candidate
+endpoint — whichever tier or host it came from — is resolved across **both address families** (every A
++ AAAA record) and the Binding transaction is run **IPv6-first with IPv4 fallback** (§5.2): the IPv6
+endpoint is attempted first and IPv4 is used only when the IPv6 endpoint is absent/unreachable — the
+reflexive address is never nulled merely because IPv6 failed.
+
+A STUN answer whose address family differs from the family of the server that answered it is
+**discarded, not returned** — the walk falls through to the next server exactly as a non-answering one
+does. This guards against a server that completes an otherwise well-formed Binding transaction (correct
+magic cookie, correctly echoed transaction id) but names an address belonging to a different network path
+than the one queried — measured: a dual-stack load balancer answering an IPv4 caller with its own IPv6
+address. Such an answer describes something other than this node's queried transport and MUST NOT be
+believed just because the transaction otherwise succeeded.
 
 The reflexive query is run from a UDP socket bound to the node's **ACTUAL listen port** (the peer-RPC
 port peers dial), not a throwaway ephemeral socket. The advertised candidate is therefore
