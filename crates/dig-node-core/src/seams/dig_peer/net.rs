@@ -482,7 +482,10 @@ fn resolve_host_both_families(host: &str) -> Vec<SocketAddr> {
 /// runs — an identical address named by both is kept only once. Pure over already-resolved
 /// addresses, so the preference itself is unit-testable without live DNS (the same seam
 /// [`StunPlan::from_tiers`] uses for tier precedence).
-fn prefer_dedicated_stun_host(dedicated: Vec<SocketAddr>, bare: Vec<SocketAddr>) -> Vec<SocketAddr> {
+fn prefer_dedicated_stun_host(
+    dedicated: Vec<SocketAddr>,
+    bare: Vec<SocketAddr>,
+) -> Vec<SocketAddr> {
     let mut seen = std::collections::HashSet::new();
     let mut addrs: Vec<SocketAddr> = dedicated.into_iter().chain(bare).collect();
     addrs.retain(|a| seen.insert(*a));
@@ -1268,10 +1271,8 @@ mod tests {
         let bare_v6: SocketAddr = "[2001:db8::2]:3478".parse().unwrap();
         let bare_v4: SocketAddr = "100.64.2.2:3478".parse().unwrap();
 
-        let merged = prefer_dedicated_stun_host(
-            vec![dedicated_v6, dedicated_v4],
-            vec![bare_v6, bare_v4],
-        );
+        let merged =
+            prefer_dedicated_stun_host(vec![dedicated_v6, dedicated_v4], vec![bare_v6, bare_v4]);
 
         assert_eq!(merged, vec![dedicated_v6, bare_v6, dedicated_v4, bare_v4]);
     }
@@ -1593,7 +1594,12 @@ mod tests {
                 let mut key = [0u8; 16];
                 key[..4].copy_from_slice(&cookie_be);
                 key[4..].copy_from_slice(txid);
-                let xored = v6.octets().iter().zip(key.iter()).map(|(a, b)| a ^ b).collect();
+                let xored = v6
+                    .octets()
+                    .iter()
+                    .zip(key.iter())
+                    .map(|(a, b)| a ^ b)
+                    .collect();
                 (0x02, xored)
             }
         };

@@ -168,7 +168,10 @@ impl Advertised {
 ///    nothing can rewrite a running process's own environment, but the NEXT process start reads
 ///    this precedence fresh and picks the persisted value up.
 /// 3. **Else nothing.**
-fn advertised_urls_precedence(env_value: Option<String>, persisted: Option<Vec<String>>) -> Advertised {
+fn advertised_urls_precedence(
+    env_value: Option<String>,
+    persisted: Option<Vec<String>>,
+) -> Advertised {
     if let Some(v) = env_value.filter(|v| !v.trim().is_empty()) {
         return parse_advertised_urls(&v);
     }
@@ -885,7 +888,10 @@ mod tests {
     fn a_persisted_override_is_used_when_the_env_var_is_absent() {
         let result =
             advertised_urls_precedence(None, Some(vec!["https://persisted.example".to_string()]));
-        assert_eq!(result.accepted, vec!["https://persisted.example".to_string()]);
+        assert_eq!(
+            result.accepted,
+            vec!["https://persisted.example".to_string()]
+        );
     }
 
     /// A BLANK env value (set but empty/whitespace) counts as absent, not as an explicit "advertise
@@ -898,7 +904,10 @@ mod tests {
             Some("   ".to_string()),
             Some(vec!["https://persisted.example".to_string()]),
         );
-        assert_eq!(result.accepted, vec!["https://persisted.example".to_string()]);
+        assert_eq!(
+            result.accepted,
+            vec!["https://persisted.example".to_string()]
+        );
     }
 
     /// Neither present: nothing to advertise, exactly `Advertised::default()` — the situation

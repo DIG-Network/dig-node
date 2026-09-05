@@ -1196,8 +1196,8 @@ fn config_get(ctx: &ControlCtx) -> Value {
     // effective configuration (env var, else the persisted override — see
     // `crate::mirror::advertise::advertised_urls_from_env`) rather than from a fresh set/clear.
     let operator = crate::mirror::advertise::configured_operator_urls();
-    let operator_override = (!operator.accepted.is_empty() || !operator.rejected.is_empty())
-        .then(|| {
+    let operator_override =
+        (!operator.accepted.is_empty() || !operator.rejected.is_empty()).then(|| {
             operator
                 .accepted
                 .iter()
@@ -1326,14 +1326,21 @@ fn mirror_advertise_view(
 /// [`crate::mirror::advertise::advertised_urls_from_env`] consults, so the promise this field
 /// makes is genuine, not merely unimplemented.
 fn config_set_mirror_advertise_urls(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
-    let parsed: SetMirrorAdvertiseUrlsParams = match serde_json::from_value(params.clone()) {
-        Ok(p) => p,
-        Err(e) => {
-            return control_error(
-                id,
-                ErrorCode::InvalidParams,
-                format!("control.config.setMirrorAdvertiseUrls: {e}"),
-            )
+    // A caller omitting `params` entirely (`null`, distinct from the KAT's documented `{}` clear
+    // form) is read the same lenient way `config_set_upstream`'s `params.get(...)` reads a missing
+    // field: as "nothing was sent", never as a malformed request.
+    let parsed: SetMirrorAdvertiseUrlsParams = if params.is_null() {
+        SetMirrorAdvertiseUrlsParams { urls: None }
+    } else {
+        match serde_json::from_value(params.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return control_error(
+                    id,
+                    ErrorCode::InvalidParams,
+                    format!("control.config.setMirrorAdvertiseUrls: {e}"),
+                )
+            }
         }
     };
     let parsed = match parsed.validated() {
