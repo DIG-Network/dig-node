@@ -1,23 +1,35 @@
-//! **The operator's advertised URLs reach the coin** (`SPEC.md` §25.10, dig-node#426).
+//! **What this node advertises reaches the coin** (`SPEC.md` §25.10, dig-node#426,
+//! `dig_ecosystem#3197`).
 //!
 //! A mirror coin publishes where its store can be fetched from, and those URLs are fixed at create
 //! for the whole epoch. Until dig-node#426 the node parsed the operator's value and then handed
 //! `create` an EMPTY list, so every create refused and no coin was ever made. This file drives the
-//! real composition the scheduler performs — environment → [`configured_urls`] → the real
-//! `NodeMirrorEffects::create` → a signed bundle — and reads the answer off the broadcast bundle.
+//! real composition the scheduler performs — environment and this node's own public address →
+//! [`effective_urls_from_env`] → the real `NodeMirrorEffects::create` → a signed bundle — and reads
+//! the answer off the broadcast bundle.
 //!
 //! # Why the assertion is on the BUNDLE, not on the list
 //!
-//! Asserting that `configured_urls()` returns the right strings would pass identically while the
-//! scheduler kept passing `Vec::new()` beside it — the exact defect this work removes. The bundle
-//! is the only artifact that can distinguish "parsed" from "published", because it is what a
-//! stranger eventually reads.
+//! Asserting that the decision returns the right strings would pass identically while the scheduler
+//! kept passing `Vec::new()` beside it — the exact defect this work removes. The bundle is the only
+//! artifact that can distinguish "parsed" from "published", because it is what a stranger eventually
+//! reads.
 //!
-//! # The fixture keeps a truthful control
+//! # Every fixture keeps a truthful control
 //!
 //! The configured value mixes a this-machine entry among two publishable ones. A fixture of only
 //! good entries cannot see a filter that drops too much, and a fixture of only bad entries cannot
 //! see one that drops too little; varying one entry against two honest survivors sees both.
+//!
+//! The same discipline decides the ADDRESS each fixture is given. Every probe about the operator's
+//! value hands the node a perfectly derivable address of its own, so that "the operator's value
+//! wins" is proven rather than inherited from there being no alternative.
+//!
+//! # The addresses here are SYNTHETIC, and that is the design
+//!
+//! `dig-node-core` hard-codes `reflexive_addr` to `null` (`dig_ecosystem#3198` is adding the
+//! producer), so no real host can supply one yet. What is under test is the plumbing between an
+//! address and the coin, which a supplied address exercises exactly.
 
 mod support;
 
@@ -410,9 +422,7 @@ fn no_public_address_creates_nothing_and_does_not_blame_the_operators_configurat
 
     // No operator value AND no address: `PublicAddress::default()` is exactly what
     // `from_network_info` reads off the shipped `dig.getNetworkInfo` answer today.
-    let advertised = with_advertise_env("", || {
-        effective_urls_from_env(&PublicAddress::default())
-    });
+    let advertised = with_advertise_env("", || effective_urls_from_env(&PublicAddress::default()));
     assert_eq!(
         advertised.state,
         AdvertiseState::NoPublicAddress,
@@ -438,7 +448,9 @@ fn no_public_address_creates_nothing_and_does_not_blame_the_operators_configurat
         .expect_err("a node that does not know where it is must not stake an epoch on a guess");
 
     assert!(
-        reason.to_string().contains("does not know its public address"),
+        reason
+            .to_string()
+            .contains("does not know its public address"),
         "the refusal must name the missing address: {reason}"
     );
     assert!(

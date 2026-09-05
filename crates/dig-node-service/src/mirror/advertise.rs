@@ -566,7 +566,11 @@ mod tests {
             // this module's operator-facing lines now live behind `AdvertiseState::reason`, and
             // `ADVERTISING_AT_CONFIGURED_URLS` is reached through the `Override` arm rather than
             // named separately, so no line is walked twice and none is missed.
-            .chain(AdvertiseState::ALL.iter().map(|state| (state.label(), state.reason())))
+            .chain(
+                AdvertiseState::ALL
+                    .iter()
+                    .map(|state| (state.label(), state.reason())),
+            )
             .collect();
 
         assert_eq!(
