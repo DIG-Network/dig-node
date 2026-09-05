@@ -42,6 +42,10 @@ pub enum ControlAction {
     ConfigGet,
     /// `control.config.setUpstream` — persist the upstream DIG RPC override (next-start effective).
     ConfigSetUpstream { url: String },
+    /// `control.config.setMirrorAdvertiseUrls` — override (non-empty list) or clear (`None`) the
+    /// URLs this node advertises in its own mirror-coin memos (dig-node#570, next-start effective —
+    /// see that method's own doc for why nothing can make it live before a restart).
+    ConfigSetMirrorAdvertiseUrls { urls: Option<Vec<String>> },
     /// `control.cache.get` — cache cap/used/dir/shared.
     CacheGet,
     /// `control.cache.setCap` — set the on-disk cache size cap (bytes; floored at 64 MiB).
@@ -220,6 +224,9 @@ impl ControlAction {
             ControlAction::Info => "control.status",
             ControlAction::ConfigGet => "control.config.get",
             ControlAction::ConfigSetUpstream { .. } => "control.config.setUpstream",
+            ControlAction::ConfigSetMirrorAdvertiseUrls { .. } => {
+                "control.config.setMirrorAdvertiseUrls"
+            }
             ControlAction::CacheGet => "control.cache.get",
             ControlAction::CacheSetCap { .. } => "control.cache.setCap",
             ControlAction::CacheClear => "control.cache.clear",
@@ -298,6 +305,14 @@ impl ControlAction {
 
         match self {
             ControlAction::ConfigSetUpstream { url } => json!({ "upstream": url }),
+            // `None` clears the override, wired as an ABSENT `urls` key (not `null` / `[]`) so the
+            // node's own `#[serde(default)]` reads it exactly like the KAT's documented `{}` clear
+            // form — see `SetMirrorAdvertiseUrlsParams`'s own doc for why an explicit empty list is
+            // refused rather than accepted as either meaning.
+            ControlAction::ConfigSetMirrorAdvertiseUrls { urls } => match urls {
+                Some(urls) => json!({ "urls": urls }),
+                None => json!({}),
+            },
             // Basis points, never a percentage and never a float. A 1 bp margin (0.01%) is a legal
             // choice and any conversion to whole percent would erase it.
             ControlAction::CollateralMarginSet { margin_bp } => json!({ "margin_bp": margin_bp }),
@@ -460,6 +475,7 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         ControlAction::Info.method(),
         ControlAction::ConfigGet.method(),
         ControlAction::ConfigSetUpstream { url: String::new() }.method(),
+        ControlAction::ConfigSetMirrorAdvertiseUrls { urls: None }.method(),
         ControlAction::CacheGet.method(),
         ControlAction::CacheSetCap { bytes: 0 }.method(),
         ControlAction::CacheClear.method(),
@@ -643,6 +659,14 @@ fn summarize(method: &str, result: &Value) -> String {
         "control.config.setUpstream" => format!(
             "upstream set to {} (effective on next node start)",
             result["upstream"].as_str().unwrap_or("?"),
+        ),
+        "control.config.setMirrorAdvertiseUrls" => format!(
+            "mirror advertise state: {} · urls: {} (effective on next node start)",
+            result["mirror_advertise"]["state"].as_str().unwrap_or("?"),
+            result["mirror_advertise"]["urls"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0),
         ),
         "control.cache.get" => format!(
             "cache {} / {} bytes used/cap · {}",

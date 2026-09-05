@@ -2619,7 +2619,9 @@ token-free by design; it is not a control-parity subcommand and this rule does n
 - `info` → `control.status` — the rich node status (version, uptime, cache, hosted-store +
   cached-capsule counts, §21 sync availability). DISTINCT from `status` (§8.3), which is an
   unauthenticated `/health` liveness probe; `info` is the token-gated detailed view.
-- `config [get]` → `control.config.get`; `config set-upstream <url>` → `control.config.setUpstream`.
+- `config [get]` → `control.config.get`; `config set-upstream <url>` → `control.config.setUpstream`;
+  `config set-mirror-advertise-urls [<url>...]` → `control.config.setMirrorAdvertiseUrls` (no
+  arguments clears the override).
 - `cache [get]` → `control.cache.get`; `cache set-cap <bytes>` → `control.cache.setCap`;
   `cache clear` → `control.cache.clear`.
 - `stores [list]` → `control.hostedStores.list`; `stores pin|unpin|status <store>` →
