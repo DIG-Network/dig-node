@@ -2765,11 +2765,18 @@ fn spawn_mirror_passes(
             ),
         }
 
-        // Read ONCE, for the life of the task, beside the wallet above. The value is an operator
-        // configuration rather than an observation, and a coin's URLs are fixed at create for the
-        // whole epoch — so re-reading it per pass would buy nothing and would let the list a
-        // warning was emitted about drift from the list actually published.
-        let advertised_urls = crate::mirror::advertise::configured_urls();
+        // The OPERATOR's half, read ONCE for the life of the task beside the wallet above. It is a
+        // configuration rather than an observation, so re-reading it per pass would buy nothing and
+        // would let the list a warning was emitted about drift from the list actually published.
+        //
+        // The DERIVED half is read per pass instead (below), because it is an observation: this
+        // node's public address and the path it holds to the network both change while the node
+        // runs, and a value captured at bring-up would leave a node that came up before its relay
+        // permanently unable to advertise.
+        let operator_urls = crate::mirror::advertise::configured_operator_urls();
+        // What the last pass concluded, so the state is logged on TRANSITION rather than every
+        // round. A line per pass, for ever, is not a report an operator reads.
+        let mut last_advertise_state: Option<crate::mirror::advertise::AdvertiseState> = None;
 
         let journal = lifecycle::journal();
         let mut presence = crate::mirror::presence::PresenceTracker::new();
@@ -2868,6 +2875,25 @@ fn spawn_mirror_passes(
             )
             .map_err(|e| crate::mirror::runner::PassError::Wallet(e.to_string()));
 
+            // What this node will advertise THIS pass (SPEC.md §25.10, dig_ecosystem#3197): the
+            // operator's value when they set one, otherwise this node's own reflexive peer address
+            // — gated on a path to it being held. `network_info` reads atomics and touches neither
+            // the chain nor an upstream, so taking it per pass costs nothing.
+            let advertised = crate::mirror::advertise::effective_urls(
+                &operator_urls,
+                &crate::mirror::advertise::PublicAddress::from_network_info(&node.network_info()),
+            );
+            if last_advertise_state != Some(advertised.state) {
+                tracing::info!(
+                    target: "mirror",
+                    state = advertised.state.label(),
+                    urls = ?advertised.urls,
+                    "{}",
+                    advertised.state.reason()
+                );
+                last_advertise_state = Some(advertised.state);
+            }
+
             match chain.chain_source(tokio::runtime::Handle::current()).await {
                 Ok(source) => {
                     // Re-read per pass, deliberately: `ChainTransport::broadcaster` does not
@@ -2889,7 +2915,7 @@ fn spawn_mirror_passes(
                         // no mirror coin. Until this reached the pass, that node's bonds were
                         // priced against its operator wallet and reported `unfunded` with a base-unit
                         // figure — a demand for money that would have bonded nothing.
-                        can_advertise: !advertised_urls.is_empty(),
+                        can_advertise: advertised.can_advertise(),
                     };
                     // `block_in_place` rather than `spawn_blocking`: the runner borrows the signer,
                     // the journal and the chain source, none of which is `'static`, and moving them
@@ -2900,12 +2926,12 @@ fn spawn_mirror_passes(
                             capsules,
                             dig_balance,
                             committed,
-                            // The operator's own list (SPEC.md 25.10, dig-node#426), read ONCE
-                            // at bring-up above. Empty when nothing is configured or nothing
-                            // configured is publishable, and `create` then refuses by name before
-                            // any chain read rather than staking collateral on an advertisement
-                            // nobody can act on.
-                            advertised_urls.clone(),
+                            // What this node advertises and WHY (SPEC.md 25.10, dig-node#426,
+                            // dig_ecosystem#3197), decided just above. Empty in every state but the
+                            // two publishing ones, and `create` then refuses — before any chain
+                            // read, naming that state's own reason — rather than staking collateral
+                            // on an advertisement nobody can act on.
+                            advertised.clone(),
                             // Re-read per pass rather than captured at spawn: this task starts
                             // beside the peer network rather than after it, so a value read once
                             // could be `None` for the life of the node and every coin it created

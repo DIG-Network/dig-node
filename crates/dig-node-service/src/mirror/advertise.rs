@@ -2,21 +2,35 @@
 //!
 //! A mirror coin publishes URLs in its memos, and `dig_mirror_coin::create` refuses an
 //! advertisement carrying none — so until this node can name a place a stranger can reach it, it
-//! cannot bond anything. This module is that name, and nothing more: it turns one operator-set
-//! string into the URL list the advertisement takes.
+//! cannot bond anything. This module is that name: it decides the URL list the advertisement takes,
+//! from the operator's own value when there is one and from this node's own public address when
+//! there is not.
 //!
-//! # Why the value is CONFIGURED and never derived
+//! # The value is DERIVED by default, and the operator's value overrides it
 //!
-//! The one address this machine can derive on its own is the STUN reflexive address the peer seam
-//! discovers, and it is the wrong thing to publish. A mirror coin's URLs are **fixed at create** for
-//! the whole epoch, so an address that is unreachable from outside — symmetric NAT, no forwarded
-//! port — or that simply changes leaves real $DIG staked on a claim the node cannot keep, which
-//! SPEC.md §25 penalises. [`crate::config::is_self_upstream`] records the same limit for the
-//! upstream slot: a node cannot decide its own public name by resolver alone.
+//! The one address this machine can learn about itself is the reflexive address the peer seam
+//! discovers — the NAT mapping of the dig-peer socket a stranger actually dials. A mirror coin's
+//! URLs are **fixed at create** for the whole epoch, so that mapping may lapse before the epoch
+//! does. Publishing it anyway is nonetheless the right default, because of what a wrong address
+//! actually costs (below): the same as advertising nothing.
 //!
-//! So an unset value is not a failure state. It means this node advertises nothing, creates no
-//! mirror coin, and says so — which is strictly better than publishing somewhere nobody can fetch
-//! from.
+//! So the node derives and publishes it, gated on LIVENESS rather than on a reachability proof —
+//! [`PublicAddress::is_live`], a held relay reservation or a confirmed direct mapping. There is no
+//! probe-back and no confirm-before-stake step: enforcement is economic, not predictive.
+//!
+//! # What an unreachable advertisement actually costs — forfeiture, never principal
+//!
+//! State this precisely, because the looser reading ("SPEC.md §25 penalises it") made this module
+//! refuse to derive anything at all. §25 says *penalised* and never defines a mechanism; the
+//! mechanism lives in `dig-mirror-coin`, and it has **no slash path**. Only the owner's key can
+//! produce a reclaim spend (`dig-mirror-coin/SPEC.md` §5, §6.4), reclaim recreates the full locked
+//! amount, and no path in that crate reduces $DIG supply (§3 rules 4 and 5). The only penalty any
+//! code here applies is credit denial: [`super::bond_verify`] hands a coin that does not name the
+//! serving peer a `BondVerdict::Unverified`, and an unverified bond earns nothing.
+//!
+//! So a bad URL costs **that epoch's rewards, capital locked until the operator reclaims it, and a
+//! reclaim fee — never the principal**. Advertising nothing costs that same epoch's rewards. The
+//! two failure directions are equal, which is why refusing to derive bought nothing.
 //!
 //! # Changing it later costs money
 //!
@@ -25,7 +39,7 @@
 //! Nothing here reclaims on a config change — spending money in response to a text edit is not a
 //! behaviour an operator asked for.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 /// The operator-set list of URLs this node advertises. Entries are separated by commas or
 /// whitespace, so both `a,b` and a shell-quoted `"a b"` work.
@@ -91,6 +105,268 @@ pub fn advertised_urls_from_env() -> Advertised {
     parse_advertised_urls(&std::env::var(ADVERTISE_URLS_ENV).unwrap_or_default())
 }
 
+/// The URL scheme a derived entry is published under.
+///
+/// Deliberately NOT `http`. `DIG_NODE_PORT` (9778) is the HTTP content port and it is
+/// LOOPBACK-BOUND by default (see [`crate::config`]), so a relay cannot mediate it and a stranger
+/// cannot reach it. What a stranger genuinely reaches is the dig-peer mTLS wire, which is the socket
+/// the reflexive mapping is OF — so the derived URL names that transport rather than one this node
+/// is not serving to the outside world. [`classify`] accepts a non-special scheme on purpose.
+const DERIVED_SCHEME: &str = "dig";
+
+/// What this node knows about where a stranger could reach it, as one pass reads it.
+///
+/// A plain value with no behaviour of its own beyond [`Self::is_live`], so the decision below is
+/// pure over it and a test supplies a whole world in three fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublicAddress {
+    /// The reflexive addresses the peer seam has learned — the NAT mappings of THIS node's dig-peer
+    /// socket, carrying their own ports.
+    ///
+    /// A list rather than one address because a dual-stack node can have a mapping per family.
+    /// Ordering here is whatever the seam reported; [`derived_urls`] is what puts IPv6 first
+    /// (CLAUDE.md §5.2).
+    pub reflexive: Vec<SocketAddr>,
+    /// Whether this node currently holds a relay reservation.
+    pub relay_reserved: bool,
+    /// Whether this node has a CONFIRMED direct inbound mapping (UPnP / NAT-PMP / PCP).
+    ///
+    /// **Nothing produces `true` today, and that is stated rather than left to be discovered.** The
+    /// pool surfaces no mapping confirmation, so [`PublicAddress::from_network_info`] always reads
+    /// this as `false` and the liveness gate rests on the relay reservation alone. The field exists
+    /// because the decision is `reserved || direct mapping` and a gate that cannot express its
+    /// second term is a gate that silently loses it; the tests drive this term directly, so the
+    /// plumbing is correct the moment a producer exists.
+    ///
+    /// **What MUST NOT be wired to it:** `dig.getNetworkInfo`'s `reachability` field. That reports
+    /// `"direct"` whenever no relay is in use, which is the ABSENCE of a relay rather than evidence
+    /// of reachability — its own comment says so. Reading it here would make the gate vacuously
+    /// true for every node that is not relayed, which is exactly the population the gate exists to
+    /// stop advertising.
+    pub direct_mapping: bool,
+}
+
+impl PublicAddress {
+    /// Whether this node is reachable ENOUGH to stake an epoch on the address it knows.
+    ///
+    /// Liveness, not a reachability proof. §25.10's enforcement is economic: a node that cannot be
+    /// reached simply earns nothing, so the gate asks only whether a path to this node is currently
+    /// held rather than trying to predict whether one will hold for the epoch.
+    pub fn is_live(&self) -> bool {
+        self.relay_reserved || self.direct_mapping
+    }
+
+    /// Reads one pass's view out of `dig.getNetworkInfo`'s answer.
+    ///
+    /// The `reflexive_addr` key is accepted as EITHER one address string or an array of them, and
+    /// anything that does not parse as a socket address is dropped. That tolerance is deliberate:
+    /// the key is hard-coded `null` in `dig-node-core` today (`dig_ecosystem#3198` is adding the
+    /// producer), so this adapter is written against a shape that does not exist yet. Every way of
+    /// being wrong about it fails in the same direction — no derived address, so no create — which
+    /// is the direction that costs an epoch's rewards rather than money.
+    pub fn from_network_info(info: &serde_json::Value) -> Self {
+        let reflexive = match &info["reflexive_addr"] {
+            serde_json::Value::String(one) => one.parse::<SocketAddr>().into_iter().collect(),
+            serde_json::Value::Array(many) => many
+                .iter()
+                .filter_map(|entry| entry.as_str()?.parse::<SocketAddr>().ok())
+                .collect(),
+            _ => Vec::new(),
+        };
+        Self {
+            reflexive,
+            relay_reserved: info["relay"]["reserved"].as_bool().unwrap_or(false),
+            // Never read from `reachability` — see the field's own documentation.
+            direct_mapping: false,
+        }
+    }
+}
+
+/// Which of §25.10's five outcomes this pass is in, and therefore what an operator is told.
+///
+/// Named states rather than a bare empty list because the four ways of publishing nothing have four
+/// different remedies, and telling an operator the wrong one is the failure this taxonomy exists to
+/// prevent: a node that cannot know its own address is not a node whose operator forgot to
+/// configure something, and money will not clear it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvertiseState {
+    /// Publishing the operator's own list. Their value always wins.
+    Override,
+    /// Publishing this node's own reflexive peer address, because no operator value is set.
+    Derived,
+    /// The operator set a value and no entry in it is publishable.
+    Off,
+    /// No operator value, and this node does not know a public address it could publish.
+    NoPublicAddress,
+    /// A public address is known, but no path to this node is currently held.
+    NoRelay,
+}
+
+impl AdvertiseState {
+    /// Every variant, so the operator-message guard walks the SET rather than a chosen example.
+    ///
+    /// Declared beside the enum for the same reason [`Rejection::ALL`] is: a walk assembled inside
+    /// the test would still compile and still pass after a variant was added, shipping the new
+    /// state's line unguarded by the very test written to guard it.
+    pub const ALL: [AdvertiseState; 5] = [
+        AdvertiseState::Override,
+        AdvertiseState::Derived,
+        AdvertiseState::Off,
+        AdvertiseState::NoPublicAddress,
+        AdvertiseState::NoRelay,
+    ];
+
+    /// The machine-readable name, as §25.10's state taxonomy spells it.
+    pub fn label(self) -> &'static str {
+        match self {
+            AdvertiseState::Override => "advertising_override",
+            AdvertiseState::Derived => "advertising_derived",
+            AdvertiseState::Off => "off",
+            AdvertiseState::NoPublicAddress => "no_public_address",
+            AdvertiseState::NoRelay => "no_relay",
+        }
+    }
+
+    /// The sentence an operator reads for this state.
+    ///
+    /// A `String` rather than a `&'static str` because two of them name the environment variable,
+    /// and spelling it a second time as a literal would be a second source of truth for the same
+    /// name — the drift this module's tests exist to catch.
+    pub fn reason(self) -> String {
+        match self {
+            AdvertiseState::Override => ADVERTISING_AT_CONFIGURED_URLS.to_string(),
+            AdvertiseState::Derived => {
+                "advertising this node's stores at its own public peer address, derived because no \
+                 operator value is set"
+                    .to_string()
+            }
+            AdvertiseState::Off => format!(
+                "no {ADVERTISE_URLS_ENV} entry is publishable, so this node advertises nothing and \
+                 creates no mirror coin (SPEC.md 25.10)"
+            ),
+            // Deliberately NOT phrased as something the operator has failed to configure. Setting
+            // a value they cannot know is not a remedy, and a blocker no action of theirs can
+            // clear must never be described as one.
+            AdvertiseState::NoPublicAddress => {
+                "this node does not know its public address yet, so it is not advertising mirrors \
+                 and not earning; nothing has reported one"
+                    .to_string()
+            }
+            AdvertiseState::NoRelay => {
+                "this node knows its public address but holds neither a relay reservation nor a \
+                 confirmed direct mapping, so it is not advertising mirrors and not earning until \
+                 a path to it is held again"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// What this node will advertise this pass, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Effective {
+    /// The URLs `create` publishes. Empty in every state but [`AdvertiseState::Override`] and
+    /// [`AdvertiseState::Derived`].
+    pub urls: Vec<String>,
+    /// Which outcome produced that list, for the refusal message and the operator surface.
+    pub state: AdvertiseState,
+}
+
+impl Default for Effective {
+    /// Nothing advertised, for the reason that is true before anything has been read.
+    fn default() -> Self {
+        Self {
+            urls: Vec::new(),
+            state: AdvertiseState::NoPublicAddress,
+        }
+    }
+}
+
+impl Effective {
+    /// Whether this node can advertise at all. `false` is an honest answer, not an error.
+    pub fn can_advertise(&self) -> bool {
+        !self.urls.is_empty()
+    }
+}
+
+/// The URLs this node advertises this pass: the operator's value if there is one, otherwise its own
+/// public address.
+///
+/// Pure over its two inputs, so a fixture is a parsed value and three fields.
+///
+/// # The order of the arms is the contract
+///
+/// 1. **An operator value that yields anything wins outright.** It is their statement of where their
+///    own collateral is staked.
+/// 2. **An operator value that yields NOTHING does not fall through to the derived address.** They
+///    named a place; silently staking their money on a different one is a surprise about money, and
+///    the warning naming their mistake is something they can act on. This also leaves the behaviour
+///    of every already-configured node exactly as it shipped.
+/// 3. **No known public address is reported BEFORE the liveness gate**, because it is the more
+///    fundamental answer and it is the one true on a node whose relay is held but reports no
+///    reflexive address — the state every host is in until `dig_ecosystem#3198` lands.
+pub fn effective_urls(operator: &Advertised, address: &PublicAddress) -> Effective {
+    if operator.can_advertise() {
+        return Effective {
+            urls: operator.accepted.clone(),
+            state: AdvertiseState::Override,
+        };
+    }
+    if !operator.rejected.is_empty() {
+        return Effective {
+            urls: Vec::new(),
+            state: AdvertiseState::Off,
+        };
+    }
+
+    let derived = derived_urls(address);
+    if !derived.can_advertise() {
+        return Effective {
+            urls: Vec::new(),
+            state: AdvertiseState::NoPublicAddress,
+        };
+    }
+    if !address.is_live() {
+        return Effective {
+            urls: Vec::new(),
+            state: AdvertiseState::NoRelay,
+        };
+    }
+    Effective {
+        urls: derived.accepted,
+        state: AdvertiseState::Derived,
+    }
+}
+
+/// This node's own reflexive addresses as publishable URLs, IPv6 first.
+///
+/// Every candidate goes through [`classify`], the same gate the operator's entries pass. A
+/// reflexive address is a reading, not a promise: a seam that reports a loopback or link-local
+/// mapping must not be able to put one into a coin merely because this node derived it rather than
+/// an operator typing it.
+fn derived_urls(address: &PublicAddress) -> Advertised {
+    let (v6, v4): (Vec<_>, Vec<_>) = address
+        .reflexive
+        .iter()
+        .partition(|addr| matches!(addr, SocketAddr::V6(_)));
+
+    let mut out = Advertised::default();
+    for addr in v6.into_iter().chain(v4) {
+        // `SocketAddr`'s own rendering already brackets an IPv6 host and carries the port, so this
+        // is the one place the URL form is spelled and there is no second way to write it.
+        let url = format!("{DERIVED_SCHEME}://{addr}");
+        match classify(&url) {
+            Some(reason) => out.rejected.push((url, reason)),
+            None => {
+                if !out.accepted.iter().any(|seen| *seen == url) {
+                    out.accepted.push(url);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Why one configured entry is not advertised, in the words an operator reads.
 ///
 /// Split out of [`configured_urls`] so a test can walk EVERY variant and assert over the rendered
@@ -123,28 +399,20 @@ fn not_advertised(reason: &str) -> String {
 const ADVERTISING_AT_CONFIGURED_URLS: &str =
     "advertising this node's stores at the operator-configured URLs, in the configured order";
 
-/// What this node reports when no configured entry may be published.
+/// The operator's parsed value, with every rejected entry reported to them.
 ///
-/// A function rather than a `const` because it names the environment variable, and `concat!` cannot
-/// take a `const`. Spelling the variable a second time as a literal would be a second source of
-/// truth for the same name — exactly the drift this module's tests exist to catch.
-fn nothing_publishable() -> String {
-    format!(
-        "no {ADVERTISE_URLS_ENV} entry is publishable, so this node advertises nothing and creates no mirror coin (SPEC.md 25.10)"
-    )
-}
-
-/// The URLs this node will publish, with every rejected entry reported to the operator.
-///
-/// This is the whole operator surface as the mirror scheduler consumes it: one call, at bring-up,
-/// yielding the list `create` advertises. An empty answer is the honest default rather than an
-/// error — `NodeMirrorEffects::create` refuses by name on it, before any chain read, so a node with
-/// nothing to advertise stakes nothing.
+/// Read ONCE at bring-up: it is configuration rather than an observation, so re-reading it per pass
+/// would buy nothing and would let the list a warning was emitted about drift from the list actually
+/// published.
 ///
 /// The warnings are emitted HERE rather than at the call site because this is the only place that
 /// knows WHY an entry was dropped; a caller handed a shortened list could only report that some
 /// entry was missing, which is not something an operator can act on.
-pub fn configured_urls() -> Vec<String> {
+///
+/// It reports only the DROPPED entries and says nothing about what is being advertised. That
+/// sentence is [`AdvertiseState::reason`]'s, because the answer now depends on this node's live
+/// address and relay state and is therefore not knowable at bring-up.
+pub fn configured_operator_urls() -> Advertised {
     let advertised = advertised_urls_from_env();
 
     for (entry, why) in &advertised.rejected {
@@ -156,17 +424,15 @@ pub fn configured_urls() -> Vec<String> {
         );
     }
 
-    if advertised.can_advertise() {
-        tracing::info!(
-            target: "mirror",
-            urls = ?advertised.accepted,
-            "{ADVERTISING_AT_CONFIGURED_URLS}"
-        );
-    } else {
-        tracing::info!(target: "mirror", "{}", nothing_publishable());
-    }
+    advertised
+}
 
-    advertised.accepted
+/// One pass's advertisement decision, taking the operator's value from the environment.
+///
+/// The composition the scheduler performs, in one call, so a test can drive exactly it rather than
+/// a re-assembled imitation of it.
+pub fn effective_urls_from_env(address: &PublicAddress) -> Effective {
+    effective_urls(&configured_operator_urls(), address)
 }
 
 /// Turns one operator-set string into the advertisement's URL list.
@@ -298,18 +564,16 @@ mod tests {
                 // and it contains the reason, so this covers both.
                 (name, not_advertised(rejection_reason(why)))
             })
-            .chain([
-                (
-                    "ADVERTISING_AT_CONFIGURED_URLS",
-                    ADVERTISING_AT_CONFIGURED_URLS.to_string(),
-                ),
-                ("nothing_publishable", nothing_publishable()),
-            ])
+            // Every state's sentence too, driven from its own `ALL` for the same reason. Five of
+            // this module's operator-facing lines now live behind `AdvertiseState::reason`, and
+            // `ADVERTISING_AT_CONFIGURED_URLS` is reached through the `Override` arm rather than
+            // named separately, so no line is walked twice and none is missed.
+            .chain(AdvertiseState::ALL.iter().map(|state| (state.label(), state.reason())))
             .collect();
 
         assert_eq!(
             lines.len(),
-            Rejection::ALL.len() + 2,
+            Rejection::ALL.len() + AdvertiseState::ALL.len(),
             "every line this module emits must be walked, never a subset: {lines:?}"
         );
         for (name, line) in &lines {
@@ -328,10 +592,22 @@ mod tests {
                 "{name}: control -- each line must still be a sentence saying what happened: {line:?}"
             );
         }
+        // Looked up BY NAME rather than by index. The walk gained five entries and an index into
+        // it would have kept passing while pointing at a different sentence entirely.
+        let off = AdvertiseState::Off.reason();
         assert!(
-            lines[3].1.contains(ADVERTISE_URLS_ENV),
-            "control: the no-entry line must name the variable an operator has to set: {:?}",
-            lines[3].1
+            off.contains(ADVERTISE_URLS_ENV),
+            "control: the unpublishable-value line must name the variable an operator has to \
+             correct: {off:?}"
+        );
+        // The converse control, and the one that matters more. An operator whose node cannot know
+        // its own address CANNOT clear that by setting anything, so naming the variable there
+        // would send them to a remedy that does not exist.
+        let no_address = AdvertiseState::NoPublicAddress.reason();
+        assert!(
+            !no_address.contains(ADVERTISE_URLS_ENV),
+            "a blocker no configuration can clear must not be described as configuration: \
+             {no_address:?}"
         );
     }
 
@@ -478,6 +754,227 @@ mod tests {
         let refused = parse_advertised_urls("http://[::1]/ http://[::]/");
         assert!(refused.accepted.is_empty(), "{refused:?}");
         assert_eq!(refused.rejected.len(), 2, "{:?}", refused.rejected);
+    }
+
+    // -- The derived default (dig_ecosystem#3197) ------------------------------------------------
+
+    /// A reflexive address, IPv4 first so the ordering assertion cannot pass by accident.
+    fn reflexive(relay_reserved: bool) -> PublicAddress {
+        PublicAddress {
+            reflexive: vec![
+                "198.51.100.7:9444".parse().expect("a v4 socket address"),
+                "[2001:db8::1]:9444".parse().expect("a v6 socket address"),
+            ],
+            relay_reserved,
+            direct_mapping: false,
+        }
+    }
+
+    /// With an address known and a relay held, the node advertises its own peer socket — IPv6
+    /// first, in `dig://` form.
+    ///
+    /// The scheme is asserted, not merely the presence of the address: `http://ip:9778` would name
+    /// the HTTP content port, which is loopback-bound by default and which no relay mediates, so a
+    /// coin carrying it would advertise somewhere no stranger can reach.
+    ///
+    /// The fixture lists IPv4 FIRST so that §5.2's IPv6-first ordering is proven rather than
+    /// inherited from the input's own order.
+    #[test]
+    fn a_known_address_with_a_path_held_is_derived_and_advertised_ipv6_first() {
+        let got = effective_urls(&Advertised::default(), &reflexive(true));
+
+        assert_eq!(got.state, AdvertiseState::Derived, "{got:?}");
+        assert_eq!(
+            got.urls,
+            vec![
+                "dig://[2001:db8::1]:9444".to_string(),
+                "dig://198.51.100.7:9444".to_string(),
+            ],
+            "the derived list must name the dig-peer wire, IPv6 first: {got:?}"
+        );
+        assert!(got.can_advertise());
+    }
+
+    /// No reflexive address means no advertisement — and the reason names the ADDRESS, never the
+    /// operator's configuration.
+    ///
+    /// This is every host's state until `dig_ecosystem#3198` lands a producer, so the sentence it
+    /// yields is the one an operator actually reads today. Telling them to configure something
+    /// would send them to a remedy that cannot work.
+    #[test]
+    fn no_known_address_advertises_nothing_and_blames_the_address_not_the_operator() {
+        let unknown = PublicAddress {
+            relay_reserved: true,
+            ..PublicAddress::default()
+        };
+        let got = effective_urls(&Advertised::default(), &unknown);
+
+        assert_eq!(got.state, AdvertiseState::NoPublicAddress, "{got:?}");
+        assert!(got.urls.is_empty(), "{got:?}");
+        assert!(
+            !got.state.reason().contains(ADVERTISE_URLS_ENV),
+            "the reason must not send the operator to a setting that cannot clear it: {:?}",
+            got.state.reason()
+        );
+    }
+
+    /// A known address with NO path held advertises nothing, and says so as its own state.
+    ///
+    /// Distinct from the case above on purpose: the two have opposite remedies — one waits for an
+    /// address, the other for a connection — and collapsing them into one empty list is what makes
+    /// an operator chase the wrong thing.
+    #[test]
+    fn a_known_address_with_no_path_held_advertises_nothing() {
+        let got = effective_urls(&Advertised::default(), &reflexive(false));
+
+        assert_eq!(got.state, AdvertiseState::NoRelay, "{got:?}");
+        assert!(got.urls.is_empty(), "{got:?}");
+    }
+
+    /// A confirmed direct mapping opens the gate on its own, with no relay reservation.
+    ///
+    /// The gate is `reserved || direct mapping`, and nothing produces the second term today — so
+    /// this is the only thing that can prove the term is wired at all rather than silently lost.
+    /// Paired with the case above, which fixes the same address with BOTH terms false.
+    #[test]
+    fn a_confirmed_direct_mapping_opens_the_gate_without_a_relay() {
+        let direct = PublicAddress {
+            direct_mapping: true,
+            ..reflexive(false)
+        };
+        let got = effective_urls(&Advertised::default(), &direct);
+
+        assert_eq!(got.state, AdvertiseState::Derived, "{got:?}");
+        assert_eq!(got.urls.len(), 2, "{got:?}");
+    }
+
+    /// The operator's value wins, and wins even where the derived one would ALSO have been
+    /// publishable.
+    ///
+    /// The address fixture is deliberately a live, derivable one. Overriding a node that could
+    /// derive nothing would be satisfied identically by an implementation with no override at all.
+    #[test]
+    fn an_operator_value_beats_a_derivable_address() {
+        let operator = parse_advertised_urls("https://mirror.example.net/dig");
+        let got = effective_urls(&operator, &reflexive(true));
+
+        assert_eq!(got.state, AdvertiseState::Override, "{got:?}");
+        assert_eq!(got.urls, vec!["https://mirror.example.net/dig".to_string()]);
+    }
+
+    /// An operator value whose every entry is unpublishable does NOT quietly fall back to the
+    /// derived address.
+    ///
+    /// They named a place. Staking their collateral on a different one because their value had a
+    /// typo is a surprise about money, and the warning naming the typo is something they can act
+    /// on. The address fixture is live, so the fallback this refuses is genuinely available.
+    #[test]
+    fn an_unpublishable_operator_value_does_not_fall_back_to_the_derived_address() {
+        let operator = parse_advertised_urls("http://localhost:4161/, mirror.example.net");
+        let got = effective_urls(&operator, &reflexive(true));
+
+        assert_eq!(got.state, AdvertiseState::Off, "{got:?}");
+        assert!(got.urls.is_empty(), "{got:?}");
+    }
+
+    /// A reflexive address that can only mean this machine never reaches a coin.
+    ///
+    /// A reading is not a promise: a seam reporting a loopback or link-local mapping must be
+    /// refused exactly as an operator typing one is. The honest sibling in the same fixture is what
+    /// separates this from a blanket refusal of every derived address.
+    #[test]
+    fn a_this_machine_reflexive_address_is_never_derived_into_a_coin() {
+        let mixed = PublicAddress {
+            reflexive: vec![
+                "127.0.0.1:9444".parse().expect("a v4 socket address"),
+                "[::1]:9444".parse().expect("a v6 socket address"),
+                "169.254.10.4:9444".parse().expect("a v4 socket address"),
+                "198.51.100.7:9444".parse().expect("a v4 socket address"),
+            ],
+            relay_reserved: true,
+            direct_mapping: false,
+        };
+        let got = effective_urls(&Advertised::default(), &mixed);
+
+        assert_eq!(
+            got.urls,
+            vec!["dig://198.51.100.7:9444".to_string()],
+            "only the genuinely public mapping may survive: {got:?}"
+        );
+
+        let only_local = PublicAddress {
+            reflexive: vec!["127.0.0.1:9444".parse().expect("a v4 socket address")],
+            relay_reserved: true,
+            direct_mapping: false,
+        };
+        let refused = effective_urls(&Advertised::default(), &only_local);
+        assert_eq!(
+            refused.state,
+            AdvertiseState::NoPublicAddress,
+            "a mapping that can only mean this machine is not a public address: {refused:?}"
+        );
+    }
+
+    /// The adapter reads the snapshot `dig.getNetworkInfo` actually returns.
+    ///
+    /// `reflexive_addr` is hard-coded `null` in `dig-node-core` today, so the null case is the
+    /// SHIPPED one and the string and array cases are written against the shape
+    /// `dig_ecosystem#3198` will produce. Both are accepted because the producer does not exist yet
+    /// to settle which; every way of being wrong drops the address, which refuses a create rather
+    /// than staking one.
+    #[test]
+    fn the_network_info_adapter_reads_the_address_and_the_relay() {
+        let null = serde_json::json!({
+            "reflexive_addr": serde_json::Value::Null,
+            "relay": { "reserved": true },
+        });
+        let read = PublicAddress::from_network_info(&null);
+        assert!(read.reflexive.is_empty(), "{read:?}");
+        assert!(read.relay_reserved, "{read:?}");
+
+        let one = serde_json::json!({
+            "reflexive_addr": "198.51.100.7:9444",
+            "relay": { "reserved": false },
+        });
+        let read = PublicAddress::from_network_info(&one);
+        assert_eq!(read.reflexive.len(), 1, "{read:?}");
+        assert!(!read.relay_reserved, "{read:?}");
+
+        let many = serde_json::json!({
+            "reflexive_addr": ["[2001:db8::1]:9444", "198.51.100.7:9444", "not an address"],
+            "relay": { "reserved": true },
+        });
+        let read = PublicAddress::from_network_info(&many);
+        assert_eq!(
+            read.reflexive.len(),
+            2,
+            "an unparseable entry is dropped, not fatal: {read:?}"
+        );
+    }
+
+    /// `reachability` is NOT evidence of a direct mapping, and must never be read as one.
+    ///
+    /// It reports `"direct"` whenever no relay is in use — the ABSENCE of a relay, not evidence of
+    /// reachability. An adapter that read it would make the liveness gate vacuously true for every
+    /// non-relayed node, which is precisely the population the gate exists to stop advertising.
+    #[test]
+    fn a_reachability_of_direct_is_not_read_as_a_confirmed_mapping() {
+        let not_relayed = serde_json::json!({
+            "reflexive_addr": "198.51.100.7:9444",
+            "reachability": "direct",
+            "relay": { "reserved": false },
+        });
+        let read = PublicAddress::from_network_info(&not_relayed);
+
+        assert!(!read.direct_mapping, "{read:?}");
+        assert!(
+            !read.is_live(),
+            "a node with no relay and no confirmed mapping is not live: {read:?}"
+        );
+        assert_eq!(
+            effective_urls(&Advertised::default(), &read).state,
+            AdvertiseState::NoRelay
+        );
     }
 
     /// The memo layout carries many URLs, so several entries is the designed case; an exact

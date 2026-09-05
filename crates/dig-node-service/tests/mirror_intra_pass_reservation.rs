@@ -46,6 +46,7 @@ use std::collections::{HashMap, HashSet};
 use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use chia_sha2::Sha256;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
+use dig_node_service::mirror::advertise::{AdvertiseState, Effective};
 use dig_node_service::mirror::lifecycle::{mirror_agg_sig_data, NodeMirrorEffects};
 use dig_node_service::mirror::plan::Bond;
 use dig_node_service::mirror::runner::MirrorEffects;
@@ -231,7 +232,10 @@ fn two_creates_in_one_pass_select_disjoint_coins() {
         Ok(HashSet::new()),
         // Non-empty: `create` refuses before any chain read without one, and a probe that tripped
         // that refusal would assert nothing about coin selection.
-        vec!["https://mirror.example/dig".to_string()],
+        Effective {
+            urls: vec!["https://mirror.example/dig".to_string()],
+            state: AdvertiseState::Override,
+        },
         // A well-formed peer id, for the same reason the URL list is non-empty: `create` refuses
         // before selecting any coin without one, and a probe that stopped at the identity guard
         // would assert nothing about DISJOINTNESS, which is the property under test.
@@ -288,7 +292,10 @@ fn the_only_coin_funds_one_create_and_the_second_refuses() {
         Vec::new(),
         Ok(PER_COIN),
         Ok(HashSet::new()),
-        vec!["https://mirror.example/dig".to_string()],
+        Effective {
+            urls: vec!["https://mirror.example/dig".to_string()],
+            state: AdvertiseState::Override,
+        },
         // A well-formed peer id: `create` refuses before selecting any coin without one, and this
         // fixture needs the FIRST create to genuinely reach coin selection so that the second one
         // has something already reserved to collide with.
