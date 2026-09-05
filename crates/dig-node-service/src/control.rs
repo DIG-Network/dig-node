@@ -323,18 +323,17 @@ pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
 /// tests stayed green because a method absent from the contract is absent from both sides of every
 /// comparison they make. Granting the ordinary tier is now a reviewable one-line edit to this list
 /// instead of a side effect of editing an unrelated one.
-/// `control.wallet.resetCoinDb` (dig-node#384) is listed because the contract has not published it
-/// yet, and BOTH consequences of listing it were weighed rather than inherited: the conformance
-/// gate tolerates the publish drift, and the method keeps the PAIRED tier. The second is the one
-/// that matters, and it is the intended answer — the DIG App drives this reset and holds a paired
-/// token, so master-tiering it would make the feature unreachable by its only consumer. It is
-/// destructive, and what bounds it is loopback-only + a token + `confirm: true` on the wire + a
-/// refusal while a spend is in flight, not tier alone.
+/// `control.wallet.resetCoinDb` (dig-node#384) is no longer here: `dig-node-control-interface`
+/// 0.32 published it (`ControlMethod::WalletResetCoinDb`), and its own `requires_master_token()`
+/// returns `false` — the same PAIRED tier this exemption used to grant by name, now delegated to
+/// the contract instead of carved out locally. That is the intended end state this list exists to
+/// reach: the DIG App still drives the reset with a paired token, unaffected by the move, because
+/// [`requires_master_token_given`] consults the published contract FIRST and this list only ever
+/// widens the master set, never narrows it.
 ///
-/// **Remove this entry the moment `dig-node-control-interface` publishes the method** — the
+/// **Remove an entry the moment `dig-node-control-interface` publishes its method** — the
 /// `the_unpublished_list_still_describes_real_drift` test fails until it is.
-pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] =
-    &["control.peers.ping", "control.wallet.resetCoinDb"];
+pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] = &["control.peers.ping"];
 
 /// Does this control method require the MASTER control token, never a paired one? PURE.
 ///
