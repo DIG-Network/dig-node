@@ -24,19 +24,43 @@
 //! epoch, so it faces two gates an operator's typed value does not:
 //!
 //! 1. **AGREEMENT** — [`PublicAddress::corroborated_addresses`]. Two DIFFERENT sources must report
-//!    the same address. `relay.dig.net` began answering STUN and reports its load balancer's address
-//!    instead of the caller's (`relay.dig.net#11`): ten well-formed answers out of ten, correct
-//!    magic cookie, matching transaction id, a routable address that serves nothing. Nothing errors,
-//!    so no amount of checking ONE answer sees it — and dig-node prefers the relay tier, so this is
-//!    the answer a node gets today. It is NC-12's shape (untrusted sources that must agree, never
-//!    one that is trusted) applied to the node's reading of itself.
+//!    the same address. `relay.dig.net` answers STUN, and for an **IPv4** caller it returns its load
+//!    balancer's SNAT'd IPv6 address with a synthetic port rather than the caller's own
+//!    (`relay.dig.net#11`, fixed by `relay.dig.net#12`) — well-formed every time, correct magic
+//!    cookie, matching transaction id, a routable address that serves nothing. Nothing errors, so no
+//!    amount of checking ONE answer sees it, and dig-node prefers the relay tier. It is NC-12's
+//!    shape (untrusted sources that must agree, never one that is trusted) applied to the node's
+//!    reading of itself.
 //! 2. **ROUTABILITY** — [`is_globally_routable`]. A derived private, CGNAT, documentation,
 //!    benchmarking or reserved address is a broken reading rather than a choice, and is refused.
 //!    An operator's LAN address is still accepted, because that IS a choice (§25.10).
 //!
-//! **No provider range is special-cased and none should be.** Blocking the AWS block that produced
-//! `relay.dig.net#11` would paper over one instance of a general defect and would be wrong for every
-//! node legitimately running on EC2. Agreement catches it; an allowlist would not.
+//! # Two things that are NOT rejection criteria, because getting either wrong is expensive
+//!
+//! **The address FAMILY is never one.** `relay.dig.net#11` is an address-family CROSSING defect, not
+//! an IPv6 one: an IPv6 caller gets the correct answer 3 times out of 3, and only an IPv4 caller
+//! gets the balancer's address — `preserve_client_ip` is mandatory for UDP ip-target groups, and AWS
+//! documents it as having no effect on traffic converted from IPv6 to IPv4. So IPv6 is both the
+//! WORKING case and the §5.2-preferred one, and a rule shaped as "distrust IPv6 from the relay"
+//! would discard good discovery while keeping the bad answers. This module ORDERS by family
+//! ([`derived_urls`]) and never judges by it.
+//!
+//! **Ownership is never one either.** Blocking the AWS block that surfaced `relay.dig.net#11` would
+//! paper over one instance of a general defect and would be wrong for every node legitimately
+//! running on EC2. Agreement catches a wrong-but-routable answer; an allowlist would not.
+//!
+//! # What this layer deliberately does NOT check — dig-node#566
+//!
+//! The sharpest discriminator is **whether the answer describes the caller**: a reported port equal
+//! to the querying socket's own source port, and a reported family matching the transport queried
+//! over. Both belong to the STUN CLIENT, which knows its own socket; neither is visible here, where
+//! the only input is an address someone reported.
+//!
+//! **The port equality check must not be lifted naively to this layer**, because a NAT'd node's
+//! reflexive port legitimately differs from its local source port — that is what NAT port mapping
+//! IS — so `reported_port == source_port` applied here would refuse exactly the population this
+//! feature exists to serve. It is a real signal where the source port is known and the comparison is
+//! per-query; it is a trap where it is not.
 //!
 //! # What an unreachable advertisement actually costs — forfeiture, never principal
 //!
@@ -150,9 +174,9 @@ const DERIVED_SCHEME: &str = "dig";
 /// The source travels with the address because a single reporter cannot be checked. A STUN server
 /// that answers promptly, with the right magic cookie, a matching transaction id and a well-formed
 /// `XOR-MAPPED-ADDRESS` can still be reporting the wrong address, and nothing about the exchange
-/// says so — measured on `relay.dig.net` (`relay.dig.net#11`), whose NLB SNATs the UDP flow so the
-/// relay honestly reports the only peer it can see: itself. Ten answers out of ten, every one
-/// well-formed, every one an AWS address that serves nothing.
+/// says so — measured on `relay.dig.net` (`relay.dig.net#11`), whose NLB SNATs an IPv4 caller's UDP
+/// flow, so the relay honestly reports the only peer it can then see: itself. Every answer
+/// well-formed; the same server answers an IPv6 caller correctly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reflexive {
     /// An opaque label for whoever reported it — a relay endpoint, a public STUN server.
@@ -212,11 +236,16 @@ impl PublicAddress {
     /// # Why agreement, and not a better single source
     ///
     /// Because a wrong answer from one source is indistinguishable from a right one. `relay.dig.net`
-    /// began answering STUN and reports its own load balancer's address rather than the caller's
-    /// (`relay.dig.net#11`): ten well-formed answers out of ten, correct magic cookie, matching
-    /// transaction id, a routable global-unicast address owned by Amazon that serves nothing.
-    /// Nothing errors, so no amount of checking ONE answer catches it. A second, independent source
-    /// disagrees immediately.
+    /// answers STUN, and for an IPv4 caller returns its own load balancer's address rather than the
+    /// caller's (`relay.dig.net#11`): well-formed every time, correct magic cookie, matching
+    /// transaction id, a routable global-unicast address that serves nothing. Nothing errors, so no
+    /// amount of checking ONE answer catches it. A second, independent source disagrees immediately.
+    ///
+    /// Agreement is the right shape precisely BECAUSE it does not depend on knowing what is wrong.
+    /// The first diagnosis of that defect was "the relay reports its balancer's address"; the real
+    /// one is narrower — an address-family crossing that leaves IPv6 callers correctly served. A
+    /// guard aimed at the first reading would have rejected good answers and kept bad ones.
+    /// Agreement is indifferent to which reading was right.
     ///
     /// This matters here more than anywhere else in the node, because this value is written **into
     /// a coin, on chain, permanently**, with collateral locked behind it for an epoch.
@@ -1150,6 +1179,29 @@ mod tests {
             direct_mapping: false,
         };
         let got = effective_urls(&Advertised::default(), &on_ec2);
+
+        assert_eq!(got.state, AdvertiseState::Derived, "{got:?}");
+        assert_eq!(got.urls, vec!["dig://[2600:1f18:11a9::1]:9444".to_string()]);
+    }
+
+    /// **An IPv6 reflexive address is never refused for being IPv6.**
+    ///
+    /// `relay.dig.net#11` is an address-family CROSSING defect: the same server answers an IPv6
+    /// caller correctly and an IPv4 caller with its balancer's address. IPv6 is therefore both the
+    /// working case and the §5.2-preferred one, so a fix shaped as "distrust IPv6 from the relay"
+    /// would throw away good discovery and keep the bad answers. This pins the rule such a fix
+    /// would break, using an IPv6 address in the very range that surfaced the defect.
+    #[test]
+    fn an_ipv6_address_is_never_refused_for_being_ipv6() {
+        let v6_only = PublicAddress {
+            reflexive: vec![
+                seen("relay", "[2600:1f18:11a9::1]:9444"),
+                seen("stun.example", "[2600:1f18:11a9::1]:9444"),
+            ],
+            relay_reserved: true,
+            direct_mapping: false,
+        };
+        let got = effective_urls(&Advertised::default(), &v6_only);
 
         assert_eq!(got.state, AdvertiseState::Derived, "{got:?}");
         assert_eq!(got.urls, vec!["dig://[2600:1f18:11a9::1]:9444".to_string()]);

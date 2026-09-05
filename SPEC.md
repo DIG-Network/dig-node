@@ -9592,12 +9592,24 @@ The derived form:
 **A derived address MUST be CORROBORATED before it is published: two DIFFERENT sources MUST report
 the same address.** A single source cannot be checked. A STUN server that answers promptly, with the
 correct magic cookie, a matching transaction id and a well-formed `XOR-MAPPED-ADDRESS` can still be
-reporting the wrong address, and nothing in the exchange says so — `relay.dig.net` did exactly this,
-reporting its load balancer's address because the balancer SNATs the UDP flow, ten well-formed
-answers out of ten. Since the node prefers the relay tier, that is the answer it gets. This value is
-written into a coin permanently with collateral behind it, so it takes NC-12's discipline: sources
-are untrusted and must AGREE, never trusted individually. Readings that disagree corroborate
-neither.
+reporting the wrong address, and nothing in the exchange says so — `relay.dig.net` did exactly this
+for IPv4 callers, reporting its load balancer's address because the balancer SNATs an IPv4 caller's
+UDP flow. Since the node prefers the relay tier, that is the answer it gets. This value is written
+into a coin permanently with collateral behind it, so it takes NC-12's discipline: sources are
+untrusted and must AGREE, never trusted individually. Readings that disagree corroborate neither.
+
+**The address FAMILY MUST NOT be a rejection criterion.** That defect is an address-family CROSSING,
+not an IPv6 one: the same server answers an IPv6 caller correctly. IPv6 is both the working case and
+the §5.2-preferred one, so a rule distrusting IPv6 answers would discard correct discovery while
+keeping incorrect answers. The node MAY order derived entries by family and MUST NOT judge them by
+it.
+
+**A node SHOULD additionally verify that a STUN answer DESCRIBES THE CALLER** — the reported port
+equal to the querying socket's own source port, and the reported family matching the transport
+queried over. That check belongs to the STUN client, which knows its own socket, and MUST NOT be
+applied where the source port is unknown: a NAT'd node's reflexive port legitimately differs from its
+local source port, so the comparison made anywhere else would refuse the very nodes reflexive
+discovery exists for.
 
 **A derived address MUST be global unicast.** A private, shared/CGNAT, link-local, loopback,
 documentation, benchmarking, discard-only, unique-local or otherwise reserved address MUST NOT be
