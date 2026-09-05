@@ -309,10 +309,10 @@ impl ControlAction {
             // node's own `#[serde(default)]` reads it exactly like the KAT's documented `{}` clear
             // form — see `SetMirrorAdvertiseUrlsParams`'s own doc for why an explicit empty list is
             // refused rather than accepted as either meaning.
-            ControlAction::ConfigSetMirrorAdvertiseUrls { urls } => match urls {
-                Some(urls) => json!({ "urls": urls }),
-                None => json!({}),
-            },
+            ControlAction::ConfigSetMirrorAdvertiseUrls { urls: Some(urls) } => {
+                json!({ "urls": urls })
+            }
+            ControlAction::ConfigSetMirrorAdvertiseUrls { urls: None } => json!({}),
             // Basis points, never a percentage and never a float. A 1 bp margin (0.01%) is a legal
             // choice and any conversion to whole percent would erase it.
             ControlAction::CollateralMarginSet { margin_bp } => json!({ "margin_bp": margin_bp }),
