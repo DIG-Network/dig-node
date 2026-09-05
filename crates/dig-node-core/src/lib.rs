@@ -4322,9 +4322,10 @@ impl Node {
         let genesis = hex::encode(peer::genesis_challenge_from_env());
         let endpoint = peer::relay_url_from_env();
         let port = peer::peer_port_from_env();
-        // This node's own server-reflexive reading, if the peer-network bring-up's STUN walk has
-        // ever answered (dig-node#567) — `None` on a not-yet-started or relay-less offline node,
-        // which `reflexive_addr` below reports honestly as `null` rather than guessing.
+        // Every reading this node's reflexive-address gather has collected, if the peer-network
+        // bring-up's STUN gather has ever answered (dig-node#567) — empty on a not-yet-started or
+        // relay-less offline node, which `reflexive_addr` below reports honestly as `null` rather
+        // than guessing.
         let reflexive = self.peer_status.reflexive();
         // The node's REAL advertised candidate addresses, ordered IPv6-first (ecosystem HARD RULE):
         // a routable IPv6 address (when discoverable) precedes the IPv4 fallback, and the reflexive
@@ -4332,11 +4333,15 @@ impl Node {
         // is the one a stranger behind a DIFFERENT NAT can actually dial. `listen_addr` reports the
         // primary (IPv6-preferred) advertised endpoint — a dialable address, NOT the wildcard bind
         // address (`[::]` / `0.0.0.0`) the listener binds. (The listener itself binds `[::]` dual-stack;
-        // that wildcard is a bind target, never a dialable candidate to report to peers.)
+        // that wildcard is a bind target, never a dialable candidate to report to peers.) This list is
+        // a peer-discovery HINT, not a durable claim, so it folds in the FIRST reading gathered
+        // (tier-precedence order) rather than waiting on agreement — the on-chain advertisement gate
+        // (`mirror::advertise::PublicAddress`) is what actually requires agreement, over the FULL
+        // `reflexive_addr` array below, never over this candidate list.
         let candidates = net::advertised_socket_addrs_with_reflexive(
             port,
             net::advertise_loopback_from_env(),
-            reflexive.map(|(addr, _)| addr),
+            reflexive.first().map(|(addr, _)| *addr),
         );
         let candidate_addresses: Vec<String> = candidates.iter().map(|a| a.to_string()).collect();
         let listen = candidate_addresses
@@ -4344,14 +4349,19 @@ impl Node {
             .cloned()
             .unwrap_or_else(|| format!("[::]:{port}"));
         // The shape `PublicAddress::from_network_info` (dig-node-service) reads back out: `null`
-        // when nothing has answered, else a ONE-element array naming the reporting tier as `source`
-        // — never a bare string or a bare list, both of which that adapter reads as carrying NO
-        // provenance and therefore incapable of ever corroborating a second, independent reading
-        // (dig-node#566). Fail closed: a `null` here is visible and harmless; inventing a value
-        // this node never actually measured is not — see dig-node#567.
-        let reflexive_addr = match reflexive {
-            Some((addr, source)) => json!([{ "source": source, "addr": addr.to_string() }]),
-            None => Value::Null,
+        // when nothing has answered, else a JSON array of ONE OBJECT PER READING naming the
+        // reporting CLASS as `source` — never a bare string or a bare list, both of which that
+        // adapter reads as carrying NO provenance and therefore incapable of ever corroborating a
+        // second, independent reading. `dig_stun::establish` (dig-node#566) is what turns this array
+        // into a belief; this method only ever reports what was measured. Fail closed: a `null` here
+        // is visible and harmless; inventing a value this node never actually measured is not.
+        let reflexive_addr = if reflexive.is_empty() {
+            Value::Null
+        } else {
+            json!(reflexive
+                .iter()
+                .map(|(addr, source)| json!({ "source": source, "addr": addr.to_string() }))
+                .collect::<Vec<_>>())
         };
         let snap = self
             .peer_status
@@ -16827,25 +16837,32 @@ mod tests {
         );
     }
 
-    /// Once the peer-network bring-up's STUN walk answers, the reading MUST reach BOTH surfaces
-    /// dig-node#567 names: `reflexive_addr` (what the mirror-advertise pass parses back out via
-    /// `PublicAddress::from_network_info`) and `candidate_addresses` (what `dign network-info`
-    /// renders as `candidates:` — the exact line the bug was measured against on a real host).
+    /// Once the peer-network bring-up's reflexive gather answers, every reading MUST reach BOTH
+    /// surfaces dig-node#567/#566 name: `reflexive_addr` (what the mirror-advertise pass parses back
+    /// out via `PublicAddress::from_network_info`, and what `dig_stun::establish` runs agreement
+    /// over) and `candidate_addresses` (what `dign network-info` renders as `candidates:` — the
+    /// exact line the bug was measured against on a real host).
     ///
     /// `reflexive_addr` is asserted by STRUCTURE, not merely "is not null": a bare string or a bare
     /// list would also read as "populated" but carries no provenance, and
     /// `PublicAddress::from_network_info` treats that as un-corroboratable — silently defeating the
-    /// ticket's requirement that the source travel with the address. Only the one-element
-    /// `[{"source", "addr"}]` shape satisfies both surfaces at once.
+    /// requirement that the source travel with the address. Only the `[{"source", "addr"}]` shape
+    /// satisfies both surfaces at once. Two DIFFERENT readings are asserted here (not one), because
+    /// a single-entry array was the structural gap dig-node#566 exists to close: before that ticket,
+    /// production could never gather more than one reading, so `reflexive_addr` could never carry
+    /// enough for `dig_stun::establish` to agree over.
     #[test]
-    fn network_info_publishes_a_discovered_reflexive_address_with_its_source_and_folds_it_into_candidates(
+    fn network_info_publishes_every_discovered_reading_with_its_source_and_folds_the_first_into_candidates(
     ) {
         let (node, _td) = test_node(Some([7u8; 32]));
-        // A documentation-range address (RFC 5737) so it can never collide with a real address this
-        // test host happens to own — the assertion below must hold on every machine, not just one
-        // lucky one.
-        let discovered: std::net::SocketAddr = "203.0.113.7:9444".parse().unwrap();
-        node.peer_status.set_reflexive(discovered, "relay");
+        // Documentation-range addresses (RFC 5737) so they can never collide with a real address
+        // this test host happens to own — the assertions below must hold on every machine.
+        let first: std::net::SocketAddr = "203.0.113.7:9444".parse().unwrap();
+        let second: std::net::SocketAddr = "203.0.113.8:9444".parse().unwrap();
+        node.peer_status.set_reflexive(vec![
+            (first, "relay:relay.example".to_string()),
+            (second, "public:stun.example".to_string()),
+        ]);
 
         let info = node.network_info();
 
@@ -16854,15 +16871,21 @@ mod tests {
             .expect("reflexive_addr must be an array once a tier has answered");
         assert_eq!(
             reflexive.len(),
-            1,
-            "exactly one reading has been recorded: {info}"
+            2,
+            "both readings gathered must be published, not just the first: {info}"
         );
-        assert_eq!(reflexive[0]["source"], json!("relay"), "{info}");
         assert_eq!(
-            reflexive[0]["addr"],
-            json!(discovered.to_string()),
+            reflexive[0]["source"],
+            json!("relay:relay.example"),
             "{info}"
         );
+        assert_eq!(reflexive[0]["addr"], json!(first.to_string()), "{info}");
+        assert_eq!(
+            reflexive[1]["source"],
+            json!("public:stun.example"),
+            "{info}"
+        );
+        assert_eq!(reflexive[1]["addr"], json!(second.to_string()), "{info}");
 
         let candidates: Vec<std::net::SocketAddr> = info["candidate_addresses"]
             .as_array()
@@ -16871,8 +16894,8 @@ mod tests {
             .map(|v| v.as_str().unwrap().parse().expect("a socket addr"))
             .collect();
         assert!(
-            candidates.contains(&discovered),
-            "the discovered reflexive address must reach the candidate list an operator reads via \
+            candidates.contains(&first),
+            "the FIRST reading gathered must reach the candidate list an operator reads via \
              `dign network-info`, not only the new field: {candidates:?}"
         );
     }
