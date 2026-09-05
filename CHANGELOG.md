@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.254.82] - 2026-09-05
+
+### Features
+- **wallet:** Adopt the current chia-query line and its shared mempool-refusal list (#558)- **mirror:** Derive the advertised mirror URL from this node's reflexive peer address (#562)
+
+### Bug Fixes
+- **wallet:** Drain a held $DIG arrival within the frame that attributes it (#547)- **peer:** Fall back to public STUN when the relay answers nothing (interim) (#561)
+
+### Documentation
+- Add CONTRIBUTING.md (#551)
+
+### CI
+- **release:** Wire PREV_VERSION into ensure-version-increment.yml (#549)- **release:** Gate the stable job to workflow_dispatch only (the cron must cut ONLY nightlies) (#555)- Harden the .deb job's apt bootstrap against bullseye mirror-skew 404s (#564)
+
+### Chores
+- **wallet:** Adopt dig-options 0.5.0 and chia-query 0.21.0 (#554)
+
 ## [0.254.72] - 2026-09-03
 
 ### Features
