@@ -6998,12 +6998,28 @@ per-method timeout so a dial never hangs.
 
 ### 19.2. STUN reflexive-address discovery
 
-The node discovers its server-reflexive (public) transport address via STUN (RFC 5389) against the STUN
-server co-located with the relay (`<relay-host>:3478`, derived from `DIG_RELAY_URL`). The STUN endpoints
-are resolved across **both address families** (every A + AAAA record) and the Binding transaction is run
-**IPv6-first with IPv4 fallback** (§5.2): the IPv6 STUN server is attempted first and IPv4 is used only
-when the IPv6 server is absent/unreachable — the reflexive address is never nulled merely because IPv6
-failed.
+The node discovers its server-reflexive (public) transport address via STUN (RFC 5389), walking a
+precedence-ordered plan (`StunPlan`, dig_ecosystem#3198) of up to three tiers, each already IPv6-first
+within itself: an **operator override** (`DIG_STUN_SERVER`, when set — never silently bypassed in favor
+of a default), the **DIG relay's co-located STUN endpoint** (the intended steady state), and a **public
+third-party fallback** (Google + Cloudflare) reached only when the relay tier answers nothing. The relay
+reclaims the role automatically the moment it answers again — no code change, no redeploy. Within the
+relay tier, the node derives the endpoint from `DIG_RELAY_URL`'s host and PREFERS a dedicated
+`stun.<relay-host>` DNS name over the bare relay host when it resolves; an unresolvable `stun.` name is
+skipped silently, never an error, so a relay operator who has not adopted the convention keeps working
+exactly as before, and one who has activates the dedicated endpoint by DNS alone. Every candidate
+endpoint — whichever tier or host it came from — is resolved across **both address families** (every A
++ AAAA record) and the Binding transaction is run **IPv6-first with IPv4 fallback** (§5.2): the IPv6
+endpoint is attempted first and IPv4 is used only when the IPv6 endpoint is absent/unreachable — the
+reflexive address is never nulled merely because IPv6 failed.
+
+A STUN answer whose address family differs from the family of the server that answered it is
+**discarded, not returned** — the walk falls through to the next server exactly as a non-answering one
+does. This guards against a server that completes an otherwise well-formed Binding transaction (correct
+magic cookie, correctly echoed transaction id) but names an address belonging to a different network path
+than the one queried — measured: a dual-stack load balancer answering an IPv4 caller with its own IPv6
+address. Such an answer describes something other than this node's queried transport and MUST NOT be
+believed just because the transaction otherwise succeeded.
 
 The reflexive query is run from a UDP socket bound to the node's **ACTUAL listen port** (the peer-RPC
 port peers dial), not a throwaway ephemeral socket. The advertised candidate is therefore

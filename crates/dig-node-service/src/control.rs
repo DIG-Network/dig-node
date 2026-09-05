@@ -60,13 +60,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dig_node_control_interface::params::{
-    WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams, WalletCoinsParams,
-    WalletReservationsReserveParams,
+    SetMirrorAdvertiseUrlsParams, WalletCoinByIdParams, WalletCoinSpendParams,
+    WalletCoinsByParentParams, WalletCoinsParams, WalletReservationsReserveParams,
 };
 use dig_node_control_interface::results::{
-    AutomatedSpend, SpendAsset, SpendAuthority, SpendChainReference, SpendFailureStage,
-    SpendOutcome, SpendsListResult, WalletOperatorAddressResult,
-    WalletOperatorAddressUnavailableReason,
+    AutomatedSpend, MirrorAdvertiseState, MirrorAdvertiseView, SetMirrorAdvertiseUrlsResult,
+    SpendAsset, SpendAuthority, SpendChainReference, SpendFailureStage, SpendOutcome,
+    SpendsListResult, WalletOperatorAddressResult, WalletOperatorAddressUnavailableReason,
 };
 use dig_node_control_interface::ControlMethod;
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
@@ -178,6 +178,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.status",
     "control.config.get",
     "control.config.setUpstream",
+    "control.config.setMirrorAdvertiseUrls",
     "control.log.setLevel",
     "control.cache.get",
     "control.cache.setCap",
@@ -245,6 +246,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.status",
     "control.config.get",
     "control.config.setUpstream",
+    "control.config.setMirrorAdvertiseUrls",
     "control.log.setLevel",
     "control.cache.get",
     "control.cache.setCap",
@@ -782,6 +784,13 @@ const PINNED_KEY: &str = "pinned_stores";
 /// `control.config.setUpstream`; read by `Config::from_env` on next start).
 pub const UPSTREAM_OVERRIDE_KEY: &str = "upstream_override";
 
+/// The config.json key for the persisted mirror-advertise-URLs override (set via
+/// `control.config.setMirrorAdvertiseUrls`, dig-node-control-interface 0.33.0; read by
+/// [`crate::mirror::advertise::advertised_urls_from_env`] on next start — that read is what makes
+/// this override's `requires_restart: true` promise become TRUE the next time the process starts,
+/// rather than never, since nothing can rewrite a running process's own environment).
+pub const MIRROR_ADVERTISE_URLS_OVERRIDE_KEY: &str = "mirror_advertise_urls_override";
+
 /// Read the pinned-store list from the node's config.json. Each entry is a
 /// canonical lowercase 64-hex store id (optionally with a pinned root, kept as a
 /// `{store_id, root?}` object). Missing/blank config → empty list.
@@ -905,6 +914,47 @@ pub fn set_upstream_override(config_path: &Path, upstream: &str) -> std::io::Res
     })
 }
 
+/// Read the persisted mirror-advertise-URLs override from config.json, if any. Missing file,
+/// missing key, or an empty array all read as `None` — "no override, use the derived default" —
+/// matching [`SetMirrorAdvertiseUrlsParams::validated`]'s refusal of an explicit empty list: this
+/// key is never WRITTEN as `[]`, only removed, so an empty array seen here would mean the file was
+/// edited by hand rather than through this control call.
+pub fn read_mirror_advertise_urls_override_from(config_path: &Path) -> Option<Vec<String>> {
+    let txt = std::fs::read_to_string(config_path).ok()?;
+    let v: Value = serde_json::from_str(&txt).ok()?;
+    let urls: Vec<String> = v
+        .get(MIRROR_ADVERTISE_URLS_OVERRIDE_KEY)
+        .and_then(|u| u.as_array())?
+        .iter()
+        .filter_map(|entry| entry.as_str().map(str::to_string))
+        .collect();
+    (!urls.is_empty()).then_some(urls)
+}
+
+/// Read the persisted mirror-advertise-URLs override from the real config path.
+pub fn read_mirror_advertise_urls_override() -> Option<Vec<String>> {
+    read_mirror_advertise_urls_override_from(&dig_node_core::config_path())
+}
+
+/// Persist (`Some`) or clear (`None`) the mirror-advertise-URLs override in config.json. `urls` is
+/// assumed already validated (non-empty, well-formed) by the caller — this function only writes
+/// or removes the key, exactly as [`set_upstream_override`] does for its own key.
+pub fn set_mirror_advertise_urls_override(
+    config_path: &Path,
+    urls: Option<&[String]>,
+) -> std::io::Result<()> {
+    update_config(config_path, |v| match urls {
+        None => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove(MIRROR_ADVERTISE_URLS_OVERRIDE_KEY);
+            }
+        }
+        Some(urls) => {
+            v[MIRROR_ADVERTISE_URLS_OVERRIDE_KEY] = json!(urls);
+        }
+    })
+}
+
 /// Is a value a canonical lowercase 64-hex string (a store id / root)? PURE.
 pub fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
@@ -1014,6 +1064,9 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.status" => control_ok(id, status(ctx).await),
         "control.config.get" => control_ok(id, config_get(ctx)),
         "control.config.setUpstream" => config_set_upstream(ctx, id, params),
+        "control.config.setMirrorAdvertiseUrls" => {
+            config_set_mirror_advertise_urls(ctx, id, params)
+        }
         "control.log.setLevel" => log_set_level(id, params),
         "control.cache.get" => control_ok(id, cache_get()),
         "control.cache.setCap" => cache_set_cap(id, params),
@@ -1138,6 +1191,21 @@ async fn status(ctx: &ControlCtx) -> Value {
 fn config_get(ctx: &ControlCtx) -> Value {
     let (dir, shared) = (crate::meta::cache_dir(), crate::meta::cache_shared());
     let port = ctx.addr.rsplit(':').next().unwrap_or("");
+    // dig-node-control-interface 0.33.0's additive `ConfigResult.mirror_advertise` (dig-node#570):
+    // the SAME view `control.config.setMirrorAdvertiseUrls` reports, from the operator's CURRENTLY
+    // effective configuration (env var, else the persisted override — see
+    // `crate::mirror::advertise::advertised_urls_from_env`) rather than from a fresh set/clear.
+    let operator = crate::mirror::advertise::configured_operator_urls();
+    let operator_override = (!operator.accepted.is_empty() || !operator.rejected.is_empty())
+        .then(|| {
+            operator
+                .accepted
+                .iter()
+                .cloned()
+                .chain(operator.rejected.iter().map(|(entry, _)| entry.clone()))
+                .collect()
+        });
+    let mirror_advertise = mirror_advertise_view(ctx, &operator, operator_override);
     json!({
         "addr": ctx.addr,
         "port": port,
@@ -1147,6 +1215,7 @@ fn config_get(ctx: &ControlCtx) -> Value {
         "cache_shared": shared,
         "config_path": ctx.config_path.display().to_string(),
         "sync_available": ctx.sync_available,
+        "mirror_advertise": mirror_advertise,
     })
 }
 
@@ -1198,6 +1267,107 @@ fn config_set_upstream(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             format!("failed to persist upstream override: {e}"),
         ),
     }
+}
+
+/// Map this service's own [`crate::mirror::advertise::AdvertiseState`] to the WIRE
+/// `MirrorAdvertiseState` dig-node-control-interface 0.33.0 declares.
+///
+/// An explicit match, never a string round-trip through `.label()`: both enums already agree
+/// character-for-character on their six spellings (`AdvertiseState::label()` IS the snake_case
+/// form `MirrorAdvertiseState`'s own `#[serde(rename_all = "snake_case")]` produces), but a match
+/// makes a variant added to EITHER enum without a corresponding arm here a COMPILE error, never a
+/// silently-wrong or silently-missing wire label.
+fn to_wire_advertise_state(
+    state: crate::mirror::advertise::AdvertiseState,
+) -> MirrorAdvertiseState {
+    use crate::mirror::advertise::AdvertiseState as Local;
+    match state {
+        Local::Override => MirrorAdvertiseState::AdvertisingOverride,
+        Local::Derived => MirrorAdvertiseState::AdvertisingDerived,
+        Local::Off => MirrorAdvertiseState::Off,
+        Local::NoPublicAddress => MirrorAdvertiseState::NoPublicAddress,
+        Local::Uncorroborated => MirrorAdvertiseState::UncorroboratedAddress,
+        Local::NoRelay => MirrorAdvertiseState::NoRelay,
+    }
+}
+
+/// The mirror advertise-URL view both `control.config.get` and
+/// `control.config.setMirrorAdvertiseUrls` report — ONE function, so the two surfaces can never
+/// compute this differently. `operator` is the already-decided operator override (what a set/clear
+/// just persisted, or what the environment currently holds); `operator_override` is the verbatim
+/// value [`MirrorAdvertiseView::operator_override`] reports alongside it.
+fn mirror_advertise_view(
+    ctx: &ControlCtx,
+    operator: &crate::mirror::advertise::Advertised,
+    operator_override: Option<Vec<String>>,
+) -> MirrorAdvertiseView {
+    let address =
+        crate::mirror::advertise::PublicAddress::from_network_info(&ctx.node.network_info());
+    let effective = crate::mirror::advertise::effective_urls(operator, &address);
+    MirrorAdvertiseView {
+        urls: effective.urls,
+        operator_override,
+        state: to_wire_advertise_state(effective.state),
+    }
+}
+
+/// `control.config.setMirrorAdvertiseUrls` (dig-node-control-interface 0.33.0, dig-node#570) —
+/// override (`Some`, non-empty, well-formed) or clear (`None`) the URLs this node advertises in
+/// its own mirror-coin memos.
+///
+/// # `requires_restart` is unconditionally `true`, and that is the honest answer today
+///
+/// [`crate::server`]'s mirror-creation task reads the operator's configured URLs via
+/// [`crate::mirror::advertise::configured_operator_urls`] exactly ONCE, for the life of that task
+/// (deliberately — see that function's own doc: re-reading it per pass would only let the
+/// bring-up warning drift from what is actually published). No control call can rewrite a running
+/// process's already-captured state, so this override cannot take effect before a restart. It DOES
+/// take effect at the NEXT one: the persisted write below is what
+/// [`crate::mirror::advertise::advertised_urls_from_env`] consults, so the promise this field
+/// makes is genuine, not merely unimplemented.
+fn config_set_mirror_advertise_urls(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    let parsed: SetMirrorAdvertiseUrlsParams = match serde_json::from_value(params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return control_error(
+                id,
+                ErrorCode::InvalidParams,
+                format!("control.config.setMirrorAdvertiseUrls: {e}"),
+            )
+        }
+    };
+    let parsed = match parsed.validated() {
+        Ok(p) => p,
+        Err(e) => return control_error(id, ErrorCode::InvalidParams, e.message),
+    };
+
+    if let Err(e) = set_mirror_advertise_urls_override(&ctx.config_path, parsed.urls.as_deref()) {
+        return control_error(
+            id,
+            ErrorCode::ControlError,
+            format!("failed to persist mirror-advertise-urls override: {e}"),
+        );
+    }
+
+    // What THIS call just persisted, not what the running process's own environment still says
+    // (which cannot change) -- so the response matches what actually took effect on disk.
+    let operator = match &parsed.urls {
+        Some(urls) => crate::mirror::advertise::Advertised {
+            accepted: urls.clone(),
+            rejected: Vec::new(),
+        },
+        None => crate::mirror::advertise::Advertised::default(),
+    };
+    let mirror_advertise = mirror_advertise_view(ctx, &operator, parsed.urls);
+
+    control_ok(
+        id,
+        serde_json::to_value(SetMirrorAdvertiseUrlsResult {
+            mirror_advertise,
+            requires_restart: true,
+        })
+        .unwrap_or_default(),
+    )
 }
 
 /// Cache view (cap/used/dir/shared) — reuses the dig-node crate's resolvers.
@@ -6938,6 +7108,65 @@ mod tests {
         // Blank clears it.
         set_upstream_override(&config_path, "  ").unwrap();
         assert_eq!(read_upstream_override_from(&config_path), None);
+    }
+
+    /// The persistence half of `control.config.setMirrorAdvertiseUrls` (dig-node#570): a set
+    /// round-trips, a second set REPLACES rather than appends, and `None` clears -- the same
+    /// three-state contract `SetMirrorAdvertiseUrlsParams` documents on the wire.
+    #[test]
+    fn mirror_advertise_urls_override_roundtrips_replaces_and_clears() {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-mirror-advertise-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let config_path = dir.path().join("config.json");
+        assert_eq!(read_mirror_advertise_urls_override_from(&config_path), None);
+
+        let first = vec!["dig://[2001:db8::7]:9776".to_string()];
+        set_mirror_advertise_urls_override(&config_path, Some(&first)).unwrap();
+        assert_eq!(
+            read_mirror_advertise_urls_override_from(&config_path),
+            Some(first)
+        );
+
+        // A second SET replaces the list rather than merging into it.
+        let second = vec![
+            "dig://relay.example:9776".to_string(),
+            "dig://[2001:db8::8]:9776".to_string(),
+        ];
+        set_mirror_advertise_urls_override(&config_path, Some(&second)).unwrap();
+        assert_eq!(
+            read_mirror_advertise_urls_override_from(&config_path),
+            Some(second)
+        );
+
+        // `None` clears it.
+        set_mirror_advertise_urls_override(&config_path, None).unwrap();
+        assert_eq!(read_mirror_advertise_urls_override_from(&config_path), None);
+    }
+
+    /// The pin registry and the upstream override already prove `update_config` preserves sibling
+    /// keys (`update_config_preserves_dig_node_keys`); this proves the mirror-advertise-urls key
+    /// joins that set rather than clobbering it — a THIRD service-owned key living beside the other
+    /// two in the same file.
+    #[test]
+    fn mirror_advertise_urls_override_coexists_with_pins_and_upstream() {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-mirror-advertise-coexist-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        let config_path = dir.path().join("config.json");
+
+        let store = "f".repeat(64);
+        add_pin(&config_path, &store, None).unwrap();
+        set_upstream_override(&config_path, "https://example.test").unwrap();
+        set_mirror_advertise_urls_override(&config_path, Some(&["dig://h:1".to_string()])).unwrap();
+
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(v["pinned_stores"][0]["store_id"], json!(store));
+        assert_eq!(v["upstream_override"], json!("https://example.test"));
+        assert_eq!(v["mirror_advertise_urls_override"], json!(["dig://h:1"]));
     }
 
     /// (#1851 leg-2) `control.wallet.balance` MUST emit `balance`/`pending` as JSON **numbers**,

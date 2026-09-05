@@ -297,7 +297,9 @@ pub fn advertise_loopback_from_env() -> bool {
 // -- Shared NAT-traversal config (#385) --------------------------------------------------------------
 
 /// The RFC-5389 STUN port the DIG relay co-locates with its relay host (`relay.dig.net:3478`). A node
-/// derives its STUN server from the relay endpoint (`<relay-host>:STUN_PORT`) — dig-nat L7 spec §3.
+/// derives its STUN server from the relay endpoint, preferring a dedicated `stun.<relay-host>` DNS
+/// name over the bare relay host when it resolves (see [`stun_servers_from_relay`]) — dig-nat L7
+/// spec §3.
 pub const STUN_PORT: u16 = 3478;
 
 /// The shared [`dig_nat::NatConfig`] for EVERY node peer dial (DHT lookups, multi-source range
@@ -437,35 +439,72 @@ pub fn parse_relay_host(endpoint: &str) -> Option<String> {
     parse_relay_endpoint(endpoint).map(|e| e.host)
 }
 
-/// Resolve the DIG STUN servers (`<relay-host>:STUN_PORT`) from the relay endpoint URL across BOTH
-/// address families — every A + AAAA record — ordered IPv6-first (§5.2, `dig_ip::Family`). The caller
-/// MUST NOT pre-collapse to one family: the reflexive discovery below races IPv6 first and falls back
-/// to IPv4, so it needs a STUN endpoint per family (#1393). Best-effort blocking DNS resolution;
-/// returns an empty vec when the host can't be parsed/resolved. Call off the async runtime (e.g. via
-/// `spawn_blocking`).
+/// Resolve the DIG STUN servers from the relay endpoint URL across BOTH address families — every
+/// A + AAAA record — ordered IPv6-first (§5.2, `dig_ip::Family`), preferring a DEDICATED
+/// `stun.<relay-host>` DNS name over the bare relay host when it resolves (see
+/// [`prefer_dedicated_stun_host`]). The caller MUST NOT pre-collapse to one family: the reflexive
+/// discovery below races IPv6 first and falls back to IPv4, so it needs a STUN endpoint per family
+/// (#1393). Best-effort blocking DNS resolution throughout; returns an empty vec when the relay
+/// endpoint itself can't be parsed. Call off the async runtime (e.g. via `spawn_blocking`).
+///
+/// # Why `stun.<relay-host>`, not a hardcoded `stun.relay.dig.net`
+///
+/// dig-relay is GPL-2.0 and self-hosting is supported (SYSTEM.md); hardcoding DIG's own hostname
+/// would silently break every self-hosted relay's node peers. Deriving the CONVENTION from
+/// whatever relay endpoint the operator already configured means a self-hoster who adopts the
+/// `stun.` naming activates the dedicated endpoint with a DNS change alone — no dig-node release,
+/// no config flag, and every node that dials through THIS function picks it up identically:
+/// [`stun_server_from_relay`] (the traversal-ladder / DHT-transport single-endpoint feed) delegates
+/// here rather than deriving its own list, so the two can never talk to different hosts.
 pub fn stun_servers_from_relay(relay_endpoint: &str) -> Vec<SocketAddr> {
-    use std::net::ToSocketAddrs;
     let Some(host) = parse_relay_host(relay_endpoint) else {
         return Vec::new();
     };
-    let mut addrs: Vec<SocketAddr> = match (host.as_str(), STUN_PORT).to_socket_addrs() {
-        Ok(iter) => iter.collect(),
-        Err(_) => return Vec::new(),
-    };
+    let dedicated = resolve_host_both_families(&format!("stun.{host}"));
+    let bare = resolve_host_both_families(&host);
+    prefer_dedicated_stun_host(dedicated, bare)
+}
+
+/// Every `A` + `AAAA` record for `host` at [`STUN_PORT`], in whatever order the resolver returns
+/// them. Empty (never an error) when `host` doesn't resolve — an absent DNS name is a normal,
+/// silently-skipped outcome for every STUN tier in this module, not a fault. Best-effort blocking
+/// DNS; call off the async runtime.
+fn resolve_host_both_families(host: &str) -> Vec<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    (host, STUN_PORT)
+        .to_socket_addrs()
+        .map(Iterator::collect)
+        .unwrap_or_default()
+}
+
+/// Merge a dedicated STUN host's resolved addresses ahead of the bare relay host's own, so the
+/// dedicated endpoint is tried first WITHIN each address family once the final IPv6-first sort
+/// runs — an identical address named by both is kept only once. Pure over already-resolved
+/// addresses, so the preference itself is unit-testable without live DNS (the same seam
+/// [`StunPlan::from_tiers`] uses for tier precedence).
+fn prefer_dedicated_stun_host(dedicated: Vec<SocketAddr>, bare: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut seen = std::collections::HashSet::new();
+    let mut addrs: Vec<SocketAddr> = dedicated.into_iter().chain(bare).collect();
+    addrs.retain(|a| seen.insert(*a));
     // IPv6-first: `dig_ip::Family` orders V6 before V4 (the ecosystem's canonical family sort).
+    // Stable, so within each family the dedicated host's entries (pushed first, above) stay ahead
+    // of the bare host's.
     addrs.sort_by_key(dig_ip::Family::of);
     addrs
 }
 
-/// Resolve the single IPv6-first DIG STUN server (`<relay-host>:STUN_PORT`) for the traversal-ladder
-/// hole-punch tier + DHT transport (a single reflexive-input endpoint, dig-nat L7 spec §3). The
-/// reflexive-advertise path uses [`stun_servers_from_relay`] instead (it needs a per-family endpoint).
-/// `None` when the host can't be parsed/resolved. Call off the async runtime.
+/// Resolve the single IPv6-first DIG STUN server for the traversal-ladder hole-punch tier + DHT
+/// transport (a single reflexive-input endpoint, dig-nat L7 spec §3), preferring the dedicated
+/// `stun.<relay-host>` endpoint exactly as [`stun_servers_from_relay`] does — it delegates to that
+/// function rather than re-deriving the host, so the two can never disagree about which server to
+/// try first. The reflexive-advertise path uses [`stun_servers_from_relay`] directly instead (it
+/// needs every per-family endpoint, not just the first). `None` when the host can't be
+/// parsed/resolved. Call off the async runtime.
 pub fn stun_server_from_relay(relay_endpoint: &str) -> Option<SocketAddr> {
     stun_servers_from_relay(relay_endpoint).into_iter().next()
 }
 
-// -- Public STUN fallback (INTERIM - dig_ecosystem#3198) ----------------------------------------
+// -- Public STUN fallback (STANDING, LAST-RESORT - dig_ecosystem#3198) --------------------------
 
 /// Which of the STUN tiers actually answered this node's Binding request.
 ///
@@ -483,9 +522,14 @@ pub enum StunSource {
     /// The STUN server co-located with the DIG relay (`<relay-host>:STUN_PORT`) - the intended
     /// steady state, and the tier this node prefers whenever it answers.
     Relay,
-    /// A public third-party STUN server from [`PUBLIC_STUN_SERVERS`]. **Interim only**
-    /// (dig_ecosystem#3198): reached solely when the relay tier yields nothing, so the relay
-    /// reclaims the role the moment it starts answering - with no code change and no redeploy.
+    /// A public third-party STUN server from [`PUBLIC_STUN_SERVERS`]. A STANDING fallback,
+    /// retained deliberately and reached only LAST — solely when the relay tier yields nothing —
+    /// so the relay reclaims the role the moment it starts answering, with no code change and no
+    /// redeploy. Kept rather than removed once the relay works: a single STUN source is a single
+    /// point of trust, the relay can itself be wrong or briefly unreachable, and a node with no
+    /// reflexive address publishes nothing and earns nothing. `dig_ecosystem#3198` tracks
+    /// requiring TWO sources to agree before a reading is used durably/on-chain — this tier
+    /// existing is what makes that corroboration possible at all.
     Public,
 }
 
@@ -515,13 +559,23 @@ impl StunSource {
 pub const STUN_SERVER_ENV: &str = "DIG_STUN_SERVER";
 
 /// The public STUN servers this node falls back to when the DIG relay answers nothing
-/// (dig_ecosystem#3198). **Interim**: the relay is meant to serve this role (dig-nat L7 spec §3) and
-/// reclaims it automatically the moment it answers, because the relay tier is tried first.
+/// (dig_ecosystem#3198). A STANDING fallback, kept deliberately rather than deleted once the relay
+/// works: the relay is preferred (dig-nat L7 spec §3) and reclaims the role automatically the
+/// moment it answers, because the relay tier is tried first and this one is tried LAST — but a
+/// single STUN source (even the relay) is a single point of trust, and a node with no reflexive
+/// address at all publishes nothing and earns nothing. Measured justification: before dig-relay
+/// 0.19.7 fixed a family-tag defect, `relay.dig.net` answered every IPv4 caller with the load
+/// balancer's OWN IPv6 address — this tier was the only source that answered honestly during that
+/// window, which is exactly the failure mode a single-source design cannot survive.
 ///
 /// More than one operator on purpose. A single third-party host would make one company's outage an
 /// outage of every DIG node's address discovery, which is a worse dependency than the one being
 /// worked around. Both entries publish A **and** AAAA records, so the IPv6-first walk (§5.2) has a
 /// real IPv6 endpoint to try rather than falling to IPv4 by default.
+///
+/// This tier is reached LAST on purpose, not merely last in this list: a third party learning
+/// every DIG node's address is a real privacy cost, so it is paid only once every closer-to-home
+/// option (operator override, then the DIG relay) has already failed to answer.
 ///
 /// Note the ports differ and are NOT [`STUN_PORT`] for every host: Google serves STUN on 19302.
 pub const PUBLIC_STUN_SERVERS: &[(&str, u16)] =
@@ -730,15 +784,25 @@ impl StunPlan {
                 let Ok(socket) = bind_stun_socket(port, server.is_ipv6()) else {
                     continue;
                 };
-                if let Ok(result) =
+                let Ok(result) =
                     dig_nat::stun::query_reflexive_address(&socket, server, timeout).await
-                {
-                    return Some(ReflexiveDiscovery {
-                        addr: reflexive_candidate(result, port),
-                        source: *source,
-                        server,
-                    });
+                else {
+                    continue;
+                };
+                // An answer whose family differs from the family of the server we queried is not
+                // about THIS query and must be discarded rather than believed just because the
+                // transaction otherwise completed (correct cookie, correctly echoed transaction
+                // id): a dual-stack load balancer has been measured answering an IPv4 caller with
+                // its OWN IPv6 address. Fall through exactly as a non-answering server does, all
+                // the way to a lower-precedence tier if nothing in this one answers honestly.
+                if dig_ip::Family::of(&result) != dig_ip::Family::of(&server) {
+                    continue;
                 }
+                return Some(ReflexiveDiscovery {
+                    addr: reflexive_candidate(result, port),
+                    source: *source,
+                    server,
+                });
             }
         }
         None
@@ -769,7 +833,7 @@ pub fn stun_fallback_warning(
     match discovery {
         Some(d) if d.source == StunSource::Public && plan.has_source(StunSource::Relay) => {
             Some(format!(
-                "the DIG relay answered no STUN binding request; this node's reflexive address came from the PUBLIC fallback server {} instead. This is interim (dig_ecosystem#3198) - the relay is preferred and resumes automatically once it answers.",
+                "the DIG relay answered no STUN binding request; this node's reflexive address came from the PUBLIC fallback server {} instead. The relay is preferred and this node will use it again automatically the next time it answers, with no restart needed; dig_ecosystem#3198 tracks requiring a second source to agree before this reading is used durably.",
                 d.server
             ))
         }
@@ -1189,6 +1253,60 @@ mod tests {
         assert_eq!(parse_relay_host("relay.dig.net"), None);
     }
 
+    // -- `stun.<relay-host>` preference: pure over already-resolved addresses, so it is testable ---
+    // -- without live DNS, the same seam `StunPlan::from_tiers` uses for tier precedence. ----------
+
+    /// The dedicated `stun.<relay-host>` endpoint leads the bare host's own answer WITHIN each
+    /// family — proving the preference survives the final IPv6-first sort rather than being
+    /// scrambled by it. Four DISTINCT addresses so the ordering has something real to get wrong:
+    /// a implementation that only ever resolved the bare host (today's code) cannot produce this
+    /// order at all, because it never has the dedicated addresses to place.
+    #[test]
+    fn the_dedicated_stun_host_leads_the_bare_hosts_answer_within_each_family() {
+        let dedicated_v6: SocketAddr = "[2001:db8::1]:3478".parse().unwrap();
+        let dedicated_v4: SocketAddr = "100.64.1.1:3478".parse().unwrap();
+        let bare_v6: SocketAddr = "[2001:db8::2]:3478".parse().unwrap();
+        let bare_v4: SocketAddr = "100.64.2.2:3478".parse().unwrap();
+
+        let merged = prefer_dedicated_stun_host(
+            vec![dedicated_v6, dedicated_v4],
+            vec![bare_v6, bare_v4],
+        );
+
+        assert_eq!(merged, vec![dedicated_v6, bare_v6, dedicated_v4, bare_v4]);
+    }
+
+    /// The measured shape at `relay.dig.net`: `stun.<host>`'s AAAA points at the SAME dualstack
+    /// NLB the bare host's own AAAA already names, while its A record is a NEW IPv4-only NLB.
+    /// The identical IPv6 entry must survive only ONCE — trying the same server twice wastes a
+    /// full STUN timeout for zero benefit — while the genuinely new IPv4 entry is kept.
+    #[test]
+    fn an_address_named_by_both_hosts_is_tried_only_once() {
+        let shared_v6: SocketAddr = "[2606:4700::1]:3478".parse().unwrap();
+        let new_v4: SocketAddr = "100.64.9.9:3478".parse().unwrap();
+
+        let merged = prefer_dedicated_stun_host(vec![shared_v6, new_v4], vec![shared_v6]);
+
+        assert_eq!(
+            merged,
+            vec![shared_v6, new_v4],
+            "the shared address must appear exactly once: {merged:?}"
+        );
+    }
+
+    /// A relay operator who has not adopted the `stun.` convention: the dedicated name resolves to
+    /// nothing (as if NXDOMAIN), and the bare host's own answer is used, completely unchanged from
+    /// today's behaviour. No error, no empty result — the preference is additive.
+    #[test]
+    fn an_unresolvable_dedicated_stun_host_falls_back_to_the_bare_host_unchanged() {
+        let bare_v6: SocketAddr = "[2001:db8::9]:3478".parse().unwrap();
+        let bare_v4: SocketAddr = "100.64.3.3:3478".parse().unwrap();
+
+        let merged = prefer_dedicated_stun_host(Vec::new(), vec![bare_v6, bare_v4]);
+
+        assert_eq!(merged, vec![bare_v6, bare_v4]);
+    }
+
     /// **Proves:** a relay endpoint the node cannot read yields NO destination, in each of the four
     /// ways the pre-#285 parser invented one — an unknown scheme, an unparsable port, embedded
     /// userinfo, and a fragment. Each malformed input is paired with the well-formed endpoint it is
@@ -1444,38 +1562,65 @@ mod tests {
         assert_eq!(reflexive, None);
     }
 
-    // -- Public STUN fallback (INTERIM - dig_ecosystem#3198) --------------------------------------
+    // -- Public STUN fallback (STANDING, LAST-RESORT - dig_ecosystem#3198) --------------------------
 
     /// Encode a STUN Binding success response carrying `mapped` in XOR-MAPPED-ADDRESS, echoing
-    /// `txid` (RFC 5389 §15.2, IPv4 form).
+    /// `txid` (RFC 5389 §15.2). `mapped`'s own variant selects the wire family (0x01 IPv4 / 0x02
+    /// IPv6) and XOR key (the 32-bit cookie alone for IPv4; cookie‖transaction-id for IPv6) — so
+    /// this ONE encoder builds both an honest same-family answer and, for the cross-family guard
+    /// tests below, an answer whose family deliberately does not match the server socket it came
+    /// from (the measured dig-relay defect: an IPv4-bound endpoint answering with an IPv6 address).
     ///
     /// Written out here rather than borrowed from dig-nat on purpose: a fake server built from
     /// dig-nat's own encoder would round-trip that crate against itself and pass even if both halves
     /// were wrong together. Encoding from the RFC means these tests exercise dig-nat's real parser.
-    fn encode_binding_success(txid: &[u8; 12], mapped: std::net::SocketAddrV4) -> Vec<u8> {
+    fn encode_binding_success(txid: &[u8; 12], mapped: SocketAddr) -> Vec<u8> {
         let cookie = dig_nat::stun::MAGIC_COOKIE;
-        let mut attr = Vec::with_capacity(12);
+        let cookie_be = cookie.to_be_bytes();
+        let port_xor = (mapped.port() ^ (cookie >> 16) as u16).to_be_bytes();
+        let (family, addr_xor): (u8, Vec<u8>) = match mapped.ip() {
+            IpAddr::V4(v4) => {
+                let xored = v4
+                    .octets()
+                    .iter()
+                    .zip(cookie_be.iter())
+                    .map(|(a, b)| a ^ b)
+                    .collect();
+                (0x01, xored)
+            }
+            IpAddr::V6(v6) => {
+                // RFC 5389 §15.2: the IPv6 XOR key is the 32-bit cookie followed by the 96-bit txid.
+                let mut key = [0u8; 16];
+                key[..4].copy_from_slice(&cookie_be);
+                key[4..].copy_from_slice(txid);
+                let xored = v6.octets().iter().zip(key.iter()).map(|(a, b)| a ^ b).collect();
+                (0x02, xored)
+            }
+        };
+
+        let mut attr = Vec::with_capacity(8 + addr_xor.len());
         attr.extend_from_slice(&dig_nat::stun::ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
-        attr.extend_from_slice(&8u16.to_be_bytes());
+        attr.extend_from_slice(&((4 + addr_xor.len()) as u16).to_be_bytes());
         attr.push(0); // reserved
-        attr.push(0x01); // address family: IPv4
-        attr.extend_from_slice(&(mapped.port() ^ (cookie >> 16) as u16).to_be_bytes());
-        attr.extend_from_slice(&(u32::from(*mapped.ip()) ^ cookie).to_be_bytes());
+        attr.push(family);
+        attr.extend_from_slice(&port_xor);
+        attr.extend_from_slice(&addr_xor);
 
         let mut msg = Vec::with_capacity(20 + attr.len());
         msg.extend_from_slice(&dig_nat::stun::BINDING_SUCCESS.to_be_bytes());
         msg.extend_from_slice(&(attr.len() as u16).to_be_bytes());
-        msg.extend_from_slice(&cookie.to_be_bytes());
+        msg.extend_from_slice(&cookie_be);
         msg.extend_from_slice(txid);
         msg.extend_from_slice(&attr);
         msg
     }
 
-    /// A fake STUN server on loopback that answers every Binding request with `mapped`. Returns the
-    /// address to point a tier at.
-    async fn spawn_fake_stun(mapped: &str) -> SocketAddr {
-        let mapped: std::net::SocketAddrV4 = mapped.parse().unwrap();
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    /// A fake STUN server bound to `bind_addr` that answers every Binding request with `mapped`
+    /// (any family, independent of `bind_addr`'s own family — see [`encode_binding_success`]).
+    /// Returns the address to point a tier at.
+    async fn spawn_fake_stun_at(bind_addr: &str, mapped: &str) -> SocketAddr {
+        let mapped: SocketAddr = mapped.parse().unwrap();
+        let socket = tokio::net::UdpSocket::bind(bind_addr).await.unwrap();
         let addr = socket.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
@@ -1491,6 +1636,12 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A fake STUN server on IPv4 loopback that answers every Binding request with `mapped`.
+    /// The common case ([`spawn_fake_stun_at`] with the family that every pre-existing test needs).
+    async fn spawn_fake_stun(mapped: &str) -> SocketAddr {
+        spawn_fake_stun_at("127.0.0.1:0", mapped).await
     }
 
     /// A real, free loopback UDP port with nothing listening on it - the stand-in for a relay whose
@@ -1536,8 +1687,8 @@ mod tests {
     }
 
     /// The relay RECLAIMS the role the moment it answers - no code change, no redeploy. Both tiers
-    /// are configured and both work here, and the relay still wins; that ordering is what makes this
-    /// fallback interim rather than a permanent dependency on a third party.
+    /// are configured and both work here, and the relay still wins; that ordering is what keeps this
+    /// fallback a genuine LAST resort rather than a permanent redirection away from the relay.
     #[tokio::test]
     async fn a_relay_that_answers_is_never_overtaken_by_the_public_tier() {
         let listen_port = free_local_port();
@@ -1553,6 +1704,70 @@ mod tests {
         assert_eq!(discovery.source, StunSource::Relay);
         assert_eq!(discovery.server, relay);
         assert_eq!(discovery.addr.ip().to_string(), "100.64.1.1");
+    }
+
+    /// **The revert-proof for the cross-family STUN guard.** A relay bound to IPv4 — the node
+    /// queried it over IPv4 — but answering with an IPv6 address is the measured dig-relay defect:
+    /// a dual-stack load balancer's own IPv6 address, not the caller's, with an otherwise perfectly
+    /// well-formed Binding response (correct cookie, correct echoed transaction id). That answer is
+    /// not about this node's query and must be discarded, falling through the ladder exactly as a
+    /// silent relay does (#3198's fallback), to the public tier's honest, same-family answer.
+    ///
+    /// The public tier is the honest CONTROL, not incidental set-dressing: without it this test
+    /// could not distinguish "the bogus answer was rejected and the walk continued" from "discovery
+    /// broke and returns None for any reason" — the two look identical if the only tier configured
+    /// is the lying one.
+    #[tokio::test]
+    async fn a_cross_family_stun_answer_is_discarded_and_the_ladder_falls_through() {
+        let listen_port = free_local_port();
+        // Bound on IPv4 loopback; answers with an IPv6 address anyway (the LB-reflects-itself bug).
+        let relay = spawn_fake_stun("[2606:4700::dead:beef]:1234").await;
+        let public = spawn_fake_stun("100.64.7.7:41234").await;
+        let plan = StunPlan::from_tiers(Vec::new(), vec![relay], vec![public]);
+
+        let discovery = plan
+            .discover_reflexive(listen_port, Duration::from_millis(400))
+            .await
+            .expect("the public tier answered honestly, so a reflexive address MUST be discovered");
+
+        assert_eq!(
+            discovery.source,
+            StunSource::Public,
+            "the relay's cross-family answer must be discarded rather than returned: {discovery:?}"
+        );
+        assert_eq!(discovery.addr.ip().to_string(), "100.64.7.7");
+    }
+
+    /// The reverse direction: an IPv6-bound server answering with an IPv4 address is equally not an
+    /// answer to this node's query, and is discarded the same way. Skips gracefully where the host
+    /// has no IPv6 loopback (mirrors `dual_stack_bind_accepts_an_ipv4_loopback_client` above).
+    #[tokio::test]
+    async fn a_cross_family_stun_answer_is_discarded_the_other_direction_too() {
+        if !crate::peer::tests::is_ipv6_loopback_available().await {
+            eprintln!(
+                "skipping a_cross_family_stun_answer_is_discarded_the_other_direction_too: no \
+                 IPv6 loopback in this environment"
+            );
+            return;
+        }
+        let listen_port = free_local_port();
+        // 100.64.x.x (RFC 6598 shared address space), not a documentation range: dig-nat's own
+        // `is_usable_reflexive_addr` rejects 203.0.113.0/24 et al. regardless of family, which would
+        // make this test pass for THAT reason instead of the cross-family guard under test.
+        let relay = spawn_fake_stun_at("[::1]:0", "100.64.5.5:1234").await;
+        let public = spawn_fake_stun("100.64.7.7:41234").await;
+        let plan = StunPlan::from_tiers(Vec::new(), vec![relay], vec![public]);
+
+        let discovery = plan
+            .discover_reflexive(listen_port, Duration::from_millis(400))
+            .await
+            .expect("the public tier answered honestly, so a reflexive address MUST be discovered");
+
+        assert_eq!(
+            discovery.source,
+            StunSource::Public,
+            "the IPv6 relay's IPv4 answer must be discarded rather than returned: {discovery:?}"
+        );
     }
 
     /// The operator override outranks BOTH defaults. An operator running a private relay must never
