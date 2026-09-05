@@ -769,13 +769,13 @@ pub fn stun_fallback_warning(
     match discovery {
         Some(d) if d.source == StunSource::Public && plan.has_source(StunSource::Relay) => {
             Some(format!(
-                "the DIG relay answered no STUN binding request; this node's reflexive address came                  from the PUBLIC fallback server {} instead. This is interim (dig_ecosystem#3198) -                  the relay is preferred and resumes automatically once it answers.",
+                "the DIG relay answered no STUN binding request; this node's reflexive address came from the PUBLIC fallback server {} instead. This is interim (dig_ecosystem#3198) - the relay is preferred and resumes automatically once it answers.",
                 d.server
             ))
         }
         Some(_) => None,
         None => Some(format!(
-            "no STUN server answered across {} tier(s); this node has NO reflexive address and will              advertise only its local addresses.",
+            "no STUN server answered across {} tier(s); this node has NO reflexive address and will advertise only its local addresses.",
             plan.sources().len()
         )),
     }
@@ -1742,5 +1742,50 @@ mod tests {
             .filter_map(|&(host, _)| host.rsplit_once('.').map(|(_, tld)| tld))
             .collect();
         assert!(!domains.is_empty());
+    }
+
+    /// A LIVE probe against the REAL relay and the REAL public fallback on the host it runs on.
+    ///
+    /// `#[ignore]`d because it needs outbound UDP and the public internet; CI must not depend on
+    /// either, and a network-flaky required check is worse than no check. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test -p dig-node-core --lib live_stun_probe -- --ignored --nocapture
+    /// ```
+    ///
+    /// It prints BOTH postures - the relay tier alone (what this node did before the change) and the
+    /// full tiered plan (what it does now) - so the difference is measured on the real silent relay
+    /// rather than inferred from a fake one.
+    #[tokio::test]
+    #[ignore = "live network: probes relay.dig.net and the public STUN fallback"]
+    async fn live_stun_probe_reports_which_tier_answers() {
+        let port = free_local_port();
+        let endpoint = crate::peer::relay_url_from_env();
+        let relay_servers = stun_servers_from_relay(&endpoint);
+        let public = public_stun_servers();
+        println!("relay endpoint       : {endpoint}");
+        println!("relay STUN servers   : {relay_servers:?}");
+        println!("public STUN servers  : {public:?}");
+        println!("node listen port     : {port}");
+
+        // The relay tier ALONE - exactly what reflexive discovery had before this change.
+        let before = StunPlan::from_tiers(Vec::new(), relay_servers.clone(), Vec::new())
+            .discover_reflexive(port, Duration::from_secs(2))
+            .await;
+        println!("RELAY ONLY (pre-change): {before:?}");
+
+        // The tiered plan this change introduces.
+        let plan = StunPlan::from_tiers(Vec::new(), relay_servers, public);
+        let after = plan.discover_reflexive(port, Duration::from_secs(2)).await;
+        println!("TIERED (this change)   : {after:?}");
+        println!(
+            "warning                : {:?}",
+            stun_fallback_warning(&plan, after)
+        );
+
+        assert!(
+            after.is_some(),
+            "no STUN tier answered on this host; check outbound UDP before reading this as a defect"
+        );
     }
 }

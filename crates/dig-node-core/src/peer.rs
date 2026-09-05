@@ -3127,7 +3127,7 @@ async fn bring_up_dht(
     let reflexive = stun_discovery.map(|d| d.addr);
     if let Some(d) = stun_discovery {
         println!(
-            "dig-node peer network: STUN reflexive address {} added to advertised candidates              (source: {})",
+            "dig-node peer network: STUN reflexive address {} added to advertised candidates (source: {})",
             d.addr,
             d.source.label()
         );
