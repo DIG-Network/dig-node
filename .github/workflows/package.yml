@@ -99,10 +99,90 @@ jobs:
           ]') }}
     steps:
       - name: Bootstrap the container for checkout
+        # ROOT CAUSE (measured; four earlier hypotheses were tested and ruled out or narrowed
+        # first — do not re-litigate this without new evidence):
+        #
+        # `bullseye-security`'s live mirror network is internally inconsistent: its Packages
+        # index names package versions its own pool no longer serves, and the mismatch differs
+        # PER ARCHITECTURE. Measured directly against `security.debian.org` — the CORRECT host
+        # per hypothesis 3 below, which is real but not sufficient on its own:
+        #   libglib2.0-0 2.66.8-1+deb11u8    amd64 -> 404  (index names u8, pool doesn't have it)
+        #   openssl      1.1.1w-0+deb11u8    arm64 -> 404  (index names u8, pool doesn't have it)
+        #   openssl      1.1.1w-0+deb11u8    amd64 -> 200  (same version, other arch, present)
+        #   libcurl4     7.74.0-1.3+deb11u16 arm64 -> 200 manually, yet 404'd inside CI
+        # Bullseye is `oldoldstable` and its Release file states
+        # `Valid-Until: Mon, 07 Sep 2026 21:13:04 UTC` — the suite is being retired from the live
+        # mirror network and the pool is losing objects while the index still lists them. No
+        # mirror choice and no retry strategy can fix an index that disagrees with its own pool:
+        # any live "current" mirror can be mid-prune at the exact moment CI asks it, which is why
+        # this looked like edge-cache flakiness before it was measured directly.
+        #
+        # Four hypotheses were tested, in order — keep this list so nobody re-derives them:
+        #   1. stale apt index                    — REFUTED. The index was demonstrably fresh
+        #                                             (Age: 67, correct Last-Modified) and still
+        #                                             named a file the pool did not have.
+        #   2. container poisoned by a half-unpack — REAL, and fixed below (`dpkg --configure -a`
+        #                                             + `apt-get -f install` + a full apt-list
+        #                                             wipe between attempts). It was masking
+        #                                             attempts 2-5, not the underlying cause.
+        #   3. wrong mirror host                   — REAL, and fixed below by pinning away from
+        #                                             the live network entirely, which subsumes
+        #                                             the earlier `security.debian.org` sed: the
+        #                                             two live hosts serve DIFFERENT, and each
+        #                                             independently inconsistent, views of a suite
+        #                                             that is actively being retired.
+        #   4. transient per-edge 404s             — partly real (retrying a live mirror
+        #                                             sometimes succeeds) but does not clear the
+        #                                             index/pool disagreement, only the cache
+        #                                             noise sitting on top of it.
+        #
+        # FIX: stop depending on the LIVE mirror network altogether. Pin all three suite lines
+        # (bullseye, bullseye-updates, bullseye-security) to the SAME immutable
+        # `snapshot.debian.org` timestamp, whose Packages index and pool were captured together
+        # and can never drift apart afterwards. Verified end-to-end against `20260901T000000Z`:
+        # every package that 404'd above returns 200 and the version the index names matches what
+        # the pool actually serves, on both archives:
+        #   http://snapshot.debian.org/archive/debian/20260901T000000Z           (bullseye, bullseye-updates)
+        #   http://snapshot.debian.org/archive/debian-security/20260901T000000Z  (bullseye-security)
+        # snapshot.debian.org 302-redirects every request — use `curl -L` when probing by hand;
+        # apt follows redirects itself and needs no extra flag.
+        #
+        # `Acquire::Check-Valid-Until "false"` is REQUIRED here and is NOT the thing dig-node#565
+        # warns against. #565 is about disabling this check on the LIVE, current suite to paper
+        # over its approaching EOL — that hides a real signal about a suite still moving under
+        # you. Here the suite is a deliberately PINNED historical snapshot: its Release file's
+        # `Valid-Until` will inevitably pass while the pin itself never changes, and there is no
+        # live signal to hide by disabling the check on a snapshot that is frozen by definition.
+        # Do not "fix" this by removing the flag once `Valid-Until` lapses.
+        #
+        # snapshot.debian.org is slower and rate-limited relative to the CDN-backed live mirrors,
+        # so the retry loop below now has a genuine purpose — smoothing real throttling — rather
+        # than papering over index/pool drift. A materially slower install step than before this
+        # change is an expected trade-off of the fix, not a new regression to chase.
+        #
+        # The base image (`debian:11`) and the glibc floor it provides are UNCHANGED here, on
+        # purpose: that decision is the coordinator's and stays open as dig-node#565.
         run: |
           set -eux
-          apt-get update -qq
-          apt-get install -y --no-install-recommends ca-certificates curl git
+          cat > /etc/apt/sources.list <<'SOURCES_EOF'
+          deb http://snapshot.debian.org/archive/debian/20260901T000000Z bullseye main
+          deb http://snapshot.debian.org/archive/debian/20260901T000000Z bullseye-updates main
+          deb http://snapshot.debian.org/archive/debian-security/20260901T000000Z bullseye-security main
+          SOURCES_EOF
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot-no-valid-until
+          for attempt in 1 2 3 4 5; do
+            if apt-get update -qq && apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::No-Cache=true ca-certificates curl git; then
+              exit 0
+            fi
+            echo "apt bootstrap attempt $attempt/5 failed -- resetting apt/dpkg state and retrying" >&2
+            dpkg --configure -a || true
+            apt-get -f install -y || true
+            apt-get clean
+            rm -rf /var/lib/apt/lists/*
+            sleep $(( attempt * 10 ))
+          done
+          echo "::error::apt bootstrap failed after 5 attempts" >&2
+          exit 1
       - uses: actions/checkout@v4
         with:
           persist-credentials: false

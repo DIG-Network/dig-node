@@ -182,10 +182,41 @@ jobs:
       # (and the floor assertion) comes from the local composite action, which cannot run until the
       # repository is on disk.
       - name: Bootstrap the container for checkout
+        # ROOT CAUSE + full measurement history: see `package.yml`'s identical "Bootstrap the
+        # container for checkout" step (`deb` job) — this step was a byte-for-byte duplicate of
+        # that one (structural: a local composite action cannot run before `actions/checkout`, so
+        # each caller bootstraps independently; see the comment above this step). Summary:
+        # `bullseye-security`'s live mirror network is internally inconsistent as the suite retires
+        # — its Packages index names package versions the pool no longer serves, and the mismatch
+        # differs PER ARCHITECTURE — so no mirror choice or retry strategy fixes it.
+        #
+        # FIX: stop depending on the live mirror network. Pin all three suite lines to the same
+        # immutable `snapshot.debian.org` timestamp used in `package.yml`
+        # (`20260901T000000Z`), whose index and pool were captured together and verified
+        # end-to-end there. `Acquire::Check-Valid-Until "false"` is required for a pinned snapshot
+        # and is NOT the live-suite-EOL question tracked as dig-node#565 — see `package.yml` for
+        # why that distinction holds.
         run: |
           set -eux
-          apt-get update -qq
-          apt-get install -y --no-install-recommends ca-certificates curl git
+          cat > /etc/apt/sources.list <<'SOURCES_EOF'
+          deb http://snapshot.debian.org/archive/debian/20260901T000000Z bullseye main
+          deb http://snapshot.debian.org/archive/debian/20260901T000000Z bullseye-updates main
+          deb http://snapshot.debian.org/archive/debian-security/20260901T000000Z bullseye-security main
+          SOURCES_EOF
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot-no-valid-until
+          for attempt in 1 2 3 4 5; do
+            if apt-get update -qq && apt-get install -y --no-install-recommends -o Acquire::Retries=3 -o Acquire::http::No-Cache=true ca-certificates curl git; then
+              exit 0
+            fi
+            echo "apt bootstrap attempt $attempt/5 failed -- resetting apt/dpkg state and retrying" >&2
+            dpkg --configure -a || true
+            apt-get -f install -y || true
+            apt-get clean
+            rm -rf /var/lib/apt/lists/*
+            sleep $(( attempt * 10 ))
+          done
+          echo "::error::apt bootstrap failed after 5 attempts" >&2
+          exit 1
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
