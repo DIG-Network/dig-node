@@ -48,10 +48,17 @@ runs:
       # disagree with the pool state served by another, 404ing on whichever package most recently
       # rotated. `update` already runs immediately before `install`, so a fresh index alone does
       # not fix it — a retried attempt gets an independent shot at an index+pool pair that agree.
+      #
+      # Deliberately NO `--fix-missing`: it lets apt UNPACK the packages it could fetch and
+      # proceed past the 404 instead of aborting, which left `git`/`perl`/`liberror-perl`
+      # half-configured on a real run (dpkg then reports them "already the newest version" on
+      # every later attempt, so a subsequent retry never even re-touches the network for the
+      # missing file). Without it, a failed fetch aborts before unpacking anything, so every
+      # retry starts from a genuinely clean container state.
       run: |
         set -eux
         for attempt in 1 2 3 4 5; do
-          if apt-get update -qq && apt-get install -y --no-install-recommends -o Acquire::Retries=3 --fix-missing \
+          if apt-get update -qq && apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
             ca-certificates curl git build-essential pkg-config perl make cmake clang binutils; then
             exit 0
           fi
