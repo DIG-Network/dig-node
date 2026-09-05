@@ -457,6 +457,15 @@ fn no_public_address_creates_nothing_and_does_not_blame_the_operators_configurat
         !reason.to_string().contains(ADVERTISE_URLS_ENV),
         "a blocker no configuration can clear must not be described as configuration: {reason}"
     );
+    // The refusal's RUNTIME VALUE, because nothing else can see this defect. `create` composes its
+    // sentence from a `\` string continuation, and `cargo fmt` has been observed collapsing one
+    // while keeping the indentation — leaving a literal run of spaces baked into the middle of a
+    // sentence. `cargo fmt --check` is SATISFIED by that, since the formatter produced it, and a
+    // source grep misses it because the backslash is already gone. Only the composed string tells.
+    assert!(
+        !reason.to_string().contains("  "),
+        "a run of two spaces mid-sentence is an eaten line continuation, not prose: {reason}"
+    );
     assert!(
         broadcast_bytes(&broadcaster).is_empty(),
         "no spend may be attempted for an advertisement no stranger could act on"
