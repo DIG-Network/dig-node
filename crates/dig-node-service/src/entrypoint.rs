@@ -246,8 +246,8 @@ enum ConfigCommand {
         /// The upstream RPC URL (blank clears the override).
         url: String,
     },
-    /// Override (or clear) the URLs this node advertises in its own mirror-coin memos
-    /// (dig-node#570, effective on next node start).
+    /// Override (or clear) the URLs this node advertises in its own mirror-coin memos,
+    /// effective on next node start.
     SetMirrorAdvertiseUrls {
         /// Absolute URL(s) to advertise. Omit entirely to CLEAR the override and revert to this
         /// node's derived (self-discovered) address.

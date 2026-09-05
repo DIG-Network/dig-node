@@ -43,8 +43,8 @@ pub enum ControlAction {
     /// `control.config.setUpstream` — persist the upstream DIG RPC override (next-start effective).
     ConfigSetUpstream { url: String },
     /// `control.config.setMirrorAdvertiseUrls` — override (non-empty list) or clear (`None`) the
-    /// URLs this node advertises in its own mirror-coin memos (dig-node#570, next-start effective —
-    /// see that method's own doc for why nothing can make it live before a restart).
+    /// URLs this node advertises in its own mirror-coin memos (next-start effective — see that
+    /// method's own doc for why nothing can make it live before a restart).
     ConfigSetMirrorAdvertiseUrls { urls: Option<Vec<String>> },
     /// `control.cache.get` — cache cap/used/dir/shared.
     CacheGet,
