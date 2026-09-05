@@ -2652,18 +2652,16 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // reflexive-advertise path races IPv6 before falling back to IPv4 and so needs a per-family endpoint
     // (#1393). The single IPv6-first server (`stun_servers.first()`) feeds the traversal-ladder
     // hole-punch tier + DHT transport, which take one reflexive-input endpoint.
-    let stun_servers: Vec<std::net::SocketAddr> = if relay_enabled() {
-        let ep = relay_endpoint.clone();
-        tokio::task::spawn_blocking(move || crate::net::stun_servers_from_relay(&ep))
+    // Tiered since dig_ecosystem#3198: the operator override, then the DIG relay, then a PUBLIC
+    // fallback reached ONLY when the relay yields nothing. relay.dig.net answers no binding request
+    // today, which left every NAT'd node with no reflexive address at all; the relay is tried first
+    // and reclaims the role the moment it answers, with no code change and no redeploy.
+    let stun_plan: crate::net::StunPlan = {
+        let ep = relay_enabled().then(|| relay_endpoint.clone());
+        tokio::task::spawn_blocking(move || crate::net::StunPlan::resolve(ep.as_deref()))
             .await
             .unwrap_or_default()
-    } else {
-        Vec::new()
     };
-    let stun_server = stun_servers.first().copied();
-    if let Some(stun) = stun_server {
-        println!("dig-node peer network: STUN server for reflexive discovery: {stun}");
-    }
 
     // The full-ladder runtime the DHT-lookup transport composes from (#836): the local listen port
     // (UPnP tier) + this node's STUN reflexive address (hole-punch input) + the relayed / TURN-last
@@ -2674,12 +2672,28 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // fetch traverses direct → port-mapping → hole-punch → relay exactly like the DHT dial — a NAT'd
     // node reaches a holder over hole-punch/relay instead of DISCOVERING a provider it can only try
     // Direct against (dig-download 0.5's runtime-injecting dial API closes the prior #836 gap).
-    let reflexive = crate::net::reflexive_via_stun(
-        &stun_servers,
-        peer_port_from_env(),
-        std::time::Duration::from_secs(2),
-    )
-    .await;
+    let stun_discovery = stun_plan
+        .discover_reflexive(peer_port_from_env(), std::time::Duration::from_secs(2))
+        .await;
+    let reflexive = stun_discovery.map(|d| d.addr);
+    // The single reflexive-input endpoint the traversal ladder's hole-punch tier queries (dig-nat L7
+    // spec §3). Prefer the endpoint that actually ANSWERED over the plan's first entry: in the exact
+    // failure this fallback exists for, the plan's first entry is the one that did not.
+    let stun_server = stun_discovery
+        .map(|d| d.server)
+        .or_else(|| stun_plan.primary());
+    if let Some(d) = stun_discovery {
+        println!(
+            "dig-node peer network: STUN server for reflexive discovery: {} (source: {})",
+            d.server,
+            d.source.label()
+        );
+    }
+    // A silent relay used to be invisible here - the node simply had no reflexive address and
+    // nothing said why, which is how this went unnoticed while an operator's $DIG sat idle.
+    if let Some(warning) = crate::net::stun_fallback_warning(&stun_plan, stun_discovery) {
+        tracing::warn!("dig-node peer network: {warning}");
+    }
     // The resolved relay socket address, shared by the relayed dialer (Leg B initiator) AND the relay
     // accept loop below (Leg B responder, observability-only remote addr on accepted circuits).
     let relay_socket_addr: Option<std::net::SocketAddr> = if relay_enabled() {
@@ -2732,7 +2746,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         &nat_runtime,
         &network_id_str,
         &handle,
-        &stun_servers,
+        &stun_plan,
     )
     .await
     {
@@ -3068,7 +3082,7 @@ async fn bring_up_dht(
     runtime: &Arc<dig_nat::NatRuntime>,
     network_id: &str,
     pool: &dig_gossip::GossipHandle,
-    stun_servers: &[std::net::SocketAddr],
+    stun_plan: &crate::net::StunPlan,
 ) -> Result<
     (
         Arc<crate::dht::DhtHandle>,
@@ -3078,10 +3092,20 @@ async fn bring_up_dht(
 > {
     use dig_dht::{CandidateAddr, DhtConfig, DhtService};
 
-    // The single IPv6-first STUN server feeds the DHT transport's hole-punch tier (one reflexive-input
-    // endpoint); the reflexive-advertise path below races the full per-family set (#1393).
-    let stun_server = stun_servers.first().copied();
     let config = DhtConfig::default();
+    // This node's STUN-discovered server-reflexive (public) address (#385), so a remote peer behind a
+    // different NAT can dial / hole-punch to it, not just to a LAN-local address. Best-effort +
+    // bounded: a failure (no tier answered) advertises the local addresses only.
+    //
+    // The walk is TIERED (dig_ecosystem#3198) and races IPv6 before IPv4 within each tier (#1393,
+    // §5.2). It is hoisted ABOVE the transport so the hole-punch tier can be given an endpoint that
+    // actually ANSWERED rather than the plan's first entry - which, when the relay is the silent one,
+    // is exactly the endpoint that did not.
+    let port = peer_port_from_env();
+    let stun_discovery = stun_plan.discover_reflexive(port, config.rpc_timeout).await;
+    let stun_server = stun_discovery
+        .map(|d| d.server)
+        .or_else(|| stun_plan.primary());
     // The transport dials peers as THIS node (client cert = our identity), scoping relay lookups to
     // our network id, bounding each RPC by the config's per-RPC timeout, over the FULL NAT ladder with
     // the relay's STUN server feeding its hole-punch tier (#385).
@@ -3100,14 +3124,12 @@ async fn bring_up_dht(
     // address (`[::]` / `0.0.0.0`) is NOT dialable and must never leak as a candidate. A NAT'd node
     // with no routable address advertises nothing here and stays reachable via the relay tiers dig-nat
     // composes; loopback/in-process setups opt into a loopback candidate via DIG_NODE_ADVERTISE_LOOPBACK.
-    let port = peer_port_from_env();
-    // This node's STUN-discovered server-reflexive (public) address (#385), so a remote peer behind a
-    // different NAT can dial / hole-punch to it, not just to a LAN-local address. Best-effort +
-    // bounded: a failure (no STUN server, timeout) advertises the local addresses only.
-    let reflexive = crate::net::reflexive_via_stun(stun_servers, port, config.rpc_timeout).await;
-    if let Some(r) = reflexive {
+    let reflexive = stun_discovery.map(|d| d.addr);
+    if let Some(d) = stun_discovery {
         println!(
-            "dig-node peer network: STUN reflexive address {r} added to advertised candidates"
+            "dig-node peer network: STUN reflexive address {} added to advertised candidates (source: {})",
+            d.addr,
+            d.source.label()
         );
     }
     // Assemble the advertised candidate set, IPv6-first via dig_ip::Family (the reflexive leads its
