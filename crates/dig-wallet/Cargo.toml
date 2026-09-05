@@ -78,7 +78,7 @@ axum = "0.7"
 # The PUBLISHED control-plane contract. `BalanceAsset` is re-exported from it rather than
 # restated here: the wire spelling of an asset and the asset a read scopes to must be the same
 # value, and two enums naming the same tokens agree only until one of them gains a variant.
-dig-node-control-interface = "0.31"
+dig-node-control-interface = "0.33"
 # The ecosystem's single definition of a Chia offer id (dig_ecosystem#3140, #283):
 # `sha256(spend_bundle.to_bytes())`, the value Chia's `Offer.name()`, Sage and dexie use. This
 # crate once derived the id itself from the offered coin set alone, which collided across offers

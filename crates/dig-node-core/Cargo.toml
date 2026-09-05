@@ -144,7 +144,7 @@ chia-traits = "0.36.1"
 # path keys + orders candidate addresses via `dig_ip::Family` and aggregates them source-tagged +
 # de-duplicated via `dig_ip::PeerCandidates` — never a hand-rolled family sort (epic #1020, #1032).
 # A leaf crate (no transitive DIG deps), so the crates.io release is used directly.
-dig-ip = "0.1.2"
+dig-ip = "0.1.3"
 # The canonical dig-app ⇄ dig-node IPC session/signing contract (engine role-half + wire types +
 # domain builders + frame bounds). SSOT shared with dig-app so the two halves can never drift (#1080).
 # Pinned EXACTLY: 0.3.0 is the first release on this line and the caret range would silently accept
