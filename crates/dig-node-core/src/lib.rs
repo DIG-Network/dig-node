@@ -16858,7 +16858,11 @@ mod tests {
             "exactly one reading has been recorded: {info}"
         );
         assert_eq!(reflexive[0]["source"], json!("relay"), "{info}");
-        assert_eq!(reflexive[0]["addr"], json!(discovered.to_string()), "{info}");
+        assert_eq!(
+            reflexive[0]["addr"],
+            json!(discovered.to_string()),
+            "{info}"
+        );
 
         let candidates: Vec<std::net::SocketAddr> = info["candidate_addresses"]
             .as_array()
