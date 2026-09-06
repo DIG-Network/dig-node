@@ -2474,12 +2474,15 @@ fn wire_relay_reservation(
 ///
 /// Bounded by its own accepted-connection semaphore (mirroring the direct listener, audit #179): a
 /// relay cannot make us spawn unbounded serve tasks. `relay_addr` (observability only) is recorded as
-/// the accepted [`PeerConnection`](dig_nat::PeerConnection)'s remote address.
+/// the accepted [`PeerConnection`](dig_nat::PeerConnection)'s remote address. `gossip` is the SAME
+/// connected-pool handle the direct listener registers into (**dig_ecosystem#3124**, the relay leg) —
+/// `None` on the in-process FFI path, `Some` in production.
 fn spawn_relay_accept_loop(
     mut inbound: tokio::sync::mpsc::Receiver<dig_nat::relay::RelayTunnel>,
     identity: Arc<dig_nat::NodeCert>,
     responder: Arc<dyn PeerRpcResponder>,
     relay_addr: Option<std::net::SocketAddr>,
+    gossip: Option<dig_gossip::GossipHandle>,
 ) {
     let mut acceptor = dig_nat::RelayAcceptor::new(identity);
     if let Some(addr) = relay_addr {
@@ -2490,9 +2493,10 @@ fn spawn_relay_accept_loop(
         while let Some(tunnel) = inbound.recv().await {
             let acceptor = acceptor.clone();
             let responder = responder.clone();
+            let gossip = gossip.clone();
             let spawned = spawn_with_permit(&conn_permits, async move {
                 match acceptor.accept(tunnel).await {
-                    Ok(conn) => serve_accepted_relay_conn(conn, responder).await,
+                    Ok(conn) => serve_accepted_relay_conn(conn, responder, gossip.as_ref()).await,
                     Err(e) => {
                         tracing::debug!(error = %e, "relayed circuit mTLS accept failed; dropped")
                     }
@@ -2507,16 +2511,23 @@ fn spawn_relay_accept_loop(
 
 /// Serve one ACCEPTED relayed circuit exactly like a direct inbound connection: build the authenticated
 /// caller [`dig_dht::Contact`] from the mTLS-verified `peer_id` + relay endpoint (identity comes from
-/// the certificate the handshake verified, never the wire body), then serve the muxed session against
-/// `responder` via [`serve_peer_session_from`]. Identical downstream handling to a direct inbound (§the
-/// accepted [`PeerConnection`](dig_nat::PeerConnection) carries the SAME authentication), so a NAT'd
-/// peer reaching us over a relay circuit gets the full L7 peer RPC (availability / range / DHT).
+/// the certificate the handshake verified, never the wire body), register it in the connected pool for
+/// as long as it is served (**dig_ecosystem#3124**, the relay leg — see [`adopt_inbound_peer_in_pool`]),
+/// then serve the muxed session against `responder` via [`serve_peer_session_from`]. Identical
+/// downstream handling to a direct inbound (the accepted [`PeerConnection`](dig_nat::PeerConnection)
+/// carries the SAME authentication), so a NAT'd peer reaching us over a relay circuit gets the full L7
+/// peer RPC (availability / range / DHT) AND is counted while it does.
+///
+/// `gossip` is `None` on the in-process FFI path (no peer network, so nothing to register into) and
+/// `Some` in production — mirroring the direct listener's own optional pool handle.
 async fn serve_accepted_relay_conn(
     conn: dig_nat::PeerConnection,
     responder: Arc<dyn PeerRpcResponder>,
+    gossip: Option<&dig_gossip::GossipHandle>,
 ) {
     let dig_nat::PeerConnection {
         peer_id,
+        remote_addr,
         mut session,
         ..
     } = conn;
@@ -2525,7 +2536,23 @@ async fn serve_accepted_relay_conn(
     // never fan the relay address network-wide as a bogus direct-dial target under this peer_id
     // (DiD-1 / #1532) — the peer stays reachable for response routing on the live session.
     let caller = Some(crate::dht::relayed_caller_contact(&peer_id));
+
+    // COUNT the peer for as long as we serve it, over the RELAYED entry point — `remote_addr` is the
+    // relay's own socket, never a dial target, and `TraversalKind::Relayed` is what makes
+    // `adopt_inbound_peer_in_pool` route here instead of to the direct entry point.
+    let adopted = adopt_inbound_peer_in_pool(
+        gossip,
+        &peer_id,
+        remote_addr,
+        dig_nat::TraversalKind::Relayed,
+        &session,
+    )
+    .await;
+
     serve_peer_session_from(caller, &mut session, responder).await;
+
+    // The serve loop has returned: stop counting, the same way the direct listener does.
+    release_inbound_pool_slot(gossip, adopted).await;
 }
 
 /// Bring up the peer network (the fallible body of [`spawn_peer_network`]).
@@ -3123,13 +3150,17 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // Leg B responder half (#1532/#1536): drain the introduced relay circuits the reservation surfaces
     // and serve each — over THIS node's persistent identity — exactly like a direct inbound. Wired only
     // when the relay is enabled (else `relay_inbound` is `None`). This runs alongside the direct mTLS
-    // listener below so a NAT'd peer that could only reach us over a relay circuit is now ACCEPTED.
+    // listener below so a NAT'd peer that could only reach us over a relay circuit is now ACCEPTED —
+    // and, since dig_ecosystem#3124's relay leg, COUNTED in the same pool the direct listener uses
+    // (`handle_for_pool` cloned again here: it is still needed below, moved into
+    // `serve_peer_rpc_listener_with` only after this call returns).
     if let Some(inbound) = relay_inbound {
         spawn_relay_accept_loop(
             inbound,
             identity.clone(),
             responder.clone(),
             relay_socket_addr,
+            Some(handle_for_pool.clone()),
         );
     }
 
@@ -3596,6 +3627,15 @@ pub async fn serve_peer_rpc_listener_with(
 /// Register an ACCEPTED inbound peer in the dig-gossip connected pool for as long as this node serves
 /// it, and stop counting it when the serve loop ends (**dig_ecosystem#3124**).
 ///
+/// Shared by BOTH accepted-inbound tiers this node adopts: a direct mTLS accept
+/// (`method = TraversalKind::Direct`, called from [`serve_peer_rpc_listener_with`]) and an accepted
+/// relayed circuit (`method = TraversalKind::Relayed`, called from [`serve_accepted_relay_conn`]).
+/// `method` decides which dig-gossip entry point is called — see the dispatch below — because each
+/// types the pool slot's tier, and the tier drives `via`, the per-tier admission cap, and dialability.
+/// Reusing the wrong one for a given tier is the mistake this single call site exists to make
+/// impossible: see [`GossipHandle::adopt_direct_inbound_handle`](dig_gossip::GossipHandle::adopt_direct_inbound_handle)'s
+/// own doc for the three ways a wrong reuse corrupts a downstream decision.
+///
 /// # Why this exists
 ///
 /// The pool is what every subsystem reads to answer "am I connected", and until this call the node
@@ -3606,14 +3646,14 @@ pub async fn serve_peer_rpc_listener_with(
 ///
 /// The serve loop below needs `&mut PeerSession` to answer the peer's L7 RPC, and `PeerSession` is not
 /// `Clone`. Handing the session to the pool would buy the count and stop serving the peer — strictly
-/// worse than being uncounted. `adopt_direct_inbound_handle` takes a `ClosedHandle` instead, so
+/// worse than being uncounted. The handle-taking entry points take a `ClosedHandle` instead, so
 /// ownership stays here and the peer is both counted and served.
 ///
-/// Adoption is best-effort by design: it is ACCOUNTING, and every refusal the pool can return (the
-/// accepted-direct cap, a ban, a full pool, a peer already holding a dialable slot) is a decision this
-/// node made on purpose. None of them is a reason to refuse SERVICE to a peer whose handshake already
-/// succeeded, so a refusal is logged and the connection is served uncounted — the behaviour that
-/// shipped before this call existed.
+/// Adoption is best-effort by design: it is ACCOUNTING, and every refusal the pool can return (a
+/// per-tier cap, the aggregate inbound cap, a ban, a full pool, a peer already holding a dialable slot)
+/// is a decision this node made on purpose. None of them is a reason to refuse SERVICE to a peer whose
+/// handshake already succeeded, so a refusal is logged and the connection is served uncounted — the
+/// behaviour that shipped before this call existed.
 ///
 /// Returns the `PeerId` to deregister once serving ends, or `None` when nothing was registered.
 async fn adopt_inbound_peer_in_pool(
@@ -3658,15 +3698,27 @@ async fn adopt_inbound_peer_in_pool(
     //
     // So NO dig-nat adoption site in this repo supplies a broadcast sink today. This one passes `None`
     // explicitly; `seams/dig_peer/bootstrap.rs` and `seams/dig_peer/pex.rs` adopt through
-    // `adopt_nat_connection`, which takes no sink parameter at all; and `serve_accepted_relay_conn`
-    // adopts nothing. Passing `None` makes dig-gossip report such a peer as unreachable for broadcast, which is true;
-    // supplying a sink that cannot deliver would make it report a delivery that never happens.
+    // `adopt_nat_connection`, which takes no sink parameter at all. Passing `None` makes dig-gossip
+    // report such a peer as unreachable for broadcast, which is true; supplying a sink that cannot
+    // deliver would make it report a delivery that never happens.
     let broadcast_sink = None;
 
-    match gossip
-        .adopt_direct_inbound_handle(pool_id, remote, method, observed, broadcast_sink)
-        .await
-    {
+    // Dispatch by the traversal tier the connection actually arrived over. `adopt_direct_inbound_handle`
+    // itself REFUSES `TraversalKind::Relayed` (it belongs to the relayed entry point), so routing a
+    // relayed connection there is not a silent mistyping — it fails the adoption outright and the peer
+    // is served uncounted, which is how a wrong reuse here would have been caught rather than shipped
+    // mislabelled. Every other tier (today, only `Direct`) takes the direct entry point unchanged.
+    let adopted = if matches!(method, dig_nat::TraversalKind::Relayed) {
+        gossip
+            .adopt_relayed_inbound_handle(pool_id, remote, observed, broadcast_sink)
+            .await
+    } else {
+        gossip
+            .adopt_direct_inbound_handle(pool_id, remote, method, observed, broadcast_sink)
+            .await
+    };
+
+    match adopted {
         Ok(peer_id) => Some(InboundPoolSlot {
             peer_id,
             superseded,
@@ -5768,7 +5820,9 @@ pub(crate) mod tests {
                 session: dig_nat::mux::PeerSession::server(tls),
             };
             let responder: Arc<dyn PeerRpcResponder> = Arc::new(StubResponder);
-            serve_accepted_relay_conn(conn, responder).await;
+            // No pool for this test: it proves the RPC still answers, not pool accounting — that is
+            // `an_accepted_relayed_peer_is_counted_served_and_released`'s job, below.
+            serve_accepted_relay_conn(conn, responder, None).await;
         });
 
         let client_dir = tempfile::tempdir().expect("client cert dir");
@@ -5812,6 +5866,149 @@ pub(crate) mod tests {
         // ended, so the test hung after the RPC had already succeeded.
         drop(conn);
         let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+    }
+
+    /// **dig_ecosystem#3124, relay leg: an ACCEPTED relayed circuit becomes a counted pool member,
+    /// keeps being served, and is released when it leaves — the same three properties the direct
+    /// leg proved, over the OTHER accepted-inbound tier.**
+    ///
+    /// ## Why `via == "relay"` is the assertion that matters here
+    ///
+    /// The nearest wrong fix compiles and adopts successfully: call `adopt_direct_inbound_handle`
+    /// instead of `adopt_relayed_inbound_handle` (or pass `TraversalKind::Direct` instead of
+    /// `::Relayed` into `adopt_inbound_peer_in_pool`). That mistake would still raise `peer_count`
+    /// to 1 — a test asserting only the count would pass against it — but it mistypes the slot's
+    /// TIER, which is what `via`, the per-tier admission cap, and (per
+    /// [`GossipHandle::adopt_direct_inbound_handle`](dig_gossip::GossipHandle::adopt_direct_inbound_handle)'s
+    /// own doc) dialability all derive from. `via == "relay"` is the cheapest observable that
+    /// distinguishes "adopted correctly" from "adopted, mislabelled". The OTHER nearest-wrong
+    /// fix — reusing `adopt_inbound_peer_in_pool` unchanged, still hardcoded to the direct entry
+    /// point — is caught by the count itself: `adopt_direct_inbound_handle` REFUSES
+    /// `TraversalKind::Relayed` outright, so that mistake adopts NOTHING and `peer_count` stays 0.
+    #[tokio::test]
+    async fn an_accepted_relayed_peer_is_counted_served_and_released() {
+        use std::time::Duration;
+        install_crypto_provider();
+
+        let (gossip, _gdir) = fresh_pool_handle("relay-inbound-3124", [13u8; 32]).await;
+        assert_eq!(
+            gossip.peer_count().await,
+            0,
+            "the pool starts empty, so any count below is caused by the relayed circuit"
+        );
+
+        let server_dir = tempfile::tempdir().expect("server cert dir");
+        let server_identity =
+            load_or_generate_node_cert(server_dir.path(), &node_seed("relay-3124-server"))
+                .expect("server identity");
+        let server_peer_id = server_identity.peer_id();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_cert = server_identity.clone();
+        let gossip_in_server = gossip.clone();
+        let server = tokio::spawn(async move {
+            // Exactly the handshake `RelayAcceptor::accept` runs over a real introduced circuit
+            // (§ the sibling test above) — this test's subject is the pool registration that
+            // happens AROUND that handshake, not the handshake itself.
+            let (tcp, peer_addr) = listener.accept().await.unwrap();
+            let server_tls =
+                dig_tls::server_config(&server_cert, dig_nat::BindingPolicy::Opportunistic)
+                    .expect("server config");
+            let captured = server_tls.captured_peer_id;
+            let captured_bls = server_tls.captured_bls;
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.config);
+            let tls = acceptor.accept(tcp).await.expect("mtls accept");
+            let verified = captured.get().expect("client presented a cert");
+            let conn = dig_nat::PeerConnection {
+                peer_id: verified,
+                method: dig_nat::TraversalKind::Relayed,
+                remote_addr: peer_addr,
+                peer_bls_pub: captured_bls.get(),
+                session: dig_nat::mux::PeerSession::server(tls),
+            };
+            let responder: Arc<dyn PeerRpcResponder> = Arc::new(StubResponder);
+            serve_accepted_relay_conn(conn, responder, Some(&gossip_in_server)).await;
+        });
+
+        let client_dir = tempfile::tempdir().expect("client cert dir");
+        let client_identity =
+            load_or_generate_node_cert(client_dir.path(), &node_seed("relay-3124-client"))
+                .expect("client identity");
+        let client_peer_id = client_identity.peer_id();
+        let target = dig_nat::PeerTarget::with_addr(server_peer_id, addr, "DIG_MAINNET");
+        let config = dig_nat::NatConfig::builder()
+            .enabled_methods(vec![dig_nat::TraversalKind::Direct])
+            .per_method_timeout(Duration::from_secs(5))
+            .build();
+        let mut conn = dig_nat::connect(&target, &client_identity, &config)
+            .await
+            .expect("the peer connects over mTLS");
+
+        // (a) COUNTED — this was zero for every relayed inbound peer (`serve_accepted_relay_conn`
+        // adopted nothing at all).
+        let peers = await_any_peer(&gossip).await;
+        assert_eq!(
+            peers.len(),
+            1,
+            "the relayed circuit must appear in the pool: {peers:?}"
+        );
+        assert_eq!(
+            peers[0]["via"], "relay",
+            "typed as the RELAYED tier, not mislabelled direct: {peers:?}"
+        );
+        assert_eq!(peers[0]["direction"], "inbound");
+
+        let pool_id = dig_gossip::PeerId::from(*client_peer_id.as_bytes());
+        let detailed = gossip.connected_pool_peers_detailed();
+        let peer = detailed
+            .iter()
+            .find(|p| p.peer_id == pool_id)
+            .expect("the relayed peer is in the pool, keyed on the CLIENT's certificate identity");
+        assert!(
+            !peer.is_outbound,
+            "this node never dialed the peer; it must not be charged outbound diversity"
+        );
+        assert_eq!(
+            peer.dial_addr, None,
+            "a relayed circuit's remote is the relay's own socket and must never be offered as a \
+             dial target"
+        );
+
+        // (b) STILL SERVED — a count-only assertion also passes against the shape that buys the
+        // count and stops answering the peer (the by-value-adoption trap #71 already fixed once).
+        let resp = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream = conn.session.open_stream().await.expect("open stream");
+            write_framed(
+                &mut stream,
+                &json!({"jsonrpc":"2.0","id":9,"method":"dig.getNetworkInfo"}),
+            )
+            .await
+            .unwrap();
+            read_framed(&mut stream).await.unwrap().expect("a frame")
+        })
+        .await
+        .expect("the counted relayed circuit answered within 10s");
+        assert_eq!(
+            resp["result"]["echo_method"],
+            json!("dig.getNetworkInfo"),
+            "adoption must not cost the peer its serve loop"
+        );
+        assert_eq!(
+            gossip.peer_count().await,
+            1,
+            "serving the peer neither duplicates nor drops its slot"
+        );
+
+        // (c) RELEASED — bounded-join the server task FIRST (its last line is the release), so this
+        // assertion cannot race the release the way a bare read after `drop(conn)` would.
+        drop(conn);
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+        assert_eq!(
+            gossip.peer_count().await,
+            0,
+            "the pool must stop counting the peer once its serve loop has ended"
+        );
     }
 
     #[tokio::test]
