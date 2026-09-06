@@ -6,6 +6,7 @@ name: Commitlint
 on:
   pull_request:
     branches:
+      - develop
       - main
     types: [opened, edited, synchronize, reopened]
 
