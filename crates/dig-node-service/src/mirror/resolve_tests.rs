@@ -84,6 +84,7 @@ fn intent(store: &str, root: &str, epoch: i64) -> SpendIntent {
             root: id(root),
             epoch,
         }),
+        advertised_urls: Vec::new(),
     }
 }
 

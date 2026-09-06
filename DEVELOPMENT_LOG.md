@@ -1597,3 +1597,53 @@ voice that is REACHED and says no.
 
 Ask what the nearest wrong implementation is, then ask which input it would answer differently on. If
 no fixture in the suite is that input, the property is undefended however many tests surround it.
+
+## A pure re-derivation from a live scan has no memory of its own confirmations (dig-node#574)
+
+`mirror::observe` was written deliberately stateless — a pure function over four freshly-gathered
+readings, with no wallet, no signer, no chain handle. That purity is real and worth keeping: it is
+what makes the hostile cases testable as literals instead of a chain that must be induced into a
+state. But "no state of its own" and "no memory across restarts" turned out to be the same property
+read two ways, and the second reading has a cost nobody had priced: a coin this node created,
+confirmed, and durably recorded confirming becomes indistinguishable from a coin that never existed
+the moment ONE live scan comes back short — a cold replica, a restart, a chain source that answers
+"no coins" instead of erroring.
+
+Measured on a real host: three bonds, all confirmed on chain, read as zero immediately after a
+routine service restart. The capsules were untouched (5 hosted stores, 407 MB cached) and the $DIG
+was still locked on chain — only the OBSERVATION emptied, because the observation was rebuilt from
+nothing but a chain query that happened to answer short at that instant.
+
+**The sharper cost was not the display.** `mirror::plan`'s in-flight suppression is keyed on the
+audit record's `pending`/`submitted` rows — and a create that has already CONFIRMED has left that
+set, correctly, because a confirmed coin needs no suppression as long as the live scan can still see
+it. The same short scan that emptied the read surface therefore also cleared the one thing standing
+between a lagging chain source and a second coin paid for collateral that already exists. Two
+different-looking symptoms (a wrong number on a read-only surface, a possible double-spend on a
+money path) turned out to share one root: an observation with no fallback treats "the chain didn't
+answer this instant" and "this never happened" as the same fact.
+
+**The fix keeps the purity and adds a fallback that never outranks chain.** The audit record already
+had almost everything needed — `SpendRecord` carries `store_id` + `AuditedBond{root, epoch}` +
+`amount_mojos` structurally, and a `Confirmed` status carries the coin id, because
+`SpendJournal::confirmed` requires one. `mirror::local_bond::recheck_missing_bonds` reads that record
+as a CANDIDATE only: for a bond the live scan missed, it asks the record for a coin id, then asks
+chain directly and independently whether THAT SPECIFIC coin still bonds this content and is unspent —
+the same check (`chain_bond_verdict`) already used to verify a stranger's claimed bond, reused here
+against this node's own past claim about itself. Only a fresh positive verdict is folded back in, as
+if the scan had found it; a stale, reclaimed, or wrongly-attributed record falls through to the
+ordinary path exactly as if it did not exist.
+
+Two things worth carrying forward:
+
+* **A "pure function, no I/O" module can still have a false-negative surface if its ONLY input is a
+  read that can fail short instead of failing loud.** The purity argument (easy to test, no smuggled
+  state) is real and does not conflict with adding a fallback — the fallback belongs in the IMPURE
+  caller that already does I/O, feeding the pure function a better input, never inside the pure
+  function itself.
+* **A local record that could inform a decision is either a belief or a candidate, and the whole
+  design turns on which.** A candidate is re-verified through the SAME authority the rest of the
+  system already trusts before it changes anything; a belief is trusted on its own say-so. The
+  difference is not scrutiny of the record — it is whether a wrong record can ever, by itself,
+  produce a wrong outcome. Here it cannot: `Unbonded`/`Unverified` from the re-check discards the
+  candidate no matter how confidently the record states it.

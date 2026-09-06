@@ -580,3 +580,75 @@ fn an_all_rejected_value_refuses_and_spends_nothing() {
         "the refusal must be reached before any chain read, so no coin is selected or reserved"
     );
 }
+
+/// **The URLs a create actually advertised reach the DURABLE audit record, not only the coin**
+/// (dig-node#574).
+///
+/// The prior tests in this file prove the advertisement reaches the broadcast bundle — a fact
+/// visible on chain to anyone. This proves it also survives in this node's OWN record of what it
+/// did, which is the half a restart depends on: `mirror::observe` re-derives a bond's state from a
+/// live chain scan alone, and a scan that comes back short after a restart or a lagging replica has
+/// nothing else to fall back on unless this node wrote its own creates down.
+///
+/// Asserted on the JOURNAL, read back through `SpendLog::ledger()`, exactly as a restarted process
+/// would read it — never on the `SpendIntent`/`MirrorSpends` values in memory, which a caching bug
+/// could satisfy while writing nothing to disk.
+#[test]
+fn the_advertised_urls_reach_the_durable_audit_record() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (signer, address) = operator(dir.path());
+
+    let mut chain = Chain::default();
+    chain.fund(&address, &[PER_COIN], salt(4));
+
+    let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+    let journal = SpendJournal::new(log);
+    let broadcaster = MockBroadcaster::default();
+    let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
+
+    let configured = "https://mirror-c.example/dig, https://[2001:db8::9]/dig";
+    let advertised = with_advertise_env(configured, || {
+        effective_urls_from_env(&a_live_node_with_a_public_address())
+    });
+    assert_eq!(advertised.state, AdvertiseState::Override);
+
+    let effects = NodeMirrorEffects::new(
+        Vec::new(),
+        Ok(PER_COIN),
+        Ok(HashSet::new()),
+        advertised,
+        Some(own_peer_id()),
+        &chain,
+        signer.owner_puzzle_hash(),
+        Some(&signer),
+        &journal,
+        Some(&broadcaster),
+        runtime.handle().clone(),
+    );
+
+    effects
+        .create(&bond(0xE5, 0xF6), EPOCH, PER_COIN)
+        .expect("a configured advertisement and a funding coin are both present");
+
+    assert_eq!(
+        broadcast_bytes(&broadcaster).len(),
+        1,
+        "the create must have reached the mempool, or the record below proves nothing real"
+    );
+
+    let ledger = journal
+        .log()
+        .ledger()
+        .expect("the audit file this node just wrote parses");
+    assert_eq!(ledger.records.len(), 1, "exactly one spend was made");
+    assert_eq!(
+        ledger.records[0].advertised_urls,
+        vec![
+            "https://mirror-c.example/dig".to_string(),
+            "https://[2001:db8::9]/dig".to_string(),
+        ],
+        "the durable record must carry the SAME URLs this create actually advertised, in the same \
+         order — a record naming different URLs, or none, cannot later tell an operator what this \
+         bond originally promised (dig_ecosystem#3203)"
+    );
+}

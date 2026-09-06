@@ -84,6 +84,7 @@ mod converge_tests;
 pub mod events;
 pub mod funding;
 pub mod lifecycle;
+pub(crate) mod local_bond;
 pub mod observe;
 pub mod pass;
 pub mod plan;

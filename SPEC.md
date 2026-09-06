@@ -9180,6 +9180,35 @@ A pass runs: at start-up (once the wallet and a chain source are available), on 
 A confirmed create is `Confirmed { height, coin_id }` in the audit record, observed on the created
 coin. The `intended_coin_id` is recorded at submission so §23.5's reconcile accounts for it.
 
+8. **Recovers a bond step 2's scan came back SHORT on, from what this node itself recorded
+   creating** (dig-node#574). Step 2 is a live read of a puzzle hash every mirror coin shares; a
+   restart, a cold or lagging chain source, or a source that answers "no coins" instead of erroring
+   all render an existing, unspent, fully-collateralised bond identically to one that was never
+   created. Because step 6's in-flight suppression is keyed on `pending`/`submitted` entries, a
+   bond whose create has already CONFIRMED is not suppressed either — so the SAME short scan that
+   would empty §25.8's surface also clears the one thing that would have stopped a second coin
+   being paid for collateral that already exists.
+
+   For every held bond step 2 did not cover, the audit record is asked what coin this node last
+   recorded CONFIRMING for that exact `(store, root, epoch)` — never a `pending` or `submitted`
+   entry, which for a create carries no coin id at all (step 7). If the record names one, that
+   SPECIFIC coin id is re-verified against chain directly — the same independent check that verifies
+   an untrusted peer's claimed bond (§25.6a), run here against this node's own past record — and only
+   a fresh `bonded` verdict is folded back into step 2's observation, as if the scan had found it. A
+   verdict of `unbonded` or `unverified` recovers nothing: the record is a CANDIDATE to re-check,
+   never a belief, and a coin chain disproves — reclaimed, or never real — MUST fall through to an
+   ordinary create exactly as if no record existed. Sufficiency against today's collateral
+   requirement is NOT re-checked here, matching step 2's own scan: both report a recovered coin at
+   what it actually locks, never at today's requirement (§25.3).
+
+   The audit record ALSO carries the URLs a create advertised its bond as fetchable from, alongside
+   the `(store, root, epoch)` it already carried structurally — recorded at submission, from the
+   same composition that reached the coin, so the two cannot disagree (§25.10 governs what is
+   composed; this is only that it is written down).
+
+   This step is bounded to what is actually missing: a bond step 2's scan already covers is never
+   looked up here, so a healthy node's pass makes no additional chain calls through it.
+
 ### 25.5. Presence and debounce
 
 > **PARTIALLY PENDING — the debounce rule is implemented and now has a caller; the scanning is
@@ -9493,6 +9522,11 @@ one setting to turn off** (§6.0/#207).
 > `unknown { reason: "chain_unreadable" }`, which remains the honest answer and is never an empty
 > page. A bond whose create is refused — for want of an advertised URL, for want of uncommitted
 > operator $DIG, or because the chain could not be read — reports as uncovered, which is what it is.
+
+A `bonded` row's coin MAY come from step 8's recovery (§25.4) rather than from step 2's live scan
+directly — the two are indistinguishable to a caller, and that is deliberate: a recovered coin was
+re-verified against chain before being folded in, so it is exactly as `bonded` as one the scan found
+on its own, never a lesser, "locally believed" variant of the state.
 
 The lifecycle exposes, per `(store, root)`, over the control plane and with a `dign` verb (§8.6
 CLI parity): the bond state — `bonded { coin_id, epoch, amount }`, `pending` (in-flight create),

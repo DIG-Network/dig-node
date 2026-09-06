@@ -433,6 +433,46 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         Ok(record.and_then(|r| r.confirmed_height))
     }
 
+    fn recheck_bond(
+        &self,
+        store_id: &str,
+        root: &str,
+        epoch: i64,
+        coin_id: &str,
+    ) -> dig_node_core::mirror_bond::BondVerdict {
+        use dig_node_core::mirror_bond::BondVerdict;
+
+        // A malformed id is this node's OWN record being wrong, not a stranger's -- but the answer
+        // is the same either way: nothing here can be re-verified, so it is not promoted.
+        let (Ok(store_launcher_id), Ok(root_hash), Ok(claimed_coin_id)) = (
+            parse_id(store_id, "store id"),
+            parse_id(root, "root hash"),
+            parse_id(coin_id, "coin id"),
+        ) else {
+            tracing::error!(
+                target: "mirror",
+                store_id,
+                root,
+                coin_id,
+                "a locally recorded mirror bond has an unparsable id; it is not re-verified"
+            );
+            return BondVerdict::Unverified;
+        };
+
+        super::bond_verify::chain_bond_verdict(
+            self.source,
+            store_launcher_id,
+            root_hash,
+            &num_bigint::BigInt::from(epoch),
+            // Sufficiency against TODAY's requirement is deliberately not checked here -- see the
+            // trait doc on `MirrorEffects::recheck_bond` for why `Some(0)` is the right value
+            // rather than `None` (which could never promote to `Bonded`) or today's per-coin figure
+            // (which would hold this path to a stricter bar than the ordinary live-scan path does).
+            Some(0),
+            claimed_coin_id,
+        )
+    }
+
     fn dig_balance_base_units(&self) -> Result<u64, PassError> {
         self.dig_balance.clone()
     }

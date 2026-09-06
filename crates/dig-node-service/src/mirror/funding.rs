@@ -2112,6 +2112,7 @@ mod tests {
             fee_mojos: 0,
             store_id: None,
             bond: None,
+            advertised_urls: Vec::new(),
         }
     }
 
