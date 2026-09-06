@@ -25,6 +25,7 @@ use chia_protocol::{Bytes32, Coin, CoinSpend};
 use chia_sdk_types::MAINNET_CONSTANTS;
 use dig_mirror_coin::MirrorCoin;
 use dig_node_service::mirror::lifecycle::mirror_agg_sig_data;
+use dig_node_service::mirror::plan::ReclaimReason;
 use dig_node_service::mirror::spends::build_reclaim;
 use dig_wallet::operator_wallet::OperatorWallet;
 use dig_wallet::sage::spend::required_bls_signatures;
@@ -80,8 +81,14 @@ fn owned_mirror_coin(owner: &Wallet) -> MirrorCoin {
 fn reclaim_spends() -> Vec<CoinSpend> {
     let owner = fixture_wallet();
     let coin = owned_mirror_coin(&owner);
-    build_reclaim(&coin, owner.public_key, Vec::<Coin>::new(), 0)
-        .expect("a zero-fee reclaim builds")
+    build_reclaim(
+        &coin,
+        owner.public_key,
+        Vec::<Coin>::new(),
+        0,
+        ReclaimReason::NoLongerHeld,
+    )
+    .expect("a zero-fee reclaim builds")
         .coin_spends()
         .to_vec()
 }

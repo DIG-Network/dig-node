@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reconcile_recorded_in_a_DIFFERENT_epoch_allows_this_one() {
+    fn a_reconcile_recorded_in_a_different_epoch_allows_this_one() {
         assert!(epoch_cap_allows(Some(41), 42));
     }
 }
