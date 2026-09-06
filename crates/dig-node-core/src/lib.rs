@@ -5264,6 +5264,8 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+mod continuation_guard;
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
@@ -6942,11 +6944,11 @@ mod tests {
         let modules_budget = cache_budget().modules;
         assert!(
             modules_budget > CAPSULE,
-            "the capsule must fit the modules share ALONE, or it would be evicted whether or not              the stray bytes were counted"
+            "the capsule must fit the modules share ALONE, or it would be evicted whether or not the stray bytes were counted"
         );
         assert!(
             modules_budget.saturating_sub(STRAY) < CAPSULE,
-            "charging the stray bytes must push the capsule OVER the share, or counting them              changes nothing observable"
+            "charging the stray bytes must push the capsule OVER the share, or counting them changes nothing observable"
         );
 
         let store = "9a".repeat(32);
@@ -11429,7 +11431,7 @@ mod tests {
         );
         assert!(
             unsearched.get("absence_established").is_none(),
-            "a node that consulted nothing must make NO claim - an inserted `false` would tell the              caller a search ran and came back incomplete, which never happened"
+            "a node that consulted nothing must make NO claim - an inserted `false` would tell the caller a search ran and came back incomplete, which never happened"
         );
 
         // A node that DID search, conclusively: the claim is present and positive.
@@ -16346,7 +16348,7 @@ mod tests {
             ));
             assert_eq!(
                 started, expect_warm,
-                "{origin:?}: expected warm-started == {expect_warm} for this origin                  (Peer must effect nothing; the Local control must prove a warm is observable)"
+                "{origin:?}: expected warm-started == {expect_warm} for this origin (Peer must effect nothing; the Local control must prove a warm is observable)"
             );
         }
         std::env::remove_var("DIG_NODE_PIN");

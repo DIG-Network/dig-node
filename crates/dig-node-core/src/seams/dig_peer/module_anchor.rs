@@ -867,7 +867,7 @@ mod tests {
         assert_eq!(
             verdict(&module, &hex32(STORE), &hex32(CHAIN_ROOT)),
             ModuleAnchor::NotAnchored,
-            "a module committing the peer's root, pulled at the chain root, is evidence against the              holder — the arm matters, because only NotAnchored earns a demotion"
+            "a module committing the peer's root, pulled at the chain root, is evidence against the holder — the arm matters, because only NotAnchored earns a demotion"
         );
     }
 

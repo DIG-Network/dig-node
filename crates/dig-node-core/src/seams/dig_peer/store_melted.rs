@@ -1121,7 +1121,7 @@ mod tests {
         assert_eq!(
             sent[0],
             (store(4), MeltPath::Local),
-            "the melting holder ORIGINATES its announcement, so it takes the dedup-exempt path \n             (#3061) and has no sender to exclude"
+            "the melting holder ORIGINATES its announcement, so it takes the dedup-exempt path (#3061) and has no sender to exclude"
         );
     }
 
