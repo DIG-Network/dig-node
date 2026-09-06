@@ -8253,6 +8253,17 @@ the suffixes a future producer has not invented yet. A consumer MUST read `kind`
 
 `amount_mojos` is denominated in the entry's own `asset`; an amount MUST NOT be read without it.
 
+A mirror-coin RECLAIM additionally records WHY it reclaimed and WHAT ASKED, structurally:
+`reclaim_reason` ∈ `no_longer_held` | `epoch_ended` | `url_stale` (§25.4's three reasons, rendered
+snake_case) and, for `url_stale`, `trigger` ∈ `daily` | `manual`. Both are `#[serde(default)]`
+(`None` on records written before they existed) and both are derived by `MirrorSpends::intent`
+from the operation, never supplied by a caller, so an entry cannot claim a reason its bundle does
+not have. `dign spends` and `control.spends.list` render them. This is what lets an operator
+reading their record tell a rollover from a URL reconcile from a lost capsule — three reclaims that
+look identical on chain and mean three different things about their node. The obligation this
+discharges is §25.7's: the user cannot approve each unattended spend, so they are owed a complete
+account of every one, and "complete" now includes which of the two triggers moved it (§25.13).
+
 ### 23.2. Status, and what MUST NOT be claimed
 
 `status.state ∈ { pending, submitted, confirmed, failed, unresolved }`.
@@ -9634,6 +9645,16 @@ The surface MUST hold four properties, each of which is a money statement:
 * A crash at any point loses at most watcher events; the next pass re-derives the plan from disk
   and chain, and §23.5's reconcile plus in-flight suppression prevent both double-creates and
   silent losses.
+* A URL reconcile fails CLOSED on every gate: an address the node cannot establish, a requirement it
+  cannot price, a chain or wallet it cannot read, or a recreate it cannot afford each leave every coin
+  exactly where it was and spend nothing (§25.13.4). The one direction §25.13 accepts as a cost is
+  STALENESS — a coin advertising yesterday's address for up to the rest of its epoch — because that is
+  the same cost as advertising nothing (§25.10) and is recoverable, while a reclaim whose recreate never
+  comes is a bond destroyed on this machine's word.
+* A URL reconcile can leave the node UNBONDED for a bounded window — between a `UrlStale` reclaim
+  confirming and the ordinary pass re-creating — and §25.13.6 states that window and what widens it. It
+  is the same window an epoch rollover already opens every seven days; §25.13 adds at most one more per
+  epoch on the automatic path.
 
 ### 25.10. What the node advertises: derived by default, overridden by the operator
 
