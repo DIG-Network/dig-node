@@ -2057,7 +2057,7 @@ mod tests {
         // chain source symptom the ticket measures. Without recovery, `plan()` would see an
         // uncovered held bond and create a second coin.
         let effects = FakeEffects {
-            disk: held(&[capsule.clone()]),
+            disk: held(std::slice::from_ref(&capsule)),
             chain: Vec::new(),
             balance: 10 * REQUIRED,
             recheck_verdict: Some(dig_node_core::mirror_bond::BondVerdict::Bonded),
@@ -2129,7 +2129,7 @@ mod tests {
         journal.confirmed(&recorded, TargetCoinId(id("reclaimed-coin")), 1);
 
         let effects = FakeEffects {
-            disk: held(&[capsule.clone()]),
+            disk: held(std::slice::from_ref(&capsule)),
             chain: Vec::new(),
             balance: 10 * REQUIRED,
             // The only difference from the test above: chain says this specific coin no longer
