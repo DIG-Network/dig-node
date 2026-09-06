@@ -374,35 +374,40 @@ impl<E: MirrorEffects> PassRunner<E> {
         // stop the pass from reclaiming money that is sitting on chain.
         super::resolve::resolve_landed_spends(&self.journal, &self.effects, &on_chain);
 
-        // For every HELD bond this scan did NOT cover, ask whether this node's own durable record
-        // names a coin it already confirmed creating — and, only if a fresh chain re-check agrees,
-        // fold it back in as if the scan had found it (dig-node#574). A scan that comes back short
-        // after a restart or a lagging chain source otherwise reads as "no bonds", and the planner
-        // below would pay for a second coin over collateral that is still genuinely locked. Never
-        // `?`: a ledger this pass cannot read recovers nothing, which is the same safe direction
-        // `in_flight_creates` already takes on the identical failure.
-        match self.log.ledger() {
-            Ok(ledger) => {
-                let recovered = super::local_bond::recheck_missing_bonds(
-                    &self.effects,
-                    &ledger,
-                    &held,
-                    &on_chain,
-                    ctx.current_epoch,
-                );
-                on_chain.extend(recovered);
-            }
+        // Read ONCE and shared by both questions the ledger answers this pass: which bonds are
+        // already covered by a durable record (recovery, dig-node#574) and which creates are still
+        // in flight (§25.4.6). Never `?`: an audit record this pass cannot read answers neither
+        // question, which for BOTH is the safe direction — recovering nothing risks a duplicate the
+        // next epoch's rollover reclaims, exactly as suppressing nothing already did before this
+        // record existed at all.
+        let ledger = match self.log.ledger() {
+            Ok(ledger) => ledger,
             Err(e) => {
                 tracing::warn!(
                     target: "mirror",
                     error = %e,
                     "the spend audit record could not be read; no missing bond is recovered from \
-                     it this pass"
+                     it and no in-flight create is suppressed this pass"
                 );
+                crate::spend_audit::SpendLedger::default()
             }
-        }
+        };
 
-        let in_flight = in_flight_creates(&self.log, ctx.current_epoch);
+        // For every HELD bond the live scan did NOT cover, ask whether this node's own durable
+        // record names a coin it already confirmed creating — and, only if a fresh chain re-check
+        // agrees, fold it back in as if the scan had found it. A scan that comes back short after a
+        // restart or a lagging chain source otherwise reads as "no bonds", and the planner below
+        // would pay for a second coin over collateral that is still genuinely locked.
+        let recovered = super::local_bond::recheck_missing_bonds(
+            &self.effects,
+            &ledger,
+            &held,
+            &on_chain,
+            ctx.current_epoch,
+        );
+        on_chain.extend(recovered);
+
+        let in_flight = in_flight_creates(&ledger, ctx.current_epoch);
         // NOT `?`. The balance prices creates and nothing else, so a wallet that cannot report its
         // $DIG must degrade the create half rather than abort the pass — aborting here would leave a
         // node unable to advertise AND unable to recover what it has already locked, which is rule 1
@@ -640,30 +645,24 @@ fn canonical(bond: &Bond) -> Bond {
 /// The bonds whose CURRENT-epoch create is open and unresolved (§25.4.6).
 ///
 /// Read from the audit record, which is the in-flight ledger. Only `Pending` and `Submitted` count:
-/// a `Confirmed` create has a coin the chain observation already sees, and a `Failed` one did not
-/// happen.
+/// a `Failed` create did not happen, so it needs no suppression. A `Confirmed` create is excluded
+/// for a DIFFERENT reason — it needs no suppression FROM THIS SET, because it is not the thing
+/// standing between a short chain observation and a duplicate: that job belongs to
+/// [`super::local_bond::recheck_missing_bonds`] (dig-node#574), which re-verifies a confirmed
+/// bond's OWN coin directly rather than relying on it having been suppressed here. This set is
+/// deliberately narrow — it is the ledger's answer to "is a create still IN FLIGHT", never to "is
+/// this bond already covered".
 ///
 /// `Unresolved` deserves its name here, because it is the tempting one to include. It means the node
 /// signed and does not know what happened, so there may well be a coin. It does NOT suppress: a
 /// suppression that never lifts leaves the bond permanently uncollateralised, whereas the duplicate
 /// it risks is reclaimed at the next rollover as `EpochEnded`. Both directions cost something; only
 /// one of them is permanent.
-fn in_flight_creates(log: &SpendLog, current_epoch: i64) -> Vec<Bond> {
-    let ledger = match log.ledger() {
-        Ok(ledger) => ledger,
-        Err(e) => {
-            // Suppress nothing rather than everything. An unreadable ledger read as "everything is
-            // in flight" would silently stop the node collateralising anything at all, with no
-            // surface saying why.
-            tracing::warn!(
-                target: "mirror",
-                error = %e,
-                "the spend audit record could not be read; no in-flight create is suppressed this pass"
-            );
-            return Vec::new();
-        }
-    };
-
+///
+/// Takes the already-folded ledger rather than the log: the caller reads it once per pass and
+/// shares it with [`super::local_bond::recheck_missing_bonds`], so a pass never parses the audit
+/// file twice for two different questions about the same moment.
+fn in_flight_creates(ledger: &crate::spend_audit::SpendLedger, current_epoch: i64) -> Vec<Bond> {
     ledger
         .records
         .iter()
@@ -682,6 +681,7 @@ mod tests {
     use super::*;
     use crate::spend_audit::{
         kinds, Asset, AuditedBond, Authority, FailureStage, SpendIntent, SpendJournal, SpendKind,
+        Submission, TargetCoinId,
     };
     use dig_node_control_interface::results::{
         CollateralRequirementResult, CollateralUnknownReason,
@@ -750,6 +750,10 @@ mod tests {
         /// the `PassError::Funding` arm of the alert wiring is unreachable from any double, and an
         /// operator-facing path no test can take reads as covered while never having run.
         create_funding_failure: Option<super::super::funding::FundingError>,
+        /// What [`MirrorEffects::recheck_bond`] answers, for the dig-node#574 recovery wiring.
+        /// `None` keeps every existing fixture on the trait's own safe default (`Unverified`) —
+        /// this double changing behaviour only when a test explicitly asks it to.
+        recheck_verdict: Option<dig_node_core::mirror_bond::BondVerdict>,
     }
 
     impl MirrorEffects for FakeEffects {
@@ -803,6 +807,17 @@ mod tests {
                 });
             }
             Ok(())
+        }
+
+        fn recheck_bond(
+            &self,
+            _store_id: &str,
+            _root: &str,
+            _epoch: i64,
+            _coin_id: &str,
+        ) -> dig_node_core::mirror_bond::BondVerdict {
+            self.recheck_verdict
+                .unwrap_or(dig_node_core::mirror_bond::BondVerdict::Unverified)
         }
     }
 
@@ -1988,6 +2003,149 @@ mod tests {
             report.locked_dig_base_units,
             300 + 900 + 1_500,
             "a broadcast reclaim has not confirmed, so its collateral is still locked"
+        );
+    }
+
+    /// **A bond a live scan comes back short on, with a CONFIRMED durable record chain re-verifies,
+    /// is neither double-created NOR reported missing — through the REAL `PassRunner::run()`
+    /// pipeline** (dig-node#574).
+    ///
+    /// `mirror::local_bond`'s own tests prove `recheck_missing_bonds` in isolation; this proves the
+    /// WIRING in `run()` — that its result actually reaches `on_chain` before `pass::decide`, and
+    /// therefore both `execute()`'s create loop and the reported `states`. A wiring bug (the wrong
+    /// epoch threaded through, the recovered coin dropped on the floor instead of extended into
+    /// `on_chain`) would pass every `local_bond` test unit-tests and still double-create here.
+    #[test]
+    fn a_bond_missing_from_the_scan_with_a_reverified_record_is_recovered_not_recreated() {
+        let capsule = bond("aa", "11");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+
+        // Seed the audit record as an EARLIER session would have left it: a mirror-coin create for
+        // this exact bond, CONFIRMED, at an amount distinguishable from this epoch's own
+        // requirement (`REQUIRED`) — so a recovered figure equal to `REQUIRED` by coincidence cannot
+        // pass this assertion.
+        const RECORDED_AMOUNT: u64 = 4_242;
+        let journal = SpendJournal::with_clock(log.clone(), || 1_000);
+        let recorded = journal.begin(SpendIntent {
+            kind: SpendKind::new(kinds::MIRROR_COIN),
+            purpose: "create a mirror coin".to_string(),
+            authority: Authority {
+                principal: "node".to_string(),
+                grant: "mirror-collateral".to_string(),
+            },
+            asset: Asset::Dig,
+            amount_mojos: RECORDED_AMOUNT,
+            fee_mojos: 0,
+            store_id: Some(id("aa")),
+            bond: Some(AuditedBond {
+                root: id("11"),
+                epoch: NOW_EPOCH,
+            }),
+            advertised_urls: Vec::new(),
+        });
+        journal.submitted(
+            &recorded,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![],
+            },
+        );
+        journal.confirmed(&recorded, TargetCoinId(id("recorded-coin")), 1);
+
+        // The LIVE scan comes back short: no coin for this bond, exactly the cold-replica / lagging
+        // chain source symptom the ticket measures. Without recovery, `plan()` would see an
+        // uncovered held bond and create a second coin.
+        let effects = FakeEffects {
+            disk: held(&[capsule.clone()]),
+            chain: Vec::new(),
+            balance: 10 * REQUIRED,
+            recheck_verdict: Some(dig_node_core::mirror_bond::BondVerdict::Bonded),
+            ..FakeEffects::default()
+        };
+        let mut pass = runner(effects, log);
+        let report = pass.run(&ctx()).expect("the pass observes");
+
+        assert!(
+            report.created.is_empty(),
+            "a coin that already exists and re-verified as bonded must not be created again: \
+             {:?}",
+            report.created
+        );
+        let state = report
+            .states
+            .iter()
+            .find(|(b, _)| *b == capsule)
+            .map(|(_, s)| s.clone());
+        assert_eq!(
+            state,
+            Some(BondState::Bonded {
+                coin_id: id("recorded-coin"),
+                epoch: NOW_EPOCH,
+                amount_dig_base_units: RECORDED_AMOUNT,
+            }),
+            "the recovered row must report the RECORD's own coin id and amount, not a guess or \
+             today's requirement: {state:?}"
+        );
+    }
+
+    /// **The control: the SAME durable record, but chain re-verifies it as `Unbonded`, is NOT
+    /// recovered — the pass creates a fresh coin exactly as if no record existed.**
+    ///
+    /// Without this control, the test above is satisfied identically by an implementation that
+    /// promotes ANY bond with a local record regardless of what the re-check answers — which is
+    /// precisely "believed over chain" rather than "in addition to it".
+    #[test]
+    fn a_record_whose_coin_chain_disproves_does_not_suppress_the_ordinary_create() {
+        let capsule = bond("aa", "11");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
+
+        let journal = SpendJournal::with_clock(log.clone(), || 1_000);
+        let recorded = journal.begin(SpendIntent {
+            kind: SpendKind::new(kinds::MIRROR_COIN),
+            purpose: "create a mirror coin".to_string(),
+            authority: Authority {
+                principal: "node".to_string(),
+                grant: "mirror-collateral".to_string(),
+            },
+            asset: Asset::Dig,
+            amount_mojos: 4_242,
+            fee_mojos: 0,
+            store_id: Some(id("aa")),
+            bond: Some(AuditedBond {
+                root: id("11"),
+                epoch: NOW_EPOCH,
+            }),
+            advertised_urls: Vec::new(),
+        });
+        journal.submitted(
+            &recorded,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![],
+            },
+        );
+        journal.confirmed(&recorded, TargetCoinId(id("reclaimed-coin")), 1);
+
+        let effects = FakeEffects {
+            disk: held(&[capsule.clone()]),
+            chain: Vec::new(),
+            balance: 10 * REQUIRED,
+            // The only difference from the test above: chain says this specific coin no longer
+            // bonds anything — reclaimed, most plausibly, since the pass which recorded it.
+            recheck_verdict: Some(dig_node_core::mirror_bond::BondVerdict::Unbonded),
+            ..FakeEffects::default()
+        };
+        let mut pass = runner(effects, log);
+        let report = pass.run(&ctx()).expect("the pass observes");
+
+        assert_eq!(
+            report.created,
+            vec![capsule],
+            "a coin chain disproves must not suppress the ordinary create — the collateral it once \
+             locked is gone, and this bond genuinely needs a fresh coin: {:?}",
+            report.created
         );
     }
 }
