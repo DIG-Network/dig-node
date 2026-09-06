@@ -161,6 +161,34 @@ pub trait MirrorEffects {
     /// (§25.3) and must be identical for every create in that pass. An implementation that re-derived
     /// it per call could price two coins of one pass differently.
     fn create(&self, bond: &Bond, epoch: i64, amount_dig_base_units: u64) -> Result<(), PassError>;
+
+    /// Re-verify ONE bond this pass's [`Self::observe_chain`] scan did NOT return, using a coin id
+    /// this node recorded creating as the candidate to check — never as the answer
+    /// (dig-node#574, `super::local_bond`).
+    ///
+    /// This is [`super::bond_verify::chain_bond_verdict`] — the SAME independent chain check that
+    /// verifies an untrusted PEER's claimed bond — run here against this node's own past record. A
+    /// coin id this node wrote down is not a stranger's claim, but it is still only a claim: the
+    /// verdict must come from the coin itself (its puzzle hash, its creating spend, its own declared
+    /// `(store, root, epoch)`) and never from what this node's ledger says it is, so a stale,
+    /// since-spent, or — in principle — wrongly-attributed coin id fails this exactly as it would
+    /// fail a stranger's. Sufficiency against today's collateral requirement is deliberately NOT
+    /// re-checked: an on-chain coin found by the ordinary scan is reported `Bonded` at whatever it
+    /// actually locked too (`pass::bond_states`), and this path must not hold a stricter bar than
+    /// that one.
+    ///
+    /// Defaults to [`dig_node_core::mirror_bond::BondVerdict::Unverified`] — a fixture that does not
+    /// model live chain makes no claim, which is the safe direction: the caller then falls back to
+    /// its existing chain-only behaviour exactly as if this method did not exist.
+    fn recheck_bond(
+        &self,
+        _store_id: &str,
+        _root: &str,
+        _epoch: i64,
+        _coin_id: &str,
+    ) -> dig_node_core::mirror_bond::BondVerdict {
+        dig_node_core::mirror_bond::BondVerdict::Unverified
+    }
 }
 
 /// What a pass consults that this module does not observe for itself.
@@ -338,13 +366,41 @@ impl<E: MirrorEffects> PassRunner<E> {
             .presence
             .observe(&on_disk_held, ctx.now_unix_ms, self.settling_window_ms);
 
-        let on_chain = self.effects.observe_chain()?;
+        let mut on_chain = self.effects.observe_chain()?;
 
         // BEFORE the in-flight set is derived, so a create this sweep confirms stops suppressing
         // itself in the same pass rather than one pass later. Never `?`: resolution is bookkeeping
         // about spends that have already happened, and a sweep that could not complete must not
         // stop the pass from reclaiming money that is sitting on chain.
         super::resolve::resolve_landed_spends(&self.journal, &self.effects, &on_chain);
+
+        // For every HELD bond this scan did NOT cover, ask whether this node's own durable record
+        // names a coin it already confirmed creating — and, only if a fresh chain re-check agrees,
+        // fold it back in as if the scan had found it (dig-node#574). A scan that comes back short
+        // after a restart or a lagging chain source otherwise reads as "no bonds", and the planner
+        // below would pay for a second coin over collateral that is still genuinely locked. Never
+        // `?`: a ledger this pass cannot read recovers nothing, which is the same safe direction
+        // `in_flight_creates` already takes on the identical failure.
+        match self.log.ledger() {
+            Ok(ledger) => {
+                let recovered = super::local_bond::recheck_missing_bonds(
+                    &self.effects,
+                    &ledger,
+                    &held,
+                    &on_chain,
+                    ctx.current_epoch,
+                );
+                on_chain.extend(recovered);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "mirror",
+                    error = %e,
+                    "the spend audit record could not be read; no missing bond is recovered from \
+                     it this pass"
+                );
+            }
+        }
 
         let in_flight = in_flight_creates(&self.log, ctx.current_epoch);
         // NOT `?`. The balance prices creates and nothing else, so a wallet that cannot report its
@@ -1339,6 +1395,7 @@ mod tests {
                 root: id(root),
                 epoch,
             }),
+            advertised_urls: Vec::new(),
         }
     }
 

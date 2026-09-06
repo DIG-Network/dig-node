@@ -379,6 +379,16 @@ pub struct SpendIntent {
     /// The `(root, epoch)` half of a bond, for spends that bond one. `None` for every other kind.
     #[serde(default)]
     pub bond: Option<AuditedBond>,
+    /// The URLs a CREATE advertises this bond as fetchable from. Empty for every other spend,
+    /// including a reclaim: returning collateral advertises nothing (dig-node#574).
+    ///
+    /// Carried structurally, beside `bond`, for the same reason `bond` is: a restart loses nothing
+    /// this node wrote down about its OWN create, and `dig_ecosystem#3203`'s reset/remint work
+    /// needs to compare a bond's ORIGINAL advertisement against its current one. Recording it here
+    /// rather than re-deriving it from `super::advertise::Effective` at read time is what makes
+    /// that comparison meaningful — the current URL set can change after this coin was created.
+    #[serde(default)]
+    pub advertised_urls: Vec<String>,
 }
 
 /// One entry in the audit record: a full snapshot of one spend at one revision.
@@ -411,6 +421,11 @@ pub struct SpendRecord {
     /// a duplicate-free decision from the chain instead.
     #[serde(default)]
     pub bond: Option<AuditedBond>,
+    /// The URLs a CREATE advertises this bond as fetchable from, carried through from the intent.
+    /// Empty for every other spend. `#[serde(default)]` so a line written before this field existed
+    /// still parses, answering "no URL recorded" rather than refusing to read (dig-node#574).
+    #[serde(default)]
+    pub advertised_urls: Vec<String>,
     /// When the node decided to spend (unix ms).
     pub initiated_ms: u64,
     /// When this revision was written (unix ms).
@@ -965,6 +980,7 @@ impl SpendJournal {
             fee_mojos: intent.fee_mojos,
             store_id: intent.store_id,
             bond: intent.bond,
+            advertised_urls: intent.advertised_urls,
             initiated_ms: now,
             updated_ms: now,
             status: SpendStatus::Pending,
@@ -1241,6 +1257,67 @@ pub fn reconcile(
     Ok(report)
 }
 
+/// What this node durably knows it created for one `(store, root, epoch)`, from the audit record
+/// alone (dig-node#574).
+///
+/// Read from a [`SpendStatus::Confirmed`] entry ONLY. A `Pending`, `Submitted` or `Unresolved`
+/// mirror-coin create carries no coin id at all (`crate::mirror::resolve`'s module doc explains
+/// why: the created coin's parent is whichever funding input the builder drew, and this node
+/// cannot derive it at signing time) — so a `Confirmed` record is the ONLY kind that can name a
+/// candidate worth re-checking. This is deliberate, not an oversight: the whole point of
+/// [`LocalMirrorBond`] is to hand a caller a coin id to go verify against chain, and a status this
+/// ledger cannot yet attach one to has nothing to offer.
+pub struct LocalMirrorBond {
+    /// The coin this node last saw chain confirm for this triple.
+    pub coin_id: TargetCoinId,
+    /// What that coin locks, read from the record — which is the coin's OWN amount at the time it
+    /// was created, never today's requirement (SPEC.md §25.3).
+    pub amount_dig_base_units: u64,
+    /// The URLs that create advertised this bond as fetchable from.
+    pub advertised_urls: Vec<String>,
+}
+
+/// The newest CONFIRMED mirror-coin record naming exactly `(store_id, root, epoch)`, if any.
+///
+/// **This is a CANDIDATE, never a verdict.** The caller's job is to ask chain whether the coin
+/// this returns is still real and still unspent — this function only answers "what did this node
+/// write down" (dig-node#574).
+///
+/// `None` covers three different honest cases the caller cannot tell apart and does not need to:
+/// no record names this triple, every record naming it predates the bond field
+/// (`#[serde(default)]` then answers `None` on `AuditedBond` itself), or every record naming it is
+/// still open. All three mean the same thing here — there is no local candidate to offer — and the
+/// caller falls back to its existing chain-only behaviour exactly as if this function did not exist.
+///
+/// A triple with TWO confirmed coins (legitimate — see `mirror::plan`'s own doc on duplicates) is
+/// resolved to whichever this scan visits first: any genuinely confirmed coin for the triple is an
+/// equally valid candidate to re-verify, and the caller needs only one.
+pub fn confirmed_mirror_bond(
+    ledger: &SpendLedger,
+    store_id: &str,
+    root: &str,
+    epoch: i64,
+) -> Option<LocalMirrorBond> {
+    ledger.records.iter().find_map(|record| {
+        if record.kind.as_str() != kinds::MIRROR_COIN {
+            return None;
+        }
+        let bond = record.bond.as_ref()?;
+        if record.store_id.as_deref() != Some(store_id) || bond.root != root || bond.epoch != epoch
+        {
+            return None;
+        }
+        let SpendStatus::Confirmed { coin_id, .. } = &record.status else {
+            return None;
+        };
+        Some(LocalMirrorBond {
+            coin_id: coin_id.clone(),
+            amount_dig_base_units: record.amount_mojos,
+            advertised_urls: record.advertised_urls.clone(),
+        })
+    })
+}
+
 /// Unix milliseconds now.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1303,7 +1380,130 @@ mod tests {
             fee_mojos: 10,
             store_id: Some("store-a".to_string()),
             bond: None,
+            advertised_urls: Vec::new(),
         }
+    }
+
+    /// A mirror-coin CREATE intent, for the [`confirmed_mirror_bond`] fixtures below — distinct
+    /// from [`intent`], which is not a mirror spend at all (`Asset::Xch`, no `bond`).
+    fn mirror_create_intent(store_id: &str, root: &str, epoch: i64, urls: Vec<String>) -> SpendIntent {
+        SpendIntent {
+            kind: SpendKind::new(kinds::MIRROR_COIN),
+            purpose: format!("create a mirror coin for store {store_id} at root {root}"),
+            authority: Authority {
+                principal: "node".to_string(),
+                grant: "mirror-collateral".to_string(),
+            },
+            asset: Asset::Dig,
+            amount_mojos: 1_000,
+            fee_mojos: 0,
+            store_id: Some(store_id.to_string()),
+            bond: Some(AuditedBond {
+                root: root.to_string(),
+                epoch,
+            }),
+            advertised_urls: urls,
+        }
+    }
+
+    const EPOCH: i64 = 105;
+
+    /// **No record names the triple: the honest answer is `None`, not a crash.**
+    #[test]
+    fn no_record_at_all_answers_no_local_candidate() {
+        let ledger = SpendLedger::default();
+        assert!(confirmed_mirror_bond(&ledger, "store-a", "root-a", EPOCH).is_none());
+    }
+
+    /// **A CONFIRMED record is returned with its OWN coin id, amount and URLs — not a plausible
+    /// stand-in for them.**
+    ///
+    /// The coin id, amount and URL are each given a DISTINCT, recognisable value so a wrong wiring
+    /// — returning the wrong field, or a hardcoded placeholder — cannot pass by accident.
+    #[test]
+    fn a_confirmed_record_names_its_own_coin_amount_and_urls() {
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log.clone(), clock);
+        let recorded = journal.begin(mirror_create_intent(
+            "store-a",
+            "root-a",
+            EPOCH,
+            vec!["https://node.example/store-a".to_string()],
+        ));
+        journal.submitted(
+            &recorded,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("funding-coin".to_string())],
+            },
+        );
+        journal.confirmed(&recorded, TargetCoinId("the-real-coin-id".to_string()), 42);
+
+        let ledger = log.ledger().expect("ledger");
+        let found = confirmed_mirror_bond(&ledger, "store-a", "root-a", EPOCH)
+            .expect("a confirmed mirror-coin record for this triple exists");
+        assert_eq!(found.coin_id.0, "the-real-coin-id");
+        assert_eq!(found.amount_dig_base_units, 1_000);
+        assert_eq!(
+            found.advertised_urls,
+            vec!["https://node.example/store-a".to_string()]
+        );
+    }
+
+    /// **An OPEN record — signed but not yet confirmed — is never offered as a candidate.**
+    ///
+    /// A create's `intended_coin_id` is always `None` (its output coin's parent is undiscoverable
+    /// at signing time — see `crate::mirror::resolve`), so a wrong implementation that read
+    /// `intended_coin_id` instead of gating on `SpendStatus::Confirmed` would silently return
+    /// `None` here too — for the WRONG reason. This fixture is what tells the two apart: it
+    /// asserts on the whole ledger reaching `Submitted`, not merely on this function's output,
+    /// so a future change that starts deriving a coin id for an open create does not silently
+    /// start offering it as a verified candidate.
+    #[test]
+    fn an_open_submitted_record_is_not_offered_as_a_candidate() {
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log.clone(), clock);
+        let recorded = journal.begin(mirror_create_intent("store-a", "root-a", EPOCH, vec![]));
+        journal.submitted(
+            &recorded,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![FundingCoinId("funding-coin".to_string())],
+            },
+        );
+
+        let ledger = log.ledger().expect("ledger");
+        assert_eq!(ledger.records[0].status, SpendStatus::Submitted);
+        assert!(
+            confirmed_mirror_bond(&ledger, "store-a", "root-a", EPOCH).is_none(),
+            "a spend that has not confirmed must not be handed back as a verified candidate"
+        );
+    }
+
+    /// **A confirmed record for a DIFFERENT epoch does not cover the epoch being asked about.**
+    ///
+    /// Proves the match is keyed on all three terms of the triple, not on `(store_id, root)` alone
+    /// — which a rollover makes a real distinction: the previous epoch's coin is legitimately being
+    /// reclaimed, and offering it here would tell a caller a stale coin still covers the live epoch.
+    #[test]
+    fn a_confirmed_record_for_a_different_epoch_does_not_match() {
+        let (log, _scratch) = tmp_log();
+        let journal = SpendJournal::with_clock(log.clone(), clock);
+        let recorded = journal.begin(mirror_create_intent("store-a", "root-a", EPOCH - 1, vec![]));
+        journal.submitted(
+            &recorded,
+            Submission {
+                intended_coin_id: None,
+                funding_coin_ids: vec![],
+            },
+        );
+        journal.confirmed(&recorded, TargetCoinId("last-epochs-coin".to_string()), 1);
+
+        let ledger = log.ledger().expect("ledger");
+        assert!(
+            confirmed_mirror_bond(&ledger, "store-a", "root-a", EPOCH).is_none(),
+            "a coin confirmed for a PRIOR epoch must not be offered as covering the current one"
+        );
     }
 
     /// **A pending entry is durable BEFORE the producer can sign.**
@@ -1602,6 +1802,7 @@ mod tests {
             fee_mojos: 0,
             store_id: store.map(str::to_string),
             bond: None,
+            advertised_urls: Vec::new(),
             initiated_ms,
             updated_ms: initiated_ms,
             status: SpendStatus::Pending,

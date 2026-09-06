@@ -68,6 +68,9 @@ pub struct MirrorSpends {
     root_hash: Bytes32,
     epoch: BigInt,
     collateral_dig_base_units: u64,
+    /// The URLs a CREATE advertises this bond as fetchable from. Empty for a reclaim, which
+    /// advertises nothing (dig-node#574).
+    advertised_urls: Vec<String>,
 }
 
 impl MirrorSpends {
@@ -148,6 +151,7 @@ impl MirrorSpends {
                     root: hex::encode(self.root_hash),
                     epoch,
                 }),
+            advertised_urls: self.advertised_urls.clone(),
         }
     }
 }
@@ -177,6 +181,10 @@ pub fn build_create(
     fee_coins: Vec<Coin>,
     fee: u64,
 ) -> Result<MirrorSpends, MirrorError> {
+    // Cloned BEFORE the move below, so the audit record can carry the same URLs the coin was
+    // actually built to advertise — never a second read of `urls` that could name a different set.
+    let advertised_urls = urls.clone();
+
     let spends = dig_mirror_coin::create(
         MirrorAdvertisement {
             // The peer this collateral stands behind, and NOT an `Option`. A coin that names
@@ -211,6 +219,7 @@ pub fn build_create(
         root_hash,
         epoch,
         collateral_dig_base_units,
+        advertised_urls,
     })
 }
 
@@ -247,6 +256,8 @@ pub fn build_reclaim(
         // epoch's requirement. A coin bonded under a previous epoch's amount is reclaimed at that
         // amount (SPEC.md 25.3).
         collateral_dig_base_units: mirror.collateral(),
+        // A reclaim returns collateral; it advertises nothing.
+        advertised_urls: Vec::new(),
     })
 }
 
@@ -272,6 +283,7 @@ pub(crate) fn empty_for_tests(fee_mojos: u64, owner_puzzle_hash: Bytes32) -> Mir
         root_hash: Bytes32::default(),
         epoch: BigInt::from(0),
         collateral_dig_base_units: 0,
+        advertised_urls: Vec::new(),
     }
 }
 
@@ -301,5 +313,6 @@ pub(crate) fn unsignable_for_tests(owner_puzzle_hash: Bytes32) -> MirrorSpends {
         root_hash: Bytes32::default(),
         epoch: BigInt::from(0),
         collateral_dig_base_units: 0,
+        advertised_urls: Vec::new(),
     }
 }
