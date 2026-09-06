@@ -1429,6 +1429,8 @@ mod tests {
                 epoch,
             }),
             advertised_urls: urls,
+            reclaim_reason: None,
+            trigger: None,
         }
     }
 

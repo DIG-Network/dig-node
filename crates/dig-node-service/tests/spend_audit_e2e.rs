@@ -47,6 +47,8 @@ fn intent(store: &str) -> SpendIntent {
         store_id: Some(store.to_string()),
         bond: None,
         advertised_urls: Vec::new(),
+        reclaim_reason: None,
+        trigger: None,
     }
 }
 

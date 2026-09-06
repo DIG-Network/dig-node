@@ -535,6 +535,7 @@ mod tests {
             dig_balance_base_units: Some(1_000_000),
             creates_enabled: true,
             can_advertise: true,
+            reconcile: None,
         }
     }
 
@@ -689,7 +690,7 @@ mod tests {
         assert_eq!(d.create, vec![bond("aa", "11")]);
         assert_eq!(
             d.per_coin_dig_base_units,
-            Some(apply_safety_margin(REQUIRED, 500)),
+            Some(dig_mirror_collateral::margin::apply_safety_margin(REQUIRED, 500)),
             "the amount is the margined requirement, not the bare one and not a constant"
         );
         assert_ne!(

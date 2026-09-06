@@ -322,8 +322,13 @@ mod tests {
 
     fn requirement_known() -> CollateralRequirementResult {
         CollateralRequirementResult::Known {
+            epoch: NOW_EPOCH as u64,
+            protocol_version: 1,
             required_per_store_dig_base_units: PER_COIN,
-            margin_bp_applied: 0,
+            stores: 1,
+            owners: 1,
+            multiplier_micros: 1_000_000,
+            handicap_dig_base_units: 0,
         }
     }
 

@@ -2196,6 +2196,8 @@ mod tests {
                 epoch: NOW_EPOCH,
             }),
             advertised_urls: Vec::new(),
+            reclaim_reason: None,
+            trigger: None,
         });
         journal.submitted(
             &recorded,
@@ -2271,6 +2273,8 @@ mod tests {
                 epoch: NOW_EPOCH,
             }),
             advertised_urls: Vec::new(),
+            reclaim_reason: None,
+            trigger: None,
         });
         journal.submitted(
             &recorded,
