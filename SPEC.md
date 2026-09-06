@@ -2863,8 +2863,28 @@ forcing a yank. The full occupied set, measured, is:
 | 12 | `NODE_UNREACHABLE` | — |
 
 0–11 were therefore taken before this CLI added a code, and 12 is the first free number. A new
-code MUST be drawn from 13 upward and MUST re-check BOTH tables first; 126, 127 and 128+n are
-reserved by the shell and MUST NOT be used.
+code MUST be drawn from 13 upward; 126, 127 and 128+n are reserved by the shell and MUST NOT be
+used.
+
+**This is enforced mechanically, not by re-reading this table by hand (dig_ecosystem#3189).**
+`scripts/check-exit-code-collisions.sh` parses BOTH enums' `code()`/`name()` match arms straight
+out of their own source -- this file's `ExitCode`, and a live fetch of dig-app's
+`crates/dig-app-core/src/gateway/outcome.rs` `ErrorCode` at its default branch -- and fails if any
+number carries two different names on the two sides, or if either side draws a number from the
+reserved shell range. `.github/workflows/ci.yml`'s `scripts` job runs it for real (no fixtures, a
+genuine network fetch) on every PR, so a collision introduced on EITHER side is a red, required CI
+check on the PR that introduces it -- not a note a reviewer has to catch by hand, which is exactly
+how `NODE_UNREACHABLE`'s first assignment (7, colliding with `NOT_CONNECTED`) was caught the one
+time it happened. `cli.rs`'s `no_exit_code_collides_with_the_dig_app_gateway_numbering` test
+remains a second, narrower, hermetic pin of the same property: it transcribes `diga`'s table
+rather than fetching it, so it is correct only until that table changes without this copy being
+updated too. The live script is the authoritative check; the transcribed test is defense-in-depth
+specifically for the #407 shape and costs nothing to keep.
+
+**A third number space exists and is NOT this one.** The extension's `WALLET_WS_ERR.NOT_CONNECTED
+= -33001` is a JSON-RPC error code, not a process exit code -- a separate space with its own table
+and no shared numbering with `dign`/`diga` at all. It is not a rival of the table above; nothing
+here should be read as claiming otherwise.
 
 ---
 

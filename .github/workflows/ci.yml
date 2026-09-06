@@ -58,6 +58,16 @@ jobs:
             echo "::endgroup::"
           done
 
+      # The hermetic tests above only prove the PARSING/collision logic is correct on synthetic
+      # fixtures -- they never touch dig-app's real table, so a genuine collision introduced by a
+      # future PR (on EITHER side) would not be caught by them alone. This step runs the actual
+      # guard for real: this checkout's own ExitCode table against a live fetch of dig-app's
+      # current main (dig_ecosystem#3189). A fetch failure fails this step CLOSED -- see the
+      # script's own header comment for why a network hiccup must never be read as "diga has no
+      # codes" and silently wave a real collision through.
+      - name: Exit-code collision guard (dign vs diga, live)
+        run: bash scripts/check-exit-code-collisions.sh
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

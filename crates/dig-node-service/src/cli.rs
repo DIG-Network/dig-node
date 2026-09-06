@@ -233,6 +233,14 @@ mod tests {
     /// The `diga` map is transcribed rather than imported: dig-node MUST NOT take a dependency
     /// on dig-app (it is the engine, not a consumer of its own client). That makes this fixture
     /// the drift risk, so it names the file it was read from and the SPEC carries the same table.
+    ///
+    /// This is now a SECOND, narrower check, not the only one (dig_ecosystem#3189):
+    /// `scripts/check-exit-code-collisions.sh` reads BOTH tables live -- this file, and a fetch
+    /// of dig-app's actual current source -- and gates every PR in CI (SPEC.md §8.4). That check
+    /// catches a collision the moment either side introduces it; this test only catches one
+    /// introduced on `dign`'s side, and only stays correct until `diga`'s table changes without
+    /// this transcription being updated. Kept as fast, hermetic, in-process defense-in-depth for
+    /// the exact #407 shape, not as the authoritative check.
     #[test]
     fn no_exit_code_collides_with_the_dig_app_gateway_numbering() {
         // Read from modules/apps/dig-app/crates/dig-app-core/src/gateway/outcome.rs.
