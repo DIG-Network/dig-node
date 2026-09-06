@@ -263,7 +263,10 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
         &[]
     };
 
-    let MirrorPlan { mut reclaim, create } = plan(
+    let MirrorPlan {
+        mut reclaim,
+        create,
+    } = plan(
         desired,
         inputs.on_chain,
         inputs.current_epoch,

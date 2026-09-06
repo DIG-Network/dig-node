@@ -225,11 +225,30 @@ mod tests {
     #[test]
     fn only_the_two_most_recent_conclusive_observations_are_kept() {
         let mut state = ReconcileState::default();
-        state.record_check(1, CheckOutcome::Conclusive { urls: vec!["a".into()] });
-        state.record_check(2, CheckOutcome::Conclusive { urls: vec!["b".into()] });
-        state.record_check(3, CheckOutcome::Conclusive { urls: vec!["c".into()] });
+        state.record_check(
+            1,
+            CheckOutcome::Conclusive {
+                urls: vec!["a".into()],
+            },
+        );
+        state.record_check(
+            2,
+            CheckOutcome::Conclusive {
+                urls: vec!["b".into()],
+            },
+        );
+        state.record_check(
+            3,
+            CheckOutcome::Conclusive {
+                urls: vec!["c".into()],
+            },
+        );
 
-        assert_eq!(state.observations.len(), 2, "a third observation must evict the oldest");
+        assert_eq!(
+            state.observations.len(),
+            2,
+            "a third observation must evict the oldest"
+        );
         assert_eq!(state.observations[0].personal_day, 2);
         assert_eq!(state.observations[1].personal_day, 3);
     }
@@ -241,10 +260,19 @@ mod tests {
     #[test]
     fn an_inconclusive_check_does_not_erase_prior_conclusive_observations() {
         let mut state = ReconcileState::default();
-        state.record_check(1, CheckOutcome::Conclusive { urls: vec!["a".into()] });
+        state.record_check(
+            1,
+            CheckOutcome::Conclusive {
+                urls: vec!["a".into()],
+            },
+        );
         state.record_check(2, CheckOutcome::Inconclusive { state: "no_relay" });
 
-        assert_eq!(state.observations.len(), 1, "the day-1 observation must survive");
+        assert_eq!(
+            state.observations.len(),
+            1,
+            "the day-1 observation must survive"
+        );
         assert_eq!(state.last_completed_day, Some(2));
         assert!(state.last_inconclusive.is_some());
     }
@@ -257,7 +285,12 @@ mod tests {
         state.record_check(1, CheckOutcome::Inconclusive { state: "off" });
         assert!(state.last_inconclusive.is_some());
 
-        state.record_check(2, CheckOutcome::Conclusive { urls: vec!["a".into()] });
+        state.record_check(
+            2,
+            CheckOutcome::Conclusive {
+                urls: vec!["a".into()],
+            },
+        );
         assert!(state.last_inconclusive.is_none());
     }
 }

@@ -127,7 +127,9 @@ fn same_url_set(a: &[String], b: &[String]) -> bool {
 /// answer `false` — the safe direction: hysteresis fails toward NOT spending.
 pub fn is_stable(observations: &[Observation], target: &[String]) -> bool {
     let [a, b] = observations else { return false };
-    a.personal_day != b.personal_day && same_url_set(&a.urls, target) && same_url_set(&b.urls, target)
+    a.personal_day != b.personal_day
+        && same_url_set(&a.urls, target)
+        && same_url_set(&b.urls, target)
 }
 
 /// `SPEC.md` §25.13.7.5 — may the automatic trigger reconcile in `current_epoch`?
@@ -268,7 +270,10 @@ mod tests {
     #[test]
     fn zero_or_one_observation_is_never_stable() {
         assert!(!is_stable(&[], &[]));
-        assert!(!is_stable(&[obs(1, "https://a")], &["https://a".to_string()]));
+        assert!(!is_stable(
+            &[obs(1, "https://a")],
+            &["https://a".to_string()]
+        ));
     }
 
     /// **The exact property named in the ticket**: `A, B, A` across three days — two DIFFERENT

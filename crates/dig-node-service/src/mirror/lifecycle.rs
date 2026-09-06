@@ -520,8 +520,9 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         // `fee = 0` with no fee coins, always. §25.4.4: a zero-fee reclaim may not be admitted under
         // fee pressure, and the next pass retries it — whereas a reclaim gated on selectable XCH
         // cannot run at all on the exhausted wallet that needs it most.
-        let spends = super::spends::build_reclaim(&coin, signer.synthetic_key(), Vec::new(), 0, reason)
-            .map_err(|e| PassError::Wallet(e.to_string()))?;
+        let spends =
+            super::spends::build_reclaim(&coin, signer.synthetic_key(), Vec::new(), 0, reason)
+                .map_err(|e| PassError::Wallet(e.to_string()))?;
 
         tracing::info!(
             target: "mirror",

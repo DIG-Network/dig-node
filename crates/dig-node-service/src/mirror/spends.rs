@@ -159,10 +159,13 @@ impl MirrorSpends {
             // `SPEC.md` §F: derived from the SAME `ReclaimReason` the runner decided to act on,
             // never supplied by a caller, so an entry cannot claim a reason its bundle does not
             // have. `None` on a create (`self.reclaim_reason` is `None` there by construction).
-            reclaim_reason: self.reclaim_reason.map(|r| reclaim_reason_label(r).to_string()),
+            reclaim_reason: self
+                .reclaim_reason
+                .map(|r| reclaim_reason_label(r).to_string()),
             trigger: self.reclaim_reason.and_then(|r| match r {
                 super::plan::ReclaimReason::UrlStale(trigger) => Some(trigger.label().to_string()),
-                super::plan::ReclaimReason::NoLongerHeld | super::plan::ReclaimReason::EpochEnded => None,
+                super::plan::ReclaimReason::NoLongerHeld
+                | super::plan::ReclaimReason::EpochEnded => None,
             }),
         }
     }

@@ -2914,9 +2914,10 @@ fn spawn_mirror_passes(
                     // Reuse the CURRENT relay-reservation/direct-mapping reading (unrelated to the
                     // STUN gather and read fresh every pass already) and override only the readings
                     // half with what THIS gather just collected.
-                    let mut fresh_address = crate::mirror::advertise::PublicAddress::from_network_info(
-                        &node.network_info(),
-                    );
+                    let mut fresh_address =
+                        crate::mirror::advertise::PublicAddress::from_network_info(
+                            &node.network_info(),
+                        );
                     fresh_address.reflexive = fresh_readings
                         .iter()
                         .map(|r| crate::mirror::advertise::Reflexive {
@@ -2929,7 +2930,10 @@ fn spawn_mirror_passes(
 
                     if fresh_effective.can_advertise() {
                         node.replace_reflexive_readings(
-                            fresh_readings.into_iter().map(|r| (r.addr, r.class)).collect(),
+                            fresh_readings
+                                .into_iter()
+                                .map(|r| (r.addr, r.class))
+                                .collect(),
                         );
                         reconcile_state.record_check(
                             today,
@@ -2971,12 +2975,14 @@ fn spawn_mirror_passes(
             // pre-conditions of the automatic trigger, not gates the manual one shares (`SPEC.md`
             // §25.13.2's table).
             let reconcile_attempt = if config.url_reconcile_enabled
-                && crate::mirror::schedule::is_stable(&reconcile_state.observations, &advertised.urls)
+                && crate::mirror::schedule::is_stable(
+                    &reconcile_state.observations,
+                    &advertised.urls,
+                )
                 && crate::mirror::schedule::epoch_cap_allows(
                     reconcile_state.last_auto_reconcile_epoch,
                     epoch,
-                )
-            {
+                ) {
                 Some(crate::mirror::runner::ReconcileAttempt {
                     trigger: crate::mirror::plan::Trigger::Daily,
                     advertised: advertised.clone(),

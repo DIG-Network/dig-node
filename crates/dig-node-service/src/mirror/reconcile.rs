@@ -141,7 +141,12 @@ pub struct ReconcileInputs<'a> {
 /// `Ord`, which would sort by `coin_id` first. "The affordable prefix" must name the same coins on
 /// every machine regardless of which coin id a chain happened to assign, so the order is the bond's
 /// own identity, not the coin's.
-fn stale_set(bonded: &[DeclaredBond], held_bonds: &[Bond], current_epoch: i64, target: &[String]) -> Vec<DeclaredBond> {
+fn stale_set(
+    bonded: &[DeclaredBond],
+    held_bonds: &[Bond],
+    current_epoch: i64,
+    target: &[String],
+) -> Vec<DeclaredBond> {
     let held: BTreeSet<&Bond> = held_bonds.iter().collect();
     let target_set: BTreeSet<&String> = target.iter().collect();
 
@@ -151,7 +156,8 @@ fn stale_set(bonded: &[DeclaredBond], held_bonds: &[Bond], current_epoch: i64, t
         .filter(|d| held.contains(&Bond::new(&d.held.store_id, &d.held.root)))
         .cloned()
         .collect();
-    candidates.sort_by(|a, b| (&a.held.store_id, &a.held.root).cmp(&(&b.held.store_id, &b.held.root)));
+    candidates
+        .sort_by(|a, b| (&a.held.store_id, &a.held.root).cmp(&(&b.held.store_id, &b.held.root)));
 
     candidates
         .into_iter()
@@ -180,7 +186,9 @@ fn stale_set(bonded: &[DeclaredBond], held_bonds: &[Bond], current_epoch: i64, t
 pub fn decide(inputs: &ReconcileInputs<'_>) -> Result<ReconcileDirective, RefusalReason> {
     // Gate 1.
     if !inputs.advertised.can_advertise() {
-        return Err(RefusalReason::AdvertiseNotPublishing(inputs.advertised.state));
+        return Err(RefusalReason::AdvertiseNotPublishing(
+            inputs.advertised.state,
+        ));
     }
     // Gate 2.
     if !inputs.mirror_enabled {
@@ -370,7 +378,9 @@ mod tests {
         };
         assert_eq!(
             decide(&f.inputs()),
-            Err(RefusalReason::AdvertiseNotPublishing(AdvertiseState::Uncorroborated))
+            Err(RefusalReason::AdvertiseNotPublishing(
+                AdvertiseState::Uncorroborated
+            ))
         );
     }
 
@@ -390,7 +400,10 @@ mod tests {
                 state,
                 rejected: Vec::new(),
             };
-            assert_eq!(decide(&f.inputs()), Err(RefusalReason::AdvertiseNotPublishing(state)));
+            assert_eq!(
+                decide(&f.inputs()),
+                Err(RefusalReason::AdvertiseNotPublishing(state))
+            );
         }
     }
 
@@ -448,7 +461,9 @@ mod tests {
         };
         assert_eq!(
             decide(&f.inputs()),
-            Err(RefusalReason::RequirementUnknown(CollateralUnknownReason::NotCensused))
+            Err(RefusalReason::RequirementUnknown(
+                CollateralUnknownReason::NotCensused
+            ))
         );
     }
 
@@ -502,7 +517,11 @@ mod tests {
             declared("c2", "s2", "r2", old_urls()),
         ];
         let directive = decide(&f.inputs()).unwrap();
-        assert_eq!(directive.coin_ids, vec![id("c1"), id("c2")], "canonical (store, root) order");
+        assert_eq!(
+            directive.coin_ids,
+            vec![id("c1"), id("c2")],
+            "canonical (store, root) order"
+        );
         assert_eq!(directive.left_unaffordable, 0);
     }
 
@@ -535,7 +554,11 @@ mod tests {
         // Balance augmented by both reclaims (2 * PER_COIN) funds exactly one recreate.
         f.dig_balance_base_units = Some(0);
         let directive = decide(&f.inputs()).unwrap();
-        assert_eq!(directive.coin_ids, vec![id("c1")], "only the affordable prefix is named");
+        assert_eq!(
+            directive.coin_ids,
+            vec![id("c1")],
+            "only the affordable prefix is named"
+        );
         assert_eq!(directive.left_unaffordable, 1);
     }
 
