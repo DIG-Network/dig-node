@@ -300,13 +300,28 @@ mod tests {
     }
 
     fn declared(tag: &str, store: &str, root: &str, urls: Vec<String>) -> DeclaredBond {
+        declared_at(tag, store, root, urls, PER_COIN)
+    }
+
+    /// A declared bond whose OWN locked collateral differs from [`PER_COIN`] — the ONLY way `K < n`
+    /// or an `InsufficientFunds` refusal can arise for a SINGLE-coin case: a stale coin whose own
+    /// collateral equals the CURRENT price always funds its own recreate on reclaim alone, whatever
+    /// the rest of the wallet holds (`SPEC.md` §25.13.5's "common case Rᵢ = C" — locked in here so a
+    /// fixture cannot silently drift back to the case that can never be short).
+    fn declared_at(
+        tag: &str,
+        store: &str,
+        root: &str,
+        urls: Vec<String>,
+        collateral_dig_base_units: u64,
+    ) -> DeclaredBond {
         DeclaredBond {
             held: HeldMirror {
                 coin_id: id(tag),
                 store_id: id(store),
                 root: id(root),
                 epoch: NOW_EPOCH,
-                collateral_dig_base_units: PER_COIN,
+                collateral_dig_base_units,
             },
             urls,
         }
@@ -482,14 +497,21 @@ mod tests {
     /// **The bound pinned from BOTH sides** (CLAUDE.md's fixture-design rule): one base unit short
     /// of affording the first recreate must refuse; exactly enough must proceed. A bound tested only
     /// from below could pass an implementation that is off by one in the expensive direction.
+    ///
+    /// The stale coin's OWN collateral is set BELOW [`PER_COIN`] — the mid-epoch-margin-raise case
+    /// `SPEC.md` §25.13.5 names — because a coin locked at exactly the current price always funds
+    /// its own recreate on reclaim alone, whatever the rest of the wallet holds; that case can never
+    /// exercise this refusal and a fixture that used it would pass for the wrong reason.
     #[test]
     fn gate8_insufficient_funds_bound_from_below_refuses() {
+        const OLD_COLLATERAL: u64 = PER_COIN - 200;
         let mut f = Fixture::holding_one_stale_bond();
-        f.dig_balance_base_units = Some(PER_COIN - 1); // one short even after the reclaim returns PER_COIN
+        f.bonded = vec![declared_at("c1", "s1", "r1", old_urls(), OLD_COLLATERAL)];
+        f.dig_balance_base_units = Some(199); // augmented = 199 + 800 = 999, one short of 1_000
         assert_eq!(
             decide(&f.inputs()),
             Err(RefusalReason::InsufficientFunds {
-                have_dig_base_units: 2 * PER_COIN - 1,
+                have_dig_base_units: 199 + OLD_COLLATERAL,
                 need_dig_base_units: PER_COIN,
             })
         );
@@ -497,8 +519,10 @@ mod tests {
 
     #[test]
     fn gate8_insufficient_funds_bound_from_above_at_exactly_the_requirement_proceeds() {
+        const OLD_COLLATERAL: u64 = PER_COIN - 200;
         let mut f = Fixture::holding_one_stale_bond();
-        f.dig_balance_base_units = Some(0); // the reclaimed PER_COIN alone must be exactly enough
+        f.bonded = vec![declared_at("c1", "s1", "r1", old_urls(), OLD_COLLATERAL)];
+        f.dig_balance_base_units = Some(200); // augmented = 200 + 800 = 1_000, exactly enough
         let directive = decide(&f.inputs()).expect("exactly enough must be affordable");
         assert_eq!(directive.coin_ids, vec![id("c1")]);
         assert_eq!(directive.left_unaffordable, 0);
@@ -550,14 +574,18 @@ mod tests {
     /// naming all of them (which would reclaim a bond this call cannot afford to recreate).
     #[test]
     fn names_only_the_affordable_prefix_when_funds_are_short() {
+        // Both stale coins locked BELOW the current price -- the mid-epoch-margin-raise case
+        // (SPEC.md §25.13.5): a coin locked at exactly today's price always funds its own recreate
+        // on reclaim alone, so `K < n` cannot arise unless at least one coin locked less than that.
+        const OLD_COLLATERAL: u64 = PER_COIN - 200;
         let mut f = Fixture::holding_one_stale_bond();
         f.held_bonds = vec![bond("s1", "r1"), bond("s2", "r2")];
         f.bonded = vec![
-            declared("c1", "s1", "r1", old_urls()),
-            declared("c2", "s2", "r2", old_urls()),
+            declared_at("c1", "s1", "r1", old_urls(), OLD_COLLATERAL),
+            declared_at("c2", "s2", "r2", old_urls(), OLD_COLLATERAL),
         ];
-        // Balance augmented by both reclaims (2 * PER_COIN) funds exactly one recreate.
-        f.dig_balance_base_units = Some(0);
+        // augmented = 200 + 2*800 = 1_800 -- funds exactly one recreate at PER_COIN (1_000), not two.
+        f.dig_balance_base_units = Some(200);
         let directive = decide(&f.inputs()).unwrap();
         assert_eq!(
             directive.coin_ids,
