@@ -70,7 +70,7 @@ pub struct ObservedCapsule {
 /// Wraps [`HeldMirror`] instead of duplicating its fields, and adds exactly the one thing
 /// `observe_chain` does not carry. `HeldMirror` stays lean on purpose — no other consumer of it
 /// ever needs a URL — so this type exists for the one question that does:
-/// [`super::reconcile::reconcile_to_current_url`] comparing what a coin declares against what this
+/// [`super::reconcile::decide`] comparing what a coin declares against what this
 /// node would advertise NOW, after its public address may have changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredBond {
@@ -151,7 +151,7 @@ pub trait MirrorEffects {
     ///
     /// A superset of [`Self::observe_chain`] for the one caller that must compare a coin's OWN
     /// advertisement against what this node would advertise NOW —
-    /// [`super::reconcile::reconcile_to_current_url`]. Not folded into `observe_chain` itself:
+    /// [`super::reconcile::decide`]. Not folded into `observe_chain` itself:
     /// doing so would make every implementor of this trait, including every existing test double,
     /// carry a URL list nothing else has any use for.
     ///

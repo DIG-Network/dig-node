@@ -70,7 +70,7 @@ impl HeldMirror {
     }
 }
 
-/// Which of the two callers asked [`super::reconcile::reconcile_to_current_url`] (dig-node#570) to
+/// Which of the two callers asked [`super::reconcile::decide`] (dig-node#570) to
 /// bring this node's mirror coins in line with what it advertises now.
 ///
 /// Recorded on [`ReclaimReason::UrlStale`] and carried into the audit entry (`SPEC.md` §23, §F) so
