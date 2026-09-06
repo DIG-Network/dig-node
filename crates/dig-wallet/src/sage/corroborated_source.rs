@@ -495,7 +495,7 @@ mod tests {
 
         assert!(
             matches!(outcome, Err(ChainSourceError::Transport(_))),
-            "no peer spoke, so this node does not know where the chain is; reporting that as              Ok(None) tells a caller the source HAS no peak, which is a fact it may act on              (got {outcome:?})"
+            "no peer spoke, so this node does not know where the chain is; reporting that as Ok(None) tells a caller the source HAS no peak, which is a fact it may act on (got {outcome:?})"
         );
     }
 

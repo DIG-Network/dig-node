@@ -173,6 +173,7 @@ fn intent() -> SpendIntent {
         fee_mojos: 0,
         store_id: Some("store-a".to_string()),
         bond: None,
+        advertised_urls: Vec::new(),
     }
 }
 

@@ -1092,7 +1092,7 @@ fn an_inconclusive_outcome_answers_with_its_own_wire_code_and_a_not_found_stays_
     assert_eq!(
         inconclusive["error"]["code"],
         serde_json::json!(crate::download::content_miss_inconclusive()),
-        "a caller must be able to tell 'unanswered' from 'not found': the first is worth retrying          and the second is not"
+        "a caller must be able to tell 'unanswered' from 'not found': the first is worth retrying and the second is not"
     );
 
     assert!(
@@ -1250,7 +1250,7 @@ fn budget_ms_keeps_absent_distinct_from_zero_and_from_a_granted_value() {
     assert_ne!(
         unbudgeted.time_budget(0, 3),
         exhausted.time_budget(0, 3),
-        "absent and exhausted MUST NOT be the same allowance; collapsing them lets a spent budget          silently buy a fresh one at every hop"
+        "absent and exhausted MUST NOT be the same allowance; collapsing them lets a spent budget silently buy a fresh one at every hop"
     );
 }
 
@@ -1285,11 +1285,11 @@ async fn an_exhausted_budget_asks_nobody_and_does_not_claim_the_absence() {
     assert_eq!(
         ask.asked().len(),
         0,
-        "a hop granted zero time must not ask onward - relaying on time it was never given is the          amplification the budget exists to bound"
+        "a hop granted zero time must not ask onward - relaying on time it was never given is the amplification the budget exists to bound"
     );
     assert!(
         !located.establishes_absence(),
-        "and having asked nobody, it has established nothing: reporting a proven absence here turns          one exhausted hop into an authoritative not-found for every reader below it"
+        "and having asked nobody, it has established nothing: reporting a proven absence here turns one exhausted hop into an authoritative not-found for every reader below it"
     );
 
     // CONTROL: the same node, the same everything, a budget that is merely SMALL rather than spent.
@@ -1305,7 +1305,7 @@ async fn an_exhausted_budget_asks_nobody_and_does_not_claim_the_absence() {
     assert_eq!(
         control_ask.asked().len(),
         1,
-        "the node DOES forward when granted time, so the exhausted arm above measured a decision          and not a node that simply never asks"
+        "the node DOES forward when granted time, so the exhausted arm above measured a decision and not a node that simply never asks"
     );
 }
 
@@ -1667,7 +1667,7 @@ async fn a_failed_dht_walk_stays_unproven_through_the_production_locator_chain()
         .await;
     assert!(
         !errored.establishes_absence(),
-        "the union and the capsule fallback swallowed the walk failure into Ok(vec![]), so the          node claimed a proven absence for content it never managed to look for"
+        "the union and the capsule fallback swallowed the walk failure into Ok(vec![]), so the node claimed a proven absence for content it never managed to look for"
     );
 
     let honest = crate::download::NodeContent::provider_locator_chain(
@@ -1680,7 +1680,7 @@ async fn a_failed_dht_walk_stays_unproven_through_the_production_locator_chain()
         .await;
     assert!(
         negative.establishes_absence(),
-        "a chain whose every source completed and found nobody STILL establishes the absence -          without this the fix above is satisfied by never concluding anything"
+        "a chain whose every source completed and found nobody STILL establishes the absence - without this the fix above is satisfied by never concluding anything"
     );
     assert!(
         errored.is_empty() && negative.is_empty(),

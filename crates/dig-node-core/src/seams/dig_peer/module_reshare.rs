@@ -1430,7 +1430,7 @@ mod tests {
         };
         assert!(
             reason.contains(REFUSAL),
-            "the refusal the holder produced must survive into the warm's own outcome, not be              discarded by a `let...else`; got: {reason}"
+            "the refusal the holder produced must survive into the warm's own outcome, not be discarded by a `let...else`; got: {reason}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1994,7 +1994,7 @@ mod tests {
         let outcome = failed.warm(&store_hex, &root_hex).await;
         assert!(
             matches!(outcome, WarmOutcome::Refused(_)),
-            "the control: this pull must genuinely FAIL, or the report below is the success path in              disguise: {outcome:?}"
+            "the control: this pull must genuinely FAIL, or the report below is the success path in disguise: {outcome:?}"
         );
         assert_eq!(
             failed_spy
@@ -2003,7 +2003,7 @@ mod tests {
                 .expect("lifecycle lock")
                 .as_slice(),
             &[(store_hex.clone(), root_hex.clone())],
-            "a FAILED pull must still report its end, naming the capsule — it is the pull most              likely to have spent relay budget on hops that delivered nothing"
+            "a FAILED pull must still report its end, naming the capsule — it is the pull most likely to have spent relay budget on hops that delivered nothing"
         );
 
         // SUCCEEDING pull: the same report, so the seam is not failure-only either.
@@ -2126,12 +2126,12 @@ mod tests {
 
         assert!(
             outcome.is_err(),
-            "the control: the pull must genuinely PANIC and be caught, or the report below is just              the ordinary return path"
+            "the control: the pull must genuinely PANIC and be caught, or the report below is just the ordinary return path"
         );
         assert_eq!(
             spy.finished.lock().expect("lifecycle lock").as_slice(),
             &[(store_hex.clone(), root_hex.clone())],
-            "an unwinding pull must still report its end — a statement after the await is skipped by              the unwind, and the tier-0 catch_unwind then continues with the entry leaked"
+            "an unwinding pull must still report its end — a statement after the await is skipped by the unwind, and the tier-0 catch_unwind then continues with the entry leaked"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2603,14 +2603,14 @@ mod tests {
 
         assert!(
             registry.claim("local:mine".into()).is_none(),
-            "this node's OWN warm was refused a slot because relays hold them all — the two share              one cap, which is the cost of running the relay leg"
+            "this node's OWN warm was refused a slot because relays hold them all — the two share one cap, which is the cost of running the relay leg"
         );
 
         // A finished relay hands the slot back; nothing about the claim is relay-specific.
         drop(relayed.into_iter().next().expect("at least one claim"));
         assert!(
             registry.claim("local:mine".into()).is_some(),
-            "the control: the local warm must succeed once a relay slot frees, or the refusal above              proves only that the registry was broken"
+            "the control: the local warm must succeed once a relay slot frees, or the refusal above proves only that the registry was broken"
         );
     }
 

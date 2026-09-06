@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(
             request["params"]["ask_id"],
             json!(hex::encode([9u8; 16])),
-            "the caller's ask_id rides the request as hex; minting a new one per hop, or dropping              the field, silently disables the dedup the id exists for"
+            "the caller's ask_id rides the request as hex; minting a new one per hop, or dropping the field, silently disables the dedup the id exists for"
         );
     }
 
@@ -1050,7 +1050,7 @@ mod tests {
                 && miss_answer(None)
                     .pointer("/result/items/0/absence_established")
                     .is_none(),
-            "fixture precondition: the three frames must differ in absence_established, and the              absent one must OMIT the key rather than carry a null"
+            "fixture precondition: the three frames must differ in absence_established, and the absent one must OMIT the key rather than carry a null"
         );
 
         assert_eq!(
@@ -1061,7 +1061,7 @@ mod tests {
         assert_eq!(
             subtree_claim(&miss_answer(None)),
             SubtreeClaim::NoClaim,
-            "a peer that says NOTHING about its search has not said the search succeeded; reading              its silence as an establishment is the unwrap_or(true) the taxonomy owner names as wrong"
+            "a peer that says NOTHING about its search has not said the search succeeded; reading its silence as an establishment is the unwrap_or(true) the taxonomy owner names as wrong"
         );
         assert_eq!(
             subtree_claim(&miss_answer(Some(false))),
@@ -1123,14 +1123,14 @@ mod tests {
         assert_eq!(
             subtree_claim(&empty),
             SubtreeClaim::NoClaim,
-            "an absence must be ESTABLISHED by an item that carries it; folding [] to the identity              hands a responder absence_established for free"
+            "an absence must be ESTABLISHED by an item that carries it; folding [] to the identity hands a responder absence_established for free"
         );
         assert_eq!(
             subtree_claim(&json!({"jsonrpc":"2.0","id":1,"result":{"items":[
                 json!({"available": false, "absence_established": true})
             ]}})),
             SubtreeClaim::Established,
-            "the control: a real established item still establishes, so the guard above narrowed              the empty case and nothing else"
+            "the control: a real established item still establishes, so the guard above narrowed the empty case and nothing else"
         );
         assert!(
             !parsed(&empty).is_conclusive(),

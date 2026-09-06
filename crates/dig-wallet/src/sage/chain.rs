@@ -1033,7 +1033,7 @@ mod tests {
             );
             assert!(
                 super::refusal_is_bundle_intrinsic(&format!("FAILED: {name}")),
-                "{name} is on the canonical list, but this crate did not recognise it once                  composed as `FAILED: {name}` — the verdict split has stopped stripping the                  verdict, and a spend no node will ever admit now holds its inputs for the full                  TTL"
+                "{name} is on the canonical list, but this crate did not recognise it once composed as `FAILED: {name}` — the verdict split has stopped stripping the verdict, and a spend no node will ever admit now holds its inputs for the full TTL"
             );
         }
 
@@ -1091,7 +1091,7 @@ mod tests {
         let stated = super::ChainTransport::stated_rejection(&intrinsic).expect("a stated reason");
         assert!(
             super::refusal_is_bundle_intrinsic(&stated),
-            "a bundle no node will admit is being held for the full TTL; the translation changed              the reason's spelling and every exact match silently stopped matching"
+            "a bundle no node will admit is being held for the full TTL; the translation changed the reason's spelling and every exact match silently stopped matching"
         );
 
         // Status 2 = PENDING, the node declining to admit without saying why.
