@@ -133,7 +133,12 @@ mod tests {
     const EPOCH: i64 = 105;
 
     /// A ledger holding one CONFIRMED mirror-coin record for `(store, root, EPOCH)`.
-    fn ledger_with_confirmed_bond(store: &str, root: &str, coin_id: &str, amount: u64) -> SpendLedger {
+    fn ledger_with_confirmed_bond(
+        store: &str,
+        root: &str,
+        coin_id: &str,
+        amount: u64,
+    ) -> SpendLedger {
         let dir = tempfile::tempdir().expect("temp dir");
         let log = SpendLog::at(dir.path().join("spend-audit.jsonl"));
         let journal = SpendJournal::new(log.clone());
@@ -184,13 +189,19 @@ mod tests {
     }
 
     impl MirrorEffects for FakeRecheck {
-        fn observe_disk(&self) -> Result<Vec<super::super::runner::ObservedCapsule>, super::super::runner::PassError> {
+        fn observe_disk(
+            &self,
+        ) -> Result<Vec<super::super::runner::ObservedCapsule>, super::super::runner::PassError>
+        {
             unreachable!("recheck_missing_bonds must not scan disk")
         }
         fn observe_chain(&self) -> Result<Vec<HeldMirror>, super::super::runner::PassError> {
             unreachable!("recheck_missing_bonds must not re-scan the chain broadly")
         }
-        fn coin_confirmation(&self, _coin_id: &str) -> Result<Option<u32>, super::super::runner::PassError> {
+        fn coin_confirmation(
+            &self,
+            _coin_id: &str,
+        ) -> Result<Option<u32>, super::super::runner::PassError> {
             unreachable!("recheck_missing_bonds must ask recheck_bond, never coin_confirmation")
         }
         fn dig_balance_base_units(&self) -> Result<u64, super::super::runner::PassError> {
@@ -211,7 +222,13 @@ mod tests {
         ) -> Result<(), super::super::runner::PassError> {
             unreachable!("recheck_missing_bonds never spends")
         }
-        fn recheck_bond(&self, store_id: &str, root: &str, epoch: i64, coin_id: &str) -> BondVerdict {
+        fn recheck_bond(
+            &self,
+            store_id: &str,
+            root: &str,
+            epoch: i64,
+            coin_id: &str,
+        ) -> BondVerdict {
             self.calls.borrow_mut().push((
                 store_id.to_string(),
                 root.to_string(),
@@ -291,8 +308,16 @@ mod tests {
         assert_eq!(got.collateral_dig_base_units, 4_242);
 
         let calls = effects.calls.borrow();
-        assert_eq!(calls.len(), 1, "exactly one candidate needed exactly one re-check");
-        assert_eq!(calls[0].3, id("the-real-coin"), "the CANDIDATE coin id must be the one asked about");
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one candidate needed exactly one re-check"
+        );
+        assert_eq!(
+            calls[0].3,
+            id("the-real-coin"),
+            "the CANDIDATE coin id must be the one asked about"
+        );
     }
 
     /// **THE constraint this whole module exists to hold: a local record chain re-verifies as

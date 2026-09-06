@@ -1386,7 +1386,12 @@ mod tests {
 
     /// A mirror-coin CREATE intent, for the [`confirmed_mirror_bond`] fixtures below — distinct
     /// from [`intent`], which is not a mirror spend at all (`Asset::Xch`, no `bond`).
-    fn mirror_create_intent(store_id: &str, root: &str, epoch: i64, urls: Vec<String>) -> SpendIntent {
+    fn mirror_create_intent(
+        store_id: &str,
+        root: &str,
+        epoch: i64,
+        urls: Vec<String>,
+    ) -> SpendIntent {
         SpendIntent {
             kind: SpendKind::new(kinds::MIRROR_COIN),
             purpose: format!("create a mirror coin for store {store_id} at root {root}"),
