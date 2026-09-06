@@ -9904,3 +9904,260 @@ The wallet balance alone overstates what is available towards the unmade creates
 unauthenticated balance is in addition a figure a stranger chooses (§25.11) — so where the
 remaining $DIG has not been authenticated, the cost of the unmade creates is reported alone, as an
 *unmeasured* observation.
+
+## 25.13. Reconciling existing coins to the current advertised URL (dig_ecosystem#3203, dig-node#570)
+
+> **Implementation status.** The AUTOMATIC trigger (§25.13.1-§25.13.7, §25.13.9) is implemented:
+> `mirror/reconcile.rs` (the pure decision), `mirror/schedule.rs` (the personal-day offset,
+> hysteresis, the epoch cap), `mirror/reconcile_state.rs` (persisted state), wired into the round
+> loop in `server.rs`. **The MANUAL trigger (§25.13.8) is SPECIFIED, NOT YET IMPLEMENTED** — it
+> depends on `dig-node-control-interface` 0.34.0 declaring `control.mirror.reconcile`, tracked on
+> dig-node-control-interface#52. Nothing below may be read as claiming a manual button, a
+> `control.mirror.reconcile` RPC handler, or a `dign mirror reconcile` CLI verb exists yet.
+
+### 25.13.1. The drift, and the two things that close it
+
+A mirror coin's URLs are fixed at create for the whole epoch (§25.10). When what the node advertises
+changes — a new public IP, an operator override set or cleared, a corroborated address replacing none —
+every existing current-epoch coin advertises an address the node no longer serves from. Its collateral
+stays locked; it earns nothing (§25.10's economic enforcement); nothing is slashed. That is the drift.
+
+Two things close it, and the second exists only because the first is slow:
+
+1. **The epoch rollover closes it for free.** §25.4 reclaims every prior-epoch coin (`EpochEnded`) and
+   re-creates at whatever `effective_urls` yields that pass. With `MIRROR_EPOCH_LENGTH_MS` = 7 days, a
+   drift is therefore at most one epoch old and costs at most one epoch's rewards.
+2. **§25.13 closes it INSIDE the epoch**, at the price of two spends per affected coin — one reclaim,
+   one create — which the user accepted with the cadence (dig-node#570). There is no in-place URL
+   update; this section MUST NOT be read as leaving room for one.
+
+**What two spends cost, stated so no surface overstates it.** $DIG collateral is RECLAIMED and
+RE-LOCKED, not lost: the reclaim returns exactly what the coin locked and the create locks this epoch's
+margined requirement, so the net $DIG movement per coin is zero unless the operator changed the margin
+mid-epoch. The real costs are the XCH fees, the funding-reservation windows the spends occupy, and the
+unbonded window §25.13.6 names.
+
+### 25.13.2. One primitive, two triggers
+
+There is ONE reconcile-to-current-URL decision function, `reconcile::decide`. It is called two ways —
+the daily detector (built) and, once wired, `control.mirror.reconcile` (not yet built) — and the two
+triggers differ ONLY in what happens BEFORE `decide` is called: the daily trigger additionally requires
+hysteresis and the epoch cap to clear (§25.13.7.4-5), neither of which the manual trigger is subject to.
+Nothing on the path from `decide`'s output to the signer branches on the trigger except the audit
+attribution (§23.1).
+
+### 25.13.3. The stale set
+
+For one pass, the **target** is `effective_urls(operator, address).urls` — the same list the pass's
+creates publish — and a coin is **stale** exactly when ALL of:
+
+1. it is in this pass's chain observation with `epoch == current_epoch`;
+2. its `(store, root)` is in the settled `Held` set on disk — a coin whose capsule is gone is
+   `NoLongerHeld`'s business, and its URL is irrelevant;
+3. the SET of its memo URLs (`MirrorCoin::urls`, read via `MirrorEffects::observe_bonded_urls`,
+   `mirror/runner.rs`), compared as exact strings with order ignored, differs from the SET of the
+   target.
+
+Order is ignored on purpose: §25.10 publishes an operator's order verbatim and puts derived IPv6 first,
+so a reorder is not a change and MUST NOT cost two spends. A coin with `epoch > current_epoch` is never
+stale (a slow clock keeps foreign-epoch coins, §25.4).
+
+The stale set is ordered by the canonical key `(store_id, root)` (`mirror/reconcile.rs`'s `stale_set`) —
+deliberately NOT the coin's own id — so "the affordable prefix" names the same coins on every machine.
+
+### 25.13.4. The gates, in order, and what each refusal means
+
+A reconcile that cannot complete MUST NOT START. Every gate is evaluated BEFORE any reclaim is built,
+and a failed gate is a **refusal**: nothing was signed and nothing was broadcast.
+
+| # | gate | refusal reason | how it is checked |
+|---|---|---|---|
+| 1 | `effective_urls(..).state` is `Override` or `Derived` | the §25.10 state label itself: `off`, `no_public_address`, `uncorroborated_address`, or `no_relay` | `reconcile::RefusalReason::AdvertiseNotPublishing(AdvertiseState)` |
+| 2 | §25.7's switch `mirror_enabled` is on | `disabled` | explicit |
+| 3 | the chain observation is complete | (structural) | `PassRunner::run` only reaches `reconcile::decide` after its own chain read has already succeeded — the same abort §25.4's pass applies |
+| 4 | the stale set (§25.13.3) is non-empty | `url_unchanged` when a current-epoch coin exists and none is stale; `no_mirror_coins` when no current-epoch coin is held at all | explicit |
+| 5 | this epoch's requirement is `Known` | `requirement_unknown { reason }` | explicit |
+| 6 | the node can SPEND (signer open, broadcast enabled) | (folded) | left to the SAME effects-level handling the ordinary create/reclaim paths already degrade through on an unavailable wallet, rather than a second capability check — a failed attempt there costs a log line, never a spend |
+| 7 | the operator wallet's spendable $DIG is MEASURED | `funds_unmeasured` | explicit; **NOT separately authenticated (§25.11) from the ordinary pass's own funds-split reading — see the note below** |
+| 8 | at least the FIRST stale coin's recreate is affordable (§25.13.5, `K ≥ 1`) | `insufficient_funds { have_dig_base_units, need_dig_base_units }` | explicit |
+| 9 | no `UrlStale` reclaim is IN FLIGHT (§25.13.6) | `reconcile_in_progress` | explicit, via `runner::reconcile_in_flight` reusing `SpendRecord::reserves_funding_at` |
+
+**Gate 7's scoped reading.** The gate uses the SAME `dig_balance_base_units` figure the ordinary create
+path already sizes its own funds split against — an unauthenticated address total, per §25.11's own
+caveat about that figure. This is consistent with, not a regression from, the ordinary path's existing
+behaviour: the money-moving spends themselves (`reclaim`/`create`) still authenticate their own
+candidate coins before signing regardless of what balance figure sized the plan, so an inflated sizing
+input can widen §25.13.6's unbonded window but cannot itself cause an unauthenticated spend.
+
+**Gate 1 is the one that outranks the others, and its direction is the whole design.** Reclaim-first is
+forced, not preferred — a reclaim returns the collateral that funds the create behind it, so on a wallet
+without spare $DIG there is no other order. A reconcile that reclaimed and then could not create would
+leave the node with fewer bonds than before it started, having paid to get there. Refusing to start is
+therefore the ONLY safe failure.
+
+### 25.13.5. The plan is sized BEFORE any reclaim, and partial is a normal outcome
+
+Let the stale set in canonical order be `s₁ … sₙ`, each locking `Rᵢ` base units, let `C` be this
+epoch's margined per-coin requirement, and let `W` be the pass's own funds reading. **The affordable
+prefix `K` is the largest `k ≤ n` such that `plan::split_by_funds` — the SAME split the ordinary create
+path calls — applied to `s₁ … sₖ` at `per_coin = C` with `balance = W + Σᵢ≤ₙ Rᵢ` funds all `k`.**
+(`reconcile::decide` augments the balance by the FULL stale set's reclaimable total, not a per-`k`
+recomputation — in the common case `Rᵢ = C` for every `i`, so this is equivalent and `K = n` whenever the
+wallet holds the fee XCH; only a mid-epoch margin change can make `K < n`.)
+
+Then, and only then: **exactly `K` coins are reclaimed — `s₁ … sₖ`** (as `ReclaimReason::UrlStale`
+entries appended to the ordinary pass's reclaim list, `mirror/pass.rs`). Coins `sₖ₊₁ … sₙ` are LEFT AS
+THEY ARE: still bonded, still advertising the old URL, reported with `url_current: false` once §25.8's
+surface carries that field (not yet built). **`K = 0` is a refusal** (gate 8), never a plan.
+
+### 25.13.6. Execution: this pass reclaims; a later pass re-creates
+
+The `K` `UrlStale` reclaims run AFTER every `NoLongerHeld`/`EpochEnded` reclaim and BEFORE any create,
+in the SAME ordinary pass (`PassRunner::execute`, unmodified). **The `K` recreates do NOT happen in this
+pass**: a reclaim's returned collateral is chain-visible only once the reclaim confirms, and this pass's
+chain observation still shows the reclaimed coins as owned, so `pass::decide`'s ordinary create table —
+computed from that SAME snapshot — plans no create for these bonds this round. They happen in the first
+LATER pass whose chain observation no longer shows the reclaimed coin, through the entirely unmodified
+ordinary create path — the bond is still `held` on disk with no current-epoch coin, which is exactly the
+condition that path already creates for.
+
+**The unbonded window.** Between a `UrlStale` reclaim confirming and its recreate being broadcast, the
+node holds no coin for that bond — one confirmation plus at most one round in the common case, widening
+if the advertise state stops publishing or the requirement becomes unknown in between. This is the SAME
+window an epoch rollover already opens every seven days; §25.13 adds at most one more per epoch on the
+automatic path (§25.13.7.5's cap).
+
+**In flight.** A reconcile is in progress from the first `UrlStale` reclaim's `Submitted` audit entry
+until every such entry is terminal, bounded by `FUNDING_RESERVATION_WINDOW_MS` from the entry's last
+revision (`runner::reconcile_in_flight`, reusing `SpendRecord::reserves_funding_at` — the SAME window
+§25.4.6's funding reservation uses, so the two can never disagree about how long an unresolved spend
+counts).
+
+### 25.13.7. The automatic trigger — the daily detector
+
+#### 25.13.7.1. The personal day, and why it is derived rather than drawn
+
+Each node checks once per **personal day**: a 24-hour period whose boundary is offset from `00:00 UTC`
+by a per-node value derived from its own peer id (`mirror/schedule.rs`):
+
+```
+offset_secs = u64::from_be_bytes(SHA-256("dig-node/mirror-url-reconcile/personal-day/v1" ‖ peer_id)[0..8]) mod 86_400
+```
+
+where `peer_id` is the node's 32-byte peer id (`PeerStatus::peer_id`, hex-decoded). The node MUST NOT
+persist the offset — it is a pure function of an identity that is itself persisted. A node with no peer
+id (the peer network disabled or not yet up) uses `offset_secs = 0`.
+
+**Why derived, and why not drawn once and persisted.** A value drawn at each start re-rolls, so a node
+that restarts before its slot can go indefinitely without a single check while every log line looks
+normal — silence, where a herd is at least visible. A value drawn ONCE and persisted removes the restart
+re-roll but keeps the failure behind a rarer trigger: a lost, reset or migrated state file re-rolls it.
+The derived offset has no state to lose, is uniform across the network because peer ids are uniform, and
+is stable across restarts because the identity is.
+
+**What deriving from a public value gives away, bounded.** A third party who knows a node's peer id
+knows its slot, which lets them time a STUN-tier outage or a flood of dissenting readings at that node's
+check — making the check INCONCLUSIVE (spends nothing) and never causing a spend, since a spend requires
+agreement across independent source classes (NC-12), which timing does not provide.
+
+#### 25.13.7.2. When a check is due, and the clock rules
+
+The detector keeps `last_completed_day: Option<i64>` (`reconcile_state.rs`). A check is **due** when
+`d(now) > last_completed_day` (or `None`), evaluated on every iteration of the round loop
+(`MIRROR_ROUND_LENGTH_MS`), so a check fires within one round of the boundary and needs no timer of its
+own.
+
+* **At most one check per personal day.**
+* **A clock that moves BACKWARD never makes a check due** — the node waits for real time to catch up.
+* **A clock that jumps FORWARD by `N` days makes exactly ONE check due**, not `N`.
+
+#### 25.13.7.3. The observation: a fresh gather, then the same decision the pass makes
+
+A check gathers FRESH readings (`dig_node_core::net::gather_reflexive_readings`, the SAME arguments
+bring-up uses) and evaluates `effective_urls` over them. The observation is **conclusive** when the
+fresh evaluation yields `Override` or `Derived`; it is **inconclusive** otherwise.
+
+**A conclusive gather REPLACES the published readings** (`Node::replace_reflexive_readings`), so
+`dig.getNetworkInfo`, §25.8's posture and the ordinary pass's creates all see the new address. **An
+inconclusive gather MUST NOT replace them**: the node keeps the readings it had. `peer.rs`'s
+`PeerStatus.reflexive` doc reads "replaced only by a conclusive re-gather" rather than "never cleared:
+there is no periodic re-gather" as of this section.
+
+**A check that finds the same address is free and silent** — no spend, one state-file write, nothing
+logged above `debug`. This is the overwhelmingly common case.
+
+#### 25.13.7.4. Hysteresis — stability before spending
+
+The detector keeps the two most recent CONCLUSIVE observations (`schedule::is_stable`). A target `S` is
+**stable** when both recorded observations have `urls == S` (set equality) and were taken on two
+DISTINCT personal days. Inconclusive days neither confirm nor reset: `A, inconclusive, A` establishes
+`A` on the third day. `A, B, A` is not stable — two DIFFERENT readings in three days is the flap this
+rule waits out.
+
+The automatic trigger proceeds to §25.13.4's gates only when the target is stable. **The interim
+state — between the first observation of a change and stability — is: spend nothing, leave every coin
+exactly where it is.** The node MUST NOT reclaim-without-recreate as an interim measure.
+
+**What this costs in the worst case.** An address that changes every personal day never becomes stable
+and is NEVER automatically reconciled; such a node's coins stay at their create-time URL until rollover.
+
+#### 25.13.7.5. The epoch cap
+
+**The automatic trigger MUST NOT reconcile more than `URL_RECONCILE_MAX_AUTO_PER_EPOCH` = 1 time per
+mirror epoch** (`schedule::epoch_cap_allows`), counted as a reconcile in which at least one `UrlStale`
+reclaim was ACCEPTED by the mempool, persisted as `last_auto_reconcile_epoch`. With this cap the
+automatic path adds at most one more reclaim/create pair per capsule per epoch beyond rollover's own —
+the lifecycle's unattended spend count is at most DOUBLED, and a pathological network cannot make it
+worse than that.
+
+#### 25.13.7.6. The switch, and the consent it rests on
+
+`collateral.json` gains `url_reconcile_enabled: bool`, `#[serde(default)]` to **`true`**. The automatic
+trigger runs only while it is `true`; the daily GATHER and the drift REPORT run regardless, because
+seeing is not spending. Default-on because the user asked for the behaviour by name; a switch because
+the spend count can now grow without a person watching.
+
+### 25.13.8. The manual trigger — SPECIFIED, NOT YET IMPLEMENTED
+
+The method's wire shape is owned by `dig-node-control-interface` (release-first;
+dig-node-control-interface#52). Once adopted, a live call runs §25.13.3-6 exactly — the same
+`reconcile::decide` the daily detector calls, with `Trigger::Manual`, which skips §25.13.7.4-5 and
+nothing else. Nothing in this repository serves `control.mirror.reconcile` or a `dign mirror reconcile`
+CLI verb yet; a reader MUST NOT infer either exists from this section.
+
+### 25.13.9. Persisted detector state
+
+`mirror-reconcile.json`, beside `collateral.json` in the node's state directory
+(`mirror/reconcile_state.rs`), written atomically (write-then-rename), every field
+`#[serde(default)]`: `version`, `last_completed_day`, `observations` (at most two), `last_inconclusive`,
+`last_auto_reconcile_epoch`.
+
+**A missing, unreadable or malformed file reads as "never observed"** — the safe direction: it delays
+any automatic spend by at least two personal days and cannot cause one. It is NOT a source of truth for
+what is bonded; it is a throttle record, and losing it costs one day. **No coin id is ever persisted
+here** — the coin ids a reconcile actually names are read fresh from chain every time
+(`MirrorEffects::observe_bonded_urls`), so there is no persisted-candidate-vs-chain-truth question here
+the way dig-node#574 raised for mirror-bond ids.
+
+### 25.13.10. What a reader may NOT conclude
+
+* That the automatic path cannot leave the node unbonded. It can, for the window §25.13.6 names, once
+  per epoch at most.
+* That a coin's `urls` prove reachability. They are the coin's memo, which §25.10 calls advisory fetch
+  hints.
+* That refusing on `Uncorroborated` is a statement that the new address is wrong. It is a statement
+  that one source is not agreement.
+* That `control.mirror.reconcile`, a dig-app "Reset mirrors" button, or `dign mirror reconcile` exist.
+  They do not, as of this section (§25.13.8).
+
+### 25.13.11. Failure directions, stated
+
+* Every gate fails CLOSED to staleness: coins untouched, nothing spent, the reason recorded (or logged).
+* Hysteresis fails toward NOT spending: a flap delays a reconcile; it never causes one.
+* The epoch cap fails toward NOT spending: excess drift waits for a rollover that closes it free.
+* A lost state file fails toward NOT spending.
+* An inconclusive gather fails toward the OLD address: the node may keep advertising an address it has
+  lost, for at most one epoch.
+* The one direction that fails EXPENSIVE is the unbonded window (§25.13.6), bounded to one confirmation
+  plus one round in the common case, identical in kind to the rollover window the lifecycle already
+  opens weekly.
