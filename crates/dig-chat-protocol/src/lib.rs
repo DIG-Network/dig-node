@@ -53,3 +53,6 @@ pub use types::{
     ChatEnumError, ChatMessage, DeliveryReceipt, DeliveryStatus, Presence, PresenceState,
     ReadReceipt, TypingIndicator, TypingState,
 };
+
+#[cfg(test)]
+mod continuation_guard;

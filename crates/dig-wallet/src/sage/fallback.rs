@@ -1454,7 +1454,7 @@ mod chain_failure_tests {
         );
         assert!(
             !matches!(result, Ok(ref v) if v.is_empty()),
-            "an undatable answer must NEVER be reported as a childless parent — that terminates a              lineage walk on a branch the caller never actually read"
+            "an undatable answer must NEVER be reported as a childless parent — that terminates a lineage walk on a branch the caller never actually read"
         );
     }
 

@@ -1113,7 +1113,7 @@ mod descriptor_ask {
             );
             assert!(
                 started.elapsed() > ladder,
-                "the fixture must outlast the {ladder:?} descriptor ladder or it proves nothing --              elapsed {:?}",
+                "the fixture must outlast the {ladder:?} descriptor ladder or it proves nothing -- elapsed {:?}",
                 started.elapsed()
             );
             assert!(
@@ -1144,7 +1144,7 @@ mod descriptor_ask {
             );
             assert!(
                 started.elapsed() < RELAY_STALL_WINDOW + RELAY_POLL_INTERVAL * 2,
-                "a frozen hop must be dropped at the stall window, not held to the ceiling -- elapsed              {:?}",
+                "a frozen hop must be dropped at the stall window, not held to the ceiling -- elapsed {:?}",
                 started.elapsed()
             );
         }
@@ -1217,7 +1217,7 @@ mod descriptor_ask {
             );
             assert!(
             started.elapsed() < nearly_spent + RELAY_POLL_INTERVAL * 2,
-            "the wait must end at the budget it was GIVEN, not at the per-hop maximum -- elapsed              {:?} against a budget of {nearly_spent:?}",
+            "the wait must end at the budget it was GIVEN, not at the per-hop maximum -- elapsed {:?} against a budget of {nearly_spent:?}",
             started.elapsed()
         );
             assert!(
@@ -1808,7 +1808,7 @@ mod tests {
         assert_eq!(
             locator.calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "a refused plain round must be followed by an ESCALATED round inside the same call;              one round means the call site is no longer driving the escalation"
+            "a refused plain round must be followed by an ESCALATED round inside the same call; one round means the call site is no longer driving the escalation"
         );
     }
 
@@ -1842,7 +1842,7 @@ mod tests {
         assert_eq!(
             budget.remaining(&store, &id_of(0x77)),
             full,
-            "the control: another capsule must be unaffected, or the ledger is global rather than              per pull"
+            "the control: another capsule must be unaffected, or the ledger is global rather than per pull"
         );
 
         // Overrun saturates instead of wrapping into a fresh allowance.
@@ -1889,7 +1889,7 @@ mod tests {
         assert_eq!(
             budget.remaining(&store, &root),
             full,
-            "pull two must start with the WHOLE budget; a ledger keyed to the capsule for the              daemon's lifetime would still read zero here and would refuse the relay path forever,              while naming a peer as the cause"
+            "pull two must start with the WHOLE budget; a ledger keyed to the capsule for the daemon's lifetime would still read zero here and would refuse the relay path forever, while naming a peer as the cause"
         );
     }
 

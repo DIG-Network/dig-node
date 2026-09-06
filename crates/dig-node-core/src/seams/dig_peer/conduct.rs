@@ -295,7 +295,7 @@ mod tests {
         );
         assert!(
             dialable.contains(&slow),
-            "unverifiable distress must NEVER remove a peer from the dial set, however sustained —              otherwise loading an honest holder is enough to evict it"
+            "unverifiable distress must NEVER remove a peer from the dial set, however sustained — otherwise loading an honest holder is enough to evict it"
         );
         assert!(
             dialable.contains(&quiet),

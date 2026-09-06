@@ -5463,7 +5463,7 @@ pub(crate) mod tests {
         assert_eq!(
             key_a.len(),
             136,
-            "fixture guard: a real module checkpoint key is 136 bytes — a shorter key cannot              exhibit the NAME_MAX overflow this test exists to catch"
+            "fixture guard: a real module checkpoint key is 136 bytes — a shorter key cannot exhibit the NAME_MAX overflow this test exists to catch"
         );
 
         for (key, total) in [(&key_a, 11u64), (&key_b, 22u64)] {

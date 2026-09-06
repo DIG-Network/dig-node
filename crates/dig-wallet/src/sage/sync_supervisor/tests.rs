@@ -2850,7 +2850,7 @@ async fn a_stall_and_its_recovery_are_both_named_in_the_log() {
     );
     assert!(
         log.contains("observed_behind_for_secs"),
-        "the stall must say how long it was OBSERVED behind — and say only that, because the          freeze may predate the first observation by any amount: {log}"
+        "the stall must say how long it was OBSERVED behind — and say only that, because the freeze may predate the first observation by any amount: {log}"
     );
     assert!(
         !log.contains("stalled_for_secs"),
@@ -3969,11 +3969,11 @@ async fn a_shutdown_is_honoured_while_a_catch_up_is_running() {
 fn the_catch_up_deadline_is_a_duration_a_human_waits() {
     assert!(
         CATCH_UP_DEADLINE <= Duration::from_secs(4 * 60 * 60),
-        "a deadline longer than an afternoon cannot end a parked catch-up in any useful sense:          {CATCH_UP_DEADLINE:?}"
+        "a deadline longer than an afternoon cannot end a parked catch-up in any useful sense: {CATCH_UP_DEADLINE:?}"
     );
     assert!(
         CATCH_UP_DEADLINE >= Duration::from_secs(5 * 60),
-        "measured catch-ups take tens of milliseconds, but a deadline under five minutes leaves          no room for a slow first sync — and aborting one restarts it from genesis:          {CATCH_UP_DEADLINE:?}"
+        "measured catch-ups take tens of milliseconds, but a deadline under five minutes leaves no room for a slow first sync — and aborting one restarts it from genesis: {CATCH_UP_DEADLINE:?}"
     );
 }
 
@@ -4024,12 +4024,12 @@ async fn the_ceiling_derives_from_the_quorum_height_and_the_injected_lifetime() 
     assert_eq!(
         ceiling.anchor(),
         SETTLED_HEIGHT,
-        "the ceiling must be anchored on the height the quorum settled, which the writer cannot          inflate — not on anything the writer said"
+        "the ceiling must be anchored on the height the quorum settled, which the writer cannot inflate — not on anything the writer said"
     );
     assert_eq!(
         ceiling.limit(),
         SETTLED_HEIGHT + sync::peak_allowance(lifetime),
-        "the allowance must be derived from the lifetime this supervisor runs sessions for; a          hardcoded one silently becomes too tight when that value moves UP"
+        "the allowance must be derived from the lifetime this supervisor runs sessions for; a hardcoded one silently becomes too tight when that value moves UP"
     );
     assert!(
         !ceiling.admits(SETTLED_HEIGHT + 1_000_000),
@@ -4879,7 +4879,7 @@ async fn a_frame_on_a_live_session_attributes_through_the_update_loop() {
     assert_eq!(
         h.script.catch_up_count(),
         1,
-        "isolation: the row must be attributed while the FIRST session is still live. A second          catch-up means the post-catch-up pass could explain the result, and this test would no          longer be about `run_update_loop`'s attributor at all"
+        "isolation: the row must be attributed while the FIRST session is still live. A second catch-up means the post-catch-up pass could explain the result, and this test would no longer be about `run_update_loop`'s attributor at all"
     );
 
     assert_eq!(

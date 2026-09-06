@@ -613,6 +613,8 @@ pub unsafe extern "C" fn dig_bytes_free(ptr: *mut u8, len: usize) {
 }
 
 #[cfg(test)]
+mod continuation_guard;
+#[cfg(test)]
 mod tests {
     use super::*;
     use digstore_core::codec::Encode;

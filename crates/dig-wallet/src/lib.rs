@@ -1181,6 +1181,8 @@ const SETTINGS_HTML: &str = include_str!("settings.html");
 const WC_BUNDLE_JS: &str = include_str!("wc-bundle.js");
 
 #[cfg(test)]
+mod continuation_guard;
+#[cfg(test)]
 mod tests {
     use super::*;
 

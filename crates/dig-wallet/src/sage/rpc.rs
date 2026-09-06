@@ -11158,7 +11158,7 @@ mod tests {
                 fixed,
                 Err(super::super::db::ResetRefusal::SpendInFlight { .. })
             ),
-            "the disciplined clock must still see the 60s hold as live seconds after it was              taken, jumped wall clock notwithstanding — got {fixed:?}"
+            "the disciplined clock must still see the 60s hold as live seconds after it was taken, jumped wall clock notwithstanding — got {fixed:?}"
         );
 
         // THE DEFECT this ticket closes: had `wallet_reset_coin_db` instead fed the raw, jumped
@@ -11169,7 +11169,7 @@ mod tests {
         let undisciplined = be.db.reset_chain_cache(jumped_wall_ms).await.unwrap();
         assert!(
             undisciplined.is_ok(),
-            "sanity: an undisciplined jumped reading DOES bypass the refusal, which is exactly              why the control-plane call site must never use one"
+            "sanity: an undisciplined jumped reading DOES bypass the refusal, which is exactly why the control-plane call site must never use one"
         );
     }
     /// A bundle spending exactly the coin `spendable_row(id_byte, amount)` describes, in the hex

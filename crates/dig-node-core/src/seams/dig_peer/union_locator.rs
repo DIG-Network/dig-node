@@ -285,7 +285,7 @@ mod tests {
         let union = UnionLocator::new(vec![Arc::new(FailingSource), Arc::new(EmptyLocator)]);
         assert!(
             union.find_providers(&cid).await.is_err(),
-            "a union whose source failed and which found nobody must report the failure;              Ok(vec![]) here is what a caller reads as a proven absence"
+            "a union whose source failed and which found nobody must report the failure; Ok(vec![]) here is what a caller reads as a proven absence"
         );
 
         // ARM 2 - a healthy leg found a holder: the failure is immaterial, the holder survives.

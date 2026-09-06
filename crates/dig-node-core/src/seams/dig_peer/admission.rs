@@ -459,11 +459,11 @@ mod tests {
         assert_eq!(
             node_limits().max_request_units,
             crate::MAX_AVAILABILITY_ITEMS as u32,
-            "the admission clamp must equal the advertised batch limit, or the node refuses batches              it says it serves"
+            "the admission clamp must equal the advertised batch limit, or the node refuses batches it says it serves"
         );
         assert!(
             node_limits().max_request_units > AdmissionLimits::default().max_request_units,
-            "the crate default is the smaller of the two — if this ever stops holding, the override              is doing nothing and the comment above it is false"
+            "the crate default is the smaller of the two — if this ever stops holding, the override is doing nothing and the comment above it is false"
         );
     }
 
