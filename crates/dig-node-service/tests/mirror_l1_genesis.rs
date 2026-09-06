@@ -89,8 +89,8 @@ fn reclaim_spends() -> Vec<CoinSpend> {
         ReclaimReason::NoLongerHeld,
     )
     .expect("a zero-fee reclaim builds")
-        .coin_spends()
-        .to_vec()
+    .coin_spends()
+    .to_vec()
 }
 
 /// Every BLS signature a reclaim requires under the Chia L1 domain, as `(key, message)`.
