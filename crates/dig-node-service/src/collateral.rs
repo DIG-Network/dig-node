@@ -89,6 +89,20 @@ pub struct CollateralConfig {
     /// one setting to turn off.
     #[serde(default = "default_mirror_enabled")]
     pub mirror_enabled: bool,
+
+    /// Whether the AUTOMATIC daily URL reconcile may spend (`SPEC.md` §25.13.7.6, dig-node#570).
+    ///
+    /// **Gates the automatic trigger only.** The daily GATHER and the drift REPORT run regardless
+    /// — seeing is not spending — and the manual `control.mirror.reconcile` method ignores this
+    /// switch entirely (a press IS the human confirmation §25.13.8 rests on).
+    ///
+    /// Default-on, for the same consent model as [`Self::mirror_enabled`] and §18.23's auto-tipping:
+    /// disclosed, bounded (hysteresis + the epoch cap), fully audited (`SPEC.md` §F), and one
+    /// setting to turn off. It is a switch, rather than always-on, because the spend count here can
+    /// grow without a person watching in a way an ordinary mirror bond's cannot — the user asked for
+    /// the behaviour by name, and this is what makes that consent revocable.
+    #[serde(default = "default_url_reconcile_enabled")]
+    pub url_reconcile_enabled: bool,
 }
 
 fn default_margin_bp() -> u64 {
@@ -96,6 +110,10 @@ fn default_margin_bp() -> u64 {
 }
 
 fn default_mirror_enabled() -> bool {
+    true
+}
+
+fn default_url_reconcile_enabled() -> bool {
     true
 }
 
@@ -107,6 +125,7 @@ impl Default for CollateralConfig {
             // choice.
             retention_epochs: None,
             mirror_enabled: default_mirror_enabled(),
+            url_reconcile_enabled: default_url_reconcile_enabled(),
         }
     }
 }

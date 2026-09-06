@@ -71,6 +71,10 @@ pub struct MirrorSpends {
     /// The URLs a CREATE advertises this bond as fetchable from. Empty for a reclaim, which
     /// advertises nothing (dig-node#574).
     advertised_urls: Vec<String>,
+    /// `Some` only for a RECLAIM (`SPEC.md` §F); `None` for a create, which has no reason to give.
+    /// Set at build time from the SAME [`super::plan::ReclaimReason`] the runner decided to act on,
+    /// never invented here — see [`build_reclaim`].
+    reclaim_reason: Option<super::plan::ReclaimReason>,
 }
 
 impl MirrorSpends {
@@ -152,7 +156,26 @@ impl MirrorSpends {
                     epoch,
                 }),
             advertised_urls: self.advertised_urls.clone(),
+            // `SPEC.md` §F: derived from the SAME `ReclaimReason` the runner decided to act on,
+            // never supplied by a caller, so an entry cannot claim a reason its bundle does not
+            // have. `None` on a create (`self.reclaim_reason` is `None` there by construction).
+            reclaim_reason: self.reclaim_reason.map(|r| reclaim_reason_label(r).to_string()),
+            trigger: self.reclaim_reason.and_then(|r| match r {
+                super::plan::ReclaimReason::UrlStale(trigger) => Some(trigger.label().to_string()),
+                super::plan::ReclaimReason::NoLongerHeld | super::plan::ReclaimReason::EpochEnded => None,
+            }),
         }
+    }
+}
+
+/// The `SPEC.md` §F snake_case spelling of a [`super::plan::ReclaimReason`], ignoring which
+/// [`super::plan::Trigger`] a `UrlStale` carries — that half is [`MirrorSpends::intent`]'s
+/// `trigger` field, kept separate so a reader can filter on the reason alone.
+fn reclaim_reason_label(reason: super::plan::ReclaimReason) -> &'static str {
+    match reason {
+        super::plan::ReclaimReason::NoLongerHeld => "no_longer_held",
+        super::plan::ReclaimReason::EpochEnded => "epoch_ended",
+        super::plan::ReclaimReason::UrlStale(_) => "url_stale",
     }
 }
 
@@ -220,6 +243,7 @@ pub fn build_create(
         epoch,
         collateral_dig_base_units,
         advertised_urls,
+        reclaim_reason: None,
     })
 }
 
@@ -233,11 +257,15 @@ pub fn build_create(
 /// `fee` may be zero, and a zero-fee reclaim is supported. That matters: a node whose XCH is
 /// exhausted must still be able to recover $DIG it has locked, which is precisely what the legacy
 /// could not do.
+///
+/// `reason` is recorded on the resulting audit entry verbatim (`SPEC.md` §F) — never re-derived
+/// from the coin, so a caller cannot build a bundle and then disagree with itself about why.
 pub fn build_reclaim(
     mirror: &MirrorCoin,
     synthetic_key: PublicKey,
     fee_coins: Vec<Coin>,
     fee: u64,
+    reason: super::plan::ReclaimReason,
 ) -> Result<MirrorSpends, MirrorError> {
     let spends = dig_mirror_coin::reclaim(mirror, synthetic_key, fee_coins, fee)?;
 
@@ -258,6 +286,7 @@ pub fn build_reclaim(
         collateral_dig_base_units: mirror.collateral(),
         // A reclaim returns collateral; it advertises nothing.
         advertised_urls: Vec::new(),
+        reclaim_reason: Some(reason),
     })
 }
 
@@ -284,6 +313,7 @@ pub(crate) fn empty_for_tests(fee_mojos: u64, owner_puzzle_hash: Bytes32) -> Mir
         epoch: BigInt::from(0),
         collateral_dig_base_units: 0,
         advertised_urls: Vec::new(),
+        reclaim_reason: None,
     }
 }
 
@@ -314,5 +344,6 @@ pub(crate) fn unsignable_for_tests(owner_puzzle_hash: Bytes32) -> MirrorSpends {
         epoch: BigInt::from(0),
         collateral_dig_base_units: 0,
         advertised_urls: Vec::new(),
+        reclaim_reason: None,
     }
 }

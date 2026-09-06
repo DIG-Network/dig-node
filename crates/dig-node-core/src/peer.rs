@@ -236,10 +236,12 @@ pub struct PeerStatus {
     /// [`crate::Node::network_info`] publishes from this field (dig-node#566). This field only ever
     /// answers "what did the gather see", never "what may be believed".
     ///
-    /// Set ONCE per gather, by [`Self::set_reflexive`], and never cleared: there is no periodic
-    /// re-probe today, so clearing it on some other signal would trade real readings for a worse
-    /// state — an unconditional empty `Vec` — rather than a better one. Downstream
-    /// reachability-over-time is a SEPARATE fact already tracked by `relay_reserved` above.
+    /// Set at bring-up by [`Self::set_reflexive`], and REPLACED — never merged, never cleared to
+    /// empty — only by a later CONCLUSIVE re-gather (dig-node#570 §25.13.7.3's daily check, via
+    /// `Node::replace_reflexive_readings`): the newer gather is the better measurement of this
+    /// node's CURRENT mapping, and an inconclusive re-gather must leave a working set exactly as it
+    /// was rather than trading it for a worse one. Downstream reachability-over-time is a SEPARATE
+    /// fact already tracked by `relay_reserved` above.
     reflexive: std::sync::Mutex<Vec<(std::net::SocketAddr, String)>>,
 }
 
@@ -295,12 +297,15 @@ impl PeerStatus {
     }
 
     /// Record every reading this node's reflexive-address gather collected
-    /// ([`crate::net::gather_reflexive_readings`]), called once from the peer-network bring-up.
-    /// A later call REPLACES the whole set — the bring-up runs this exactly once today, so
-    /// replace-vs-merge is not yet a live question, but replace is the correct choice if a second
-    /// caller (a periodic re-probe) is ever added: the newer gather is the better measurement of
-    /// the node's CURRENT mapping, and merging stale readings into a fresh gather would let an old
-    /// answer keep voting after the world it described has changed.
+    /// ([`crate::net::gather_reflexive_readings`]).
+    ///
+    /// A later call REPLACES the whole set, never merges into it: the newer gather is the better
+    /// measurement of the node's CURRENT mapping, and merging stale readings into a fresh gather
+    /// would let an old answer keep voting after the world it described has changed. Called once,
+    /// unconditionally, from bring-up; called again, but only on a CONCLUSIVE result, by the daily
+    /// re-check (dig-node#570 §25.13.7.3, via [`crate::Node::replace_reflexive_readings`]) — this
+    /// method itself does not know the difference and always replaces what it is given, which is
+    /// why the caller's own conclusive/inconclusive gate is where that distinction is enforced.
     pub fn set_reflexive(&self, readings: Vec<(std::net::SocketAddr, String)>) {
         *self.reflexive.lock().unwrap() = readings;
     }

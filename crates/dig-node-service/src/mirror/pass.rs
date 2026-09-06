@@ -29,14 +29,15 @@
 //!    unfunded, and conflating them produces an out-of-funds alarm about a wallet that is fine
 //!    (dig-app#300). A missed create fails safe — the money stays in the wallet.
 
-use dig_mirror_collateral::margin::apply_safety_margin;
-
 // From the control interface's published contract rather than re-exported through
 // `crate::collateral`: these are the same types the §25.8 surface serves, and naming their
 // owner keeps one definition rather than a local alias that could drift from it.
 use dig_node_control_interface::results::{CollateralRequirementResult, CollateralUnknownReason};
 
-use super::plan::{plan, Bond, FundingSplit, HeldMirror, MirrorPlan, ReclaimReason};
+use super::plan::{
+    per_coin_dig_base_units, plan, Bond, FundingSplit, HeldMirror, MirrorPlan, ReclaimReason,
+};
+use super::reconcile::ReconcileDirective;
 
 /// What one pass has decided to do, and what to report for every bond it considered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +230,16 @@ pub struct PassInputs<'a> {
     /// Reclaims ignore it, exactly as they ignore [`Self::creates_enabled`]: money already locked
     /// must come home whether or not this node can advertise anything today.
     pub can_advertise: bool,
+    /// A URL-reconcile directive for THIS pass, when [`super::reconcile::decide`] (dig-node#570)
+    /// has already sized one — `SPEC.md` §25.13's `ReconcileDirective`, naming coin ids to reclaim
+    /// because their advertised URL no longer matches what this node advertises now.
+    ///
+    /// `None` on every ordinary pass (the overwhelming majority): the daily/manual trigger is what
+    /// ever produces `Some`, and it has ALREADY sized the affordable prefix and run every one of
+    /// `SPEC.md` §25.13.4's other gates before this field is populated — `decide` here never
+    /// re-derives that decision, it only turns an already-sized directive into reclaim entries, the
+    /// same way the ordinary table turns `NoLongerHeld`/`EpochEnded` coins into them.
+    pub reconcile: Option<&'a ReconcileDirective>,
 }
 
 /// Decide one pass.
@@ -252,25 +263,39 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
         &[]
     };
 
-    let MirrorPlan { reclaim, create } = plan(
+    let MirrorPlan { mut reclaim, create } = plan(
         desired,
         inputs.on_chain,
         inputs.current_epoch,
         inputs.in_flight,
     );
 
+    // dig-node#570, `SPEC.md` §B.1: the planner stays PURE and never decides a URL is stale on its
+    // own. It ACTS on a directive [`super::reconcile::decide`] already sized and gated — every
+    // coin named here has ALREADY cleared every §25.13.4 gate, including the affordability check,
+    // so this loop only ever turns an already-priced decision into reclaim entries, exactly as the
+    // two rows above turn `NoLongerHeld`/`EpochEnded` into them. Appended AFTER the ordinary
+    // reclaims and BEFORE any create (`SPEC.md` §B.2) — the recreate for a bond reclaimed this way
+    // is NEVER this pass's: `inputs.on_chain` was snapshotted before this reclaim runs, so `create`
+    // above still sees the coin as present and plans nothing for its bond; the recreate happens
+    // automatically, through this SAME ordinary path, on the first later pass whose chain
+    // observation no longer shows the reclaimed coin (`SPEC.md` §25.13.6).
+    if let Some(directive) = inputs.reconcile {
+        for coin_id in &directive.coin_ids {
+            if let Some(coin) = inputs.on_chain.iter().find(|c| &c.coin_id == coin_id) {
+                reclaim.push((coin.clone(), ReclaimReason::UrlStale(directive.trigger)));
+            }
+            // A named id absent from `on_chain` is not this function's problem to raise: the
+            // directive was sized against a chain read from the SAME tick (`SPEC.md` §25.13.6),
+            // so an absence here means the coin left the chain between that read and this one —
+            // already reconciled, or reclaimed by another path — and reclaiming nothing for it is
+            // the correct, safe answer either way.
+        }
+    }
+
     // Rule 3. The requirement is consulted only to PRICE creates. Note it is read after the plan is
     // taken, never before it: nothing about an unknown price may reach the reclaim list.
-    let per_coin = match inputs.requirement {
-        CollateralRequirementResult::Known {
-            required_per_store_dig_base_units,
-            ..
-        } => Some(apply_safety_margin(
-            *required_per_store_dig_base_units,
-            inputs.margin_bp,
-        )),
-        CollateralRequirementResult::Unknown { .. } => None,
-    };
+    let per_coin = per_coin_dig_base_units(inputs.requirement, inputs.margin_bp);
 
     // Rule 1, continued: the balance is read AFTER the plan too, and an unknown balance prices no
     // create rather than aborting anything. `reclaim` above is already decided and is untouched by

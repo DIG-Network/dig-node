@@ -9113,12 +9113,18 @@ A pass runs: at start-up (once the wallet and a chain source are available), on 
 2. **Observes chain**: `dig_mirror_coin::list(source, owner_puzzle_hash)` — the coins actually owned.
 3. **Plans**, purely (no I/O, no clock — the epoch is a parameter):
 
-   | owned coin | its `.dig` held | action |
-   |---|---|---|
-   | `epoch == current` | yes | keep |
-   | `epoch == current` | no | **reclaim** (`NoLongerHeld` — the penalised state; the priority) |
-   | `epoch <  current` | either | **reclaim** (`EpochEnded` — the automatic form of the operation the legacy left to an operator; dig-node has no operator) |
-   | `epoch >  current` | either | **keep** |
+   | owned coin | its `.dig` held | its URLs vs. §25.13's target | action |
+   |---|---|---|---|
+   | `epoch == current` | yes | equal, or no reconcile directive this pass | keep |
+   | `epoch == current` | yes | DIFFER, and a §25.13 directive names this coin | **reclaim** (`UrlStale` — §25.13; the recreate is owed to a later pass) |
+   | `epoch == current` | no | — | **reclaim** (`NoLongerHeld` — the penalised state; the priority) |
+   | `epoch <  current` | either | — | **reclaim** (`EpochEnded` — the automatic form of the operation the legacy left to an operator; dig-node has no operator) |
+   | `epoch >  current` | either | — | **keep** |
+
+   The planner stays PURE: it never decides a URL is stale on its own. It acts on a **reconcile
+   directive** supplied as an input (§25.13.6), naming coins to reclaim by coin id; without a
+   directive the third column is not consulted and the table is exactly the first, third, fourth
+   and fifth rows.
 
    The last row is a decision, not a gap: the epoch clock is wall-clock with no chain input
    (§24.3), so a slow local clock reads a legitimately-created next-epoch coin as "future", and
@@ -9769,8 +9775,13 @@ use, which is the absence of a relay rather than evidence of reachability, and r
 the gate vacuously true for exactly the nodes it exists to stop advertising.
 
 Changing the value affects only coins created after the change. Bringing an existing coin into line
-means reclaiming and re-creating it — a round trip and a fee — and the node MUST NOT reclaim in
-response to a configuration edit, nor in response to the derived address changing.
+means reclaiming and re-creating it — a round trip and a fee — and there is exactly ONE path by which
+the node does so: §25.13's reconcile, under §25.13's gates. The node MUST NOT reclaim as a direct
+side effect of a configuration edit, of a changed reading, or of `control.config.setMirrorAdvertiseUrls`
+being called; an edit makes the drift VISIBLE (§25.8's `url_current`) and §25.13 decides — after
+corroboration, after stability where the trigger is automatic, and after the recreate has been priced —
+whether to spend. Absent §25.13 the drift closes for free at the next epoch rollover, when §25.4 reclaims
+the old-epoch coin and re-creates at whatever the node then advertises.
 
 
 ### 25.11. Funding a create — authentication precedes every figure the operator is told

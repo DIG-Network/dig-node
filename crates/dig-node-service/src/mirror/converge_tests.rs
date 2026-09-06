@@ -239,6 +239,7 @@ fn ctx_at(epoch: i64) -> PassContext {
         margin_bp: 0,
         creates_enabled: true,
         can_advertise: true,
+        reconcile: None,
     }
 }
 
@@ -276,6 +277,8 @@ fn create_intent(store: &str, root: &str, epoch: i64) -> SpendIntent {
             epoch,
         }),
         advertised_urls: Vec::new(),
+        reclaim_reason: None,
+        trigger: None,
     }
 }
 

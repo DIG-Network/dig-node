@@ -85,6 +85,8 @@ fn intent(store: &str, root: &str, epoch: i64) -> SpendIntent {
             epoch,
         }),
         advertised_urls: Vec::new(),
+        reclaim_reason: None,
+        trigger: None,
     }
 }
 

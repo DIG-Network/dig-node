@@ -2786,6 +2786,12 @@ fn spawn_mirror_passes(
         // which is precisely the behaviour the gate exists to prevent.
         let mut funding_gate = crate::mirror::funding::FundingAlertGate::default();
 
+        // dig-node#570's daily URL-reconcile detector. Loaded once, like the two trackers above: a
+        // fresh `ReconcileState` every round would forget yesterday's observation and never see
+        // hysteresis's two agreeing days. A missing/corrupt file reads as "never observed" (its own
+        // module doc) — the safe direction, since it only ever delays an automatic spend.
+        let mut reconcile_state = crate::mirror::reconcile_state::ReconcileState::load();
+
         // The disk-event accelerant (dig-node#465). Strictly a hint about WHEN to run the next
         // pass: `wait_for_next_pass` never lets an event push the round deadline out, and a `None`
         // here is a node that waits on the timer alone and converges identically, one round later.
@@ -2875,6 +2881,81 @@ fn spawn_mirror_passes(
             )
             .map_err(|e| crate::mirror::runner::PassError::Wallet(e.to_string()));
 
+            // dig-node#570 §25.13.7: once per PERSONAL day — a per-node offset derived from this
+            // node's own peer id, never drawn or persisted (`SPEC.md` §25.13.7.1) — re-gather fresh
+            // reflexive readings and, only if they CONCLUSIVELY establish an address, publish them.
+            // Placed BEFORE `advertised` below so a conclusive re-gather is reflected in THIS
+            // pass's own advertisement, exactly as bring-up's one gather already is.
+            {
+                use crate::mirror::reconcile_state::CheckOutcome;
+                use crate::mirror::schedule as reconcile_schedule;
+
+                let peer_id_bytes = node
+                    .own_peer_id()
+                    .and_then(|hex_id| hex::decode(hex_id).ok())
+                    .unwrap_or_default();
+                let offset_secs = reconcile_schedule::personal_day_offset_secs(&peer_id_bytes);
+                let now_unix_secs = (lifecycle::now_unix_ms() / 1000) as i64;
+
+                if reconcile_schedule::is_due(
+                    now_unix_secs,
+                    offset_secs,
+                    reconcile_state.last_completed_day,
+                ) {
+                    let today = reconcile_schedule::personal_day_index(now_unix_secs, offset_secs);
+                    let fresh_readings = dig_node_core::net::gather_reflexive_readings(
+                        dig_node_core::peer::relay_enabled()
+                            .then(dig_node_core::peer::relay_url_from_env),
+                        dig_node_core::peer::peer_port_from_env(),
+                        std::time::Duration::from_secs(2),
+                    )
+                    .await;
+
+                    // Reuse the CURRENT relay-reservation/direct-mapping reading (unrelated to the
+                    // STUN gather and read fresh every pass already) and override only the readings
+                    // half with what THIS gather just collected.
+                    let mut fresh_address = crate::mirror::advertise::PublicAddress::from_network_info(
+                        &node.network_info(),
+                    );
+                    fresh_address.reflexive = fresh_readings
+                        .iter()
+                        .map(|r| crate::mirror::advertise::Reflexive {
+                            source: r.class.clone(),
+                            addr: r.addr,
+                        })
+                        .collect();
+                    let fresh_effective =
+                        crate::mirror::advertise::effective_urls(&operator_urls, &fresh_address);
+
+                    if fresh_effective.can_advertise() {
+                        node.replace_reflexive_readings(
+                            fresh_readings.into_iter().map(|r| (r.addr, r.class)).collect(),
+                        );
+                        reconcile_state.record_check(
+                            today,
+                            CheckOutcome::Conclusive {
+                                urls: fresh_effective.urls.clone(),
+                            },
+                        );
+                    } else {
+                        reconcile_state.record_check(
+                            today,
+                            CheckOutcome::Inconclusive {
+                                state: fresh_effective.state.label(),
+                            },
+                        );
+                    }
+                    if let Err(e) = reconcile_state.save() {
+                        tracing::warn!(
+                            target: "mirror",
+                            error = %e,
+                            "the URL-reconcile detector's state could not be persisted; today's \
+                             check will run again next round"
+                        );
+                    }
+                }
+            }
+
             // What this node will advertise THIS pass (SPEC.md §25.10, dig_ecosystem#3197): the
             // operator's value when they set one, otherwise this node's own reflexive peer address
             // — gated on a path to it being held. `network_info` reads atomics and touches neither
@@ -2883,6 +2964,26 @@ fn spawn_mirror_passes(
                 &operator_urls,
                 &crate::mirror::advertise::PublicAddress::from_network_info(&node.network_info()),
             );
+
+            // dig-node#570 §25.13.7.4-6: may the AUTOMATIC trigger attempt a reconcile this pass?
+            // Hysteresis (two agreeing personal days) and the epoch cap (at most one automatic
+            // reconcile per epoch) are evaluated HERE, never inside `reconcile::decide` — they are
+            // pre-conditions of the automatic trigger, not gates the manual one shares (`SPEC.md`
+            // §25.13.2's table).
+            let reconcile_attempt = if config.url_reconcile_enabled
+                && crate::mirror::schedule::is_stable(&reconcile_state.observations, &advertised.urls)
+                && crate::mirror::schedule::epoch_cap_allows(
+                    reconcile_state.last_auto_reconcile_epoch,
+                    epoch,
+                )
+            {
+                Some(crate::mirror::runner::ReconcileAttempt {
+                    trigger: crate::mirror::plan::Trigger::Daily,
+                    advertised: advertised.clone(),
+                })
+            } else {
+                None
+            };
             if last_advertise_state != Some(advertised.state) {
                 tracing::info!(
                     target: "mirror",
@@ -2930,6 +3031,7 @@ fn spawn_mirror_passes(
                         // priced against its operator wallet and reported `unfunded` with a base-unit
                         // figure — a demand for money that would have bonded nothing.
                         can_advertise: advertised.can_advertise(),
+                        reconcile: reconcile_attempt,
                     };
                     // `block_in_place` rather than `spawn_blocking`: the runner borrows the signer,
                     // the journal and the chain source, none of which is `'static`, and moving them
@@ -2979,6 +3081,22 @@ fn spawn_mirror_passes(
 
                     match outcome {
                         Ok(report) => {
+                            // dig-node#570 §25.13.7.5: the epoch cap counts a reconcile spent the
+                            // moment at least one `UrlStale` reclaim reaches the mempool, not when
+                            // it was merely attempted — a pass whose directive was entirely refused
+                            // or entirely failed must not consume the epoch's one automatic try.
+                            if report.reconcile_url_stale_accepted > 0 {
+                                reconcile_state.mark_auto_reconciled(epoch);
+                                if let Err(e) = reconcile_state.save() {
+                                    tracing::warn!(
+                                        target: "mirror",
+                                        error = %e,
+                                        "the URL-reconcile epoch cap could not be persisted; a \
+                                         restart before the next rollover could permit one extra \
+                                         automatic reconcile this epoch"
+                                    );
+                                }
+                            }
                             lifecycle::publish(&snapshot, &report, epoch);
                             log_mirror_pass(&report, epoch);
                         }
@@ -3747,6 +3865,7 @@ mod tests {
             per_coin_dig_base_units: None,
             locked_dig_base_units: 0,
             funding_alert: None,
+            reconcile_url_stale_accepted: 0,
         }
     }
 

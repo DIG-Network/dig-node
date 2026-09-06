@@ -64,6 +64,22 @@ pub struct ObservedCapsule {
     pub provenance: CapsuleProvenance,
 }
 
+/// One coin [`MirrorEffects::observe_chain`] would also report, together with the URL set its own
+/// memos declare (dig-node#570).
+///
+/// Wraps [`HeldMirror`] instead of duplicating its fields, and adds exactly the one thing
+/// `observe_chain` does not carry. `HeldMirror` stays lean on purpose — no other consumer of it
+/// ever needs a URL — so this type exists for the one question that does:
+/// [`super::reconcile::reconcile_to_current_url`] comparing what a coin declares against what this
+/// node would advertise NOW, after its public address may have changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredBond {
+    /// The coin, exactly as `observe_chain` would report it.
+    pub held: HeldMirror,
+    /// The URLs this coin's memos declare it can be fetched at.
+    pub urls: Vec<String>,
+}
+
 /// Why a pass could not complete a step. Carries no key material and no puzzle hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PassError {
@@ -129,6 +145,24 @@ pub trait MirrorEffects {
 
     /// The mirror coins this wallet owns — `dig_mirror_coin::list(source, owner_puzzle_hash)`.
     fn observe_chain(&self) -> Result<Vec<HeldMirror>, PassError>;
+
+    /// Every mirror coin this wallet owns, together with the URL set each one declares
+    /// (dig-node#570).
+    ///
+    /// A superset of [`Self::observe_chain`] for the one caller that must compare a coin's OWN
+    /// advertisement against what this node would advertise NOW —
+    /// [`super::reconcile::reconcile_to_current_url`]. Not folded into `observe_chain` itself:
+    /// doing so would make every implementor of this trait, including every existing test double,
+    /// carry a URL list nothing else has any use for.
+    ///
+    /// Defaulted to empty so every existing implementor keeps compiling unchanged.
+    /// [`super::lifecycle::NodeMirrorEffects`] is the only override, and it reads the SAME
+    /// authenticated scan `observe_chain` already performs rather than taking a second chain read.
+    /// An implementor that has not overridden this reports no coins at all — the safe direction,
+    /// since reconcile reads that as "nothing to reconcile" rather than guessing a URL match.
+    fn observe_bonded_urls(&self) -> Result<Vec<DeclaredBond>, PassError> {
+        Ok(Vec::new())
+    }
 
     /// What the chain says about `coin_id`, for resolving a spend this node broadcast in an
     /// EARLIER pass (dig-node#412 step 6).
@@ -214,6 +248,25 @@ pub struct PassContext {
     /// the pass must not plan or price creates it cannot attempt. Read once at bring-up beside the
     /// advertised URL list itself, because a coin's URLs are fixed at create for the whole epoch.
     pub can_advertise: bool,
+    /// A URL-reconcile attempt for THIS pass (`SPEC.md` §25.13, dig-node#570) — `None` on the
+    /// overwhelming majority of passes. `Some` only when the daily detector or
+    /// `control.mirror.reconcile` has ALREADY cleared its OWN pre-conditions (the switch,
+    /// hysteresis, the epoch cap — none of which is [`super::reconcile::decide`]'s to re-check,
+    /// `SPEC.md` §25.13.4's own text) and is asking this pass to evaluate the remaining gates
+    /// against what THIS pass observes.
+    pub reconcile: Option<ReconcileAttempt>,
+}
+
+/// One caller's request that THIS pass attempt a URL reconcile — the trigger asking, and the
+/// address it would reconcile toward.
+#[derive(Debug, Clone)]
+pub struct ReconcileAttempt {
+    /// Which caller is asking, carried to the audit record (`SPEC.md` §F).
+    pub trigger: super::plan::Trigger,
+    /// What this node would advertise THIS pass — gate 1's input and `SPEC.md` §25.13.3's target.
+    /// Threaded in rather than re-derived, so this pass's reconcile decision and its ordinary
+    /// create pricing can never disagree about the address.
+    pub advertised: super::advertise::Effective,
 }
 
 /// What one pass actually did.
@@ -263,6 +316,12 @@ pub struct PassReport {
     /// tracker is -- a gate rebuilt each round has no memory of having spoken, and would speak every
     /// round.
     pub funding_alert: Option<super::funding::FundingAlert>,
+    /// How many `UrlStale` reclaims this pass ACCEPTED (dig-node#570, `SPEC.md` §25.13.7.5).
+    ///
+    /// Zero on every ordinary pass. The daily scheduler reads this to decide whether ITS directive
+    /// actually landed anything and, if so, marks the epoch cap spent — [`HeldMirror`] itself
+    /// carries no reason, so this is the only place that fact survives past [`Self::execute`].
+    pub reconcile_url_stale_accepted: usize,
 }
 
 /// Runs reconcile passes. Long-lived: it owns the presence tracker and the funding alert gate, the
@@ -332,6 +391,19 @@ impl<E: MirrorEffects> PassRunner<E> {
     /// Hand the presence tracker back, for the next round's runner.
     pub fn into_presence(self) -> super::presence::PresenceTracker {
         self.presence
+    }
+
+    /// Hand back the effects THIS runner already built, together with the presence tracker.
+    ///
+    /// A single consuming accessor rather than a second [`Self::into_presence`]-shaped one:
+    /// [`Self::into_presence`] and an effects-only accessor would both need `self` by value, and
+    /// only one by-value call can ever have it. This exists for dig-node#570's daily reconcile
+    /// check, which piggybacks on the SAME per-tick effects an ordinary pass just built — reading
+    /// its already-authenticated coin scan rather than opening a second one, and seeing every
+    /// funding coin the ordinary pass just committed rather than risking a double-spend against a
+    /// freshly-built effects that does not know about it.
+    pub fn into_effects_and_presence(self) -> (E, super::presence::PresenceTracker) {
+        (self.effects, self.presence)
     }
 
     /// Write the audit record through `journal` instead of the default one over this runner's log.
@@ -432,6 +504,41 @@ impl<E: MirrorEffects> PassRunner<E> {
             .map(|c| c.collateral_dig_base_units)
             .fold(0u64, u64::saturating_add);
 
+        // dig-node#570: only when a caller has ALREADY asked for one this pass (the daily
+        // detector's own hysteresis/cap/switch, or a manual call — neither is this function's to
+        // re-check, `SPEC.md` §25.13.4's own text). A FRESH bonded-urls read here, not a second
+        // general chain scan: bounded to at most once per personal day, since `ctx.reconcile` is
+        // `None` on every ordinary pass.
+        let reconcile_directive = match &ctx.reconcile {
+            Some(attempt) => {
+                let bonded = self.effects.observe_bonded_urls().unwrap_or_default();
+                match super::reconcile::decide(&super::reconcile::ReconcileInputs {
+                    trigger: attempt.trigger,
+                    advertised: &attempt.advertised,
+                    mirror_enabled: ctx.creates_enabled,
+                    held_bonds: &held,
+                    bonded: &bonded,
+                    current_epoch: ctx.current_epoch,
+                    requirement: &ctx.requirement,
+                    margin_bp: ctx.margin_bp,
+                    dig_balance_base_units,
+                    reconcile_in_progress: reconcile_in_flight(&self.log, ctx.now_unix_ms),
+                }) {
+                    Ok(directive) => Some(directive),
+                    Err(reason) => {
+                        tracing::info!(
+                            target: "mirror",
+                            trigger = attempt.trigger.label(),
+                            reason = reason.label(),
+                            "URL reconcile refused; every mirror coin is left exactly as it was"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         let decision = pass::decide(&PassInputs {
             held: &held,
             relayed: &relayed,
@@ -443,6 +550,7 @@ impl<E: MirrorEffects> PassRunner<E> {
             dig_balance_base_units,
             creates_enabled: ctx.creates_enabled,
             can_advertise: ctx.can_advertise,
+            reconcile: reconcile_directive.as_ref(),
         });
 
         Ok(self.execute(decision, ctx.current_epoch, locked_dig_base_units))
@@ -465,13 +573,23 @@ impl<E: MirrorEffects> PassRunner<E> {
 
         let mut reclaimed = Vec::new();
         let mut reclaim_failures = Vec::new();
+        // dig-node#570: counted here, before `reason` is dropped, because [`HeldMirror`] itself
+        // carries no reason and the caller (the daily scheduler) needs to know whether ITS
+        // directive actually landed anything, to decide whether the epoch cap (`SPEC.md`
+        // §25.13.7.5) is now spent.
+        let mut reconcile_url_stale_accepted = 0usize;
 
         // EVERY reclaim is attempted, and one that fails does not stop the next. These are the only
         // spends here that RETURN money, so the cost of skipping one is a round of locked collateral
         // — whereas the cost of attempting one that fails is a log line.
         for (mirror, reason) in reclaim {
             match self.effects.reclaim(&mirror, reason) {
-                Ok(()) => reclaimed.push(mirror),
+                Ok(()) => {
+                    if matches!(reason, ReclaimReason::UrlStale(_)) {
+                        reconcile_url_stale_accepted += 1;
+                    }
+                    reclaimed.push(mirror);
+                }
                 Err(e) => reclaim_failures.push((mirror, e)),
             }
         }
@@ -593,6 +711,7 @@ impl<E: MirrorEffects> PassRunner<E> {
             per_coin_dig_base_units,
             locked_dig_base_units,
             funding_alert,
+            reconcile_url_stale_accepted,
         }
     }
 }
@@ -674,6 +793,37 @@ fn in_flight_creates(ledger: &crate::spend_audit::SpendLedger, current_epoch: i6
             (bond.epoch == current_epoch).then(|| Bond::new(store_id.clone(), bond.root.clone()))
         })
         .collect()
+}
+
+/// `SPEC.md` §25.13.4 gate 9 (dig-node#570) — is an earlier `url_stale` reclaim from THIS node
+/// still unresolved?
+///
+/// "In progress" from the first such entry's `Submitted` status until every one is terminal,
+/// bounded by [`crate::spend_audit::FUNDING_RESERVATION_WINDOW_MS`] from its last revision — reused
+/// via [`crate::spend_audit::SpendRecord::reserves_funding_at`] rather than a second definition of
+/// the same window, so gate 9 and the funding reservation can never disagree about how long an
+/// unresolved spend counts.
+fn reconcile_in_flight(log: &SpendLog, now_unix_ms: u64) -> bool {
+    let ledger = match log.ledger() {
+        Ok(ledger) => ledger,
+        // Same direction as `in_flight_creates`: an unreadable ledger must not be read as "a
+        // reconcile is in progress" forever -- that would permanently refuse every future reconcile
+        // with no way to recover short of editing the audit file by hand.
+        Err(e) => {
+            tracing::warn!(
+                target: "mirror",
+                error = %e,
+                "the spend audit record could not be read; gate 9 assumes no reconcile is in progress"
+            );
+            return false;
+        }
+    };
+
+    ledger.records.iter().any(|r| {
+        r.kind.as_str() == crate::spend_audit::kinds::MIRROR_COIN
+            && r.reclaim_reason.as_deref() == Some("url_stale")
+            && r.reserves_funding_at(now_unix_ms)
+    })
 }
 
 #[cfg(test)]
@@ -851,6 +1001,7 @@ mod tests {
             margin_bp: 0,
             creates_enabled: true,
             can_advertise: true,
+            reconcile: None,
         }
     }
 
@@ -1411,6 +1562,8 @@ mod tests {
                 epoch,
             }),
             advertised_urls: Vec::new(),
+            reclaim_reason: None,
+            trigger: None,
         }
     }
 
