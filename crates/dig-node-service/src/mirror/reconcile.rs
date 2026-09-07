@@ -235,22 +235,34 @@ pub fn decide(inputs: &ReconcileInputs<'_>) -> Result<ReconcileDirective, Refusa
         return Err(RefusalReason::FundsUnmeasured);
     };
 
-    // Gate 8 and §25.13.5's sizing, together: `plan::split_by_funds` is the SAME split an ordinary
-    // create prices with, called with the balance augmented by exactly the collateral the stale
-    // set's own reclaims would return — never a second, hand-written arithmetic over it.
-    let reclaimable_total: u64 = stale
-        .iter()
-        .map(|d| d.held.collateral_dig_base_units)
-        .fold(0u64, u64::saturating_add);
-    let augmented_balance = balance.saturating_add(reclaimable_total);
-    let stale_bonds: Vec<Bond> = stale
-        .iter()
-        .map(|d| Bond::new(&d.held.store_id, &d.held.root))
-        .collect();
-    let split = plan::split_by_funds(&stale_bonds, augmented_balance, per_coin);
-    if split.affordable.is_empty() {
+    // Gate 8 and §25.13.5's sizing, together. Reclaims are SEPARATE, SEQUENTIAL spends -- each
+    // one's proceeds fund the recreate behind it, never the whole stale set at once -- so `K`
+    // cannot be read off a flat total the way `plan::split_by_funds` prices an ordinary batch of
+    // independent creates (that function stays out of this path for exactly that reason: a flat
+    // total can call a coin affordable that the actual spend sequence never funds, when
+    // collateral differs across the stale set — `SPEC.md` §25.13.5's mid-epoch-margin-raise
+    // case). `K` is instead the longest PREFIX of `stale` (canonical order, unchanged) that is
+    // self-funding at every step: walk it with a running balance seeded at this pass's own funds
+    // reading, adding each coin's OWN collateral in turn and only ever crediting a recreate once
+    // the running balance reaches `per_coin` — PRICING still comes from the SAME lookup an
+    // ordinary create uses (`plan::per_coin_dig_base_units`, already resolved above as
+    // `per_coin`); only the SIZING is this hand-written walk. Greedy and fail-closed: no
+    // skipping, no reordering — a later, richer coin must never rescue an earlier one it could
+    // not yet afford, or "the affordable prefix" would stop naming the same coins on every run.
+    let mut running_balance = balance;
+    let mut k = 0usize;
+    for d in &stale {
+        running_balance = running_balance.saturating_add(d.held.collateral_dig_base_units);
+        if running_balance >= per_coin {
+            running_balance -= per_coin;
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    if k == 0 {
         return Err(RefusalReason::InsufficientFunds {
-            have_dig_base_units: augmented_balance,
+            have_dig_base_units: balance.saturating_add(stale[0].held.collateral_dig_base_units),
             need_dig_base_units: per_coin,
         });
     }
@@ -260,7 +272,6 @@ pub fn decide(inputs: &ReconcileInputs<'_>) -> Result<ReconcileDirective, Refusa
         return Err(RefusalReason::ReconcileInProgress);
     }
 
-    let k = split.affordable.len();
     Ok(ReconcileDirective {
         coin_ids: stale[..k].iter().map(|d| d.held.coin_id.clone()).collect(),
         left_unaffordable: stale.len() - k,
@@ -526,6 +537,89 @@ mod tests {
         let directive = decide(&f.inputs()).expect("exactly enough must be affordable");
         assert_eq!(directive.coin_ids, vec![id("c1")]);
         assert_eq!(directive.left_unaffordable, 0);
+    }
+
+    /// The defect this fix closes: `K` sized from the stale set's FLAT total (`balance +
+    /// Σ Rᵢ`) can size a `K` whose first `K` coins do NOT actually fund each other in sequence,
+    /// because reclaims are separate spends -- reclaiming `s1` alone returns only `s1`'s own
+    /// collateral, never `s3`'s. `[100, 100, 1000]` at `balance = 0`, `per_coin = 1_000`: the flat
+    /// total is `1_200`, so a flat-total split would call one coin affordable; the running-balance
+    /// walk sees `0 + 100 = 100 < 1_000` at the very first coin and refuses.
+    #[test]
+    fn gate8_k_is_a_self_funding_prefix_not_a_flat_total() {
+        let mut f = Fixture::holding_one_stale_bond();
+        f.held_bonds = vec![bond("s1", "r1"), bond("s2", "r2"), bond("s3", "r3")];
+        f.bonded = vec![
+            declared_at("c1", "s1", "r1", old_urls(), 100),
+            declared_at("c2", "s2", "r2", old_urls(), 100),
+            declared_at("c3", "s3", "r3", old_urls(), 1_000),
+        ];
+        f.dig_balance_base_units = Some(0);
+        assert_eq!(
+            decide(&f.inputs()),
+            Err(RefusalReason::InsufficientFunds {
+                have_dig_base_units: 100,
+                need_dig_base_units: PER_COIN,
+            })
+        );
+    }
+
+    /// A big FIRST coin's returned collateral funds the smaller recreates walked after it: `[1000,
+    /// 100, 100]` at `balance = 0`, `per_coin = 500`. Walk: `0+1000=1000 ≥ 500` -> `k=1`, running
+    /// `500`; `500+100=600 ≥ 500` -> `k=2`, running `100`; `100+100=200 < 500` -> stop. `K = 2`,
+    /// one coin left unaffordable.
+    #[test]
+    fn gate8_a_big_first_coin_funds_the_smaller_ones_behind_it() {
+        let mut f = Fixture::holding_one_stale_bond();
+        f.held_bonds = vec![bond("s1", "r1"), bond("s2", "r2"), bond("s3", "r3")];
+        f.bonded = vec![
+            declared_at("c1", "s1", "r1", old_urls(), 1_000),
+            declared_at("c2", "s2", "r2", old_urls(), 100),
+            declared_at("c3", "s3", "r3", old_urls(), 100),
+        ];
+        f.requirement = CollateralRequirementResult::Known {
+            epoch: NOW_EPOCH as u64,
+            protocol_version: 1,
+            required_per_store_dig_base_units: 500,
+            stores: 1,
+            owners: 1,
+            multiplier_micros: 1_000_000,
+            handicap_dig_base_units: 0,
+        };
+        f.dig_balance_base_units = Some(0);
+        let directive = decide(&f.inputs()).unwrap();
+        assert_eq!(directive.coin_ids, vec![id("c1"), id("c2")]);
+        assert_eq!(directive.left_unaffordable, 1);
+    }
+
+    /// The walk never reorders to let a later big coin rescue an earlier unfundable one: `[100,
+    /// 1000]` at `balance = 0`, `per_coin = 500` stops at the first coin (`0+100=100 < 500`) even
+    /// though `s2` alone could fund a recreate -- canonical order is fixed, not a knapsack.
+    #[test]
+    fn gate8_a_later_big_coin_never_rescues_an_earlier_unfundable_one() {
+        let mut f = Fixture::holding_one_stale_bond();
+        f.held_bonds = vec![bond("s1", "r1"), bond("s2", "r2")];
+        f.bonded = vec![
+            declared_at("c1", "s1", "r1", old_urls(), 100),
+            declared_at("c2", "s2", "r2", old_urls(), 1_000),
+        ];
+        f.requirement = CollateralRequirementResult::Known {
+            epoch: NOW_EPOCH as u64,
+            protocol_version: 1,
+            required_per_store_dig_base_units: 500,
+            stores: 1,
+            owners: 1,
+            multiplier_micros: 1_000_000,
+            handicap_dig_base_units: 0,
+        };
+        f.dig_balance_base_units = Some(0);
+        assert_eq!(
+            decide(&f.inputs()),
+            Err(RefusalReason::InsufficientFunds {
+                have_dig_base_units: 100,
+                need_dig_base_units: 500,
+            })
+        );
     }
 
     #[test]

@@ -9998,12 +9998,18 @@ therefore the ONLY safe failure.
 ### 25.13.5. The plan is sized BEFORE any reclaim, and partial is a normal outcome
 
 Let the stale set in canonical order be `s₁ … sₙ`, each locking `Rᵢ` base units, let `C` be this
-epoch's margined per-coin requirement, and let `W` be the pass's own funds reading. **The affordable
-prefix `K` is the largest `k ≤ n` such that `plan::split_by_funds` — the SAME split the ordinary create
-path calls — applied to `s₁ … sₖ` at `per_coin = C` with `balance = W + Σᵢ≤ₙ Rᵢ` funds all `k`.**
-(`reconcile::decide` augments the balance by the FULL stale set's reclaimable total, not a per-`k`
-recomputation — in the common case `Rᵢ = C` for every `i`, so this is equivalent and `K = n` whenever the
-wallet holds the fee XCH; only a mid-epoch margin change can make `K < n`.)
+epoch's margined per-coin requirement (the SAME lookup the ordinary create path prices with,
+`plan::per_coin_dig_base_units`), and let `W` be the pass's own funds reading. Reclaims are SEPARATE,
+SEQUENTIAL spends — each one's proceeds fund the recreate behind it, not the whole set at once — so
+`K` cannot be read off a flat total the way an ordinary batch of independent creates can:
+**`K` is the length of the longest prefix `s₁ … sₖ` that is self-funding at every step**, walked with a
+running balance seeded at `W`: for each `sᵢ` in order, add `Rᵢ`, and if the result is `≥ C` subtract `C`
+and continue (`i` is affordable); the first `sᵢ` where the running balance falls short of `C` stops the
+walk, and every coin from there on is left unaffordable, however large — a LATER big coin never rescues
+an EARLIER one it could not yet afford (greedy, fail-closed: no skipping, no reordering). In the common
+case `Rᵢ = C` for every `i`, the running balance never dips between coins and `K = n` whenever the wallet
+holds the fee XCH; only a mid-epoch margin change (`Rᵢ ≠ C` for some prefix) can make `K < n` before `n`
+coins have been walked.
 
 Then, and only then: **exactly `K` coins are reclaimed — `s₁ … sₖ`** (as `ReclaimReason::UrlStale`
 entries appended to the ordinary pass's reclaim list, `mirror/pass.rs`). Coins `sₖ₊₁ … sₙ` are LEFT AS
