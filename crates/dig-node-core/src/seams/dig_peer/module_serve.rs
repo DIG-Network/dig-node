@@ -178,20 +178,31 @@ pub fn describe_module(cache_dir: &Path, store_hex: &str, root_hex: &str) -> Opt
     Some(info)
 }
 
-/// Read the `[offset, offset+length)` window of a locally-held module.
+/// Read the `[offset, offset+length)` window of a locally-held module, returning `(window, total)`
+/// where `total` is the module's size AT THE TIME OF THIS READ.
 ///
 /// Returns `None` when the module is not held. An offset at or past the end yields an EMPTY window
 /// rather than an error: the window is a byte range over a content-addressed blob, and the caller's own
 /// chunk-hash check is what decides whether what arrived is what it asked for.
 ///
 /// `length` is clamped to [`MAX_MODULE_WINDOW`] — a serve never lets one request size its own work.
+///
+/// `total` is returned rather than left for the caller to stat separately (dig_ecosystem#2148): a
+/// caller that stats the file BEFORE calling this, then builds `complete`/`next_offset`/
+/// `total_length` from that earlier number, can disagree with the window this function actually read
+/// if the module grew in between — the window (sized against a FRESHER stat) can carry more bytes
+/// than the caller's stale `total` allows for, so `end >= total` claims completion (or `next_offset`
+/// bookkeeping otherwise drifts) one write ahead of what was actually served. This is the same class
+/// of defect #2071 was: a client acting on a `total_length`/`complete` pair that does not describe
+/// the bytes it was actually just handed. Handing back the stat this read itself used is what keeps
+/// caller and window looking at the SAME number.
 pub fn read_module_window(
     cache_dir: &Path,
     store_hex: &str,
     root_hex: &str,
     offset: u64,
     length: u64,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, u64)> {
     use std::io::{Read, Seek, SeekFrom};
 
     let capsule = CapsuleKey::parse(store_hex, root_hex)?;
@@ -201,6 +212,9 @@ pub fn read_module_window(
     // actually asked for are ever pulled off disk.
     let mut file = std::fs::File::open(capsule.resolve_cached_path(cache_dir)).ok()?;
     let total = file.metadata().ok()?.len();
+    if total == 0 {
+        return None;
+    }
     let start = offset.min(total);
     let want = length.min(MAX_MODULE_WINDOW).min(total - start);
     file.seek(SeekFrom::Start(start)).ok()?;
@@ -208,7 +222,7 @@ pub fn read_module_window(
     file.read_exact(&mut window).ok()?;
     #[cfg(test)]
     record_module_bytes_read(root_hex, window.len() as u64);
-    Some(window)
+    Some((window, total))
 }
 
 /// Test-only tally of bytes pulled off disk by [`read_module_window`], keyed by ROOT.
@@ -492,9 +506,62 @@ mod tests {
         let (store, root) = (hex_id(5), hex_id(6));
         let bytes: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
         let dir = cache_with(&bytes, &store, &root);
+        let (window, total) = read_module_window(dir.path(), &store, &root, 100, 50).expect("held");
+        assert_eq!(window, bytes[100..150]);
         assert_eq!(
-            read_module_window(dir.path(), &store, &root, 100, 50).expect("held"),
-            bytes[100..150]
+            total,
+            bytes.len() as u64,
+            "total is the module's real on-disk size"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Proves:** `total` always describes the SAME read that produced `window` — the module can grow
+    /// between two calls, and each call's `total` tracks its OWN read, never a value left over from an
+    /// earlier stat (dig_ecosystem#2148).
+    ///
+    /// **Catches:** the shipped defect: `get_capsule` used to stat the file ONCE, up front, then call
+    /// `read_module_window` (which stats AGAIN, internally) and build `complete`/`next_offset` from the
+    /// stale, pre-read number. If the module grew in between, the window it actually served could
+    /// already reach past that stale `total`, so `end >= total` claimed completion (or otherwise
+    /// mis-set `next_offset`) for content the module had already outgrown — `next_offset == offset`,
+    /// the shipped symptom. Returning `total` FROM the read that used it removes the second, drifting
+    /// source of truth: there is no longer an earlier stat left to go stale.
+    #[test]
+    fn total_tracks_growth_between_two_reads_of_the_same_module() {
+        let (store, root) = (hex_id(15), hex_id(16));
+        let first_bytes = vec![1u8; 50];
+        let dir = cache_with(&first_bytes, &store, &root);
+
+        let (_window, total_before) =
+            read_module_window(dir.path(), &store, &root, 0, 50).expect("held");
+        assert_eq!(
+            total_before, 50,
+            "first read sees the module as it was written"
+        );
+
+        // The module grows (a peer sync landed a larger generation) BETWEEN the two reads.
+        let path = module_path(dir.path(), &store, &root);
+        let grown_bytes = vec![2u8; 200];
+        std::fs::write(&path, &grown_bytes).unwrap();
+
+        let (window_after, total_after) =
+            read_module_window(dir.path(), &store, &root, 0, 50).expect("held");
+        assert_eq!(
+            total_after, 200,
+            "the second read's total tracks the module's CURRENT size, not the first read's"
+        );
+        assert_eq!(window_after, grown_bytes[0..50]);
+        // The old defect: a caller that built `complete`/`next_offset` from `total_before` (50) against
+        // a window ending at `offset + window.len()` == 50 would read `end >= total_before` as
+        // complete, reporting `next_offset: null` for a module that is actually 200 bytes long. With
+        // `total` sourced from THIS read, a caller correctly sees `end (50) < total_after (200)` and
+        // keeps paging.
+        let start = 0u64;
+        let end = start + window_after.len() as u64;
+        assert!(
+            end < total_after,
+            "a fresh total must show more content remains, not falsely claim completion"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -510,11 +577,13 @@ mod tests {
         // Past the end: an empty window, not an error and not a wrapped read.
         assert!(read_module_window(dir.path(), &store, &root, 1_000, 10)
             .expect("held")
+            .0
             .is_empty());
         // Absurd length: clamped to what exists.
         assert_eq!(
             read_module_window(dir.path(), &store, &root, 0, u64::MAX)
                 .expect("held")
+                .0
                 .len(),
             100
         );
@@ -535,7 +604,8 @@ mod tests {
 
         let offset = MAX_MODULE_WINDOW * 2 + 17;
         let want = 4096u64;
-        let window = read_module_window(dir.path(), &store, &root, offset, want).expect("held");
+        let (window, _total) =
+            read_module_window(dir.path(), &store, &root, offset, want).expect("held");
 
         assert_eq!(window.len(), want as usize);
         assert_eq!(window, bytes[offset as usize..(offset + want) as usize]);

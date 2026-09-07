@@ -3081,6 +3081,7 @@ impl Node {
             seams::dig_peer::module_serve::read_module_window(
                 &cache_dir, &store, &root, offset, length,
             )
+            .map(|(window, _total)| window)
         })
         .await
         .unwrap_or(None)
@@ -3644,16 +3645,14 @@ impl Node {
         let cache_dir = self.cache_dir.clone();
         let (read_root, echo_root) = (root_hex.clone(), root_hex);
         let read = tokio::task::spawn_blocking(move || {
-            let capsule = CapsuleKey::parse(&store_hex, &read_root)?;
-            // `total_length` comes from the file's METADATA, not from a buffer — the whole point is
-            // that no buffer of the whole module ever exists.
-            let total = std::fs::metadata(capsule.resolve_cached_path(&cache_dir))
-                .ok()?
-                .len();
-            if total == 0 {
-                return None;
-            }
-            let window = crate::seams::dig_peer::module_serve::read_module_window(
+            // `total` comes back from the SAME read that produced `window` (dig_ecosystem#2148),
+            // rather than a separate stat taken before it: a stat-then-read gap lets the module grow
+            // in between, so a window sized against the FRESHER on-disk length could carry more bytes
+            // than an earlier, staler `total` would account for — `end >= total` would then answer
+            // `complete`/`next_offset` one write ahead of what this window actually contains, or a
+            // `total_length` a client uses to size its reassembly buffer (#2071) could already be
+            // wrong on arrival.
+            let (window, total) = crate::seams::dig_peer::module_serve::read_module_window(
                 &cache_dir,
                 &store_hex,
                 &read_root,
