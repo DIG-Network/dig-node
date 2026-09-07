@@ -52,9 +52,10 @@ pub const URL_RECONCILE_MAX_AUTO_PER_EPOCH: u32 = 1;
 /// every day — which is what lets `dign mirror bond-states` print it and an operator verify it by
 /// hand (`SPEC.md` §C). Never persisted; there is nothing here to lose.
 ///
-/// A node with no `peer_id` yet (the peer network disabled or not up) has no identity to derive
-/// from and gets offset zero — the caller's problem to interpret (`SPEC.md` §25.13.7.1: such a node
-/// gathers no readings and cannot be part of a STUN herd, so the spreading buys nothing there).
+/// A node with no `peer_id` yet (the peer network disabled or not up) hashes the empty slice like
+/// any other input — the offset is still deterministic, just meaningless for an identity-less node,
+/// which is harmless because such a node gathers no readings and cannot be part of a STUN herd
+/// (`SPEC.md` §25.13.7.1), so the offset is never acted on.
 pub fn personal_day_offset_secs(peer_id: &[u8]) -> u64 {
     let mut hasher = chia_sha2::Sha256::new();
     hasher.update(PERSONAL_DAY_TAG);
