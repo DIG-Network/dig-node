@@ -114,7 +114,7 @@ dig-mirror-coin = "0.9"
 # classes, global-unicast) before `mirror::advertise::PublicAddress` will let one reach a coin.
 # Replaces this crate's own pairwise `corroborated_addresses` check, which could not fail closed on
 # a dissenting THIRD source and did not distinguish source CLASSES from bare source strings.
-dig-stun = "0.1"
+dig-stun = "0.2"
 
 # The canonical `ChainSource` trait `dig-mirror-coin`'s census is generic over. Declared, not
 # implemented: `chia-query` already provides the implementation this node uses

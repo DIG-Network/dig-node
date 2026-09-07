@@ -68,12 +68,6 @@ use dig_sex::{NodeContext, RelevanceWeights};
 /// (SPEC §7.10e/f) so a controller can tell "the flywheel is live" from "the seam is inert".
 static TIER0_WIRED: AtomicBool = AtomicBool::new(false);
 
-/// The count of stores this process's tier-0 loop has landed in the cache — the `cache.stats`
-/// `tier0_precache.occupancy` figure. A monotonic land counter, not a live occupancy (an evicted
-/// precache store still counts); reported as the best available tier-0 signal until an
-/// eviction-aware ledger lands.
-static TIER0_LANDED: AtomicU64 = AtomicU64::new(0);
-
 /// The unix-ms timestamp of the most recent inbound serve/demand event, `0` if none yet. The
 /// [`InboundLoadSignal`] reads it to back off tier-0 while the node is serving real demand.
 static INBOUND_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
@@ -142,10 +136,16 @@ pub(crate) fn tier0_wired() -> bool {
     TIER0_WIRED.load(Ordering::Relaxed)
 }
 
-/// The number of stores this process's tier-0 loop has landed (`cache.stats` occupancy figure).
+/// The number of stores this process's tier-0 loop currently holds landed — the `cache.stats`
+/// `tier0_precache.occupancy` figure. Reads the eviction-aware ledger (`mark_tier0_land`/
+/// `forget_tier0_land`) directly, so a store the eviction sweep purges stops counting; this is a LIVE
+/// gauge, not a monotonic land counter (dig_ecosystem#2045).
 #[must_use]
 pub(crate) fn tier0_occupancy() -> u64 {
-    TIER0_LANDED.load(Ordering::Relaxed)
+    tier0_land_ledger()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .len() as u64
 }
 
 /// The live inbound-load signal: BUSY iff a real inbound-demand event fired within [`BUSY_COOLDOWN_MS`].
@@ -282,7 +282,6 @@ impl Tier0Fetcher for NodeTier0Fetcher {
                 // the tier-aware size-cap eviction so the self-driven loop PLATEAUS at the cache cap
                 // instead of growing `<cache>/modules` to disk-exhaustion.
                 mark_tier0_land(&hex::encode(preimage.store_id));
-                TIER0_LANDED.fetch_add(1, Ordering::Relaxed);
                 self.evictor.evict_if_needed().await;
                 FetchOutcome::Cached(bytes)
             }
@@ -749,6 +748,57 @@ mod tests {
         assert!(
             is_tier0_precache(&hex::encode(preimage().store_id)),
             "a tier-0 land is tagged Tier0Precache for eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn occupancy_falls_when_a_tier0_land_is_evicted() {
+        // dig_ecosystem#2045: `tier0_occupancy()` backs the `cache.stats` occupancy figure, which must
+        // read as a LIVE gauge. The old `TIER0_LANDED` monotonic counter never fell, so a node that
+        // landed then evicted a store kept reporting the evicted store as occupied — a lie about how
+        // much tier-0 content is actually held. Occupancy must instead track the eviction-aware
+        // ledger (`mark_tier0_land`/`forget_tier0_land`), so a forgotten land is un-counted.
+        //
+        // A store id distinct from `preimage()`'s (used by sibling tests sharing this process's
+        // global ledger) so this test's forget cannot un-count another test's concurrent land.
+        let unique_store = [0x77u8; 32];
+        let store_hex = hex::encode(unique_store);
+
+        let warm = Arc::new(SpyWarm {
+            verdict: WarmVerdict::Cached(4096),
+            seen: Mutex::new(Vec::new()),
+        });
+        let f = NodeTier0Fetcher {
+            lookup: Arc::new(FixedLookup(Some(Preimage {
+                store_id: unique_store,
+                root: [0x22; 32],
+                size_bytes: 4096,
+            }))),
+            gate: Arc::new(FixedGate(true)),
+            warm,
+            evictor: SpyEvictor::new(),
+        };
+
+        let before = tier0_occupancy();
+        let outcome = f.fetch_and_cache([0x02; 32], 8192).await;
+        assert_eq!(outcome, FetchOutcome::Cached(4096));
+        assert_eq!(
+            tier0_occupancy(),
+            before + 1,
+            "landing increments the eviction-aware occupancy count"
+        );
+        assert!(is_tier0_precache(&store_hex), "the land is tagged tier-0");
+
+        forget_tier0_land(&store_hex);
+
+        assert_eq!(
+            tier0_occupancy(),
+            before,
+            "occupancy must fall back once the eviction sweep forgets the land"
+        );
+        assert!(
+            !is_tier0_precache(&store_hex),
+            "a forgotten land is no longer tagged tier-0"
         );
     }
 

@@ -1645,6 +1645,7 @@ impl PeerRpcResponder for NodeResponder {
             async move {
                 tokio::task::spawn_blocking(move || {
                     module_serve::read_module_window(&cache, &s, &r, offset, length)
+                        .map(|(window, _total)| window)
                 })
                 .await
                 .unwrap_or(None)

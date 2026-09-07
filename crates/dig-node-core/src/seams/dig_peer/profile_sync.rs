@@ -113,15 +113,22 @@ pub fn profile_sync_enabled() -> bool {
 /// used to attribute a much later frame to a peer that has since been replaced in the pool.
 pub const SOLICITATION_TTL: Duration = Duration::from_secs(120);
 
-/// Maximum number of 225 answers this node will emit per inbound-request burst window.
+/// Maximum BYTES of 225 answer bodies this node will emit per inbound-request burst window.
 ///
 /// A 224 request is cheap to send and expensive to answer (a disk read plus up to
 /// [`MAX_PROFILE_BODY_BYTES`] on the wire), so an unbudgeted responder is an amplifier. The budget
 /// is per-window across ALL peers because the scarce resource being protected is this node's own
 /// upload, not any single link's fairness.
-pub const OUTBOUND_BODY_BUDGET: usize = 32;
+///
+/// Counted in BYTES, not answers (dig_ecosystem#3029, F3): a token-per-answer budget states no real
+/// ceiling on upload — one profile body can be anywhere up to [`MAX_PROFILE_BODY_BYTES`], so "32
+/// tokens" could mean 32 bytes or 32 times [`MAX_PROFILE_BODY_BYTES`] depending on what callers
+/// actually asked for. Set to the same worst case the old token budget already permitted (`32 *
+/// MAX_PROFILE_BODY_BYTES`) so this change preserves behaviour rather than silently tightening or
+/// loosening the cap.
+pub const OUTBOUND_BODY_BUDGET_BYTES: usize = 32 * MAX_PROFILE_BODY_BYTES;
 
-/// The window the [`OUTBOUND_BODY_BUDGET`] refills over.
+/// The window the [`OUTBOUND_BODY_BUDGET_BYTES`] refills over.
 pub const OUTBOUND_BUDGET_WINDOW: Duration = Duration::from_secs(10);
 
 /// File extension of a persisted profile body.
@@ -447,7 +454,10 @@ impl Solicitations {
     }
 }
 
-/// A refilling token budget bounding how many 225 answers this node emits per window.
+/// A refilling BYTE budget bounding how many bytes of 225 answers this node emits per window
+/// (dig_ecosystem#3029, F3 — a token-per-answer budget could not state the real upload ceiling since
+/// answer bodies vary in size up to [`MAX_PROFILE_BODY_BYTES`]; this type now charges and refills in
+/// the unit that actually bounds upload).
 #[derive(Clone)]
 pub struct OutboundBudget {
     inner: Arc<Mutex<(usize, Instant)>>,
@@ -457,23 +467,24 @@ pub struct OutboundBudget {
 
 impl Default for OutboundBudget {
     fn default() -> Self {
-        Self::new(OUTBOUND_BODY_BUDGET, OUTBOUND_BUDGET_WINDOW)
+        Self::new(OUTBOUND_BODY_BUDGET_BYTES, OUTBOUND_BUDGET_WINDOW)
     }
 }
 
 impl OutboundBudget {
-    /// A budget of `capacity` answers per `window`.
+    /// A budget of `capacity_bytes` bytes served per `window`.
     #[must_use]
-    pub fn new(capacity: usize, window: Duration) -> Self {
+    pub fn new(capacity_bytes: usize, window: Duration) -> Self {
         Self {
-            inner: Arc::new(Mutex::new((capacity, Instant::now()))),
-            capacity,
+            inner: Arc::new(Mutex::new((capacity_bytes, Instant::now()))),
+            capacity: capacity_bytes,
             window,
         }
     }
 
-    /// Take one token, returning `false` when the window's budget is exhausted.
-    pub fn take(&self) -> bool {
+    /// Try to charge `bytes` bytes against the window's remaining budget, returning `false` (the
+    /// budget left untouched) when `bytes` would exceed what remains.
+    pub fn take(&self, bytes: usize) -> bool {
         let mut guard = self
             .inner
             .lock()
@@ -483,10 +494,10 @@ impl OutboundBudget {
             *remaining = self.capacity;
             *since = Instant::now();
         }
-        if *remaining == 0 {
+        if *remaining < bytes {
             return false;
         }
-        *remaining -= 1;
+        *remaining -= bytes;
         true
     }
 }
@@ -741,10 +752,12 @@ pub enum ServeOutcome {
     ReadFailed,
 }
 
-/// Answer one inbound 224 request from `peer`, within the outbound budget.
+/// Answer one inbound 224 request from `peer`, within the outbound BYTE budget.
 ///
-/// The budget is taken only once the artifact is known to exist, so a flood of requests for content
-/// this node does not hold cannot starve the budget for peers asking about content it does.
+/// The budget is charged only once the artifact is known to exist AND read, so a flood of requests
+/// for content this node does not hold cannot starve the budget for peers asking about content it
+/// does. Charged by the ACTUAL body length (dig_ecosystem#3029, F3) — the byte budget states a real
+/// upload ceiling only if what it charges is what actually goes out on the wire.
 pub async fn serve_body_request(
     store: &ProfileBodyStore,
     transport: &dyn ProfileTransport,
@@ -757,9 +770,6 @@ pub async fn serve_body_request(
     if !store.has(&store_id, &root) {
         return ServeOutcome::NotHeld;
     }
-    if !budget.take() {
-        return ServeOutcome::Throttled;
-    }
     let bytes = match store.get(&store_id, &root) {
         Ok(Some(bytes)) => bytes,
         // Raced against a prune between `has` and `get` — indistinguishable from not held, and
@@ -771,6 +781,9 @@ pub async fn serve_body_request(
         }
     };
     let len = bytes.len();
+    if !budget.take(len) {
+        return ServeOutcome::Throttled;
+    }
     let body = ProfileBody {
         store_id: request.store_id,
         root: request.root,
@@ -788,8 +801,9 @@ pub async fn serve_body_request(
 /// Ask one live peer for the body behind a root this node has ALREADY resolved from chain.
 ///
 /// `root` MUST come from [`AnchoredRootResolver`] — that is the invariant [`accept_body`]'s gate 4
-/// relies on, and this is the one function that establishes it. `exclude` skips the peer an announce
-/// arrived from only when we have somewhere else to ask; otherwise asking the announcer is correct.
+/// relies on, and this is the one function that establishes it. `announcer` is asked FIRST — it just
+/// told us it has this root, so it is the peer most likely to answer immediately; this node falls
+/// back to another live peer only when the announcer is no longer live (dig_ecosystem#3029, F5).
 ///
 /// Returns the peer asked, or `None` if there was nobody to ask.
 pub async fn request_body(
@@ -797,9 +811,14 @@ pub async fn request_body(
     solicitations: &Solicitations,
     store_id: [u8; 32],
     root: [u8; 32],
+    announcer: PeerId,
 ) -> Option<PeerId> {
     let peers = transport.live_peers();
-    let peer = peers.first().copied()?;
+    let peer = if peers.contains(&announcer) {
+        announcer
+    } else {
+        peers.first().copied()?
+    };
     let root_ref = ProfileRootRef {
         store_id: Bytes32::from(store_id),
         root: Bytes32::from(root),
@@ -826,6 +845,7 @@ pub async fn handle_root_announce(
     resolver: &dyn AnchoredRootResolver,
     transport: &dyn ProfileTransport,
     solicitations: &Solicitations,
+    announcer: PeerId,
     announce: &ProfileRootRef,
 ) -> Option<PeerId> {
     let store_id: [u8; 32] = announce.store_id.into();
@@ -875,7 +895,7 @@ pub async fn handle_root_announce(
         );
         return None;
     }
-    let asked = request_body(transport, solicitations, store_id, chain_root).await;
+    let asked = request_body(transport, solicitations, store_id, chain_root, announcer).await;
     match asked {
         Some(peer) => tracing::info!(
             store = %hex::encode(store_id),
@@ -948,6 +968,7 @@ pub async fn run_profile_sync_ingest(
                     &*ctx.resolver,
                     &*ctx.transport,
                     &ctx.solicitations,
+                    sender,
                     &announce,
                 )
                 .await;
@@ -2228,16 +2249,17 @@ mod tests {
 
     #[tokio::test]
     async fn the_outbound_budget_binds_at_capacity_and_refuses_one_over() {
-        // Pinned from BOTH sides: the second answer within a capacity-2 window must succeed (a
-        // bound tested only from above would pass for an off-by-one that throttles too early), and
-        // the third must not.
+        // Pinned from BOTH sides: a second full-size answer within a two-body-sized window must
+        // succeed (a bound tested only from above would pass for an off-by-one that throttles too
+        // early), and a third must not. Capacity is now BYTES (dig_ecosystem#3029, F3): exactly two
+        // bodies' worth, not "2" answers regardless of size.
         let dir = tempdir();
         let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let sid = store_id(1);
         store.put(&sid, &root, &bytes).unwrap();
         let tx = Transport::default();
-        let budget = OutboundBudget::new(2, Duration::from_secs(60));
+        let budget = OutboundBudget::new(2 * bytes.len(), Duration::from_secs(60));
         let req = root_ref(sid, root);
 
         let a = serve_body_request(&store, &tx, &budget, peer(9), &req).await;
@@ -2250,21 +2272,27 @@ mod tests {
             ServeOutcome::Served(bytes.len()),
             "at capacity must pass"
         );
-        assert_eq!(c, ServeOutcome::Throttled, "one over must fail");
+        assert_eq!(
+            c,
+            ServeOutcome::Throttled,
+            "one body over the byte budget must fail"
+        );
     }
 
     #[tokio::test]
     async fn requests_for_content_we_do_not_hold_cannot_starve_the_budget() {
-        // The ORDERING inside `serve_body_request` is the property: the budget is taken only AFTER
-        // the artifact is known to exist. A capacity of ONE makes the difference observable — under
-        // the wrong ordering the single token is spent on a miss and the real request throttles.
+        // The ORDERING inside `serve_body_request` is the property: the budget is charged only AFTER
+        // the artifact is known to exist AND read. A capacity of exactly one body's worth of bytes
+        // makes the difference observable — under the wrong ordering the budget would be spent on a
+        // miss (which has no bytes to charge, but a token-shaped bug could still consume a slot) and
+        // the real request would throttle.
         let dir = tempdir();
         let store = ProfileBodyStore::new(dir.path().to_path_buf());
         let (bytes, root) = dpb("Ada");
         let sid = store_id(1);
         store.put(&sid, &root, &bytes).unwrap();
         let tx = Transport::default();
-        let budget = OutboundBudget::new(1, Duration::from_secs(60));
+        let budget = OutboundBudget::new(bytes.len(), Duration::from_secs(60));
 
         for i in 0..5u8 {
             let miss =
@@ -2276,7 +2304,133 @@ mod tests {
         assert_eq!(real, ServeOutcome::Served(bytes.len()));
     }
 
+    /// dig_ecosystem#3029 (F3) — the budget is charged by the ACTUAL body size, not a flat token: a
+    /// budget sized for exactly one BIG body has nothing left after serving it, but the SAME budget
+    /// serves two SMALL bodies. A flat-token charge (the pre-fix behaviour) could not tell these
+    /// apart -- either would consume "one answer" regardless of size.
+    #[tokio::test]
+    async fn a_larger_body_draws_down_the_byte_budget_by_more_than_a_smaller_one() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let (small, small_root) = dpb("Ada");
+        let sid = store_id(1);
+        store.put(&sid, &small_root, &small).unwrap();
+        let big_root = [0xBBu8; 32];
+        let big = vec![0u8; small.len() * 3];
+        store.put(&sid, &big_root, &big).unwrap();
+        let tx = Transport::default();
+
+        let budget_after_big = OutboundBudget::new(big.len(), Duration::from_secs(60));
+        let served_big = serve_body_request(
+            &store,
+            &tx,
+            &budget_after_big,
+            peer(9),
+            &root_ref(sid, big_root),
+        )
+        .await;
+        let then_small = serve_body_request(
+            &store,
+            &tx,
+            &budget_after_big,
+            peer(9),
+            &root_ref(sid, small_root),
+        )
+        .await;
+        assert_eq!(served_big, ServeOutcome::Served(big.len()));
+        assert_eq!(
+            then_small,
+            ServeOutcome::Throttled,
+            "a big-body-sized budget has nothing left after one big answer"
+        );
+
+        let budget_after_small = OutboundBudget::new(big.len(), Duration::from_secs(60));
+        let served_small = serve_body_request(
+            &store,
+            &tx,
+            &budget_after_small,
+            peer(9),
+            &root_ref(sid, small_root),
+        )
+        .await;
+        let then_small_again = serve_body_request(
+            &store,
+            &tx,
+            &budget_after_small,
+            peer(9),
+            &root_ref(sid, small_root),
+        )
+        .await;
+        assert_eq!(served_small, ServeOutcome::Served(small.len()));
+        assert_eq!(
+            then_small_again,
+            ServeOutcome::Served(small.len()),
+            "two small bodies still fit inside a big-body-sized budget"
+        );
+    }
+
     // -- The 223-driven fetch -----------------------------------------------------------------------
+
+    /// dig_ecosystem#3029 (F5) — the peer that just announced this root is asked FIRST, even when it
+    /// is not the first entry `live_peers()` happens to return. Before this fix `request_body` always
+    /// picked `peers.first()`, so an announcer buried anywhere but the front of the live-peer list was
+    /// never the one asked, despite being the peer most likely to answer immediately.
+    #[tokio::test]
+    async fn the_announcer_is_asked_first_even_when_it_is_not_the_first_live_peer() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let (_, root) = dpb("Ada");
+        let sid = store_id(1);
+        let tx = Transport::with_peers(vec![peer(9), peer(7)]);
+        let sol = Solicitations::new();
+
+        let asked = handle_root_announce(
+            &store,
+            &Subs(vec![sid]),
+            &chain_at(root),
+            &tx,
+            &sol,
+            peer(7),
+            &root_ref(sid, root),
+        )
+        .await;
+
+        assert_eq!(
+            asked,
+            Some(peer(7)),
+            "the announcer must be asked first, not `live_peers().first()`"
+        );
+    }
+
+    /// dig_ecosystem#3029 (F5) — falls back to another live peer when the announcer itself is no
+    /// longer live (it announced, then dropped before this node could ask it back).
+    #[tokio::test]
+    async fn falls_back_to_another_live_peer_when_the_announcer_has_left() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.path().to_path_buf());
+        let (_, root) = dpb("Ada");
+        let sid = store_id(1);
+        let tx = Transport::with_peers(vec![peer(9)]);
+        let sol = Solicitations::new();
+        let departed_announcer = peer(5);
+
+        let asked = handle_root_announce(
+            &store,
+            &Subs(vec![sid]),
+            &chain_at(root),
+            &tx,
+            &sol,
+            departed_announcer,
+            &root_ref(sid, root),
+        )
+        .await;
+
+        assert_eq!(
+            asked,
+            Some(peer(9)),
+            "a departed announcer must fall back to another live peer, not return None"
+        );
+    }
 
     #[tokio::test]
     async fn an_announce_the_chain_confirms_solicits_the_body_under_the_chain_root() {
@@ -2293,6 +2447,7 @@ mod tests {
             &chain_at(root),
             &tx,
             &sol,
+            peer(9),
             &root_ref(sid, root),
         )
         .await;
@@ -2324,6 +2479,7 @@ mod tests {
             &chain_at(on_chain),
             &tx,
             &sol,
+            peer(9),
             &root_ref(sid, forged),
         )
         .await;
@@ -2348,6 +2504,7 @@ mod tests {
             &chain_unreachable(),
             &tx,
             &sol,
+            peer(9),
             &root_ref(sid, root),
         )
         .await;
@@ -2384,6 +2541,7 @@ mod tests {
                 &chain,
                 &tx,
                 &sol,
+                peer(9),
                 &root_ref(sid, root),
             )
             .await;
@@ -2422,6 +2580,7 @@ mod tests {
             &chain_at(first),
             &tx,
             &sol,
+            peer(9),
             &root_ref(sid, first),
         )
         .await;
@@ -2431,6 +2590,7 @@ mod tests {
             &chain_at(second),
             &tx,
             &sol,
+            peer(9),
             &root_ref(sid, second),
         )
         .await;
