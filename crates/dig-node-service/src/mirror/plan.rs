@@ -18,6 +18,9 @@
 
 use std::collections::BTreeSet;
 
+use dig_mirror_collateral::margin::apply_safety_margin;
+use dig_node_control_interface::results::CollateralRequirementResult;
+
 /// A `(store, root)` pair this node holds and is willing to advertise — one prospective mirror.
 ///
 /// "Willing to advertise" is not the same as "present on disk". A capsule pulled on a stranger's
@@ -67,8 +70,35 @@ impl HeldMirror {
     }
 }
 
-/// Why a held coin is being reclaimed. Recorded because the two reasons are very different
-/// situations, and an operator reading the audit record needs to know which one they are looking at.
+/// Which of the two callers asked [`super::reconcile::decide`] (dig-node#570) to
+/// bring this node's mirror coins in line with what it advertises now.
+///
+/// Recorded on [`ReclaimReason::UrlStale`] and carried into the audit entry (`SPEC.md` §23, §F) so
+/// an operator reading their spend record can tell a scheduled check from a button they pressed —
+/// two situations that look identical on chain (a reclaim, then a create) and mean different things
+/// about whether a human was watching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Trigger {
+    /// The personal-day detector (`SPEC.md` §25.13.7). Gated by hysteresis and the epoch cap;
+    /// nobody was asked.
+    Daily,
+    /// `control.mirror.reconcile` (`SPEC.md` §25.13.8), called by a person or the dig-app button.
+    /// Exempt from hysteresis and the epoch cap — a press IS the human confirmation.
+    Manual,
+}
+
+impl Trigger {
+    /// The wire spelling `SPEC.md` §F and `dig-node-control-interface` use.
+    pub fn label(self) -> &'static str {
+        match self {
+            Trigger::Daily => "daily",
+            Trigger::Manual => "manual",
+        }
+    }
+}
+
+/// Why a held coin is being reclaimed. Recorded because the reasons are very different situations,
+/// and an operator reading the audit record needs to know which one they are looking at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReclaimReason {
     /// The `.dig` this coin bonds is no longer on disk, and the coin is for the CURRENT epoch.
@@ -84,6 +114,15 @@ pub enum ReclaimReason {
     /// The legacy had this as an operational step a human ran, and dig-node has no operator — so
     /// leaving it manual would strand one epoch's collateral per store, forever, with nobody to notice.
     EpochEnded,
+    /// The coin's own advertised URLs no longer match what this node advertises now
+    /// (`SPEC.md` §25.13, dig-node#570). Unlike its two siblings, a `UrlStale` reclaim is GATED: it
+    /// is made only for a coin [`super::reconcile`] has already priced a recreate for, because there
+    /// is no in-place URL update — reclaiming without being able to recreate would leave this node
+    /// with fewer bonds than before it started, having paid to get there.
+    ///
+    /// Carries which caller asked, for the audit record (`SPEC.md` §F): a scheduled check and an
+    /// operator's button press look identical on chain and mean different things.
+    UrlStale(Trigger),
 }
 
 /// What must happen to make the chain agree with the disk.
@@ -240,6 +279,30 @@ pub fn split_by_funds(create: &[Bond], balance_dig_base_units: u64, per_coin: u6
         affordable: affordable.to_vec(),
         short: short.to_vec(),
         shortfall_dig_base_units: (short.len() as u64).saturating_mul(per_coin),
+    }
+}
+
+/// The CURRENT epoch's create price, in DIG base units — `None` when the requirement is unknown.
+///
+/// Lives here rather than in `pass.rs`, even though [`super::pass::decide`] is its main caller,
+/// because [`super::reconcile::decide`] (dig-node#570) prices a recreate the SAME way, and `pass.rs`
+/// and `reconcile.rs` each need to import the other's directive type — putting the shared lookup in
+/// this lower module, which both already depend on, is what keeps that from becoming a cycle.
+/// `SPEC.md` §25 owns the pricing model; this is only the lookup, never a restatement of its
+/// arithmetic — see [`apply_safety_margin`].
+pub fn per_coin_dig_base_units(
+    requirement: &CollateralRequirementResult,
+    margin_bp: u64,
+) -> Option<u64> {
+    match requirement {
+        CollateralRequirementResult::Known {
+            required_per_store_dig_base_units,
+            ..
+        } => Some(apply_safety_margin(
+            *required_per_store_dig_base_units,
+            margin_bp,
+        )),
+        CollateralRequirementResult::Unknown { .. } => None,
     }
 }
 

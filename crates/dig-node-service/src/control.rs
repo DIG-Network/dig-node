@@ -5785,6 +5785,8 @@ mod tests {
             store_id: Some("ee".repeat(32)),
             bond: None,
             advertised_urls: Vec::new(),
+            reclaim_reason: None,
+            trigger: None,
             initiated_ms: 1_756_000_000_000,
             updated_ms: 1_756_000_001_000,
             status,

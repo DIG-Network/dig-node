@@ -90,10 +90,13 @@ pub mod pass;
 pub mod plan;
 pub mod pointers;
 pub mod presence;
+pub mod reconcile;
+pub mod reconcile_state;
 pub(crate) mod resolve;
 #[cfg(test)]
 mod resolve_tests;
 pub mod runner;
+pub mod schedule;
 pub mod signer;
 pub mod spends;
 pub mod states;

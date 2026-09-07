@@ -389,6 +389,17 @@ pub struct SpendIntent {
     /// that comparison meaningful — the current URL set can change after this coin was created.
     #[serde(default)]
     pub advertised_urls: Vec<String>,
+    /// For a mirror-coin RECLAIM, WHY it reclaimed: `no_longer_held` / `epoch_ended` / `url_stale`
+    /// (`SPEC.md` §25.4's three reasons, snake_case). `None` for every other kind and for a create,
+    /// which has no reason to give (`SPEC.md` §F). `#[serde(default)]` so a record written before
+    /// this field existed still parses, answering `None` — which suppresses nothing on the gate-9
+    /// in-flight read, the same safe direction an unreadable ledger already falls back to.
+    #[serde(default)]
+    pub reclaim_reason: Option<String>,
+    /// For a `reclaim_reason: "url_stale"` entry, WHICH caller asked: `daily` / `manual`
+    /// (`SPEC.md` §F). `None` for every other reclaim reason and for a create.
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 /// One entry in the audit record: a full snapshot of one spend at one revision.
@@ -426,6 +437,12 @@ pub struct SpendRecord {
     /// still parses, answering "no URL recorded" rather than refusing to read (dig-node#574).
     #[serde(default)]
     pub advertised_urls: Vec<String>,
+    /// For a mirror-coin RECLAIM, why it reclaimed (`SPEC.md` §F). See [`SpendIntent::reclaim_reason`].
+    #[serde(default)]
+    pub reclaim_reason: Option<String>,
+    /// For a `reclaim_reason: "url_stale"` entry, which caller asked. See [`SpendIntent::trigger`].
+    #[serde(default)]
+    pub trigger: Option<String>,
     /// When the node decided to spend (unix ms).
     pub initiated_ms: u64,
     /// When this revision was written (unix ms).
@@ -981,6 +998,8 @@ impl SpendJournal {
             store_id: intent.store_id,
             bond: intent.bond,
             advertised_urls: intent.advertised_urls,
+            reclaim_reason: intent.reclaim_reason,
+            trigger: intent.trigger,
             initiated_ms: now,
             updated_ms: now,
             status: SpendStatus::Pending,
@@ -1381,6 +1400,8 @@ mod tests {
             store_id: Some("store-a".to_string()),
             bond: None,
             advertised_urls: Vec::new(),
+            reclaim_reason: None,
+            trigger: None,
         }
     }
 
@@ -1408,6 +1429,8 @@ mod tests {
                 epoch,
             }),
             advertised_urls: urls,
+            reclaim_reason: None,
+            trigger: None,
         }
     }
 
@@ -1808,6 +1831,8 @@ mod tests {
             store_id: store.map(str::to_string),
             bond: None,
             advertised_urls: Vec::new(),
+            reclaim_reason: None,
+            trigger: None,
             initiated_ms,
             updated_ms: initiated_ms,
             status: SpendStatus::Pending,

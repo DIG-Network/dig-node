@@ -4992,6 +4992,22 @@ impl Node {
     pub fn own_peer_id(&self) -> Option<String> {
         self.peer_status.peer_id()
     }
+
+    /// Replace this node's published reflexive-address readings with a FRESH gather's result
+    /// (dig-node#570 §25.13.7.3's daily re-check).
+    ///
+    /// Bring-up calls `PeerStatus::set_reflexive` unconditionally with its one gather; a periodic
+    /// re-gather must not repeat that blindly, because a worse fresh reading must never overwrite a
+    /// working one. So this is a narrow, deliberate REPLACE — the caller decides whether to call it
+    /// at all.
+    ///
+    /// The decision of WHETHER a fresh gather is trustworthy enough to publish (`dig_stun::establish`
+    /// agreement over it) is made one layer up, in `dig-node-service`'s mirror lifecycle, which
+    /// already runs that same verification every round — `dig-node-core` has no dependency on it and
+    /// gains none here. This method is only the narrow write access that decision needs.
+    pub fn replace_reflexive_readings(&self, readings: Vec<(std::net::SocketAddr, String)>) {
+        self.peer_status.set_reflexive(readings);
+    }
 }
 
 /// The COMPOSITION-ROOT upcasts (#1285 W1c — the locked "Option A" shape). `Node` stays ONE
