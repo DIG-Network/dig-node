@@ -300,7 +300,7 @@ dig-nat = "0.21"
 # (`dig-node-service`'s `PublicAddress::corroborated_addresses`) is being retired in favour of this:
 # a second hand-rolled implementation of a security primitive is exactly the rival CLAUDE.md's
 # "centralize rival implementations" rule exists to catch.
-dig-stun = "0.1"
+dig-stun = "0.2"
 # dig-gossip is the ONE peer-stack exception: it stays a git dependency PINNED to a release commit
 # (dig_ecosystem#2647, NC-7 exception) — here v0.32.0 (rev 1a3391662ecce1a3cbe8b74122a52bbb1b28d3ee).
 # It cannot be published to crates.io while its `native-tls` [patch.crates-io] fork stands, because
