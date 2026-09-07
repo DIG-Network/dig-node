@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.255.0] - 2026-09-07
+
+### Chores
+- Add develop branch to CI trigger (#576)
+
 ## [0.254.85] - 2026-09-05
 
 ### Features
