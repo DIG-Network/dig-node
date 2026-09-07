@@ -10,6 +10,12 @@
 //! the store's singleton is closed. A forged/replayed announcement, or a chain the node cannot reach,
 //! deletes NOTHING (see [`confirm_melt`] / [`MeltStatus`]).
 //!
+//! **A terminal spend must also be [`MELT_CONFIRMATION_DEPTH`]-deep** (dig_ecosystem#2093): a
+//! lineage that terminates only a handful of blocks behind the peak could still be reorg-reverted,
+//! and unlike a spend, a delete cannot be undone by the reorg that un-does it. [`confirm_melt_via_chain`]
+//! answers `Unknown` — never `Melted` — until the terminal spend clears that depth or the peak is
+//! unreachable.
+//!
 //! # The wire (`dig_gossip`, opcode 221) is a PUBLIC broadcast — §5.4-EXEMPT
 //!
 //! A store deletion is public-by-nature and addressed to everyone (like L2 consensus gossip), so the
@@ -348,6 +354,19 @@ pub async fn run_melt_tick(
 /// walk bounded.
 const MAX_LINEAGE_HOPS: usize = 10_000;
 
+/// How many blocks deep the terminal spend of a melted lineage must sit before this node treats the
+/// melt as final (dig_ecosystem#2093).
+///
+/// A melt DELETES hosted content, and a delete cannot be undone by a later reorg the way a spend can
+/// be un-confirmed. A terminal spend that is only a handful of blocks deep could still be reverted,
+/// which would make the "melt" this node just acted on never have happened. No dig-node-core-reachable
+/// canonical reorg-depth constant exists (`dig-wallet`'s `MAX_REORG_DEPTH` is real but dig-node-core
+/// must not depend on dig-wallet), so this is declared here: 32 blocks is roughly 10 minutes at
+/// Chia's 18.75s block spacing, the depth Chia wallets already treat as reorg-safe. The cost of
+/// waiting an extra ~10 minutes before deleting is minutes; the cost of deleting on a reorg-reverted
+/// melt is unrecoverable data loss, so the asymmetry favours waiting.
+pub const MELT_CONFIRMATION_DEPTH: u32 = 32;
+
 /// The deepest live DataLayer lineage measured on mainnet (all 53 launcher coins surveyed).
 const DEEPEST_MEASURED_MAINNET_LINEAGE: usize = 599;
 
@@ -438,6 +457,10 @@ pub async fn confirm_melt_via_chain(chain: &dyn ChainReads, store_id: &[u8; 32])
 
     // FACT 2 — follow real parentage from the launcher to the end of the lineage.
     let mut current = launcher_id;
+    // The block the CURRENT terminal coin was spent at — tracked as the walk advances so a
+    // confirmed melt (dig_ecosystem#2093) can be depth-checked without a second chain read for the
+    // coin the loop already fetched.
+    let mut terminal_spent_at = launcher.spent_block_index;
     for hop in 0..MAX_LINEAGE_HOPS {
         let children = match chain.coin_records_by_parent_ids(&[current], true).await {
             Ok(children) => children,
@@ -458,8 +481,18 @@ pub async fn confirm_melt_via_chain(chain: &dyn ChainReads, store_id: &[u8; 32])
                 // hop means the answer is untrustworthy, not that the store is gone.
                 MeltStatus::Unknown
             } else if children.is_empty() {
-                // The spend created NOTHING — the lineage terminated.
-                MeltStatus::Melted
+                // The spend created NOTHING — the lineage terminated. Not yet authoritative: a
+                // terminal spend this shallow could still be reverted by a reorg, and a melt is an
+                // IRREVERSIBLE delete (dig_ecosystem#2093). Require confirmation depth, fail CLOSED
+                // to `Unknown` (deletes nothing) when the peak itself is unreachable.
+                match chain.peak_height().await {
+                    Ok(peak)
+                        if peak.saturating_sub(terminal_spent_at) >= MELT_CONFIRMATION_DEPTH =>
+                    {
+                        MeltStatus::Melted
+                    }
+                    _ => MeltStatus::Unknown,
+                }
             } else {
                 // Children exist but none is a singleton. This is where a TRUNCATED page lands: the
                 // query honours a server-side limit, and a page that dropped the odd successor
@@ -475,6 +508,7 @@ pub async fn confirm_melt_via_chain(chain: &dyn ChainReads, store_id: &[u8; 32])
         if !next.spent {
             return MeltStatus::Live;
         }
+        terminal_spent_at = next.spent_block_index;
         current = next.coin.coin_id();
     }
     MeltStatus::Unknown
@@ -607,13 +641,15 @@ impl MeltCache for Arc<crate::Node> {
         let mut removed = 0;
         for capsule in self.cache_list_cached().await {
             // Match on the PARSED 32 bytes, never on the hex TEXT. A capsule id is canonical-hex but
-            // NOT canonical-case — `CapsuleKey::parse` admits and preserves mixed case, so the
-            // directory name can be `Ab..cD` while `hex::encode` here would produce lowercase. A
-            // textual compare therefore matches nothing for such a store while `held_store_ids`
-            // (which decodes, and so is case-insensitive) still reports it held: the node would
-            // tombstone the store, announce a melt of `generations: 0`, and go on serving the
-            // content it just told the network it had deleted. Decoding both sides keeps the
-            // held-check and the delete looking at the same identity.
+            // a cached directory is not guaranteed canonical-CASE on disk: `CapsuleKey::parse` now
+            // lower-cases at construction (dig_ecosystem#2147), but a directory written by a prior
+            // binary — or by any path that names a cache entry without going through `parse` — can
+            // still be `Ab..cD` while `hex::encode` here would produce lowercase. A textual compare
+            // therefore matches nothing for such a store while `held_store_ids` (which decodes, and
+            // so is case-insensitive) still reports it held: the node would tombstone the store,
+            // announce a melt of `generations: 0`, and go on serving the content it just told the
+            // network it had deleted. Decoding both sides keeps the held-check and the delete
+            // looking at the same identity regardless of how the directory name was cased.
             if parse_hex32(&capsule.store_id).as_ref() == Some(store_id)
                 && self
                     .cache_remove_cached(&capsule.store_id, &capsule.root)
@@ -1199,6 +1235,11 @@ mod tests {
         /// ceiling can stop a walk over this chain.
         endless: bool,
         parent_queries: AtomicUsize,
+        /// The chain tip height `peak_height()` answers with (dig_ecosystem#2093's confirmation-depth
+        /// gate). Defaults far deeper than any fixture's `spent_block_index` (11) so every existing
+        /// `Terminated` fixture reads as confirmed unless a test deliberately shallows it via
+        /// [`Self::with_peak`].
+        peak: Answer<u32>,
     }
 
     /// A coin record with an explicit parent + amount, so a real parentage chain can be built.
@@ -1251,6 +1292,10 @@ mod tests {
                 unreachable_at: None,
                 endless: false,
                 parent_queries: AtomicUsize::new(0),
+                // `coin_rec` sets `spent_block_index: 11` for every spent coin, so any peak well
+                // past `11 + MELT_CONFIRMATION_DEPTH` reads every `Terminated` fixture as confirmed
+                // unless a test deliberately narrows it via `with_peak`.
+                peak: Answer::Ok(1_000),
             }
         }
 
@@ -1263,6 +1308,12 @@ mod tests {
 
         fn with_launcher(mut self, launcher: Answer<Option<CoinInfo>>) -> Self {
             self.launcher = launcher;
+            self
+        }
+
+        /// Override the chain tip `peak_height()` answers with (dig_ecosystem#2093).
+        fn with_peak(mut self, peak: Answer<u32>) -> Self {
+            self.peak = peak;
             self
         }
 
@@ -1374,7 +1425,10 @@ mod tests {
             unimplemented!("the melt gate must not parse spends (#747-immunity)")
         }
         async fn peak_height(&self) -> ChainResult<u32> {
-            unimplemented!("the melt gate must not read the peak")
+            match &self.peak {
+                Answer::Ok(peak) => Ok(*peak),
+                Answer::Unreachable => Err(ChainError::Chain("coinset unreachable".into())),
+            }
         }
         async fn push(&self, _bundle: SpendBundle) -> ChainResult<()> {
             unimplemented!("the melt gate is read-only")
@@ -1393,6 +1447,50 @@ mod tests {
         assert_eq!(
             confirm_melt_via_chain(&chain, &store(1)).await,
             MeltStatus::Melted
+        );
+    }
+
+    /// CHAIN-1b (dig_ecosystem#2093) — a terminal spend SHALLOWER than
+    /// [`MELT_CONFIRMATION_DEPTH`] is not yet final: a reorg could still revert it, and a melt is an
+    /// irreversible delete. `Unknown` deletes nothing, so the holder keeps serving until the depth is
+    /// met.
+    #[tokio::test]
+    async fn a_terminal_spend_shallower_than_the_confirmation_depth_is_not_yet_melted() {
+        // The terminal spend lands at `spent_block_index: 11` (`coin_rec`); one block short of the
+        // required depth is the sharpest possible off-by-one probe.
+        let chain = MockChain::minted(store(1), 2, Lineage::Terminated)
+            .with_peak(Answer::Ok(11 + MELT_CONFIRMATION_DEPTH - 1));
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(1)).await,
+            MeltStatus::Unknown,
+            "one block short of the confirmation depth must not authorize a delete"
+        );
+    }
+
+    /// CHAIN-1c (dig_ecosystem#2093) — exactly [`MELT_CONFIRMATION_DEPTH`] blocks deep IS melted
+    /// (pinned from the other side of CHAIN-1b, so the boundary itself is proven, not just "less
+    /// than X fails").
+    #[tokio::test]
+    async fn a_terminal_spend_exactly_at_the_confirmation_depth_is_melted() {
+        let chain = MockChain::minted(store(1), 2, Lineage::Terminated)
+            .with_peak(Answer::Ok(11 + MELT_CONFIRMATION_DEPTH));
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(1)).await,
+            MeltStatus::Melted,
+            "exactly the confirmation depth must authorize the delete"
+        );
+    }
+
+    /// CHAIN-1d (dig_ecosystem#2093) — an unreachable peak fails CLOSED, same as every other
+    /// unreachable chain read in this walk: `Unknown`, never a guessed `Melted`.
+    #[tokio::test]
+    async fn an_unreachable_peak_fails_closed_to_unknown() {
+        let chain =
+            MockChain::minted(store(1), 2, Lineage::Terminated).with_peak(Answer::Unreachable);
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(1)).await,
+            MeltStatus::Unknown,
+            "an unreachable peak must never be treated as confirming a melt"
         );
     }
 
@@ -1718,12 +1816,13 @@ mod tests {
 
     /// REAL-2 — a MIXED-CASE store directory is deleted, not silently skipped.
     ///
-    /// `CapsuleKey::parse` admits and preserves mixed case (`is_canonical_hex_id` accepts any ASCII
-    /// hex digit, with its own test asserting `Ab..cD` parses), so a mixed-case cache directory is
-    /// reachable. `held_store_ids` DECODES the hex and so is case-insensitive; a delete that compared
-    /// the hex TEXT against `hex::encode` (always lowercase) matched nothing. The node would then
-    /// tombstone the store, broadcast a melt of `generations: 0`, and keep serving the content it had
-    /// just announced as deleted — a melt reported but not performed.
+    /// `CapsuleKey::parse` now lower-cases at construction (dig_ecosystem#2147), but a directory
+    /// written directly (bypassing `parse`) — this fixture, or a cache left by a prior binary — is
+    /// still reachable in mixed case, so the delete path must not assume every on-disk name is
+    /// already canonical. `held_store_ids` DECODES the hex and so is case-insensitive; a delete that
+    /// compared the hex TEXT against `hex::encode` (always lowercase) matched nothing. The node
+    /// would then tombstone the store, broadcast a melt of `generations: 0`, and keep serving the
+    /// content it had just announced as deleted — a melt reported but not performed.
     #[tokio::test]
     async fn the_real_cache_deletes_a_mixed_case_store_directory() {
         let (node, td) = crate::test_support::test_node_for_peer_surface();
