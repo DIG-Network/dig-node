@@ -273,7 +273,8 @@ ROUTING.md §11` Phase 4). §2.5 + §8 are the normative target the integration 
 | `-32601` | method not found | unknown method, OR a peer/write/control method named on the anonymous read tier |
 | `-32602` | invalid params | missing/malformed params (bad hex, wrong type, out-of-range) |
 | `-32000` | server error | upstream failure, chain read failure, file I/O, config write |
-| `-32004` | resource unavailable | this node does not hold the content AND located no holder (genuine not-found) |
+| `-32002` | `ENGINE_WARMING` | the p2p engine has not yet attached to the HTTP surface (~30s cold-start window) — the peer tier has genuinely not been consulted; retryable (dig_ecosystem#2097) |
+| `-32004` | resource unavailable | this node does not hold the content, the peer tier WAS consulted (or there is none), AND located no holder (genuine not-found) — never returned while the peer tier is still attaching; see `-32002` |
 | `-32005` | `ROOT_NOT_ANCHORED` | served/requested root ≠ chain-anchored root, chain unreachable, or no confirmed generation (§4) — the anchor pin failing closed, UNIFORMLY across the `/s` tier, `dig.getContent` (read), AND `dig.fetchRange` (serve) |
 | `-32006` | `PEER_UNREACHABLE` | no traversal strategy reached the named peer |
 | `-32007` | `RANGE_NOT_SATISFIABLE` | `offset ≥ total_length` or the range is otherwise unsatisfiable |

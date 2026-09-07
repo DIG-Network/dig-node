@@ -684,6 +684,14 @@ pub enum ErrorCode {
     /// passes through. Which layer answered is carried by `data.origin`, never by the
     /// name — so the name is taken from the shared catalogue rather than restated.
     ResourceUnavailable,
+    /// `-32002` — the request arrived before this node's peer tier had finished attaching
+    /// (dig_ecosystem#2097). The HTTP surface opens ~30s before the p2p engine attaches, so a
+    /// request in that window has genuinely NOT been checked against the peer network yet —
+    /// distinct from `RESOURCE_UNAVAILABLE`, which means the peer tier WAS consulted (or there is
+    /// none) and the content is still not found. Reporting `-32004` here would tell a caller "not
+    /// found" for content this node simply has not finished asking about; this code tells the
+    /// caller to retry shortly instead. Transient/retryable. Shell error.
+    EngineWarming,
     /// `-32010` — the blind-passthrough relay to the upstream DIG RPC failed
     /// (unreachable / non-JSON). Dig-node-shell error distinguishing a local
     /// proxy failure from an upstream-returned JSON-RPC error.
@@ -803,6 +811,10 @@ impl ErrorCode {
             ErrorCode::ResourceUnavailable => {
                 shared(dig_rpc_protocol::ErrorCode::ResourceUnavailable)
             }
+            // Not in the shared `dig_rpc_protocol` catalogue: dig-node-service-only, so minted
+            // as a plain literal like the wallet/control bands below rather than restated from a
+            // shared source that does not define it.
+            ErrorCode::EngineWarming => -32002,
             ErrorCode::UpstreamError => shared(dig_rpc_protocol::ErrorCode::UpstreamError),
             ErrorCode::Unauthorized => shared(dig_rpc_protocol::ErrorCode::Unauthorized),
             ErrorCode::NotSupported => shared(dig_rpc_protocol::ErrorCode::NotSupported),
@@ -844,6 +856,7 @@ impl ErrorCode {
             ErrorCode::ResourceUnavailable => {
                 dig_rpc_protocol::ErrorCode::ResourceUnavailable.machine_code()
             }
+            ErrorCode::EngineWarming => "ENGINE_WARMING",
             ErrorCode::UpstreamError => dig_rpc_protocol::ErrorCode::UpstreamError.machine_code(),
             ErrorCode::Unauthorized => dig_rpc_protocol::ErrorCode::Unauthorized.machine_code(),
             ErrorCode::NotSupported => dig_rpc_protocol::ErrorCode::NotSupported.machine_code(),
@@ -878,6 +891,8 @@ impl ErrorCode {
             | ErrorCode::ControlIngressLimited
             // The audit record is a node-private FILE read by the shell, not by the node.
             | ErrorCode::SpendAuditUnreadable
+            // Minted by the shell's dispatch gate itself, before the read path is ever asked.
+            | ErrorCode::EngineWarming
             | ErrorCode::ParseError => "shell",
             ErrorCode::MethodNotFound => "boundary",
             // The wallet balance read (#1851) is served by the node-custodied wallet backend.
@@ -926,6 +941,10 @@ impl ErrorCode {
                     "a genuine content miss, whether this node missed locally or a ",
                     "relayed upstream did.",
                 )
+            }
+            ErrorCode::EngineWarming => {
+                "Peer tier not yet attached; retry. The request arrived before the p2p engine \
+                 finished attaching to the HTTP surface."
             }
             ErrorCode::UpstreamError => {
                 "The blind-passthrough relay to the upstream DIG RPC failed."
@@ -984,6 +1003,7 @@ impl ErrorCode {
             ErrorCode::InvalidParams,
             ErrorCode::DispatchFailed,
             ErrorCode::ResourceUnavailable,
+            ErrorCode::EngineWarming,
             ErrorCode::UpstreamError,
             ErrorCode::Unauthorized,
             ErrorCode::NotSupported,
