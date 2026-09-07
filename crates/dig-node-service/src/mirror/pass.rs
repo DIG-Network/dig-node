@@ -29,14 +29,17 @@
 //!    unfunded, and conflating them produces an out-of-funds alarm about a wallet that is fine
 //!    (dig-app#300). A missed create fails safe — the money stays in the wallet.
 
-use dig_mirror_collateral::margin::apply_safety_margin;
-
 // From the control interface's published contract rather than re-exported through
 // `crate::collateral`: these are the same types the §25.8 surface serves, and naming their
 // owner keeps one definition rather than a local alias that could drift from it.
 use dig_node_control_interface::results::{CollateralRequirementResult, CollateralUnknownReason};
 
-use super::plan::{plan, Bond, FundingSplit, HeldMirror, MirrorPlan, ReclaimReason};
+#[cfg(test)]
+use super::plan::Trigger;
+use super::plan::{
+    per_coin_dig_base_units, plan, Bond, FundingSplit, HeldMirror, MirrorPlan, ReclaimReason,
+};
+use super::reconcile::ReconcileDirective;
 
 /// What one pass has decided to do, and what to report for every bond it considered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +232,16 @@ pub struct PassInputs<'a> {
     /// Reclaims ignore it, exactly as they ignore [`Self::creates_enabled`]: money already locked
     /// must come home whether or not this node can advertise anything today.
     pub can_advertise: bool,
+    /// A URL-reconcile directive for THIS pass, when [`super::reconcile::decide`] (dig-node#570)
+    /// has already sized one — `SPEC.md` §25.13's `ReconcileDirective`, naming coin ids to reclaim
+    /// because their advertised URL no longer matches what this node advertises now.
+    ///
+    /// `None` on every ordinary pass (the overwhelming majority): the daily/manual trigger is what
+    /// ever produces `Some`, and it has ALREADY sized the affordable prefix and run every one of
+    /// `SPEC.md` §25.13.4's other gates before this field is populated — `decide` here never
+    /// re-derives that decision, it only turns an already-sized directive into reclaim entries, the
+    /// same way the ordinary table turns `NoLongerHeld`/`EpochEnded` coins into them.
+    pub reconcile: Option<&'a ReconcileDirective>,
 }
 
 /// Decide one pass.
@@ -252,25 +265,42 @@ pub fn decide(inputs: &PassInputs<'_>) -> PassDecision {
         &[]
     };
 
-    let MirrorPlan { reclaim, create } = plan(
+    let MirrorPlan {
+        mut reclaim,
+        create,
+    } = plan(
         desired,
         inputs.on_chain,
         inputs.current_epoch,
         inputs.in_flight,
     );
 
+    // dig-node#570, `SPEC.md` §B.1: the planner stays PURE and never decides a URL is stale on its
+    // own. It ACTS on a directive [`super::reconcile::decide`] already sized and gated — every
+    // coin named here has ALREADY cleared every §25.13.4 gate, including the affordability check,
+    // so this loop only ever turns an already-priced decision into reclaim entries, exactly as the
+    // two rows above turn `NoLongerHeld`/`EpochEnded` into them. Appended AFTER the ordinary
+    // reclaims and BEFORE any create (`SPEC.md` §B.2) — the recreate for a bond reclaimed this way
+    // is NEVER this pass's: `inputs.on_chain` was snapshotted before this reclaim runs, so `create`
+    // above still sees the coin as present and plans nothing for its bond; the recreate happens
+    // automatically, through this SAME ordinary path, on the first later pass whose chain
+    // observation no longer shows the reclaimed coin (`SPEC.md` §25.13.6).
+    if let Some(directive) = inputs.reconcile {
+        for coin_id in &directive.coin_ids {
+            if let Some(coin) = inputs.on_chain.iter().find(|c| &c.coin_id == coin_id) {
+                reclaim.push((coin.clone(), ReclaimReason::UrlStale(directive.trigger)));
+            }
+            // A named id absent from `on_chain` is not this function's problem to raise: the
+            // directive was sized against a chain read from the SAME tick (`SPEC.md` §25.13.6),
+            // so an absence here means the coin left the chain between that read and this one —
+            // already reconciled, or reclaimed by another path — and reclaiming nothing for it is
+            // the correct, safe answer either way.
+        }
+    }
+
     // Rule 3. The requirement is consulted only to PRICE creates. Note it is read after the plan is
     // taken, never before it: nothing about an unknown price may reach the reclaim list.
-    let per_coin = match inputs.requirement {
-        CollateralRequirementResult::Known {
-            required_per_store_dig_base_units,
-            ..
-        } => Some(apply_safety_margin(
-            *required_per_store_dig_base_units,
-            inputs.margin_bp,
-        )),
-        CollateralRequirementResult::Unknown { .. } => None,
-    };
+    let per_coin = per_coin_dig_base_units(inputs.requirement, inputs.margin_bp);
 
     // Rule 1, continued: the balance is read AFTER the plan too, and an unknown balance prices no
     // create rather than aborting anything. `reclaim` above is already decided and is untouched by
@@ -507,6 +537,7 @@ mod tests {
             dig_balance_base_units: Some(1_000_000),
             creates_enabled: true,
             can_advertise: true,
+            reconcile: None,
         }
     }
 
@@ -661,7 +692,9 @@ mod tests {
         assert_eq!(d.create, vec![bond("aa", "11")]);
         assert_eq!(
             d.per_coin_dig_base_units,
-            Some(apply_safety_margin(REQUIRED, 500)),
+            Some(dig_mirror_collateral::margin::apply_safety_margin(
+                REQUIRED, 500
+            )),
             "the amount is the margined requirement, not the bare one and not a constant"
         );
         assert_ne!(
@@ -1066,5 +1099,101 @@ mod tests {
             vec![(bond("aa", "11"), BondState::Pending)],
             "not `Bonded` -- nothing is advertising it yet -- and not `Reclaiming`, which would describe last epoch's money while the question is about this epoch's capsule"
         );
+    }
+
+    /// **Proves:** a `UrlStale` reclaim from a live [`ReconcileDirective`] lands AFTER every
+    /// ordinary reclaim and BEFORE any create (`SPEC.md` §B.2), and is priced/ordered
+    /// independently of them.
+    ///
+    /// **Catches** the defect the reviewer named on dig-node#573: nothing previously constructed a
+    /// `PassInputs` with `reconcile: Some(_)` ALONGSIDE real ordinary reclaims, so moving the
+    /// append (or dropping it) changed nothing green. Moving the `if let Some(directive) =
+    /// inputs.reconcile` block in `decide` to run after `create` is computed makes this fail on
+    /// order -- `UrlStale` then lands after a create instead of before one (verified by hand while
+    /// writing this test, then restored).
+    #[test]
+    fn a_url_stale_directive_reclaims_after_ordinary_reclaims_and_before_creates() {
+        let held = [bond("aa", "11"), bond("stale", "99")];
+        let req = known();
+        let gone_current = coin("gone_current", "bb", "22", NOW_EPOCH, REQUIRED);
+        let gone_past = coin("gone_past", "cc", "33", NOW_EPOCH - 1, REQUIRED);
+        let stale_coin = coin("stale_coin", "stale", "99", NOW_EPOCH, REQUIRED);
+        let on_chain = [gone_current.clone(), gone_past.clone(), stale_coin.clone()];
+        let directive = ReconcileDirective {
+            coin_ids: vec![stale_coin.coin_id.clone()],
+            left_unaffordable: 0,
+            trigger: Trigger::Manual,
+        };
+        let i = PassInputs {
+            reconcile: Some(&directive),
+            ..inputs(&held, &on_chain, &req)
+        };
+
+        let d = decide(&i);
+
+        assert_eq!(
+            d.reclaim,
+            vec![
+                (gone_current, ReclaimReason::NoLongerHeld),
+                (gone_past, ReclaimReason::EpochEnded),
+                (stale_coin, ReclaimReason::UrlStale(Trigger::Manual)),
+            ],
+            "ordinary reclaims first, in `plan`'s own order, the directive's `UrlStale` reclaim last"
+        );
+        assert_eq!(
+            d.create,
+            vec![bond("aa", "11")],
+            "the stale coin's own bond is still covered this pass -- `on_chain` was snapshotted before the reclaim above runs, so nothing here recreates it early"
+        );
+    }
+
+    /// **Proves:** a directive naming a coin id absent from `on_chain` reclaims nothing for it and
+    /// never panics -- the coin already left the chain between the directive's own read and this
+    /// pass's (`SPEC.md` §25.13.6), so silently reclaiming nothing is the correct answer.
+    #[test]
+    fn a_stale_directive_naming_a_coin_no_longer_on_chain_reclaims_nothing_for_it() {
+        let held = [bond("aa", "11")];
+        let req = known();
+        let on_chain: [HeldMirror; 0] = [];
+        let directive = ReconcileDirective {
+            coin_ids: vec![id("vanished")],
+            left_unaffordable: 0,
+            trigger: Trigger::Daily,
+        };
+        let i = PassInputs {
+            reconcile: Some(&directive),
+            ..inputs(&held, &on_chain, &req)
+        };
+
+        let d = decide(&i);
+
+        assert!(
+            d.reclaim.is_empty(),
+            "the named coin is not this function's problem to raise once it has left the chain"
+        );
+        assert_eq!(d.create, vec![bond("aa", "11")]);
+    }
+
+    /// **Proves:** `reconcile: None` leaves the plan exactly as it was before dig-node#570 --
+    /// nothing here regresses an ordinary pass with no directive in flight.
+    #[test]
+    fn no_reconcile_directive_leaves_the_ordinary_plan_untouched() {
+        let held = [bond("aa", "11")];
+        let req = known();
+        let on_chain = [coin("gone", "bb", "22", NOW_EPOCH, REQUIRED)];
+        let i = inputs(&held, &on_chain, &req);
+        assert!(i.reconcile.is_none());
+
+        let d = decide(&i);
+
+        assert_eq!(
+            d.reclaim,
+            vec![(
+                coin("gone", "bb", "22", NOW_EPOCH, REQUIRED),
+                ReclaimReason::NoLongerHeld
+            )],
+            "identical to the ordinary plan -- no `UrlStale` entry appears from nowhere"
+        );
+        assert_eq!(d.create, vec![bond("aa", "11")]);
     }
 }

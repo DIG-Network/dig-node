@@ -2113,6 +2113,8 @@ mod tests {
             store_id: None,
             bond: None,
             advertised_urls: Vec::new(),
+            reclaim_reason: None,
+            trigger: None,
         }
     }
 

@@ -115,6 +115,9 @@ pub fn observe(
         dig_balance_base_units,
         creates_enabled: ctx.creates_enabled,
         can_advertise: ctx.can_advertise,
+        // This is a READ, never a reconcile attempt (see the module doc: it cannot spend). A live
+        // reconcile directive is `runner::PassRunner::run`'s concern alone.
+        reconcile: None,
     });
 
     BondObservation {

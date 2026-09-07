@@ -179,9 +179,13 @@ impl CapsuleKey {
     /// This is the ONLY boundary at which untrusted key bytes become a usable capsule identity, so it
     /// is the one place the whitelist has to be right.
     pub(crate) fn parse(store: &str, root: &str) -> Option<Self> {
+        // dig_ecosystem#2147: lower-case both components at this single construction boundary so the
+        // same 32 bytes named in two different casings resolve to ONE key — same `Eq`/`Hash`, same
+        // `Display`. `is_canonical_hex_id` deliberately accepts either case; this is the only place
+        // case gets normalized, so every derived comparison agrees by construction.
         (is_canonical_hex_id(store) && is_canonical_hex_id(root)).then(|| CapsuleKey {
-            store: store.to_string(),
-            root: root.to_string(),
+            store: store.to_ascii_lowercase(),
+            root: root.to_ascii_lowercase(),
         })
     }
 
@@ -490,5 +494,43 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 2, "only the two `.dig` artifacts remain");
         assert!(names.iter().all(|n| n.ends_with(".dig")));
+    }
+
+    #[test]
+    fn parse_normalizes_id_case_so_one_capsule_is_one_key() {
+        // dig_ecosystem#2147: the same capsule named in two different casings must resolve to ONE
+        // `CapsuleKey` — same store(), same rendering, same hash bucket — never two distinct keys for
+        // what is the same 32 bytes.
+        let lower = hex_id(0x7e);
+        let upper = lower.to_ascii_uppercase();
+        // A MIXED-case rendering of the SAME 32 bytes as `lower`/`upper` — alternating the case of
+        // each hex digit — not a different id. (An earlier draft of this test used an unrelated hex
+        // string here, which compared two different capsules and could never pass.)
+        let mixed: String = lower
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+
+        let key_lower = CapsuleKey::parse(&lower, &lower).expect("canonical");
+        let key_upper = CapsuleKey::parse(&upper, &upper).expect("canonical");
+        let key_mixed = CapsuleKey::parse(&mixed, &mixed).expect("canonical");
+
+        assert_eq!(key_lower, key_upper, "case must not create a second key");
+        assert_eq!(key_lower, key_mixed, "case must not create a second key");
+        assert_eq!(key_upper.store(), lower, "store() is always lower-case");
+        assert_eq!(key_upper.to_string(), format!("{lower}:{lower}"));
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(key_lower);
+        set.insert(key_upper);
+        set.insert(key_mixed);
+        assert_eq!(set.len(), 1, "one capsule must occupy one hash bucket");
     }
 }

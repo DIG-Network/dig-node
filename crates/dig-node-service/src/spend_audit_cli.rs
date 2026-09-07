@@ -323,6 +323,8 @@ mod tests {
             store_id: store.map(str::to_string),
             bond: None,
             advertised_urls: Vec::new(),
+            reclaim_reason: None,
+            trigger: None,
         }
     }
 

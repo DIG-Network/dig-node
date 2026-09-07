@@ -16,6 +16,7 @@ mod support;
 
 use chia_protocol::{Bytes32, Coin};
 use dig_mirror_coin::MirrorCoin;
+use dig_node_service::mirror::plan::ReclaimReason;
 use dig_node_service::mirror::signer::{MirrorSigner, SignError, MIRROR_SPEND_FEE_CEILING_MOJOS};
 use dig_node_service::mirror::spends::build_reclaim;
 use dig_node_service::spend_audit::{SpendJournal, SpendLog};
@@ -103,6 +104,7 @@ fn a_reclaim_built_above_the_ceiling_is_refused_even_though_no_caller_says_so() 
         owner.public_key,
         fee_coins(&owner, RUINOUS_FEE_MOJOS),
         RUINOUS_FEE_MOJOS,
+        ReclaimReason::NoLongerHeld,
     )
     .expect("a reclaim at any fee builds; refusing it is the signer's job");
 
@@ -138,6 +140,7 @@ fn the_same_reclaim_at_a_legal_fee_signs() {
         owner.public_key,
         fee_coins(&owner, MIRROR_SPEND_FEE_CEILING_MOJOS),
         MIRROR_SPEND_FEE_CEILING_MOJOS,
+        ReclaimReason::NoLongerHeld,
     )
     .expect("builds");
 
@@ -167,7 +170,14 @@ fn the_same_reclaim_at_a_legal_fee_signs() {
 fn a_zero_fee_reclaim_signs() {
     let owner = signers_own_wallet();
     let coin = owned_mirror_coin(&owner);
-    let spends = build_reclaim(&coin, owner.public_key, fee_coins(&owner, 0), 0).expect("builds");
+    let spends = build_reclaim(
+        &coin,
+        owner.public_key,
+        fee_coins(&owner, 0),
+        0,
+        ReclaimReason::NoLongerHeld,
+    )
+    .expect("builds");
 
     let dir = tempfile::tempdir().expect("tempdir");
     let (journal, _log) = journal(dir.path());

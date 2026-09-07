@@ -174,6 +174,8 @@ fn intent() -> SpendIntent {
         store_id: Some("store-a".to_string()),
         bond: None,
         advertised_urls: Vec::new(),
+        reclaim_reason: None,
+        trigger: None,
     }
 }
 

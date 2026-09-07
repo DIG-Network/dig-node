@@ -408,6 +408,28 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         Ok(held_mirrors(&inventory))
     }
 
+    fn observe_bonded_urls(&self) -> Result<Vec<super::runner::DeclaredBond>, PassError> {
+        // Calling `observe_chain` here rather than re-scanning is what keeps this ONE chain read:
+        // it populates `self.resolved` as a side effect, and that cache is exactly where each
+        // coin's own `MirrorCoin` — and therefore its `.urls()` — already lives.
+        let held = self.observe_chain()?;
+        let resolved = self.resolved.borrow();
+        Ok(held
+            .into_iter()
+            .map(|held| {
+                let urls = resolved
+                    .get(&held.coin_id)
+                    .map(|coin| coin.urls().to_vec())
+                    // Not reached in practice: `observe_chain` just inserted every coin it
+                    // returned into `resolved` under this same key. Falling back to empty rather
+                    // than panicking keeps a future refactor that breaks this invariant a wrong
+                    // answer instead of a crash on a money-adjacent read path.
+                    .unwrap_or_default();
+                super::runner::DeclaredBond { held, urls }
+            })
+            .collect())
+    }
+
     fn coin_confirmation(&self, coin_id: &str) -> Result<Option<u32>, PassError> {
         // A malformed id is this node's own bookkeeping being wrong, not the chain being
         // unreachable, so it is NOT an `Err`: reporting it as one would count a permanent local
@@ -498,8 +520,9 @@ impl<S: ChainSource> MirrorEffects for NodeMirrorEffects<'_, S> {
         // `fee = 0` with no fee coins, always. §25.4.4: a zero-fee reclaim may not be admitted under
         // fee pressure, and the next pass retries it — whereas a reclaim gated on selectable XCH
         // cannot run at all on the exhausted wallet that needs it most.
-        let spends = super::spends::build_reclaim(&coin, signer.synthetic_key(), Vec::new(), 0)
-            .map_err(|e| PassError::Wallet(e.to_string()))?;
+        let spends =
+            super::spends::build_reclaim(&coin, signer.synthetic_key(), Vec::new(), 0, reason)
+                .map_err(|e| PassError::Wallet(e.to_string()))?;
 
         tracing::info!(
             target: "mirror",
@@ -1440,6 +1463,7 @@ mod tests {
             per_coin_dig_base_units: None,
             locked_dig_base_units: 4_242,
             funding_alert: None,
+            reconcile_url_stale_accepted: 0,
         };
 
         publish(&snapshot, &report, 9);

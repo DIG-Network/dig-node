@@ -3081,6 +3081,7 @@ impl Node {
             seams::dig_peer::module_serve::read_module_window(
                 &cache_dir, &store, &root, offset, length,
             )
+            .map(|(window, _total)| window)
         })
         .await
         .unwrap_or(None)
@@ -3644,16 +3645,14 @@ impl Node {
         let cache_dir = self.cache_dir.clone();
         let (read_root, echo_root) = (root_hex.clone(), root_hex);
         let read = tokio::task::spawn_blocking(move || {
-            let capsule = CapsuleKey::parse(&store_hex, &read_root)?;
-            // `total_length` comes from the file's METADATA, not from a buffer — the whole point is
-            // that no buffer of the whole module ever exists.
-            let total = std::fs::metadata(capsule.resolve_cached_path(&cache_dir))
-                .ok()?
-                .len();
-            if total == 0 {
-                return None;
-            }
-            let window = crate::seams::dig_peer::module_serve::read_module_window(
+            // `total` comes back from the SAME read that produced `window` (dig_ecosystem#2148),
+            // rather than a separate stat taken before it: a stat-then-read gap lets the module grow
+            // in between, so a window sized against the FRESHER on-disk length could carry more bytes
+            // than an earlier, staler `total` would account for — `end >= total` would then answer
+            // `complete`/`next_offset` one write ahead of what this window actually contains, or a
+            // `total_length` a client uses to size its reassembly buffer (#2071) could already be
+            // wrong on arrival.
+            let (window, total) = crate::seams::dig_peer::module_serve::read_module_window(
                 &cache_dir,
                 &store_hex,
                 &read_root,
@@ -4991,6 +4990,22 @@ impl Node {
     /// node creating one is paying collateral for a claim no reader can credit to it.
     pub fn own_peer_id(&self) -> Option<String> {
         self.peer_status.peer_id()
+    }
+
+    /// Replace this node's published reflexive-address readings with a FRESH gather's result
+    /// (dig-node#570 §25.13.7.3's daily re-check).
+    ///
+    /// Bring-up calls `PeerStatus::set_reflexive` unconditionally with its one gather; a periodic
+    /// re-gather must not repeat that blindly, because a worse fresh reading must never overwrite a
+    /// working one. So this is a narrow, deliberate REPLACE — the caller decides whether to call it
+    /// at all.
+    ///
+    /// The decision of WHETHER a fresh gather is trustworthy enough to publish (`dig_stun::establish`
+    /// agreement over it) is made one layer up, in `dig-node-service`'s mirror lifecycle, which
+    /// already runs that same verification every round — `dig-node-core` has no dependency on it and
+    /// gains none here. This method is only the narrow write access that decision needs.
+    pub fn replace_reflexive_readings(&self, readings: Vec<(std::net::SocketAddr, String)>) {
+        self.peer_status.set_reflexive(readings);
     }
 }
 

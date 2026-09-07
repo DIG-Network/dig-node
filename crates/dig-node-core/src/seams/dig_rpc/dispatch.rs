@@ -26,6 +26,31 @@ use crate::Node;
 #[allow(unused_imports)]
 use crate::*;
 
+/// `-32002` (dig_ecosystem#2097): the peer tier has genuinely not been consulted yet — the p2p
+/// engine attaches ~30s after the HTTP surface opens. Distinct from [`RESOURCE_NOT_AVAILABLE`]
+/// (`-32004`), which means the peer tier WAS consulted (or there is none) and the content is still
+/// not found. Declared here rather than in `lib.rs`'s shared catalogue, matching how
+/// `dig-node-service`'s `ErrorCode::EngineWarming` mints the SAME numeric code independently on its
+/// own surface.
+const ENGINE_WARMING: i64 = -32002;
+
+/// Decide the miss error for a request that fell all the way through with no configured upstream
+/// (dig_ecosystem#2097): `(code, message)`.
+///
+/// Pulled out as a pure decision so the ordering rule — `-32004` may only ever mean "the peer tier
+/// was consulted (or there is none) and the content is still not found", never "the peer tier has
+/// not been asked yet" — is unit-testable without a full [`Node`] fixture.
+fn no_upstream_miss_error(p2p_attached: bool) -> (i64, &'static str) {
+    if p2p_attached {
+        (
+            RESOURCE_NOT_AVAILABLE,
+            "resource not available: this node does not hold it and no peer served it",
+        )
+    } else {
+        (ENGINE_WARMING, "peer tier not yet attached; retry")
+    }
+}
+
 /// Seam 4 (dig RPC server) — the node's core JSON-RPC dispatch.
 #[async_trait::async_trait]
 pub trait RpcDispatch: Send + Sync {
@@ -996,12 +1021,8 @@ impl RpcDispatch for Node {
         //    pin — so even on the proxy path the node never serves a generation the
         //    chain did not confirm.
         if !node.has_upstream() {
-            return err(
-                &id,
-                RESOURCE_NOT_AVAILABLE,
-                "resource not available: this node does not hold it and no peer served it"
-                    .to_string(),
-            );
+            let (code, msg) = no_upstream_miss_error(node.p2p_content().is_some());
+            return err(&id, code, msg.to_string());
         }
         let upstream_req = pinned_root
             .map(|pin| pin_request_root(&req, &pin.to_hex()))
@@ -1189,6 +1210,34 @@ mod holder_claim_tests {
             holder_claim_for_landing(ReadOrigin::Local, RequestProvenance::StoreServed),
             HolderClaim::Suppress,
             "a stranger's store page must not choose what this operator bonds $DIG against"
+        );
+    }
+}
+
+#[cfg(test)]
+mod engine_warming_tests {
+    use super::{no_upstream_miss_error, ENGINE_WARMING, RESOURCE_NOT_AVAILABLE};
+
+    /// dig_ecosystem#2097 — a node with no upstream and no p2p engine attached has genuinely never
+    /// asked the peer tier about this content: ENGINE_WARMING, never RESOURCE_NOT_AVAILABLE.
+    #[test]
+    fn no_p2p_attached_answers_engine_warming_not_resource_not_available() {
+        let (code, _msg) = no_upstream_miss_error(false);
+        assert_eq!(
+            code, ENGINE_WARMING,
+            "the peer tier was never consulted; -32004 would misreport an unasked question as a miss"
+        );
+    }
+
+    /// dig_ecosystem#2097 — the SAME node, once the p2p engine has attached, answers the ordinary
+    /// genuine-miss code. This is the other side of the boundary: proves the fix does not turn
+    /// EVERY no-upstream miss into ENGINE_WARMING forever.
+    #[test]
+    fn p2p_attached_and_a_miss_answers_resource_not_available() {
+        let (code, _msg) = no_upstream_miss_error(true);
+        assert_eq!(
+            code, RESOURCE_NOT_AVAILABLE,
+            "once the peer tier has been consulted, a miss is a genuine -32004"
         );
     }
 }
