@@ -81,6 +81,35 @@ pub(crate) fn list_cached_capsules(modules_root: &std::path::Path) -> Vec<Cached
     out
 }
 
+/// Resolve `(store_hex, root_hex)` to its on-disk module path WITHOUT re-casing either component
+/// (dig_ecosystem#2147/#2090) -- the current `.dig` path if it exists, else the legacy `.module`
+/// path, else the `.dig` path. Deliberately distinct from `CapsuleKey::resolve_cached_path`, which
+/// lower-cases both components for identity and so can miss a mixed-case directory a pre-#2147
+/// binary wrote, on a case-sensitive filesystem. Callers that already hold the caller-supplied (or
+/// on-disk-observed) casing -- such as a delete that must match what a held-check just matched --
+/// use this instead.
+fn resolve_cached_path_raw_case(
+    cache_dir: &std::path::Path,
+    store_hex: &str,
+    root_hex: &str,
+) -> std::path::PathBuf {
+    let build = |ext: &str| {
+        cache_dir
+            .join("modules")
+            .join(store_hex)
+            .join(format!("{root_hex}.{ext}"))
+    };
+    let unified = build(crate::capsule_key::CACHED_MODULE_EXT);
+    if unified.exists() {
+        return unified;
+    }
+    let legacy = build(crate::capsule_key::LEGACY_MODULE_EXT);
+    if legacy.exists() {
+        return legacy;
+    }
+    unified
+}
+
 /// Seam 6 (capsule management) — the node's on-disk `.dig` capsule cache: list/remove/fetch a held
 /// capsule, gap-fill a missing chain-confirmed generation, and the self-reference plumbing that lets
 /// `&self` read handlers spawn an owned background backfill.
@@ -249,7 +278,23 @@ impl CapsuleStore for Node {
         };
         // Remove whichever artifact is on disk — the current `.dig` or a legacy `.module` (#1896) — so
         // a removal on a not-yet-migrated cache still clears the holder claim.
-        let path = capsule.resolve_cached_path(&self.cache_dir);
+        //
+        // Tried in TWO casings (dig_ecosystem#2147/#2090). First the caller's RAW hex casing: on a
+        // case-sensitive filesystem (dig-node runs on Linux), a directory a pre-#2147 binary wrote in
+        // mixed case is findable ONLY by the exact casing the held-check (`held_store_ids`, which
+        // DECODES hex rather than text-comparing) matched — `CapsuleKey`'s identity-normalized
+        // lower-case path would name a directory that was never on disk, and the delete would
+        // silently no-op while the node kept serving content it had just announced melted. Then, if
+        // that misses, `CapsuleKey`'s lower-cased path: a caller may pass hex in a DIFFERENT casing
+        // than the (post-#2147, canonically lower-case) directory actually on disk, and that case must
+        // still resolve — `CapsuleKey::parse` is what makes one 32-byte identity match regardless of
+        // how a caller spells it.
+        let raw = resolve_cached_path_raw_case(&self.cache_dir, store_id_hex, root_hex);
+        let path = if raw.exists() {
+            raw
+        } else {
+            capsule.resolve_cached_path(&self.cache_dir)
+        };
 
         let _guard = self.cache_lock.lock().await;
         if !path.exists() {
