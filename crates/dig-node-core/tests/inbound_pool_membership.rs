@@ -493,3 +493,189 @@ async fn the_accepted_direct_cap_still_binds_after_a_supersede_and_stale_release
     server.abort();
     service.stop().await.expect("stop");
 }
+
+/// Build a `NatPeerConnection` over a loopback duplex with a chosen `peer_id`, remote address and
+/// traversal tier -- the same pattern `peer.rs`'s own unit tests use to exercise `adopt_nat_connection`
+/// (the single outbound-adoption entry point, called in production from `bootstrap.rs`/`pex.rs`)
+/// without a real socket. The `peer_id` is passed in explicitly rather than derived from a TLS
+/// handshake here, so the caller can make it byte-identical to a real mTLS identity used elsewhere --
+/// which is exactly how the test below gets the SAME identity into both an outbound and an inbound
+/// slot. Returns the server `PeerSession` half; drop it to end the session, hold it to keep the
+/// outbound slot's session alive.
+fn loopback_nat_conn(
+    peer_id_bytes: [u8; 32],
+    remote: std::net::SocketAddr,
+    method: dig_nat::TraversalKind,
+) -> (dig_gossip::NatPeerConnection, dig_nat::PeerSession) {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let inner = dig_nat::PeerConnection {
+        peer_id: dig_nat::PeerId::from_bytes(peer_id_bytes),
+        method,
+        remote_addr: remote,
+        peer_bls_pub: None,
+        session: dig_nat::PeerSession::client(client_io),
+    };
+    (
+        dig_gossip::NatPeerConnection::new(inner),
+        dig_nat::PeerSession::server(server_io),
+    )
+}
+
+/// **dig_ecosystem#3124 -- the one unmeasured property: a peer that is BOTH dialled (outbound) and
+/// accepted (inbound) is counted exactly ONCE, and both directions keep being served.**
+///
+/// `adopt_inbound_peer_in_pool`'s own doc (`peer.rs:3658-3662`) lists "a peer already holding a
+/// dialable slot" among dig-gossip's refusals -- meaning the de-duplication this test proves lives in
+/// dig-gossip, not dig-node, and has never before been exercised FROM dig-node. Nothing here builds a
+/// pool entry directly: the outbound slot is created through the real `adopt_nat_connection` adoption
+/// path (the single outbound entry point), and the inbound slot is created by a real mTLS dial against
+/// `serve_peer_rpc_listener_with`'s listener, exactly like every other test in this file.
+#[tokio::test]
+async fn a_peer_that_is_both_dialled_and_accepted_is_counted_once() {
+    dig_node_core::peer::install_crypto_provider();
+
+    let (service, gossip_a, _gdir) = running_gossip().await;
+    assert_eq!(gossip_a.peer_count().await, 0, "the pool starts empty");
+
+    let server_identity = test_identity("3124-dualslot-server");
+    let server_peer_id = server_identity.peer_id();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let listen_addr = listener.local_addr().expect("local addr");
+
+    let responder: Arc<dyn PeerRpcResponder> = Arc::new(TestResponder);
+    let server = tokio::spawn(serve_peer_rpc_listener_with(
+        listener,
+        server_identity,
+        responder,
+        None,
+        Some(gossip_a.clone()),
+    ));
+
+    // Identity B -- used for BOTH the outbound and the inbound slot below.
+    let b_identity = test_identity("3124-dualslot-peer-b");
+    let b_peer_id = b_identity.peer_id();
+    let b_bytes = *b_peer_id.as_bytes();
+
+    // -- Step 1: B occupies an OUTBOUND (dialled) slot, via the real adoption path -----------------
+    let fake_dial_addr: std::net::SocketAddr = "198.51.100.9:9444".parse().expect("addr");
+    let (outbound_conn, _outbound_server_session) =
+        loopback_nat_conn(b_bytes, fake_dial_addr, dig_nat::TraversalKind::Direct);
+    let adopted = gossip_a
+        .adopt_nat_connection(outbound_conn)
+        .await
+        .expect("B's outbound slot is uncontested");
+    assert_eq!(adopted, dig_gossip::PeerId::from(b_bytes));
+
+    // Precondition: exactly one DIALABLE slot for B, before the inbound leg touches anything.
+    assert_eq!(
+        gossip_a.peer_count().await,
+        1,
+        "the outbound adoption must land before the inbound leg is driven"
+    );
+    let pool_id_b = dig_gossip::PeerId::from(b_bytes);
+    let outbound_detail = gossip_a
+        .connected_pool_peers_detailed()
+        .into_iter()
+        .find(|p| p.peer_id == pool_id_b)
+        .expect("B's outbound slot exists");
+    assert!(
+        outbound_detail.is_outbound,
+        "step 1 must produce a DIALLED slot, or this test measures the wrong thing"
+    );
+    assert!(
+        !gossip_a.dialable_pool_peers().is_empty(),
+        "the outbound slot must be dialable before the inbound leg is driven"
+    );
+
+    // -- Step 2: the SAME identity B now dials A INBOUND over real mTLS -----------------------------
+    let target = dig_nat::PeerTarget::with_addr(server_peer_id, listen_addr, "DIG_MAINNET");
+    let config = dig_nat::NatConfig::builder()
+        .enabled_methods(vec![dig_nat::TraversalKind::Direct])
+        .per_method_timeout(Duration::from_secs(5))
+        .build();
+    let mut inbound_conn = dig_nat::connect(&target, &b_identity, &config)
+        .await
+        .expect("B's transport-level connect succeeds even if the pool refuses to adopt it");
+    assert_eq!(
+        *b_identity.peer_id().as_bytes(),
+        b_bytes,
+        "the inbound dial must authenticate as the SAME identity as the outbound slot"
+    );
+
+    // Give the server's spawned adoption a moment to run, then settle: the count must NOT go to 2.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        gossip_a.peer_count().await,
+        1,
+        "a peer that is both dialled and accepted must be counted ONCE, not twice"
+    );
+
+    // -- Step 3: exactly ONE row for B's peer_id among connected_pool_peers() -----------------------
+    // (`connected_peers_json` is `pub(crate)` inside dig-node-core and unreachable from this
+    // integration-test crate; `connected_pool_peers()` is its public dig-gossip source, so counting
+    // matching rows here proves the same property `connected_peers_json` would report.)
+    let matching_rows = gossip_a
+        .connected_pool_peers()
+        .into_iter()
+        .filter(|(peer_id, _addr, _outbound)| *peer_id == pool_id_b)
+        .count();
+    assert_eq!(
+        matching_rows, 1,
+        "exactly one row must carry B's peer_id -- a de-duplication failure would emit two"
+    );
+    // The surviving row is the DIALLED slot, per `adopt_inbound_peer_in_pool`'s own refusal doc
+    // (peer.rs:3658-3662): "a peer already holding a dialable slot" is refused, so the pre-existing
+    // outbound slot is kept and the inbound accept is the one that is turned away.
+    let surviving = gossip_a
+        .connected_pool_peers_detailed()
+        .into_iter()
+        .find(|p| p.peer_id == pool_id_b)
+        .expect("B still has exactly one slot");
+    assert!(
+        surviving.is_outbound,
+        "the surviving slot must be the pre-existing DIALLED one, per the documented refusal"
+    );
+
+    // -- Step 4: still served, BOTH ways -- the discriminator against a shape that buys the count by
+    // dropping a connection. The dialled slot was never a live RPC session in this fixture (it is a
+    // bare loopback duplex with no responder on the other end), so what matters here is that the
+    // INBOUND session -- the one the pool refused to adopt -- is still answered.
+    {
+        let mut stream = inbound_conn.session.open_stream().await.expect("open stream");
+        let req = json!({"jsonrpc":"2.0","id":21,"method":"dig.getNetworkInfo"});
+        write_framed(&mut stream, &req).await.expect("write");
+        let resp = read_one_frame(&mut stream).await;
+        assert_eq!(
+            resp["result"]["served_method"], "dig.getNetworkInfo",
+            "the un-adopted inbound peer must still be served -- refusing adoption must not refuse service"
+        );
+    }
+    assert_eq!(
+        gossip_a.peer_count().await,
+        1,
+        "serving the refused inbound peer must not perturb the count"
+    );
+
+    // -- Step 5: released cleanly, SESSION-scoped ------------------------------------------------------
+    // Drop the inbound session first: the outbound slot must survive, because releasing it was never
+    // the inbound session's to release (it never held the slot).
+    drop(inbound_conn);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        gossip_a.peer_count().await,
+        1,
+        "the inbound session ending must not release the outbound slot it never owned"
+    );
+
+    // Now release the outbound slot itself and confirm the count reaches zero.
+    gossip_a
+        .disconnect(&pool_id_b)
+        .await
+        .expect("release the outbound slot");
+    await_peer_count(&gossip_a, 0, "after the outbound slot is released").await;
+
+    server.abort();
+    service.stop().await.expect("stop");
+}
