@@ -102,6 +102,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The params `pairing.poll` is called with — lifted out (like the strings below)
+/// because the poll loop itself dials a real node and cannot be driven from a unit
+/// test. `redemption_secret` is REQUIRED (#3191/W1): the node refuses a poll that
+/// omits it, so a client that forgot to thread it through would fail every poll.
+fn poll_params(pairing_id: &str, redemption_secret: &str) -> Value {
+    json!({ "pairing_id": pairing_id, "redemption_secret": redemption_secret })
+}
+
 /// `dig-node pair connect` — the CLIENT half of the handshake (#403).
 ///
 /// Uses [`call_open`], never [`call_control`]: the requester by definition holds no token yet, and
@@ -117,13 +125,25 @@ fn connect(config: &Config, client_name: Option<String>) -> std::io::Result<Outc
         .as_str()
         .ok_or_else(|| std::io::Error::other("dig-node: pairing.request returned no pairing_id"))?
         .to_string();
+    // #3191/W1: the redemption secret is the value that actually redeems the token —
+    // captured here from the request result and never derived from `pairing_id`.
+    let redemption_secret = requested["redemption_secret"]
+        .as_str()
+        .ok_or_else(|| {
+            std::io::Error::other("dig-node: pairing.request returned no redemption_secret")
+        })?
+        .to_string();
     let code = requested["pairing_code"].as_str().unwrap_or("??????");
     let expires_ms = requested["expires_ms"].as_u64().unwrap_or(0);
 
     eprintln!("{}", waiting_banner(code, &pairing_id));
 
     loop {
-        let polled = call_open(config, "pairing.poll", json!({ "pairing_id": pairing_id }))?;
+        let polled = call_open(
+            config,
+            "pairing.poll",
+            poll_params(&pairing_id, &redemption_secret),
+        )?;
         match polled["status"].as_str().unwrap_or("unknown") {
             "approved" => {
                 let token = polled["token"].as_str().ok_or_else(|| {
@@ -258,6 +278,15 @@ fn format_list(result: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Proves (#3191/W1):** the CLI client polls with the redemption secret it received from
+    /// `pairing.request`, never with the `pairing_id` alone.
+    #[test]
+    fn the_pair_client_polls_with_the_redemption_secret_it_received() {
+        let params = poll_params("a-pairing-id", "a-redemption-secret");
+        assert_eq!(params["pairing_id"], json!("a-pairing-id"));
+        assert_eq!(params["redemption_secret"], json!("a-redemption-secret"));
+    }
 
     /// **Proves (dig-node#403):** none of `pair connect`'s user-facing strings carries the
     /// signature of a lost `\` line continuation.
