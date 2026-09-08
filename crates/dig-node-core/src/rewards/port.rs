@@ -95,6 +95,13 @@ pub trait RewardsChainPort: Send + Sync {
 
     /// SPEC §6.3: submit ONE bundle of at most `MAX_ENTRY_WRITES_PER_BUNDLE` actions with a fee.
     async fn submit_entry_writes(&self, bundle: EntryWriteBundle) -> Result<(), ChainPortError>;
+
+    /// SPEC §2.1: spend the distributor singleton's `NewEpoch` action when a synced state is
+    /// needed for an entry-set write (§8.2) and the epoch has rolled. Idempotent in effect — SPEC
+    /// §2.1 clause 3 names TWO willing spenders (this prover and #3251's claim loop) as correct,
+    /// not a conflict, and neither MUST treat a not-yet-rolled epoch as an error or assume the
+    /// other already did it.
+    async fn spend_new_epoch(&self, launcher_id: Bytes32) -> Result<(), ChainPortError>;
 }
 
 /// The production adapter until DIG-Network/dig_ecosystem#3249 lands: reports
@@ -122,6 +129,10 @@ impl RewardsChainPort for UnavailableChainPort {
     async fn submit_entry_writes(&self, _bundle: EntryWriteBundle) -> Result<(), ChainPortError> {
         Err(ChainPortError::Unavailable)
     }
+
+    async fn spend_new_epoch(&self, _launcher_id: Bytes32) -> Result<(), ChainPortError> {
+        Err(ChainPortError::Unavailable)
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +157,10 @@ mod tests {
                 fee_mojos: 0,
             })
             .await,
+            Err(ChainPortError::Unavailable)
+        );
+        assert_eq!(
+            port.spend_new_epoch([0u8; 32]).await,
             Err(ChainPortError::Unavailable)
         );
     }

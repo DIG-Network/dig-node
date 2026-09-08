@@ -9,7 +9,7 @@
 //! compares a candidate against this node's own identity, and every caller — regardless of which
 //! path produced the candidate — MUST call through here rather than re-implement the comparison.
 
-use super::gate::{GateOutcome, MirrorCoinGatePort};
+use super::gate::{EpochContext, GateError, GateOutcome, MirrorCoinGatePort};
 
 /// Which discovery path produced a candidate. Exists ONLY for logging/tests (SPEC §5.3 clause 4's
 /// control needs to name the path a candidate arrived by) — it MUST NOT change the admission
@@ -57,6 +57,11 @@ pub enum AdmissionDecision {
     /// The mirror-coin gate did not admit the candidate (SPEC §4, §10.3) — fail-closed
     /// ineligibility, not an accusation.
     GateIneligible,
+    /// D5: the gate could not evaluate this candidate at all because the mirror-collateral epoch
+    /// ordinal was not supplied — a PROVER-side configuration fault, never a peer-attributable
+    /// verdict. The caller MUST NOT treat this as `GateIneligible` and MUST NOT strike the peer for
+    /// it (SPEC §3.6 clause 4).
+    ChainSourceUnavailable,
 }
 
 /// THE single admission point. Every discovery path calls this and nothing else decides
@@ -72,19 +77,17 @@ pub async fn admit(
     candidate: &Candidate,
     own: &OwnIdentity,
     gate: &dyn MirrorCoinGatePort,
-    mirror_collateral_epoch_ordinal: Option<u64>,
+    epoch_ctx: EpochContext,
 ) -> AdmissionDecision {
     if candidate.peer_id == own.peer_id {
         return AdmissionDecision::SelfExcluded;
     }
 
-    match gate
-        .evaluate(candidate.peer_id, mirror_collateral_epoch_ordinal)
-        .await
-    {
-        GateOutcome::Eligible {
+    match gate.evaluate(candidate.peer_id, epoch_ctx).await {
+        Err(GateError::EpochOrdinalUnavailable) => AdmissionDecision::ChainSourceUnavailable,
+        Ok(GateOutcome::Eligible {
             payout_puzzle_hash,
-        } => {
+        }) => {
             if own.controls(&payout_puzzle_hash) {
                 AdmissionDecision::SelfExcluded
             } else {
@@ -93,7 +96,7 @@ pub async fn admit(
                 }
             }
         }
-        GateOutcome::Ineligible(_) => AdmissionDecision::GateIneligible,
+        Ok(GateOutcome::Ineligible(_)) => AdmissionDecision::GateIneligible,
     }
 }
 
@@ -110,13 +113,22 @@ mod tests {
 
     #[async_trait]
     impl MirrorCoinGatePort for FakeGate {
-        async fn evaluate(&self, peer_id: [u8; 32], _epoch: Option<u64>) -> GateOutcome {
+        async fn evaluate(&self, peer_id: [u8; 32], _ctx: EpochContext) -> Result<GateOutcome, GateError> {
             match self.eligible.get(&peer_id) {
-                Some(ph) => GateOutcome::Eligible {
+                Some(ph) => Ok(GateOutcome::Eligible {
                     payout_puzzle_hash: *ph,
-                },
-                None => GateOutcome::Ineligible(GateIneligibleReason::AbsentDeclaration),
+                }),
+                None => Ok(GateOutcome::Ineligible(GateIneligibleReason::AbsentDeclaration)),
             }
+        }
+    }
+
+    struct UnavailableFakeGate;
+
+    #[async_trait]
+    impl MirrorCoinGatePort for UnavailableFakeGate {
+        async fn evaluate(&self, _peer_id: [u8; 32], _ctx: EpochContext) -> Result<GateOutcome, GateError> {
+            Err(GateError::EpochOrdinalUnavailable)
         }
     }
 
@@ -124,6 +136,14 @@ mod tests {
         OwnIdentity {
             peer_id: [0xAA; 32],
             controlled_puzzle_hashes: vec![[0xBB; 32]],
+        }
+    }
+
+    fn ctx() -> EpochContext {
+        EpochContext {
+            current_epoch: Some(2),
+            epoch_rolled_over_at: None,
+            now: 0,
         }
     }
 
@@ -144,7 +164,7 @@ mod tests {
                 peer_id: own.peer_id,
                 path,
             };
-            let decision = admit(&candidate, &own, &gate, Some(1)).await;
+            let decision = admit(&candidate, &own, &gate, ctx()).await;
             assert_eq!(decision, AdmissionDecision::SelfExcluded, "path {path:?}");
         }
     }
@@ -164,7 +184,7 @@ mod tests {
             peer_id: foreign_peer,
             path: DiscoveryPath::DhtWalk,
         };
-        let decision = admit(&candidate, &own, &gate, Some(1)).await;
+        let decision = admit(&candidate, &own, &gate, ctx()).await;
         assert_eq!(decision, AdmissionDecision::SelfExcluded);
     }
 
@@ -188,7 +208,7 @@ mod tests {
                 peer_id: honest_peer,
                 path,
             };
-            let decision = admit(&candidate, &own, &gate, Some(1)).await;
+            let decision = admit(&candidate, &own, &gate, ctx()).await;
             assert_eq!(
                 decision,
                 AdmissionDecision::Admit {
@@ -209,7 +229,21 @@ mod tests {
             peer_id: [0x33; 32],
             path: DiscoveryPath::DhtWalk,
         };
-        let decision = admit(&candidate, &own, &gate, Some(1)).await;
+        let decision = admit(&candidate, &own, &gate, ctx()).await;
         assert_eq!(decision, AdmissionDecision::GateIneligible);
+    }
+
+    /// D5: a gate error (absent epoch ordinal) MUST surface as `ChainSourceUnavailable`, never as
+    /// `GateIneligible` — a caller telling these apart is exactly what keeps this from striking a
+    /// peer for the operator's own configuration gap.
+    #[tokio::test]
+    async fn gate_error_surfaces_as_chain_source_unavailable_not_gate_ineligible() {
+        let own = own();
+        let candidate = Candidate {
+            peer_id: [0x44; 32],
+            path: DiscoveryPath::DhtWalk,
+        };
+        let decision = admit(&candidate, &own, &UnavailableFakeGate, ctx()).await;
+        assert_eq!(decision, AdmissionDecision::ChainSourceUnavailable);
     }
 }
