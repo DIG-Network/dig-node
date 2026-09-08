@@ -598,13 +598,13 @@ async fn a_peer_that_is_both_dialled_and_accepted_is_counted_once() {
     let mut inbound_conn = dig_nat::connect(&target, &b_identity, &config)
         .await
         .expect("B's transport-level connect succeeds even if the pool refuses to adopt it");
-    assert_eq!(
-        *b_identity.peer_id().as_bytes(),
-        b_bytes,
-        "the inbound dial must authenticate as the SAME identity as the outbound slot"
-    );
+    // (No same-identity assertion here: `b_bytes` was derived FROM `b_identity` two lines above, so
+    // comparing them back is true by construction and proves nothing about the server side. The
+    // property that matters -- that the server admitted B as the SAME identity, not a distinct one --
+    // is carried by `peer_count() == 1` below: a real identity mismatch would create a SECOND slot and
+    // the count would read 2. That is the assertion doing the real work.)
 
-    // -- Step 2b (moved ahead of Step 3's count/row assertions): the RPC round-trip IS the ordering
+    // -- Step 3 (moved ahead of Step 4's count/row assertions): the RPC round-trip IS the ordering
     // barrier, not a courtesy check. `adopt_inbound_peer_in_pool` is called at `peer.rs:3602`,
     // strictly BEFORE `serve_peer_session_from_with` starts answering RPC on the accepted session
     // (peer.rs:3614) -- so a successful `dig.getNetworkInfo` response over `inbound_conn` proves the
@@ -633,7 +633,7 @@ async fn a_peer_that_is_both_dialled_and_accepted_is_counted_once() {
         "a peer that is both dialled and accepted must be counted ONCE, not twice"
     );
 
-    // -- Step 3: exactly ONE row for B's peer_id among connected_pool_peers() -----------------------
+    // -- Step 4: exactly ONE row for B's peer_id among connected_pool_peers() -----------------------
     // (`connected_peers_json` is `pub(crate)` inside dig-node-core and unreachable from this
     // integration-test crate; `connected_pool_peers()` is its public dig-gossip source, so counting
     // matching rows here proves the same property `connected_peers_json` would report.)
@@ -669,16 +669,34 @@ async fn a_peer_that_is_both_dialled_and_accepted_is_counted_once() {
 
     // -- Step 5: released cleanly, SESSION-scoped ------------------------------------------------------
     // Drop the inbound session first: the outbound slot must survive, because releasing it was never
-    // the inbound session's to release (it never held the slot). No wait is needed here either: the
-    // inbound leg was REFUSED adoption (confirmed above), so `release_inbound_pool_slot` was called
-    // with `adopted = None` and is a documented no-op (peer.rs `release_inbound_pool_slot`) -- there
-    // is no pending async decrement for this drop to race against.
+    // the inbound session's to release (it never held the slot).
+    //
+    // This checks a NON-event -- that no release happens -- so a single instant read right after
+    // `drop` cannot prove it: dropping the CLIENT side does not synchronously run the SERVER's
+    // teardown. The server must first observe the closed transport in its own accept/serve task and
+    // only then run `release_inbound_pool_slot`; an instant read fires before the server has had a
+    // chance to act, which passes just as well under the defect this step exists to catch (an
+    // erroneous release of the outbound slot) as it does under correct behaviour -- it cannot tell
+    // the two apart. Poll across a bounded window instead: if the inbound leg's teardown incorrectly
+    // released the OUTBOUND slot it never owned, the count drops to 0 at some point inside the
+    // window and this loop catches it; if the release is correctly a no-op, the count simply stays
+    // at 1 for the whole window.
+    //
+    // There is no cheap positive signal available here that the server has specifically finished
+    // processing THIS disconnect (the RPC-round-trip trick Step 3 uses needs a live stream, which
+    // `drop` just closed) -- so the window is the whole proof, not a supplement to one.
     drop(inbound_conn);
-    assert_eq!(
-        gossip_a.peer_count().await,
-        1,
-        "the inbound session ending must not release the outbound slot it never owned"
-    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        assert_eq!(
+            gossip_a.peer_count().await,
+            1,
+            "the inbound session ending released the outbound slot it never owned -- a \
+             session-scoped release defect: the refused inbound leg tore down B's dialled slot when \
+             its own transport closed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Now release the outbound slot itself and confirm the count reaches zero.
     gossip_a
