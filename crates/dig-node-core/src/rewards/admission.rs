@@ -30,7 +30,7 @@ pub struct Candidate {
 }
 
 /// This node's own identity, on both SPEC §5.2 coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnIdentity {
     pub peer_id: [u8; 32],
     /// Every puzzle hash this node's own wallet controls. A `Vec` (not a single hash) because a

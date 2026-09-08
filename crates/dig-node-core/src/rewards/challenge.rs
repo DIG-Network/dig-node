@@ -370,7 +370,7 @@ mod tests {
     /// peer. Simulates the fault path failing to strike every peer in a set of several.
     #[tokio::test]
     async fn prover_fault_never_increments_any_peer_strike() {
-        let mut strikes = StrikeTracker::new();
+        let strikes = StrikeTracker::new();
         let peers: [Bytes32; 3] = [[10; 32], [11; 32], [12; 32]];
         for peer in peers {
             strikes.record_prover_fault(peer, LAUNCHER);
