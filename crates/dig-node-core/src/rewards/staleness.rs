@@ -17,7 +17,11 @@ use super::spec_constants::STALE_ENTRY_SET_SECONDS;
 /// `last_entry_write_at == None` means the entry set has never been written to. That is not
 /// "unknown" — it is maximally stale the moment the distributor itself has existed at least the
 /// bound: "never written" cannot be more current than "written a long time ago".
-pub fn is_entry_set_stale(state: &DistributorChainState, now: u64, distributor_created_at: u64) -> bool {
+pub fn is_entry_set_stale(
+    state: &DistributorChainState,
+    now: u64,
+    distributor_created_at: u64,
+) -> bool {
     if state.reserve_base_units == 0 {
         return false;
     }
@@ -51,7 +55,11 @@ mod tests {
     #[test]
     fn fresh_write_with_reserve_is_not_stale() {
         let s = state(100, Some(1_000));
-        assert!(!is_entry_set_stale(&s, 1_000 + STALE_ENTRY_SET_SECONDS - 1, 0));
+        assert!(!is_entry_set_stale(
+            &s,
+            1_000 + STALE_ENTRY_SET_SECONDS - 1,
+            0
+        ));
     }
 
     #[test]
@@ -66,7 +74,11 @@ mod tests {
     fn never_written_entry_set_with_reserve_and_old_enough_distributor_is_stale() {
         let s = state(100, None);
         let created_at = 500;
-        assert!(is_entry_set_stale(&s, created_at + STALE_ENTRY_SET_SECONDS, created_at));
+        assert!(is_entry_set_stale(
+            &s,
+            created_at + STALE_ENTRY_SET_SECONDS,
+            created_at
+        ));
     }
 
     #[test]

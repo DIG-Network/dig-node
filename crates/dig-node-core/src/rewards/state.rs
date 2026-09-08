@@ -131,7 +131,12 @@ impl Clock for TestClock {
     }
 }
 
-fn new_status(launcher_id: [u8; 32], store_id: [u8; 32], root: [u8; 32], now: u64) -> RewardProverStatus {
+fn new_status(
+    launcher_id: [u8; 32],
+    store_id: [u8; 32],
+    root: [u8; 32],
+    now: u64,
+) -> RewardProverStatus {
     RewardProverStatus {
         launcher_id,
         store_id,
@@ -171,7 +176,15 @@ mod tests {
         let status = idle_status([1; 32], [2; 32], [3; 32], 1000);
         let json = serde_json::to_value(&status).unwrap();
         let obj = json.as_object().unwrap();
-        for forbidden in ["healthy", "ok", "up", "running", "stale", "isStale", "staleness"] {
+        for forbidden in [
+            "healthy",
+            "ok",
+            "up",
+            "running",
+            "stale",
+            "isStale",
+            "staleness",
+        ] {
             assert!(
                 !obj.contains_key(forbidden),
                 "status record must not carry a {forbidden:?} key (SPEC §2.4)"

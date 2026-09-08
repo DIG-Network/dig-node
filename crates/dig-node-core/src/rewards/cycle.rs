@@ -13,8 +13,10 @@
 //!    stalled writer: it compares `observed_at` against the reader's OWN clock, never a flag the
 //!    writer set — a wedged writer cannot make this reassuring because it cannot touch it.
 
+use super::spec_constants::{
+    PROVER_CYCLE_DEADLINE_SECONDS, PROVER_CYCLE_PERIOD_SECONDS, PROVER_HEARTBEAT_SECONDS,
+};
 use super::state::{Clock, ProverState, StatusHandle};
-use super::spec_constants::{PROVER_CYCLE_DEADLINE_SECONDS, PROVER_CYCLE_PERIOD_SECONDS, PROVER_HEARTBEAT_SECONDS};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +29,11 @@ use tokio::time::timeout;
 /// care what the work does.
 ///
 /// Returns `true` if the cycle completed within the deadline, `false` if it was abandoned.
-pub async fn run_cycle_with_deadline<F, Fut>(status: &StatusHandle, clock: &dyn Clock, cycle_fn: F) -> bool
+pub async fn run_cycle_with_deadline<F, Fut>(
+    status: &StatusHandle,
+    clock: &dyn Clock,
+    cycle_fn: F,
+) -> bool
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = ()>,
@@ -39,7 +45,12 @@ where
         s.observed_at = started_at;
     });
 
-    match timeout(Duration::from_secs(PROVER_CYCLE_DEADLINE_SECONDS), cycle_fn()).await {
+    match timeout(
+        Duration::from_secs(PROVER_CYCLE_DEADLINE_SECONDS),
+        cycle_fn(),
+    )
+    .await
+    {
         Ok(()) => {
             let completed_at = clock.now_unix_seconds();
             status.update(|s| {
@@ -75,7 +86,11 @@ pub fn heartbeat_tick(status: &StatusHandle, clock: &dyn Clock) {
 /// The heartbeat loop: calls [`heartbeat_tick`] every `PROVER_HEARTBEAT_SECONDS` until `stop`
 /// carries `true`. Runs independently of whether a cycle is in progress — SPEC §2.5 clause 1 is
 /// explicit that this MUST fire "including while `Idle`".
-pub async fn heartbeat_loop(status: StatusHandle, clock: Arc<dyn Clock>, mut stop: watch::Receiver<bool>) {
+pub async fn heartbeat_loop(
+    status: StatusHandle,
+    clock: Arc<dyn Clock>,
+    mut stop: watch::Receiver<bool>,
+) {
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(PROVER_HEARTBEAT_SECONDS)) => {
@@ -115,9 +130,13 @@ mod tests {
         let clock = TestClock::new(1_000);
         let status = status_at(1_000);
 
-        let completed = run_cycle_with_deadline(&status, &clock, || std::future::pending::<()>()).await;
+        let completed =
+            run_cycle_with_deadline(&status, &clock, || std::future::pending::<()>()).await;
 
-        assert!(!completed, "a cycle that never resolves must be reported as abandoned");
+        assert!(
+            !completed,
+            "a cycle that never resolves must be reported as abandoned"
+        );
         let snap = status.snapshot();
         assert_eq!(snap.consecutive_cycle_failures, 1);
         assert_eq!(
@@ -137,7 +156,10 @@ mod tests {
         let snap = status.snapshot();
         assert_eq!(snap.consecutive_cycle_failures, 0);
         assert_eq!(snap.last_cycle_completed_at, Some(1_000));
-        assert_eq!(snap.next_cycle_due_at, Some(1_000 + PROVER_CYCLE_PERIOD_SECONDS));
+        assert_eq!(
+            snap.next_cycle_due_at,
+            Some(1_000 + PROVER_CYCLE_PERIOD_SECONDS)
+        );
     }
 
     /// SPEC §2.5 clause 1: a heartbeat fires even while the prover is sitting `Idle` between
@@ -154,7 +176,11 @@ mod tests {
 
         let snap = status.snapshot();
         assert_eq!(snap.observed_at, 1_000 + PROVER_HEARTBEAT_SECONDS);
-        assert_eq!(snap.prover_state, ProverState::Idle, "a heartbeat must not touch prover_state");
+        assert_eq!(
+            snap.prover_state,
+            ProverState::Idle,
+            "a heartbeat must not touch prover_state"
+        );
     }
 
     /// The wedged-loop reader-side property: `observed_at` stops advancing while a cycle is stuck

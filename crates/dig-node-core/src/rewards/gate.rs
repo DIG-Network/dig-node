@@ -108,7 +108,11 @@ pub enum GateError {
 /// The mirror-coin gate contract [`admission::admit`](super::admission::admit) drives.
 #[async_trait]
 pub trait MirrorCoinGatePort: Send + Sync {
-    async fn evaluate(&self, peer_id: [u8; 32], ctx: EpochContext) -> Result<GateOutcome, GateError>;
+    async fn evaluate(
+        &self,
+        peer_id: [u8; 32],
+        ctx: EpochContext,
+    ) -> Result<GateOutcome, GateError>;
 }
 
 /// The SPEC §4-driven gate: takes a candidate's coin-id hint and a `MirrorCoinReader`, and decides
@@ -166,7 +170,11 @@ impl<R: MirrorCoinReader> SpecMirrorCoinGate<R> {
 
 #[async_trait]
 impl<R: MirrorCoinReader> MirrorCoinGatePort for SpecMirrorCoinGate<R> {
-    async fn evaluate(&self, peer_id: [u8; 32], ctx: EpochContext) -> Result<GateOutcome, GateError> {
+    async fn evaluate(
+        &self,
+        peer_id: [u8; 32],
+        ctx: EpochContext,
+    ) -> Result<GateOutcome, GateError> {
         // SPEC §4.6 clause 2 / D5: the ordinal is an INPUT; its absence is a PROVER fault
         // (ChainSourceUnavailable at the cycle layer), never guessed and never peer-attributable
         // ineligibility (dig_ecosystem#3259, #3250 D5).
@@ -177,27 +185,37 @@ impl<R: MirrorCoinReader> MirrorCoinGatePort for SpecMirrorCoinGate<R> {
         // SPEC §4.6.1: a coin qualifies for the census of epoch `n` only by declaring `n-1`
         // EXACTLY. `n == 0` means no epoch has closed a census round yet — nothing can qualify.
         let Some(census_epoch) = current_epoch.checked_sub(1) else {
-            return Ok(GateOutcome::Ineligible(GateIneligibleReason::DoesNotAdvertise));
+            return Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::DoesNotAdvertise,
+            ));
         };
 
         let Some(hint) = self.coin_hint_for.get(&peer_id).copied().flatten() else {
-            return Ok(GateOutcome::Ineligible(GateIneligibleReason::AbsentCoinIdHint));
+            return Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::AbsentCoinIdHint,
+            ));
         };
 
         if !self
             .advertises_current_or_previous(hint, census_epoch, ctx.in_grace_window())
             .await
         {
-            return Ok(GateOutcome::Ineligible(GateIneligibleReason::DoesNotAdvertise));
+            return Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::DoesNotAdvertise,
+            ));
         }
 
         if !self.reader.declares_peer(hint, peer_id).await {
-            return Ok(GateOutcome::Ineligible(GateIneligibleReason::PeerNotDeclared));
+            return Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::PeerNotDeclared,
+            ));
         }
 
         match self.reader.owner_puzzle_hash(hint).await {
             Some(payout_puzzle_hash) => Ok(GateOutcome::Eligible { payout_puzzle_hash }),
-            None => Ok(GateOutcome::Ineligible(GateIneligibleReason::AbsentDeclaration)),
+            None => Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::AbsentDeclaration,
+            )),
         }
     }
 }
@@ -223,7 +241,10 @@ mod tests {
             _root: [u8; 32],
             epoch: u64,
         ) -> bool {
-            self.advertising.get(&(coin_id, epoch)).copied().unwrap_or(false)
+            self.advertising
+                .get(&(coin_id, epoch))
+                .copied()
+                .unwrap_or(false)
         }
         async fn declares_peer(&self, coin_id: [u8; 32], peer_id: [u8; 32]) -> bool {
             self.declaring.get(&coin_id) == Some(&peer_id)
@@ -256,7 +277,9 @@ mod tests {
         let g = gate(FakeReader::default(), None);
         assert_eq!(
             g.evaluate(PEER, ctx(Some(2))).await,
-            Ok(GateOutcome::Ineligible(GateIneligibleReason::AbsentCoinIdHint))
+            Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::AbsentCoinIdHint
+            ))
         );
     }
 
@@ -276,7 +299,9 @@ mod tests {
         let g = gate(FakeReader::default(), Some(COIN));
         assert_eq!(
             g.evaluate(PEER, ctx(Some(0))).await,
-            Ok(GateOutcome::Ineligible(GateIneligibleReason::DoesNotAdvertise))
+            Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::DoesNotAdvertise
+            ))
         );
     }
 
@@ -286,7 +311,9 @@ mod tests {
         let g = gate(reader, Some(COIN));
         assert_eq!(
             g.evaluate(PEER, ctx(Some(2))).await,
-            Ok(GateOutcome::Ineligible(GateIneligibleReason::DoesNotAdvertise))
+            Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::DoesNotAdvertise
+            ))
         );
     }
 
@@ -302,7 +329,9 @@ mod tests {
         let g = gate(reader, Some(COIN));
         assert_eq!(
             g.evaluate(PEER, ctx(Some(5))).await,
-            Ok(GateOutcome::Ineligible(GateIneligibleReason::DoesNotAdvertise)),
+            Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::DoesNotAdvertise
+            )),
             "declaring n directly must NOT qualify the census of epoch n (SPEC §4.6.1)"
         );
     }
@@ -331,7 +360,9 @@ mod tests {
         let g = gate(reader, Some(COIN));
         assert_eq!(
             g.evaluate(PEER, ctx(Some(2))).await,
-            Ok(GateOutcome::Ineligible(GateIneligibleReason::PeerNotDeclared))
+            Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::PeerNotDeclared
+            ))
         );
     }
 
@@ -345,7 +376,9 @@ mod tests {
         let g = gate(reader, Some(COIN));
         assert_eq!(
             g.evaluate(PEER, ctx(Some(2))).await,
-            Ok(GateOutcome::Ineligible(GateIneligibleReason::AbsentDeclaration))
+            Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::AbsentDeclaration
+            ))
         );
     }
 
@@ -402,7 +435,9 @@ mod tests {
         };
         assert_eq!(
             g.evaluate(PEER, outside_grace).await,
-            Ok(GateOutcome::Ineligible(GateIneligibleReason::DoesNotAdvertise))
+            Ok(GateOutcome::Ineligible(
+                GateIneligibleReason::DoesNotAdvertise
+            ))
         );
     }
 }

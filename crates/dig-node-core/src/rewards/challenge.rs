@@ -8,7 +8,9 @@
 //! out.
 
 use super::port::Bytes32;
-use super::spec_constants::{CHALLENGE_NO_REPEAT_CYCLES, CHALLENGE_STRIKES_TO_EVICT, CHALLENGE_WINDOW_BYTES};
+use super::spec_constants::{
+    CHALLENGE_NO_REPEAT_CYCLES, CHALLENGE_STRIKES_TO_EVICT, CHALLENGE_WINDOW_BYTES,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 
@@ -52,17 +54,33 @@ impl NoRepeatMemory {
         Self::default()
     }
 
-    pub fn is_repeat(&self, peer_id: Bytes32, launcher_id: Bytes32, resource_id: Bytes32, offset: u64, cycle_index: u32) -> bool {
+    pub fn is_repeat(
+        &self,
+        peer_id: Bytes32,
+        launcher_id: Bytes32,
+        resource_id: Bytes32,
+        offset: u64,
+        cycle_index: u32,
+    ) -> bool {
         self.recent
             .get(&(peer_id, launcher_id))
             .is_some_and(|windows| {
                 windows.iter().any(|(cyc, rid, off)| {
-                    *rid == resource_id && *off == offset && cycle_index.saturating_sub(*cyc) < CHALLENGE_NO_REPEAT_CYCLES
+                    *rid == resource_id
+                        && *off == offset
+                        && cycle_index.saturating_sub(*cyc) < CHALLENGE_NO_REPEAT_CYCLES
                 })
             })
     }
 
-    pub fn record(&mut self, peer_id: Bytes32, launcher_id: Bytes32, resource_id: Bytes32, offset: u64, cycle_index: u32) {
+    pub fn record(
+        &mut self,
+        peer_id: Bytes32,
+        launcher_id: Bytes32,
+        resource_id: Bytes32,
+        offset: u64,
+        cycle_index: u32,
+    ) {
         self.recent
             .entry((peer_id, launcher_id))
             .or_default()
@@ -158,14 +176,21 @@ pub async fn run_window(
     length: u64,
     expected_bytes: &[u8],
 ) -> bool {
-    match transport.fetch_window(peer_id, resource_id, offset, length).await {
+    match transport
+        .fetch_window(peer_id, resource_id, offset, length)
+        .await
+    {
         Ok(response) => response.bytes == expected_bytes,
         Err(_) => false,
     }
 }
 
 /// SPEC §3.5: a cycle passes only if ALL windows match — no partial credit.
-pub async fn run_cycle(transport: &dyn ChallengeTransport, peer_id: Bytes32, windows: &[(Bytes32, u64, u64, Vec<u8>)]) -> bool {
+pub async fn run_cycle(
+    transport: &dyn ChallengeTransport,
+    peer_id: Bytes32,
+    windows: &[(Bytes32, u64, u64, Vec<u8>)],
+) -> bool {
     for (resource_id, offset, length, expected) in windows {
         if !run_window(transport, peer_id, *resource_id, *offset, *length, expected).await {
             return false;
@@ -192,7 +217,12 @@ impl StrikeTracker {
     ///
     /// MUST NEVER be called for a cycle abandoned through the prover's own fault — see
     /// [`Self::record_prover_fault`], which exists precisely so that path cannot reach this one.
-    pub fn record_peer_outcome(&mut self, peer_id: Bytes32, launcher_id: Bytes32, passed: bool) -> bool {
+    pub fn record_peer_outcome(
+        &mut self,
+        peer_id: Bytes32,
+        launcher_id: Bytes32,
+        passed: bool,
+    ) -> bool {
         let key = (peer_id, launcher_id);
         if passed {
             self.consecutive_failures.insert(key, 0);

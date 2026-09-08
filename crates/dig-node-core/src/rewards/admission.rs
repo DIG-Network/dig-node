@@ -41,7 +41,9 @@ pub struct OwnIdentity {
 
 impl OwnIdentity {
     fn controls(&self, puzzle_hash: &[u8; 32]) -> bool {
-        self.controlled_puzzle_hashes.iter().any(|h| h == puzzle_hash)
+        self.controlled_puzzle_hashes
+            .iter()
+            .any(|h| h == puzzle_hash)
     }
 }
 
@@ -85,15 +87,11 @@ pub async fn admit(
 
     match gate.evaluate(candidate.peer_id, epoch_ctx).await {
         Err(GateError::EpochOrdinalUnavailable) => AdmissionDecision::ChainSourceUnavailable,
-        Ok(GateOutcome::Eligible {
-            payout_puzzle_hash,
-        }) => {
+        Ok(GateOutcome::Eligible { payout_puzzle_hash }) => {
             if own.controls(&payout_puzzle_hash) {
                 AdmissionDecision::SelfExcluded
             } else {
-                AdmissionDecision::Admit {
-                    payout_puzzle_hash,
-                }
+                AdmissionDecision::Admit { payout_puzzle_hash }
             }
         }
         Ok(GateOutcome::Ineligible(_)) => AdmissionDecision::GateIneligible,
@@ -113,12 +111,18 @@ mod tests {
 
     #[async_trait]
     impl MirrorCoinGatePort for FakeGate {
-        async fn evaluate(&self, peer_id: [u8; 32], _ctx: EpochContext) -> Result<GateOutcome, GateError> {
+        async fn evaluate(
+            &self,
+            peer_id: [u8; 32],
+            _ctx: EpochContext,
+        ) -> Result<GateOutcome, GateError> {
             match self.eligible.get(&peer_id) {
                 Some(ph) => Ok(GateOutcome::Eligible {
                     payout_puzzle_hash: *ph,
                 }),
-                None => Ok(GateOutcome::Ineligible(GateIneligibleReason::AbsentDeclaration)),
+                None => Ok(GateOutcome::Ineligible(
+                    GateIneligibleReason::AbsentDeclaration,
+                )),
             }
         }
     }
@@ -127,7 +131,11 @@ mod tests {
 
     #[async_trait]
     impl MirrorCoinGatePort for UnavailableFakeGate {
-        async fn evaluate(&self, _peer_id: [u8; 32], _ctx: EpochContext) -> Result<GateOutcome, GateError> {
+        async fn evaluate(
+            &self,
+            _peer_id: [u8; 32],
+            _ctx: EpochContext,
+        ) -> Result<GateOutcome, GateError> {
             Err(GateError::EpochOrdinalUnavailable)
         }
     }

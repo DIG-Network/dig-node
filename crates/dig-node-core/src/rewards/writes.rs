@@ -65,7 +65,10 @@ impl FeeBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteOutcome {
     /// A bundle ready to submit through `RewardsChainPort::submit_entry_writes`.
-    Bundle { bundle: EntryWriteBundle, still_pending: u32 },
+    Bundle {
+        bundle: EntryWriteBundle,
+        still_pending: u32,
+    },
     /// Nothing submitted, `count` decisions withheld this cycle (rate-limited or none ready) —
     /// they MUST still surface in `pending_entry_writes`, never silently dropped.
     Pending { count: u32 },
@@ -96,7 +99,12 @@ impl EntryWriteScheduler {
     }
 
     /// SPEC §6.3 clause 4 hysteresis check — keyed on the payout puzzle hash, never `peer_id`.
-    pub fn is_in_reentry_cooldown(&self, payout_puzzle_hash: Bytes32, launcher_id: Bytes32, now: u64) -> bool {
+    pub fn is_in_reentry_cooldown(
+        &self,
+        payout_puzzle_hash: Bytes32,
+        launcher_id: Bytes32,
+        now: u64,
+    ) -> bool {
         match self.cooldown_until.get(&(payout_puzzle_hash, launcher_id)) {
             Some(&until) => now < until,
             None => false,
@@ -104,8 +112,10 @@ impl EntryWriteScheduler {
     }
 
     fn record_removal(&mut self, payout_puzzle_hash: Bytes32, launcher_id: Bytes32, now: u64) {
-        self.cooldown_until
-            .insert((payout_puzzle_hash, launcher_id), now + REENTRY_COOLDOWN_SECONDS);
+        self.cooldown_until.insert(
+            (payout_puzzle_hash, launcher_id),
+            now + REENTRY_COOLDOWN_SECONDS,
+        );
     }
 
     /// Decide this cycle's write for one distributor from a queue of pending decisions (already
@@ -201,7 +211,10 @@ mod tests {
             .collect();
         let outcome = scheduler.decide(LAUNCHER, decisions, 100, &mut budget, 0);
         match outcome {
-            WriteOutcome::Bundle { bundle, still_pending } => {
+            WriteOutcome::Bundle {
+                bundle,
+                still_pending,
+            } => {
                 assert_eq!(bundle.actions.len(), MAX_ENTRY_WRITES_PER_BUNDLE as usize);
                 assert_eq!(still_pending, 3);
             }
@@ -233,7 +246,8 @@ mod tests {
         let mut scheduler = EntryWriteScheduler::new();
         let mut budget = FeeBudget::new(10, 0); // 240 mojos/day
         let fee = 1_000; // exceeds the whole day's budget on the first attempt
-        let outcome = scheduler.decide(LAUNCHER, vec![add(PAYOUT_A, LAUNCHER)], fee, &mut budget, 0);
+        let outcome =
+            scheduler.decide(LAUNCHER, vec![add(PAYOUT_A, LAUNCHER)], fee, &mut budget, 0);
         assert_eq!(outcome, WriteOutcome::FeeBudgetExhausted { count: 1 });
     }
 
@@ -244,18 +258,24 @@ mod tests {
     fn reentry_cooldown_survives_a_fresh_peer_id_for_the_same_payout_hash() {
         let mut scheduler = EntryWriteScheduler::new();
         let mut budget = FeeBudget::new(1_000_000, 0);
-        let outcome = scheduler.decide(LAUNCHER, vec![remove(PAYOUT_A, LAUNCHER)], 100, &mut budget, 0);
+        let outcome = scheduler.decide(
+            LAUNCHER,
+            vec![remove(PAYOUT_A, LAUNCHER)],
+            100,
+            &mut budget,
+            0,
+        );
         assert!(matches!(outcome, WriteOutcome::Bundle { .. }));
 
         // A "fresh peer_id" is not even a parameter to this cooldown check — it is keyed purely on
         // the payout puzzle hash, which is exactly what makes the bypass impossible: nothing about
         // peer identity can change which key is consulted.
-        assert!(scheduler.is_in_reentry_cooldown(PAYOUT_A, LAUNCHER, ENTRY_WRITE_MIN_INTERVAL_SECONDS));
         assert!(scheduler.is_in_reentry_cooldown(
             PAYOUT_A,
             LAUNCHER,
-            REENTRY_COOLDOWN_SECONDS - 1
+            ENTRY_WRITE_MIN_INTERVAL_SECONDS
         ));
+        assert!(scheduler.is_in_reentry_cooldown(PAYOUT_A, LAUNCHER, REENTRY_COOLDOWN_SECONDS - 1));
         assert!(!scheduler.is_in_reentry_cooldown(PAYOUT_A, LAUNCHER, REENTRY_COOLDOWN_SECONDS));
     }
 
