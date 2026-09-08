@@ -615,7 +615,11 @@ async fn a_peer_that_is_both_dialled_and_accepted_is_counted_once() {
     // why the RPC assertion moved ahead of the "still served" comment it used to sit under -- it now
     // does double duty as both the serve-path proof AND the happens-before proof for step 2/3.
     {
-        let mut stream = inbound_conn.session.open_stream().await.expect("open stream");
+        let mut stream = inbound_conn
+            .session
+            .open_stream()
+            .await
+            .expect("open stream");
         let req = json!({"jsonrpc":"2.0","id":21,"method":"dig.getNetworkInfo"});
         write_framed(&mut stream, &req).await.expect("write");
         let resp = read_one_frame(&mut stream).await;
