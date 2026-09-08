@@ -668,6 +668,200 @@ mod tests {
         assert_eq!(after["result"]["status"], json!("unknown"));
     }
 
+    /// **Proves:** the value the operator handles (`pairing_id`) does not by itself redeem the
+    /// minted token. `pairing.poll` requires the `redemption_secret` returned only to the
+    /// requesting client; a poll that omits it is refused, and the entry survives so the correct
+    /// poll (with the secret) still delivers the token afterwards.
+    #[test]
+    fn a_poll_without_the_requesters_redemption_secret_does_not_deliver_the_token() {
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let p = pending();
+
+        let req = request(&p, json!(1), &json!({ "client_name": "ext" }));
+        let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
+        let secret = req["result"]["redemption_secret"]
+            .as_str()
+            .expect("pairing.request must return a redemption_secret")
+            .to_string();
+
+        approve(&p, config, json!(2), &json!({ "pairing_id": pid.clone() }));
+
+        // Poll with the operator-visible id ALONE — no secret.
+        let bare = poll(&p, json!(3), &json!({ "pairing_id": pid.clone() }));
+        assert_eq!(
+            bare["error"]["data"]["code"],
+            json!(ErrorCode::InvalidParams.name()),
+            "a poll missing the redemption secret must be refused, not answered: {bare}"
+        );
+        assert!(
+            bare.get("result").is_none(),
+            "a poll missing the secret must never carry a result, let alone a token: {bare}"
+        );
+
+        // The entry must have SURVIVED the failed poll: the correct poll still delivers it.
+        let ok = poll(
+            &p,
+            json!(4),
+            &json!({ "pairing_id": pid, "redemption_secret": secret }),
+        );
+        assert_eq!(ok["result"]["status"], json!("approved"));
+        assert!(ok["result"]["token"].as_str().is_some());
+    }
+
+    /// **Proves:** a WRONG redemption secret is answered identically to an unknown id — it must
+    /// not become an oracle over the id space. The entry survives, and a subsequent correct poll
+    /// still delivers the token.
+    #[test]
+    fn a_poll_with_a_wrong_redemption_secret_is_indistinguishable_from_an_unknown_id() {
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let p = pending();
+
+        let req = request(&p, json!(1), &json!({ "client_name": "ext" }));
+        let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
+        let secret = req["result"]["redemption_secret"].as_str().unwrap().to_string();
+        approve(&p, config, json!(2), &json!({ "pairing_id": pid.clone() }));
+
+        let wrong = poll(
+            &p,
+            json!(3),
+            &json!({ "pairing_id": pid.clone(), "redemption_secret": "0".repeat(64) }),
+        );
+        let fabricated = poll(
+            &p,
+            json!(3),
+            &json!({ "pairing_id": "f".repeat(32), "redemption_secret": "0".repeat(64) }),
+        );
+        assert_eq!(wrong, json!({ "jsonrpc": "2.0", "id": 3, "result": { "status": "unknown" } }));
+        assert_eq!(
+            wrong["result"], fabricated["result"],
+            "a wrong secret must read exactly like an unknown id: {wrong} vs {fabricated}"
+        );
+
+        let ok = poll(
+            &p,
+            json!(4),
+            &json!({ "pairing_id": pid, "redemption_secret": secret }),
+        );
+        assert_eq!(ok["result"]["status"], json!("approved"));
+    }
+
+    /// **Proves:** the redemption secret never appears anywhere it isn't strictly needed —
+    /// `list()` and `approve()`'s own result must not carry it.
+    #[test]
+    fn the_redemption_secret_is_never_serialized_by_list_or_approve() {
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let p = pending();
+        let req = request(&p, json!(1), &json!({ "client_name": "ext" }));
+        let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
+
+        let l = list(&p, config, json!(2));
+        let pending_entry = &l["result"]["pending"][0];
+        assert!(
+            pending_entry.get("redemption_secret").is_none(),
+            "list() must never carry the redemption secret: {l}"
+        );
+
+        let ap = approve(&p, config, json!(3), &json!({ "pairing_id": pid }));
+        assert!(
+            ap["result"].get("redemption_secret").is_none(),
+            "approve()'s result must never carry the redemption secret: {ap}"
+        );
+    }
+
+    /// **Proves:** a pending request the node already accepted is never displaced to make room
+    /// for a later one. Flooding `pairing.request` past the slot cap leaves the FIRST entry
+    /// pending and redeemable, and the surplus requests are refused with `PAIRING_PENDING_LIMITED`.
+    #[test]
+    fn a_pending_request_is_never_displaced_by_a_later_request() {
+        let p = pending();
+        let first = request(&p, json!(0), &json!({ "client_name": "first" }));
+        let first_id = first["result"]["pairing_id"].as_str().unwrap().to_string();
+        let first_secret = first["result"]["redemption_secret"].as_str().unwrap().to_string();
+
+        let mut saw_limited = false;
+        for i in 1..(MAX_PENDING as i64 + 8) {
+            let r = request(&p, json!(i), &json!({ "client_name": "flood" }));
+            if r.get("error").is_some() {
+                assert_eq!(r["error"]["data"]["code"], json!("PAIRING_PENDING_LIMITED"));
+                saw_limited = true;
+            }
+        }
+        assert!(saw_limited, "the surplus requests past the cap must be refused");
+
+        let still_pending = poll(
+            &p,
+            json!(999),
+            &json!({ "pairing_id": first_id, "redemption_secret": first_secret }),
+        );
+        assert_eq!(
+            still_pending["result"]["status"],
+            json!("pending"),
+            "the first-accepted pending request must never be displaced: {still_pending}"
+        );
+    }
+
+    /// **Proves:** the third defect — approved-but-unpolled entries never age out of `prune()`, so
+    /// the cap must stop the map growing even when every held entry is already approved. Filling
+    /// the map with 32 approved entries and requesting one more must refuse, not grow the map.
+    #[test]
+    fn a_pending_map_at_capacity_of_approved_entries_does_not_grow() {
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let p = pending();
+        for i in 0..MAX_PENDING {
+            let r = request(&p, json!(i as i64), &json!({ "client_name": "c" }));
+            let pid = r["result"]["pairing_id"].as_str().unwrap().to_string();
+            approve(&p, config, json!(1000 + i as i64), &json!({ "pairing_id": pid }));
+        }
+        assert_eq!(p.lock().unwrap().map.len(), MAX_PENDING);
+
+        let refused = request(&p, json!(9999), &json!({ "client_name": "one-more" }));
+        assert!(refused.get("error").is_some(), "at cap the request must be refused: {refused}");
+        assert_eq!(
+            p.lock().unwrap().map.len(),
+            MAX_PENDING,
+            "the map must not grow past MAX_PENDING even when every held entry is approved"
+        );
+    }
+
+    /// **Proves:** a burst of `pairing.request` calls is bounded by the pairing-specific token
+    /// bucket, independently of the pending-slot cap (this fires well before `MAX_PENDING`).
+    #[test]
+    fn a_burst_of_pairing_requests_is_bounded_by_the_pairing_slot_budget() {
+        let p = pending();
+        let mut saw_limited = false;
+        for i in 0..(PAIRING_BUCKET_CAPACITY as i64 + 4) {
+            let r = request(&p, json!(i), &json!({ "client_name": "burst" }));
+            if r.get("error").is_some() {
+                assert_eq!(r["error"]["data"]["code"], json!("PAIRING_PENDING_LIMITED"));
+                saw_limited = true;
+            }
+        }
+        assert!(saw_limited, "a tight burst must eventually be refused by the bucket");
+    }
+
+    /// **Proves:** the pairing-slot budget bounds a BURST, and the fix does not recreate the
+    /// failure `control_ingress_admits` exists to avoid: an ordinary operator pairing sequence
+    /// (a handful of requests, spaced by the refill interval) is never refused.
+    #[test]
+    fn a_normal_operator_pairing_sequence_is_never_refused() {
+        let p = pending();
+        for i in 0..5 {
+            let r = request(&p, json!(i), &json!({ "client_name": "ext" }));
+            assert!(
+                r.get("result").is_some(),
+                "an ordinary, interval-spaced pairing request must never be refused: {r}"
+            );
+            {
+                let mut g = p.lock().unwrap();
+                g.bucket_tokens = PAIRING_BUCKET_CAPACITY as f64;
+            }
+        }
+    }
+
     #[test]
     fn load_paired_tokens_tolerates_missing_and_malformed() {
         let scratch = tmp_config();
