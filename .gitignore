@@ -21,3 +21,12 @@ config.json
 # lane-local scratch (never committed)
 .lane/
 
+
+# gitnexus writes agent-tooling files into the repository it indexes. They are
+# development-loop private and must never be tracked here.
+# Prefer `gitnexus analyze --skip-agents-md`.
+/AGENTS.md
+/CLAUDE.md
+/.claude/skills/gitnexus/
+/.claude/skills/generated/
+/.gitnexus/
