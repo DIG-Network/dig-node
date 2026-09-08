@@ -24,7 +24,7 @@ config.json
 
 # gitnexus writes agent-tooling files into the repository it indexes. They are
 # development-loop private and must never be tracked here.
-# See DIG-Network/dig_ecosystem#3177. Prefer `gitnexus analyze --skip-agents-md`.
+# Prefer `gitnexus analyze --skip-agents-md`.
 /AGENTS.md
 /CLAUDE.md
 /.claude/skills/gitnexus/
