@@ -297,6 +297,12 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
 
+# Compiles the branded DIG icon (`../../assets/dig.rc`) into a Windows resource that
+# `build.rs` links into `dig-node`/`dign` (dig_ecosystem#2917). Not a `dig-*`/`chia-*`
+# crate, so no cross-repo version lockstep applies here.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 # The install-root owner-SID probe (#565 LPE) reads the directory owner through the Win32 security
 # API (`GetNamedSecurityInfoW` → owner SID → `ConvertSidToStringSidW`) instead of spawning a
 # PowerShell owner query — a bare-name spawn from the (attacker-writable) install root is itself the
