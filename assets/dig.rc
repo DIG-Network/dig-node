@@ -1,0 +1,18 @@
+// Windows resource script for dig-node.
+//
+// Windows shows the LOWEST-ORDINAL icon resource as an executable's icon in
+// Explorer, the taskbar and the Alt-Tab switcher, so the branded DIG mark must
+// be ordinal 1 and must stay the only ICON statement in this file.
+//
+// `dig.ico` is the canonical, byte-pinned DIG icon (10 frames: 16/20/24/32/40/
+// 48/64/96/128/256, with hardened alpha at <=32 so the D's counter does not
+// bleed shut at taskbar size). It is vendored verbatim and gated on its sha256
+// by `scripts/check-icon.sh` — never re-save or "optimize" it, as any rewrite
+// changes the hash and breaks the gate in this repo and in every sibling repo
+// that vendors the same bytes.
+//
+// Deliberately NOT declared here: an RT_MANIFEST resource. Declaring a
+// manifest in both the .rc and the linker's /MANIFEST:EMBED lets one silently
+// displace the other (CVT1100/LNK1123 if both name RT_MANIFEST).
+
+1 ICON "dig.ico"
