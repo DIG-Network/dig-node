@@ -604,8 +604,29 @@ async fn a_peer_that_is_both_dialled_and_accepted_is_counted_once() {
         "the inbound dial must authenticate as the SAME identity as the outbound slot"
     );
 
-    // Give the server's spawned adoption a moment to run, then settle: the count must NOT go to 2.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // -- Step 2b (moved ahead of Step 3's count/row assertions): the RPC round-trip IS the ordering
+    // barrier, not a courtesy check. `adopt_inbound_peer_in_pool` is called at `peer.rs:3602`,
+    // strictly BEFORE `serve_peer_session_from_with` starts answering RPC on the accepted session
+    // (peer.rs:3614) -- so a successful `dig.getNetworkInfo` response over `inbound_conn` proves the
+    // server has already reached and returned from the adoption attempt. A bare `sleep` before the
+    // count assertion below cannot make that promise: on a slow CI box the accept task may simply not
+    // have run yet, and `peer_count() == 1` would be trivially true for the wrong reason (the inbound
+    // leg never having been driven at all), not because the pool correctly refused it. This is also
+    // why the RPC assertion moved ahead of the "still served" comment it used to sit under -- it now
+    // does double duty as both the serve-path proof AND the happens-before proof for step 2/3.
+    {
+        let mut stream = inbound_conn.session.open_stream().await.expect("open stream");
+        let req = json!({"jsonrpc":"2.0","id":21,"method":"dig.getNetworkInfo"});
+        write_framed(&mut stream, &req).await.expect("write");
+        let resp = read_one_frame(&mut stream).await;
+        assert_eq!(
+            resp["result"]["served_method"], "dig.getNetworkInfo",
+            "the un-adopted inbound peer must still be served -- refusing adoption must not refuse service"
+        );
+    }
+
+    // The RPC round-trip above already proves the adoption attempt ran and returned, so this count
+    // read needs no sleep to be meaningful: it must NOT go to 2.
     assert_eq!(
         gossip_a.peer_count().await,
         1,
@@ -625,9 +646,12 @@ async fn a_peer_that_is_both_dialled_and_accepted_is_counted_once() {
         matching_rows, 1,
         "exactly one row must carry B's peer_id -- a de-duplication failure would emit two"
     );
-    // The surviving row is the DIALLED slot, per `adopt_inbound_peer_in_pool`'s own refusal doc
-    // (peer.rs:3658-3662): "a peer already holding a dialable slot" is refused, so the pre-existing
-    // outbound slot is kept and the inbound accept is the one that is turned away.
+    // The surviving row is the DIALLED slot: `adopt_direct_inbound_handle`
+    // (dig-gossip `service/gossip_handle.rs`, admission section) refuses outright -- it does not
+    // supersede -- whenever the held slot's `dial_addr()` is `Some`: "an accepted connection NEVER
+    // supersedes a slot this node can dial" (the #870 rule). `adopt_inbound_peer_in_pool`'s own doc
+    // (peer.rs:3658-3662) names the same refusal. So the pre-existing outbound slot is kept and the
+    // inbound accept is the one turned away -- this is a REFUSAL, not a supersede-by-newer-connection.
     let surviving = gossip_a
         .connected_pool_peers_detailed()
         .into_iter()
@@ -637,21 +661,6 @@ async fn a_peer_that_is_both_dialled_and_accepted_is_counted_once() {
         surviving.is_outbound,
         "the surviving slot must be the pre-existing DIALLED one, per the documented refusal"
     );
-
-    // -- Step 4: still served, BOTH ways -- the discriminator against a shape that buys the count by
-    // dropping a connection. The dialled slot was never a live RPC session in this fixture (it is a
-    // bare loopback duplex with no responder on the other end), so what matters here is that the
-    // INBOUND session -- the one the pool refused to adopt -- is still answered.
-    {
-        let mut stream = inbound_conn.session.open_stream().await.expect("open stream");
-        let req = json!({"jsonrpc":"2.0","id":21,"method":"dig.getNetworkInfo"});
-        write_framed(&mut stream, &req).await.expect("write");
-        let resp = read_one_frame(&mut stream).await;
-        assert_eq!(
-            resp["result"]["served_method"], "dig.getNetworkInfo",
-            "the un-adopted inbound peer must still be served -- refusing adoption must not refuse service"
-        );
-    }
     assert_eq!(
         gossip_a.peer_count().await,
         1,
@@ -660,9 +669,11 @@ async fn a_peer_that_is_both_dialled_and_accepted_is_counted_once() {
 
     // -- Step 5: released cleanly, SESSION-scoped ------------------------------------------------------
     // Drop the inbound session first: the outbound slot must survive, because releasing it was never
-    // the inbound session's to release (it never held the slot).
+    // the inbound session's to release (it never held the slot). No wait is needed here either: the
+    // inbound leg was REFUSED adoption (confirmed above), so `release_inbound_pool_slot` was called
+    // with `adopted = None` and is a documented no-op (peer.rs `release_inbound_pool_slot`) -- there
+    // is no pending async decrement for this drop to race against.
     drop(inbound_conn);
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         gossip_a.peer_count().await,
         1,
