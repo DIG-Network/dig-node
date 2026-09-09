@@ -109,11 +109,11 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
 /// is the point: a consumer's own lock can pin an old patch even when every caret dep and every
 /// higher-layer bump looks correct.
 ///
-/// **Known-red (#3269):** `dig-node-core` now depends on 0.11.0 directly, but `dig-peer` 0.13 and
-/// `dig-download` 0.22 both still pin caret `"0.10"`, which excludes 0.11 — so `cargo metadata`
-/// resolves BOTH lines today. This assertion is deliberately left at exactly-one/0.11 (never widened to
-/// accept a set — see #836/#1576) and stays red until the dig-peer 0.14.0 / dig-download 0.23.0 cascade
-/// (a separate, already-dispatched lane) republishes on the 0.11 line.
+/// **Cascade closed (#3269):** `dig-node-core` depends on 0.11.0 directly; `dig-peer` (0.14.0),
+/// `dig-download` (0.23.0) and `dig-peer-selector` (0.12.0) all now resolve `dig-rpc-protocol`
+/// 0.11 too, so `cargo metadata` resolves exactly one line. This assertion is deliberately left at
+/// exactly-one/0.11 (never widened to accept a set — see #836/#1576); if a future dependency bump
+/// reopens the split, this test goes red again on purpose.
 #[test]
 fn the_workspace_carries_exactly_one_module_wire_crate() {
     let versions = locked_versions("dig-rpc-protocol");

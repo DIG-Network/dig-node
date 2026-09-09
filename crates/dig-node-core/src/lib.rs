@@ -9190,35 +9190,56 @@ mod tests {
         );
     }
 
-    /// **Proves:** an all-zero `launcher_id` — what an uninitialised/never-assigned registry slot
-    /// hex-encodes to — is OMITTED, never rendered as a real distributor with a plausible-looking
-    /// 64-hex id. This is the money-hole class the `dig-rewards-coin` driver's adversarial gates
-    /// found three times: an unset field that reads fine and costs the operator.
-    /// **Catches:** a boundary that lets an uninitialised slot answer as if it were a real
-    /// distributor.
+    /// **Proves:** a zeroed `launcher_id`, `store_id` OR `root` — what an
+    /// uninitialised/never-assigned registry slot hex-encodes to — is never rendered as a real
+    /// distributor with a plausible-looking id, AND that dropping it is never silent: a
+    /// `tracing::warn!` fires naming the zeroed field(s), so a registration bug is observable
+    /// rather than swallowed. This is the money-hole class the `dig-rewards-coin` driver's
+    /// adversarial gates found three times (an unset field that reads fine and costs the
+    /// operator), plus the SPEC §2.4 clause 1 defect a security + adversarial gate found in the
+    /// first version of this filter: an all-zero-`launcher_id`-only check that silently destroyed
+    /// the evidence of a bad registration, and never checked `store_id`/`root` at all.
+    ///
+    /// **Catches:** (1) a boundary that lets an uninitialised slot answer as if it were a real
+    /// distributor; (2) a filter that only checks `launcher_id`, missing a registration bug that
+    /// zeroes `store_id` or `root` beside an otherwise-valid `launcher_id` (the exact gap
+    /// security named — nothing before this test covered it); (3) a fix that goes back to
+    /// dropping the bad record with no log line at all.
     #[test]
-    fn get_reward_prover_status_omits_an_all_zero_launcher_id() {
+    fn get_reward_prover_status_logs_and_excludes_a_zeroed_identity_field() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let (node, _td) = test_node(None);
+
+        // Case 1: launcher_id itself is zeroed (the original, narrower gap).
         node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
             sample_reward_prover_status([0u8; 32]),
         ));
-        // A real, non-zero entry alongside it, to prove the filter is selective, not a
+
+        // Case 2: launcher_id is VALID, but store_id is zeroed — the gap security named, which
+        // the launcher_id-only filter would have let straight through as a plausible record.
+        let valid_but_zeroed_store = [0xccu8; 32];
+        let mut zeroed_store_status = sample_reward_prover_status(valid_but_zeroed_store);
+        zeroed_store_status.store_id = [0u8; 32];
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            zeroed_store_status,
+        ));
+
+        // A real, fully-valid entry alongside both, to prove the guard is selective, not a
         // by-product of the registry being otherwise empty.
         let real_id = [0xaau8; 32];
         node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
             sample_reward_prover_status(real_id),
         ));
 
-        let resp = rt.block_on(handle_rpc(
+        let (resp, logs) = rt.block_on(capture_sync_logs(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus"}),
             crate::download::ReadOrigin::Local,
             crate::download::RequestProvenance::FirstParty,
-        ));
+        )));
 
         let statuses = resp["result"]["statuses"]
             .as_array()
@@ -9226,9 +9247,25 @@ mod tests {
         assert_eq!(
             statuses.len(),
             1,
-            "the zero-id entry must be omitted: {resp}"
+            "only the fully-valid entry may be returned: {resp}"
         );
         assert_eq!(statuses[0]["launcher_id"], json!(hex::encode(real_id)));
+
+        // The observable signal: a warning naming which field was zero, for EACH bad
+        // registration — not silence.
+        assert!(
+            logs.contains("all-zero identity field") && logs.contains("launcher_id"),
+            "expected a warning about the zeroed-launcher_id registration, got: {logs}"
+        );
+        assert!(
+            logs.contains(&hex::encode(valid_but_zeroed_store)),
+            "expected the zeroed-store_id registration's (valid) launcher_id in the log so an \
+             operator can find which registration was bad: {logs}"
+        );
+        assert!(
+            logs.matches("all-zero identity field").count() >= 2,
+            "expected one warning per bad registration (2 here), got: {logs}"
+        );
     }
 
     /// **Proves:** `dig.getRewardProverStatus` is NOT peer-reachable (CONTROL plane — loopback

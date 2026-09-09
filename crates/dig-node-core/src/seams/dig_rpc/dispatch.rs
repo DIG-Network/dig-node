@@ -149,6 +149,30 @@ async fn resolve_enforced_pin(
 /// same-name struct-to-struct copy. This subsystem has already shipped a 24x-too-high fee
 /// ceiling and a 2x-understated eviction count that a correctness gate passed twice, so every
 /// non-identical field below is called out rather than assumed.
+/// Names which of a reward-prover status record's identity fields (`launcher_id`, `store_id`,
+/// `root`) are all-zero, if any. An all-zero value in any of these is never a real distributor's
+/// or module's identity — it's what an unassigned/uninitialised registry slot hex-encodes to
+/// ("0000…0000"), which reads exactly like a valid 64-hex id to every consumer including shipped
+/// dig-app 15.5.0.
+///
+/// Isolated on purpose (dig_ecosystem#3269 security/adversarial gate): this is a
+/// registration-bug DETECTOR that belongs, longer-term, at #3265's writer (the code that will
+/// actually populate this registry) rather than woven into the wire mapping below — kept here,
+/// small and easy to relocate, only because #3265 has not landed yet.
+fn zeroed_identity_fields(s: &crate::rewards::state::RewardProverStatus) -> Vec<&'static str> {
+    let mut zeroed = Vec::new();
+    if s.launcher_id == [0u8; 32] {
+        zeroed.push("launcher_id");
+    }
+    if s.store_id == [0u8; 32] {
+        zeroed.push("store_id");
+    }
+    if s.root == [0u8; 32] {
+        zeroed.push("root");
+    }
+    zeroed
+}
+
 fn reward_prover_status_to_wire(
     s: crate::rewards::state::RewardProverStatus,
 ) -> dig_rpc_protocol::types::RewardProverStatus {
@@ -749,16 +773,29 @@ impl RpcDispatch for Node {
                 let statuses: Vec<dig_rpc_protocol::types::RewardProverStatus> = node
                     .reward_prover_status_snapshots()
                     .into_iter()
-                    // An all-zero `launcher_id` is never a real distributor's identity — it is
-                    // what an uninitialised/never-assigned registry slot hex-encodes to
-                    // ("0000…0000"), which reads exactly like a valid 64-hex id to every
-                    // consumer including shipped dig-app 15.5.0. Omit it rather than let a slot
-                    // that was never assigned a distributor render as a real one with a
-                    // real-looking id — the money-hole class the driver's gates found three
-                    // times (an unset field that reads fine and costs the operator). This is
-                    // the boundary decision, not a `rewards/**` change: the registry itself is
-                    // never asked to validate what it stores.
-                    .filter(|s| s.launcher_id != [0u8; 32])
+                    // A zeroed `launcher_id`, `store_id` or `root` is never a real distributor's
+                    // or module's identity — see `zeroed_identity_fields`. Excluding it rather
+                    // than presenting it as a real record avoids the money-hole class the
+                    // driver's gates found three times (an unset field that reads fine and costs
+                    // the operator), BUT exclusion alone would silently destroy the evidence that
+                    // a registration bug happened — the exact §2.4 clause 1 violation a security
+                    // + adversarial gate found in the first version of this filter (dig-node#595
+                    // review round). So this is never a silent drop: a `tracing::warn!` fires
+                    // naming which field(s) were zero, making a bad registration observable
+                    // rather than swallowed, even though the record still never reaches a caller.
+                    .filter(|s| {
+                        let zeroed = zeroed_identity_fields(s);
+                        if !zeroed.is_empty() {
+                            tracing::warn!(
+                                launcher_id = %hex::encode(s.launcher_id),
+                                store_id = %hex::encode(s.store_id),
+                                root = %hex::encode(s.root),
+                                zeroed_fields = ?zeroed,
+                                "reward-prover status registration has an all-zero identity field; excluding it from dig.getRewardProverStatus rather than presenting it as a real distributor"
+                            );
+                        }
+                        zeroed.is_empty()
+                    })
                     .filter(|s| match &filter_launcher_id {
                         Some(want) => hex::encode(s.launcher_id).eq_ignore_ascii_case(want),
                         None => true,
