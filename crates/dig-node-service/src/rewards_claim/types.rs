@@ -67,12 +67,23 @@ pub enum ClaimOutcome {
 /// The closed set of states this loop can be in. Never a health boolean (SPEC §2.4) — each name
 /// maps to a different fact an operator can act on.
 ///
-/// # Precedence (Defect A1 fix)
+/// # Precedence: `ChainSourceUnavailable` > `Faulted` > `ClaimableButNotClaiming` > `Idle` >
+/// `Nominal` (Defect A1, refined by Defect B3)
 /// `ChainSourceUnavailable` outranks everything (no chain at all). Next, `Faulted` outranks
 /// `Nominal` and `ClaimableButNotClaiming`: a cycle where a chain call returned
 /// `ClaimPortError::Other(_)` is never allowed to read as healthy just because nothing else in
 /// the cycle happened to be claimable. Only once no fault is live can `ClaimableButNotClaiming`
 /// or `Nominal` apply.
+///
+/// # Defect B3: a per-distributor problem must never set the cycle-wide fault
+/// `Faulted` used to also fire on [`ClaimOutcome::PayoutPuzzleHashMismatch`] — a single hostile or
+/// buggy ENTRY ROW pinned the whole surface at `Faulted` indefinitely (non-terminal, so it recurred
+/// every cycle) and buried the `ClaimableButNotClaiming` signal this ticket exists to produce. A
+/// payout-hash mismatch is now a per-distributor COUNTED refusal (see
+/// [`ClaimStatus::payout_hash_mismatches_this_cycle`] and
+/// [`Self::claims_refused_payout_mismatch`]), never [`Self::fault_reported`]. `Faulted` is reserved
+/// for a genuinely cycle-wide failure: discovery itself failing, or a chain-port call returning
+/// `ClaimPortError::Other(_)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClaimLoopState {
     /// No cycle has ever been attempted yet.
@@ -87,10 +98,20 @@ pub enum ClaimLoopState {
     /// Defect A1: this state exists precisely so a reported fault can never be laundered into
     /// `Nominal` for lack of anywhere else to fall through to.
     Faulted { cycles: u32 },
-    /// The silent-failure case this ticket exists to prevent: at least one distributor was
-    /// claimable THIS CYCLE, nothing was submitted THIS CYCLE, and no fault is live. Computed, never
-    /// asserted by a writer about itself — see [`ClaimStatus::compute_state`].
-    ClaimableButNotClaiming,
+    /// The silent-failure case this ticket exists to prevent: fewer distributors were claimed THIS
+    /// CYCLE than were claimable, and no fault is live. Carries both numbers so a reader sees the
+    /// SIZE of the gap, not just its existence. Computed, never asserted by a writer about itself —
+    /// see [`ClaimStatus::compute_state`].
+    ///
+    /// # Defect B1: a zero-test masked a partial shortfall
+    /// This used to fire only when `claims_submitted_this_cycle == 0` — a magnitude comparison
+    /// disguised as an existence check. `claimable = 10, submitted_this_cycle = 1` read `Nominal`:
+    /// one submission (e.g. a distributor whose fee happened to sort first) masked nine same-cycle
+    /// skips. Reachable precisely because [`super::engine::ClaimEngine`]'s per-cycle budget
+    /// (Defect C2) is the first thing that can skip a claimable distributor while another one
+    /// submits in the same cycle. Fixed to a true magnitude comparison: fires whenever
+    /// `submitted < claimable`, whatever the non-zero submitted count is.
+    ClaimableButNotClaiming { claimable: u32, submitted: u32 },
     /// A cycle completed, nothing above is true.
     Nominal,
 }
@@ -136,12 +157,23 @@ pub struct ClaimStatus {
     /// already exhausted this cycle.
     pub claims_skipped_cycle_budget: u64,
     /// Defect E: lifetime count of claims REFUSED because the port returned an entry for a puzzle
-    /// hash other than this node's own — see [`ClaimOutcome::PayoutPuzzleHashMismatch`].
+    /// hash other than this node's own — see [`ClaimOutcome::PayoutPuzzleHashMismatch`]. A
+    /// per-distributor counted fault (Defect B3), never [`Self::fault_reported`].
     pub claims_refused_payout_mismatch: u64,
+    /// Defect B3: THIS CYCLE's twin of [`Self::claims_refused_payout_mismatch`] — without it a
+    /// reader could not tell an ONGOING misdirection from an old, no-longer-recurring one, the same
+    /// per-cycle-vs-lifetime gap Defect A3 named for the other counters.
+    pub payout_hash_mismatches_this_cycle: u32,
     /// THIS CYCLE's count of distributors observed with no entry slot (Defect B) — no longer a
     /// lifetime blacklist size, because the engine no longer blacklists a launcher id permanently;
     /// see [`super::engine::ClaimEngine`]'s module doc.
-    pub terminal_no_entry_slot: u32,
+    ///
+    /// # Defect R2: renamed from `terminal_no_entry_slot`
+    /// That name quoted SPEC §12.5 clause 1's "terminal, non-error" language to justify behaviour
+    /// that is deliberately non-terminal since the Defect B fix — a doc claim born false in the
+    /// commit that fixed the code. Renamed before #3268 publishes it over RPC; see R1 in the fix
+    /// brief for why clause 1's literal wording is itself the thing under amendment, not this field.
+    pub no_entry_slot_this_cycle: u32,
     /// Set when a chain call THIS CYCLE returned `ClaimPortError::Other(_)` — reset at the start of
     /// every `run_cycle` (Defect A1: this used to latch true for the rest of the process's life,
     /// which would have permanently suppressed every other state once tripped once).
@@ -168,7 +200,8 @@ impl Default for ClaimStatus {
             claims_skipped_fee_ceiling: 0,
             claims_skipped_cycle_budget: 0,
             claims_refused_payout_mismatch: 0,
-            terminal_no_entry_slot: 0,
+            payout_hash_mismatches_this_cycle: 0,
+            no_entry_slot_this_cycle: 0,
             fault_reported: false,
             consecutive_faulted_cycles: 0,
             state: ClaimLoopState::Idle,
@@ -183,8 +216,9 @@ impl ClaimStatus {
     /// than its own numbers support (SPEC §2.4's reasoning, applied to this loop's own surface).
     ///
     /// Precedence, most urgent first: `ChainSourceUnavailable` > `Faulted` >
-    /// `ClaimableButNotClaiming` > `Nominal`. See [`ClaimLoopState`]'s doc for why a fault must
-    /// never be absorbed into `Nominal` (Defect A1).
+    /// `ClaimableButNotClaiming` > `Idle` > `Nominal`. See [`ClaimLoopState`]'s doc for why a fault
+    /// must never be absorbed into `Nominal` (Defect A1) and why a per-distributor fault (Defect B3)
+    /// must never set it.
     #[must_use]
     pub fn compute_state(&self) -> ClaimLoopState {
         if self.state == ClaimLoopState::ChainSourceUnavailable {
@@ -198,8 +232,14 @@ impl ClaimStatus {
                 cycles: self.consecutive_faulted_cycles.max(1),
             };
         }
-        if self.distributors_claimable > 0 && self.claims_submitted_this_cycle == 0 {
-            return ClaimLoopState::ClaimableButNotClaiming;
+        // Defect B1: a magnitude comparison, not a zero-test -- `claims_submitted_this_cycle < 10`
+        // fires just as much when 1 of 10 claimable was submitted as when 0 were; a partial
+        // shortfall must never be masked by whichever claims did go through.
+        if self.claims_submitted_this_cycle < u64::from(self.distributors_claimable) {
+            return ClaimLoopState::ClaimableButNotClaiming {
+                claimable: self.distributors_claimable,
+                submitted: u32::try_from(self.claims_submitted_this_cycle).unwrap_or(u32::MAX),
+            };
         }
         ClaimLoopState::Nominal
     }
@@ -220,8 +260,47 @@ mod tests {
         };
         assert_eq!(
             status.compute_state(),
-            ClaimLoopState::ClaimableButNotClaiming
+            ClaimLoopState::ClaimableButNotClaiming {
+                claimable: 3,
+                submitted: 0
+            }
         );
+    }
+
+    /// Defect B1 regression: a magnitude comparison, not a zero-test. `claimable = 10,
+    /// submitted_this_cycle = 1` used to read `Nominal` because the old predicate only checked
+    /// `submitted_this_cycle == 0` -- one submission masked nine same-cycle skips.
+    #[test]
+    fn a_partial_shortfall_is_claimable_but_not_claiming_not_nominal() {
+        let status = ClaimStatus {
+            distributors_claimable: 10,
+            claims_submitted_this_cycle: 1,
+            fault_reported: false,
+            last_cycle_at: Some(1),
+            ..ClaimStatus::default()
+        };
+        assert_eq!(
+            status.compute_state(),
+            ClaimLoopState::ClaimableButNotClaiming {
+                claimable: 10,
+                submitted: 1
+            },
+            "1 of 10 claimable submitted must still read the shortfall, never Nominal"
+        );
+    }
+
+    /// Defect B1 regression: the other half of the fix -- every claimable distributor submitted
+    /// must read `Nominal`, not a false-positive shortfall.
+    #[test]
+    fn claiming_every_claimable_distributor_is_nominal() {
+        let status = ClaimStatus {
+            distributors_claimable: 10,
+            claims_submitted_this_cycle: 10,
+            fault_reported: false,
+            last_cycle_at: Some(1),
+            ..ClaimStatus::default()
+        };
+        assert_eq!(status.compute_state(), ClaimLoopState::Nominal);
     }
 
     /// Defect A1/A2: this test used to assert `Nominal` here, encoding the bug (a reported fault
@@ -260,7 +339,10 @@ mod tests {
         };
         assert_eq!(
             status.compute_state(),
-            ClaimLoopState::ClaimableButNotClaiming
+            ClaimLoopState::ClaimableButNotClaiming {
+                claimable: 1,
+                submitted: 0
+            }
         );
     }
 
@@ -289,6 +371,29 @@ mod tests {
         assert_eq!(
             status.compute_state(),
             ClaimLoopState::ChainSourceUnavailable
+        );
+    }
+
+    /// Defect B3 regression: a per-distributor payout-hash mismatch count, with no cycle-wide
+    /// `fault_reported`, must read the `ClaimableButNotClaiming` shortfall it actually represents,
+    /// never `Faulted` -- `engine.rs` is the one that decides `fault_reported`, but this proves the
+    /// state computation itself no longer has any path from "a mismatch happened" to `Faulted`.
+    #[test]
+    fn a_payout_mismatch_count_alone_does_not_force_faulted() {
+        let status = ClaimStatus {
+            distributors_claimable: 2,
+            claims_submitted_this_cycle: 1,
+            payout_hash_mismatches_this_cycle: 1,
+            fault_reported: false,
+            last_cycle_at: Some(1),
+            ..ClaimStatus::default()
+        };
+        assert_eq!(
+            status.compute_state(),
+            ClaimLoopState::ClaimableButNotClaiming {
+                claimable: 2,
+                submitted: 1
+            }
         );
     }
 }
