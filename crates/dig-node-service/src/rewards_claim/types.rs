@@ -25,7 +25,9 @@ pub struct OwnEntry {
 }
 
 /// What one distributor's evaluation this cycle produced — never silently nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy` since [`Self::Faulted`] carries a `String` (the chain port's own bounded error text).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimOutcome {
     /// `InitiatePayout` was submitted for this launcher id.
     Submitted { launcher_id: Bytes32 },
@@ -65,6 +67,42 @@ pub enum ClaimOutcome {
     /// own hash and proceeding. A mismatch means the port is confused or hostile, so it counts as a
     /// fault, never a routine skip.
     PayoutPuzzleHashMismatch { launcher_id: Bytes32 },
+    /// The seventh case, added because the other six could only say a peer was legitimately not
+    /// paid, never that something went wrong: a chain call for this launcher id returned
+    /// `ClaimPortError::Other(_)` this cycle -- the chain answered but the call itself failed.
+    /// Distinct from `ClaimPortError::Unavailable` (no chain reached at all -- a cycle-wide
+    /// condition, surfaced as [`ClaimLoopState::ChainSourceUnavailable`], never per-launcher). Every
+    /// one of `evaluate_pre_budget`'s three chain reads and `evaluate_budget_phase`'s two can
+    /// produce this outcome; only the last of those five (`submit_initiate_payout` itself) is a
+    /// genuine "we tried to pay you and the chain said no" -- the earlier four never got far enough
+    /// to read a fee or attempt a spend. For a peer's money this is still the one fact worth
+    /// reporting either way: nothing legitimate happened to this distributor this cycle, and unlike
+    /// every variant above, it is not a deliberate, correct non-payment.
+    ///
+    /// The current [`super::port::ClaimPortError`] shape cannot distinguish "definitely never
+    /// landed" from "landed, fate unknown" any further than this: `Other(_)` IS the chain giving a
+    /// resolved answer (see `evaluate_budget_phase`'s "F12" doc comment), so every site that
+    /// produces this outcome already knows the call did not succeed and, by construction, that no
+    /// fee is left committed for it (either none was ever read, or it was read, pre-committed to
+    /// the persisted window, and reversed by `ClaimEngine::uncommit_fee` before this outcome was
+    /// built). There is no "fate unknown" case reachable today; if one is ever added (e.g. a
+    /// request that times out with no chain answer at all), it needs its own variant rather than
+    /// being folded in here, because it could not carry the same "no money moved" guarantee.
+    Faulted {
+        launcher_id: Bytes32,
+        /// `Some(fee)` only when a fee was pre-committed to the persisted fee window and then
+        /// reversed before this outcome was produced (the `submit_initiate_payout` failure path) --
+        /// proof the fee did not stay spent despite the pre-commit. `None` means no fee was ever
+        /// read for this attempt, so there was nothing to commit or reverse. Either way the
+        /// persisted window reflects zero net spend for this launcher id this cycle (see
+        /// `f12_a_failed_submission_does_not_inflate_the_persisted_window`).
+        reversed_fee_mojos: Option<u64>,
+        /// The chain port's own words for why (`ClaimPortError::Other`'s payload), bounded to 200
+        /// chars before it is stored or logged -- it originates from a chain port and so is
+        /// attacker-adjacent, the same discipline `service::summarize_stderr` applies to a tool's
+        /// own stderr.
+        reason: String,
+    },
 }
 
 /// The closed set of states this loop can be in. Never a health boolean (SPEC §2.4) — each name
