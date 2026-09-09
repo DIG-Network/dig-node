@@ -582,6 +582,13 @@ impl Node {
     /// Register a live reward-prover status handle (dig_ecosystem#3269/#3265) so
     /// `dig.getRewardProverStatus` can read it. Additive — registering a second handle for the
     /// same distributor is the registrar's mistake to avoid, not this method's to dedupe.
+    ///
+    /// Only called from tests today: #3265 (the always-on prover loop that would call this from
+    /// production bring-up) has not landed, so clippy's non-test lib target sees no production
+    /// caller yet. `allow(dead_code)` here is a stand-in for that missing caller, not a claim the
+    /// registry itself is unused — remove this attribute the moment #3265 lands and wires a real
+    /// call site.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn register_reward_prover_status(&self, handle: rewards::state::StatusHandle) {
         self.reward_prover_statuses
             .write()
