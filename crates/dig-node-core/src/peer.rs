@@ -5633,6 +5633,34 @@ pub(crate) mod tests {
         }
     }
 
+    /// **Proves** (dig_ecosystem#3269, binding #3261's rule node-side): every `Method` whose wire
+    /// name contains `Reward` is absent from THIS node's `is_peer_reachable_method` allowlist —
+    /// exercising the real `pub(crate)` function, not the crate-level `Method::is_peer_reachable`
+    /// it delegates to, so a future special-case added HERE (the way `dig.getProviderSnapshot` and
+    /// `cache.pushCapsule` are special-cased above) is caught too.
+    /// **Catches:** a reward method reaching a remote peer over mTLS — a money-adjacent read no
+    /// unauthenticated peer should get, regardless of whether the wrapper's crate-delegation path
+    /// or a local special-case is what would have let it through.
+    #[test]
+    fn reward_methods_are_absent_from_the_node_peer_allowlist() {
+        let reward_methods: Vec<dig_rpc_protocol::Method> = dig_rpc_protocol::Method::ALL
+            .iter()
+            .copied()
+            .filter(|m| m.name().contains("Reward"))
+            .collect();
+        assert!(
+            !reward_methods.is_empty(),
+            "expected at least one Reward-named method in Method::ALL; found none"
+        );
+        for m in reward_methods {
+            assert!(
+                !is_peer_reachable_method(m.name()),
+                "{} must be absent from is_peer_reachable_method",
+                m.name()
+            );
+        }
+    }
+
     /// **Proves:** `dig.getProviderSnapshot` is peer-reachable as the ONE deliberate dig-node-LOCAL
     /// addition beyond the shared `dig-rpc-protocol` allowlist (epic #1934 child 4a) — it is not (yet)
     /// in that crate's set, so the wrapper allowlists it explicitly, and this test records that as an

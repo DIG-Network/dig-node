@@ -96,10 +96,11 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
         .collect()
 }
 
-/// **Proves:** exactly ONE `dig-rpc-protocol` resolves in the workspace, and it is the 0.10 line that
-/// defines the module wire (`ModuleInfo` / `GetModuleInfoParams` / `FetchModuleRangeParams`) AND the
+/// **Proves:** exactly ONE `dig-rpc-protocol` resolves in the workspace, and it is the 0.11 line that
+/// defines the module wire (`ModuleInfo` / `GetModuleInfoParams` / `FetchModuleRangeParams`), the
 /// recursive-ask contract this node adopted (`GetAvailabilityParams::budget_ms` / `::ask_id`,
-/// `AvailabilityAnswer::absence_established`, `ErrorCode::ContentMissInconclusive`).
+/// `AvailabilityAnswer::absence_established`, `ErrorCode::ContentMissInconclusive`), AND (#3269) the
+/// reward RPC surface (`Method::GetRewardProverStatus` et al., all `Tier::Control`).
 ///
 /// **Catches:** the obligation-8 skew directly. Before the #1576 cascade, dig-download consumed
 /// dig-rpc-protocol 0.5 while dig-peer 0.4 pulled 0.3.1, so a tree containing both held TWO `ModuleInfo`
@@ -107,6 +108,12 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
 /// that drive the entire pull plan. Asserting the TRANSITIVE lock entry (not the caret dep in a manifest)
 /// is the point: a consumer's own lock can pin an old patch even when every caret dep and every
 /// higher-layer bump looks correct.
+///
+/// **Known-red (#3269):** `dig-node-core` now depends on 0.11.0 directly, but `dig-peer` 0.13 and
+/// `dig-download` 0.22 both still pin caret `"0.10"`, which excludes 0.11 — so `cargo metadata`
+/// resolves BOTH lines today. This assertion is deliberately left at exactly-one/0.11 (never widened to
+/// accept a set — see #836/#1576) and stays red until the dig-peer 0.14.0 / dig-download 0.23.0 cascade
+/// (a separate, already-dispatched lane) republishes on the 0.11 line.
 #[test]
 fn the_workspace_carries_exactly_one_module_wire_crate() {
     let versions = locked_versions("dig-rpc-protocol");
@@ -117,8 +124,10 @@ fn the_workspace_carries_exactly_one_module_wire_crate() {
          majors means two `ModuleInfo` shapes across the module pull's trust boundary"
     );
     assert!(
-        versions[0].starts_with("0.10."),
-        "the availability contract this node adopted ships in dig-rpc-protocol 0.10; the workspace          resolved {} — on an earlier line the canonical items simply do not exist and this node          would be back to declaring its own",
+        versions[0].starts_with("0.11."),
+        "the availability contract plus the #3269 reward RPC surface this node adopted ship in \
+         dig-rpc-protocol 0.11; the workspace resolved {} — on an earlier line the canonical items \
+         simply do not exist and this node would be back to declaring its own",
         versions[0]
     );
 }
