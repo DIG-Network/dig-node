@@ -63,6 +63,15 @@ impl FeeBudget {
     /// ceiling there would fail open, whereas mistaking a ceiling for a fee here fails closed
     /// (the prover refuses to write, which is exactly what §6.3 clause 3 asks of it).
     pub fn daily_limit_for(standard_fee_mojos: u64) -> u64 {
+        // `saturating_mul` saturates toward `u64::MAX`, which is the permissive direction for a
+        // spend ceiling (a `checked_mul` refusal, or a `min` against a sane maximum, would be the
+        // fail-closed direction instead). Left as-is: this fn returns `u64`, not `Result`, and
+        // every caller (`Self::new`, `PersistedEntryWriter::decide`'s `daily_limit_mojos` param)
+        // treats its output as an infallible bound, so making it fail closed ripples into a
+        // signature change here and at both call sites rather than staying a local fix. No
+        // realistic configured fee reaches this overflow (`standard_fee_mojos` would need to
+        // exceed ~u64::MAX / 24), so this is a direction note for the next person to touch this
+        // fn, not a live exploit.
         standard_fee_mojos.saturating_mul(MAX_BUNDLES_PER_DAY)
     }
 
@@ -284,11 +293,23 @@ pub enum PersistedWriteOutcome {
 /// [`EntryWriteScheduler::record_submitted`] documents.
 pub struct PersistedEntryWriter<'a> {
     store: &'a dyn WriteBoundStore,
+    /// Set when [`Self::commit`] observes a `save` error. This is the enforcement of the
+    /// obligation this module's `commit` doc previously stated but never checked: a store where
+    /// `load` succeeds but `save` fails would otherwise keep returning pre-submit state forever,
+    /// so `spent_mojos_today` never accumulates and the daily ceiling silently becomes
+    /// `MAX_BUNDLES_PER_DAY × whatever fee the caller supplies` instead of `× standard_fee`.
+    /// `Cell`, not a plain `bool`, because [`Self::decide`] takes `&self`. There is deliberately
+    /// no clearing method: recovery is a fresh writer after the operator fixes the store — a
+    /// reset path is how a poison flag becomes decorative.
+    poisoned: std::cell::Cell<bool>,
 }
 
 impl<'a> PersistedEntryWriter<'a> {
     pub fn new(store: &'a dyn WriteBoundStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            poisoned: std::cell::Cell::new(false),
+        }
     }
 
     /// Load this distributor's persisted bounds, then decide this cycle's write. Returns the
@@ -307,6 +328,10 @@ impl<'a> PersistedEntryWriter<'a> {
         daily_limit_mojos: u64,
         now: u64,
     ) -> (PersistedWriteOutcome, Option<WriteBoundState>) {
+        if self.poisoned.get() {
+            return (PersistedWriteOutcome::PersistenceUnavailable, None);
+        }
+
         let mut state = match self.store.load(launcher_id) {
             Ok(state) => state,
             Err(_) => return (PersistedWriteOutcome::PersistenceUnavailable, None),
@@ -373,12 +398,18 @@ impl<'a> PersistedEntryWriter<'a> {
     }
 
     /// Persist the state [`Self::decide`] returned, once the caller has confirmed the chain
-    /// accepted the bundle. On `Err`, the caller MUST treat the NEXT cycle as
-    /// `PersistenceUnavailable` too — a save failure means the bounds this submit just advanced
-    /// are not durable, so trusting them in memory afterward would reopen the exact hole this
-    /// seam exists to close.
+    /// accepted the bundle. On `Err`, this writer is POISONED for the rest of its lifetime: every
+    /// subsequent [`Self::decide`] call returns `PersistenceUnavailable` with no state, regardless
+    /// of what `load` would return — a save failure means the bounds this submit just advanced are
+    /// not durable, so trusting them in memory afterward would reopen the exact hole this seam
+    /// exists to close. There is no unpoison method; a fresh writer after the store is fixed is
+    /// the only recovery.
     pub fn commit(&self, launcher_id: Bytes32, state: &WriteBoundState) -> Result<(), StoreError> {
-        self.store.save(launcher_id, state)
+        let result = self.store.save(launcher_id, state);
+        if result.is_err() {
+            self.poisoned.set(true);
+        }
+        result
     }
 }
 
@@ -665,5 +696,74 @@ mod tests {
             Some(&(now + REENTRY_COOLDOWN_SECONDS)),
             "reentry cooldown (§6.3 clause 4) must persist"
         );
+    }
+
+    /// A store whose `load` always succeeds but whose `save` always fails — the save-failure hole
+    /// C6 closes: without the poison flag, `decide` would keep reloading the same never-advanced
+    /// state forever, so `spent_mojos_today` never accumulates and the daily ceiling silently
+    /// becomes `MAX_BUNDLES_PER_DAY × whatever fee the caller supplies`.
+    #[derive(Default)]
+    struct LoadOkSaveErrStore {
+        states: std::sync::Mutex<HashMap<Bytes32, WriteBoundState>>,
+    }
+
+    impl WriteBoundStore for LoadOkSaveErrStore {
+        fn load(&self, launcher_id: Bytes32) -> Result<WriteBoundState, StoreError> {
+            Ok(self
+                .states
+                .lock()
+                .unwrap()
+                .get(&launcher_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn save(&self, _launcher_id: Bytes32, _state: &WriteBoundState) -> Result<(), StoreError> {
+            Err(StoreError("disk full".to_string()))
+        }
+    }
+
+    /// C6: a `commit` failure poisons the writer for its whole lifetime — every subsequent
+    /// `decide` call returns `PersistenceUnavailable` with no state, across at least two
+    /// subsequent cycles (not just the one immediately after), so a single lucky follow-up call
+    /// cannot pass by accident through the rate bound.
+    #[test]
+    fn save_failure_poisons_the_writer_for_every_subsequent_cycle() {
+        let store = LoadOkSaveErrStore::default();
+        let writer = PersistedEntryWriter::new(&store);
+
+        // Cycle 1: load succeeds, decide produces a bundle, commit's save fails.
+        let (outcome, state) = writer.decide(
+            LAUNCHER,
+            vec![remove(PAYOUT_A, LAUNCHER)],
+            100,
+            1_000_000,
+            0,
+        );
+        assert!(matches!(outcome, PersistedWriteOutcome::Bundle { .. }));
+        let commit_result = writer.commit(LAUNCHER, &state.expect("decide returns state"));
+        assert!(commit_result.is_err(), "the fake store's save always fails");
+
+        // Cycle 2: poisoned — no load, no bundle, regardless of rate/cooldown state.
+        let (outcome_2, state_2) = writer.decide(
+            LAUNCHER,
+            vec![add([9; 32], LAUNCHER)],
+            100,
+            1_000_000,
+            ENTRY_WRITE_MIN_INTERVAL_SECONDS + 1,
+        );
+        assert_eq!(outcome_2, PersistedWriteOutcome::PersistenceUnavailable);
+        assert!(state_2.is_none());
+
+        // Cycle 3: still poisoned — this is the assertion a single-follow-up-call test could miss.
+        let (outcome_3, state_3) = writer.decide(
+            LAUNCHER,
+            vec![add([8; 32], LAUNCHER)],
+            100,
+            1_000_000,
+            2 * ENTRY_WRITE_MIN_INTERVAL_SECONDS + 2,
+        );
+        assert_eq!(outcome_3, PersistedWriteOutcome::PersistenceUnavailable);
+        assert!(state_3.is_none());
     }
 }

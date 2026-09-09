@@ -29,11 +29,14 @@
 //! not add a second, separate protection on top of the rate bound — stated plainly here so nobody
 //! reads this engine as having two independent spend controls when it has one.
 //!
-//! **Eviction**: up to 96 `Remove` actions/day (half of 192, if every bundle is all removals). SPEC
-//! §6.4: `RemoveEntry` settles the entry's full accrued balance, ignoring `payout_threshold` — so
-//! sustained eviction can flush an entire 250-entry set's accrued balance, including sub-threshold
-//! dust that could never otherwise have been claimed, in **~1.3 days** (250 entries / 192
-//! actions-per-day capacity for removals alone).
+//! **Eviction**: if every bundle is all removals, the ceiling is **192 `Remove` actions/day** (24
+//! bundles × 8 actions each) — the same 192-action/day cap stated above, not a fraction of it.
+//! **96/day is a different number: the evict-plus-re-add churn ceiling**, since each churn (evict
+//! one entry, admit a replacement) costs one `Remove` and one `Add`, so 192 actions/day buy at
+//! most 96 churns/day. SPEC §6.4: `RemoveEntry` settles the entry's full accrued balance, ignoring
+//! `payout_threshold` — so sustained churn can flush an entire 250-entry set's accrued balance,
+//! including sub-threshold dust that could never otherwise have been claimed, in **~2.6 days**
+//! (250 entries / 96 churns-per-day).
 
 pub mod admission;
 pub mod challenge;

@@ -37,7 +37,8 @@ pub struct WindowPlan {
 /// `% bound` is modulo-biased: outcomes below `u64::MAX % bound` are drawn very slightly more often
 /// than the rest, by a factor bounded by `bound / 2^64`. At `bound` sizes realistic here (a
 /// resource's byte length, at most a handful of GiB) that bias is on the order of 2^-20 or smaller
-/// — judged inert by both the security and decider gates on this ticket. If this ever needs to
+/// — the decider gate did not judge this in its first round on this ticket, adjudicating it only
+/// afterward as inert (bias ≈ 2⁻³¹). If this ever needs to
 /// tighten (e.g. `bound` grows close to `2^64`), switch to rejection sampling (redraw when
 /// `raw >= bound * (u64::MAX / bound)`); it is a two-line change and this comment marks exactly
 /// where.
