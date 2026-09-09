@@ -203,10 +203,10 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
                 BudgetPhaseResult::Outcome(outcome) => {
                     match &outcome {
                         ClaimOutcome::Submitted { .. } => submitted_this_cycle += 1,
-                        ClaimOutcome::SkippedCycleBudgetExhausted { .. } => {
-                            if first_deferred_this_cycle.is_none() {
-                                first_deferred_this_cycle = Some(claim.launcher_id);
-                            }
+                        ClaimOutcome::SkippedCycleBudgetExhausted { .. }
+                            if first_deferred_this_cycle.is_none() =>
+                        {
+                            first_deferred_this_cycle = Some(claim.launcher_id);
                         }
                         _ => {}
                     }
@@ -1146,7 +1146,11 @@ mod tests {
             1,
             "the high-accrual victim must be the one claimed, regardless of discovery order"
         );
-        assert_eq!(e.status().claims_submitted, 1, "the budget fits exactly one claim");
+        assert_eq!(
+            e.status().claims_submitted,
+            1,
+            "the budget fits exactly one claim"
+        );
         assert_eq!(
             e.status().claims_skipped_cycle_budget,
             10,
@@ -1301,7 +1305,11 @@ mod tests {
         }
         // The healthy distributor claims every cycle, so the surface reads Nominal, not buried.
         assert_eq!(e.status().state, ClaimLoopState::Nominal);
-        assert_eq!(e.status().claims_submitted, 3, "the healthy one claimed all 3 cycles");
+        assert_eq!(
+            e.status().claims_submitted,
+            3,
+            "the healthy one claimed all 3 cycles"
+        );
         assert_eq!(e.status().claims_refused_payout_mismatch, 3);
     }
 

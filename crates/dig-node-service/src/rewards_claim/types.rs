@@ -42,8 +42,11 @@ pub enum ClaimOutcome {
         fee_mojos: u64,
         ceiling_mojos: u64,
     },
-    /// SPEC §12.5 clause 1: no entry slot for our puzzle hash — terminal, non-error. Eviction
-    /// already settled everything owed (SPEC §6.4).
+    /// SPEC v0.1.3 §12.5: no entry slot for our puzzle hash this cycle — terminal for THIS claim
+    /// attempt only, never for the distributor. Eviction already settled everything owed (SPEC
+    /// §6.4), but §12.5 forbids caching an absence any more than a value and forbids a permanent
+    /// per-distributor exclusion set: the loop keeps observing this distributor on §8.6's cadence,
+    /// because a peer can re-enter after eviction (§12.5 clause 2's re-entry path).
     NoEntrySlot { launcher_id: Bytes32 },
     /// SPEC §9.3: the distributor's reserve asset is not `DIG_ASSET_ID` — not ours, dropped.
     NotOurs { launcher_id: Bytes32 },
@@ -171,8 +174,15 @@ pub struct ClaimStatus {
     /// # Defect R2: renamed from `terminal_no_entry_slot`
     /// That name quoted SPEC §12.5 clause 1's "terminal, non-error" language to justify behaviour
     /// that is deliberately non-terminal since the Defect B fix — a doc claim born false in the
-    /// commit that fixed the code. Renamed before #3268 publishes it over RPC; see R1 in the fix
-    /// brief for why clause 1's literal wording is itself the thing under amendment, not this field.
+    /// commit that fixed the code. Renamed before #3268 publishes it over RPC.
+    ///
+    /// SPEC v0.1.3 §12.5 (the amendment R1 flagged as pending is now merged and tagged) confirms
+    /// this reading directly: an absent entry slot is terminal for ONE claim attempt, never for the
+    /// distributor, MUST NOT be cached, and MUST NOT accumulate into a permanent exclusion set —
+    /// this field satisfies v0.1.3 clause 6's "surfaced, not silently absorbed" requirement without
+    /// a tenth named [`ClaimLoopState`] variant: it is a per-cycle count, dated by
+    /// [`Self::last_cycle_at`], reset at the start of every `run_cycle` alongside the other
+    /// per-cycle counters (never a lifetime latch).
     pub no_entry_slot_this_cycle: u32,
     /// Set when a chain call THIS CYCLE returned `ClaimPortError::Other(_)` — reset at the start of
     /// every `run_cycle` (Defect A1: this used to latch true for the rest of the process's life,
