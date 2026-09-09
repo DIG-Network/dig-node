@@ -23,6 +23,15 @@ use super::spec_constants::{
 };
 use std::collections::HashMap;
 
+/// One day in seconds — the window every fee-budget rollover in this module is measured against.
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// The most bundles the §6.3 clause 2 rate bound permits in a day (one per 3,600 s → 24), derived
+/// rather than written as a literal so it cannot drift from the interval it comes from. The daily
+/// fee ceiling is this many standard fees, which is why `mod.rs` states the rate bound and the fee
+/// ceiling are ONE spend control and not two independent ones.
+const MAX_BUNDLES_PER_DAY: u64 = SECONDS_PER_DAY / ENTRY_WRITE_MIN_INTERVAL_SECONDS;
+
 /// Reentry-cooldown key — deliberately `(payout_puzzle_hash, launcher_id)`, never `peer_id`.
 pub type CooldownKey = (Bytes32, Bytes32);
 
@@ -37,14 +46,28 @@ pub struct FeeBudget {
 impl FeeBudget {
     pub fn new(standard_fee_mojos: u64, now: u64) -> Self {
         Self {
-            limit_mojos_per_day: standard_fee_mojos.saturating_mul(24),
+            limit_mojos_per_day: Self::daily_limit_for(standard_fee_mojos),
             spent_mojos_today: 0,
             day_started_at: now,
         }
     }
 
+    /// The SPEC §6.3 daily fee ceiling for an operator's configured standard fee:
+    /// [`MAX_BUNDLES_PER_DAY`] fees' worth.
+    ///
+    /// THE single place this product is formed. A second copy is how one write path ends up
+    /// bounding spend 24× looser than the other while both look internally consistent — and a
+    /// ceiling that is silently 24× too high is indistinguishable from ordinary operation right up
+    /// to the point the operator's XCH is gone. [`PersistedEntryWriter::decide`] therefore takes
+    /// the ALREADY-DERIVED ceiling instead of re-deriving it from a fee: mistaking a fee for a
+    /// ceiling there would fail open, whereas mistaking a ceiling for a fee here fails closed
+    /// (the prover refuses to write, which is exactly what §6.3 clause 3 asks of it).
+    pub fn daily_limit_for(standard_fee_mojos: u64) -> u64 {
+        standard_fee_mojos.saturating_mul(MAX_BUNDLES_PER_DAY)
+    }
+
     fn roll_if_new_day(&mut self, now: u64) {
-        if now.saturating_sub(self.day_started_at) >= 86_400 {
+        if now.saturating_sub(self.day_started_at) >= SECONDS_PER_DAY {
             self.spent_mojos_today = 0;
             self.day_started_at = now;
         }
@@ -272,12 +295,16 @@ impl<'a> PersistedEntryWriter<'a> {
     /// updated (not-yet-persisted) state alongside every non-refusal outcome; the caller MUST
     /// call [`Self::commit`] with that state after the chain confirms a `Bundle` outcome's submit
     /// succeeded. Nothing here submits to the chain.
+    ///
+    /// `daily_limit_mojos` is TODAY'S WHOLE FEE CEILING in mojos, not a per-bundle fee — derive it
+    /// with [`FeeBudget::daily_limit_for`] so this path and the in-memory [`FeeBudget`] cannot
+    /// bound the same spend differently. `fee_mojos` is what THIS bundle would cost.
     pub fn decide(
         &self,
         launcher_id: Bytes32,
         decisions: Vec<EntryAction>,
         fee_mojos: u64,
-        standard_fee_mojos: u64,
+        daily_limit_mojos: u64,
         now: u64,
     ) -> (PersistedWriteOutcome, Option<WriteBoundState>) {
         let mut state = match self.store.load(launcher_id) {
@@ -285,7 +312,7 @@ impl<'a> PersistedEntryWriter<'a> {
             Err(_) => return (PersistedWriteOutcome::PersistenceUnavailable, None),
         };
 
-        if now.saturating_sub(state.day_started_at) >= 86_400 {
+        if now.saturating_sub(state.day_started_at) >= SECONDS_PER_DAY {
             state.spent_mojos_today = 0;
             state.day_started_at = now;
         }
@@ -306,7 +333,6 @@ impl<'a> PersistedEntryWriter<'a> {
             );
         }
 
-        let daily_limit_mojos = standard_fee_mojos.saturating_mul(24);
         if state.spent_mojos_today.saturating_add(fee_mojos) > daily_limit_mojos {
             return (
                 PersistedWriteOutcome::FeeBudgetExhausted {
@@ -591,6 +617,53 @@ mod tests {
         assert_eq!(
             cap_outcome,
             PersistedWriteOutcome::FeeBudgetExhausted { count: 1 }
+        );
+    }
+
+    /// The GENERAL form of the bug the restart test above catches one instance of: `decide` +
+    /// `commit` must round-trip EVERY field of [`WriteBoundState`], not only the fields whichever
+    /// scenario test happens to inspect. A seam that carries `last_bundle_sent_at` and
+    /// `cooldown_until` but silently drops `spent_mojos_today` passes every per-cycle check and
+    /// drains the operator's XCH one restart at a time. So: field by field, each with a distinct
+    /// non-zero value, so no dropped field can hide behind a plausible-looking zero.
+    #[test]
+    fn decide_then_commit_persists_every_write_bound_field() {
+        let store = FakeStore::default();
+        let writer = PersistedEntryWriter::new(&store);
+
+        // A clock exactly one day in rolls the loaded (default, all-zero) state's day window over,
+        // so `day_started_at` lands on a non-zero value of its own rather than staying at 0.
+        let now = SECONDS_PER_DAY;
+        let (outcome, state) = writer.decide(
+            LAUNCHER,
+            vec![remove(PAYOUT_A, LAUNCHER)],
+            250,
+            1_000_000,
+            now,
+        );
+        assert!(matches!(outcome, PersistedWriteOutcome::Bundle { .. }));
+        writer
+            .commit(LAUNCHER, &state.expect("decide returns state on success"))
+            .unwrap();
+
+        let persisted = store.load(LAUNCHER).unwrap();
+        assert_eq!(
+            persisted.last_bundle_sent_at,
+            Some(now),
+            "rate bound (§6.3 clause 2) must persist"
+        );
+        assert_eq!(
+            persisted.spent_mojos_today, 250,
+            "fee budget (§6.3 clause 3) — the field a restart loop drains"
+        );
+        assert_eq!(
+            persisted.day_started_at, now,
+            "the day window the spend is measured against must persist with it"
+        );
+        assert_eq!(
+            persisted.cooldown_until.get(&(PAYOUT_A, LAUNCHER)),
+            Some(&(now + REENTRY_COOLDOWN_SECONDS)),
+            "reentry cooldown (§6.3 clause 4) must persist"
         );
     }
 }
