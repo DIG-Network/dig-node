@@ -192,8 +192,10 @@ pub struct ClaimStatus {
     /// distributor, MUST NOT be cached, and MUST NOT accumulate into a permanent exclusion set —
     /// this field satisfies v0.1.3 clause 6's "surfaced, not silently absorbed" requirement without
     /// a tenth named [`ClaimLoopState`] variant: it is a per-cycle count, dated by
-    /// [`Self::last_cycle_at`], reset at the start of every `run_cycle` alongside the other
-    /// per-cycle counters (never a lifetime latch).
+    /// [`Self::last_attempt_at`] -- the field stamped unconditionally every cycle, the true
+    /// analogue of §2.3's `observed_at` -- and reset at the TOP of every `run_cycle` alongside the
+    /// other per-cycle counters, before any early return, so a stalled writer can never leave a
+    /// stale count sitting under a fresh timestamp (never a lifetime latch).
     pub no_entry_slot_this_cycle: u32,
     /// Set when a chain call THIS CYCLE returned `ClaimPortError::Other(_)` — reset at the start of
     /// every `run_cycle` (Defect A1: this used to latch true for the rest of the process's life,

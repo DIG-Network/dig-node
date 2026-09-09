@@ -19,7 +19,8 @@
 //!
 //! # The chain seam
 //!
-//! `dig-rewards-coin` is SPEC-only at v0.1.1 (`src/` is `error.rs` + `lib.rs`); its driver is
+//! `dig-rewards-coin` is v0.1.3, published on crates.io, and still SPEC-only (`src/` is
+//! `error.rs` + `lib.rs`); its driver is
 //! DIG-Network/dig_ecosystem#3249, still open. So the whole engine here is built against the narrow
 //! [`ClaimChainPort`] trait derived from the SPEC's described surface, tested with a full in-memory
 //! fake, and the production adapter — until #3249 ships — is [`UnavailableClaimChainPort`], which
