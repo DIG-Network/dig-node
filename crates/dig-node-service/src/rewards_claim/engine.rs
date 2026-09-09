@@ -2011,7 +2011,10 @@ mod tests {
             1,
             "the one candidate must have been evaluated, or this proves nothing about its fee"
         );
-        assert!(matches!(outcomes[0], ClaimOutcome::PayoutPuzzleHashMismatch { .. }).not(),);
+        assert!(!matches!(
+            outcomes[0],
+            ClaimOutcome::PayoutPuzzleHashMismatch { .. }
+        ));
 
         let persisted = RewardsClaimConfig::load_from(dir.path());
         assert_eq!(
