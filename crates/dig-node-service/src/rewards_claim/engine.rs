@@ -185,35 +185,10 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         self.status.no_entry_slot_this_cycle = 0;
         self.status.last_attempt_at = Some(now);
 
-        // F7: the cadence gate and the persisted budget window -- both keyed off
-        // `self.fee_window_state_dir`, so a caller that never opted in via
-        // `with_persisted_fee_window` sees no change at all (every pre-F7 test).
-        if self.fee_window_state_dir.is_some() {
-            // Refuse to START a cycle until the cadence has elapsed since the last one that ran
-            // to completion -- stops a restart loop from immediately re-running a cycle that
-            // already ran, independent of whether the fee window below has room left.
-            if let Some(last_completed) = self.last_cycle_completed_at {
-                if now.saturating_sub(last_completed) < self.cadence_seconds {
-                    return Vec::new();
-                }
-            }
-            // The aggregate budget is enforced against this window, never a per-`run_cycle`
-            // local: roll a fresh window only once the cadence has elapsed since it opened,
-            // otherwise keep accumulating into what is already spent in it.
-            let window_still_open = self
-                .fee_window_start_unix
-                .is_some_and(|start| now.saturating_sub(start) < self.cadence_seconds);
-            if !window_still_open {
-                self.fee_window_start_unix = Some(now);
-                self.fee_spent_in_window_mojos = 0;
-                self.persist_fee_window();
-            }
-        }
-        let mut spent_this_cycle_mojos = if self.fee_window_state_dir.is_some() {
-            self.fee_spent_in_window_mojos
-        } else {
-            0
-        };
+        // RED-PROOF REVERT (scratch/f7-red-proof-2, not for merge): the F7 cadence gate and
+        // persisted-window seed are disabled here on purpose, to observe the pre-fix defect
+        // reproduce. `spent_this_cycle_mojos` starts at 0 every call, exactly as pre-F7.
+        let mut spent_this_cycle_mojos = 0u64;
         let mut budget_exhausted = false;
 
         let mut discovery_failed = false;
@@ -535,17 +510,8 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             });
         }
 
-        // F7: write-then-spend, never spend-then-write. If persistence is armed, the fee this
-        // submission is about to cost is committed to disk BEFORE the chain call, not after --
-        // so a crash between "we decided to spend" and the chain call returning can never leave
-        // an unpersisted spend that a restart would repeat. Conservative in the failure direction
-        // only: a submission that ultimately errors still counts against the persisted window,
-        // even though `spent_this_cycle_mojos` below (the in-cycle running total the NEXT
-        // candidate's budget check reads) only advances on a confirmed `Ok`, exactly as before F7.
-        if self.fee_window_state_dir.is_some() {
-            self.fee_spent_in_window_mojos += fee;
-            self.persist_fee_window();
-        }
+        // RED-PROOF REVERT (scratch/f7-red-proof-2, not for merge): write-then-spend
+        // persistence disabled here on purpose, so the pre-fix defect reproduces.
 
         match self
             .port
