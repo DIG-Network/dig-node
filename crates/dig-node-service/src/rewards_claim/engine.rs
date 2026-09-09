@@ -91,9 +91,12 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// (Defect B2) within the per-claim ceiling AND the per-cycle aggregate fee budget. Returns
     /// every outcome, one per evaluated distributor.
     pub async fn run_cycle(&mut self, now: u64) -> Vec<ClaimOutcome> {
-        // Defect A1/A4: per-cycle fields are reset here, not carried over — a fault or a claim count
-        // from a PAST cycle must never leak into this cycle's reading of `compute_state()`.
+        // Defect A1/A4/F1: per-cycle fields are reset here, not carried over — a fault or a claim
+        // count from a PAST cycle must never leak into this cycle's reading of `compute_state()`.
+        // F1: `chain_unavailable_this_cycle` joins this reset -- it must never persist past the
+        // cycle it was observed in (see `ClaimStatus::chain_unavailable_this_cycle`'s doc).
         self.status.fault_reported = false;
+        self.status.chain_unavailable_this_cycle = false;
         self.status.payout_hash_mismatches_this_cycle = 0;
         self.status.last_attempt_at = Some(now);
         let mut spent_this_cycle_mojos = 0u64;
@@ -103,6 +106,8 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         let discovered = match self.port.discover_distributors().await {
             Ok(v) => v,
             Err(ClaimPortError::Unavailable) => {
+                // F1: per-cycle only — never a latch. See `ClaimStatus::chain_unavailable_this_cycle`.
+                self.status.chain_unavailable_this_cycle = true;
                 self.status.state = ClaimLoopState::ChainSourceUnavailable;
                 return Vec::new();
             }
@@ -153,6 +158,7 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             match self.evaluate_pre_budget(launcher_id).await {
                 PreBudgetResult::Fault => faulted += 1,
                 PreBudgetResult::ChainUnavailable => {
+                    self.status.chain_unavailable_this_cycle = true;
                     self.status.state = ClaimLoopState::ChainSourceUnavailable;
                     return outcomes;
                 }
@@ -197,6 +203,7 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             {
                 BudgetPhaseResult::Fault => faulted += 1,
                 BudgetPhaseResult::ChainUnavailable => {
+                    self.status.chain_unavailable_this_cycle = true;
                     self.status.state = ClaimLoopState::ChainSourceUnavailable;
                     return outcomes;
                 }
@@ -238,9 +245,10 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         if !discovery_failed && !all_faulted_cycle {
             self.status.last_cycle_at = Some(now);
         }
-        if self.status.state != ClaimLoopState::ChainSourceUnavailable {
-            self.status.state = self.status.compute_state();
-        }
+        // F1: unconditional now -- `compute_state` reads `chain_unavailable_this_cycle` (reset at
+        // the top of this function), never `self.state`, so the old "don't overwrite a latch" guard
+        // is gone along with the latch itself.
+        self.status.state = self.status.compute_state();
         outcomes
     }
 
@@ -1334,6 +1342,112 @@ mod tests {
         assert_eq!(e.status().claims_submitted, 0);
         assert_eq!(e.status().distributors_known, 0);
         assert!(e.status().last_cycle_at.is_none(), "no cycle completed");
+    }
+
+    /// A discovery port that answers `Unavailable` on its FIRST call only, then delegates every
+    /// call (including later `discover_distributors` calls) to a healthy inner `FakeChainPort` --
+    /// modelling a node still syncing, or one dropped connection, exactly as F1 describes.
+    struct FlakyThenHealthyPort {
+        calls: Mutex<u32>,
+        inner: FakeChainPort,
+    }
+
+    #[async_trait]
+    impl ClaimChainPort for FlakyThenHealthyPort {
+        async fn discover_distributors(
+            &self,
+        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                return Err(ClaimPortError::Unavailable);
+            }
+            drop(calls);
+            self.inner.discover_distributors().await
+        }
+        async fn resolve_launch_comment(
+            &self,
+            launcher_id: Bytes32,
+        ) -> Result<Option<DiscoveredDistributor>, ClaimPortError> {
+            self.inner.resolve_launch_comment(launcher_id).await
+        }
+        async fn reserve_asset_id(&self, launcher_id: Bytes32) -> Result<Bytes32, ClaimPortError> {
+            self.inner.reserve_asset_id(launcher_id).await
+        }
+        async fn payout_threshold(&self, launcher_id: Bytes32) -> Result<u64, ClaimPortError> {
+            self.inner.payout_threshold(launcher_id).await
+        }
+        async fn own_entry(
+            &self,
+            launcher_id: Bytes32,
+            payout_puzzle_hash: Bytes32,
+        ) -> Result<Option<super::super::types::OwnEntry>, ClaimPortError> {
+            self.inner.own_entry(launcher_id, payout_puzzle_hash).await
+        }
+        async fn required_fee_mojos(&self, launcher_id: Bytes32) -> Result<u64, ClaimPortError> {
+            self.inner.required_fee_mojos(launcher_id).await
+        }
+        async fn submit_initiate_payout(
+            &self,
+            launcher_id: Bytes32,
+            payout_puzzle_hash: Bytes32,
+            fee_mojos: u64,
+        ) -> Result<(), ClaimPortError> {
+            self.inner
+                .submit_initiate_payout(launcher_id, payout_puzzle_hash, fee_mojos)
+                .await
+        }
+    }
+
+    /// **F1 regression -- the anti-latch test.** `ChainSourceUnavailable` must be a PER-CYCLE
+    /// reading, never a process-lifetime latch. Cycle 1 hits the transient `Unavailable` port path
+    /// and must report it honestly; cycle 2, once the chain answers again, MUST read `Nominal` --
+    /// not the stale `ChainSourceUnavailable` from cycle 1 -- because a real claim submits.
+    #[tokio::test]
+    async fn a_transient_unavailable_cycle_does_not_latch_state_for_the_rest_of_the_process() {
+        let distributor = one_distributor(
+            Some(super::super::types::OwnEntry {
+                payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+                counter: 0,
+                accrued_base_units: 5_000,
+            }),
+            1_000,
+            10,
+        );
+        let launcher_id = distributor.launcher_id;
+        let port = FlakyThenHealthyPort {
+            calls: Mutex::new(0),
+            inner: FakeChainPort::new(vec![distributor]),
+        };
+        let mut e = ClaimEngine::new(
+            port,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        );
+
+        let outcomes = e.run_cycle(1_000).await;
+        assert!(outcomes.is_empty(), "cycle 1: no chain, no outcomes");
+        assert_eq!(
+            e.status().state,
+            ClaimLoopState::ChainSourceUnavailable,
+            "cycle 1: the transient unavailability must be reported honestly"
+        );
+
+        let outcomes = e.run_cycle(2_000).await;
+        assert_eq!(
+            outcomes,
+            vec![ClaimOutcome::Submitted { launcher_id }],
+            "cycle 2: the chain is healthy and a real claim is submitted"
+        );
+        assert_eq!(
+            e.status().state,
+            ClaimLoopState::Nominal,
+            "cycle 2 MUST NOT still read ChainSourceUnavailable -- that is a process-lifetime \
+             latch on the very state whose whole point is to be a live reading"
+        );
     }
 
     /// The launch-comment parser wired end-to-end: what `resolve_launch_comment` would produce for

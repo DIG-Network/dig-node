@@ -78,6 +78,14 @@ pub enum ClaimOutcome {
 /// the cycle happened to be claimable. Only once no fault is live can `ClaimableButNotClaiming`
 /// or `Nominal` apply.
 ///
+/// # F1: `ChainSourceUnavailable` is a per-cycle reading, never a latch
+/// This used to be decided by comparing against `self.state` -- LAST cycle's computed reading --
+/// so once any cycle took an `Unavailable` port path, every later cycle's `compute_state` saw its
+/// own prior verdict and re-asserted it forever, even after the chain came back and real claims
+/// were submitting. [`ClaimStatus::chain_unavailable_this_cycle`] fixes this: reset to `false` at
+/// the top of every `run_cycle`, set `true` only on a cycle that actually took the `Unavailable`
+/// path this cycle. `compute_state` reads that flag, never `self.state`.
+///
 /// # Defect B3: a per-distributor problem must never set the cycle-wide fault
 /// `Faulted` used to also fire on [`ClaimOutcome::PayoutPuzzleHashMismatch`] — a single hostile or
 /// buggy ENTRY ROW pinned the whole surface at `Faulted` indefinitely (non-terminal, so it recurred
@@ -123,6 +131,9 @@ pub enum ClaimLoopState {
 /// whether this loop is actually doing anything, never a boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimStatus {
+    /// F1: set when THIS cycle actually took an `Unavailable` port path -- reset to `false` at the
+    /// top of every `run_cycle`, never latched. See [`ClaimLoopState`]'s "F1" doc section.
+    pub chain_unavailable_this_cycle: bool,
     pub distributors_known: u32,
     pub distributors_with_own_entry: u32,
     /// Computed independently of whether a submission actually happened this cycle — an
@@ -197,6 +208,7 @@ pub struct ClaimStatus {
 impl Default for ClaimStatus {
     fn default() -> Self {
         ClaimStatus {
+            chain_unavailable_this_cycle: false,
             distributors_known: 0,
             distributors_with_own_entry: 0,
             distributors_claimable: 0,
@@ -229,9 +241,14 @@ impl ClaimStatus {
     /// `ClaimableButNotClaiming` > `Idle` > `Nominal`. See [`ClaimLoopState`]'s doc for why a fault
     /// must never be absorbed into `Nominal` (Defect A1) and why a per-distributor fault (Defect B3)
     /// must never set it.
+    ///
+    /// # F1: reads `chain_unavailable_this_cycle`, never `self.state`
+    /// The old guard compared against `self.state` -- last cycle's OWN computed output -- which
+    /// made `ChainSourceUnavailable` a process-lifetime latch (see [`ClaimLoopState`]'s "F1" doc
+    /// section). `chain_unavailable_this_cycle` is reset every cycle, so this reading is live.
     #[must_use]
     pub fn compute_state(&self) -> ClaimLoopState {
-        if self.state == ClaimLoopState::ChainSourceUnavailable {
+        if self.chain_unavailable_this_cycle {
             return ClaimLoopState::ChainSourceUnavailable;
         }
         if self.last_attempt_at.is_none() && self.last_cycle_at.is_none() {
@@ -375,12 +392,35 @@ mod tests {
             claims_submitted: 0,
             fault_reported: false,
             last_cycle_at: Some(1),
-            state: ClaimLoopState::ChainSourceUnavailable,
+            chain_unavailable_this_cycle: true,
             ..ClaimStatus::default()
         };
         assert_eq!(
             status.compute_state(),
             ClaimLoopState::ChainSourceUnavailable
+        );
+    }
+
+    /// F1 regression at the `compute_state` level: a PAST cycle's `ChainSourceUnavailable` must
+    /// never leak into THIS cycle's reading once `chain_unavailable_this_cycle` is false again --
+    /// proving the fix reads the per-cycle flag, never `self.state` (which this struct literal
+    /// deliberately still carries as `ChainSourceUnavailable`, simulating what a stale `self.state`
+    /// would look like if the old guard were still in place).
+    #[test]
+    fn a_past_cycles_chain_unavailable_state_does_not_latch_the_next_computation() {
+        let status = ClaimStatus {
+            distributors_claimable: 1,
+            claims_submitted_this_cycle: 1,
+            fault_reported: false,
+            last_cycle_at: Some(2),
+            chain_unavailable_this_cycle: false,
+            state: ClaimLoopState::ChainSourceUnavailable,
+            ..ClaimStatus::default()
+        };
+        assert_eq!(
+            status.compute_state(),
+            ClaimLoopState::Nominal,
+            "chain_unavailable_this_cycle is false this cycle -- a stale self.state must not win"
         );
     }
 
