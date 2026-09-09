@@ -89,6 +89,33 @@ pub struct RewardsClaimConfig {
     /// field existed, which is the same as `None` (no rotation history yet).
     #[serde(default)]
     pub rotation_cursor: Option<Bytes32>,
+
+    /// F7: the start (unix seconds) of the CURRENT aggregate-fee-budget window. Read alongside
+    /// [`Self::fee_spent_in_window_mojos`] to decide, on each cycle, whether the window has rolled
+    /// over (`now - fee_window_start_unix >= cadence_seconds`) or whether spend must keep
+    /// accumulating into it. `None` until the first cycle ever runs; absent from a config written
+    /// before this field existed, which is the same as `None` (no window has started yet, so the
+    /// next cycle starts one fresh rather than reading a fabricated "already spent" history).
+    #[serde(default)]
+    pub fee_window_start_unix: Option<u64>,
+
+    /// F7: fee mojos already spent inside [`Self::fee_window_start_unix`]'s window. This is the
+    /// field that actually bounds a crash-restart loop: without it, every fresh process starts
+    /// this at zero and re-grants a full [`Self::max_cycle_fee_budget_mojos`] on every restart, no
+    /// matter how many restarts happen inside one cadence period. Defaults to `0` — a config
+    /// written before this field existed had spent nothing in a window that did not exist either.
+    #[serde(default)]
+    pub fee_spent_in_window_mojos: u64,
+
+    /// F7: the unix-second timestamp of the last cycle that ran to completion. The cadence gate
+    /// (`now - last_cycle_completed_at < cadence_seconds`) refuses to START a new cycle at all
+    /// until the cadence has genuinely elapsed since this time, so a crash-restart loop cannot
+    /// immediately re-run a cycle that already ran, independent of the fee-window check above.
+    /// `None` until the first cycle ever completes; absent from a config written before this field
+    /// existed is the same as `None` (no completed cycle on record, so the next cycle is allowed to
+    /// run immediately -- the honest reading for a node that has never run this loop before).
+    #[serde(default)]
+    pub last_cycle_completed_at: Option<u64>,
 }
 
 fn default_enabled() -> bool {
@@ -120,6 +147,9 @@ impl Default for RewardsClaimConfig {
             max_fee_mojos: default_max_fee_mojos(),
             max_cycle_fee_budget_mojos: default_max_cycle_fee_budget_mojos(),
             rotation_cursor: None,
+            fee_window_start_unix: None,
+            fee_spent_in_window_mojos: 0,
+            last_cycle_completed_at: None,
         }
     }
 }
@@ -220,6 +250,9 @@ mod tests {
             max_fee_mojos: 150_000,
             max_cycle_fee_budget_mojos: 900_000,
             rotation_cursor: None,
+            fee_window_start_unix: None,
+            fee_spent_in_window_mojos: 0,
+            last_cycle_completed_at: None,
         };
         cfg.save_to(dir.path()).expect("save");
 
@@ -246,6 +279,27 @@ mod tests {
 
         let loaded = RewardsClaimConfig::load_from(dir.path());
         assert_eq!(loaded.rotation_cursor, Some(cursor));
+        assert_eq!(loaded, cfg);
+    }
+
+    /// F7: the persisted fee-window fields must round-trip through save/load exactly like every
+    /// other field -- this is the state a restart reads back to avoid re-granting a fresh budget.
+    #[test]
+    fn the_fee_window_fields_survive_a_save_load_round_trip() {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-rewards-claim-fee-window-test-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let cfg = RewardsClaimConfig {
+            fee_window_start_unix: Some(1_000),
+            fee_spent_in_window_mojos: 1_500_000,
+            last_cycle_completed_at: Some(1_000),
+            ..RewardsClaimConfig::default()
+        };
+        cfg.save_to(dir.path()).expect("save");
+
+        let loaded = RewardsClaimConfig::load_from(dir.path());
         assert_eq!(loaded, cfg);
     }
 
