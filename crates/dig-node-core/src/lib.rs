@@ -6287,7 +6287,7 @@ mod tests {
                 inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
                 mirror_pointers: OnceLock::new(),
-            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+                reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -6365,7 +6365,7 @@ mod tests {
                 inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
                 mirror_pointers: OnceLock::new(),
-            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+                reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -9132,11 +9132,25 @@ mod tests {
         assert_eq!(counters["total_paid_out_base_units"], json!(88));
 
         // No health boolean, no precomputed staleness (SPEC §2.4) — by KEY SET, not substring.
-        let keys: std::collections::BTreeSet<&str> =
-            s.as_object().expect("status is an object").keys().map(String::as_str).collect();
-        for banned in ["alive", "healthy", "ok", "up", "running", "stale", "seconds_since_last_run"]
-        {
-            assert!(!keys.contains(banned), "banned key {banned:?} present: {keys:?}");
+        let keys: std::collections::BTreeSet<&str> = s
+            .as_object()
+            .expect("status is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for banned in [
+            "alive",
+            "healthy",
+            "ok",
+            "up",
+            "running",
+            "stale",
+            "seconds_since_last_run",
+        ] {
+            assert!(
+                !keys.contains(banned),
+                "banned key {banned:?} present: {keys:?}"
+            );
         }
     }
 
@@ -9159,7 +9173,11 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         ));
 
-        assert_eq!(resp["result"], json!({"statuses": []}), "explicit empty list: {resp}");
+        assert_eq!(
+            resp["result"],
+            json!({"statuses": []}),
+            "explicit empty list: {resp}"
+        );
     }
 
     /// **Proves:** an all-zero `launcher_id` — what an uninitialised/never-assigned registry slot
@@ -9195,7 +9213,11 @@ mod tests {
         let statuses = resp["result"]["statuses"]
             .as_array()
             .expect("result.statuses is an array");
-        assert_eq!(statuses.len(), 1, "the zero-id entry must be omitted: {resp}");
+        assert_eq!(
+            statuses.len(),
+            1,
+            "the zero-id entry must be omitted: {resp}"
+        );
         assert_eq!(statuses[0]["launcher_id"], json!(hex::encode(real_id)));
     }
 
@@ -9221,7 +9243,10 @@ mod tests {
             Method::from_name("dig.getRewardProverStatus"),
             Some(Method::GetRewardProverStatus)
         );
-        assert_eq!(Method::GetRewardProverStatus.tier(), dig_rpc_protocol::Tier::Control);
+        assert_eq!(
+            Method::GetRewardProverStatus.tier(),
+            dig_rpc_protocol::Tier::Control
+        );
     }
 
     /// **Proves:** `dig.getRewardProverStatus` restricts to the requested `launcher_id` when the
