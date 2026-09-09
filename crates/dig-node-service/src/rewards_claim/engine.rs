@@ -33,6 +33,15 @@ pub struct ClaimEngine<P, H> {
     cycle_fee_budget_mojos: u64,
     dig_asset_id: Bytes32,
     status: ClaimStatus,
+    /// Defect B2: which launcher id the per-cycle budget cut off LAST, so the next cycle gives that
+    /// one first crack instead of it being permanently outranked. This only breaks TIES among
+    /// candidates with equal accrued value (see [`Self::order_for_budget`]) — it can never let a
+    /// lower-accrued distributor (an attacker's dust) jump ahead of a genuinely higher-earning one,
+    /// because accrued value is always the primary sort key. `None` until a cycle first defers
+    /// someone for budget. Persisted alongside [`super::config::RewardsClaimConfig`] (via
+    /// [`Self::with_rotation_cursor`] / [`Self::rotation_cursor`]) so a restart does not re-arm a
+    /// fresh queue and starve the tail forever.
+    rotation_cursor: Option<Bytes32>,
 }
 
 impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
@@ -52,7 +61,24 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             cycle_fee_budget_mojos,
             dig_asset_id,
             status: ClaimStatus::default(),
+            rotation_cursor: None,
         }
+    }
+
+    /// Restores the per-cycle budget rotation cursor (Defect B2) from persisted state — the
+    /// production wiring (DIG-Network/dig_ecosystem#3268) loads it from
+    /// [`super::config::RewardsClaimConfig`] alongside the rest of this loop's preferences.
+    #[must_use]
+    pub fn with_rotation_cursor(mut self, cursor: Option<Bytes32>) -> Self {
+        self.rotation_cursor = cursor;
+        self
+    }
+
+    /// The current budget rotation cursor (Defect B2) — persist this after every `run_cycle` so a
+    /// restart resumes the rotation instead of restarting it and re-starving the same tail.
+    #[must_use]
+    pub fn rotation_cursor(&self) -> Option<Bytes32> {
+        self.rotation_cursor
     }
 
     #[must_use]
@@ -61,13 +87,14 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     }
 
     /// Run one cycle: discover candidates (chain + re-derived hints), evaluate each against SPEC
-    /// §9.3/§8.3/§12.5, and submit a claim for every one that clears the per-claim threshold, the
-    /// per-claim fee ceiling AND the per-cycle aggregate fee budget. Returns every outcome, one per
-    /// evaluated distributor.
+    /// §9.3/§8.3/§12.5, then claim from the above-threshold set in DESCENDING ACCRUED-VALUE ORDER
+    /// (Defect B2) within the per-claim ceiling AND the per-cycle aggregate fee budget. Returns
+    /// every outcome, one per evaluated distributor.
     pub async fn run_cycle(&mut self, now: u64) -> Vec<ClaimOutcome> {
         // Defect A1/A4: per-cycle fields are reset here, not carried over — a fault or a claim count
         // from a PAST cycle must never leak into this cycle's reading of `compute_state()`.
         self.status.fault_reported = false;
+        self.status.payout_hash_mismatches_this_cycle = 0;
         self.status.last_attempt_at = Some(now);
         let mut spent_this_cycle_mojos = 0u64;
         let mut budget_exhausted = false;
@@ -112,44 +139,85 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
 
         let mut outcomes = Vec::new();
         let mut with_entry = 0u32;
-        let mut claimable = 0u32;
         let mut faulted = 0u32;
         let mut submitted_this_cycle = 0u64;
         let mut no_entry_this_cycle = 0u32;
+        let mut eligible: Vec<EligibleClaim> = Vec::new();
 
+        // Phase 1: everything up to (and including) the payout-threshold check, for every
+        // candidate — none of this touches the per-cycle budget. Above-threshold candidates become
+        // `Eligible` and move to phase 2 instead of being decided here.
         for launcher_id in candidates {
             // Defect B: no permanent blacklist skip here — every candidate is re-evaluated every
             // cycle, including one that reported `NoEntrySlot` on a prior cycle.
-            match self
-                .evaluate_one(
-                    launcher_id,
-                    &mut spent_this_cycle_mojos,
-                    &mut budget_exhausted,
-                )
-                .await
-            {
-                EvalResult::Fault => {
-                    faulted += 1;
+            match self.evaluate_pre_budget(launcher_id).await {
+                PreBudgetResult::Fault => faulted += 1,
+                PreBudgetResult::ChainUnavailable => {
+                    self.status.state = ClaimLoopState::ChainSourceUnavailable;
+                    return outcomes;
                 }
-                EvalResult::Outcome(outcome, entry_seen, was_claimable) => {
+                PreBudgetResult::Eligible {
+                    launcher_id,
+                    accrued_base_units,
+                } => {
+                    with_entry += 1;
+                    eligible.push(EligibleClaim {
+                        launcher_id,
+                        accrued_base_units,
+                    });
+                }
+                PreBudgetResult::Outcome(outcome, entry_seen) => {
                     if entry_seen {
                         with_entry += 1;
                     }
-                    if was_claimable {
-                        claimable += 1;
+                    if let ClaimOutcome::NoEntrySlot { .. } = &outcome {
+                        no_entry_this_cycle += 1;
                     }
+                    outcomes.push(outcome);
+                }
+            }
+        }
+
+        // Defect B1/E: every `Eligible` candidate is claimable regardless of what phase 2 later
+        // decides for it (submitted, ceiling-skipped or budget-skipped all count) — matching what
+        // `distributors_claimable` always meant here.
+        let claimable = u32::try_from(eligible.len()).unwrap_or(u32::MAX);
+
+        // Phase 2: order by accrued value DESCENDING (Defect B2) — an attacker's dust distributors
+        // (our own entry there accrues little to nothing) always sort behind a victim's genuine
+        // earnings, regardless of the fee the attacker sets. The persisted rotation cursor only
+        // breaks TIES within an accrued-value tier, so it can never let a lower-value distributor
+        // displace a higher-value one; see `Self::order_for_budget`.
+        let ordered = self.order_for_budget(eligible);
+        let mut first_deferred_this_cycle: Option<Bytes32> = None;
+        for claim in &ordered {
+            match self
+                .evaluate_budget_phase(claim, &mut spent_this_cycle_mojos, &mut budget_exhausted)
+                .await
+            {
+                BudgetPhaseResult::Fault => faulted += 1,
+                BudgetPhaseResult::ChainUnavailable => {
+                    self.status.state = ClaimLoopState::ChainSourceUnavailable;
+                    return outcomes;
+                }
+                BudgetPhaseResult::Outcome(outcome) => {
                     match &outcome {
-                        ClaimOutcome::NoEntrySlot { .. } => no_entry_this_cycle += 1,
                         ClaimOutcome::Submitted { .. } => submitted_this_cycle += 1,
+                        ClaimOutcome::SkippedCycleBudgetExhausted { .. } => {
+                            if first_deferred_this_cycle.is_none() {
+                                first_deferred_this_cycle = Some(claim.launcher_id);
+                            }
+                        }
                         _ => {}
                     }
                     outcomes.push(outcome);
                 }
-                EvalResult::ChainUnavailable => {
-                    self.status.state = ClaimLoopState::ChainSourceUnavailable;
-                    return outcomes;
-                }
             }
+        }
+        // Defect B2: advance the rotation cursor to whoever the budget cut off FIRST this cycle, so
+        // that one gets first crack next cycle instead of the same tail being dropped every time.
+        if let Some(deferred) = first_deferred_this_cycle {
+            self.rotation_cursor = Some(deferred);
         }
 
         // Defect A4: an all-faulted cycle (candidates existed, discovery succeeded, but every one of
@@ -161,7 +229,7 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         self.status.distributors_faulted = faulted;
         self.status.claims_submitted += submitted_this_cycle;
         self.status.claims_submitted_this_cycle = submitted_this_cycle;
-        self.status.terminal_no_entry_slot = no_entry_this_cycle;
+        self.status.no_entry_slot_this_cycle = no_entry_this_cycle;
         self.status.consecutive_faulted_cycles = if self.status.fault_reported {
             self.status.consecutive_faulted_cycles + 1
         } else {
@@ -176,23 +244,21 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         outcomes
     }
 
-    async fn evaluate_one(
-        &mut self,
-        launcher_id: Bytes32,
-        spent_this_cycle_mojos: &mut u64,
-        budget_exhausted: &mut bool,
-    ) -> EvalResult {
+    /// Everything up to and including the payout-threshold check (SPEC §9.3, §12.5, §8.6) — none of
+    /// it depends on, or affects, the per-cycle budget. An above-threshold, hash-matching entry
+    /// becomes `Eligible` and is decided in [`Self::evaluate_budget_phase`] instead.
+    async fn evaluate_pre_budget(&mut self, launcher_id: Bytes32) -> PreBudgetResult {
         let asset = match self.port.reserve_asset_id(launcher_id).await {
             Ok(a) => a,
-            Err(ClaimPortError::Unavailable) => return EvalResult::ChainUnavailable,
+            Err(ClaimPortError::Unavailable) => return PreBudgetResult::ChainUnavailable,
             Err(ClaimPortError::Other(_)) => {
                 self.status.fault_reported = true;
-                return EvalResult::Fault;
+                return PreBudgetResult::Fault;
             }
         };
         if asset != self.dig_asset_id {
             // SPEC §9.3: not ours, dropped — not counted as known/claimable.
-            return EvalResult::Outcome(ClaimOutcome::NotOurs { launcher_id }, false, false);
+            return PreBudgetResult::Outcome(ClaimOutcome::NotOurs { launcher_id }, false);
         }
 
         // SPEC §12.5 clause 3: re-read the entry slot fresh on EVERY call — never cached.
@@ -203,75 +269,118 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         {
             Ok(Some(e)) => e,
             Ok(None) => {
-                return EvalResult::Outcome(
-                    ClaimOutcome::NoEntrySlot { launcher_id },
-                    false,
-                    false,
-                );
+                return PreBudgetResult::Outcome(ClaimOutcome::NoEntrySlot { launcher_id }, false);
             }
-            Err(ClaimPortError::Unavailable) => return EvalResult::ChainUnavailable,
+            Err(ClaimPortError::Unavailable) => return PreBudgetResult::ChainUnavailable,
             Err(ClaimPortError::Other(_)) => {
                 self.status.fault_reported = true;
-                return EvalResult::Fault;
+                return PreBudgetResult::Fault;
             }
         };
 
         if entry.payout_puzzle_hash != self.own_payout_puzzle_hash {
             // Defect E: the port handed back an entry for a puzzle hash that is not this node's own.
             // Submitting against it would pay someone else. Refuse -- never substitute our own hash
-            // and proceed -- and surface it as a fault, since a divergent entry means the port is
-            // confused or hostile, not that there is nothing to claim.
-            self.status.fault_reported = true;
+            // and proceed.
+            //
+            // Defect B3: this is a PER-DISTRIBUTOR problem, not a cycle-wide one -- it must never
+            // set `fault_reported` (that pins the whole surface at `Faulted`, permanently, since the
+            // refusal is deliberately non-terminal and recurs every cycle). Count it instead, both
+            // lifetime and per-cycle, and let `ClaimableButNotClaiming` (or `Nominal`, if everything
+            // else claimed) surface it.
             self.status.claims_refused_payout_mismatch += 1;
-            return EvalResult::Outcome(
+            self.status.payout_hash_mismatches_this_cycle += 1;
+            return PreBudgetResult::Outcome(
                 ClaimOutcome::PayoutPuzzleHashMismatch { launcher_id },
                 true,
-                false,
             );
         }
 
         let threshold = match self.port.payout_threshold(launcher_id).await {
             Ok(t) => t,
-            Err(ClaimPortError::Unavailable) => return EvalResult::ChainUnavailable,
+            Err(ClaimPortError::Unavailable) => return PreBudgetResult::ChainUnavailable,
             Err(ClaimPortError::Other(_)) => {
                 self.status.fault_reported = true;
-                return EvalResult::Fault;
+                return PreBudgetResult::Fault;
             }
         };
 
         if entry.accrued_base_units < threshold {
             self.status.claims_skipped_below_threshold += 1;
-            return EvalResult::Outcome(
+            return PreBudgetResult::Outcome(
                 ClaimOutcome::SkippedBelowThreshold {
                     launcher_id,
                     accrued: entry.accrued_base_units,
                     threshold,
                 },
                 true,
-                false,
             );
         }
 
+        PreBudgetResult::Eligible {
+            launcher_id,
+            accrued_base_units: entry.accrued_base_units,
+        }
+    }
+
+    /// Orders the above-threshold candidates for the budget pass (Defect B2): primarily by accrued
+    /// value DESCENDING, so an attacker's dust distributors — where this node's own entry accrues
+    /// little to nothing — always sort behind a victim's genuine earnings no matter what fee the
+    /// attacker sets. The persisted [`Self::rotation_cursor`] only breaks ties WITHIN an equal-value
+    /// tier: it rebuilds a byte-order canonical ranking of the candidates present this cycle, then
+    /// rotates that ranking so the cursor's own launcher id sorts first — guaranteeing a genuinely
+    /// tied, budget-exceeding honest tail eventually reaches the front, without ever letting a
+    /// lower-value candidate outrank a higher-value one.
+    fn order_for_budget(&self, mut eligible: Vec<EligibleClaim>) -> Vec<EligibleClaim> {
+        let mut canonical: Vec<Bytes32> = eligible.iter().map(|c| c.launcher_id).collect();
+        canonical.sort();
+        let cursor_index = self
+            .rotation_cursor
+            .and_then(|cursor| canonical.iter().position(|id| *id == cursor))
+            .unwrap_or(0);
+        let len = canonical.len();
+        let rotation_key = |id: &Bytes32| -> usize {
+            let pos = canonical.iter().position(|x| x == id).unwrap_or(0);
+            if len == 0 {
+                0
+            } else {
+                (pos + len - cursor_index) % len
+            }
+        };
+        eligible.sort_by(|a, b| {
+            b.accrued_base_units
+                .cmp(&a.accrued_base_units)
+                .then_with(|| rotation_key(&a.launcher_id).cmp(&rotation_key(&b.launcher_id)))
+        });
+        eligible
+    }
+
+    /// The fee ceiling, per-cycle budget and submission for one already-`Eligible` candidate (SPEC
+    /// §8.3, Defect C1/C2). The payout puzzle hash is `self.own_payout_puzzle_hash` unconditionally
+    /// — [`Self::evaluate_pre_budget`] already refused any entry that diverged from it.
+    async fn evaluate_budget_phase(
+        &mut self,
+        claim: &EligibleClaim,
+        spent_this_cycle_mojos: &mut u64,
+        budget_exhausted: &mut bool,
+    ) -> BudgetPhaseResult {
+        let launcher_id = claim.launcher_id;
         let fee = match self.port.required_fee_mojos(launcher_id).await {
             Ok(f) => f,
-            Err(ClaimPortError::Unavailable) => return EvalResult::ChainUnavailable,
+            Err(ClaimPortError::Unavailable) => return BudgetPhaseResult::ChainUnavailable,
             Err(ClaimPortError::Other(_)) => {
                 self.status.fault_reported = true;
-                return EvalResult::Fault;
+                return BudgetPhaseResult::Fault;
             }
         };
 
         if fee > self.max_fee_mojos {
             self.status.claims_skipped_fee_ceiling += 1;
-            return EvalResult::Outcome(
-                ClaimOutcome::SkippedFeeAboveCeiling {
-                    launcher_id,
-                    fee_mojos: fee,
-                    ceiling_mojos: self.max_fee_mojos,
-                },
-                true,
-                true,
-            );
+            return BudgetPhaseResult::Outcome(ClaimOutcome::SkippedFeeAboveCeiling {
+                launcher_id,
+                fee_mojos: fee,
+                ceiling_mojos: self.max_fee_mojos,
+            });
         }
 
         // Defect C2: the per-claim ceiling alone does not bound what K distributors can collectively
@@ -280,38 +389,53 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         if *budget_exhausted || *spent_this_cycle_mojos + fee > self.cycle_fee_budget_mojos {
             *budget_exhausted = true;
             self.status.claims_skipped_cycle_budget += 1;
-            return EvalResult::Outcome(
-                ClaimOutcome::SkippedCycleBudgetExhausted {
-                    launcher_id,
-                    fee_mojos: fee,
-                    budget_mojos: self.cycle_fee_budget_mojos,
-                },
-                true,
-                true,
-            );
+            return BudgetPhaseResult::Outcome(ClaimOutcome::SkippedCycleBudgetExhausted {
+                launcher_id,
+                fee_mojos: fee,
+                budget_mojos: self.cycle_fee_budget_mojos,
+            });
         }
 
         match self
             .port
-            .submit_initiate_payout(launcher_id, entry.payout_puzzle_hash, fee)
+            .submit_initiate_payout(launcher_id, self.own_payout_puzzle_hash, fee)
             .await
         {
             Ok(()) => {
                 *spent_this_cycle_mojos += fee;
-                EvalResult::Outcome(ClaimOutcome::Submitted { launcher_id }, true, true)
+                BudgetPhaseResult::Outcome(ClaimOutcome::Submitted { launcher_id })
             }
-            Err(ClaimPortError::Unavailable) => EvalResult::ChainUnavailable,
+            Err(ClaimPortError::Unavailable) => BudgetPhaseResult::ChainUnavailable,
             Err(ClaimPortError::Other(_)) => {
                 self.status.fault_reported = true;
-                EvalResult::Fault
+                BudgetPhaseResult::Fault
             }
         }
     }
 }
 
-enum EvalResult {
-    /// `(outcome, entry_slot_was_present, was_claimable)`.
-    Outcome(ClaimOutcome, bool, bool),
+/// An above-threshold, hash-matching candidate waiting for the budget pass (Defect B2).
+struct EligibleClaim {
+    launcher_id: Bytes32,
+    accrued_base_units: u64,
+}
+
+/// The outcome of [`ClaimEngine::evaluate_pre_budget`].
+enum PreBudgetResult {
+    /// `(outcome, entry_slot_was_present)`.
+    Outcome(ClaimOutcome, bool),
+    /// Above threshold, hash matches — proceeds to [`ClaimEngine::evaluate_budget_phase`].
+    Eligible {
+        launcher_id: Bytes32,
+        accrued_base_units: u64,
+    },
+    Fault,
+    ChainUnavailable,
+}
+
+/// The outcome of [`ClaimEngine::evaluate_budget_phase`].
+enum BudgetPhaseResult {
+    Outcome(ClaimOutcome),
     Fault,
     ChainUnavailable,
 }
@@ -607,7 +731,7 @@ mod tests {
 
         let first = e.run_cycle(1_000).await;
         assert_eq!(first, vec![ClaimOutcome::NoEntrySlot { launcher_id }]);
-        assert_eq!(e.status().terminal_no_entry_slot, 1);
+        assert_eq!(e.status().no_entry_slot_this_cycle, 1);
         assert!(!e.status().fault_reported, "no chain fault reported");
         assert_eq!(e.status().claims_submitted, 0, "no lost payment claimed");
 
@@ -962,9 +1086,143 @@ mod tests {
         assert_eq!(e.status().claims_skipped_cycle_budget, 2);
     }
 
+    /// **Defect B2 (blocking) -- the anti-suppression test.** Ten attacker-funded dust distributors
+    /// (our own entry there accrues almost nothing, but each demands a fee big enough that ONE of
+    /// them alone exhausts the cycle budget) must NOT prevent a genuinely high-accrual distributor
+    /// from being claimed in the same cycle, no matter what order the chain sweep happens to return
+    /// them in (`FakeChainPort` stores candidates in a `HashMap`, so discovery order here is exactly
+    /// as arbitrary as a real chain sweep's).
+    #[tokio::test]
+    async fn dust_distributors_do_not_suppress_a_high_accrual_claim_in_the_same_cycle() {
+        const DUST_FEE: u64 = 100;
+        let victim = FakeDistributor {
+            launcher_id: Bytes32::new([0xFFu8; 32]),
+            store_id: Bytes32::new([3u8; 32]),
+            root: Bytes32::new([4u8; 32]),
+            reserve_asset_id: DIG_ASSET_ID,
+            payout_threshold: 1_000,
+            entry: Some(super::super::types::OwnEntry {
+                payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+                counter: 0,
+                accrued_base_units: 100_000, // genuinely high accrual
+            }),
+            fee_mojos: DUST_FEE,
+        };
+        let victim_id = victim.launcher_id;
+        let mut distributors = vec![victim];
+        for i in 0..10u8 {
+            distributors.push(FakeDistributor {
+                launcher_id: Bytes32::new([i; 32]),
+                store_id: Bytes32::new([3u8; 32]),
+                root: Bytes32::new([4u8; 32]),
+                reserve_asset_id: DIG_ASSET_ID,
+                payout_threshold: 1_000,
+                entry: Some(super::super::types::OwnEntry {
+                    payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+                    counter: 0,
+                    accrued_base_units: 1_100, // just above threshold -- dust, not zero
+                }),
+                fee_mojos: DUST_FEE, // funder-controlled: attacker sets this at will
+            });
+        }
+        // The budget fits exactly ONE distributor's fee -- first-come order would let any dust
+        // distributor that sorts ahead of the victim consume it entirely.
+        let mut e = ClaimEngine::new(
+            FakeChainPort::new(distributors),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            DUST_FEE,
+            DIG_ASSET_ID,
+        );
+
+        let outcomes = e.run_cycle(1_000).await;
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, ClaimOutcome::Submitted { launcher_id } if *launcher_id == victim_id))
+                .count(),
+            1,
+            "the high-accrual victim must be the one claimed, regardless of discovery order"
+        );
+        assert_eq!(e.status().claims_submitted, 1, "the budget fits exactly one claim");
+        assert_eq!(
+            e.status().claims_skipped_cycle_budget,
+            10,
+            "every dust distributor is deferred, never the victim"
+        );
+    }
+
+    /// **Defect B2 (blocking) -- the fairness half.** A persisted rotation cursor must advance
+    /// across cycles so a genuinely tied, budget-exceeding honest tail is not the same distributor
+    /// dropped every cycle forever.
+    #[tokio::test]
+    async fn the_rotation_cursor_advances_so_a_tied_starved_tail_is_eventually_served() {
+        const FEE: u64 = 10;
+        const BUDGET: u64 = 20; // only 2 of 3 equal-value distributors fit per cycle
+        let distributors: Vec<FakeDistributor> = (0..3u8)
+            .map(|i| FakeDistributor {
+                launcher_id: Bytes32::new([i + 1; 32]),
+                store_id: Bytes32::new([3u8; 32]),
+                root: Bytes32::new([4u8; 32]),
+                reserve_asset_id: DIG_ASSET_ID,
+                payout_threshold: 1_000,
+                entry: Some(super::super::types::OwnEntry {
+                    payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+                    counter: 0,
+                    accrued_base_units: 5_000, // EQUAL for all three -- a genuine tie
+                }),
+                fee_mojos: FEE,
+            })
+            .collect();
+        let mut e = ClaimEngine::new(
+            FakeChainPort::new(distributors),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            BUDGET,
+            DIG_ASSET_ID,
+        );
+
+        let mut deferred_across_cycles: std::collections::HashSet<Bytes32> =
+            std::collections::HashSet::new();
+        for cycle in 1..=3u32 {
+            let outcomes = e.run_cycle(u64::from(cycle) * 1_000).await;
+            for outcome in &outcomes {
+                if let ClaimOutcome::SkippedCycleBudgetExhausted { launcher_id, .. } = outcome {
+                    deferred_across_cycles.insert(*launcher_id);
+                }
+            }
+        }
+
+        assert!(
+            deferred_across_cycles.len() > 1,
+            "the same distributor must not be the only one ever deferred across cycles -- got {deferred_across_cycles:?}"
+        );
+        assert!(
+            e.rotation_cursor().is_some(),
+            "the cursor must have advanced at least once"
+        );
+    }
+
+    /// Defect B2: `with_rotation_cursor` / `rotation_cursor` are the seam a persisted config uses
+    /// to survive a restart -- proves the getter reflects what the setter installed before any
+    /// cycle has run.
+    #[test]
+    fn rotation_cursor_round_trips_through_the_engine_accessors() {
+        let cursor = Bytes32::new([0x42u8; 32]);
+        let e = engine(FakeChainPort::new(Vec::new())).with_rotation_cursor(Some(cursor));
+        assert_eq!(e.rotation_cursor(), Some(cursor));
+    }
+
     /// Defect E regression: a port returning an entry whose `payout_puzzle_hash` diverges from this
-    /// node's own must produce ZERO submissions and a reported fault -- never pay whoever the port
-    /// named instead.
+    /// node's own must produce ZERO submissions -- never pay whoever the port named instead --
+    /// counted both lifetime and per-cycle.
+    ///
+    /// Defect B3 regression: this used to also assert `fault_reported`, which set the CYCLE-WIDE
+    /// `Faulted` state for a PER-DISTRIBUTOR problem -- see `a_payout_mismatch_never_sets_the_cycle_
+    /// wide_fault_or_masks_other_distributors` below for the exploit this enabled.
     #[tokio::test]
     async fn entry_for_a_different_payout_puzzle_hash_is_refused_not_paid() {
         let wrong_hash = Bytes32::new([0x77u8; 32]);
@@ -990,10 +1248,61 @@ mod tests {
         assert_eq!(e.status().claims_submitted, 0, "never paid the wrong hash");
         assert!(e.port.submitted.lock().unwrap().is_empty());
         assert!(
-            e.status().fault_reported,
-            "a divergent entry is a fault, not a routine skip"
+            !e.status().fault_reported,
+            "Defect B3: a per-distributor mismatch must never set the cycle-wide fault"
         );
         assert_eq!(e.status().claims_refused_payout_mismatch, 1);
+        assert_eq!(e.status().payout_hash_mismatches_this_cycle, 1);
+    }
+
+    /// **Defect B3 (blocking) -- the exploit the review found.** A single hostile/buggy entry row
+    /// (a payout-hash mismatch on one launcher) must NOT pin the whole surface at `Faulted` and
+    /// must NOT bury the `ClaimableButNotClaiming` signal for every OTHER, healthy distributor.
+    #[tokio::test]
+    async fn a_payout_mismatch_never_sets_the_cycle_wide_fault_or_masks_other_distributors() {
+        let wrong_hash = Bytes32::new([0x77u8; 32]);
+        let mismatched = FakeDistributor {
+            launcher_id: Bytes32::new([0xAAu8; 32]),
+            store_id: Bytes32::new([3u8; 32]),
+            root: Bytes32::new([4u8; 32]),
+            reserve_asset_id: DIG_ASSET_ID,
+            payout_threshold: 1_000,
+            entry: Some(super::super::types::OwnEntry {
+                payout_puzzle_hash: wrong_hash,
+                counter: 0,
+                accrued_base_units: 5_000,
+            }),
+            fee_mojos: 10,
+        };
+        // A second, healthy distributor whose claim would exceed the budget alongside the
+        // mismatched one's fee, so a fault-flag leak would be free to hide behind
+        // `ClaimableButNotClaiming` too -- proving the precedence fix, not just the flag.
+        let healthy = FakeDistributor {
+            launcher_id: Bytes32::new([0xBBu8; 32]),
+            store_id: Bytes32::new([3u8; 32]),
+            root: Bytes32::new([4u8; 32]),
+            reserve_asset_id: DIG_ASSET_ID,
+            payout_threshold: 1_000,
+            entry: Some(super::super::types::OwnEntry {
+                payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+                counter: 0,
+                accrued_base_units: 5_000,
+            }),
+            fee_mojos: 10,
+        };
+        let mut e = engine(FakeChainPort::new(vec![mismatched, healthy]));
+
+        for cycle in 1..=3u32 {
+            e.run_cycle(u64::from(cycle) * 1_000).await;
+            assert!(
+                !matches!(e.status().state, ClaimLoopState::Faulted { .. }),
+                "cycle {cycle}: a per-distributor mismatch must never read as the cycle-wide Faulted"
+            );
+        }
+        // The healthy distributor claims every cycle, so the surface reads Nominal, not buried.
+        assert_eq!(e.status().state, ClaimLoopState::Nominal);
+        assert_eq!(e.status().claims_submitted, 3, "the healthy one claimed all 3 cycles");
+        assert_eq!(e.status().claims_refused_payout_mismatch, 3);
     }
 
     /// ACCEPTANCE 12 — with `UnavailableClaimChainPort` wired, the engine reports the named state
