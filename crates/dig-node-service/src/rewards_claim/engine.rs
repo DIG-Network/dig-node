@@ -144,7 +144,11 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         {
             Ok(Some(e)) => e,
             Ok(None) => {
-                return EvalResult::Outcome(ClaimOutcome::NoEntrySlot { launcher_id }, false, false);
+                return EvalResult::Outcome(
+                    ClaimOutcome::NoEntrySlot { launcher_id },
+                    false,
+                    false,
+                );
             }
             Err(ClaimPortError::Unavailable) => return EvalResult::ChainUnavailable,
             Err(ClaimPortError::Other(_)) => {
@@ -261,7 +265,10 @@ mod tests {
         fn new(distributors: Vec<FakeDistributor>) -> Self {
             FakeChainPort {
                 distributors: Mutex::new(
-                    distributors.into_iter().map(|d| (d.launcher_id, d)).collect(),
+                    distributors
+                        .into_iter()
+                        .map(|d| (d.launcher_id, d))
+                        .collect(),
                 ),
                 submitted: Mutex::new(Vec::new()),
                 own_entry_reads: Mutex::new(0),
@@ -374,9 +381,7 @@ mod tests {
         }
     }
 
-    fn engine(
-        port: FakeChainPort,
-    ) -> ClaimEngine<FakeChainPort, NoHintSource> {
+    fn engine(port: FakeChainPort) -> ClaimEngine<FakeChainPort, NoHintSource> {
         ClaimEngine::new(
             port,
             NoHintSource,
@@ -515,7 +520,10 @@ mod tests {
 
         let reads_after_first = *e.port.own_entry_reads.lock().unwrap();
         let second = e.run_cycle(2_000).await;
-        assert!(second.is_empty(), "terminal distributor is skipped, not retried");
+        assert!(
+            second.is_empty(),
+            "terminal distributor is skipped, not retried"
+        );
         assert_eq!(
             *e.port.own_entry_reads.lock().unwrap(),
             reads_after_first,

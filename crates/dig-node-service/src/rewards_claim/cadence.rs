@@ -69,8 +69,12 @@ mod tests {
             jitter_seconds: 500,
             max_fee_mojos: 1,
         };
-        let interval = next_interval_seconds(cfg.cadence_seconds, cfg.jitter_seconds, &FixedJitter(0));
-        assert_eq!(interval, 12_000, "configured cadence, not the 86_400 default");
+        let interval =
+            next_interval_seconds(cfg.cadence_seconds, cfg.jitter_seconds, &FixedJitter(0));
+        assert_eq!(
+            interval, 12_000,
+            "configured cadence, not the 86_400 default"
+        );
         let interval_at_ceiling =
             next_interval_seconds(cfg.cadence_seconds, cfg.jitter_seconds, &FixedJitter(500));
         assert_eq!(interval_at_ceiling, 12_500);

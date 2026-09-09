@@ -141,7 +141,10 @@ mod tests {
             last_cycle_at: Some(1),
             ..ClaimStatus::default()
         };
-        assert_eq!(status.compute_state(), ClaimLoopState::ClaimableButNotClaiming);
+        assert_eq!(
+            status.compute_state(),
+            ClaimLoopState::ClaimableButNotClaiming
+        );
     }
 
     #[test]
@@ -178,6 +181,9 @@ mod tests {
             state: ClaimLoopState::ChainSourceUnavailable,
             ..ClaimStatus::default()
         };
-        assert_eq!(status.compute_state(), ClaimLoopState::ChainSourceUnavailable);
+        assert_eq!(
+            status.compute_state(),
+            ClaimLoopState::ChainSourceUnavailable
+        );
     }
 }

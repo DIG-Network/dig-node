@@ -89,7 +89,11 @@ mod tests {
         let lower = parse_launch_comment(lid(), &format!("dig-rewards:v1:{store}:{root}")).unwrap();
         let upper = parse_launch_comment(
             lid(),
-            &format!("dig-rewards:v1:{}:{}", store.to_uppercase(), root.to_uppercase()),
+            &format!(
+                "dig-rewards:v1:{}:{}",
+                store.to_uppercase(),
+                root.to_uppercase()
+            ),
         )
         .unwrap();
         assert_eq!(lower.store_id, upper.store_id);
