@@ -91,13 +91,22 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// (Defect B2) within the per-claim ceiling AND the per-cycle aggregate fee budget. Returns
     /// every outcome, one per evaluated distributor.
     pub async fn run_cycle(&mut self, now: u64) -> Vec<ClaimOutcome> {
-        // Defect A1/A4/F1: per-cycle fields are reset here, not carried over — a fault or a claim
-        // count from a PAST cycle must never leak into this cycle's reading of `compute_state()`.
-        // F1: `chain_unavailable_this_cycle` joins this reset -- it must never persist past the
-        // cycle it was observed in (see `ClaimStatus::chain_unavailable_this_cycle`'s doc).
+        // Defect A1/A4/F1/F3: EVERY per-cycle field is reset here, at the TOP, before any early
+        // return — a fault, a claim count or a stale distributor tally from a PAST cycle must never
+        // leak into this cycle's reading, including on the `ChainUnavailable` early-return paths
+        // below that skip the end-of-function assignment block entirely (F3: those paths used to
+        // leave last cycle's `distributors_claimable` / `claims_submitted_this_cycle` /
+        // `distributors_faulted` / `no_entry_slot_this_cycle` sitting stale under this cycle's
+        // freshly-stamped `last_attempt_at`).
         self.status.fault_reported = false;
         self.status.chain_unavailable_this_cycle = false;
         self.status.payout_hash_mismatches_this_cycle = 0;
+        self.status.distributors_known = 0;
+        self.status.distributors_with_own_entry = 0;
+        self.status.distributors_claimable = 0;
+        self.status.distributors_faulted = 0;
+        self.status.claims_submitted_this_cycle = 0;
+        self.status.no_entry_slot_this_cycle = 0;
         self.status.last_attempt_at = Some(now);
         let mut spent_this_cycle_mojos = 0u64;
         let mut budget_exhausted = false;
@@ -124,6 +133,14 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         }
 
         let mut candidates: Vec<Bytes32> = discovered.iter().map(|d| d.launcher_id).collect();
+        // F4: a real adapter can plausibly return the same launcher id twice (one distributor
+        // reachable via two of the §1.3 launch comments this node scans, across the
+        // `(store_id, root)` pairs it mirrors). Without this, phase 2 would evaluate it twice and
+        // submit `InitiatePayout` twice against one entry slot in one cycle -- the second spend is
+        // invalid (counter already incremented) but the fee is paid anyway, double-charging the
+        // cycle budget for a single distributor.
+        candidates.sort_unstable();
+        candidates.dedup();
 
         // SPEC §13.2: a hint only ADDS a candidate; every property is re-derived from chain before
         // it counts, and a hint that fails re-derivation is dropped, never trusted.
@@ -1450,6 +1467,118 @@ mod tests {
         );
     }
 
+    /// A discovery port that answers healthily on its FIRST call, then `Unavailable` on every call
+    /// after that -- the inverse of `FlakyThenHealthyPort`, for F3's staleness scenario.
+    struct HealthyThenUnavailablePort {
+        calls: Mutex<u32>,
+        inner: FakeChainPort,
+    }
+
+    #[async_trait]
+    impl ClaimChainPort for HealthyThenUnavailablePort {
+        async fn discover_distributors(
+            &self,
+        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                drop(calls);
+                return self.inner.discover_distributors().await;
+            }
+            Err(ClaimPortError::Unavailable)
+        }
+        async fn resolve_launch_comment(
+            &self,
+            launcher_id: Bytes32,
+        ) -> Result<Option<DiscoveredDistributor>, ClaimPortError> {
+            self.inner.resolve_launch_comment(launcher_id).await
+        }
+        async fn reserve_asset_id(&self, launcher_id: Bytes32) -> Result<Bytes32, ClaimPortError> {
+            self.inner.reserve_asset_id(launcher_id).await
+        }
+        async fn payout_threshold(&self, launcher_id: Bytes32) -> Result<u64, ClaimPortError> {
+            self.inner.payout_threshold(launcher_id).await
+        }
+        async fn own_entry(
+            &self,
+            launcher_id: Bytes32,
+            payout_puzzle_hash: Bytes32,
+        ) -> Result<Option<super::super::types::OwnEntry>, ClaimPortError> {
+            self.inner.own_entry(launcher_id, payout_puzzle_hash).await
+        }
+        async fn required_fee_mojos(&self, launcher_id: Bytes32) -> Result<u64, ClaimPortError> {
+            self.inner.required_fee_mojos(launcher_id).await
+        }
+        async fn submit_initiate_payout(
+            &self,
+            launcher_id: Bytes32,
+            payout_puzzle_hash: Bytes32,
+            fee_mojos: u64,
+        ) -> Result<(), ClaimPortError> {
+            self.inner
+                .submit_initiate_payout(launcher_id, payout_puzzle_hash, fee_mojos)
+                .await
+        }
+    }
+
+    /// **F3 regression -- staleness under a fresh timestamp.** Cycle 1 is healthy and submits a
+    /// real claim (`distributors_claimable == 1`, `claims_submitted_this_cycle == 1`). Cycle 2 hits
+    /// the `ChainUnavailable` early-return path, which skips the end-of-function assignment block
+    /// entirely. Before the fix, cycle 1's counts stayed on `self.status` while `last_attempt_at`
+    /// was stamped fresh for cycle 2 -- exactly the stale-count-under-a-fresh-timestamp §2.4
+    /// forbids. Every per-cycle counter must read as this cycle's true zero.
+    #[tokio::test]
+    async fn a_chain_unavailable_cycle_does_not_leave_prior_cycles_counters_stale() {
+        let distributor = one_distributor(
+            Some(super::super::types::OwnEntry {
+                payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+                counter: 0,
+                accrued_base_units: 5_000,
+            }),
+            1_000,
+            10,
+        );
+        let port = HealthyThenUnavailablePort {
+            calls: Mutex::new(0),
+            inner: FakeChainPort::new(vec![distributor]),
+        };
+        let mut e = ClaimEngine::new(
+            port,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        );
+
+        e.run_cycle(1_000).await;
+        assert_eq!(
+            e.status().distributors_claimable,
+            1,
+            "cycle 1: healthy and claimable"
+        );
+        assert_eq!(
+            e.status().claims_submitted_this_cycle,
+            1,
+            "cycle 1: submitted"
+        );
+
+        e.run_cycle(2_000).await;
+        assert_eq!(e.status().state, ClaimLoopState::ChainSourceUnavailable);
+        assert_eq!(
+            e.status().distributors_claimable,
+            0,
+            "F3: cycle 1's claimable count must not survive under cycle 2's fresh last_attempt_at"
+        );
+        assert_eq!(
+            e.status().claims_submitted_this_cycle,
+            0,
+            "F3: cycle 1's submission count must not survive into cycle 2"
+        );
+        assert_eq!(e.status().distributors_faulted, 0);
+        assert_eq!(e.status().no_entry_slot_this_cycle, 0);
+    }
+
     /// The launch-comment parser wired end-to-end: what `resolve_launch_comment` would produce for
     /// a real chain reply, confirming the two modules compose (not a duplicate of parser.rs's own
     /// table-driven unit tests).
@@ -1460,5 +1589,95 @@ mod tests {
         let comment = format!("dig-rewards:v1:{store}:{root}");
         let d = parse_launch_comment(Bytes32::new([5u8; 32]), &comment).expect("parses");
         assert_eq!(d.launcher_id, Bytes32::new([5u8; 32]));
+    }
+    /// A discovery port that returns the SAME launcher id twice from one `discover_distributors`
+    /// call -- plausible for a real adapter scanning §1.3 launch comments across every
+    /// `(store_id, root)` pair this node mirrors, when one distributor is reachable via two of
+    /// them.
+    struct DuplicatingDiscoveryPort(FakeChainPort);
+
+    #[async_trait]
+    impl ClaimChainPort for DuplicatingDiscoveryPort {
+        async fn discover_distributors(
+            &self,
+        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
+            let mut v = self.0.discover_distributors().await?;
+            let doubled = v.clone();
+            v.extend(doubled);
+            Ok(v)
+        }
+        async fn resolve_launch_comment(
+            &self,
+            launcher_id: Bytes32,
+        ) -> Result<Option<DiscoveredDistributor>, ClaimPortError> {
+            self.0.resolve_launch_comment(launcher_id).await
+        }
+        async fn reserve_asset_id(&self, launcher_id: Bytes32) -> Result<Bytes32, ClaimPortError> {
+            self.0.reserve_asset_id(launcher_id).await
+        }
+        async fn payout_threshold(&self, launcher_id: Bytes32) -> Result<u64, ClaimPortError> {
+            self.0.payout_threshold(launcher_id).await
+        }
+        async fn own_entry(
+            &self,
+            launcher_id: Bytes32,
+            payout_puzzle_hash: Bytes32,
+        ) -> Result<Option<super::super::types::OwnEntry>, ClaimPortError> {
+            self.0.own_entry(launcher_id, payout_puzzle_hash).await
+        }
+        async fn required_fee_mojos(&self, launcher_id: Bytes32) -> Result<u64, ClaimPortError> {
+            self.0.required_fee_mojos(launcher_id).await
+        }
+        async fn submit_initiate_payout(
+            &self,
+            launcher_id: Bytes32,
+            payout_puzzle_hash: Bytes32,
+            fee_mojos: u64,
+        ) -> Result<(), ClaimPortError> {
+            self.0
+                .submit_initiate_payout(launcher_id, payout_puzzle_hash, fee_mojos)
+                .await
+        }
+    }
+
+    /// **F4 (non-blocking, cheap) -- a duplicated launcher id must submit EXACTLY ONCE.** Without
+    /// dedup, phase 2 evaluates the same candidate twice and pays the fee twice against one entry
+    /// slot in one cycle; the second spend is invalid (`counter` already incremented) but the fee
+    /// is spent anyway.
+    #[tokio::test]
+    async fn a_duplicated_launcher_id_submits_exactly_once() {
+        let distributor = one_distributor(
+            Some(super::super::types::OwnEntry {
+                payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+                counter: 0,
+                accrued_base_units: 5_000,
+            }),
+            1_000,
+            10,
+        );
+        let launcher_id = distributor.launcher_id;
+        let port = DuplicatingDiscoveryPort(FakeChainPort::new(vec![distributor]));
+        let mut e = ClaimEngine::new(
+            port,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        );
+
+        let outcomes = e.run_cycle(1_000).await;
+
+        assert_eq!(
+            outcomes,
+            vec![ClaimOutcome::Submitted { launcher_id }],
+            "exactly one submission for one distributor, even though discovery reported it twice"
+        );
+        assert_eq!(e.status().claims_submitted, 1);
+        assert_eq!(
+            e.status().distributors_known,
+            1,
+            "dedup collapses the duplicate"
+        );
     }
 }
