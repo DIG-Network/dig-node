@@ -2145,10 +2145,14 @@ mod tests {
         // every cycle. `distributors_claimable` counts only the healthy one (1); the mismatch
         // never enters `eligible` so it is not in `claimable` either, but it IS folded into the
         // shortfall predicate's denominator, so `submitted (1) < claimable (1) + mismatches (1)`.
+        //
+        // F13: the payload reports that same folded denominator (2), not the un-folded
+        // `distributors_claimable` (1) alone -- a state named `ClaimableButNotClaiming` whose
+        // numbers said "0 short" would contradict its own name.
         assert_eq!(
             e.status().state,
             ClaimLoopState::ClaimableButNotClaiming {
-                claimable: 1,
+                claimable: 2,
                 submitted: 1
             },
             "an ongoing payout-hash mismatch is a real, per-cycle shortfall -- it must never read \
@@ -2198,10 +2202,13 @@ mod tests {
             !matches!(e.status().state, ClaimLoopState::Faulted { .. }),
             "a per-distributor mismatch must never set the cycle-wide Faulted (Defect B3)"
         );
+        // F13: `distributors_claimable` (the un-folded term) is 0, but the payload reports the
+        // folded shortfall denominator -- `distributors_claimable (0) + mismatches (1)` -- so an
+        // all-mismatching cycle carries a nonzero `claimable` instead of a reassuring zero.
         assert_eq!(
             e.status().state,
             ClaimLoopState::ClaimableButNotClaiming {
-                claimable: 0,
+                claimable: 1,
                 submitted: 0
             },
             "all-K-distributors mismatching is a real, systemic shortfall -- it must never read \
