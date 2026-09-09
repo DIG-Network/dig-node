@@ -68,4 +68,3 @@ fn no_reward_method_is_peer_reachable() {
         );
     }
 }
-
