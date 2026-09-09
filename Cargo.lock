@@ -2698,7 +2698,7 @@ dependencies = [
  "dig-dht",
  "dig-nat",
  "dig-peer",
- "dig-rpc-protocol 0.10.3",
+ "dig-rpc-protocol",
  "futures",
  "serde",
  "serde_json",
@@ -2977,19 +2977,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dig-node-control-interface"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae55b76cb5b6a621b8ebc7d4ca8cb6f8a22c2b8b735aeb85e5b923d211d5ea45"
-dependencies = [
- "async-trait",
- "semver",
- "serde",
- "serde_json",
- "url",
-]
-
-[[package]]
 name = "dig-node-core"
 version = "0.68.1"
 dependencies = [
@@ -3015,7 +3002,7 @@ dependencies = [
  "dig-peer",
  "dig-peer-selector",
  "dig-pex",
- "dig-rpc-protocol 0.10.3",
+ "dig-rpc-protocol",
  "dig-sex",
  "dig-social-profile",
  "dig-store-cache",
@@ -3074,10 +3061,10 @@ dependencies = [
  "dig-logging",
  "dig-mirror-coin",
  "dig-mirror-collateral",
- "dig-node-control-interface 0.35.0",
+ "dig-node-control-interface",
  "dig-node-core",
  "dig-node-service",
- "dig-rpc-protocol 0.11.0",
+ "dig-rpc-protocol",
  "dig-stun",
  "dig-urn-resolver",
  "dig-wallet",
@@ -3165,7 +3152,7 @@ dependencies = [
  "chia-traits 0.36.1",
  "dig-message",
  "dig-nat",
- "dig-rpc-protocol 0.10.3",
+ "dig-rpc-protocol",
  "dig-tls",
  "serde",
  "serde_json",
@@ -3226,17 +3213,6 @@ name = "dig-rpc-protocol"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66c46a32c3fc6203773b6f551b21e5475b81b60d8b2c72a3b71c74694b149ade"
-dependencies = [
- "serde",
- "serde_json",
- "serde_repr",
-]
-
-[[package]]
-name = "dig-rpc-protocol"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f88c346aa9ed0cd82ed1bcc051a6b3511058cc01ce7204a8e5ca65829fb0775"
 dependencies = [
  "serde",
  "serde_json",
@@ -3416,7 +3392,7 @@ dependencies = [
  "clvmr 0.16.4",
  "dig-clvm",
  "dig-keystore",
- "dig-node-control-interface 0.33.0",
+ "dig-node-control-interface",
  "dig-node-core",
  "dig-offers",
  "dig-options 0.5.0",
