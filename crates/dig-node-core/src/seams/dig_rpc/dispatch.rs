@@ -152,8 +152,8 @@ async fn resolve_enforced_pin(
 /// Names which of a reward-prover status record's identity fields (`launcher_id`, `store_id`,
 /// `root`) are all-zero, if any. An all-zero value in any of these is never a real distributor's
 /// or module's identity — it's what an unassigned/uninitialised registry slot hex-encodes to
-/// ("0000…0000"), which reads exactly like a valid 64-hex id to every consumer including shipped
-/// dig-app 15.5.0.
+/// ("0000…0000"), which reads exactly like a valid 64-hex id to every consumer, including the
+/// dig-app consumer in dig-app#403 (unmerged).
 ///
 /// Isolated on purpose (dig_ecosystem#3269 security/adversarial gate): this is a
 /// registration-bug DETECTOR that belongs, longer-term, at #3265's writer (the code that will
