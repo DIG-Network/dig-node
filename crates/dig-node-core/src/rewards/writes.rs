@@ -215,11 +215,15 @@ pub struct NoPersistence;
 
 impl WriteBoundStore for NoPersistence {
     fn load(&self, _launcher_id: Bytes32) -> Result<WriteBoundState, StoreError> {
-        Err(StoreError("no write-bound persistence backend configured".to_string()))
+        Err(StoreError(
+            "no write-bound persistence backend configured".to_string(),
+        ))
     }
 
     fn save(&self, _launcher_id: Bytes32, _state: &WriteBoundState) -> Result<(), StoreError> {
-        Err(StoreError("no write-bound persistence backend configured".to_string()))
+        Err(StoreError(
+            "no write-bound persistence backend configured".to_string(),
+        ))
     }
 }
 
@@ -523,9 +527,13 @@ mod tests {
     #[test]
     fn no_persistence_writer_submits_zero_bundles() {
         let writer = PersistedEntryWriter::new(&NoPersistence);
-        let (outcome, state) = writer.decide(LAUNCHER, vec![add(PAYOUT_A, LAUNCHER)], 100, 1_000_000, 0);
+        let (outcome, state) =
+            writer.decide(LAUNCHER, vec![add(PAYOUT_A, LAUNCHER)], 100, 1_000_000, 0);
         assert_eq!(outcome, PersistedWriteOutcome::PersistenceUnavailable);
-        assert!(state.is_none(), "no bundle-tracking state may be produced without a store");
+        assert!(
+            state.is_none(),
+            "no bundle-tracking state may be produced without a store"
+        );
     }
 
     /// THE money-bug regression: without persistence, restarting the process resets every bound to
@@ -558,13 +566,8 @@ mod tests {
         let writer_after_restart = PersistedEntryWriter::new(&store);
 
         // Rate bound survives the restart: a second attempt one second later is still withheld.
-        let (rate_outcome, _) = writer_after_restart.decide(
-            LAUNCHER,
-            vec![add([9; 32], LAUNCHER)],
-            100,
-            1_000_000,
-            1,
-        );
+        let (rate_outcome, _) =
+            writer_after_restart.decide(LAUNCHER, vec![add([9; 32], LAUNCHER)], 100, 1_000_000, 1);
         assert_eq!(rate_outcome, PersistedWriteOutcome::Pending { count: 1 });
 
         // Reentry cooldown survives the restart too: the just-removed payout hash is still held,
@@ -585,6 +588,9 @@ mod tests {
             1_000_000,
             ENTRY_WRITE_MIN_INTERVAL_SECONDS + 2,
         );
-        assert_eq!(cap_outcome, PersistedWriteOutcome::FeeBudgetExhausted { count: 1 });
+        assert_eq!(
+            cap_outcome,
+            PersistedWriteOutcome::FeeBudgetExhausted { count: 1 }
+        );
     }
 }
