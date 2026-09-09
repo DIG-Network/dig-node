@@ -80,6 +80,12 @@ pub mod meta;
 /// `(store, root, epoch)`, and its disappearance drives reclaim of the collateral. The node signs
 /// those spends itself with its own operator wallet, scoped by construction. See [`mirror`].
 pub mod mirror;
+/// The node's PEER-SIDE reward claim loop (DIG-Network/dig_ecosystem#3251): discovers the
+/// reward distributors covering the `(store_id, root)`s this node mirrors and submits
+/// `InitiatePayout` on a jittered cadence, default 24h. The other half of the reward-distributor
+/// lifecycle from `dig_node_core::rewards` (#3250, the funder-side prover, a sibling lane). See
+/// [`rewards_claim`].
+pub mod rewards_claim;
 /// `dign network-info` (#303): this node's OWN network posture -- peer id, network + genesis,
 /// advertised addresses (IPv6-first, §5.2), reachability and relay reservation. Reads the node's
 /// OPEN `dig.getNetworkInfo` surface, so it needs no control token. See [`network_info`].
