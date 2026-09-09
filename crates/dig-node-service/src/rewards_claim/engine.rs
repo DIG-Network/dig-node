@@ -698,7 +698,9 @@ enum PreBudgetResult {
     /// A chain read (`reserve_asset_id`, `own_entry` or `payout_threshold`) returned
     /// `ClaimPortError::Other`. None of these ever reads a fee, so [`ClaimOutcome::Faulted`] built
     /// from this is always `reversed_fee_mojos: None`.
-    Fault { reason: String },
+    Fault {
+        reason: String,
+    },
     ChainUnavailable,
 }
 
@@ -2066,6 +2068,61 @@ mod tests {
             persisted.fee_spent_in_window_mojos, 0,
             "a submission that definitely never broadcast must leave the persisted window \
              exactly as it was, not charged for a fee that was never spent"
+        );
+    }
+
+    /// #3251 rework: a failed submission must produce `ClaimOutcome::Faulted`, not just increment
+    /// `distributors_faulted` and vanish from the outcome stream -- the exact silence this ticket
+    /// exists to close. Reuses F12's own fixture (a submission that DEFINITELY failed) so both
+    /// facts are proven from the SAME cycle: the outcome exists AND the fee it reversed is not
+    /// left charged against the persisted window.
+    #[tokio::test]
+    async fn a_failed_submission_produces_a_faulted_outcome_with_the_fee_it_reversed() {
+        const CYCLE_BUDGET: u64 = 1_000_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        const FEE_MOJOS: u64 = 10;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-faulted-outcome-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let failing = Bytes32::new([0x79u8; 32]);
+        let d = budget_consuming_distributor(failing, FEE_MOJOS);
+        let port = FakeChainPort::new(vec![d]);
+        port.fail_submit_for(failing);
+        let mut e = ClaimEngine::new(
+            port,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+
+        let outcomes = e.run_cycle(1_000).await;
+
+        assert_eq!(
+            outcomes,
+            vec![ClaimOutcome::Faulted {
+                launcher_id: failing,
+                reversed_fee_mojos: Some(FEE_MOJOS),
+                reason: "simulated submission failure".to_string(),
+            }],
+            "a definitely-failed submission must be reported, not silently absorbed into the \
+             `faulted` counter alone"
+        );
+        assert_eq!(
+            e.status().distributors_faulted,
+            1,
+            "the counter stays; it is not a substitute for the outcome"
+        );
+
+        let persisted = RewardsClaimConfig::load_from(dir.path());
+        assert_eq!(
+            persisted.fee_spent_in_window_mojos, 0,
+            "the fee `Faulted` reports as reversed must actually be reversed in the persisted \
+             window, not merely claimed reversed in the outcome"
         );
     }
 
