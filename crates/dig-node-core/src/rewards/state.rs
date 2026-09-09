@@ -169,27 +169,60 @@ pub fn idle_status(
 mod tests {
     use super::*;
 
-    /// SPEC §2.4: no `healthy`/`ok`/`up`/`running` key, and no precomputed staleness field, in the
-    /// serialized record.
+    /// The closed set of keys SPEC §2.4 forbids anywhere in the record. This asserts over object
+    /// *keys*, never over substrings of the serialized string: `ProverState::Running` legitimately
+    /// serializes the *value* `"running"`, so a substring test would fail on honest input while
+    /// still passing a smuggled `isRunning` **key**. Keep it key-based; a "simplification" back to
+    /// a substring check both breaks honest serialization and stops catching the real defect.
+    const FORBIDDEN_HEALTH_KEYS: &[&str] = &[
+        "healthy",
+        "ok",
+        "up",
+        "running",
+        "isRunning",
+        "stale",
+        "isStale",
+        "staleness",
+        "secondsSinceLastRun",
+        "lastRunSecondsAgo",
+        "uptime",
+        "alive",
+        "live",
+    ];
+
+    /// Walk a `serde_json::Value` depth-first, asserting no object at ANY depth carries a forbidden
+    /// key. A top-level-only check would miss a forbidden key smuggled into a nested struct (e.g. a
+    /// future field added inside `counters`) — this recurses through objects and arrays so a
+    /// smuggled key at any depth still fails the test.
+    fn assert_no_forbidden_health_keys(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for forbidden in FORBIDDEN_HEALTH_KEYS {
+                    assert!(
+                        !map.contains_key(*forbidden),
+                        "status record must not carry a {forbidden:?} key at any depth (SPEC §2.4)"
+                    );
+                }
+                for nested in map.values() {
+                    assert_no_forbidden_health_keys(nested);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_no_forbidden_health_keys(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// SPEC §2.4: no `healthy`/`ok`/`up`/`running`/... key, and no precomputed staleness field,
+    /// anywhere in the serialized record — recursively, not just at the top level.
     #[test]
     fn serialized_status_has_no_health_or_staleness_key() {
         let status = idle_status([1; 32], [2; 32], [3; 32], 1000);
         let json = serde_json::to_value(&status).unwrap();
-        let obj = json.as_object().unwrap();
-        for forbidden in [
-            "healthy",
-            "ok",
-            "up",
-            "running",
-            "stale",
-            "isStale",
-            "staleness",
-        ] {
-            assert!(
-                !obj.contains_key(forbidden),
-                "status record must not carry a {forbidden:?} key (SPEC §2.4)"
-            );
-        }
+        assert_no_forbidden_health_keys(&json);
     }
 
     #[test]

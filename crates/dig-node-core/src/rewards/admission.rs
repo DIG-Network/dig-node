@@ -10,6 +10,7 @@
 //! path produced the candidate — MUST call through here rather than re-implement the comparison.
 
 use super::gate::{EpochContext, GateError, GateOutcome, MirrorCoinGatePort};
+use super::port::Bytes32;
 
 /// Which discovery path produced a candidate. Exists ONLY for logging/tests (SPEC §5.3 clause 4's
 /// control needs to name the path a candidate arrived by) — it MUST NOT change the admission
@@ -47,11 +48,44 @@ impl OwnIdentity {
     }
 }
 
+/// Proof that a candidate passed THE single admission point (SPEC §5.3). Fields are private and no
+/// public constructor exists, so an `EntryAction::Add` cannot be built without one — a path that
+/// skips `admit` fails to compile rather than silently writing an entry for this node itself. This
+/// type's whole reason to exist is that privacy: a `pub` field or a `pub fn new` here reopens
+/// exactly the per-path habit DIG-Network/dig-node#261 already cost a lane for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedPeer {
+    payout_puzzle_hash: Bytes32,
+    launcher_id: Bytes32,
+}
+
+impl AdmittedPeer {
+    /// The payout puzzle hash the entry would use (SPEC §10.2).
+    pub fn payout_puzzle_hash(&self) -> Bytes32 {
+        self.payout_puzzle_hash
+    }
+
+    /// Which distributor this admission was decided for.
+    pub fn launcher_id(&self) -> Bytes32 {
+        self.launcher_id
+    }
+
+    /// Test-only escape hatch, `cfg(test)`-gated so it never ships: production code has no way to
+    /// mint an `AdmittedPeer` except through [`admit`].
+    #[cfg(test)]
+    pub fn for_test(payout_puzzle_hash: Bytes32, launcher_id: Bytes32) -> Self {
+        Self {
+            payout_puzzle_hash,
+            launcher_id,
+        }
+    }
+}
+
 /// What [`admit`] decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionDecision {
-    /// Eligible on the chain gate AND not self — carries the payout puzzle hash the entry would use.
-    Admit { payout_puzzle_hash: [u8; 32] },
+    /// Eligible on the chain gate AND not self.
+    Admit(AdmittedPeer),
     /// Refused because the candidate is this node itself, on the peer_id coordinate, the puzzle_hash
     /// coordinate, or both (SPEC §5.2). Refused at admission, never a display filter (§5.3.3) — the
     /// caller MUST NOT write an entry for this candidate under any circumstance.
@@ -80,6 +114,7 @@ pub async fn admit(
     own: &OwnIdentity,
     gate: &dyn MirrorCoinGatePort,
     epoch_ctx: EpochContext,
+    launcher_id: Bytes32,
 ) -> AdmissionDecision {
     if candidate.peer_id == own.peer_id {
         return AdmissionDecision::SelfExcluded;
@@ -91,7 +126,10 @@ pub async fn admit(
             if own.controls(&payout_puzzle_hash) {
                 AdmissionDecision::SelfExcluded
             } else {
-                AdmissionDecision::Admit { payout_puzzle_hash }
+                AdmissionDecision::Admit(AdmittedPeer {
+                    payout_puzzle_hash,
+                    launcher_id,
+                })
             }
         }
         Ok(GateOutcome::Ineligible(_)) => AdmissionDecision::GateIneligible,
@@ -101,6 +139,10 @@ pub async fn admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which distributor `admit` is deciding for in these tests — arbitrary, self-exclusion does
+    /// not depend on it.
+    const LAUNCHER: Bytes32 = [9; 32];
     use crate::rewards::gate::{GateIneligibleReason, MirrorCoinGatePort};
     use async_trait::async_trait;
 
@@ -172,7 +214,7 @@ mod tests {
                 peer_id: own.peer_id,
                 path,
             };
-            let decision = admit(&candidate, &own, &gate, ctx()).await;
+            let decision = admit(&candidate, &own, &gate, ctx(), LAUNCHER).await;
             assert_eq!(decision, AdmissionDecision::SelfExcluded, "path {path:?}");
         }
     }
@@ -192,7 +234,7 @@ mod tests {
             peer_id: foreign_peer,
             path: DiscoveryPath::DhtWalk,
         };
-        let decision = admit(&candidate, &own, &gate, ctx()).await;
+        let decision = admit(&candidate, &own, &gate, ctx(), LAUNCHER).await;
         assert_eq!(decision, AdmissionDecision::SelfExcluded);
     }
 
@@ -216,12 +258,10 @@ mod tests {
                 peer_id: honest_peer,
                 path,
             };
-            let decision = admit(&candidate, &own, &gate, ctx()).await;
+            let decision = admit(&candidate, &own, &gate, ctx(), LAUNCHER).await;
             assert_eq!(
                 decision,
-                AdmissionDecision::Admit {
-                    payout_puzzle_hash: honest_payout
-                },
+                AdmissionDecision::Admit(AdmittedPeer::for_test(honest_payout, LAUNCHER)),
                 "path {path:?}"
             );
         }
@@ -237,7 +277,7 @@ mod tests {
             peer_id: [0x33; 32],
             path: DiscoveryPath::DhtWalk,
         };
-        let decision = admit(&candidate, &own, &gate, ctx()).await;
+        let decision = admit(&candidate, &own, &gate, ctx(), LAUNCHER).await;
         assert_eq!(decision, AdmissionDecision::GateIneligible);
     }
 
@@ -251,7 +291,7 @@ mod tests {
             peer_id: [0x44; 32],
             path: DiscoveryPath::DhtWalk,
         };
-        let decision = admit(&candidate, &own, &UnavailableFakeGate, ctx()).await;
+        let decision = admit(&candidate, &own, &UnavailableFakeGate, ctx(), LAUNCHER).await;
         assert_eq!(decision, AdmissionDecision::ChainSourceUnavailable);
     }
 }

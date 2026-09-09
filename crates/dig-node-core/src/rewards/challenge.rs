@@ -33,6 +33,14 @@ pub struct WindowPlan {
 /// A CSPRNG-drawn `u64` in `[0, bound)`. SPEC §3.2 clause 4: MUST NOT be derived from a counter, a
 /// timestamp, a peer id, a store id, a root, a cycle index, or any hash of those — `getrandom`
 /// draws from the OS CSPRNG and touches none of those inputs.
+///
+/// `% bound` is modulo-biased: outcomes below `u64::MAX % bound` are drawn very slightly more often
+/// than the rest, by a factor bounded by `bound / 2^64`. At `bound` sizes realistic here (a
+/// resource's byte length, at most a handful of GiB) that bias is on the order of 2^-20 or smaller
+/// — judged inert by both the security and decider gates on this ticket. If this ever needs to
+/// tighten (e.g. `bound` grows close to `2^64`), switch to rejection sampling (redraw when
+/// `raw >= bound * (u64::MAX / bound)`); it is a two-line change and this comment marks exactly
+/// where.
 fn csprng_u64_below(bound: u64) -> u64 {
     if bound == 0 {
         return 0;
@@ -78,6 +86,14 @@ impl NoRepeatMemory {
             })
     }
 
+    /// Record a just-issued window, and prune everything older than
+    /// [`CHALLENGE_NO_REPEAT_CYCLES`] at the same time — both the per-subject window list AND any
+    /// `(peer_id, launcher_id)` key left with no window inside the horizon. `peer_id` is
+    /// peer-supplied, so without BOTH prunes this map is a memory-growth primitive: a peer that
+    /// keeps presenting fresh identities (a new key per cycle) would grow the outer map forever,
+    /// and even a stable peer's window list would grow forever without the inner prune. Neither
+    /// prune loses information [`Self::is_repeat`] could still use — the horizon it checks against
+    /// is exactly `CHALLENGE_NO_REPEAT_CYCLES`.
     pub fn record(
         &mut self,
         peer_id: Bytes32,
@@ -86,6 +102,12 @@ impl NoRepeatMemory {
         offset: u64,
         cycle_index: u32,
     ) {
+        self.recent.retain(|_, windows| {
+            windows.retain(|(cyc, _, _)| {
+                cycle_index.saturating_sub(*cyc) < CHALLENGE_NO_REPEAT_CYCLES
+            });
+            !windows.is_empty()
+        });
         self.recent
             .entry((peer_id, launcher_id))
             .or_default()
@@ -351,6 +373,31 @@ mod tests {
         memory.record(PEER, LAUNCHER, RESOURCE, 5, 0);
         assert!(memory.is_repeat(PEER, LAUNCHER, RESOURCE, 5, CHALLENGE_NO_REPEAT_CYCLES - 1));
         assert!(!memory.is_repeat(PEER, LAUNCHER, RESOURCE, 5, CHALLENGE_NO_REPEAT_CYCLES));
+    }
+
+    /// `peer_id` is peer-supplied; without pruning, a peer presenting a fresh identity every cycle
+    /// (or one honest peer over many cycles) would grow `NoRepeatMemory` without bound. This drives
+    /// far more distinct peer ids and cycles than the horizon and asserts the map never exceeds a
+    /// small, horizon-bounded size.
+    #[test]
+    fn no_repeat_memory_does_not_grow_without_bound() {
+        let mut memory = NoRepeatMemory::new();
+        for cycle in 0..2_000u32 {
+            let peer = {
+                let mut id = [0u8; 32];
+                id[0..4].copy_from_slice(&cycle.to_le_bytes());
+                id
+            };
+            memory.record(peer, LAUNCHER, RESOURCE, cycle as u64, cycle);
+            // Only subjects whose most recent window is still inside the no-repeat horizon may
+            // remain — a distinct peer id every cycle means at most CHALLENGE_NO_REPEAT_CYCLES of
+            // them are ever live at once.
+            assert!(
+                memory.recent.len() <= CHALLENGE_NO_REPEAT_CYCLES as usize,
+                "NoRepeatMemory grew to {} entries at cycle {cycle}, unbounded",
+                memory.recent.len()
+            );
+        }
     }
 
     #[test]

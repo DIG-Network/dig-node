@@ -8,6 +8,7 @@
 //! adapter — until #3249 ships — reports [`ChainPortError::Unavailable`] and runs no cycles. See
 //! [`unavailable`] for that adapter.
 
+use super::admission::AdmittedPeer;
 use async_trait::async_trait;
 
 /// A 32-byte chain identifier (launcher id, store id, root, puzzle hash — all the same shape).
@@ -49,10 +50,11 @@ pub struct DistributorChainState {
 /// One add/remove decision destined for a bundle (SPEC §6.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryAction {
-    Add {
-        payout_puzzle_hash: Bytes32,
-        launcher_id: Bytes32,
-    },
+    /// Carries [`AdmittedPeer`] rather than loose fields: `AdmittedPeer` is mintable only by
+    /// `admission::admit`, so an `Add` cannot be constructed from a discovery path that skipped
+    /// admission — self-exclusion becomes a compile-time property of this type, not a convention
+    /// every future discovery path must remember to honour (SPEC §5.3; DIG-Network/dig-node#261).
+    Add(AdmittedPeer),
     Remove {
         payout_puzzle_hash: Bytes32,
         launcher_id: Bytes32,
