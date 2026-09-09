@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use chia_protocol::Bytes32;
 use serde::{Deserialize, Serialize};
 
 use super::cadence::CLAIM_JITTER_SECONDS_DEFAULT;
@@ -50,6 +51,13 @@ pub struct RewardsClaimConfig {
     /// Whether the claim loop runs at all. Default-on: a peer earning rewards and never claiming
     /// them is the silent-failure case this ticket exists to prevent, so opting IN by default is
     /// the honest posture — see [`crate::rewards_claim`]'s module doc.
+    ///
+    /// # R5: `true` here does not mean the loop is running yet
+    /// Nothing in this codebase constructs a [`super::ClaimEngine`] outside this module's own tests
+    /// (DIG-Network/dig_ecosystem#3268, not yet landed) — see [`crate::rewards_claim`]'s module doc,
+    /// "Not yet wired into node startup". An operator who reads their own `rewards-claim.json` and
+    /// sees `enabled: true` is exactly the person who needs to know that; the module doc alone does
+    /// not reach them.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
@@ -71,6 +79,16 @@ pub struct RewardsClaimConfig {
     /// [`CLAIM_CYCLE_FEE_BUDGET_MOJOS_DEFAULT`]'s doc for the attacker-cost reasoning.
     #[serde(default = "default_max_cycle_fee_budget_mojos")]
     pub max_cycle_fee_budget_mojos: u64,
+
+    /// Defect B2: the tie-break cursor [`super::ClaimEngine::order_for_budget`] uses to rotate a
+    /// legitimately starved tail (a set of equal-accrual honest distributors whose combined fee
+    /// exceeds one cycle's budget every cycle) so the SAME distributors are not dropped every
+    /// cycle forever. Persisted here — not just held in the in-memory [`super::ClaimEngine`] — so
+    /// a node that restarts daily does not reset the rotation and starve the tail permanently.
+    /// `None` until the first cycle defers something; absent from a config written before this
+    /// field existed, which is the same as `None` (no rotation history yet).
+    #[serde(default)]
+    pub rotation_cursor: Option<Bytes32>,
 }
 
 fn default_enabled() -> bool {
@@ -101,6 +119,7 @@ impl Default for RewardsClaimConfig {
             jitter_seconds: default_jitter_seconds(),
             max_fee_mojos: default_max_fee_mojos(),
             max_cycle_fee_budget_mojos: default_max_cycle_fee_budget_mojos(),
+            rotation_cursor: None,
         }
     }
 }
@@ -200,10 +219,33 @@ mod tests {
             jitter_seconds: 1_800,
             max_fee_mojos: 150_000,
             max_cycle_fee_budget_mojos: 900_000,
+            rotation_cursor: None,
         };
         cfg.save_to(dir.path()).expect("save");
 
         let loaded = RewardsClaimConfig::load_from(dir.path());
+        assert_eq!(loaded, cfg);
+    }
+
+    /// Defect B2: a rotation cursor left in memory only resets on every restart, which starves a
+    /// legitimately-tied honest tail forever on any node that restarts daily. It must round-trip
+    /// through save/load exactly like every other field.
+    #[test]
+    fn the_rotation_cursor_survives_a_save_load_round_trip() {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-rewards-claim-cursor-test-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let cursor = Bytes32::from([7u8; 32]);
+        let cfg = RewardsClaimConfig {
+            rotation_cursor: Some(cursor),
+            ..RewardsClaimConfig::default()
+        };
+        cfg.save_to(dir.path()).expect("save");
+
+        let loaded = RewardsClaimConfig::load_from(dir.path());
+        assert_eq!(loaded.rotation_cursor, Some(cursor));
         assert_eq!(loaded, cfg);
     }
 
