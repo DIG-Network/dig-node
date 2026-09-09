@@ -60,6 +60,7 @@ pub mod mirror_bond;
 mod module_tier_tag;
 pub mod peer;
 pub mod rate_limit;
+pub mod rewards;
 pub mod store_exchange;
 
 #[cfg(test)]
