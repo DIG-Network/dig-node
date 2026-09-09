@@ -130,8 +130,7 @@ mod tests {
         let clock = TestClock::new(1_000);
         let status = status_at(1_000);
 
-        let completed =
-            run_cycle_with_deadline(&status, &clock, std::future::pending::<()>).await;
+        let completed = run_cycle_with_deadline(&status, &clock, std::future::pending::<()>).await;
 
         assert!(
             !completed,
