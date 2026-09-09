@@ -30,6 +30,17 @@
 //! A silent no-op that reported progress instead would be the exact defect this ticket exists to
 //! prevent (SPEC §2.4): with the unavailable adapter wired, zero claims IS the true state, so the
 //! status surface must say so by name, not by omission.
+//!
+//! # Not yet wired into node startup (Defect D — stated, not fixed here)
+//! Nothing in this codebase constructs a [`ClaimEngine`] outside this module's own tests: there is
+//! no scheduler that drives [`ClaimEngine::run_cycle`] on a cadence, and no RPC method exposes
+//! [`ClaimStatus`] to an operator, even though [`RewardsClaimConfig::enabled`] defaults to `true`.
+//! Wiring this into node startup — picking a concrete [`ClaimChainPort`] adapter, starting the
+//! cadence loop, and exposing `ClaimStatus` over RPC — is a separate unit of work with its own
+//! review surface, deferred out of this PR on purpose: the only production adapter available today
+//! is [`UnavailableClaimChainPort`], and the real one arrives with
+//! DIG-Network/dig_ecosystem#3249. Until that wiring lands, this module compiles, is fully tested
+//! against the fake chain port, and does nothing in a running node.
 
 mod cadence;
 mod config;

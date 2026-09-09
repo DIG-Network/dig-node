@@ -56,6 +56,12 @@ pub enum ClaimOutcome {
         fee_mojos: u64,
         budget_mojos: u64,
     },
+    /// Defect E: the port's `own_entry` returned an entry whose `payout_puzzle_hash` does not equal
+    /// THIS node's own (`ClaimEngine::own_payout_puzzle_hash`). Paying it would send funds to
+    /// somewhere that is not this node, so the claim is REFUSED — not corrected by substituting our
+    /// own hash and proceeding. A mismatch means the port is confused or hostile, so it counts as a
+    /// fault, never a routine skip.
+    PayoutPuzzleHashMismatch { launcher_id: Bytes32 },
 }
 
 /// The closed set of states this loop can be in. Never a health boolean (SPEC §2.4) — each name
@@ -129,6 +135,9 @@ pub struct ClaimStatus {
     /// Defect C2: lifetime count of claims skipped because the per-cycle aggregate fee budget was
     /// already exhausted this cycle.
     pub claims_skipped_cycle_budget: u64,
+    /// Defect E: lifetime count of claims REFUSED because the port returned an entry for a puzzle
+    /// hash other than this node's own — see [`ClaimOutcome::PayoutPuzzleHashMismatch`].
+    pub claims_refused_payout_mismatch: u64,
     /// THIS CYCLE's count of distributors observed with no entry slot (Defect B) — no longer a
     /// lifetime blacklist size, because the engine no longer blacklists a launcher id permanently;
     /// see [`super::engine::ClaimEngine`]'s module doc.
@@ -158,6 +167,7 @@ impl Default for ClaimStatus {
             claims_skipped_below_threshold: 0,
             claims_skipped_fee_ceiling: 0,
             claims_skipped_cycle_budget: 0,
+            claims_refused_payout_mismatch: 0,
             terminal_no_entry_slot: 0,
             fault_reported: false,
             consecutive_faulted_cycles: 0,

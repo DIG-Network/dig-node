@@ -216,6 +216,20 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             }
         };
 
+        if entry.payout_puzzle_hash != self.own_payout_puzzle_hash {
+            // Defect E: the port handed back an entry for a puzzle hash that is not this node's own.
+            // Submitting against it would pay someone else. Refuse -- never substitute our own hash
+            // and proceed -- and surface it as a fault, since a divergent entry means the port is
+            // confused or hostile, not that there is nothing to claim.
+            self.status.fault_reported = true;
+            self.status.claims_refused_payout_mismatch += 1;
+            return EvalResult::Outcome(
+                ClaimOutcome::PayoutPuzzleHashMismatch { launcher_id },
+                true,
+                false,
+            );
+        }
+
         let threshold = match self.port.payout_threshold(launcher_id).await {
             Ok(t) => t,
             Err(ClaimPortError::Unavailable) => return EvalResult::ChainUnavailable,
@@ -946,6 +960,40 @@ mod tests {
         );
         assert_eq!(e.status().claims_submitted, 2);
         assert_eq!(e.status().claims_skipped_cycle_budget, 2);
+    }
+
+    /// Defect E regression: a port returning an entry whose `payout_puzzle_hash` diverges from this
+    /// node's own must produce ZERO submissions and a reported fault -- never pay whoever the port
+    /// named instead.
+    #[tokio::test]
+    async fn entry_for_a_different_payout_puzzle_hash_is_refused_not_paid() {
+        let wrong_hash = Bytes32::new([0x77u8; 32]);
+        assert_ne!(wrong_hash, OUR_PAYOUT_PUZZLE_HASH);
+        let d = one_distributor(
+            Some(super::super::types::OwnEntry {
+                payout_puzzle_hash: wrong_hash,
+                counter: 0,
+                accrued_base_units: 5_000,
+            }),
+            1_000,
+            10,
+        );
+        let launcher_id = d.launcher_id;
+        let mut e = engine(FakeChainPort::new(vec![d]));
+
+        let outcomes = e.run_cycle(1_000).await;
+
+        assert_eq!(
+            outcomes,
+            vec![ClaimOutcome::PayoutPuzzleHashMismatch { launcher_id }]
+        );
+        assert_eq!(e.status().claims_submitted, 0, "never paid the wrong hash");
+        assert!(e.port.submitted.lock().unwrap().is_empty());
+        assert!(
+            e.status().fault_reported,
+            "a divergent entry is a fault, not a routine skip"
+        );
+        assert_eq!(e.status().claims_refused_payout_mismatch, 1);
     }
 
     /// ACCEPTANCE 12 — with `UnavailableClaimChainPort` wired, the engine reports the named state

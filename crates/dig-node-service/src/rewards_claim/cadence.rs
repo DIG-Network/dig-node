@@ -68,6 +68,7 @@ mod tests {
             cadence_seconds: 12_000,
             jitter_seconds: 500,
             max_fee_mojos: 1,
+            max_cycle_fee_budget_mojos: 10,
         };
         let interval =
             next_interval_seconds(cfg.cadence_seconds, cfg.jitter_seconds, &FixedJitter(0));
