@@ -41,7 +41,8 @@ mod types;
 
 pub use cadence::{next_interval_seconds, FixedJitter, JitterSource, CLAIM_JITTER_SECONDS_DEFAULT};
 pub use config::{
-    RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT, CLAIM_FEE_CEILING_MOJOS_DEFAULT,
+    RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT, CLAIM_CYCLE_FEE_BUDGET_MOJOS_DEFAULT,
+    CLAIM_FEE_CEILING_MOJOS_DEFAULT,
 };
 pub use engine::ClaimEngine;
 pub use hints::{DistributorHint, DistributorHintSource, NoHintSource};

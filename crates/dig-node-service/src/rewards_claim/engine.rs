@@ -2,24 +2,36 @@
 //! [`DistributorHintSource`], never against a concrete chain client (see the module doc's "chain
 //! seam" section).
 
-use std::collections::HashSet;
-
 use chia_protocol::Bytes32;
 
 use super::hints::DistributorHintSource;
 use super::port::{ClaimChainPort, ClaimPortError};
 use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus};
 
-/// Drives one claim cycle for this node against a [`ClaimChainPort`] + [`DistributorHintSource`],
-/// holding the terminal "no entry slot" set (SPEC §12.5 clause 1) and the anti-silence status
-/// surface across calls to [`Self::run_cycle`].
+/// Drives one claim cycle for this node against a [`ClaimChainPort`] + [`DistributorHintSource`]
+/// and the anti-silence status surface across calls to [`Self::run_cycle`].
+///
+/// # No permanent "no entry slot" blacklist (Defect B)
+/// An earlier version of this engine cached a launcher id in a process-lifetime `terminal_no_entry`
+/// set the first time `own_entry` returned `None`, and never re-checked it. That is wrong in two
+/// reachable cases: SPEC §12.5 clause 2's re-entry path (a peer evicted, re-challenged and
+/// legitimately re-admitted would never claim again until the process restarted), and a peer that
+/// discovers a distributor before the funder's `AddEntry` lands (blacklisted on its very first
+/// cycle, never paid at all). SPEC §12.5 clause 3 — re-read the entry slot before every claim,
+/// never cache one across cycles — argues directly against caching an absence forever too. The fix:
+/// no blacklist at all. `own_entry` is a cheap chain READ, so it is re-issued every cycle for every
+/// candidate; `ClaimOutcome::NoEntrySlot` stays the reported outcome (still non-error, still no
+/// spend, still no chain fault), but it is now a per-cycle observation, not a lifetime sentence.
 pub struct ClaimEngine<P, H> {
     port: P,
     hints: H,
     own_payout_puzzle_hash: Bytes32,
     max_fee_mojos: u64,
+    /// Defect C2: the per-cycle aggregate fee budget — bounds what this node will spend across ALL
+    /// claims in one cycle, independent of the per-claim ceiling. See [`super::config`]'s module doc
+    /// for the attacker-cost reasoning that makes this necessary in addition to `max_fee_mojos`.
+    cycle_fee_budget_mojos: u64,
     dig_asset_id: Bytes32,
-    terminal_no_entry: HashSet<Bytes32>,
     status: ClaimStatus,
 }
 
@@ -29,6 +41,7 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         hints: H,
         own_payout_puzzle_hash: Bytes32,
         max_fee_mojos: u64,
+        cycle_fee_budget_mojos: u64,
         dig_asset_id: Bytes32,
     ) -> Self {
         ClaimEngine {
@@ -36,8 +49,8 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             hints,
             own_payout_puzzle_hash,
             max_fee_mojos,
+            cycle_fee_budget_mojos,
             dig_asset_id,
-            terminal_no_entry: HashSet::new(),
             status: ClaimStatus::default(),
         }
     }
@@ -48,9 +61,18 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     }
 
     /// Run one cycle: discover candidates (chain + re-derived hints), evaluate each against SPEC
-    /// §9.3/§8.3/§12.5, and submit a claim for every one that clears both the threshold and the fee
-    /// ceiling. Returns every outcome, one per evaluated distributor.
+    /// §9.3/§8.3/§12.5, and submit a claim for every one that clears the per-claim threshold, the
+    /// per-claim fee ceiling AND the per-cycle aggregate fee budget. Returns every outcome, one per
+    /// evaluated distributor.
     pub async fn run_cycle(&mut self, now: u64) -> Vec<ClaimOutcome> {
+        // Defect A1/A4: per-cycle fields are reset here, not carried over — a fault or a claim count
+        // from a PAST cycle must never leak into this cycle's reading of `compute_state()`.
+        self.status.fault_reported = false;
+        self.status.last_attempt_at = Some(now);
+        let mut spent_this_cycle_mojos = 0u64;
+        let mut budget_exhausted = false;
+
+        let mut discovery_failed = false;
         let discovered = match self.port.discover_distributors().await {
             Ok(v) => v,
             Err(ClaimPortError::Unavailable) => {
@@ -58,11 +80,16 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
                 return Vec::new();
             }
             Err(ClaimPortError::Other(_)) => {
+                // Defect A4: do NOT stamp `last_discovery_at` here — a reader relies on this
+                // timestamp going stale to notice a wedged discovery path.
                 self.status.fault_reported = true;
+                discovery_failed = true;
                 Vec::new()
             }
         };
-        self.status.last_discovery_at = Some(now);
+        if !discovery_failed {
+            self.status.last_discovery_at = Some(now);
+        }
 
         let mut candidates: Vec<Bytes32> = discovered.iter().map(|d| d.launcher_id).collect();
 
@@ -81,18 +108,29 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         }
 
         self.status.distributors_known = candidates.len() as u32;
+        let any_candidates = !candidates.is_empty();
 
         let mut outcomes = Vec::new();
         let mut with_entry = 0u32;
         let mut claimable = 0u32;
+        let mut faulted = 0u32;
+        let mut submitted_this_cycle = 0u64;
+        let mut no_entry_this_cycle = 0u32;
 
         for launcher_id in candidates {
-            if self.terminal_no_entry.contains(&launcher_id) {
-                continue;
-            }
-
-            match self.evaluate_one(launcher_id).await {
-                EvalResult::Fault => continue,
+            // Defect B: no permanent blacklist skip here — every candidate is re-evaluated every
+            // cycle, including one that reported `NoEntrySlot` on a prior cycle.
+            match self
+                .evaluate_one(
+                    launcher_id,
+                    &mut spent_this_cycle_mojos,
+                    &mut budget_exhausted,
+                )
+                .await
+            {
+                EvalResult::Fault => {
+                    faulted += 1;
+                }
                 EvalResult::Outcome(outcome, entry_seen, was_claimable) => {
                     if entry_seen {
                         with_entry += 1;
@@ -100,9 +138,10 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
                     if was_claimable {
                         claimable += 1;
                     }
-                    if matches!(outcome, ClaimOutcome::NoEntrySlot { .. }) {
-                        self.terminal_no_entry.insert(launcher_id);
-                        self.status.terminal_no_entry_slot += 1;
+                    match &outcome {
+                        ClaimOutcome::NoEntrySlot { .. } => no_entry_this_cycle += 1,
+                        ClaimOutcome::Submitted { .. } => submitted_this_cycle += 1,
+                        _ => {}
                     }
                     outcomes.push(outcome);
                 }
@@ -113,16 +152,36 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             }
         }
 
+        // Defect A4: an all-faulted cycle (candidates existed, discovery succeeded, but every one of
+        // them faulted) must not stamp `last_cycle_at` either — same staleness reasoning as above.
+        let all_faulted_cycle = any_candidates && outcomes.is_empty() && self.status.fault_reported;
+
         self.status.distributors_with_own_entry = with_entry;
         self.status.distributors_claimable = claimable;
-        self.status.last_cycle_at = Some(now);
+        self.status.distributors_faulted = faulted;
+        self.status.claims_submitted += submitted_this_cycle;
+        self.status.claims_submitted_this_cycle = submitted_this_cycle;
+        self.status.terminal_no_entry_slot = no_entry_this_cycle;
+        self.status.consecutive_faulted_cycles = if self.status.fault_reported {
+            self.status.consecutive_faulted_cycles + 1
+        } else {
+            0
+        };
+        if !discovery_failed && !all_faulted_cycle {
+            self.status.last_cycle_at = Some(now);
+        }
         if self.status.state != ClaimLoopState::ChainSourceUnavailable {
             self.status.state = self.status.compute_state();
         }
         outcomes
     }
 
-    async fn evaluate_one(&mut self, launcher_id: Bytes32) -> EvalResult {
+    async fn evaluate_one(
+        &mut self,
+        launcher_id: Bytes32,
+        spent_this_cycle_mojos: &mut u64,
+        budget_exhausted: &mut bool,
+    ) -> EvalResult {
         let asset = match self.port.reserve_asset_id(launcher_id).await {
             Ok(a) => a,
             Err(ClaimPortError::Unavailable) => return EvalResult::ChainUnavailable,
@@ -201,13 +260,30 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             );
         }
 
+        // Defect C2: the per-claim ceiling alone does not bound what K distributors can collectively
+        // force this node to spend in one cycle. Once the cycle budget is gone, every remaining
+        // candidate is skipped the same way, not spent past it.
+        if *budget_exhausted || *spent_this_cycle_mojos + fee > self.cycle_fee_budget_mojos {
+            *budget_exhausted = true;
+            self.status.claims_skipped_cycle_budget += 1;
+            return EvalResult::Outcome(
+                ClaimOutcome::SkippedCycleBudgetExhausted {
+                    launcher_id,
+                    fee_mojos: fee,
+                    budget_mojos: self.cycle_fee_budget_mojos,
+                },
+                true,
+                true,
+            );
+        }
+
         match self
             .port
             .submit_initiate_payout(launcher_id, entry.payout_puzzle_hash, fee)
             .await
         {
             Ok(()) => {
-                self.status.claims_submitted += 1;
+                *spent_this_cycle_mojos += fee;
                 EvalResult::Outcome(ClaimOutcome::Submitted { launcher_id }, true, true)
             }
             Err(ClaimPortError::Unavailable) => EvalResult::ChainUnavailable,
@@ -241,6 +317,7 @@ mod tests {
     const DIG_ASSET_ID: Bytes32 = Bytes32::new([9u8; 32]);
     const OUR_PAYOUT_PUZZLE_HASH: Bytes32 = Bytes32::new([1u8; 32]);
     const FEE_CEILING: u64 = 1_000_000_000;
+    const CYCLE_BUDGET: u64 = 1_000_000_000;
 
     #[derive(Clone)]
     struct FakeDistributor {
@@ -387,6 +464,7 @@ mod tests {
             NoHintSource,
             OUR_PAYOUT_PUZZLE_HASH,
             FEE_CEILING,
+            CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
     }
@@ -504,10 +582,11 @@ mod tests {
         assert!(e.port.submitted.lock().unwrap().is_empty());
     }
 
-    /// ACCEPTANCE 6 — no entry slot is terminal, non-error, and reports neither a chain fault nor
-    /// a lost payment; the SECOND tick performs zero retries against that distributor.
+    /// Defect B regression: `NoEntrySlot` is non-error and reports neither a chain fault nor a lost
+    /// payment, but it is NO LONGER a permanent blacklist — the second tick re-checks the same
+    /// distributor (SPEC §12.5 clause 3: re-read fresh before every claim, never cache).
     #[tokio::test]
-    async fn no_entry_slot_is_terminal_and_not_retried() {
+    async fn no_entry_slot_is_non_terminal_and_re_checked_every_cycle() {
         let d = one_distributor(None, 1_000, 10);
         let launcher_id = d.launcher_id;
         let mut e = engine(FakeChainPort::new(vec![d]));
@@ -520,15 +599,48 @@ mod tests {
 
         let reads_after_first = *e.port.own_entry_reads.lock().unwrap();
         let second = e.run_cycle(2_000).await;
-        assert!(
-            second.is_empty(),
-            "terminal distributor is skipped, not retried"
+        assert_eq!(
+            second,
+            vec![ClaimOutcome::NoEntrySlot { launcher_id }],
+            "still no entry, so still reported -- but re-evaluated, not silently skipped"
         );
         assert_eq!(
             *e.port.own_entry_reads.lock().unwrap(),
-            reads_after_first,
-            "zero retries on the next tick"
+            reads_after_first + 1,
+            "the second tick re-reads the entry slot rather than trusting a cached absence"
         );
+    }
+
+    /// Defect B — the fix's whole point: SPEC §12.5 clause 2's re-entry path. A distributor with no
+    /// entry slot on cycle 1 (never admitted yet, or evicted) that gains one before cycle 2 (legit
+    /// re-admission, or a discovery-vs-`AddEntry` race resolving) must produce a claim on cycle 2 —
+    /// the old process-lifetime blacklist made this permanently unreachable.
+    #[tokio::test]
+    async fn no_entry_slot_then_re_admitted_produces_a_claim_on_the_later_cycle() {
+        let d = one_distributor(None, 1_000, 10);
+        let launcher_id = d.launcher_id;
+        let port = FakeChainPort::new(vec![d]);
+        let mut e = engine(port);
+
+        let first = e.run_cycle(1_000).await;
+        assert_eq!(first, vec![ClaimOutcome::NoEntrySlot { launcher_id }]);
+
+        // The distributor admits our entry between cycle 1 and cycle 2.
+        e.port
+            .distributors
+            .lock()
+            .unwrap()
+            .get_mut(&launcher_id)
+            .unwrap()
+            .entry = Some(super::super::types::OwnEntry {
+            payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+            counter: 0,
+            accrued_base_units: 5_000,
+        });
+
+        let second = e.run_cycle(2_000).await;
+        assert_eq!(second, vec![ClaimOutcome::Submitted { launcher_id }]);
+        assert_eq!(e.status().claims_submitted, 1);
     }
 
     /// ACCEPTANCE 7 — two consecutive ticks perform two fresh entry-slot reads; no cached slot.
@@ -648,6 +760,7 @@ mod tests {
             OneHint(launcher_id),
             OUR_PAYOUT_PUZZLE_HASH,
             FEE_CEILING,
+            CYCLE_BUDGET,
             DIG_ASSET_ID,
         );
 
@@ -675,12 +788,164 @@ mod tests {
             BogusHint,
             OUR_PAYOUT_PUZZLE_HASH,
             FEE_CEILING,
+            CYCLE_BUDGET,
             DIG_ASSET_ID,
         );
 
         let outcomes = e.run_cycle(1_000).await;
         assert!(outcomes.is_empty());
         assert_eq!(e.status().distributors_known, 0);
+    }
+
+    /// A port whose discovery call always returns a real (non-`Unavailable`) chain fault, every
+    /// cycle -- the failure Defect A1 describes.
+    struct AlwaysFaultingDiscoveryPort;
+    #[async_trait]
+    impl ClaimChainPort for AlwaysFaultingDiscoveryPort {
+        async fn discover_distributors(
+            &self,
+        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
+            Err(ClaimPortError::Other("simulated chain fault".into()))
+        }
+        async fn resolve_launch_comment(
+            &self,
+            _launcher_id: Bytes32,
+        ) -> Result<Option<DiscoveredDistributor>, ClaimPortError> {
+            Ok(None)
+        }
+        async fn reserve_asset_id(&self, _launcher_id: Bytes32) -> Result<Bytes32, ClaimPortError> {
+            Err(ClaimPortError::Other("unreachable".into()))
+        }
+        async fn payout_threshold(&self, _launcher_id: Bytes32) -> Result<u64, ClaimPortError> {
+            Err(ClaimPortError::Other("unreachable".into()))
+        }
+        async fn own_entry(
+            &self,
+            _launcher_id: Bytes32,
+            _payout_puzzle_hash: Bytes32,
+        ) -> Result<Option<super::super::types::OwnEntry>, ClaimPortError> {
+            Err(ClaimPortError::Other("unreachable".into()))
+        }
+        async fn required_fee_mojos(&self, _launcher_id: Bytes32) -> Result<u64, ClaimPortError> {
+            Err(ClaimPortError::Other("unreachable".into()))
+        }
+        async fn submit_initiate_payout(
+            &self,
+            _launcher_id: Bytes32,
+            _payout_puzzle_hash: Bytes32,
+            _fee_mojos: u64,
+        ) -> Result<(), ClaimPortError> {
+            Err(ClaimPortError::Other("unreachable".into()))
+        }
+    }
+
+    /// Defect A1/A2 regression -- THE anti-green test for this defect: a port that errors on
+    /// discovery every cycle must NEVER read `Nominal`. Before the fix, `fault_reported` had no
+    /// fault-bearing state to fall through to and this laundered into `Nominal` forever.
+    #[tokio::test]
+    async fn repeated_discovery_faults_never_read_as_nominal() {
+        let mut e = ClaimEngine::new(
+            AlwaysFaultingDiscoveryPort,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        );
+
+        for cycle in 1..=3u32 {
+            e.run_cycle(u64::from(cycle) * 1_000).await;
+            assert_ne!(
+                e.status().state,
+                ClaimLoopState::Nominal,
+                "cycle {cycle}: a reported fault must never read as Nominal"
+            );
+            assert_eq!(
+                e.status().state,
+                ClaimLoopState::Faulted { cycles: cycle },
+                "cycle {cycle}: consecutive fault count must track the streak"
+            );
+        }
+    }
+
+    /// Defect A4 regression: a failed discovery must leave `last_discovery_at` unchanged (a reader
+    /// depends on that timestamp going stale to notice a wedged discovery path).
+    #[tokio::test]
+    async fn failed_discovery_leaves_last_discovery_at_unchanged() {
+        let mut e = ClaimEngine::new(
+            AlwaysFaultingDiscoveryPort,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        );
+
+        e.run_cycle(1_000).await;
+        assert_eq!(e.status().last_discovery_at, None);
+        e.run_cycle(2_000).await;
+        assert_eq!(
+            e.status().last_discovery_at,
+            None,
+            "still unchanged after a second failed discovery"
+        );
+        assert_eq!(
+            e.status().last_attempt_at,
+            Some(2_000),
+            "last_attempt_at still proves the loop is alive"
+        );
+    }
+
+    /// Defect C2 regression: K distributors each individually under the per-claim ceiling must NOT
+    /// collectively spend past the per-cycle aggregate budget.
+    #[tokio::test]
+    async fn distributors_each_under_ceiling_do_not_collectively_exceed_the_cycle_budget() {
+        const PER_CLAIM_FEE: u64 = 10;
+        const BUDGET: u64 = 25; // only 2 of 4 distributors can be paid out of this budget
+        let distributors: Vec<FakeDistributor> = (0..4u8)
+            .map(|i| FakeDistributor {
+                launcher_id: Bytes32::new([i + 10; 32]),
+                store_id: Bytes32::new([3u8; 32]),
+                root: Bytes32::new([4u8; 32]),
+                reserve_asset_id: DIG_ASSET_ID,
+                payout_threshold: 1_000,
+                entry: Some(super::super::types::OwnEntry {
+                    payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+                    counter: 0,
+                    accrued_base_units: 5_000,
+                }),
+                fee_mojos: PER_CLAIM_FEE,
+            })
+            .collect();
+        let mut e = ClaimEngine::new(
+            FakeChainPort::new(distributors),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING, // each individual fee (10) is far under the per-claim ceiling
+            BUDGET,
+            DIG_ASSET_ID,
+        );
+
+        let outcomes = e.run_cycle(1_000).await;
+
+        let submitted = outcomes
+            .iter()
+            .filter(|o| matches!(o, ClaimOutcome::Submitted { .. }))
+            .count();
+        let budget_skipped = outcomes
+            .iter()
+            .filter(|o| matches!(o, ClaimOutcome::SkippedCycleBudgetExhausted { .. }))
+            .count();
+        assert_eq!(
+            submitted, 2,
+            "only 2 claims fit inside the 25-mojo budget at 10 each"
+        );
+        assert_eq!(
+            budget_skipped, 2,
+            "the remaining 2 are skipped, not spent past the budget"
+        );
+        assert_eq!(e.status().claims_submitted, 2);
+        assert_eq!(e.status().claims_skipped_cycle_budget, 2);
     }
 
     /// ACCEPTANCE 12 — with `UnavailableClaimChainPort` wired, the engine reports the named state
@@ -693,6 +958,7 @@ mod tests {
             NoHintSource,
             OUR_PAYOUT_PUZZLE_HASH,
             FEE_CEILING,
+            CYCLE_BUDGET,
             DIG_ASSET_ID,
         );
 

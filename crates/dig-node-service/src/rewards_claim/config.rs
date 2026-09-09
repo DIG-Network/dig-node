@@ -12,15 +12,35 @@ use super::cadence::CLAIM_JITTER_SECONDS_DEFAULT;
 /// SPEC §8.6: the peer-side claim cadence default.
 pub const CLAIM_CADENCE_SECONDS_DEFAULT: u64 = 86_400;
 
-/// The max fee ceiling this node will spend on one claim (requirement 2), reusing
-/// `crate::mirror::signer::MIRROR_SPEND_FEE_CEILING_MOJOS` as the source for the same class of
-/// peer-side spend. Not a floor: a true "net > 0" floor is not computable here — the fee is XCH
-/// mojos, the reward is $DIG base units, and the node holds no exchange rate between them. SPEC
-/// §8.3 clause 2 already asserts `payout_threshold` (1 $DIG) is "above any plausible fee", so the
-/// threshold IS the economic floor by construction; this constant only caps what the node will pay
-/// to collect it. See the module doc's "fee ceiling" reasoning for the full argument.
-pub const CLAIM_FEE_CEILING_MOJOS_DEFAULT: u64 =
-    crate::mirror::signer::MIRROR_SPEND_FEE_CEILING_MOJOS;
+/// The max fee ceiling this node will spend on ONE claim (requirement 2). Not a floor: a true
+/// "net > 0" floor is not computable here — the fee is XCH mojos, the reward is $DIG base units,
+/// and the node holds no exchange rate between them. SPEC §8.3 clause 2 already asserts
+/// `payout_threshold` (1 $DIG) is "above any plausible fee", so the threshold IS the economic floor
+/// by construction; this constant only caps what the node will pay to collect it.
+///
+/// # Defect C1: the magnitude, not the reasoning, was wrong
+/// This constant originally reused `crate::mirror::signer::MIRROR_SPEND_FEE_CEILING_MOJOS`
+/// (1_000_000_000 mojos = 0.001 XCH) — a number sized for a mirror-coin spend, not a per-distributor
+/// claim repeated daily. Against a routine Chia transaction fee of 5,000-100,000 mojos, that ceiling
+/// was four to five orders of magnitude too loose to ever bind a real fee: a peer could still lose
+/// money inside it whenever 1 $DIG is worth less than 0.001 XCH, and the ceiling would never notice.
+/// 200,000 mojos is 2x the top of the observed routine-fee range — enough headroom to survive a
+/// congested mempool without giving up the one computable control this loop has.
+pub const CLAIM_FEE_CEILING_MOJOS_DEFAULT: u64 = 200_000;
+
+/// The per-cycle AGGREGATE fee budget (Defect C2): a cap on what this node will spend across ALL
+/// claims in one cycle, independent of [`CLAIM_FEE_CEILING_MOJOS_DEFAULT`]'s per-claim cap.
+///
+/// `required_fee_mojos(launcher_id)` is per-distributor state that anyone may create: a DIG-asset
+/// distributor may be launched over any widely mirrored store. Without an aggregate cap, an
+/// attacker funding K such distributors and getting a victim peer's payout puzzle hash admitted to
+/// each could force that peer to spend up to `K * CLAIM_FEE_CEILING_MOJOS_DEFAULT` of its own XCH
+/// per cycle, at a cost to the attacker of only K $DIG. Defaulting this to 10x the per-claim ceiling
+/// bounds a single cycle to roughly 10 distributors' worth of fees before the loop stops claiming
+/// for the rest of that cycle and reports it by name
+/// (`ClaimOutcome::SkippedCycleBudgetExhausted`) — configurable for an operator who mirrors more
+/// than that many distributors' worth of stores.
+pub const CLAIM_CYCLE_FEE_BUDGET_MOJOS_DEFAULT: u64 = CLAIM_FEE_CEILING_MOJOS_DEFAULT * 10;
 
 const REWARDS_CLAIM_CONFIG_FILE: &str = "rewards-claim.json";
 
@@ -42,10 +62,15 @@ pub struct RewardsClaimConfig {
     #[serde(default = "default_jitter_seconds")]
     pub jitter_seconds: u64,
 
-    /// The fee ceiling (requirement 2) — see [`CLAIM_FEE_CEILING_MOJOS_DEFAULT`]'s doc for why this
-    /// is a ceiling, not a floor.
+    /// The PER-CLAIM fee ceiling (requirement 2) — see [`CLAIM_FEE_CEILING_MOJOS_DEFAULT`]'s doc for
+    /// why this is a ceiling, not a floor, and for the magnitude reasoning (Defect C1).
     #[serde(default = "default_max_fee_mojos")]
     pub max_fee_mojos: u64,
+
+    /// The PER-CYCLE aggregate fee budget (Defect C2) — see
+    /// [`CLAIM_CYCLE_FEE_BUDGET_MOJOS_DEFAULT`]'s doc for the attacker-cost reasoning.
+    #[serde(default = "default_max_cycle_fee_budget_mojos")]
+    pub max_cycle_fee_budget_mojos: u64,
 }
 
 fn default_enabled() -> bool {
@@ -64,6 +89,10 @@ fn default_max_fee_mojos() -> u64 {
     CLAIM_FEE_CEILING_MOJOS_DEFAULT
 }
 
+fn default_max_cycle_fee_budget_mojos() -> u64 {
+    CLAIM_CYCLE_FEE_BUDGET_MOJOS_DEFAULT
+}
+
 impl Default for RewardsClaimConfig {
     fn default() -> Self {
         RewardsClaimConfig {
@@ -71,6 +100,7 @@ impl Default for RewardsClaimConfig {
             cadence_seconds: default_cadence_seconds(),
             jitter_seconds: default_jitter_seconds(),
             max_fee_mojos: default_max_fee_mojos(),
+            max_cycle_fee_budget_mojos: default_max_cycle_fee_budget_mojos(),
         }
     }
 }
@@ -137,7 +167,24 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.cadence_seconds, 86_400);
         assert_eq!(cfg.jitter_seconds, 3_600);
-        assert_eq!(cfg.max_fee_mojos, 1_000_000_000);
+        assert_eq!(cfg.max_fee_mojos, 200_000);
+        assert_eq!(cfg.max_cycle_fee_budget_mojos, 2_000_000);
+    }
+
+    /// Defect C1 regression: the ceiling must actually bind a routine Chia fee — the old default
+    /// (1_000_000_000, transplanted from `MIRROR_SPEND_FEE_CEILING_MOJOS`) was 4-5 orders of
+    /// magnitude looser than the observed 5,000-100,000 mojo range and never rejected a real fee.
+    #[test]
+    fn the_default_per_claim_ceiling_actually_binds_a_routine_fee() {
+        let cfg = RewardsClaimConfig::default();
+        assert!(
+            cfg.max_fee_mojos < 1_000_000,
+            "the default ceiling must be within striking distance of a routine fee, not 1e9"
+        );
+        assert!(
+            cfg.max_fee_mojos >= 100_000,
+            "the default ceiling must not reject the top of the routine fee range outright"
+        );
     }
 
     #[test]
@@ -151,7 +198,8 @@ mod tests {
             enabled: false,
             cadence_seconds: 43_200,
             jitter_seconds: 1_800,
-            max_fee_mojos: 500_000_000,
+            max_fee_mojos: 150_000,
+            max_cycle_fee_budget_mojos: 900_000,
         };
         cfg.save_to(dir.path()).expect("save");
 

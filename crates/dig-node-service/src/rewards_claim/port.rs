@@ -44,8 +44,13 @@ pub trait ClaimChainPort: Send + Sync {
     /// SPEC §8.3: the distributor's own chain-curried `payout_threshold` — never hardcoded here.
     async fn payout_threshold(&self, launcher_id: Bytes32) -> Result<u64, ClaimPortError>;
 
-    /// SPEC §10.2/§12.5: this node's own entry slot, re-read fresh on every call — the engine MUST
-    /// NOT cache the result across cycles. `Ok(None)` is SPEC §12.5's terminal "no slot" outcome.
+    /// SPEC §10.2/§12.5: this node's own entry slot, re-read fresh on EVERY call, EVERY cycle — the
+    /// engine MUST NOT cache the result across cycles and MUST NOT treat one `Ok(None)` as
+    /// permanent (Defect B): SPEC §12.5 clause 2 describes a legitimate re-entry path (evicted,
+    /// re-challenged, re-admitted), and this call cannot tell "never admitted yet" apart from
+    /// "evicted" from the absence alone — nor does it need to, since SPEC §6.4 clause 1 means
+    /// nothing is owed either way. `Ok(None)` means only "no claim this cycle", never "no claim
+    /// ever again".
     async fn own_entry(
         &self,
         launcher_id: Bytes32,
