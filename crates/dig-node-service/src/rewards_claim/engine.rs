@@ -468,6 +468,7 @@ enum BudgetPhaseResult {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -1426,7 +1427,11 @@ mod tests {
     /// call (including later `discover_distributors` calls) to a healthy inner `FakeChainPort` --
     /// modelling a node still syncing, or one dropped connection, exactly as F1 describes.
     struct FlakyThenHealthyPort {
-        calls: Mutex<u32>,
+        // An atomic counter, not a `Mutex<u32>` -- a guard held across the `.await` below would
+        // make this port's future not `Send`, which `#[async_trait]`'s generated signature
+        // requires. Nothing here needs a lock: it is a single counter, never held past its own
+        // increment.
+        calls: AtomicU32,
         inner: FakeChainPort,
     }
 
@@ -1435,12 +1440,10 @@ mod tests {
         async fn discover_distributors(
             &self,
         ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
-            let mut calls = self.calls.lock().unwrap();
-            *calls += 1;
-            if *calls == 1 {
+            let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call_number == 1 {
                 return Err(ClaimPortError::Unavailable);
             }
-            drop(calls);
             self.inner.discover_distributors().await
         }
         async fn resolve_launch_comment(
@@ -1494,7 +1497,7 @@ mod tests {
         );
         let launcher_id = distributor.launcher_id;
         let port = FlakyThenHealthyPort {
-            calls: Mutex::new(0),
+            calls: AtomicU32::new(0),
             inner: FakeChainPort::new(vec![distributor]),
         };
         let mut e = ClaimEngine::new(
@@ -1531,7 +1534,9 @@ mod tests {
     /// A discovery port that answers healthily on its FIRST call, then `Unavailable` on every call
     /// after that -- the inverse of `FlakyThenHealthyPort`, for F3's staleness scenario.
     struct HealthyThenUnavailablePort {
-        calls: Mutex<u32>,
+        // Atomic, not `Mutex<u32>` -- see `FlakyThenHealthyPort`'s comment: a guard held across
+        // the `.await` below would make this port's future not `Send`.
+        calls: AtomicU32,
         inner: FakeChainPort,
     }
 
@@ -1540,10 +1545,8 @@ mod tests {
         async fn discover_distributors(
             &self,
         ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
-            let mut calls = self.calls.lock().unwrap();
-            *calls += 1;
-            if *calls == 1 {
-                drop(calls);
+            let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call_number == 1 {
                 return self.inner.discover_distributors().await;
             }
             Err(ClaimPortError::Unavailable)
@@ -1600,7 +1603,7 @@ mod tests {
             10,
         );
         let port = HealthyThenUnavailablePort {
-            calls: Mutex::new(0),
+            calls: AtomicU32::new(0),
             inner: FakeChainPort::new(vec![distributor]),
         };
         let mut e = ClaimEngine::new(
