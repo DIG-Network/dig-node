@@ -31,6 +31,24 @@
 //! prevent (SPEC §2.4): with the unavailable adapter wired, zero claims IS the true state, so the
 //! status surface must say so by name, not by omission.
 
+mod cadence;
+mod config;
+mod engine;
+mod hints;
+mod parser;
+mod port;
+mod types;
+
+pub use cadence::{next_interval_seconds, FixedJitter, JitterSource, CLAIM_JITTER_SECONDS_DEFAULT};
+pub use config::{
+    RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT, CLAIM_FEE_CEILING_MOJOS_DEFAULT,
+};
+pub use engine::ClaimEngine;
+pub use hints::{DistributorHint, DistributorHintSource, NoHintSource};
+pub use parser::parse_launch_comment;
+pub use port::{ClaimChainPort, ClaimPortError, UnavailableClaimChainPort};
+pub use types::{ClaimLoopState, ClaimOutcome, ClaimStatus, DiscoveredDistributor, OwnEntry};
+
 #[cfg(test)]
 mod tests {
     #[test]
