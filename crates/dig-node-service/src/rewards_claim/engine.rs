@@ -66,6 +66,15 @@ pub struct ClaimEngine<P, H> {
     /// F7: when the last cycle that ran to completion finished -- the cadence gate's clock. See
     /// [`super::config::RewardsClaimConfig::last_cycle_completed_at`].
     last_cycle_completed_at: Option<u64>,
+    /// F8/F10: set by [`Self::with_persisted_fee_window`] when the loaded
+    /// [`RewardsClaimConfig`] was [`RewardsClaimConfig::corrupt`] (unreadable, unparsable, or a
+    /// spend exceeding its own budget), OR discovered at the top of [`Self::run_cycle`] when
+    /// either persisted clock reads AFTER `now` (a future-dated clock is corrupt state exactly
+    /// the same way, F10). Either way this fails CLOSED: the window reads as fully spent and no
+    /// candidate is evaluated, rather than silently loading [`RewardsClaimConfig::default`] and
+    /// re-granting a budget (F8) or silently freezing forever under a healthy-looking state (the
+    /// pre-F9 reading of F10).
+    fee_window_poisoned: bool,
 }
 
 impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
@@ -91,6 +100,7 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             fee_window_start_unix: None,
             fee_spent_in_window_mojos: 0,
             last_cycle_completed_at: None,
+            fee_window_poisoned: false,
         }
     }
 
@@ -124,11 +134,15 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// also the defect this method exists to close for production use: nothing here is wired into
     /// node startup yet (`crate::rewards_claim`'s module doc, "Not yet wired into node startup"),
     /// so the production wiring (#3268) is the one place expected to call this.
+    /// F10 (§8.6 floor): also applied here, not just in [`RewardsClaimConfig::load_from`] --
+    /// this is a constructor argument, independent of whatever the config file says, and the same
+    /// hot-loop hazard applies to whatever caller passes it a degenerate value directly.
     #[must_use]
     pub fn with_persisted_fee_window(mut self, dir: &Path, cadence_seconds: u64) -> Self {
         let cfg = RewardsClaimConfig::load_from(dir);
         self.fee_window_state_dir = Some(dir.to_path_buf());
-        self.cadence_seconds = cadence_seconds;
+        self.cadence_seconds = cadence_seconds.max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
+        self.fee_window_poisoned = cfg.corrupt;
         self.fee_window_start_unix = cfg.fee_window_start_unix;
         self.fee_spent_in_window_mojos = cfg.fee_spent_in_window_mojos;
         self.last_cycle_completed_at = cfg.last_cycle_completed_at;
@@ -140,11 +154,28 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// [`Self::rotation_cursor`], which this engine does not own writing to disk for) exactly as
     /// it was read. A failed write is logged, never fatal — the same survivable-degradation
     /// posture [`super::config::RewardsClaimConfig::load_from`] already uses for a read.
+    ///
+    /// # F8: never overwrites a corrupt file with defaults
+    /// If the file on disk has gone corrupt SINCE this engine last read it (a concurrent write, or
+    /// disk damage between calls), the fresh `load_from` above returns [`RewardsClaimConfig`] with
+    /// `corrupt: true` -- writing our in-memory fee-window fields into that value and saving it
+    /// would silently paper over the corruption with a value that looks clean (defaulted `enabled`,
+    /// a dropped `rotation_cursor`, exactly the "worse" half of the F8 finding). Refuse instead:
+    /// leave the corrupt file exactly as it is on disk and let the NEXT `run_cycle` observe
+    /// `corrupt` itself and report [`ClaimLoopState::PersistedStateCorrupt`].
     fn persist_fee_window(&self) {
         let Some(dir) = &self.fee_window_state_dir else {
             return;
         };
         let mut cfg = RewardsClaimConfig::load_from(dir);
+        if cfg.corrupt {
+            tracing::warn!(
+                path = %dir.display(),
+                "the rewards-claim preference file is corrupt on disk; refusing to overwrite it \
+                 with a fee-window update"
+            );
+            return;
+        }
         cfg.fee_window_start_unix = self.fee_window_start_unix;
         cfg.fee_spent_in_window_mojos = self.fee_spent_in_window_mojos;
         cfg.last_cycle_completed_at = self.last_cycle_completed_at;
@@ -189,11 +220,31 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         // `self.fee_window_state_dir`, so a caller that never opted in via
         // `with_persisted_fee_window` sees no change at all (every pre-F7 test).
         if self.fee_window_state_dir.is_some() {
+            // F8/F10: a corrupt persisted file, or either persisted clock reading AFTER `now` (a
+            // future-dated clock is corrupt state exactly the same way a torn write is -- an
+            // ordinary NTP step or clock glitch would otherwise freeze the window forever, F10),
+            // must never be treated as a fresh start. Fail CLOSED: submit nothing, report it by
+            // name, and -- critically -- return BEFORE the cadence gate and the window-roll logic
+            // below, which would otherwise happily manufacture a brand-new zeroed window out of
+            // untrustworthy state.
+            let future_dated_clock = self.last_cycle_completed_at.is_some_and(|t| t > now)
+                || self.fee_window_start_unix.is_some_and(|t| t > now);
+            if self.fee_window_poisoned || future_dated_clock {
+                self.fee_window_poisoned = true;
+                self.status.state = ClaimLoopState::PersistedStateCorrupt;
+                return Vec::new();
+            }
             // Refuse to START a cycle until the cadence has elapsed since the last one that ran
             // to completion -- stops a restart loop from immediately re-running a cycle that
             // already ran, independent of whether the fee window below has room left.
+            //
+            // F9: this is a DELIBERATE skip, not a fault and not silence -- name it, so it can
+            // never read as "healthy and idle" (a stale `state` from whatever cycle last computed
+            // one would otherwise stand here forever, since this path never reaches
+            // `compute_state` below).
             if let Some(last_completed) = self.last_cycle_completed_at {
                 if now.saturating_sub(last_completed) < self.cadence_seconds {
+                    self.status.state = ClaimLoopState::CadenceNotElapsed;
                     return Vec::new();
                 }
             }
@@ -369,9 +420,12 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         }
         // F7: this cycle ran to completion (every early return above -- ChainUnavailable -- skips
         // this line, which is exactly right: those never reached the cadence gate's definition of
-        // "ran"). Stamp and persist unconditionally, including a fault-only or all-faulted cycle --
-        // an operator restarting to work around a wedged cycle must still get the cadence gate's
-        // protection, not a loophole that lets a fault re-arm an immediate retry.
+        // "ran" -- F9: neither does the `CadenceNotElapsed` / `PersistedStateCorrupt` early
+        // returns above, for the same reason: none of these ever reached the point where a cycle
+        // is considered to have run). Stamp and persist unconditionally, including a fault-only or
+        // all-faulted cycle -- an operator restarting to work around a wedged cycle must still get
+        // the cadence gate's protection, not a loophole that lets a fault re-arm an immediate
+        // retry.
         if self.fee_window_state_dir.is_some() {
             self.last_cycle_completed_at = Some(now);
             self.persist_fee_window();
@@ -525,7 +579,17 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         // Defect C2: the per-claim ceiling alone does not bound what K distributors can collectively
         // force this node to spend in one cycle. Once the cycle budget is gone, every remaining
         // candidate is skipped the same way, not spent past it.
-        if *budget_exhausted || *spent_this_cycle_mojos + fee > self.cycle_fee_budget_mojos {
+        //
+        // F14: `saturating_add`, never a bare `+` -- `spent_this_cycle_mojos` is seeded from a
+        // persisted value (`RewardsClaimConfig::fee_spent_in_window_mojos`) on the very first
+        // candidate of a cycle. `config::RewardsClaimConfig::load_from` now rejects a spend
+        // exceeding its own budget at load time (fails closed, see F8), but this comparison must
+        // not ALSO be able to panic on a `u64` overflow if that guard is ever bypassed -- the
+        // workspace enables `overflow-checks` in release, so an unchecked add here is a live
+        // panic-on-corrupt-input path, not just a debug-build lint.
+        if *budget_exhausted
+            || spent_this_cycle_mojos.saturating_add(fee) > self.cycle_fee_budget_mojos
+        {
             *budget_exhausted = true;
             self.status.claims_skipped_cycle_budget += 1;
             return BudgetPhaseResult::Outcome(ClaimOutcome::SkippedCycleBudgetExhausted {
@@ -538,12 +602,12 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         // F7: write-then-spend, never spend-then-write. If persistence is armed, the fee this
         // submission is about to cost is committed to disk BEFORE the chain call, not after --
         // so a crash between "we decided to spend" and the chain call returning can never leave
-        // an unpersisted spend that a restart would repeat. Conservative in the failure direction
-        // only: a submission that ultimately errors still counts against the persisted window,
-        // even though `spent_this_cycle_mojos` below (the in-cycle running total the NEXT
-        // candidate's budget check reads) only advances on a confirmed `Ok`, exactly as before F7.
+        // an unpersisted spend that a restart would repeat. This pre-commit is deliberately
+        // conservative: a genuine crash mid-`await` never returns to the `match` below at all, so
+        // the only way to protect against THAT case is to have already written the spend before
+        // making the call.
         if self.fee_window_state_dir.is_some() {
-            self.fee_spent_in_window_mojos += fee;
+            self.fee_spent_in_window_mojos = self.fee_spent_in_window_mojos.saturating_add(fee);
             self.persist_fee_window();
         }
 
@@ -556,11 +620,33 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
                 *spent_this_cycle_mojos += fee;
                 BudgetPhaseResult::Outcome(ClaimOutcome::Submitted { launcher_id })
             }
-            Err(ClaimPortError::Unavailable) => BudgetPhaseResult::ChainUnavailable,
+            // F12: the call HAS resolved here, with a definite answer -- unlike the crash case
+            // above, "no" means the fee was never broadcast (`ClaimPortError::Unavailable`: never
+            // even reached the network; `Other(_)`: the network is reachable but the submission
+            // was rejected). Charging the persisted window for a fee that never left would let an
+            // attacker exhaust this node's per-cycle budget for free with K always-failing
+            // submissions, suppressing a victim's real claims for the rest of the window at zero
+            // cost -- reverse the pre-commit now that we know it did not consume a fee.
+            Err(ClaimPortError::Unavailable) => {
+                self.uncommit_fee(fee);
+                BudgetPhaseResult::ChainUnavailable
+            }
             Err(ClaimPortError::Other(_)) => {
+                self.uncommit_fee(fee);
                 self.status.fault_reported = true;
                 BudgetPhaseResult::Fault
             }
+        }
+    }
+
+    /// F12: reverses a pre-committed persisted spend once [`Self::evaluate_budget_phase`]'s
+    /// submission call has DEFINITELY returned without broadcasting -- see that method's "F12"
+    /// doc comment for why the pre-commit itself must stay conservative for a genuine crash
+    /// mid-call, which never reaches this method at all.
+    fn uncommit_fee(&mut self, fee: u64) {
+        if self.fee_window_state_dir.is_some() {
+            self.fee_spent_in_window_mojos = self.fee_spent_in_window_mojos.saturating_sub(fee);
+            self.persist_fee_window();
         }
     }
 }
@@ -626,6 +712,15 @@ mod tests {
         distributors: Mutex<HashMap<Bytes32, FakeDistributor>>,
         submitted: Mutex<Vec<(Bytes32, Bytes32, u64)>>,
         own_entry_reads: Mutex<u32>,
+        /// F12: launcher ids whose `submit_initiate_payout` must return
+        /// `Err(ClaimPortError::Other(_))` -- simulates a submission that definitely never
+        /// broadcast.
+        fail_submit_for: Mutex<std::collections::HashSet<Bytes32>>,
+        /// F15: when set, `submit_initiate_payout` snapshots the persisted spend at this
+        /// directory into `submit_snapshots` BEFORE returning -- proving the write already
+        /// landed on disk before the chain call resolves, not just before `run_cycle` returns.
+        submit_snapshot_dir: Mutex<Option<std::path::PathBuf>>,
+        submit_snapshots: Mutex<Vec<u64>>,
     }
 
     impl FakeChainPort {
@@ -639,7 +734,20 @@ mod tests {
                 ),
                 submitted: Mutex::new(Vec::new()),
                 own_entry_reads: Mutex::new(0),
+                fail_submit_for: Mutex::new(std::collections::HashSet::new()),
+                submit_snapshot_dir: Mutex::new(None),
+                submit_snapshots: Mutex::new(Vec::new()),
             }
+        }
+
+        /// F12: makes `submit_initiate_payout` for `id` return `Err(Other(_))` instead of `Ok`.
+        fn fail_submit_for(&self, id: Bytes32) {
+            self.fail_submit_for.lock().unwrap().insert(id);
+        }
+
+        /// F15: arms the pre-submit snapshot hook against `dir`.
+        fn arm_submit_snapshot(&self, dir: std::path::PathBuf) {
+            *self.submit_snapshot_dir.lock().unwrap() = Some(dir);
         }
     }
 
@@ -724,6 +832,13 @@ mod tests {
             payout_puzzle_hash: Bytes32,
             fee_mojos: u64,
         ) -> Result<(), ClaimPortError> {
+            if let Some(dir) = self.submit_snapshot_dir.lock().unwrap().clone() {
+                let snapshot = RewardsClaimConfig::load_from(&dir).fee_spent_in_window_mojos;
+                self.submit_snapshots.lock().unwrap().push(snapshot);
+            }
+            if self.fail_submit_for.lock().unwrap().contains(&launcher_id) {
+                return Err(ClaimPortError::Other("simulated submission failure".into()));
+            }
             self.submitted
                 .lock()
                 .unwrap()
@@ -1644,6 +1759,296 @@ mod tests {
         assert_eq!(
             persisted.fee_spent_in_window_mojos, 20,
             "each submission must persist its own spend immediately, not wait for cycle end"
+        );
+    }
+
+    /// F15: `f7_a_spend_is_persisted_per_submission_not_batched_to_cycle_end` above only reads the
+    /// file AFTER `run_cycle` returns, which a cycle-end-batched persist would also satisfy --
+    /// exactly the vacuous-test class F11 named. This test snapshots the file DURING each
+    /// submission's own chain call, before that call (or `run_cycle`) has returned: the second
+    /// distributor's snapshot can only show the first distributor's 10-mojo spend already on disk
+    /// if persistence genuinely happens per submission. Must go red with the pre-commit in
+    /// `evaluate_budget_phase` moved to after the `.await` (or to cycle end).
+    #[tokio::test]
+    async fn f15_a_spend_is_visible_on_disk_before_the_submission_call_resolves() {
+        const CYCLE_BUDGET: u64 = 1_000_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f15-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let distributors = vec![
+            budget_consuming_distributor(Bytes32::new([0x72u8; 32]), 10),
+            budget_consuming_distributor(Bytes32::new([0x73u8; 32]), 10),
+        ];
+        let port = FakeChainPort::new(distributors);
+        port.arm_submit_snapshot(dir.path().to_path_buf());
+        let mut e = ClaimEngine::new(
+            port,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+
+        let outcomes = e.run_cycle(1_000).await;
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, ClaimOutcome::Submitted { .. }))
+                .count(),
+            2,
+            "both distributors must have been submitted, or this proves nothing"
+        );
+
+        let snapshots = e.port.submit_snapshots.lock().unwrap().clone();
+        assert_eq!(
+            snapshots,
+            vec![10, 20],
+            "the first submission's own snapshot must already see ITS OWN pre-committed 10-mojo \
+             spend (write-then-spend), and the second must see BOTH -- a cycle-end batch would \
+             show 0 for both, since neither had landed on disk yet when these calls ran"
+        );
+    }
+
+    /// F11: the two restart tests above (`f7_restart_reproducer_...` and `f7_ten_restarts_...`)
+    /// advance the clock by ≤10s, so the CADENCE GATE alone makes them pass -- delete the window
+    /// enforcement entirely and they still go green. This test satisfies the gate (no prior
+    /// completed cycle at all, so it never even runs) and instead binds the window accumulator
+    /// directly: a cycle the gate permits, entering a window that already carries a full persisted
+    /// spend, must still be refused by the budget. Must go red with only the window-seeding line
+    /// in `with_persisted_fee_window` (`self.fee_spent_in_window_mojos = cfg.fee_spent_in_window_
+    /// mojos`) reverted to always start at `0`.
+    #[tokio::test]
+    async fn f11_a_gate_permitted_cycle_is_still_refused_by_an_already_full_persisted_window() {
+        const CYCLE_BUDGET: u64 = 1_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f11-window-binds-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        // Simulate a crash mid-window: a prior process opened this window and spent it in full,
+        // but never recorded a completed cycle (a real crash never gets that far either).
+        let seeded = RewardsClaimConfig {
+            fee_window_start_unix: Some(1_000),
+            fee_spent_in_window_mojos: CYCLE_BUDGET,
+            last_cycle_completed_at: None, // no completed cycle on record -- the gate is satisfied
+            ..RewardsClaimConfig::default()
+        };
+        seeded.save_to(dir.path()).expect("seed the window");
+
+        let launcher_id = Bytes32::new([0x74u8; 32]);
+        let mut e = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(launcher_id, 10)]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+
+        // Still well inside the seeded window (`1_000 + 5 - 1_000 = 5 < CADENCE_SECONDS`), so the
+        // gate cannot be what refuses this -- only the window accumulator can.
+        let outcomes = e.run_cycle(1_005).await;
+
+        assert_eq!(
+            outcomes,
+            vec![ClaimOutcome::SkippedCycleBudgetExhausted {
+                launcher_id,
+                fee_mojos: 10,
+                budget_mojos: CYCLE_BUDGET,
+            }],
+            "a window seeded as already fully spent must refuse every claim, even though the \
+             cadence gate itself was satisfied"
+        );
+    }
+
+    /// F9 regression: a deliberately-skipped cycle must report its OWN named condition, never a
+    /// stale reading left over from the last cycle that actually ran. Must go red with only the
+    /// `self.status.state = ClaimLoopState::CadenceNotElapsed;` assignment on the cadence-gate
+    /// early return removed.
+    #[tokio::test]
+    async fn f9_a_cadence_skipped_cycle_reports_its_own_state_not_a_stale_one() {
+        const CYCLE_BUDGET: u64 = 1_000_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f9-cadence-state-")
+            .tempdir()
+            .expect("a scratch dir");
+        let launcher_id = Bytes32::new([0x75u8; 32]);
+
+        let mut first = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(launcher_id, 10)]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+        let first_outcomes = first.run_cycle(1_000).await;
+        assert_eq!(
+            first_outcomes,
+            vec![ClaimOutcome::Submitted { launcher_id }],
+            "the first cycle must actually run and claim, or its state proves nothing to skip past"
+        );
+        assert_eq!(
+            first.status().state,
+            ClaimLoopState::Nominal,
+            "sanity: the first cycle's OWN state must be something other than CadenceNotElapsed"
+        );
+        drop(first);
+
+        let mut second = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(launcher_id, 10)]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+        let second_outcomes = second.run_cycle(1_010).await;
+
+        assert_eq!(
+            second_outcomes,
+            Vec::new(),
+            "the cadence gate must still refuse to run"
+        );
+        assert_eq!(
+            second.status().state,
+            ClaimLoopState::CadenceNotElapsed,
+            "a deliberately-skipped cycle must name itself, never read as the previous cycle's \
+             Nominal (or any other stale) state"
+        );
+    }
+
+    /// F10 regression: a future-dated `last_cycle_completed_at` (an NTP step, a clock glitch, or
+    /// corrupt state) must not silently freeze the loop forever while reading healthy -- it must
+    /// be a REPORTED condition. Must go red with only the `future_dated_clock` check removed (the
+    /// old behaviour: `saturating_sub` yields 0, the cadence gate blocks the cycle, and — with F9
+    /// fixed — that reads as `CadenceNotElapsed`, never `PersistedStateCorrupt` as asserted here).
+    #[tokio::test]
+    async fn f10_a_future_dated_clock_is_reported_not_silent() {
+        const CYCLE_BUDGET: u64 = 1_000_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f10-future-clock-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let far_future = 9_999_999_999u64;
+        let seeded = RewardsClaimConfig {
+            last_cycle_completed_at: Some(far_future),
+            ..RewardsClaimConfig::default()
+        };
+        seeded
+            .save_to(dir.path())
+            .expect("seed a future-dated clock");
+
+        let launcher_id = Bytes32::new([0x76u8; 32]);
+        let mut e = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(launcher_id, 10)]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+
+        let outcomes = e.run_cycle(1_000).await;
+
+        assert_eq!(
+            outcomes,
+            Vec::new(),
+            "a future-dated clock must submit nothing this cycle"
+        );
+        assert_eq!(
+            e.status().state,
+            ClaimLoopState::PersistedStateCorrupt,
+            "a future-dated clock must be its own reported condition, never silent, and never \
+             read as CadenceNotElapsed (which is what the old unvalidated saturating_sub bug \
+             would produce once F9 is fixed)"
+        );
+    }
+
+    /// F12 regression: a submission that DEFINITELY failed (the call returned `Err`, so it never
+    /// broadcast) must not permanently inflate the persisted window -- that is free denial-of-
+    /// service for an attacker running K always-failing submissions. Must go red with the
+    /// `uncommit_fee` calls on the `Err` branches of `evaluate_budget_phase`'s `match` removed.
+    #[tokio::test]
+    async fn f12_a_failed_submission_does_not_inflate_the_persisted_window() {
+        const CYCLE_BUDGET: u64 = 1_000_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f12-failed-submit-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let failing = Bytes32::new([0x78u8; 32]);
+        let d = budget_consuming_distributor(failing, 10);
+        let port = FakeChainPort::new(vec![d]);
+        port.fail_submit_for(failing);
+        let mut e = ClaimEngine::new(
+            port,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+
+        let outcomes = e.run_cycle(1_000).await;
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the one candidate must have been evaluated, or this proves nothing about its fee"
+        );
+        assert!(matches!(outcomes[0], ClaimOutcome::PayoutPuzzleHashMismatch { .. }).not(),);
+
+        let persisted = RewardsClaimConfig::load_from(dir.path());
+        assert_eq!(
+            persisted.fee_spent_in_window_mojos, 0,
+            "a submission that definitely never broadcast must leave the persisted window \
+             exactly as it was, not charged for a fee that was never spent"
+        );
+    }
+
+    /// F14 regression: the per-cycle budget comparison must never panic on a corrupted or
+    /// otherwise near-`u64::MAX` in-cycle spend total -- the workspace enables `overflow-checks`
+    /// in release, so a bare `+` here is a live panic-on-corrupt-input path, not just a debug
+    /// lint. Must go red (panic) with `saturating_add` reverted to a bare `+` in
+    /// `evaluate_budget_phase`'s budget comparison.
+    #[tokio::test]
+    async fn f14_a_near_max_spent_value_does_not_panic_the_budget_comparison() {
+        let d = budget_consuming_distributor(Bytes32::new([0x80u8; 32]), 10);
+        let launcher_id = d.launcher_id;
+        let mut e = engine(FakeChainPort::new(vec![d]));
+        let mut spent_this_cycle_mojos = u64::MAX - 5;
+        let mut budget_exhausted = false;
+        let claim = EligibleClaim {
+            launcher_id,
+            accrued_base_units: 5_000,
+        };
+
+        let result = e
+            .evaluate_budget_phase(&claim, &mut spent_this_cycle_mojos, &mut budget_exhausted)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                BudgetPhaseResult::Outcome(ClaimOutcome::SkippedCycleBudgetExhausted { .. })
+            ),
+            "a near-overflow spent value must read as budget-exhausted, never panic and never \
+             submit"
         );
     }
 

@@ -95,6 +95,17 @@ pub enum ClaimOutcome {
 /// [`Self::claims_refused_payout_mismatch`]), never [`Self::fault_reported`]. `Faulted` is reserved
 /// for a genuinely cycle-wide failure: discovery itself failing, or a chain-port call returning
 /// `ClaimPortError::Other(_)`.
+///
+/// # F8/F9/F10: `PersistedStateCorrupt` and `CadenceNotElapsed` are assigned DIRECTLY, never via
+/// [`ClaimStatus::compute_state`]
+/// Both are written by [`super::engine::ClaimEngine::run_cycle`] on an early return that happens
+/// BEFORE any of this cycle's own numbers exist to compute a reading from — there is no
+/// "claimable" or "faulted" count to rank against `compute_state`'s ladder, because no candidate
+/// was ever evaluated. F9's finding was exactly this gap: an early return that assigned NEITHER a
+/// direct state NOR fell through to `compute_state` left whatever `self.state` a PAST cycle
+/// computed sitting there, stamped with a fresh `last_attempt_at` that made a deliberate skip read
+/// as "healthy and idle". Every exit out of `run_cycle` now sets `state` one of these two ways —
+/// directly here, or through `compute_state` at the bottom — never neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClaimLoopState {
     /// No cycle has ever been attempted yet.
@@ -103,6 +114,20 @@ pub enum ClaimLoopState {
     /// The chain seam reported [`super::port::ClaimPortError::Unavailable`] — see the module doc's
     /// "chain seam" section. Zero cycles ran; this is the true state, not a silent no-op.
     ChainSourceUnavailable,
+    /// F8/F10, fund-safety: the persisted rewards-claim state (`RewardsClaimConfig`) was
+    /// unreadable, unparsable, carried a spend exceeding its own budget (F14), or carried a
+    /// future-dated clock (F10) — corrupt state, not a fresh peer. The engine treats the window
+    /// as fully spent and submits nothing until an operator fixes or removes the file; this state
+    /// exists so that refusal is visible rather than a silent, permanent freeze that reads as
+    /// `Nominal` (the pre-F9 shape of the F10 defect).
+    PersistedStateCorrupt,
+    /// F9: the cadence has not yet elapsed since the last cycle that ran to completion — a
+    /// DELIBERATE skip, its own named condition rather than the absence of one. Without this, the
+    /// gate's early return left a stale `self.state` from whatever a PAST cycle computed standing
+    /// under this cycle's freshly-stamped `last_attempt_at`, indistinguishable from a healthy idle
+    /// loop (the fourth relocation of this error class — see [`super::engine::ClaimEngine`]'s
+    /// module doc for the first three).
+    CadenceNotElapsed,
     /// A chain call this cycle returned `ClaimPortError::Other(_)` — a real fault, distinct from
     /// `ChainSourceUnavailable` (no chain at all). `cycles` is the number of CONSECUTIVE cycles a
     /// fault has now been observed on, so an operator can tell a one-off blip from a wedged loop.
@@ -275,8 +300,15 @@ impl ClaimStatus {
         let shortfall_denominator = u64::from(self.distributors_claimable)
             + u64::from(self.payout_hash_mismatches_this_cycle);
         if self.claims_submitted_this_cycle < shortfall_denominator {
+            // F13: report the SAME quantity the predicate above just used, not the un-folded
+            // `distributors_claimable` alone. Before this fix, all-K-mismatching produced
+            // `ClaimableButNotClaiming { claimable: 0, submitted: 0 }` -- the name was right (F2
+            // already folded mismatches into firing the state at all) but the payload said
+            // nothing was wrong, because it reported the term the mismatches were never counted
+            // in. The payload must carry the full shortfall the name is claiming, or it is a
+            // state whose numbers contradict its own name.
             return ClaimLoopState::ClaimableButNotClaiming {
-                claimable: self.distributors_claimable,
+                claimable: u32::try_from(shortfall_denominator).unwrap_or(u32::MAX),
                 submitted: u32::try_from(self.claims_submitted_this_cycle).unwrap_or(u32::MAX),
             };
         }
@@ -452,10 +484,38 @@ mod tests {
         };
         assert_eq!(
             status.compute_state(),
+            // F13: `claimable` is now the FOLDED shortfall (2 claimable + 1 mismatch = 3), not
+            // the un-folded `distributors_claimable` alone -- see the F13 regression below for
+            // the case (all-K-mismatching) that made the un-folded reading actively misleading.
             ClaimLoopState::ClaimableButNotClaiming {
-                claimable: 2,
+                claimable: 3,
                 submitted: 1
             }
+        );
+    }
+
+    /// F13 regression: all-K-mismatching must report the shortfall it actually represents, not a
+    /// payload that contradicts its own state name. Before the fix, this read `claimable: 0,
+    /// submitted: 0` -- a name saying something is wrong next to numbers saying nothing is. Must
+    /// go red with only the `claimable: shortfall_denominator` fix reverted to
+    /// `claimable: self.distributors_claimable`.
+    #[test]
+    fn all_k_mismatching_reports_the_folded_shortfall_not_zero() {
+        let status = ClaimStatus {
+            distributors_claimable: 0,
+            claims_submitted_this_cycle: 0,
+            payout_hash_mismatches_this_cycle: 4,
+            fault_reported: false,
+            last_cycle_at: Some(1),
+            ..ClaimStatus::default()
+        };
+        assert_eq!(
+            status.compute_state(),
+            ClaimLoopState::ClaimableButNotClaiming {
+                claimable: 4,
+                submitted: 0
+            },
+            "the payload must carry the same shortfall the predicate fired on, never 0"
         );
     }
 }

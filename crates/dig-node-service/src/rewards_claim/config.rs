@@ -43,6 +43,14 @@ pub const CLAIM_FEE_CEILING_MOJOS_DEFAULT: u64 = 200_000;
 /// than that many distributors' worth of stores.
 pub const CLAIM_CYCLE_FEE_BUDGET_MOJOS_DEFAULT: u64 = CLAIM_FEE_CEILING_MOJOS_DEFAULT * 10;
 
+/// F10 (§8.6 floor): the lowest `cadence_seconds` this config will honour. SPEC §8.6 sets the
+/// default at `86_400` but never floors an operator-supplied override, so an unvalidated `0` (or a
+/// handful of seconds) would hot-loop `ClaimEngine::run_cycle` — a chain read on every tick with no
+/// cadence protection at all, the same class of unbounded-work defect F7 closed for spend. One
+/// minute is short enough to never bind a legitimate operator (SPEC's own default is a full day)
+/// and long enough that a degenerate value cannot turn this loop into a busy-poll.
+pub const CLAIM_CADENCE_FLOOR_SECONDS: u64 = 60;
+
 const REWARDS_CLAIM_CONFIG_FILE: &str = "rewards-claim.json";
 
 /// This node's peer-side claim-loop preferences.
@@ -116,6 +124,17 @@ pub struct RewardsClaimConfig {
     /// run immediately -- the honest reading for a node that has never run this loop before).
     #[serde(default)]
     pub last_cycle_completed_at: Option<u64>,
+
+    /// F8: set by [`Self::load_from`] (never persisted, never read from the file itself) when the
+    /// file was present but unparsable, unreadable, or carried a `fee_spent_in_window_mojos`
+    /// exceeding its own `max_cycle_fee_budget_mojos` (F14) — corrupt state, not a fresh peer.
+    /// `ClaimEngine` reads this to fail CLOSED (treat the window as fully spent, submit nothing)
+    /// rather than the old behaviour of falling back to [`Self::default`], which re-granted a full
+    /// budget through the exact crash-restart loop F7 exists to bound. `#[serde(skip)]` because a
+    /// value read off disk can never itself declare "I am corrupt" — that fact lives only in
+    /// *how* the read failed, decided once, here, at load time.
+    #[serde(skip)]
+    pub corrupt: bool,
 }
 
 fn default_enabled() -> bool {
@@ -150,6 +169,7 @@ impl Default for RewardsClaimConfig {
             fee_window_start_unix: None,
             fee_spent_in_window_mojos: 0,
             last_cycle_completed_at: None,
+            corrupt: false,
         }
     }
 }
@@ -165,42 +185,102 @@ impl RewardsClaimConfig {
         self.save_to(&crate::state::state_dir())
     }
 
-    /// Load from an explicit directory. A missing or unparsable file yields the default — the same
-    /// survivable-degradation posture as `CollateralConfig::load_from` — visibly logged, never
-    /// silent, and never fatal to node start over one preferences file.
+    /// F8: the fail-CLOSED reading for a file this process could not trust — present but
+    /// unparsable, unreadable, or carrying a spend that exceeds its own budget (F14). Deliberately
+    /// NOT [`Self::default`]: a missing file is a clean first run and defaults are the honest
+    /// reading for it, but a corrupt one must never be treated the same way, because `default()`
+    /// re-grants a full spend budget into exactly the crash-restart loop F7 exists to bound.
+    /// `corrupt: true` is the only signal a caller needs — every other field here is a placeholder
+    /// `ClaimEngine` must not act on, and [`Self::save_to`] must never be called with this value
+    /// (see [`super::engine::ClaimEngine::persist_fee_window`]'s corrupt-file guard).
+    fn poisoned() -> Self {
+        RewardsClaimConfig {
+            corrupt: true,
+            ..Self::default()
+        }
+    }
+
+    /// Load from an explicit directory.
+    ///
+    /// A MISSING file is a clean first run: [`Self::default`] is the honest reading, because
+    /// nothing has ever been decided or spent yet.
+    ///
+    /// A file this process cannot trust — unreadable, unparsable, or (F14) carrying a persisted
+    /// spend larger than its own budget — is a DIFFERENT fact and must never share `default()`'s
+    /// code path (F8): it becomes [`Self::poisoned`], visibly logged, and never fatal to node
+    /// start over one preferences file, but never silently re-granting a budget either.
     pub fn load_from(dir: &Path) -> Self {
         let path = dir.join(REWARDS_CLAIM_CONFIG_FILE);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     path = %path.display(),
                     error = %e,
-                    "the rewards-claim preference file could not be read; using defaults"
+                    "the rewards-claim preference file could not be read; failing closed, not \
+                     using defaults"
                 );
-                return Self::default();
+                return Self::poisoned();
             }
         };
-        match serde_json::from_str(&text) {
-            Ok(cfg) => cfg,
+        match serde_json::from_str::<RewardsClaimConfig>(&text) {
+            Ok(mut cfg) => {
+                // F10 (§8.6 floor): an operator-supplied cadence below the floor is clamped, not
+                // corrupt -- see `CLAIM_CADENCE_FLOOR_SECONDS`'s doc for why this is the one F7
+                // field that is safe to correct upward rather than fail closed over.
+                if cfg.cadence_seconds < CLAIM_CADENCE_FLOOR_SECONDS {
+                    tracing::warn!(
+                        path = %path.display(),
+                        cadence_seconds = cfg.cadence_seconds,
+                        floor = CLAIM_CADENCE_FLOOR_SECONDS,
+                        "rewards-claim cadence_seconds below the §8.6 floor; clamping up"
+                    );
+                    cfg.cadence_seconds = CLAIM_CADENCE_FLOOR_SECONDS;
+                }
+                // F14: a persisted spend exceeding the budget it is measured against is not a big
+                // number to clamp down -- clamping would hand back exactly the budget the
+                // corruption was hiding. It is corrupt state: fail closed instead.
+                if cfg.fee_spent_in_window_mojos > cfg.max_cycle_fee_budget_mojos {
+                    tracing::error!(
+                        path = %path.display(),
+                        spent = cfg.fee_spent_in_window_mojos,
+                        budget = cfg.max_cycle_fee_budget_mojos,
+                        "persisted rewards-claim spend exceeds its own budget; failing closed, \
+                         not clamping"
+                    );
+                    return Self::poisoned();
+                }
+                cfg
+            }
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     path = %path.display(),
                     error = %e,
-                    "the rewards-claim preference file could not be parsed; using defaults"
+                    "the rewards-claim preference file could not be parsed; failing closed, not \
+                     using defaults"
                 );
-                Self::default()
+                Self::poisoned()
             }
         }
     }
 
-    /// Persist to `dir`, creating the state directory with restricted permissions if needed.
+    /// Persist to `dir`, ATOMICALLY: written to a temp file beside the real path, then renamed
+    /// over it — the same pattern `crate::mirror::reconcile_state::ReconcileState::save_to` uses
+    /// for the same class of state in this crate (F8). Without this, a crash mid-`write` can leave
+    /// a torn file that [`Self::load_from`] would previously have read as [`Self::default`] and
+    /// re-granted a full budget into — the exact restart-loop F7 was written to close, reopened
+    /// through F7's own persist path. A rename is atomic on the same filesystem, so the file this
+    /// process's crash leaves behind is always either the old complete contents or the new
+    /// complete contents, never a half-write.
     pub fn save_to(&self, dir: &Path) -> std::io::Result<()> {
         crate::state::ensure_dir_restricted(dir)?;
         let path = dir.join(REWARDS_CLAIM_CONFIG_FILE);
+        let temp = path.with_extension("json.tmp");
         let body = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&path, body)?;
+        std::fs::write(&temp, &body)?;
+        crate::control::restrict_permissions(&temp);
+        std::fs::rename(&temp, &path)?;
         crate::control::restrict_permissions(&path);
         Ok(())
     }
@@ -253,6 +333,7 @@ mod tests {
             fee_window_start_unix: None,
             fee_spent_in_window_mojos: 0,
             last_cycle_completed_at: None,
+            corrupt: false,
         };
         cfg.save_to(dir.path()).expect("save");
 
@@ -324,6 +405,86 @@ mod tests {
         assert_eq!(
             RewardsClaimConfig::load_from(dir.path()),
             RewardsClaimConfig::default()
+        );
+    }
+
+    /// F8 regression: a present-but-unparsable file must NOT load as [`RewardsClaimConfig::default`]
+    /// — that is exactly the fail-OPEN bug (a torn write reads as a clean first run and re-grants a
+    /// full spend budget). Must go red with only the `Err(e) => ... Self::poisoned()` branch of
+    /// [`RewardsClaimConfig::load_from`]'s parse-failure arm reverted to `Self::default()`.
+    #[test]
+    fn a_corrupt_file_fails_closed_not_default() {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-rewards-claim-corrupt-test-")
+            .tempdir()
+            .expect("a scratch dir");
+        std::fs::write(
+            dir.path().join(REWARDS_CLAIM_CONFIG_FILE),
+            b"{ this is not json, or a torn write mid-object",
+        )
+        .expect("write garbage");
+
+        let loaded = RewardsClaimConfig::load_from(dir.path());
+        assert!(
+            loaded.corrupt,
+            "a present-but-unparsable file must be reported as corrupt, never silently defaulted"
+        );
+        assert_ne!(
+            loaded,
+            RewardsClaimConfig::default(),
+            "corrupt state must be distinguishable from a clean first run"
+        );
+    }
+
+    /// F8: a MISSING file is the opposite fact from a corrupt one -- still a clean first run.
+    #[test]
+    fn a_missing_file_is_not_corrupt() {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-rewards-claim-missing-not-corrupt-")
+            .tempdir()
+            .expect("a scratch dir");
+        assert!(!RewardsClaimConfig::load_from(dir.path()).corrupt);
+    }
+
+    /// F10 (§8.6 floor) regression: an operator (or corrupt/hostile) config with `cadence_seconds:
+    /// 0` must not be honoured verbatim -- it would hot-loop `run_cycle` with no cadence
+    /// protection at all. Must go red with only the floor-clamp removed from `load_from`.
+    #[test]
+    fn a_cadence_below_the_floor_is_clamped_up_on_load() {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-rewards-claim-cadence-floor-")
+            .tempdir()
+            .expect("a scratch dir");
+        std::fs::write(
+            dir.path().join(REWARDS_CLAIM_CONFIG_FILE),
+            br#"{"cadence_seconds": 0}"#,
+        )
+        .expect("write");
+
+        let loaded = RewardsClaimConfig::load_from(dir.path());
+        assert_eq!(loaded.cadence_seconds, CLAIM_CADENCE_FLOOR_SECONDS);
+        assert!(!loaded.corrupt, "a low cadence is clamped, not corrupt");
+    }
+
+    /// F14 regression: a persisted spend larger than its own budget is corrupt state, not a large
+    /// number to clamp down -- clamping down would hand back exactly the budget the corruption was
+    /// hiding. Must go red with only that branch removed (i.e. the field loaded verbatim).
+    #[test]
+    fn a_spend_exceeding_its_own_budget_fails_closed() {
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-rewards-claim-spend-overflow-")
+            .tempdir()
+            .expect("a scratch dir");
+        std::fs::write(
+            dir.path().join(REWARDS_CLAIM_CONFIG_FILE),
+            br#"{"fee_spent_in_window_mojos": 999999999999, "max_cycle_fee_budget_mojos": 2000000}"#,
+        )
+        .expect("write");
+
+        let loaded = RewardsClaimConfig::load_from(dir.path());
+        assert!(
+            loaded.corrupt,
+            "a spend exceeding its own budget must fail closed, never be clamped down"
         );
     }
 }
