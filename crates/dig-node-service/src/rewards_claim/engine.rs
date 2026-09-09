@@ -2,8 +2,11 @@
 //! [`DistributorHintSource`], never against a concrete chain client (see the module doc's "chain
 //! seam" section).
 
+use std::path::{Path, PathBuf};
+
 use chia_protocol::Bytes32;
 
+use super::config::RewardsClaimConfig;
 use super::hints::DistributorHintSource;
 use super::port::{ClaimChainPort, ClaimPortError};
 use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus};
@@ -42,6 +45,27 @@ pub struct ClaimEngine<P, H> {
     /// [`Self::with_rotation_cursor`] / [`Self::rotation_cursor`]) so a restart does not re-arm a
     /// fresh queue and starve the tail forever.
     rotation_cursor: Option<Bytes32>,
+
+    /// F7: when `Some`, this engine persists [`Self::fee_window_start_unix`],
+    /// [`Self::fee_spent_in_window_mojos`] and [`Self::last_cycle_completed_at`] into
+    /// [`RewardsClaimConfig`] in this directory -- see [`Self::with_persisted_fee_window`]. `None`
+    /// keeps the engine purely in-memory, the behaviour every test before F7 relies on.
+    fee_window_state_dir: Option<PathBuf>,
+    /// F7: the cadence length the persisted budget window and the cadence gate are measured
+    /// against. Deliberately a constructor argument of [`Self::with_persisted_fee_window`], never
+    /// read from [`RewardsClaimConfig::cadence_seconds`] directly -- the engine has no other
+    /// dependency on the rest of that config, and the caller (which already loaded it) is the one
+    /// place that should decide what "the cadence" means.
+    cadence_seconds: u64,
+    /// F7: the start (unix seconds) of the current aggregate-fee-budget window -- see
+    /// [`super::config::RewardsClaimConfig::fee_window_start_unix`].
+    fee_window_start_unix: Option<u64>,
+    /// F7: fee mojos already spent inside the current window -- the field that actually bounds a
+    /// crash-restart loop. See [`super::config::RewardsClaimConfig::fee_spent_in_window_mojos`].
+    fee_spent_in_window_mojos: u64,
+    /// F7: when the last cycle that ran to completion finished -- the cadence gate's clock. See
+    /// [`super::config::RewardsClaimConfig::last_cycle_completed_at`].
+    last_cycle_completed_at: Option<u64>,
 }
 
 impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
@@ -62,6 +86,11 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             dig_asset_id,
             status: ClaimStatus::default(),
             rotation_cursor: None,
+            fee_window_state_dir: None,
+            cadence_seconds: 0,
+            fee_window_start_unix: None,
+            fee_spent_in_window_mojos: 0,
+            last_cycle_completed_at: None,
         }
     }
 
@@ -79,6 +108,53 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     #[must_use]
     pub fn rotation_cursor(&self) -> Option<Bytes32> {
         self.rotation_cursor
+    }
+
+    /// F7: restores the persisted aggregate-fee-budget window and cadence clock from `dir` and
+    /// arms this engine to keep persisting them there after every submission and every completed
+    /// cycle (never batched to cycle end — see [`Self::run_cycle`]'s "F7" doc section for why).
+    ///
+    /// `cadence_seconds` is both the window length and the cadence gate's threshold: the same
+    /// number [`super::config::RewardsClaimConfig::cadence_seconds`] carries, passed in explicitly
+    /// because this engine has no other dependency on the rest of that config.
+    ///
+    /// Without this call, the engine is exactly as it was before F7: a fresh
+    /// [`Self::cycle_fee_budget_mojos`] and no cadence gate on every construction. That is
+    /// deliberately still true for a caller that has not opted in (every pre-F7 test), but it is
+    /// also the defect this method exists to close for production use: nothing here is wired into
+    /// node startup yet (`crate::rewards_claim`'s module doc, "Not yet wired into node startup"),
+    /// so the production wiring (#3268) is the one place expected to call this.
+    #[must_use]
+    pub fn with_persisted_fee_window(mut self, dir: &Path, cadence_seconds: u64) -> Self {
+        let cfg = RewardsClaimConfig::load_from(dir);
+        self.fee_window_state_dir = Some(dir.to_path_buf());
+        self.cadence_seconds = cadence_seconds;
+        self.fee_window_start_unix = cfg.fee_window_start_unix;
+        self.fee_spent_in_window_mojos = cfg.fee_spent_in_window_mojos;
+        self.last_cycle_completed_at = cfg.last_cycle_completed_at;
+        self
+    }
+
+    /// F7: read-modify-write the fee-window fields into whatever `RewardsClaimConfig` currently
+    /// sits on disk at [`Self::fee_window_state_dir`], leaving every other field (including
+    /// [`Self::rotation_cursor`], which this engine does not own writing to disk for) exactly as
+    /// it was read. A failed write is logged, never fatal — the same survivable-degradation
+    /// posture [`super::config::RewardsClaimConfig::load_from`] already uses for a read.
+    fn persist_fee_window(&self) {
+        let Some(dir) = &self.fee_window_state_dir else {
+            return;
+        };
+        let mut cfg = RewardsClaimConfig::load_from(dir);
+        cfg.fee_window_start_unix = self.fee_window_start_unix;
+        cfg.fee_spent_in_window_mojos = self.fee_spent_in_window_mojos;
+        cfg.last_cycle_completed_at = self.last_cycle_completed_at;
+        if let Err(e) = cfg.save_to(dir) {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "the rewards-claim fee-budget window could not be persisted"
+            );
+        }
     }
 
     #[must_use]
@@ -108,7 +184,36 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         self.status.claims_submitted_this_cycle = 0;
         self.status.no_entry_slot_this_cycle = 0;
         self.status.last_attempt_at = Some(now);
-        let mut spent_this_cycle_mojos = 0u64;
+
+        // F7: the cadence gate and the persisted budget window -- both keyed off
+        // `self.fee_window_state_dir`, so a caller that never opted in via
+        // `with_persisted_fee_window` sees no change at all (every pre-F7 test).
+        if self.fee_window_state_dir.is_some() {
+            // Refuse to START a cycle until the cadence has elapsed since the last one that ran
+            // to completion -- stops a restart loop from immediately re-running a cycle that
+            // already ran, independent of whether the fee window below has room left.
+            if let Some(last_completed) = self.last_cycle_completed_at {
+                if now.saturating_sub(last_completed) < self.cadence_seconds {
+                    return Vec::new();
+                }
+            }
+            // The aggregate budget is enforced against this window, never a per-`run_cycle`
+            // local: roll a fresh window only once the cadence has elapsed since it opened,
+            // otherwise keep accumulating into what is already spent in it.
+            let window_still_open = self
+                .fee_window_start_unix
+                .is_some_and(|start| now.saturating_sub(start) < self.cadence_seconds);
+            if !window_still_open {
+                self.fee_window_start_unix = Some(now);
+                self.fee_spent_in_window_mojos = 0;
+                self.persist_fee_window();
+            }
+        }
+        let mut spent_this_cycle_mojos = if self.fee_window_state_dir.is_some() {
+            self.fee_spent_in_window_mojos
+        } else {
+            0
+        };
         let mut budget_exhausted = false;
 
         let mut discovery_failed = false;
@@ -261,6 +366,15 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         };
         if !discovery_failed && !all_faulted_cycle {
             self.status.last_cycle_at = Some(now);
+        }
+        // F7: this cycle ran to completion (every early return above -- ChainUnavailable -- skips
+        // this line, which is exactly right: those never reached the cadence gate's definition of
+        // "ran"). Stamp and persist unconditionally, including a fault-only or all-faulted cycle --
+        // an operator restarting to work around a wedged cycle must still get the cadence gate's
+        // protection, not a loophole that lets a fault re-arm an immediate retry.
+        if self.fee_window_state_dir.is_some() {
+            self.last_cycle_completed_at = Some(now);
+            self.persist_fee_window();
         }
         // F1: unconditional now -- `compute_state` reads `chain_unavailable_this_cycle` (reset at
         // the top of this function), never `self.state`, so the old "don't overwrite a latch" guard
@@ -419,6 +533,18 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
                 fee_mojos: fee,
                 budget_mojos: self.cycle_fee_budget_mojos,
             });
+        }
+
+        // F7: write-then-spend, never spend-then-write. If persistence is armed, the fee this
+        // submission is about to cost is committed to disk BEFORE the chain call, not after --
+        // so a crash between "we decided to spend" and the chain call returning can never leave
+        // an unpersisted spend that a restart would repeat. Conservative in the failure direction
+        // only: a submission that ultimately errors still counts against the persisted window,
+        // even though `spent_this_cycle_mojos` below (the in-cycle running total the NEXT
+        // candidate's budget check reads) only advances on a confirmed `Ok`, exactly as before F7.
+        if self.fee_window_state_dir.is_some() {
+            self.fee_spent_in_window_mojos += fee;
+            self.persist_fee_window();
         }
 
         match self
@@ -1244,6 +1370,281 @@ mod tests {
         let cursor = Bytes32::new([0x42u8; 32]);
         let e = engine(FakeChainPort::new(Vec::new())).with_rotation_cursor(Some(cursor));
         assert_eq!(e.rotation_cursor(), Some(cursor));
+    }
+
+    /// F7: a distributor whose required fee alone equals the whole cycle budget, so ONE submitted
+    /// claim exhausts it completely -- makes every F7 test below unambiguous about whether a
+    /// SECOND full budget was granted.
+    fn budget_consuming_distributor(launcher_id: Bytes32, fee_mojos: u64) -> FakeDistributor {
+        FakeDistributor {
+            launcher_id,
+            store_id: Bytes32::new([3u8; 32]),
+            root: Bytes32::new([4u8; 32]),
+            reserve_asset_id: DIG_ASSET_ID,
+            payout_threshold: 1_000,
+            entry: Some(super::super::types::OwnEntry {
+                payout_puzzle_hash: OUR_PAYOUT_PUZZLE_HASH,
+                counter: 0,
+                accrued_base_units: 5_000,
+            }),
+            fee_mojos,
+        }
+    }
+
+    /// **F7 (blocking) — the restart reproducer.** Before the fix, a fresh [`ClaimEngine`] has an
+    /// empty in-memory budget and cadence clock no matter what a PRIOR process already spent, so
+    /// this must FAIL before the fix: the second engine submits its claim too, spending a second
+    /// full [`CYCLE_BUDGET`] inside the same window a prior process already exhausted.
+    #[tokio::test]
+    async fn f7_restart_reproducer_a_second_engine_from_the_same_directory_refuses_to_overspend() {
+        const CYCLE_BUDGET: u64 = 1_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f7-reproducer-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let mut first = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(
+                Bytes32::new([0x10u8; 32]),
+                CYCLE_BUDGET,
+            )]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+        let first_outcomes = first.run_cycle(1_000).await;
+        assert_eq!(
+            first_outcomes,
+            vec![ClaimOutcome::Submitted {
+                launcher_id: Bytes32::new([0x10u8; 32])
+            }],
+            "the first cycle must actually spend the whole budget, or this reproduces nothing"
+        );
+        drop(first);
+
+        // A NEW process, seconds later — nowhere near CADENCE_SECONDS away — reconstructs the
+        // engine from the SAME directory and faces a DIFFERENT distributor that also costs the
+        // whole budget.
+        let mut second = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(
+                Bytes32::new([0x20u8; 32]),
+                CYCLE_BUDGET,
+            )]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+        let second_outcomes = second.run_cycle(1_010).await;
+
+        let second_submitted = second_outcomes
+            .iter()
+            .filter(|o| matches!(o, ClaimOutcome::Submitted { .. }))
+            .count();
+        assert_eq!(
+            second_submitted, 0,
+            "a restart inside the same budget window must not be able to spend a second full \
+             cycle budget -- a process restart is not a fresh peer"
+        );
+    }
+
+    /// F7: ten simulated restarts inside ONE window must not collectively exceed the aggregate
+    /// budget, however many of those restarts each try to spend a full budget's worth.
+    #[tokio::test]
+    async fn f7_ten_restarts_inside_one_window_never_collectively_exceed_the_budget() {
+        const CYCLE_BUDGET: u64 = 1_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f7-ten-restarts-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let mut total_submitted_mojos = 0u64;
+        for i in 0..10u8 {
+            let launcher_id = Bytes32::new([0x30 + i; 32]);
+            let mut e = ClaimEngine::new(
+                FakeChainPort::new(vec![budget_consuming_distributor(
+                    launcher_id,
+                    CYCLE_BUDGET,
+                )]),
+                NoHintSource,
+                OUR_PAYOUT_PUZZLE_HASH,
+                FEE_CEILING,
+                CYCLE_BUDGET,
+                DIG_ASSET_ID,
+            )
+            .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+            let outcomes = e.run_cycle(1_000 + u64::from(i)).await;
+            if outcomes
+                .iter()
+                .any(|o| matches!(o, ClaimOutcome::Submitted { .. }))
+            {
+                total_submitted_mojos += CYCLE_BUDGET;
+            }
+        }
+
+        assert!(
+            total_submitted_mojos <= CYCLE_BUDGET,
+            "ten restarts inside one window spent {total_submitted_mojos} mojos, over the \
+             {CYCLE_BUDGET}-mojo budget"
+        );
+    }
+
+    /// F7: once the window has genuinely elapsed, a restart MUST be allowed a fresh budget — the
+    /// fix bounds a crash-restart loop, it does not starve a node that legitimately restarts
+    /// between cadence periods.
+    #[tokio::test]
+    async fn f7_a_restart_after_the_window_elapsed_gets_a_fresh_budget() {
+        const CYCLE_BUDGET: u64 = 1_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f7-window-elapsed-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let mut first = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(
+                Bytes32::new([0x40u8; 32]),
+                CYCLE_BUDGET,
+            )]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+        let first_outcomes = first.run_cycle(1_000).await;
+        assert_eq!(
+            first_outcomes,
+            vec![ClaimOutcome::Submitted {
+                launcher_id: Bytes32::new([0x40u8; 32])
+            }]
+        );
+        drop(first);
+
+        // Well past both the window AND the cadence gate.
+        let later = 1_000 + CADENCE_SECONDS + 1;
+        let mut second = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(
+                Bytes32::new([0x50u8; 32]),
+                CYCLE_BUDGET,
+            )]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+        let second_outcomes = second.run_cycle(later).await;
+
+        assert_eq!(
+            second_outcomes,
+            vec![ClaimOutcome::Submitted {
+                launcher_id: Bytes32::new([0x50u8; 32])
+            }],
+            "a restart after the window elapsed must be granted a fresh budget"
+        );
+    }
+
+    /// F7: a restart immediately after a completed cycle must not even START another cycle before
+    /// the cadence elapses — independent of the fee-window check, this stops a fast restart loop
+    /// from re-running full cycles (with their own chain reads) back to back.
+    #[tokio::test]
+    async fn f7_a_restart_immediately_after_a_completed_cycle_does_not_run_another() {
+        const CYCLE_BUDGET: u64 = 1_000_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f7-cadence-gate-")
+            .tempdir()
+            .expect("a scratch dir");
+        let launcher_id = Bytes32::new([0x60u8; 32]);
+
+        let mut first = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(launcher_id, 10)]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+        let first_outcomes = first.run_cycle(1_000).await;
+        assert_eq!(
+            first_outcomes,
+            vec![ClaimOutcome::Submitted { launcher_id }],
+            "the first cycle must complete normally, or this proves nothing about a restart"
+        );
+        drop(first);
+
+        let mut second = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(launcher_id, 10)]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+        let second_outcomes = second.run_cycle(1_050).await;
+
+        assert_eq!(
+            second_outcomes,
+            Vec::new(),
+            "a restart 50 seconds after a completed cycle must not run another before the \
+             86,400-second cadence elapses"
+        );
+    }
+
+    /// F7: a crash after a submission but before the cycle finishes must still leave that spend
+    /// recorded on disk — proves the write happens PER SUBMISSION, never batched to cycle end.
+    /// Simulated by reading the persisted config directly after a cycle that submits more than one
+    /// claim, rather than waiting for `run_cycle` to return.
+    #[tokio::test]
+    async fn f7_a_spend_is_persisted_per_submission_not_batched_to_cycle_end() {
+        const CYCLE_BUDGET: u64 = 30;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f7-per-submission-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        let distributors = vec![
+            budget_consuming_distributor(Bytes32::new([0x70u8; 32]), 10),
+            budget_consuming_distributor(Bytes32::new([0x71u8; 32]), 10),
+        ];
+        let mut e = ClaimEngine::new(
+            FakeChainPort::new(distributors),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+
+        let outcomes = e.run_cycle(1_000).await;
+        let submitted: u64 = outcomes
+            .iter()
+            .filter(|o| matches!(o, ClaimOutcome::Submitted { .. }))
+            .count() as u64
+            * 10;
+        assert_eq!(submitted, 20, "both distributors must have been submitted");
+
+        // Read the file directly rather than through `e` -- proves the write already landed on
+        // disk, not just in the engine's own in-memory mirror.
+        let persisted = RewardsClaimConfig::load_from(dir.path());
+        assert_eq!(
+            persisted.fee_spent_in_window_mojos, 20,
+            "each submission must persist its own spend immediately, not wait for cycle end"
+        );
     }
 
     /// Defect E regression: a port returning an entry whose `payout_puzzle_hash` diverges from this
