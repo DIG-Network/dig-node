@@ -1328,14 +1328,75 @@ mod tests {
                 "cycle {cycle}: a per-distributor mismatch must never read as the cycle-wide Faulted"
             );
         }
-        // The healthy distributor claims every cycle, so the surface reads Nominal, not buried.
-        assert_eq!(e.status().state, ClaimLoopState::Nominal);
+        // F2 inversion: this assertion used to read `ClaimLoopState::Nominal` (an A2-class test
+        // pinning the defect as intended behaviour). A live payout-hash mismatch is a real,
+        // per-cycle shortfall exactly like an unmet `claimable` -- the healthy distributor
+        // claiming does NOT make the surface healthy while the mismatched one is still refused
+        // every cycle. `distributors_claimable` counts only the healthy one (1); the mismatch
+        // never enters `eligible` so it is not in `claimable` either, but it IS folded into the
+        // shortfall predicate's denominator, so `submitted (1) < claimable (1) + mismatches (1)`.
+        assert_eq!(
+            e.status().state,
+            ClaimLoopState::ClaimableButNotClaiming {
+                claimable: 1,
+                submitted: 1
+            },
+            "an ongoing payout-hash mismatch is a real, per-cycle shortfall -- it must never read \
+             as Nominal just because the OTHER distributor claimed"
+        );
         assert_eq!(
             e.status().claims_submitted,
             3,
             "the healthy one claimed all 3 cycles"
         );
         assert_eq!(e.status().claims_refused_payout_mismatch, 3);
+    }
+
+    /// **F2 -- all-K-distributors mismatching must read as a shortfall, never `Nominal`.** Before
+    /// the fix, a mismatch never entered `eligible`, so `claims_submitted_this_cycle` (0) and
+    /// `distributors_claimable` (0) were BOTH zero and the magnitude comparison read healthy --
+    /// the exact case the F2 brief calls out: "what if every distributor refuses for the same
+    /// reason." This must be a shortfall (`ClaimableButNotClaiming`), and it must NOT reintroduce
+    /// Defect B3 by setting the cycle-wide `Faulted`.
+    #[tokio::test]
+    async fn all_distributors_mismatching_is_a_shortfall_not_nominal() {
+        let wrong_hash = Bytes32::new([0x77u8; 32]);
+        let mismatched = FakeDistributor {
+            launcher_id: Bytes32::new([0xAAu8; 32]),
+            store_id: Bytes32::new([3u8; 32]),
+            root: Bytes32::new([4u8; 32]),
+            reserve_asset_id: DIG_ASSET_ID,
+            payout_threshold: 1_000,
+            entry: Some(super::super::types::OwnEntry {
+                payout_puzzle_hash: wrong_hash,
+                counter: 0,
+                accrued_base_units: 5_000,
+            }),
+            fee_mojos: 10,
+        };
+        let mut e = engine(FakeChainPort::new(vec![mismatched]));
+
+        e.run_cycle(1_000).await;
+
+        assert_eq!(
+            e.status().distributors_claimable,
+            0,
+            "the mismatched distributor never enters eligible"
+        );
+        assert_eq!(e.status().claims_submitted_this_cycle, 0);
+        assert!(
+            !matches!(e.status().state, ClaimLoopState::Faulted { .. }),
+            "a per-distributor mismatch must never set the cycle-wide Faulted (Defect B3)"
+        );
+        assert_eq!(
+            e.status().state,
+            ClaimLoopState::ClaimableButNotClaiming {
+                claimable: 0,
+                submitted: 0
+            },
+            "all-K-distributors mismatching is a real, systemic shortfall -- it must never read \
+             as Nominal just because nothing entered `eligible`"
+        );
     }
 
     /// ACCEPTANCE 12 — with `UnavailableClaimChainPort` wired, the engine reports the named state

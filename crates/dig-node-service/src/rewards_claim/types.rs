@@ -264,7 +264,17 @@ impl ClaimStatus {
         // Defect B1: a magnitude comparison, not a zero-test -- `claims_submitted_this_cycle < 10`
         // fires just as much when 1 of 10 claimable was submitted as when 0 were; a partial
         // shortfall must never be masked by whichever claims did go through.
-        if self.claims_submitted_this_cycle < u64::from(self.distributors_claimable) {
+        //
+        // F2: `payout_hash_mismatches_this_cycle` folds into the RIGHT side of the comparison. A
+        // mismatching distributor never enters `eligible`, so it is counted in NEITHER
+        // `claims_submitted_this_cycle` NOR `distributors_claimable` -- the shortfall was in
+        // neither term of this comparison. All-K-mismatching used to read `submitted = 0,
+        // claimable = 0` -> healthy. An ongoing mismatch is a real per-cycle shortfall exactly like
+        // an unmet `claimable`, so it belongs in the same predicate, never a separate signal
+        // nothing reads.
+        let shortfall_denominator = u64::from(self.distributors_claimable)
+            + u64::from(self.payout_hash_mismatches_this_cycle);
+        if self.claims_submitted_this_cycle < shortfall_denominator {
             return ClaimLoopState::ClaimableButNotClaiming {
                 claimable: self.distributors_claimable,
                 submitted: u32::try_from(self.claims_submitted_this_cycle).unwrap_or(u32::MAX),
