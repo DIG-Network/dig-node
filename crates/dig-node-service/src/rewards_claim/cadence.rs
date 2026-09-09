@@ -58,4 +58,21 @@ mod tests {
         assert!(over <= cadence + jitter_bound);
         assert!(over >= cadence);
     }
+
+    /// ACCEPTANCE 8 (part) — a config setting a cadence OTHER than the default is honoured by the
+    /// scheduling function, not silently overridden back to `CLAIM_CADENCE_SECONDS_DEFAULT`.
+    #[test]
+    fn a_non_default_configured_cadence_is_honoured() {
+        let cfg = super::super::config::RewardsClaimConfig {
+            enabled: true,
+            cadence_seconds: 12_000,
+            jitter_seconds: 500,
+            max_fee_mojos: 1,
+        };
+        let interval = next_interval_seconds(cfg.cadence_seconds, cfg.jitter_seconds, &FixedJitter(0));
+        assert_eq!(interval, 12_000, "configured cadence, not the 86_400 default");
+        let interval_at_ceiling =
+            next_interval_seconds(cfg.cadence_seconds, cfg.jitter_seconds, &FixedJitter(500));
+        assert_eq!(interval_at_ceiling, 12_500);
+    }
 }

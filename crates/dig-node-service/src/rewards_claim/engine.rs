@@ -675,6 +675,28 @@ mod tests {
         assert_eq!(e.status().distributors_known, 0);
     }
 
+    /// ACCEPTANCE 12 — with `UnavailableClaimChainPort` wired, the engine reports the named state
+    /// `ChainSourceUnavailable` and runs zero cycles: no discovery outcome, no fault flag, no
+    /// claim, never a silent no-op (see the module doc's "chain seam" + "HONESTY" sections).
+    #[tokio::test]
+    async fn unavailable_port_reports_chain_source_unavailable_and_runs_zero_cycles() {
+        let mut e = ClaimEngine::new(
+            crate::rewards_claim::port::UnavailableClaimChainPort,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            DIG_ASSET_ID,
+        );
+
+        let outcomes = e.run_cycle(1_000).await;
+
+        assert!(outcomes.is_empty(), "zero cycles ran");
+        assert_eq!(e.status().state, ClaimLoopState::ChainSourceUnavailable);
+        assert_eq!(e.status().claims_submitted, 0);
+        assert_eq!(e.status().distributors_known, 0);
+        assert!(e.status().last_cycle_at.is_none(), "no cycle completed");
+    }
+
     /// The launch-comment parser wired end-to-end: what `resolve_launch_comment` would produce for
     /// a real chain reply, confirming the two modules compose (not a duplicate of parser.rs's own
     /// table-driven unit tests).
