@@ -131,7 +131,7 @@ mod tests {
         let status = status_at(1_000);
 
         let completed =
-            run_cycle_with_deadline(&status, &clock, || std::future::pending::<()>()).await;
+            run_cycle_with_deadline(&status, &clock, std::future::pending::<()>).await;
 
         assert!(
             !completed,
@@ -221,6 +221,11 @@ mod tests {
         let loop_status = status.clone();
         let loop_clock: Arc<dyn Clock> = clock.clone();
         let handle = tokio::spawn(heartbeat_loop(loop_status, loop_clock, rx));
+
+        // Let the loop reach its `sleep` and REGISTER its timer before virtual time moves. Without
+        // this, `advance` jumps over a timer that does not exist yet and the loop then sleeps from the
+        // far side of the jump — the test would fail while the loop is behaving correctly.
+        tokio::task::yield_now().await;
 
         clock.advance(PROVER_HEARTBEAT_SECONDS);
         tokio::time::advance(Duration::from_secs(PROVER_HEARTBEAT_SECONDS)).await;

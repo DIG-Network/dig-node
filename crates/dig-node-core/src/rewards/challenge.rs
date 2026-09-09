@@ -42,11 +42,16 @@ fn csprng_u64_below(bound: u64) -> u64 {
     u64::from_le_bytes(buf) % bound
 }
 
+/// The `(peer_id, launcher_id)` pair a no-repeat rule is keyed on (SPEC §3.2 clause 5).
+type ChallengeSubject = (Bytes32, Bytes32);
+/// One issued window: `(cycle_index, resource_id, offset)`.
+type IssuedWindow = (u32, Bytes32, u64);
+
 /// Remembers, per `(peer_id, launcher_id)`, the `(cycle_index, resource_id, offset)` windows
 /// issued in the last [`CHALLENGE_NO_REPEAT_CYCLES`] cycles (SPEC §3.2 clause 5).
 #[derive(Default)]
 pub struct NoRepeatMemory {
-    recent: HashMap<(Bytes32, Bytes32), Vec<(u32, Bytes32, u64)>>,
+    recent: HashMap<ChallengeSubject, Vec<IssuedWindow>>,
 }
 
 impl NoRepeatMemory {
