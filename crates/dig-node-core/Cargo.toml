@@ -503,7 +503,13 @@ dig-peer = "0.14"
 # above (dig-node#422). Its predecessor 0.10.0 required `^0.13`, and because this crate passes
 # dig-dht values into the selector, that requirement is what held dig-dht at 0.13; see the dig-dht
 # entry above.
-dig-peer-selector = "0.11"
+#
+# Moved to 0.12 (dig_ecosystem#3269): 0.12.0 is the release that moves onto `dig-peer ^0.14`, the
+# last of the four links in the `dig-rpc-protocol` 0.11 cascade (dig-peer 0.14.0, dig-download
+# 0.23.0, dig-peer-selector 0.12.0). Every prior `dig-peer-selector` release — through 0.11.1 —
+# stayed on `dig-peer ^0.13`, which is what pinned this crate's `dig-peer` line above at 0.13 and
+# kept two `dig-rpc-protocol` versions resolving simultaneously.
+dig-peer-selector = "0.12"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
 # the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the

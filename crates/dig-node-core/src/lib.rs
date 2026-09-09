@@ -9062,8 +9062,11 @@ mod tests {
                 challenges_failed: 44,
                 entries_added: 55,
                 entries_removed: 66,
-                // Deliberately > u32::MAX / 2 so a truncating (rather than widening) `entry_count`
-                // conversion would be caught by the exact-value assertion below.
+                // Deliberately in the upper half of `u32`'s range (> 2^31) — the internal field IS
+                // `u32`, so this cannot exceed `u32::MAX` (that would not compile), but a value
+                // this large would not survive a mistaken re-narrowing (e.g. an accidental
+                // `as u32 as u64` round-trip through a signed/other-width type) intact, unlike a
+                // small value that would pass such a bug undetected.
                 entry_count: 3_000_000_000,
                 reserve_base_units: 77,
                 total_paid_out_base_units: 88,
@@ -9286,6 +9289,70 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         ));
         assert_eq!(all["result"]["statuses"].as_array().unwrap().len(), 2);
+    }
+
+    /// **Proves:** `total_paid_out_base_units`/`reserve_base_units` stay attributed to the
+    /// `launcher_id` (distributor) that reported them — never summed across distributors, never
+    /// cross-attributed to the other one. **Catches:** the class of defect a sibling adversarial
+    /// gate found in dig-app#403's rewards pane (dig_ecosystem#3269): a per-distributor total
+    /// rendered/returned as if it were a single subject's (there, one mirror operator's personal
+    /// earnings), overstating by however many other mirrors that distributor pays. Proving the
+    /// VALUE survives the wire hop (`get_reward_prover_status_answers_a_real_request_with_real_values`)
+    /// does not prove whose money it describes — this test does, with two distributors carrying
+    /// deliberately different, distinguishable totals.
+    #[test]
+    fn get_reward_prover_status_attributes_payout_figures_to_their_own_distributor() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        let distributor_a = [0xaau8; 32];
+        let distributor_b = [0xbbu8; 32];
+
+        let mut status_a = sample_reward_prover_status(distributor_a);
+        status_a.counters.reserve_base_units = 10_000;
+        status_a.counters.total_paid_out_base_units = 999_000;
+
+        let mut status_b = sample_reward_prover_status(distributor_b);
+        status_b.counters.reserve_base_units = 42;
+        status_b.counters.total_paid_out_base_units = 7;
+
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(status_a));
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(status_b));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let statuses = resp["result"]["statuses"].as_array().unwrap();
+        assert_eq!(statuses.len(), 2);
+
+        let find = |launcher_id: [u8; 32]| {
+            statuses
+                .iter()
+                .find(|s| s["launcher_id"] == json!(hex::encode(launcher_id)))
+                .unwrap_or_else(|| panic!("no status for launcher_id {}", hex::encode(launcher_id)))
+        };
+        let a = find(distributor_a);
+        let b = find(distributor_b);
+
+        // Each distributor's own figures, untouched.
+        assert_eq!(a["counters"]["reserve_base_units"], json!(10_000));
+        assert_eq!(a["counters"]["total_paid_out_base_units"], json!(999_000));
+        assert_eq!(b["counters"]["reserve_base_units"], json!(42));
+        assert_eq!(b["counters"]["total_paid_out_base_units"], json!(7));
+
+        // Never summed across distributors (999_000 + 7) and never cross-attributed (swapped).
+        let combined = 999_000 + 7;
+        assert_ne!(a["counters"]["total_paid_out_base_units"], json!(combined));
+        assert_ne!(b["counters"]["total_paid_out_base_units"], json!(combined));
+        assert_ne!(
+            a["counters"]["total_paid_out_base_units"],
+            b["counters"]["total_paid_out_base_units"]
+        );
     }
 
     /// **Proves:** `gap_fill_generation` is a cheap no-op when the generation is already held (no

@@ -176,6 +176,16 @@ fn reward_prover_status_to_wire(
             // than a same-name copy, so a future wire narrowing fails to compile instead of
             // silently truncating.
             entry_count: u64::from(s.counters.entry_count),
+            // SUBJECT, not just value (dig_ecosystem#3269, found by a sibling adversarial gate on
+            // dig-app#403's rewards pane): `reserve_base_units` and `total_paid_out_base_units` are
+            // per-DISTRIBUTOR figures — this distributor's own reserve, and the total THIS
+            // distributor has paid out in total to ALL of its mirrors combined. Neither is the
+            // querying node's own earnings, and `total_paid_out_base_units` is never one mirror's
+            // share; a caller rendering either as "your earnings" for the operator running this
+            // node overstates by however many other mirrors this distributor pays (the dig-app
+            // pane rendered it as personal earnings and overstated by up to 250x). This function
+            // passes both through unmodified and unaggregated (SPEC §2.4) — it is the caller's job
+            // to label them as the distributor's totals, never the operator's.
             reserve_base_units: s.counters.reserve_base_units,
             total_paid_out_base_units: s.counters.total_paid_out_base_units,
         },
