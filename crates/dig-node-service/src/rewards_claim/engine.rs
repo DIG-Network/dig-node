@@ -329,7 +329,14 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             // Defect B: no permanent blacklist skip here — every candidate is re-evaluated every
             // cycle, including one that reported `NoEntrySlot` on a prior cycle.
             match self.evaluate_pre_budget(launcher_id).await {
-                PreBudgetResult::Fault => faulted += 1,
+                PreBudgetResult::Fault { reason } => {
+                    faulted += 1;
+                    outcomes.push(ClaimOutcome::Faulted {
+                        launcher_id,
+                        reversed_fee_mojos: None,
+                        reason,
+                    });
+                }
                 PreBudgetResult::ChainUnavailable => {
                     self.status.chain_unavailable_this_cycle = true;
                     self.status.state = ClaimLoopState::ChainSourceUnavailable;
@@ -374,7 +381,17 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
                 .evaluate_budget_phase(claim, &mut spent_this_cycle_mojos, &mut budget_exhausted)
                 .await
             {
-                BudgetPhaseResult::Fault => faulted += 1,
+                BudgetPhaseResult::Fault {
+                    reason,
+                    reversed_fee_mojos,
+                } => {
+                    faulted += 1;
+                    outcomes.push(ClaimOutcome::Faulted {
+                        launcher_id: claim.launcher_id,
+                        reversed_fee_mojos,
+                        reason,
+                    });
+                }
                 BudgetPhaseResult::ChainUnavailable => {
                     self.status.chain_unavailable_this_cycle = true;
                     self.status.state = ClaimLoopState::ChainSourceUnavailable;
@@ -444,9 +461,11 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         let asset = match self.port.reserve_asset_id(launcher_id).await {
             Ok(a) => a,
             Err(ClaimPortError::Unavailable) => return PreBudgetResult::ChainUnavailable,
-            Err(ClaimPortError::Other(_)) => {
+            Err(ClaimPortError::Other(message)) => {
                 self.status.fault_reported = true;
-                return PreBudgetResult::Fault;
+                return PreBudgetResult::Fault {
+                    reason: bound_port_error_text(&message),
+                };
             }
         };
         if asset != self.dig_asset_id {
@@ -465,9 +484,11 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
                 return PreBudgetResult::Outcome(ClaimOutcome::NoEntrySlot { launcher_id }, false);
             }
             Err(ClaimPortError::Unavailable) => return PreBudgetResult::ChainUnavailable,
-            Err(ClaimPortError::Other(_)) => {
+            Err(ClaimPortError::Other(message)) => {
                 self.status.fault_reported = true;
-                return PreBudgetResult::Fault;
+                return PreBudgetResult::Fault {
+                    reason: bound_port_error_text(&message),
+                };
             }
         };
 
@@ -492,9 +513,11 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         let threshold = match self.port.payout_threshold(launcher_id).await {
             Ok(t) => t,
             Err(ClaimPortError::Unavailable) => return PreBudgetResult::ChainUnavailable,
-            Err(ClaimPortError::Other(_)) => {
+            Err(ClaimPortError::Other(message)) => {
                 self.status.fault_reported = true;
-                return PreBudgetResult::Fault;
+                return PreBudgetResult::Fault {
+                    reason: bound_port_error_text(&message),
+                };
             }
         };
 
@@ -561,9 +584,12 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         let fee = match self.port.required_fee_mojos(launcher_id).await {
             Ok(f) => f,
             Err(ClaimPortError::Unavailable) => return BudgetPhaseResult::ChainUnavailable,
-            Err(ClaimPortError::Other(_)) => {
+            Err(ClaimPortError::Other(message)) => {
                 self.status.fault_reported = true;
-                return BudgetPhaseResult::Fault;
+                return BudgetPhaseResult::Fault {
+                    reason: bound_port_error_text(&message),
+                    reversed_fee_mojos: None,
+                };
             }
         };
 
@@ -631,10 +657,13 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
                 self.uncommit_fee(fee);
                 BudgetPhaseResult::ChainUnavailable
             }
-            Err(ClaimPortError::Other(_)) => {
+            Err(ClaimPortError::Other(message)) => {
                 self.uncommit_fee(fee);
                 self.status.fault_reported = true;
-                BudgetPhaseResult::Fault
+                BudgetPhaseResult::Fault {
+                    reason: bound_port_error_text(&message),
+                    reversed_fee_mojos: Some(fee),
+                }
             }
         }
     }
@@ -666,15 +695,31 @@ enum PreBudgetResult {
         launcher_id: Bytes32,
         accrued_base_units: u64,
     },
-    Fault,
+    /// A chain read (`reserve_asset_id`, `own_entry` or `payout_threshold`) returned
+    /// `ClaimPortError::Other`. None of these ever reads a fee, so [`ClaimOutcome::Faulted`] built
+    /// from this is always `reversed_fee_mojos: None`.
+    Fault { reason: String },
     ChainUnavailable,
 }
 
 /// The outcome of [`ClaimEngine::evaluate_budget_phase`].
 enum BudgetPhaseResult {
     Outcome(ClaimOutcome),
-    Fault,
+    /// A chain call (`required_fee_mojos` or `submit_initiate_payout` itself) returned
+    /// `ClaimPortError::Other`. `reversed_fee_mojos` is `Some` only for the latter, where a fee was
+    /// already pre-committed and [`ClaimEngine::uncommit_fee`] has already reversed it.
+    Fault {
+        reason: String,
+        reversed_fee_mojos: Option<u64>,
+    },
     ChainUnavailable,
+}
+
+/// Bounds a chain port's error text before it is carried into [`ClaimOutcome::Faulted`] or logged —
+/// it originates from a chain port and is therefore attacker-adjacent, the same 200-char discipline
+/// `service::summarize_stderr` applies to a spawned tool's own stderr.
+fn bound_port_error_text(message: &str) -> String {
+    message.chars().take(200).collect()
 }
 
 #[cfg(test)]
