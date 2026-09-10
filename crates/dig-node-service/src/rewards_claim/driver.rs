@@ -29,6 +29,7 @@
 //! #3249 has not landed, so every real cycle this driver runs reports [`super::ClaimLoopState::ChainSourceUnavailable`]
 //! and submits nothing — the honest state, not an invented adapter.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -239,8 +240,34 @@ async fn run_claim_driver(handle: ClaimLoopHandle) {
     };
     let own_payout_puzzle_hash = own_payout_puzzle_hash(owner_inner_puzzle_hash);
 
-    let state_dir = crate::state::state_dir();
-    let cfg = RewardsClaimConfig::load_from(&state_dir);
+    run_claim_driver_in(
+        &crate::state::state_dir(),
+        own_payout_puzzle_hash,
+        UnavailableClaimChainPort,
+        handle,
+    )
+    .await;
+}
+
+/// The whole production body of the claim loop, with every process global it used to read taken as
+/// an argument: the state directory it loads [`RewardsClaimConfig`] from, this node's own payout
+/// puzzle hash, and the chain `port`. Split out of [`run_claim_driver`] on the same `load` /
+/// `load_from` pattern [`RewardsClaimConfig`] itself uses, for one reason: the joint between the
+/// tested gate and the tested [`drive`] loop was previously the only UNTESTED link in the chain,
+/// and an untested joint is exactly how #594's claim engine shipped complete and inert.
+///
+/// Generic over `P` so a test can drive this real body against a fake port; production always
+/// passes [`UnavailableClaimChainPort`] (see the module doc -- there is deliberately no second
+/// production adapter until #3249 lands).
+async fn run_claim_driver_in<P>(
+    state_dir: &Path,
+    own_payout_puzzle_hash: Bytes32,
+    port: P,
+    handle: ClaimLoopHandle,
+) where
+    P: ClaimChainPort,
+{
+    let cfg = RewardsClaimConfig::load_from(state_dir);
     // A4/F8: a corrupt config is not a reason to refuse to SPAWN -- `ClaimEngine::run_cycle`
     // already fails closed and reports `PersistedStateCorrupt` by name on every cycle until an
     // operator fixes or removes the file (see `engine.rs`'s `run_cycle` doc). Refusing to spawn
@@ -248,7 +275,7 @@ async fn run_claim_driver(handle: ClaimLoopHandle) {
     // exists to prevent -- a corrupt file must stay visible, not vanish into "never started".
 
     let engine = ClaimEngine::new(
-        UnavailableClaimChainPort,
+        port,
         NoHintSource,
         own_payout_puzzle_hash,
         cfg.max_fee_mojos,
@@ -256,7 +283,7 @@ async fn run_claim_driver(handle: ClaimLoopHandle) {
         dig_mirror_coin::DIG_ASSET_ID,
     )
     .with_rotation_cursor(cfg.rotation_cursor)
-    .with_persisted_fee_window(&state_dir, cfg.cadence_seconds);
+    .with_persisted_fee_window(state_dir, cfg.cadence_seconds);
 
     drive(
         engine,
@@ -870,5 +897,111 @@ mod tests {
             engine.status().state,
             super::super::types::ClaimLoopState::PersistedStateCorrupt
         );
+    }
+    // ---- The JOINT: the production body itself, not the halves around it -------------------
+
+    /// Write a `rewards-claim.json` with a fixed cadence and NO jitter, so a composition test can
+    /// advance the clock by an exact number of seconds and know precisely how many cycles that
+    /// buys.
+    fn write_config(dir: &Path, cadence_seconds: u64) {
+        RewardsClaimConfig {
+            enabled: true,
+            cadence_seconds,
+            jitter_seconds: 0,
+            ..RewardsClaimConfig::default()
+        }
+        .save_to(dir)
+        .unwrap();
+    }
+
+    /// THE COMPOSITION TEST. `decide_claim_driver` was tested, `drive` was tested -- and the
+    /// production body that joins them (`run_claim_driver_in`: load the config from the state dir,
+    /// construct the engine, reach `drive`) was tested by NOTHING. That is the same shape as #594,
+    /// which shipped a complete, fully-tested, entirely INERT claim engine: if this body returned
+    /// early, built the engine wrong, or never reached `drive`, every other test on this change
+    /// would still pass and a real node would still never claim.
+    ///
+    /// So this drives the REAL body -- the one production calls -- and asserts the anti-silence
+    /// property through it: zero cycles before the configured interval elapses, then an exactly
+    /// COUNTED number after.
+    #[tokio::test(start_paused = true)]
+    async fn the_production_body_drives_counted_cycles_from_a_written_config() {
+        let cadence = 100u64;
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), cadence);
+
+        let handle = ClaimLoopHandle::default();
+        let h = handle.clone();
+        let state_dir = dir.path().to_path_buf();
+        let driver = tokio::spawn(async move {
+            run_claim_driver_in(&state_dir, Bytes32::from([1u8; 32]), EmptyPort, h).await;
+        });
+
+        settle().await;
+        assert_eq!(
+            handle.cycles_driven(),
+            0,
+            "the production body must honour the configured interval: no cycle before it elapses"
+        );
+
+        tokio::time::advance(Duration::from_secs(cadence)).await;
+        settle().await;
+        assert_eq!(
+            handle.cycles_driven(),
+            1,
+            "one configured interval elapsed: the production body drove exactly one cycle,              proving the joint between the tested gate and the tested drive loop is live"
+        );
+
+        tokio::time::advance(Duration::from_secs(cadence)).await;
+        settle().await;
+        assert_eq!(
+            handle.cycles_driven(),
+            2,
+            "and it keeps driving, one cycle per configured interval"
+        );
+
+        driver.abort();
+    }
+
+    /// The same production body against the port production ACTUALLY passes it
+    /// ([`UnavailableClaimChainPort`], the only adapter until #3249) reports
+    /// [`ClaimLoopState::ChainSourceUnavailable`] by name once a cycle has been driven -- the
+    /// honest state of a real node today. Proves the real adapter path is reached, not only a fake
+    /// one: a counted cycle whose outcome names the missing chain source, never a reassuring
+    /// `Nominal` and never silence.
+    #[tokio::test(start_paused = true)]
+    async fn the_production_adapter_reports_chain_source_unavailable_by_name() {
+        let cadence = 100u64;
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), cadence);
+
+        let handle = ClaimLoopHandle::default();
+        let h = handle.clone();
+        let state_dir = dir.path().to_path_buf();
+        let driver = tokio::spawn(async move {
+            run_claim_driver_in(
+                &state_dir,
+                Bytes32::from([1u8; 32]),
+                UnavailableClaimChainPort,
+                h,
+            )
+            .await;
+        });
+
+        tokio::time::advance(Duration::from_secs(cadence)).await;
+        settle().await;
+        assert_eq!(handle.cycles_driven(), 1, "one cycle was driven");
+        assert_eq!(
+            handle.status().state,
+            super::super::types::ClaimLoopState::ChainSourceUnavailable,
+            "with no chain adapter wired, the driven cycle must name ChainSourceUnavailable"
+        );
+        assert_eq!(
+            handle.refusal(),
+            None,
+            "the loop RAN: an unavailable chain source is a cycle outcome, not a refusal to start"
+        );
+
+        driver.abort();
     }
 }
