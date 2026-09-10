@@ -143,23 +143,24 @@ async fn resolve_enforced_pin(
     }
 }
 
-/// Map dig-node-core's internal (`camelCase`-tagged) reward-prover status onto
-/// `dig-rpc-protocol` 0.11's wire type (snake_case-tagged struct; only its `ProverState` VALUE is
-/// camelCase) — field by field, explicit and widening where the shapes differ, never a
-/// same-name struct-to-struct copy. This subsystem has already shipped a 24x-too-high fee
-/// ceiling and a 2x-understated eviction count that a correctness gate passed twice, so every
-/// non-identical field below is called out rather than assumed.
-/// Names which of a reward-prover status record's identity fields (`launcher_id`, `store_id`,
-/// `root`) are all-zero, if any. An all-zero value in any of these is never a real distributor's
-/// or module's identity — it's what an unassigned/uninitialised registry slot hex-encodes to
-/// ("0000…0000"), which reads exactly like a valid 64-hex id to every consumer, including the
-/// dig-app consumer in dig-app#403 (unmerged).
+/// Names which of a reward-prover status record's fields are all-zero, if any, across
+/// `launcher_id`, `store_id` (both IDENTITY — an all-zero value is never a real distributor's or
+/// module's id; it's what an unassigned/uninitialised registry slot hex-encodes to, which reads
+/// exactly like a valid 64-hex id to every consumer, including the dig-app consumer in
+/// dig-app#403 (unmerged)) and `root` (an OBSERVATION, not an identity — a registered prover that
+/// has not completed its first cycle yet plausibly has no root, so a zeroed `root` alone is not a
+/// registration bug the way a zeroed identity field is).
+///
+/// Callers decide what to DO with a zeroed field; this only names which ones are zero, so the
+/// same detection drives both the exclusion decision (identity fields only, see
+/// `reward_prover_status_to_wire`'s call site) and the `tracing::warn!` that fires for a zeroed
+/// `root` too, since an operator watching the log still benefits from seeing it named.
 ///
 /// Isolated on purpose (dig_ecosystem#3269 security/adversarial gate): this is a
 /// registration-bug DETECTOR that belongs, longer-term, at #3265's writer (the code that will
 /// actually populate this registry) rather than woven into the wire mapping below — kept here,
 /// small and easy to relocate, only because #3265 has not landed yet.
-fn zeroed_identity_fields(s: &crate::rewards::state::RewardProverStatus) -> Vec<&'static str> {
+fn zeroed_fields(s: &crate::rewards::state::RewardProverStatus) -> Vec<&'static str> {
     let mut zeroed = Vec::new();
     if s.launcher_id == [0u8; 32] {
         zeroed.push("launcher_id");
@@ -173,6 +174,20 @@ fn zeroed_identity_fields(s: &crate::rewards::state::RewardProverStatus) -> Vec<
     zeroed
 }
 
+/// Whether a record's zeroed fields (from [`zeroed_fields`]) include an IDENTITY field
+/// (`launcher_id` or `store_id`). A record failing this cannot be attributed to any distributor
+/// or module, so it must never be presented as one — unlike a zeroed `root` alone, which is a
+/// legitimate "no cycle observed yet" state for an otherwise-real, otherwise-attributable prover.
+fn is_missing_identity(zeroed: &[&str]) -> bool {
+    zeroed.contains(&"launcher_id") || zeroed.contains(&"store_id")
+}
+
+/// Map dig-node-core's internal (`camelCase`-tagged) reward-prover status onto
+/// `dig-rpc-protocol` 0.11's wire type (snake_case-tagged struct; only its `ProverState` VALUE is
+/// camelCase) — field by field, explicit and widening where the shapes differ, never a
+/// same-name struct-to-struct copy. This subsystem has already shipped a 24x-too-high fee
+/// ceiling and a 2x-understated eviction count that a correctness gate passed twice, so every
+/// non-identical field below is called out rather than assumed.
 fn reward_prover_status_to_wire(
     s: crate::rewards::state::RewardProverStatus,
 ) -> dig_rpc_protocol::types::RewardProverStatus {
@@ -773,28 +788,34 @@ impl RpcDispatch for Node {
                 let statuses: Vec<dig_rpc_protocol::types::RewardProverStatus> = node
                     .reward_prover_status_snapshots()
                     .into_iter()
-                    // A zeroed `launcher_id`, `store_id` or `root` is never a real distributor's
-                    // or module's identity — see `zeroed_identity_fields`. Excluding it rather
-                    // than presenting it as a real record avoids the money-hole class the
-                    // driver's gates found three times (an unset field that reads fine and costs
-                    // the operator), BUT exclusion alone would silently destroy the evidence that
-                    // a registration bug happened — the exact §2.4 clause 1 violation a security
-                    // + adversarial gate found in the first version of this filter (dig-node#595
-                    // review round). So this is never a silent drop: a `tracing::warn!` fires
-                    // naming which field(s) were zero, making a bad registration observable
-                    // rather than swallowed, even though the record still never reaches a caller.
+                    // A zeroed `launcher_id` or `store_id` is never a real distributor's or
+                    // module's IDENTITY — see `is_missing_identity`/`zeroed_fields`. Excluding
+                    // such a record rather than presenting it as a real one avoids the money-hole
+                    // class the driver's gates found three times (an unset field that reads fine
+                    // and costs the operator), BUT exclusion alone would silently destroy the
+                    // evidence that a registration bug happened — the exact §2.4 clause 1
+                    // violation a security + adversarial gate found in the first version of this
+                    // filter (dig-node#595 review round). So this is never a silent drop: a
+                    // `tracing::warn!` fires naming which field(s) were zero, making a bad
+                    // registration observable even when the record still reaches a caller.
+                    //
+                    // A zeroed `root` alone is different: it is an OBSERVATION (the prover's most
+                    // recent cycle), not an identity, and a freshly-registered prover that has not
+                    // completed its first cycle plausibly has a zero `root` legitimately. Excluding
+                    // it on that basis alone would make a healthy, just-not-yet-cycled prover
+                    // invisible — worse than the defect this guard exists to prevent. So a
+                    // root-only zero still warns, but the record is still returned.
                     .filter(|s| {
-                        let zeroed = zeroed_identity_fields(s);
+                        let zeroed = zeroed_fields(s);
                         if !zeroed.is_empty() {
                             tracing::warn!(
                                 launcher_id = %hex::encode(s.launcher_id),
                                 store_id = %hex::encode(s.store_id),
                                 root = %hex::encode(s.root),
-                                zeroed_fields = ?zeroed,
-                                "reward-prover status registration has an all-zero identity field; excluding it from dig.getRewardProverStatus rather than presenting it as a real distributor"
+                                "reward-prover status registration has an all-zero field; excluding it from dig.getRewardProverStatus if the zeroed field is an identity field, rather than presenting it as a real distributor"
                             );
                         }
-                        zeroed.is_empty()
+                        !is_missing_identity(&zeroed)
                     })
                     .filter(|s| match &filter_launcher_id {
                         Some(want) => hex::encode(s.launcher_id).eq_ignore_ascii_case(want),
