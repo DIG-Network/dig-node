@@ -191,7 +191,7 @@ serde_json = "1"
 # per-method tier) and the mTLS peer-reachability allowlist. dig-node-core reads its
 # method names + the peer allowlist from HERE (never hand-rolled) so the contract
 # cannot drift from the other node implementation or the discovery document (#1075).
-dig-rpc-protocol = "0.10.2"
+dig-rpc-protocol = "0.11.0"
 # The directed-message base protocol (epic #793/#796): the e2e seal/open pipeline + the typed envelope
 # the chat subsystem seals into. dig-node is the TRANSPORT — it seals an app-supplied opaque DIGCHAT1
 # envelope to the recipient's 0x0010 BLS identity key and dig-gossip directed-sends the sealed bytes.
@@ -457,7 +457,11 @@ dig-pex = "0.1.1"
 # checkpoint store (`download.rs::capturing_state_store_checkpoints_a_real_module_download_key`),
 # because dig-download's own suite missed it: every `module.rs` test used `InMemoryStateStore` (no
 # filename at all) and the one `FileStateStore` test used a 3-character key.
-dig-download = "0.22"
+#
+# Moved to 0.23 (dig_ecosystem#3269): 0.23.0 is the release that re-exports `dig-rpc-protocol` 0.11's
+# `ModuleInfo`, closing the two-shapes split this crate's own `dig-rpc-protocol = "0.11.0"` line above
+# opened against dig-download's prior 0.22-line dependency on `dig-rpc-protocol` 0.10.3.
+dig-download = "0.23"
 # -- The shared peer client (#1283/#1576) -------------------------------------------------------------
 # `DigPeer` — the ONE DIG Network peer client: peer_id-pinned mTLS over the full NAT ladder plus typed
 # RPC. Depended on DIRECTLY (not only transitively through dig-download) because dig-node supplies the
@@ -469,7 +473,10 @@ dig-download = "0.22"
 # module pull's trust boundary — on the fields that drive the whole pull plan. dig-download 0.8.1 is on
 # dig-peer 0.5 too, so exactly ONE dig-rpc-protocol + ONE dig-peer resolve here (asserted by
 # `crates/dig-node-core/tests/dependency_tree.rs`).
-dig-peer = "0.13"
+#
+# Moved to 0.14 (dig_ecosystem#3269), alongside dig-download's move to 0.23 above, for the same
+# reason: 0.14.0 is on `dig-rpc-protocol` 0.11, keeping exactly one version resolving.
+dig-peer = "0.14"
 # -- Self-optimizing peer selection (#178) ------------------------------------------------------------
 # The decision + learning layer between dig-dht discovery and dig-download execution: it ranks the
 # providers `find_providers` returns (learning throughput/rtt/reliability + a per-class saturation
@@ -496,7 +503,13 @@ dig-peer = "0.13"
 # above (dig-node#422). Its predecessor 0.10.0 required `^0.13`, and because this crate passes
 # dig-dht values into the selector, that requirement is what held dig-dht at 0.13; see the dig-dht
 # entry above.
-dig-peer-selector = "0.11"
+#
+# Moved to 0.12 (dig_ecosystem#3269): 0.12.0 is the release that moves onto `dig-peer ^0.14`, the
+# last of the four links in the `dig-rpc-protocol` 0.11 cascade (dig-peer 0.14.0, dig-download
+# 0.23.0, dig-peer-selector 0.12.0). Every prior `dig-peer-selector` release — through 0.11.1 —
+# stayed on `dig-peer ^0.13`, which is what pinned this crate's `dig-peer` line above at 0.13 and
+# kept two `dig-rpc-protocol` versions resolving simultaneously.
+dig-peer-selector = "0.12"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
 # the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the
@@ -580,7 +593,7 @@ rcgen = "0.13"
 #
 # Pinned by the `the_fail_open_anchor_verifier_is_not_reachable_from_a_production_build` test, which
 # fails if `testkit` ever appears on the production entry.
-dig-download = { version = "0.22", features = ["testkit"] }
+dig-download = { version = "0.23", features = ["testkit"] }
 # Captures the peer-facing serve's real emitted tracing records into an in-memory buffer, so the
 # serve-observability tests (#1595) assert what an operator would actually see in the node log —
 # and that no payload byte or proof ever reaches it.

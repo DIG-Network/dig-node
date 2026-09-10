@@ -143,6 +143,117 @@ async fn resolve_enforced_pin(
     }
 }
 
+/// Names which of a reward-prover status record's fields are all-zero, if any, across
+/// `launcher_id`, `store_id` (both IDENTITY — an all-zero value is never a real distributor's or
+/// module's id; it's what an unassigned/uninitialised registry slot hex-encodes to, which reads
+/// exactly like a valid 64-hex id to every consumer, including the dig-app consumer in
+/// dig-app#403 (unmerged)) and `root` (an OBSERVATION, not an identity — a registered prover that
+/// has not completed its first cycle yet plausibly has no root, so a zeroed `root` alone is not a
+/// registration bug the way a zeroed identity field is).
+///
+/// Callers decide what to DO with a zeroed field; this only names which ones are zero, so the
+/// same detection drives both the exclusion decision (identity fields only, see the
+/// `GetRewardProverStatus` filter below) and the log level split there: a zeroed identity field
+/// is a `tracing::warn!` (a real registration bug, record excluded), while a zeroed `root` alone
+/// is a `tracing::debug!` (an ordinary pre-first-cycle state, record still returned) — the two
+/// outcomes are opposite, so they must never share one undifferentiated log line or level.
+///
+/// Isolated on purpose (dig_ecosystem#3269 security/adversarial gate): this is a
+/// registration-bug DETECTOR that belongs, longer-term, at #3265's writer (the code that will
+/// actually populate this registry) rather than woven into the wire mapping below — kept here,
+/// small and easy to relocate, only because #3265 has not landed yet.
+fn zeroed_fields(s: &crate::rewards::state::RewardProverStatus) -> Vec<&'static str> {
+    let mut zeroed = Vec::new();
+    if s.launcher_id == [0u8; 32] {
+        zeroed.push("launcher_id");
+    }
+    if s.store_id == [0u8; 32] {
+        zeroed.push("store_id");
+    }
+    if s.root == [0u8; 32] {
+        zeroed.push("root");
+    }
+    zeroed
+}
+
+/// Whether a record's zeroed fields (from [`zeroed_fields`]) include an IDENTITY field
+/// (`launcher_id` or `store_id`). A record failing this cannot be attributed to any distributor
+/// or module, so it must never be presented as one — unlike a zeroed `root` alone, which is a
+/// legitimate "no cycle observed yet" state for an otherwise-real, otherwise-attributable prover.
+fn is_missing_identity(zeroed: &[&str]) -> bool {
+    zeroed.contains(&"launcher_id") || zeroed.contains(&"store_id")
+}
+
+/// Map dig-node-core's internal (`camelCase`-tagged) reward-prover status onto
+/// `dig-rpc-protocol` 0.11's wire type (snake_case-tagged struct; only its `ProverState` VALUE is
+/// camelCase) — field by field, explicit and widening where the shapes differ, never a
+/// same-name struct-to-struct copy. This subsystem has already shipped a 24x-too-high fee
+/// ceiling and a 2x-understated eviction count that a correctness gate passed twice, so every
+/// non-identical field below is called out rather than assumed.
+fn reward_prover_status_to_wire(
+    s: crate::rewards::state::RewardProverStatus,
+) -> dig_rpc_protocol::types::RewardProverStatus {
+    dig_rpc_protocol::types::RewardProverStatus {
+        launcher_id: hex::encode(s.launcher_id),
+        store_id: hex::encode(s.store_id),
+        root: hex::encode(s.root),
+        prover_state: reward_prover_state_to_wire(s.prover_state),
+        prover_state_since: s.prover_state_since,
+        last_cycle_started_at: s.last_cycle_started_at,
+        last_cycle_completed_at: s.last_cycle_completed_at,
+        next_cycle_due_at: s.next_cycle_due_at,
+        last_entry_write_at: s.last_entry_write_at,
+        consecutive_cycle_failures: s.consecutive_cycle_failures,
+        pending_entry_writes: s.pending_entry_writes,
+        observed_at: s.observed_at,
+        counters: dig_rpc_protocol::types::ProverCounters {
+            mirrors_seen: s.counters.mirrors_seen,
+            challenges_issued: s.counters.challenges_issued,
+            challenges_passed: s.counters.challenges_passed,
+            challenges_failed: s.counters.challenges_failed,
+            entries_added: s.counters.entries_added,
+            entries_removed: s.counters.entries_removed,
+            // Internal `entry_count` is `u32`; the wire field is `u64` — widen explicitly rather
+            // than a same-name copy, so a future wire narrowing fails to compile instead of
+            // silently truncating.
+            entry_count: u64::from(s.counters.entry_count),
+            // SUBJECT, not just value (dig_ecosystem#3269, found by a sibling adversarial gate on
+            // dig-app#403's rewards pane): `reserve_base_units` and `total_paid_out_base_units` are
+            // per-DISTRIBUTOR figures — this distributor's own reserve, and the total THIS
+            // distributor has paid out in total to ALL of its mirrors combined. Neither is the
+            // querying node's own earnings, and `total_paid_out_base_units` is never one mirror's
+            // share; a caller rendering either as "your earnings" for the operator running this
+            // node overstates by however many other mirrors this distributor pays (the dig-app
+            // pane rendered it as personal earnings and overstated by up to 250x). This function
+            // passes both through unmodified and unaggregated (SPEC §2.4) — it is the caller's job
+            // to label them as the distributor's totals, never the operator's.
+            reserve_base_units: s.counters.reserve_base_units,
+            total_paid_out_base_units: s.counters.total_paid_out_base_units,
+        },
+    }
+}
+
+/// The SPEC §2.3 nine-variant closed set is identical between the internal and wire
+/// `ProverState`; mapped explicitly (never `transmute`d) so an internal-only variant added
+/// without a matching wire variant is a compile error here, not a silent wire mismatch.
+fn reward_prover_state_to_wire(
+    s: crate::rewards::state::ProverState,
+) -> dig_rpc_protocol::types::ProverState {
+    use crate::rewards::state::ProverState as Internal;
+    use dig_rpc_protocol::types::ProverState as Wire;
+    match s {
+        Internal::Idle => Wire::Idle,
+        Internal::Running => Wire::Running,
+        Internal::LocalCopyMissing => Wire::LocalCopyMissing,
+        Internal::ChainSourceUnavailable => Wire::ChainSourceUnavailable,
+        Internal::Unfunded => Wire::Unfunded,
+        Internal::FeeBudgetExhausted => Wire::FeeBudgetExhausted,
+        Internal::EntrySetFull => Wire::EntrySetFull,
+        Internal::Paused => Wire::Paused,
+        Internal::Stopped => Wire::Stopped,
+    }
+}
+
 #[async_trait::async_trait]
 impl RpcDispatch for Node {
     async fn dispatch(
@@ -658,6 +769,76 @@ impl RpcDispatch for Node {
                 return json!({"jsonrpc":"2.0","id":id,"result":{
             "subscriptions": set.stores(),
             "count": set.len()}});
+            }
+            // dig.getRewardProverStatus (dig_ecosystem#3269, dig-rewards-coin SPEC.md
+            // §2.3/§2.4) — CONTROL plane: loopback admin / in-process FFI ONLY, NEVER over the
+            // mTLS peer surface (absent from `is_peer_reachable_method`;
+            // `reward_methods_tier_guard.rs` fails closed on that). Reads the node's live
+            // `reward_prover_statuses` registry (empty until dig_ecosystem#3265 spawns a prover
+            // loop) — a REAL read of a real, currently-empty registry, so `{"statuses": []}`
+            // means "this node runs no prover loops" and stays true right up until #3265
+            // registers one, at which point this same read starts returning it with no dispatch
+            // change. Never serializes the internal `rewards::state::RewardProverStatus`
+            // directly (it is `camelCase`-tagged; the wire struct is snake_case) — every field is
+            // mapped explicitly by `reward_prover_status_to_wire`.
+            Some(Method::GetRewardProverStatus) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                let filter_launcher_id = params
+                    .get("launcher_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_ascii_lowercase);
+                let statuses: Vec<dig_rpc_protocol::types::RewardProverStatus> = node
+                    .reward_prover_status_snapshots()
+                    .into_iter()
+                    // A zeroed `launcher_id` or `store_id` is never a real distributor's or
+                    // module's IDENTITY — see `is_missing_identity`/`zeroed_fields`. Excluding
+                    // such a record rather than presenting it as a real one avoids the money-hole
+                    // class the driver's gates found three times (an unset field that reads fine
+                    // and costs the operator), BUT exclusion alone would silently destroy the
+                    // evidence that a registration bug happened — the exact §2.4 clause 1
+                    // violation a security + adversarial gate found in the first version of this
+                    // filter (dig-node#595 review round). So this is never a silent drop: a
+                    // `tracing::warn!` fires naming which field(s) were zero, making a bad
+                    // registration observable, and the record is excluded.
+                    //
+                    // A zeroed `root` alone is different: it is an OBSERVATION (the prover's most
+                    // recent cycle), not an identity, and a freshly-registered prover that has not
+                    // completed its first cycle plausibly has a zero `root` legitimately. Excluding
+                    // it on that basis alone would make a healthy, just-not-yet-cycled prover
+                    // invisible — worse than the defect this guard exists to prevent. So this case
+                    // is `tracing::debug!`, not `warn!`: an ordinary, expected state rather than a
+                    // fault, kept out of `warn!`-level volume so an operator polling this endpoint
+                    // is never shown (uncycled provers) x (poll rate) lines indistinguishable from
+                    // a real registration bug. The record is still returned either way.
+                    .filter(|s| {
+                        let zeroed = zeroed_fields(s);
+                        if is_missing_identity(&zeroed) {
+                            tracing::warn!(
+                                launcher_id = %hex::encode(s.launcher_id),
+                                store_id = %hex::encode(s.store_id),
+                                root = %hex::encode(s.root),
+                                zeroed_fields = ?zeroed,
+                                "reward-prover status registration is missing an identity field; excluding it from dig.getRewardProverStatus rather than presenting it as a real distributor"
+                            );
+                        } else if !zeroed.is_empty() {
+                            tracing::debug!(
+                                launcher_id = %hex::encode(s.launcher_id),
+                                store_id = %hex::encode(s.store_id),
+                                root = %hex::encode(s.root),
+                                zeroed_fields = ?zeroed,
+                                "reward-prover status has a zeroed root; likely no cycle observed yet, returning it anyway"
+                            );
+                        }
+                        !is_missing_identity(&zeroed)
+                    })
+                    .filter(|s| match &filter_launcher_id {
+                        Some(want) => hex::encode(s.launcher_id).eq_ignore_ascii_case(want),
+                        None => true,
+                    })
+                    .map(reward_prover_status_to_wire)
+                    .collect();
+                let result = dig_rpc_protocol::types::GetRewardProverStatusResult { statuses };
+                return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
             Some(Method::CacheSetCapBytes) => {
                 let requested = req
