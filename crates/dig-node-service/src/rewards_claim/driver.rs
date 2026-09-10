@@ -949,7 +949,10 @@ mod tests {
         assert_eq!(
             handle.cycles_driven(),
             1,
-            "one configured interval elapsed: the production body drove exactly one cycle,              proving the joint between the tested gate and the tested drive loop is live"
+            concat!(
+                "one configured interval elapsed: the production body drove exactly one cycle, ",
+                "proving the joint between the tested gate and the tested drive loop is live"
+            )
         );
 
         tokio::time::advance(Duration::from_secs(cadence)).await;
@@ -988,6 +991,9 @@ mod tests {
             .await;
         });
 
+        // Let the spawned body reach its first `sleep` before advancing: under paused time an
+        // `advance` that lands before the timer is registered buys no cycle at all.
+        settle().await;
         tokio::time::advance(Duration::from_secs(cadence)).await;
         settle().await;
         assert_eq!(handle.cycles_driven(), 1, "one cycle was driven");
