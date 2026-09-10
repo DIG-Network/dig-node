@@ -152,9 +152,11 @@ async fn resolve_enforced_pin(
 /// registration bug the way a zeroed identity field is).
 ///
 /// Callers decide what to DO with a zeroed field; this only names which ones are zero, so the
-/// same detection drives both the exclusion decision (identity fields only, see
-/// `reward_prover_status_to_wire`'s call site) and the `tracing::warn!` that fires for a zeroed
-/// `root` too, since an operator watching the log still benefits from seeing it named.
+/// same detection drives both the exclusion decision (identity fields only, see the
+/// `GetRewardProverStatus` filter below) and the log level split there: a zeroed identity field
+/// is a `tracing::warn!` (a real registration bug, record excluded), while a zeroed `root` alone
+/// is a `tracing::debug!` (an ordinary pre-first-cycle state, record still returned) — the two
+/// outcomes are opposite, so they must never share one undifferentiated log line or level.
 ///
 /// Isolated on purpose (dig_ecosystem#3269 security/adversarial gate): this is a
 /// registration-bug DETECTOR that belongs, longer-term, at #3265's writer (the code that will
@@ -797,23 +799,34 @@ impl RpcDispatch for Node {
                     // violation a security + adversarial gate found in the first version of this
                     // filter (dig-node#595 review round). So this is never a silent drop: a
                     // `tracing::warn!` fires naming which field(s) were zero, making a bad
-                    // registration observable even when the record still reaches a caller.
+                    // registration observable, and the record is excluded.
                     //
                     // A zeroed `root` alone is different: it is an OBSERVATION (the prover's most
                     // recent cycle), not an identity, and a freshly-registered prover that has not
                     // completed its first cycle plausibly has a zero `root` legitimately. Excluding
                     // it on that basis alone would make a healthy, just-not-yet-cycled prover
-                    // invisible — worse than the defect this guard exists to prevent. So a
-                    // root-only zero still warns, but the record is still returned.
+                    // invisible — worse than the defect this guard exists to prevent. So this case
+                    // is `tracing::debug!`, not `warn!`: an ordinary, expected state rather than a
+                    // fault, kept out of `warn!`-level volume so an operator polling this endpoint
+                    // is never shown (uncycled provers) x (poll rate) lines indistinguishable from
+                    // a real registration bug. The record is still returned either way.
                     .filter(|s| {
                         let zeroed = zeroed_fields(s);
-                        if !zeroed.is_empty() {
+                        if is_missing_identity(&zeroed) {
                             tracing::warn!(
                                 launcher_id = %hex::encode(s.launcher_id),
                                 store_id = %hex::encode(s.store_id),
                                 root = %hex::encode(s.root),
                                 zeroed_fields = ?zeroed,
-                                "reward-prover status registration has an all-zero field; excluding it from dig.getRewardProverStatus if the zeroed field is an identity field, rather than presenting it as a real distributor"
+                                "reward-prover status registration is missing an identity field; excluding it from dig.getRewardProverStatus rather than presenting it as a real distributor"
+                            );
+                        } else if !zeroed.is_empty() {
+                            tracing::debug!(
+                                launcher_id = %hex::encode(s.launcher_id),
+                                store_id = %hex::encode(s.store_id),
+                                root = %hex::encode(s.root),
+                                zeroed_fields = ?zeroed,
+                                "reward-prover status has a zeroed root; likely no cycle observed yet, returning it anyway"
                             );
                         }
                         !is_missing_identity(&zeroed)

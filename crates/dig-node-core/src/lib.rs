@@ -9201,20 +9201,24 @@ mod tests {
     /// registration, and never checked `store_id` at all.
     ///
     /// Distinguishes IDENTITY fields (`launcher_id`, `store_id` — a record missing either cannot
-    /// be attributed to any distributor, so it is EXCLUDED) from the OBSERVATION field (`root` —
-    /// legitimately zero before a prover's first cycle, so it is logged but never causes
-    /// exclusion on its own; see the fourth case below).
+    /// be attributed to any distributor, so it is EXCLUDED and logged at `WARN`) from the
+    /// OBSERVATION field (`root` — legitimately zero before a prover's first cycle, so it is
+    /// logged at `DEBUG`, never `WARN`, and never causes exclusion on its own; see the third case
+    /// below). The level split matters, not just the exclusion split: security measured that an
+    /// undifferentiated `warn!` for both cases turns steady-state log volume into (uncycled
+    /// provers) x (poll rate) lines an operator cannot distinguish from a real registration bug.
     ///
     /// **Catches:** (1) a boundary that lets an uninitialised slot answer as if it were a real
     /// distributor; (2) a filter that only checks `launcher_id`, missing a registration bug that
     /// zeroes `store_id` beside an otherwise-valid `launcher_id` (the exact gap security named);
     /// (3) a fix that goes back to dropping the bad record with no log line at all; (4) a fix
     /// that over-corrects by excluding on a zeroed `root` too, which would make a healthy,
-    /// just-not-yet-cycled prover invisible; (5) a log assertion that only checks the field NAME
-    /// `launcher_id` appears somewhere in the log line — true unconditionally, since the warn
-    /// always logs `launcher_id = %hex::encode(...)` as a structured field regardless of which
-    /// field was actually zero — rather than checking the `zeroed_fields=[...]` value itself,
-    /// which is what actually distinguishes the cases.
+    /// just-not-yet-cycled prover invisible; (5) a fix that returns the zeroed-root record but logs
+    /// it at the SAME level (`warn!`) as a real identity fault, defeating the operator's ability to
+    /// tell the two apart; (6) a log assertion that only checks the field NAME `launcher_id`
+    /// appears somewhere in the log line — true unconditionally, since the log always includes
+    /// `launcher_id = %hex::encode(...)` as a structured field regardless of which field was
+    /// actually zero — rather than checking the `zeroed_fields=[...]` value AND the level.
     #[test]
     fn get_reward_prover_status_logs_and_excludes_a_zeroed_identity_field() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -9239,7 +9243,8 @@ mod tests {
 
         // Case 3: launcher_id AND store_id are both valid, but root is zeroed — a plausible
         // "registered, not yet cycled" prover. Must still be RETURNED (root is not an identity
-        // field), but a warn must still fire naming `root` so the state stays observable.
+        // field), and a DEBUG (never WARN) still fires naming `root` so the state stays
+        // observable without polluting warn-level volume with an ordinary, expected state.
         let valid_but_zeroed_root = [0xbbu8; 32];
         let mut zeroed_root_status = sample_reward_prover_status(valid_but_zeroed_root);
         zeroed_root_status.root = [0u8; 32];
@@ -9284,23 +9289,32 @@ mod tests {
         // regardless of which field was actually zero — the exact tautology a correctness gate
         // found in an earlier version of this assertion).
         assert!(
-            logs.contains(r#"zeroed_fields=["launcher_id"]"#),
-            "expected a warning naming exactly launcher_id as zeroed, got: {logs}"
+            logs.contains("WARN") && logs.contains(r#"zeroed_fields=["launcher_id"]"#),
+            "expected a WARN naming exactly launcher_id as zeroed, got: {logs}"
         );
         assert!(
-            logs.contains(r#"zeroed_fields=["store_id"]"#),
-            "expected a warning naming exactly store_id as zeroed, got: {logs}"
+            logs.contains("WARN") && logs.contains(r#"zeroed_fields=["store_id"]"#),
+            "expected a WARN naming exactly store_id as zeroed, got: {logs}"
         );
+        // A zeroed root alone must be DEBUG, not WARN — it is an ordinary pre-first-cycle state,
+        // not a registration bug, and sharing warn-level volume with a real identity fault would
+        // make an operator polling this endpoint unable to tell them apart (the exact security
+        // finding that split these into two levels).
         assert!(
-            logs.contains(r#"zeroed_fields=["root"]"#),
-            "expected a warning naming exactly root as zeroed even though the record is still \
-             returned: {logs}"
+            logs.contains("DEBUG") && logs.contains(r#"zeroed_fields=["root"]"#),
+            "expected a DEBUG line naming exactly root as zeroed, distinct from the WARN level \
+             used for a missing identity field, even though the record is still returned: {logs}"
         );
         assert_eq!(
-            logs.matches("all-zero field").count(),
-            3,
-            "expected exactly one warning per bad registration (3 here: launcher_id, store_id, \
-             root) — no more, no fewer: {logs}"
+            logs.matches("missing an identity field").count(),
+            2,
+            "expected exactly one WARN per identity-missing registration (2 here: launcher_id, \
+             store_id) — the zeroed-root-only case must never count as one: {logs}"
+        );
+        assert_eq!(
+            logs.matches("zeroed root").count(),
+            1,
+            "expected exactly one DEBUG for the zeroed-root-only registration: {logs}"
         );
     }
 
