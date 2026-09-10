@@ -668,14 +668,16 @@ mod tests {
         async fn own_entry(
             &self,
             _launcher_id: Bytes32,
-            payout_puzzle_hash: Bytes32,
+            // Ignored ON PURPOSE (see the NOTE below): this fake always hands back the entry keyed
+            // to `entry_keyed_to`, so the ENGINE's own comparison decides claimable vs. refused.
+            _payout_puzzle_hash: Bytes32,
         ) -> Result<Option<OwnEntry>, ClaimPortError> {
             Ok(Some(OwnEntry {
                 payout_puzzle_hash: self.entry_keyed_to,
                 counter: 0,
                 accrued_base_units: 1_000,
             }))
-            // NOTE: `payout_puzzle_hash` (the argument the engine passed in, this node's own
+            // NOTE: `_payout_puzzle_hash` (the argument the engine passed in, this node's own
             // derivation) is ignored on purpose -- this fake always hands back the entry keyed to
             // `entry_keyed_to`, so the engine's OWN comparison (`entry.payout_puzzle_hash !=
             // self.own_payout_puzzle_hash`) is what decides claimable vs. refused, exactly the
