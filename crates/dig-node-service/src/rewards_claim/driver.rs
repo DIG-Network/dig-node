@@ -41,7 +41,7 @@ use super::config::RewardsClaimConfig;
 use super::engine::ClaimEngine;
 use super::hints::{DistributorHintSource, NoHintSource};
 use super::port::{ClaimChainPort, UnavailableClaimChainPort};
-use super::types::ClaimStatus;
+use super::types::{ClaimLoopState, ClaimStatus};
 
 /// The in-process accessor onto the running claim loop (SCOPE: never exposed over the wire here).
 /// Cheap to clone -- every field is an `Arc`-backed handle onto the same shared state.
@@ -166,7 +166,45 @@ async fn drive<P, H>(
         tokio::time::sleep(Duration::from_secs(interval)).await;
         let t = now();
         engine.run_cycle(t).await;
-        handle.record(engine.status());
+        let status = engine.status();
+        handle.record(status);
+        log_cycle(&status, handle.cycles_driven());
+    }
+}
+
+/// Emit the ONE record that makes a driven cycle observable in a running node.
+///
+/// Without this, the whole status surface has no reader in a shipped binary: [`handle`] is
+/// in-process only and deliberately carries no RPC (deferred to DIG-Network/dig_ecosystem#3249),
+/// so a node whose claim loop can never claim a single reward would produce output IDENTICAL to a
+/// healthy one -- silence. A status nobody can read is a doc claim, not a measurement.
+///
+/// [`ClaimLoopState::Nominal`] is the routine case (`info`). Every other state means this peer is
+/// earning nothing and names why, which on a money surface is a warning, not chatter.
+fn log_cycle(status: &ClaimStatus, cycles_driven: u64) {
+    if status.state == ClaimLoopState::Nominal {
+        tracing::info!(
+            target: "rewards_claim",
+            state = ?status.state,
+            cycles_driven,
+            distributors_known = status.distributors_known,
+            distributors_claimable = status.distributors_claimable,
+            claims_submitted = status.claims_submitted,
+            "claim cycle complete"
+        );
+    } else {
+        tracing::warn!(
+            target: "rewards_claim",
+            state = ?status.state,
+            cycles_driven,
+            distributors_known = status.distributors_known,
+            distributors_claimable = status.distributors_claimable,
+            claims_submitted = status.claims_submitted,
+            concat!(
+                "claim cycle complete but this node is NOT claiming rewards -- see the named ",
+                "state for why"
+            )
+        );
     }
 }
 
@@ -1009,5 +1047,158 @@ mod tests {
         );
 
         driver.abort();
+    }
+
+    // ---- the cycle log: the only reader of the status surface in a shipped binary ----------
+
+    /// An in-memory sink a `tracing_subscriber::fmt` layer renders records into, so a test can
+    /// assert what a running node would actually print (the same pattern `never_log.rs` and
+    /// `server.rs` use for their log assertions).
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture buffer")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn rendered(&self) -> String {
+            String::from_utf8(self.0.lock().expect("the capture buffer").clone())
+                .expect("the rendered lines are utf-8")
+        }
+    }
+
+    /// Install a capturing subscriber for the duration of the returned guard. `set_default` is
+    /// thread-local, and `#[tokio::test]` runs a current-thread runtime, so the driver task
+    /// spawned below is polled on this very thread and its records land in the buffer.
+    fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let buffer = CapturedLogs(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buffer, guard)
+    }
+
+    /// THE ACCEPTANCE BAR: a driven cycle is OBSERVABLE, not merely readable through an
+    /// in-process handle nothing in the shipped binary calls. A healthy cycle says so at `INFO`,
+    /// naming its state and its cycle count.
+    #[tokio::test(start_paused = true)]
+    async fn a_driven_cycle_emits_an_event_naming_its_state() {
+        let cadence = 100u64;
+        let (logs, _guard) = capture_logs();
+        let handle = ClaimLoopHandle::default();
+        let h = handle.clone();
+        let driver = tokio::spawn(async move {
+            drive(
+                empty_engine(),
+                cadence,
+                0,
+                &super::super::cadence::FixedJitter(0),
+                {
+                    let mut t = 0u64;
+                    move || {
+                        t += cadence;
+                        t
+                    }
+                },
+                h,
+            )
+            .await;
+        });
+
+        settle().await;
+        assert_eq!(
+            logs.rendered(),
+            "",
+            "no interval has elapsed, so there is nothing to report yet"
+        );
+
+        tokio::time::advance(Duration::from_secs(cadence)).await;
+        settle().await;
+        driver.abort();
+
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("Nominal"),
+            "the event must NAME the state a reader has to act on; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("cycles_driven=1"),
+            "and the cycle count that distinguishes a running loop from a stalled one; got: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("rewards_claim"),
+            "under the module's own target, so it can be filtered on; got: {rendered}"
+        );
+    }
+
+    /// A cycle that CANNOT claim -- today's real production path, with no chain adapter wired --
+    /// must be a WARNING naming the state, not an `INFO` line that reads like health. This is the
+    /// defect the whole ticket exists to remove: silence covering a permanent inability to earn.
+    #[tokio::test(start_paused = true)]
+    async fn a_cycle_that_cannot_claim_warns_and_names_why() {
+        let cadence = 100u64;
+        let (logs, _guard) = capture_logs();
+        let handle = ClaimLoopHandle::default();
+        let h = handle.clone();
+        let driver = tokio::spawn(async move {
+            drive(
+                ClaimEngine::new(
+                    UnavailableClaimChainPort,
+                    NoHintSource,
+                    Bytes32::from([1u8; 32]),
+                    1,
+                    10,
+                    Bytes32::from([2u8; 32]),
+                ),
+                cadence,
+                0,
+                &super::super::cadence::FixedJitter(0),
+                {
+                    let mut t = 0u64;
+                    move || {
+                        t += cadence;
+                        t
+                    }
+                },
+                h,
+            )
+            .await;
+        });
+
+        settle().await;
+        tokio::time::advance(Duration::from_secs(cadence)).await;
+        settle().await;
+        driver.abort();
+
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("WARN"),
+            "earning nothing is a warning, not routine chatter; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("ChainSourceUnavailable"),
+            "and it must name WHY this node is not claiming; got: {rendered}"
+        );
     }
 }
