@@ -192,6 +192,11 @@ serde_json = "1"
 # method names + the peer allowlist from HERE (never hand-rolled) so the contract
 # cannot drift from the other node implementation or the discovery document (#1075).
 dig-rpc-protocol = "0.11.0"
+# The reward-distributor coin driver (dig_ecosystem#3269 unit 2): the DIG-shaped CHIP-0051 constants,
+# comment/eligibility/entries/epoch/fund/launch/payout shapes and the `DistributorSnapshot` state
+# reader's OWN types. 0.2.0 deliberately ships NO chain reader (`state.rs`'s module doc,
+# DIG-Network/dig_ecosystem#3267) — see `rewards/port.rs` for what that means for this unit's adapter.
+dig-rewards-coin = "0.2"
 # The directed-message base protocol (epic #793/#796): the e2e seal/open pipeline + the typed envelope
 # the chat subsystem seals into. dig-node is the TRANSPORT — it seals an app-supplied opaque DIGCHAT1
 # envelope to the recipient's 0x0010 BLS identity key and dig-gossip directed-sends the sealed bytes.

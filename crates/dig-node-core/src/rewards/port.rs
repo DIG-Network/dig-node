@@ -1,12 +1,45 @@
 //! The chain port — the seam this whole engine is built against instead of `dig-rewards-coin`.
 //!
-//! `dig-rewards-coin` is SPEC-only as of the tag this lane read: `src/lib.rs` is a documented
-//! placeholder and `pub mod distributor {}` is empty. Implementing the driver is
-//! DIG-Network/dig_ecosystem#3249, a sibling lane. So the prover engine is built COMPLETELY against
-//! a narrow trait derived from the SPEC's own described surface (not from the driver's internals,
-//! so it is stable across #3249 landing), tested with an in-memory fake, and the production
-//! adapter — until #3249 ships — reports [`ChainPortError::Unavailable`] and runs no cycles. See
-//! [`unavailable`] for that adapter.
+//! `dig-rewards-coin` was SPEC-only as of the tag this lane first read it: `src/lib.rs` was a
+//! documented placeholder and `pub mod distributor {}` was empty. So the prover engine is built
+//! COMPLETELY against a narrow trait derived from the SPEC's own described surface (not from the
+//! driver's internals, so it is stable across the driver landing), tested with an in-memory fake, and
+//! the production adapter reports [`ChainPortError::Unavailable`] and runs no cycles. See
+//! [`UnavailableChainPort`] for that adapter.
+//!
+//! # dig_ecosystem#3269 unit 2 — the driver shipped, but still with no reader (blocking finding)
+//!
+//! `dig-rewards-coin` 0.2.0 is published and adds real types — `DistributorSnapshot` /
+//! `DistributorSlots` (its `state` module) plus `clawback`, `comment`, `constants`, `eligibility`,
+//! `entries`, `epoch`, `fund`, `launch`, `payout`. **It still ships no chain reader.** 0.2.0's own
+//! `state.rs` module doc says so directly: SPEC §12.1's `read_distributor` "does not publish one,
+//! deliberately" — the implementation that existed applied
+//! `RewardDistributor::from_parent_spend` to the eve coin's spend (the launch inner puzzle) instead
+//! of `from_eve_coin_spend`, so every read reported `Malformed`; the correct hop additionally needs
+//! `reserve_parent_id`/`reserve_lineage_proof` provenance a reader starting from a launcher id cannot
+//! currently discover. That is tracked as real design work at
+//! <https://github.com/DIG-Network/dig_ecosystem/issues/3267> and 0.2.0's own doc states the rule the
+//! future reader must honour: "every `ChainSource` error MUST become `RewardsError::ChainUnavailable`
+//! … a distributor whose read failed MUST NOT render as 'no entries' or 'nothing accrued'".
+//!
+//! Separately, and independent of #3267: **nothing in this codebase today records which distributors
+//! this node funds.** `funded_distributors` (below) needs that identity set as its starting point —
+//! there is no chain-wide "list every distributor and filter to mine" call this crate can make (that
+//! is the CLAIM side's `discover_distributors`, a different trait, a different filter, in
+//! `dig-node-service`'s `rewards_claim::port::ClaimChainPort`) — and no local registry populates it
+//! either (no launch flow, no config, no persisted launcher-id list was found in this crate or in
+//! `dig-node-service`).
+//!
+//! So a "real" `RewardsChainPort` adapter over 0.2.0 cannot honestly answer ANY of the four trait
+//! methods with live chain data yet: `funded_distributors` has no identity source, and
+//! `distributor_state`/`submit_entry_writes`/`spend_new_epoch` all need the withheld reader (a spend
+//! needs the live singleton coin `read_distributor` would supply). Writing one anyway — either by
+//! reimplementing `read_distributor` myself or by inventing a funded-distributor registry with no
+//! writer — would be exactly the kind of restated, unreviewed money-shape work SPEC §0.1 clause 1 and
+//! this crate's own withholding of a broken reader argue against, and is the shape fork this ticket's
+//! kernel invariant 6 says to escalate rather than guess. **Escalated to the L1; see this unit's
+//! RETURN.** [`UnavailableChainPort`] remains the only production adapter for now — still correct,
+//! since every real call would fail for one of the two reasons above regardless.
 
 use super::admission::AdmittedPeer;
 use async_trait::async_trait;

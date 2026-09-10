@@ -3002,6 +3002,7 @@ dependencies = [
  "dig-peer",
  "dig-peer-selector",
  "dig-pex",
+ "dig-rewards-coin",
  "dig-rpc-protocol",
  "dig-sex",
  "dig-social-profile",
@@ -3206,6 +3207,23 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dig-rewards-coin"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d1d998f4ad7966c83ce439a986c07cf0fc7ca7081a22782733145001ad73ded"
+dependencies = [
+ "chia-bls 0.36.1",
+ "chia-consensus 0.36.1",
+ "chia-protocol 0.36.1",
+ "chia-puzzle-types 0.36.1",
+ "chia-sdk-driver 0.36.0",
+ "chia-sdk-types 0.36.0",
+ "dig-constants 0.13.1",
+ "hex",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
