@@ -6413,7 +6413,6 @@ mod tests {
                 mirror_pointers: OnceLock::new(),
                 reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
                 funded_distributors: OnceLock::new(),
-            funded_distributors: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -6493,7 +6492,6 @@ mod tests {
                 mirror_pointers: OnceLock::new(),
                 reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
                 funded_distributors: OnceLock::new(),
-            funded_distributors: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
