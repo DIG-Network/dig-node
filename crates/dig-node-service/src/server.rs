@@ -2204,6 +2204,17 @@ where
     // (a tested unit, #1864) so it cannot be silently flipped to always- or never-spawn.
     crate::self_heal::spawn_driver_if_service();
 
+    // The peer reward-claim loop (DIG-Network/dig_ecosystem#3268, #3251): drives
+    // `rewards_claim::ClaimEngine::run_cycle` on a jittered cadence so
+    // `RewardsClaimConfig::enabled = true` stops being a false statement. Gated the same way the
+    // census and bond-verifier spawns above are -- `enable_chain_sync` already means "this node
+    // talks to the Chia network", and a harness sets it false precisely so nothing dials. The
+    // service-gate lives inside the seam (a tested unit, mirroring `self_heal::spawn_driver_if`)
+    // so it cannot be silently flipped to always- or never-spawn. The only production chain
+    // adapter until DIG-Network/dig_ecosystem#3249 lands is `UnavailableClaimChainPort`, so every
+    // real cycle reports `ChainSourceUnavailable` and submits nothing -- the honest state.
+    crate::rewards_claim::spawn_claim_driver_from_config(config.enable_chain_sync);
+
     // Best-effort wallet mTLS listener (#368, Sage byte-parity, node-class clients, §5.3). Binds
     // loopback only on [`DEFAULT_MTLS_PORT`], which is deliberately NOT Sage's own RPC port
     // (dig-node#260). A bind failure is NON-FATAL — the wallet stays reachable over the plain-HTTP
