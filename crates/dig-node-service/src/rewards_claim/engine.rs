@@ -46,10 +46,22 @@ pub struct ClaimEngine<P, H> {
     /// fresh queue and starve the tail forever.
     rotation_cursor: Option<Bytes32>,
 
-    /// F7: when `Some`, this engine persists [`Self::fee_window_start_unix`],
-    /// [`Self::fee_spent_in_window_mojos`] and [`Self::last_cycle_completed_at`] into
+    /// F7: when `Some`, this engine persists the aggregate-fee-budget window
+    /// (`fee_window_start_unix`, `fee_spent_in_window_mojos`, `last_cycle_completed_at`) into
     /// [`RewardsClaimConfig`] in this directory -- see [`Self::with_persisted_fee_window`]. `None`
     /// keeps the engine purely in-memory, the behaviour every test before F7 relies on.
+    ///
+    /// F18: the three fields above are DELIBERATELY NOT stored on this struct. Every one of them
+    /// is re-read fresh from [`RewardsClaimConfig::load_from`] at the top of every
+    /// [`Self::run_cycle`] regardless (see F16), so caching a copy on `Self` bought nothing and
+    /// cost exactly the class of defect F16 fixed: a value seeded once, at construction or at the
+    /// last successful read, going stale the moment an operator repairs the file underneath it.
+    /// With no field to go stale, there is nothing left to resynchronize -- `run_cycle`'s local
+    /// `CycleConditions` (built fresh from `cfg`, used, and dropped before the function returns)
+    /// is now the ONLY place any of these three values are held in memory, mirroring exactly how
+    /// [`Self::run_cycle`]'s doc already describes `fee_window_poisoned`'s removal: a future
+    /// `self.fee_window_start_unix = ...` outside `run_cycle`/`persist_fee_window` is now an
+    /// `E0609` compile error (no such field), not a convention to remember.
     fee_window_state_dir: Option<PathBuf>,
     /// F7: the cadence length the persisted budget window and the cadence gate are measured
     /// against. Deliberately a constructor argument of [`Self::with_persisted_fee_window`], never
@@ -57,26 +69,6 @@ pub struct ClaimEngine<P, H> {
     /// dependency on the rest of that config, and the caller (which already loaded it) is the one
     /// place that should decide what "the cadence" means.
     cadence_seconds: u64,
-    /// F7: the start (unix seconds) of the current aggregate-fee-budget window -- see
-    /// [`super::config::RewardsClaimConfig::fee_window_start_unix`].
-    ///
-    /// F16: this is a CACHE of the last successfully-read disk value, not the source of truth --
-    /// [`Self::run_cycle`] re-synchronizes it (and the two fields below) from a freshly reloaded
-    /// [`RewardsClaimConfig`] at the top of every cycle whose read is neither corrupt nor
-    /// future-dated, before this cycle's cadence gate or window-roll logic ever reads it. Without
-    /// that resync, a value copied in once by [`Self::with_persisted_fee_window`] -- possibly
-    /// [`super::config::RewardsClaimConfig::poisoned`]'s placeholder if the file was corrupt at
-    /// that moment -- would go stale the instant an operator repairs the file, because nothing
-    /// else on this struct ever overwrote it.
-    fee_window_start_unix: Option<u64>,
-    /// F7: fee mojos already spent inside the current window -- the field that actually bounds a
-    /// crash-restart loop. See [`super::config::RewardsClaimConfig::fee_spent_in_window_mojos`].
-    /// F16: re-synchronized from disk every cycle -- see [`Self::fee_window_start_unix`]'s doc.
-    fee_spent_in_window_mojos: u64,
-    /// F7: when the last cycle that ran to completion finished -- the cadence gate's clock. See
-    /// [`super::config::RewardsClaimConfig::last_cycle_completed_at`].
-    /// F16: re-synchronized from disk every cycle -- see [`Self::fee_window_start_unix`]'s doc.
-    last_cycle_completed_at: Option<u64>,
     // F16: there used to be a `fee_window_poisoned: bool` field here, set `true` by a corrupt
     // load or a future-dated clock and never cleared. That is the THIRD instance of one
     // mechanism -- a per-cycle condition stored as process-lifetime state (pass 3:
@@ -112,9 +104,6 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             rotation_cursor: None,
             fee_window_state_dir: None,
             cadence_seconds: 0,
-            fee_window_start_unix: None,
-            fee_spent_in_window_mojos: 0,
-            last_cycle_completed_at: None,
         }
     }
 
@@ -157,21 +146,16 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// operator fixes or removes between cycles is observed on the VERY NEXT cycle, not only on
     /// the next process restart -- see that method's `CycleConditions`.
     ///
-    /// The three fee-window fields copied in below are only a CONSTRUCTION-TIME seed -- if `dir`
-    /// is corrupt right now, that seed is [`RewardsClaimConfig::poisoned`]'s `None`/`0`/`None`
-    /// placeholders. That is fine only because [`Self::run_cycle`] never trusts this seed once a
-    /// cycle has actually run: every cycle whose fresh read is valid re-synchronizes these same
-    /// fields from THAT read before using them, so a file repaired between construction and the
-    /// first cycle (or between any two cycles) is observed from disk, never from whatever was
-    /// true at construction.
+    /// F18: this no longer seeds `fee_window_start_unix` / `fee_spent_in_window_mojos` /
+    /// `last_cycle_completed_at` from a construction-time read either -- there is nowhere left on
+    /// `Self` to seed them into. [`Self::run_cycle`] reads [`RewardsClaimConfig`] fresh at the top
+    /// of every cycle unconditionally (its `CycleConditions`), so a construction-time copy was
+    /// pure overhead: it was never trusted past the first cycle anyway once F16 landed, and now it
+    /// is never even taken.
     #[must_use]
     pub fn with_persisted_fee_window(mut self, dir: &Path, cadence_seconds: u64) -> Self {
-        let cfg = RewardsClaimConfig::load_from(dir);
         self.fee_window_state_dir = Some(dir.to_path_buf());
         self.cadence_seconds = cadence_seconds.max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
-        self.fee_window_start_unix = cfg.fee_window_start_unix;
-        self.fee_spent_in_window_mojos = cfg.fee_spent_in_window_mojos;
-        self.last_cycle_completed_at = cfg.last_cycle_completed_at;
         self
     }
 
@@ -189,7 +173,12 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// a dropped `rotation_cursor`, exactly the "worse" half of the F8 finding). Refuse instead:
     /// leave the corrupt file exactly as it is on disk and let the NEXT `run_cycle` observe
     /// `corrupt` itself and report [`ClaimLoopState::PersistedStateCorrupt`].
-    fn persist_fee_window(&self) {
+    ///
+    /// F18: `window` is the caller's in-flight view of the three fee-window values -- this engine
+    /// no longer holds them itself (see the `fee_window_state_dir` doc), so every caller (
+    /// [`Self::run_cycle`], [`Self::evaluate_budget_phase`], [`Self::uncommit_fee`]) threads its
+    /// own local [`FeeWindowState`] through instead of reading `self`.
+    fn persist_fee_window(&self, window: &FeeWindowState) {
         let Some(dir) = &self.fee_window_state_dir else {
             return;
         };
@@ -202,9 +191,9 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             );
             return;
         }
-        cfg.fee_window_start_unix = self.fee_window_start_unix;
-        cfg.fee_spent_in_window_mojos = self.fee_spent_in_window_mojos;
-        cfg.last_cycle_completed_at = self.last_cycle_completed_at;
+        cfg.fee_window_start_unix = window.start_unix;
+        cfg.fee_spent_in_window_mojos = window.spent_mojos;
+        cfg.last_cycle_completed_at = window.last_completed_at;
         if let Err(e) = cfg.save_to(dir) {
             tracing::warn!(
                 path = %dir.display(),
@@ -242,6 +231,15 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         self.status.no_entry_slot_this_cycle = 0;
         self.status.last_attempt_at = Some(now);
 
+        // F18: this engine's own view of the persisted fee window for this cycle -- there is no
+        // longer a field on `Self` to hold it across cycles; it lives here, for the lifetime of
+        // this call, and nowhere else. See `fee_window_state_dir`'s doc.
+        let mut window = FeeWindowState {
+            start_unix: None,
+            spent_mojos: 0,
+            last_completed_at: None,
+        };
+
         // F7: the cadence gate and the persisted budget window -- both keyed off
         // `self.fee_window_state_dir`, so a caller that never opted in via
         // `with_persisted_fee_window` sees no change at all (every pre-F7 test).
@@ -257,14 +255,11 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             // `RewardsClaimConfig::load_from`'s doc for why re-reading here is cheap and safe
             // (`persist_fee_window` below already re-reads the same file for the same reason).
             //
-            // F16 (stale-read fix): the fee-window fields carried here come from THIS `cfg` --
-            // the freshly reloaded value -- never from `self`. `self.fee_window_start_unix` /
-            // `self.fee_spent_in_window_mojos` / `self.last_cycle_completed_at` are only a cache
-            // of the last cycle's successful read (see their doc); reading `self` here instead of
-            // `cfg` is exactly the bug this pass fixes -- `with_persisted_fee_window` seeds those
-            // fields ONCE, at construction, so a file that was corrupt then and gets repaired
-            // later would otherwise be judged against construction-time placeholders forever,
-            // never against what is actually on disk now.
+            // F16/F18 (stale-read fix): the fee-window values carried here come from THIS `cfg`
+            // -- the freshly reloaded value -- never from a cached copy on `Self` (there is none
+            // left to read; F18 deleted the fields entirely). `with_persisted_fee_window` no
+            // longer seeds anything at construction either, so a file that was corrupt then and
+            // gets repaired later is judged only against what is actually on disk now.
             struct CycleConditions {
                 corrupt: bool,
                 future_dated_clock: bool,
@@ -289,25 +284,24 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             // must never be treated as a fresh start. Fail CLOSED: submit nothing, report it by
             // name, and -- critically -- return BEFORE the cadence gate and the window-roll logic
             // below, which would otherwise happily manufacture a brand-new zeroed window out of
-            // untrustworthy state. Critically, `self`'s fee-window fields are left UNTOUCHED here
-            // -- absent, corrupt and valid are three different facts, and only a valid read below
-            // is ever copied onto `self`, so a corrupt cycle can never overwrite a still-good
-            // cached value with `poisoned()`'s placeholders.
+            // untrustworthy state. Critically, disk is left UNTOUCHED here -- absent, corrupt and
+            // valid are three different facts, and only a valid read below is ever adopted into
+            // `window`, so a corrupt cycle can never write `poisoned()`'s placeholders over a
+            // still-good persisted value.
             if conditions.corrupt || conditions.future_dated_clock {
                 self.status.state = ClaimLoopState::PersistedStateCorrupt;
                 return Vec::new();
             }
-            // F16: THE fix -- resync `self`'s cache from this cycle's fresh, valid, non-future-
-            // dated read before the cadence gate or the window-roll logic below ever consults it.
-            // A file repaired since `self` was last synced (at construction, or at the last cycle
-            // that read a valid, non-corrupt file) is now observed from DISK, not from whatever
-            // `self` happened to hold going in -- closing both the stale-read defect (a corrupt-
-            // then-cleared file no longer resumes from `poisoned()`'s zeros) and Finding 2b (the
-            // clocks below now come from the same fresh `cfg` the corrupt/future-dated check just
-            // used, not from a separately-stale `self`).
-            self.fee_window_start_unix = conditions.fee_window_start_unix;
-            self.fee_spent_in_window_mojos = conditions.fee_spent_in_window_mojos;
-            self.last_cycle_completed_at = conditions.last_cycle_completed_at;
+            // F16/F18: THE fix -- adopt this cycle's fresh, valid, non-future-dated read into
+            // `window` before the cadence gate or the window-roll logic below ever consults it. A
+            // file repaired since the last cycle that read a valid, non-corrupt file is now
+            // observed from DISK, not from whatever a cache happened to hold going in -- closing
+            // both the stale-read defect (a corrupt-then-cleared file no longer resumes from
+            // `poisoned()`'s zeros) and Finding 2b (the clocks below now come from the same fresh
+            // `cfg` the corrupt/future-dated check just used).
+            window.start_unix = conditions.fee_window_start_unix;
+            window.spent_mojos = conditions.fee_spent_in_window_mojos;
+            window.last_completed_at = conditions.last_cycle_completed_at;
             // Refuse to START a cycle until the cadence has elapsed since the last one that ran
             // to completion -- stops a restart loop from immediately re-running a cycle that
             // already ran, independent of whether the fee window below has room left.
@@ -316,7 +310,7 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             // never read as "healthy and idle" (a stale `state` from whatever cycle last computed
             // one would otherwise stand here forever, since this path never reaches
             // `compute_state` below).
-            if let Some(last_completed) = self.last_cycle_completed_at {
+            if let Some(last_completed) = window.last_completed_at {
                 if now.saturating_sub(last_completed) < self.cadence_seconds {
                     self.status.state = ClaimLoopState::CadenceNotElapsed;
                     return Vec::new();
@@ -325,17 +319,17 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             // The aggregate budget is enforced against this window, never a per-`run_cycle`
             // local: roll a fresh window only once the cadence has elapsed since it opened,
             // otherwise keep accumulating into what is already spent in it.
-            let window_still_open = self
-                .fee_window_start_unix
+            let window_still_open = window
+                .start_unix
                 .is_some_and(|start| now.saturating_sub(start) < self.cadence_seconds);
             if !window_still_open {
-                self.fee_window_start_unix = Some(now);
-                self.fee_spent_in_window_mojos = 0;
-                self.persist_fee_window();
+                window.start_unix = Some(now);
+                window.spent_mojos = 0;
+                self.persist_fee_window(&window);
             }
         }
         let mut spent_this_cycle_mojos = if self.fee_window_state_dir.is_some() {
-            self.fee_spent_in_window_mojos
+            window.spent_mojos
         } else {
             0
         };
@@ -452,7 +446,12 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         let mut first_deferred_this_cycle: Option<Bytes32> = None;
         for claim in &ordered {
             match self
-                .evaluate_budget_phase(claim, &mut spent_this_cycle_mojos, &mut budget_exhausted)
+                .evaluate_budget_phase(
+                    claim,
+                    &mut spent_this_cycle_mojos,
+                    &mut budget_exhausted,
+                    &mut window,
+                )
                 .await
             {
                 BudgetPhaseResult::Fault {
@@ -528,8 +527,8 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         // the cadence gate's protection, not a loophole that lets a fault re-arm an immediate
         // retry.
         if self.fee_window_state_dir.is_some() {
-            self.last_cycle_completed_at = Some(now);
-            self.persist_fee_window();
+            window.last_completed_at = Some(now);
+            self.persist_fee_window(&window);
         }
         // F1: unconditional now -- `compute_state` reads `chain_unavailable_this_cycle` (reset at
         // the top of this function), never `self.state`, so the old "don't overwrite a latch" guard
@@ -663,6 +662,7 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         claim: &EligibleClaim,
         spent_this_cycle_mojos: &mut u64,
         budget_exhausted: &mut bool,
+        window: &mut FeeWindowState,
     ) -> BudgetPhaseResult {
         let launcher_id = claim.launcher_id;
         let fee = match self.port.required_fee_mojos(launcher_id).await {
@@ -717,8 +717,8 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         // the only way to protect against THAT case is to have already written the spend before
         // making the call.
         if self.fee_window_state_dir.is_some() {
-            self.fee_spent_in_window_mojos = self.fee_spent_in_window_mojos.saturating_add(fee);
-            self.persist_fee_window();
+            window.spent_mojos = window.spent_mojos.saturating_add(fee);
+            self.persist_fee_window(window);
         }
 
         match self
@@ -738,11 +738,11 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             // submissions, suppressing a victim's real claims for the rest of the window at zero
             // cost -- reverse the pre-commit now that we know it did not consume a fee.
             Err(ClaimPortError::Unavailable) => {
-                self.uncommit_fee(fee);
+                self.uncommit_fee(fee, window);
                 BudgetPhaseResult::ChainUnavailable
             }
             Err(ClaimPortError::Other(message)) => {
-                self.uncommit_fee(fee);
+                self.uncommit_fee(fee, window);
                 self.status.fault_reported = true;
                 BudgetPhaseResult::Fault {
                     reason: bound_port_error_text(&message),
@@ -756,10 +756,10 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// submission call has DEFINITELY returned without broadcasting -- see that method's "F12"
     /// doc comment for why the pre-commit itself must stay conservative for a genuine crash
     /// mid-call, which never reaches this method at all.
-    fn uncommit_fee(&mut self, fee: u64) {
+    fn uncommit_fee(&mut self, fee: u64, window: &mut FeeWindowState) {
         if self.fee_window_state_dir.is_some() {
-            self.fee_spent_in_window_mojos = self.fee_spent_in_window_mojos.saturating_sub(fee);
-            self.persist_fee_window();
+            window.spent_mojos = window.spent_mojos.saturating_sub(fee);
+            self.persist_fee_window(window);
         }
     }
 }
@@ -768,6 +768,22 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
 struct EligibleClaim {
     launcher_id: Bytes32,
     accrued_base_units: u64,
+}
+
+/// F18: [`ClaimEngine::run_cycle`]'s own, call-scoped view of the three persisted fee-window
+/// values (`fee_window_start_unix`, `fee_spent_in_window_mojos`, `last_cycle_completed_at`).
+/// These used to be cached fields on [`ClaimEngine`] itself; they are not any more (see that
+/// struct's `fee_window_state_dir` doc) -- disk, via [`RewardsClaimConfig`], is the only place
+/// they persist across cycles. This type exists only to thread the in-flight values through one
+/// `run_cycle` call, into [`ClaimEngine::evaluate_budget_phase`] and
+/// [`ClaimEngine::uncommit_fee`], and into [`ClaimEngine::persist_fee_window`]'s write.
+struct FeeWindowState {
+    /// See [`super::config::RewardsClaimConfig::fee_window_start_unix`].
+    start_unix: Option<u64>,
+    /// See [`super::config::RewardsClaimConfig::fee_spent_in_window_mojos`].
+    spent_mojos: u64,
+    /// See [`super::config::RewardsClaimConfig::last_cycle_completed_at`].
+    last_completed_at: Option<u64>,
 }
 
 /// The outcome of [`ClaimEngine::evaluate_pre_budget`].
@@ -2397,9 +2413,19 @@ mod tests {
             launcher_id,
             accrued_base_units: 5_000,
         };
+        let mut window = FeeWindowState {
+            start_unix: None,
+            spent_mojos: 0,
+            last_completed_at: None,
+        };
 
         let result = e
-            .evaluate_budget_phase(&claim, &mut spent_this_cycle_mojos, &mut budget_exhausted)
+            .evaluate_budget_phase(
+                &claim,
+                &mut spent_this_cycle_mojos,
+                &mut budget_exhausted,
+                &mut window,
+            )
             .await;
 
         assert!(
