@@ -812,6 +812,7 @@ impl RpcDispatch for Node {
                                 launcher_id = %hex::encode(s.launcher_id),
                                 store_id = %hex::encode(s.store_id),
                                 root = %hex::encode(s.root),
+                                zeroed_fields = ?zeroed,
                                 "reward-prover status registration has an all-zero field; excluding it from dig.getRewardProverStatus if the zeroed field is an identity field, rather than presenting it as a real distributor"
                             );
                         }
