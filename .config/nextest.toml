@@ -14,3 +14,7 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 3 }
 retries = 2
+# THROWAWAY (Finding 3 revert-check diagnostic, never merged): disable fail-fast so a deliberately
+# reverted enforcement's failure doesn't cancel the rest of the suite before the other four
+# under-test config.rs tests get a chance to run.
+fail-fast = false
