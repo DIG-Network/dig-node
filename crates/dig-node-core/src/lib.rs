@@ -568,6 +568,45 @@ pub struct Node {
     /// announces exactly as it always did, and a verifier that cannot fetch a pointer withholds
     /// credit rather than demoting the holder.
     mirror_pointers: OnceLock<std::sync::Arc<dyn crate::dht::MirrorCoinPointers>>,
+    /// Registry of this node's live reward-prover [`rewards::state::StatusHandle`]s, read by
+    /// `dig.getRewardProverStatus` (dig_ecosystem#3269). Nothing spawns a prover loop yet
+    /// (dig_ecosystem#3265, not landed), so this stays empty and the handler's
+    /// `{"statuses": []}` answer is a REAL, currently-empty read — SPEC §2.4 clause 1's
+    /// "not distributing" render — not a hardcoded stub. The day #3265 registers a handle via
+    /// [`Node::register_reward_prover_status`], the same read starts returning it with no
+    /// dispatch-side change.
+    reward_prover_statuses: Arc<std::sync::RwLock<Vec<rewards::state::StatusHandle>>>,
+}
+
+impl Node {
+    /// Register a live reward-prover status handle (dig_ecosystem#3269/#3265) so
+    /// `dig.getRewardProverStatus` can read it. Additive — registering a second handle for the
+    /// same distributor is the registrar's mistake to avoid, not this method's to dedupe.
+    ///
+    /// Only called from tests today: #3265 (the always-on prover loop that would call this from
+    /// production bring-up) has not landed, so clippy's non-test lib target sees no production
+    /// caller yet. `allow(dead_code)` here is a stand-in for that missing caller, not a claim the
+    /// registry itself is unused — remove this attribute the moment #3265 lands and wires a real
+    /// call site.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn register_reward_prover_status(&self, handle: rewards::state::StatusHandle) {
+        self.reward_prover_statuses
+            .write()
+            .expect("reward prover status registry lock poisoned")
+            .push(handle);
+    }
+
+    /// Snapshot every registered reward-prover status, in registration order. Empty when nothing
+    /// has registered — a REAL read of a real (currently empty) registry, see the field doc on
+    /// `reward_prover_statuses`.
+    pub(crate) fn reward_prover_status_snapshots(&self) -> Vec<rewards::state::RewardProverStatus> {
+        self.reward_prover_statuses
+            .read()
+            .expect("reward prover status registry lock poisoned")
+            .iter()
+            .map(rewards::state::StatusHandle::snapshot)
+            .collect()
+    }
 }
 
 /// A boxed async hook that reconciles the node's DHT provider records with its current cache
@@ -4815,6 +4854,7 @@ impl Node {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
         })
     }
 
@@ -5154,6 +5194,7 @@ pub(crate) mod test_support {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
         };
         (Arc::new(node), td)
     }
@@ -5949,6 +5990,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
         };
         (node, td)
     }
@@ -6083,6 +6125,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
         };
 
         // Missing before the pull.
@@ -6151,6 +6194,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -6250,6 +6294,7 @@ mod tests {
                 inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
                 mirror_pointers: OnceLock::new(),
+                reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -6327,6 +6372,7 @@ mod tests {
                 inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
                 mirror_pointers: OnceLock::new(),
+                reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -8995,6 +9041,414 @@ mod tests {
         }
     }
 
+    // -- dig.getRewardProverStatus (dig_ecosystem#3269, dig-rewards-coin SPEC.md §2.3/§2.4) -----
+
+    /// A populated SPEC §2.3 status record with every field a distinct, checkable value —
+    /// distinguishes a mapping bug (e.g. two fields swapped, or a widening dropped) from an
+    /// accidental match against a zeroed/default record.
+    fn sample_reward_prover_status(
+        launcher_id: [u8; 32],
+    ) -> crate::rewards::state::RewardProverStatus {
+        crate::rewards::state::RewardProverStatus {
+            launcher_id,
+            store_id: [0x22u8; 32],
+            root: [0x33u8; 32],
+            prover_state: crate::rewards::state::ProverState::ChainSourceUnavailable,
+            prover_state_since: 1_000,
+            last_cycle_started_at: Some(1_100),
+            last_cycle_completed_at: Some(1_200),
+            next_cycle_due_at: Some(1_300),
+            last_entry_write_at: Some(1_400),
+            consecutive_cycle_failures: 3,
+            pending_entry_writes: 5,
+            observed_at: 1_500,
+            counters: crate::rewards::state::ProverCounters {
+                mirrors_seen: 11,
+                challenges_issued: 22,
+                challenges_passed: 33,
+                challenges_failed: 44,
+                entries_added: 55,
+                entries_removed: 66,
+                // Deliberately in the upper half of `u32`'s range (> 2^31) — the internal field IS
+                // `u32`, so this cannot exceed `u32::MAX` (that would not compile), but a value
+                // this large would not survive a mistaken re-narrowing (e.g. an accidental
+                // `as u32 as u64` round-trip through a signed/other-width type) intact, unlike a
+                // small value that would pass such a bug undetected.
+                entry_count: 3_000_000_000,
+                reserve_base_units: 77,
+                total_paid_out_base_units: 88,
+            },
+        }
+    }
+
+    /// **Proves:** `dig.getRewardProverStatus` answers through the REAL dispatch entry point
+    /// (`handle_rpc` → `RpcDispatch::dispatch` → the `Method::GetRewardProverStatus` arm) with a
+    /// registered handle's values, asserted field-for-field on the SERIALIZED JSON body (snake_case
+    /// wire keys, camelCase `prover_state` enum value) — not a Rust struct, so a serde rename or a
+    /// dropped field would be caught. Also asserts the wire body's key set carries none of
+    /// `alive`/`healthy`/`ok`/`up`/`running` and no staleness field, by KEY SET rather than
+    /// substring (a substring check would pass under the defect it exists to catch).
+    /// **Catches:** a field swap, a dropped `entry_count` widening, a reintroduced health boolean.
+    #[test]
+    fn get_reward_prover_status_answers_a_real_request_with_real_values() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x11u8; 32];
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status(launcher_id),
+        ));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        let statuses = resp["result"]["statuses"]
+            .as_array()
+            .expect("result.statuses is an array");
+        assert_eq!(statuses.len(), 1, "one registered handle: {resp}");
+        let s = &statuses[0];
+
+        assert_eq!(s["launcher_id"], json!(hex::encode(launcher_id)));
+        assert_eq!(s["store_id"], json!(hex::encode([0x22u8; 32])));
+        assert_eq!(s["root"], json!(hex::encode([0x33u8; 32])));
+        // camelCase VALUE for the enum, on an otherwise snake_case-keyed wire struct (confirmed at
+        // v0.11.0: only `ProverState` carries `rename_all = "camelCase"`).
+        assert_eq!(s["prover_state"], json!("chainSourceUnavailable"));
+        assert_eq!(s["prover_state_since"], json!(1_000));
+        assert_eq!(s["last_cycle_started_at"], json!(1_100));
+        assert_eq!(s["last_cycle_completed_at"], json!(1_200));
+        assert_eq!(s["next_cycle_due_at"], json!(1_300));
+        assert_eq!(s["last_entry_write_at"], json!(1_400));
+        assert_eq!(s["consecutive_cycle_failures"], json!(3));
+        assert_eq!(s["pending_entry_writes"], json!(5));
+        assert_eq!(s["observed_at"], json!(1_500));
+
+        let counters = &s["counters"];
+        assert_eq!(counters["mirrors_seen"], json!(11));
+        assert_eq!(counters["challenges_issued"], json!(22));
+        assert_eq!(counters["challenges_passed"], json!(33));
+        assert_eq!(counters["challenges_failed"], json!(44));
+        assert_eq!(counters["entries_added"], json!(55));
+        assert_eq!(counters["entries_removed"], json!(66));
+        // The value proving the widening ran: > u32::MAX, so a truncating cast would not equal this.
+        assert_eq!(counters["entry_count"], json!(3_000_000_000u64));
+        assert_eq!(counters["reserve_base_units"], json!(77));
+        assert_eq!(counters["total_paid_out_base_units"], json!(88));
+
+        // No health boolean, no precomputed staleness (SPEC §2.4) — by KEY SET, not substring.
+        let keys: std::collections::BTreeSet<&str> = s
+            .as_object()
+            .expect("status is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for banned in [
+            "alive",
+            "healthy",
+            "ok",
+            "up",
+            "running",
+            "stale",
+            "seconds_since_last_run",
+        ] {
+            assert!(
+                !keys.contains(banned),
+                "banned key {banned:?} present: {keys:?}"
+            );
+        }
+    }
+
+    /// **Proves:** with nothing registered, `dig.getRewardProverStatus` answers
+    /// `{"statuses": []}` — SPEC §2.4 clause 1's "not distributing" render — never blank, `null`,
+    /// or an omitted `result`. **Catches:** an absent-record case that renders as nothing rather
+    /// than an explicit empty list a UI can render deterministically.
+    #[test]
+    fn get_reward_prover_status_with_no_registered_handle_is_explicit_empty() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            resp["result"],
+            json!({"statuses": []}),
+            "explicit empty list: {resp}"
+        );
+    }
+
+    /// **Proves:** a zeroed `launcher_id` OR `store_id` — what an uninitialised/never-assigned
+    /// registry slot hex-encodes to — is never rendered as a real distributor with a
+    /// plausible-looking id, AND that dropping it is never silent: a `tracing::warn!` fires
+    /// naming the SPECIFIC zeroed field(s), so a registration bug is observable rather than
+    /// swallowed. This is the money-hole class the `dig-rewards-coin` driver's adversarial gates
+    /// found three times (an unset field that reads fine and costs the operator), plus the SPEC
+    /// §2.4 clause 1 defect a security + adversarial gate found in the first version of this
+    /// filter: an all-zero-`launcher_id`-only check that silently destroyed the evidence of a bad
+    /// registration, and never checked `store_id` at all.
+    ///
+    /// Distinguishes IDENTITY fields (`launcher_id`, `store_id` — a record missing either cannot
+    /// be attributed to any distributor, so it is EXCLUDED and logged at `WARN`) from the
+    /// OBSERVATION field (`root` — legitimately zero before a prover's first cycle, so it is
+    /// logged at `DEBUG`, never `WARN`, and never causes exclusion on its own; see the third case
+    /// below). The level split matters, not just the exclusion split: security measured that an
+    /// undifferentiated `warn!` for both cases turns steady-state log volume into (uncycled
+    /// provers) x (poll rate) lines an operator cannot distinguish from a real registration bug.
+    ///
+    /// **Catches:** (1) a boundary that lets an uninitialised slot answer as if it were a real
+    /// distributor; (2) a filter that only checks `launcher_id`, missing a registration bug that
+    /// zeroes `store_id` beside an otherwise-valid `launcher_id` (the exact gap security named);
+    /// (3) a fix that goes back to dropping the bad record with no log line at all; (4) a fix
+    /// that over-corrects by excluding on a zeroed `root` too, which would make a healthy,
+    /// just-not-yet-cycled prover invisible; (5) a fix that returns the zeroed-root record but logs
+    /// it at the SAME level (`warn!`) as a real identity fault, defeating the operator's ability to
+    /// tell the two apart; (6) a log assertion that only checks the field NAME `launcher_id`
+    /// appears somewhere in the log line — true unconditionally, since the log always includes
+    /// `launcher_id = %hex::encode(...)` as a structured field regardless of which field was
+    /// actually zero — rather than checking the `zeroed_fields=[...]` value AND the level.
+    #[test]
+    fn get_reward_prover_status_logs_and_excludes_a_zeroed_identity_field() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+
+        // Case 1: launcher_id itself is zeroed (the original, narrower gap).
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status([0u8; 32]),
+        ));
+
+        // Case 2: launcher_id is VALID, but store_id is zeroed — the gap security named, which
+        // the launcher_id-only filter would have let straight through as a plausible record.
+        let valid_but_zeroed_store = [0xccu8; 32];
+        let mut zeroed_store_status = sample_reward_prover_status(valid_but_zeroed_store);
+        zeroed_store_status.store_id = [0u8; 32];
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            zeroed_store_status,
+        ));
+
+        // Case 3: launcher_id AND store_id are both valid, but root is zeroed — a plausible
+        // "registered, not yet cycled" prover. Must still be RETURNED (root is not an identity
+        // field), and a DEBUG (never WARN) still fires naming `root` so the state stays
+        // observable without polluting warn-level volume with an ordinary, expected state.
+        let valid_but_zeroed_root = [0xbbu8; 32];
+        let mut zeroed_root_status = sample_reward_prover_status(valid_but_zeroed_root);
+        zeroed_root_status.root = [0u8; 32];
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            zeroed_root_status,
+        ));
+
+        // A real, fully-valid entry alongside all three, to prove the guard is selective, not a
+        // by-product of the registry being otherwise empty.
+        let real_id = [0xaau8; 32];
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status(real_id),
+        ));
+
+        let (resp, logs) = rt.block_on(capture_sync_logs(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )));
+
+        let statuses = resp["result"]["statuses"]
+            .as_array()
+            .expect("result.statuses is an array");
+        assert_eq!(
+            statuses.len(),
+            2,
+            "the fully-valid entry AND the zeroed-root-only entry are both returned; only the \
+             zeroed-launcher_id and zeroed-store_id entries are excluded: {resp}"
+        );
+        let returned_ids: std::collections::BTreeSet<String> = statuses
+            .iter()
+            .map(|s| s["launcher_id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(returned_ids.contains(&hex::encode(real_id)));
+        assert!(returned_ids.contains(&hex::encode(valid_but_zeroed_root)));
+
+        // The observable signal: a warning naming the SPECIFIC zeroed field(s), for EACH bad
+        // registration — asserted on the actual `zeroed_fields=[...]` value, not merely on the
+        // field NAME `launcher_id` appearing somewhere (that would pass even for the store_id or
+        // root cases, since the warn always logs `launcher_id = ...` as a structured field
+        // regardless of which field was actually zero — the exact tautology a correctness gate
+        // found in an earlier version of this assertion).
+        assert!(
+            logs.contains("WARN") && logs.contains(r#"zeroed_fields=["launcher_id"]"#),
+            "expected a WARN naming exactly launcher_id as zeroed, got: {logs}"
+        );
+        assert!(
+            logs.contains("WARN") && logs.contains(r#"zeroed_fields=["store_id"]"#),
+            "expected a WARN naming exactly store_id as zeroed, got: {logs}"
+        );
+        // A zeroed root alone must be DEBUG, not WARN — it is an ordinary pre-first-cycle state,
+        // not a registration bug, and sharing warn-level volume with a real identity fault would
+        // make an operator polling this endpoint unable to tell them apart (the exact security
+        // finding that split these into two levels).
+        assert!(
+            logs.contains("DEBUG") && logs.contains(r#"zeroed_fields=["root"]"#),
+            "expected a DEBUG line naming exactly root as zeroed, distinct from the WARN level \
+             used for a missing identity field, even though the record is still returned: {logs}"
+        );
+        assert_eq!(
+            logs.matches("missing an identity field").count(),
+            2,
+            "expected exactly one WARN per identity-missing registration (2 here: launcher_id, \
+             store_id) — the zeroed-root-only case must never count as one: {logs}"
+        );
+        assert_eq!(
+            logs.matches("zeroed root").count(),
+            1,
+            "expected exactly one DEBUG for the zeroed-root-only registration: {logs}"
+        );
+    }
+
+    /// **Proves:** `dig.getRewardProverStatus` is NOT peer-reachable (CONTROL plane — loopback
+    /// admin / in-process FFI only), matching `reward_methods_tier_guard.rs`'s enumeration-based
+    /// guard with a direct, single-method assertion.
+    /// **Catches:** the method being accidentally allowlisted for the mTLS peer surface.
+    #[test]
+    fn get_reward_prover_status_is_not_peer_reachable() {
+        assert!(!peer::is_peer_reachable_method("dig.getRewardProverStatus"));
+    }
+
+    /// **Proves:** `dig.getRewardProverStatus` goes through the `Method` enum match (`Tier::Control`
+    /// per dig-rpc-protocol 0.11), not the string pre-match ahead of it — calling it over the SAME
+    /// dispatch entry point with no special-casing still resolves to the handler, so a future
+    /// refactor that moved it back to the pre-match string block would be the only way to break
+    /// this test's premise, not silently bypass the tier guard.
+    /// **Catches:** a reintroduction of the method into the pre-`Method::from_name` string match.
+    #[test]
+    fn get_reward_prover_status_is_served_via_the_method_enum_not_the_string_prematch() {
+        use dig_rpc_protocol::Method;
+        assert_eq!(
+            Method::from_name("dig.getRewardProverStatus"),
+            Some(Method::GetRewardProverStatus)
+        );
+        assert_eq!(
+            Method::GetRewardProverStatus.tier(),
+            dig_rpc_protocol::Tier::Control
+        );
+    }
+
+    /// **Proves:** `dig.getRewardProverStatus` restricts to the requested `launcher_id` when the
+    /// caller supplies one, and returns every registered status when it does not.
+    /// **Catches:** a filter that ignores the param, or one that requires it.
+    #[test]
+    fn get_reward_prover_status_filters_by_launcher_id_when_given() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        let a = [0xaau8; 32];
+        let b = [0xbbu8; 32];
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status(a),
+        ));
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status(b),
+        ));
+
+        let filtered = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus",
+                   "params":{"launcher_id": hex::encode(a)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let filtered = filtered["result"]["statuses"].as_array().unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["launcher_id"], json!(hex::encode(a)));
+
+        let all = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.getRewardProverStatus"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert_eq!(all["result"]["statuses"].as_array().unwrap().len(), 2);
+    }
+
+    /// **Proves:** `total_paid_out_base_units`/`reserve_base_units` stay attributed to the
+    /// `launcher_id` (distributor) that reported them — never summed across distributors, never
+    /// cross-attributed to the other one. **Catches:** the class of defect a sibling adversarial
+    /// gate found in dig-app#403's rewards pane (dig_ecosystem#3269): a per-distributor total
+    /// rendered/returned as if it were a single subject's (there, one mirror operator's personal
+    /// earnings), overstating by however many other mirrors that distributor pays. Proving the
+    /// VALUE survives the wire hop (`get_reward_prover_status_answers_a_real_request_with_real_values`)
+    /// does not prove whose money it describes — this test does, with two distributors carrying
+    /// deliberately different, distinguishable totals.
+    #[test]
+    fn get_reward_prover_status_attributes_payout_figures_to_their_own_distributor() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        let distributor_a = [0xaau8; 32];
+        let distributor_b = [0xbbu8; 32];
+
+        let mut status_a = sample_reward_prover_status(distributor_a);
+        status_a.counters.reserve_base_units = 10_000;
+        status_a.counters.total_paid_out_base_units = 999_000;
+
+        let mut status_b = sample_reward_prover_status(distributor_b);
+        status_b.counters.reserve_base_units = 42;
+        status_b.counters.total_paid_out_base_units = 7;
+
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(status_a));
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(status_b));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let statuses = resp["result"]["statuses"].as_array().unwrap();
+        assert_eq!(statuses.len(), 2);
+
+        let find = |launcher_id: [u8; 32]| {
+            statuses
+                .iter()
+                .find(|s| s["launcher_id"] == json!(hex::encode(launcher_id)))
+                .unwrap_or_else(|| panic!("no status for launcher_id {}", hex::encode(launcher_id)))
+        };
+        let a = find(distributor_a);
+        let b = find(distributor_b);
+
+        // Each distributor's own figures, untouched.
+        assert_eq!(a["counters"]["reserve_base_units"], json!(10_000));
+        assert_eq!(a["counters"]["total_paid_out_base_units"], json!(999_000));
+        assert_eq!(b["counters"]["reserve_base_units"], json!(42));
+        assert_eq!(b["counters"]["total_paid_out_base_units"], json!(7));
+
+        // Never summed across distributors (999_000 + 7) and never cross-attributed (swapped).
+        let combined = 999_000 + 7;
+        assert_ne!(a["counters"]["total_paid_out_base_units"], json!(combined));
+        assert_ne!(b["counters"]["total_paid_out_base_units"], json!(combined));
+        assert_ne!(
+            a["counters"]["total_paid_out_base_units"],
+            b["counters"]["total_paid_out_base_units"]
+        );
+    }
+
     /// **Proves:** `gap_fill_generation` is a cheap no-op when the generation is already held (no
     /// network, `Ok(())`). **Catches:** a gap-fill that re-pulls an already-held generation.
     #[tokio::test]
@@ -9399,6 +9853,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
         };
 
         let before = handle_rpc(
@@ -16554,6 +17009,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             ..node
         };
         // A holder for this EXACT content is known via the DHT.
@@ -16605,6 +17061,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             ..node
         };
         // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
@@ -16655,6 +17112,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             ..node
         };
 
@@ -16687,6 +17145,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -16728,6 +17187,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -16771,6 +17231,7 @@ mod tests {
             inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
+            reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
