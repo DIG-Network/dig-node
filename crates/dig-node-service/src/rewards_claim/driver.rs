@@ -226,7 +226,11 @@ impl JitterSource for OsJitter {
         if rng.fill(&mut buf).is_err() {
             return 0;
         }
-        u64::from_le_bytes(buf) % (bound + 1)
+        // `bound.saturating_add(1)` rather than `bound + 1`: `jitter_seconds` comes from the
+        // persisted config unclamped, so `u64::MAX` reaches here and `+ 1` would overflow-panic
+        // inside the detached driver task -- killing the claim loop silently for the process
+        // lifetime. Saturating keeps the draw in `0..=bound` for every input.
+        u64::from_le_bytes(buf) % bound.saturating_add(1)
     }
 }
 
@@ -1199,6 +1203,19 @@ mod tests {
         assert!(
             rendered.contains("ChainSourceUnavailable"),
             "and it must name WHY this node is not claiming; got: {rendered}"
+        );
+    }
+
+    /// `jitter_seconds` is read from the persisted config WITHOUT a clamp, so the maximum `u64`
+    /// reaches `OsJitter`. An overflowing `bound + 1` there panics the detached driver task,
+    /// which never restarts -- the claim loop would die silently for the process lifetime.
+    #[test]
+    fn an_unclamped_max_jitter_bound_does_not_panic_the_driver() {
+        let bound = std::hint::black_box(u64::MAX);
+        let offset = OsJitter.jitter_seconds(bound);
+        assert!(
+            offset <= bound,
+            "the draw must stay within 0..=bound; got {offset}"
         );
     }
 }
