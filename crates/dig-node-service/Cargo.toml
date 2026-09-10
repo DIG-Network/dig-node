@@ -116,6 +116,12 @@ dig-mirror-coin = "0.9"
 # a dissenting THIRD source and did not distinguish source CLASSES from bare source strings.
 dig-stun = "0.2"
 
+# The claim loop's cadence jitter (DIG-Network/dig_ecosystem#3268, SPEC §8.6) draws from the OS
+# CSPRNG, never a global/thread RNG -- `ring::rand::SystemRandom` is the same primitive this
+# crate's own signing paths already use for randomness (`seams::dig_peer::holdings`, in
+# `dig-node-core`), so this is not a second RNG choice entering the tree.
+ring = "0.17"
+
 # The canonical `ChainSource` trait `dig-mirror-coin`'s census is generic over. Declared, not
 # implemented: `chia-query` already provides the implementation this node uses
 # (`ChiaQueryProvider`), reached through `dig-wallet`'s one shared chain transport. Caret-matched

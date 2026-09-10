@@ -3079,6 +3079,7 @@ dependencies = [
  "notify",
  "num-bigint",
  "reqwest",
+ "ring",
  "rpassword",
  "rustls",
  "serde",
