@@ -59,12 +59,23 @@ pub struct ClaimEngine<P, H> {
     cadence_seconds: u64,
     /// F7: the start (unix seconds) of the current aggregate-fee-budget window -- see
     /// [`super::config::RewardsClaimConfig::fee_window_start_unix`].
+    ///
+    /// F16: this is a CACHE of the last successfully-read disk value, not the source of truth --
+    /// [`Self::run_cycle`] re-synchronizes it (and the two fields below) from a freshly reloaded
+    /// [`RewardsClaimConfig`] at the top of every cycle whose read is neither corrupt nor
+    /// future-dated, before this cycle's cadence gate or window-roll logic ever reads it. Without
+    /// that resync, a value copied in once by [`Self::with_persisted_fee_window`] -- possibly
+    /// [`super::config::RewardsClaimConfig::poisoned`]'s placeholder if the file was corrupt at
+    /// that moment -- would go stale the instant an operator repairs the file, because nothing
+    /// else on this struct ever overwrote it.
     fee_window_start_unix: Option<u64>,
     /// F7: fee mojos already spent inside the current window -- the field that actually bounds a
     /// crash-restart loop. See [`super::config::RewardsClaimConfig::fee_spent_in_window_mojos`].
+    /// F16: re-synchronized from disk every cycle -- see [`Self::fee_window_start_unix`]'s doc.
     fee_spent_in_window_mojos: u64,
     /// F7: when the last cycle that ran to completion finished -- the cadence gate's clock. See
     /// [`super::config::RewardsClaimConfig::last_cycle_completed_at`].
+    /// F16: re-synchronized from disk every cycle -- see [`Self::fee_window_start_unix`]'s doc.
     last_cycle_completed_at: Option<u64>,
     // F16: there used to be a `fee_window_poisoned: bool` field here, set `true` by a corrupt
     // load or a future-dated clock and never cleared. That is the THIRD instance of one
@@ -145,6 +156,14 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// [`RewardsClaimConfig::load_from`] fresh at the top of every cycle instead, so a file an
     /// operator fixes or removes between cycles is observed on the VERY NEXT cycle, not only on
     /// the next process restart -- see that method's `CycleConditions`.
+    ///
+    /// The three fee-window fields copied in below are only a CONSTRUCTION-TIME seed -- if `dir`
+    /// is corrupt right now, that seed is [`RewardsClaimConfig::poisoned`]'s `None`/`0`/`None`
+    /// placeholders. That is fine only because [`Self::run_cycle`] never trusts this seed once a
+    /// cycle has actually run: every cycle whose fresh read is valid re-synchronizes these same
+    /// fields from THAT read before using them, so a file repaired between construction and the
+    /// first cycle (or between any two cycles) is observed from disk, never from whatever was
+    /// true at construction.
     #[must_use]
     pub fn with_persisted_fee_window(mut self, dir: &Path, cadence_seconds: u64) -> Self {
         let cfg = RewardsClaimConfig::load_from(dir);
@@ -237,16 +256,31 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             // observed on the VERY NEXT cycle rather than only after a process restart -- see
             // `RewardsClaimConfig::load_from`'s doc for why re-reading here is cheap and safe
             // (`persist_fee_window` below already re-reads the same file for the same reason).
+            //
+            // F16 (stale-read fix): the fee-window fields carried here come from THIS `cfg` --
+            // the freshly reloaded value -- never from `self`. `self.fee_window_start_unix` /
+            // `self.fee_spent_in_window_mojos` / `self.last_cycle_completed_at` are only a cache
+            // of the last cycle's successful read (see their doc); reading `self` here instead of
+            // `cfg` is exactly the bug this pass fixes -- `with_persisted_fee_window` seeds those
+            // fields ONCE, at construction, so a file that was corrupt then and gets repaired
+            // later would otherwise be judged against construction-time placeholders forever,
+            // never against what is actually on disk now.
             struct CycleConditions {
                 corrupt: bool,
                 future_dated_clock: bool,
+                fee_window_start_unix: Option<u64>,
+                fee_spent_in_window_mojos: u64,
+                last_cycle_completed_at: Option<u64>,
             }
             let conditions = {
                 let cfg = RewardsClaimConfig::load_from(&dir);
                 CycleConditions {
                     corrupt: cfg.corrupt,
-                    future_dated_clock: self.last_cycle_completed_at.is_some_and(|t| t > now)
-                        || self.fee_window_start_unix.is_some_and(|t| t > now),
+                    future_dated_clock: cfg.last_cycle_completed_at.is_some_and(|t| t > now)
+                        || cfg.fee_window_start_unix.is_some_and(|t| t > now),
+                    fee_window_start_unix: cfg.fee_window_start_unix,
+                    fee_spent_in_window_mojos: cfg.fee_spent_in_window_mojos,
+                    last_cycle_completed_at: cfg.last_cycle_completed_at,
                 }
             };
             // F8/F10: a corrupt persisted file, or either persisted clock reading AFTER `now` (a
@@ -255,11 +289,25 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             // must never be treated as a fresh start. Fail CLOSED: submit nothing, report it by
             // name, and -- critically -- return BEFORE the cadence gate and the window-roll logic
             // below, which would otherwise happily manufacture a brand-new zeroed window out of
-            // untrustworthy state.
+            // untrustworthy state. Critically, `self`'s fee-window fields are left UNTOUCHED here
+            // -- absent, corrupt and valid are three different facts, and only a valid read below
+            // is ever copied onto `self`, so a corrupt cycle can never overwrite a still-good
+            // cached value with `poisoned()`'s placeholders.
             if conditions.corrupt || conditions.future_dated_clock {
                 self.status.state = ClaimLoopState::PersistedStateCorrupt;
                 return Vec::new();
             }
+            // F16: THE fix -- resync `self`'s cache from this cycle's fresh, valid, non-future-
+            // dated read before the cadence gate or the window-roll logic below ever consults it.
+            // A file repaired since `self` was last synced (at construction, or at the last cycle
+            // that read a valid, non-corrupt file) is now observed from DISK, not from whatever
+            // `self` happened to hold going in -- closing both the stale-read defect (a corrupt-
+            // then-cleared file no longer resumes from `poisoned()`'s zeros) and Finding 2b (the
+            // clocks below now come from the same fresh `cfg` the corrupt/future-dated check just
+            // used, not from a separately-stale `self`).
+            self.fee_window_start_unix = conditions.fee_window_start_unix;
+            self.fee_spent_in_window_mojos = conditions.fee_spent_in_window_mojos;
+            self.last_cycle_completed_at = conditions.last_cycle_completed_at;
             // Refuse to START a cycle until the cadence has elapsed since the last one that ran
             // to completion -- stops a restart loop from immediately re-running a cycle that
             // already ran, independent of whether the fee window below has room left.
