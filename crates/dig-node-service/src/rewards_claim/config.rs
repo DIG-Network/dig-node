@@ -213,7 +213,7 @@ impl RewardsClaimConfig {
         let path = dir.join(REWARDS_CLAIM_CONFIG_FILE);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::poisoned(),
             Err(e) => {
                 tracing::error!(
                     path = %path.display(),
@@ -229,28 +229,9 @@ impl RewardsClaimConfig {
                 // F10 (§8.6 floor): an operator-supplied cadence below the floor is clamped, not
                 // corrupt -- see `CLAIM_CADENCE_FLOOR_SECONDS`'s doc for why this is the one F7
                 // field that is safe to correct upward rather than fail closed over.
-                if cfg.cadence_seconds < CLAIM_CADENCE_FLOOR_SECONDS {
-                    tracing::warn!(
-                        path = %path.display(),
-                        cadence_seconds = cfg.cadence_seconds,
-                        floor = CLAIM_CADENCE_FLOOR_SECONDS,
-                        "rewards-claim cadence_seconds below the §8.6 floor; clamping up"
-                    );
-                    cfg.cadence_seconds = CLAIM_CADENCE_FLOOR_SECONDS;
-                }
-                // F14: a persisted spend exceeding the budget it is measured against is not a big
-                // number to clamp down -- clamping would hand back exactly the budget the
-                // corruption was hiding. It is corrupt state: fail closed instead.
-                if cfg.fee_spent_in_window_mojos > cfg.max_cycle_fee_budget_mojos {
-                    tracing::error!(
-                        path = %path.display(),
-                        spent = cfg.fee_spent_in_window_mojos,
-                        budget = cfg.max_cycle_fee_budget_mojos,
-                        "persisted rewards-claim spend exceeds its own budget; failing closed, \
-                         not clamping"
-                    );
-                    return Self::poisoned();
-                }
+                // THROWAWAY REVERT-CHECK (Finding 3): both enforcement blocks removed to prove
+                // `a_cadence_below_the_floor_is_clamped_up_on_load` and
+                // `a_spend_exceeding_its_own_budget_fails_closed` are not vacuous. Never merged.
                 cfg
             }
             Err(e) => {
@@ -260,7 +241,9 @@ impl RewardsClaimConfig {
                     "the rewards-claim preference file could not be parsed; failing closed, not \
                      using defaults"
                 );
-                Self::poisoned()
+                // THROWAWAY REVERT-CHECK (Finding 3): fail-open instead of `Self::poisoned()`, to
+                // prove `a_corrupt_file_fails_closed_not_default` is not vacuous. Never merged.
+                Self::default()
             }
         }
     }
