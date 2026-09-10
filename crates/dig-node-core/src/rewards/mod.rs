@@ -41,6 +41,7 @@
 pub mod admission;
 pub mod challenge;
 pub mod cycle;
+pub mod funded;
 pub mod gate;
 pub mod port;
 pub mod spec_constants;

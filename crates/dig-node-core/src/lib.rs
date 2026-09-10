@@ -576,6 +576,20 @@ pub struct Node {
     /// [`Node::register_reward_prover_status`], the same read starts returning it with no
     /// dispatch-side change.
     reward_prover_statuses: Arc<std::sync::RwLock<Vec<rewards::state::StatusHandle>>>,
+    /// This node's durable record of WHICH reward distributors it funds
+    /// (dig_ecosystem#3285) — identity only, never an amount; see
+    /// [`rewards::funded`]'s module doc.
+    ///
+    /// A slot rather than a constructor argument for the same reason [`Node::mirror_pointers`] is
+    /// one: the FFI/browser path has no state directory and must keep constructing a `Node`
+    /// without one. Nothing installs it in production yet — nothing in dig-node funds a
+    /// distributor today (`rewards::port`'s module doc, blocker 2), and the startup wiring that
+    /// would call [`Node::install_funded_distributor_registry`] with the node's state directory
+    /// belongs to dig_ecosystem#3268. Until then the slot stays empty, and
+    /// [`Node::funded_distributors_read`] answers
+    /// [`rewards::funded::NotConfiguredReason::NoStateDirectory`] — UNKNOWN, deliberately never an
+    /// empty funded set.
+    funded_distributors: OnceLock<rewards::funded::FundedDistributorRegistry>,
 }
 
 impl Node {
@@ -606,6 +620,47 @@ impl Node {
             .iter()
             .map(rewards::state::StatusHandle::snapshot)
             .collect()
+    }
+
+    /// Install this node's funder-ownership registry (dig_ecosystem#3285), once. Returns `false`
+    /// if a registry is already installed, in which case NOTHING changed — a second install must
+    /// not be able to swap a live registry for an inert one behind a caller's back.
+    ///
+    /// Called from tests today: the startup path that would install a real one lives in
+    /// dig_ecosystem#3268's files, so clippy's non-test lib target sees no production caller yet.
+    /// `allow(dead_code)` stands in for that missing caller — remove it when #3268 wires the call.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn install_funded_distributor_registry(
+        &self,
+        registry: rewards::funded::FundedDistributorRegistry,
+    ) -> bool {
+        self.funded_distributors.set(registry).is_ok()
+    }
+
+    /// The installed funder-ownership registry, or `None` when nothing has installed one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn funded_distributor_registry(
+        &self,
+    ) -> Option<&rewards::funded::FundedDistributorRegistry> {
+        self.funded_distributors.get()
+    }
+
+    /// Read which distributors this node funds, through the installed registry.
+    ///
+    /// With no registry installed the answer is
+    /// [`rewards::funded::NotConfiguredReason::NoStateDirectory`], the same UNKNOWN an inert
+    /// registry reports — never [`rewards::funded::FundedDistributorsRead::FundsNothing`]. A
+    /// caller rendering `dig.listRewardDistributors` must distinguish the two: an unknown rendered
+    /// as `[]` tells an operator it funds nothing when it may fund plenty
+    /// (`dig-rewards-coin` SPEC §2.4 clause 1).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn funded_distributors_read(&self) -> rewards::funded::FundedDistributorsRead {
+        match self.funded_distributor_registry() {
+            Some(registry) => registry.read(),
+            None => rewards::funded::FundedDistributorsRead::NotConfigured(
+                rewards::funded::NotConfiguredReason::NoStateDirectory,
+            ),
+        }
     }
 }
 
@@ -4855,6 +4910,7 @@ impl Node {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
         })
     }
 
@@ -5195,6 +5251,7 @@ pub(crate) mod test_support {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
         };
         (Arc::new(node), td)
     }
@@ -5953,6 +6010,63 @@ mod tests {
         );
     }
 
+    /// dig_ecosystem#3285: a node with no funder registry installed — which is EVERY production
+    /// node until #3268 wires one — must read UNKNOWN, never an empty funded set.
+    /// **Catches:** a `funded_distributors_read` that defaults to `FundsNothing`, or a `Vec`/
+    /// `Option` return that a caller would render as `[]`.
+    #[test]
+    fn a_node_with_no_installed_funder_registry_reads_not_configured() {
+        let (node, _td) = test_node(None);
+
+        assert!(
+            node.funded_distributor_registry().is_none(),
+            "nothing installs the registry in production yet (see the field doc)"
+        );
+        assert_eq!(
+            node.funded_distributors_read(),
+            crate::rewards::funded::FundedDistributorsRead::NotConfigured(
+                crate::rewards::funded::NotConfiguredReason::NoStateDirectory
+            ),
+            "a node with no registry installed must read UNKNOWN, never an empty funded set"
+        );
+    }
+
+    /// dig_ecosystem#3285: the node's read goes through the installed registry all the way to
+    /// disk, and a second install cannot swap a live registry for an inert one.
+    /// **Catches:** an accessor reading some other (empty) source, and a `set`-ignoring install.
+    #[test]
+    fn a_node_reads_through_the_installed_funder_registry() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let funded = crate::rewards::funded::FundedDistributor {
+            launcher_id: [0x21u8; 32],
+            store_id: Some([0x22u8; 32]),
+        };
+        let registry =
+            crate::rewards::funded::FundedDistributorRegistry::with_state_dir(state_dir.path());
+        assert_eq!(
+            registry.record(&funded),
+            crate::rewards::funded::RecordOutcome::Recorded
+        );
+        let (node, _td) = test_node(None);
+
+        assert!(
+            node.install_funded_distributor_registry(registry),
+            "the first install must take"
+        );
+
+        assert_eq!(
+            node.funded_distributors_read(),
+            crate::rewards::funded::FundedDistributorsRead::Funded(vec![funded]),
+            "the node's read must go through the installed registry to disk"
+        );
+        assert!(
+            !node.install_funded_distributor_registry(
+                crate::rewards::funded::FundedDistributorRegistry::disabled()
+            ),
+            "a second install must be refused rather than silently replace the live registry"
+        );
+    }
+
     fn test_node(identity_seed: Option<[u8; 32]>) -> (Node, tempfile::TempDir) {
         test_node_with_resolver(identity_seed, MockResolver::always(Ok(None)))
     }
@@ -5991,6 +6105,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
         };
         (node, td)
     }
@@ -6126,6 +6241,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
         };
 
         // Missing before the pull.
@@ -6195,6 +6311,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -6295,6 +6412,8 @@ mod tests {
                 node_peer_id: OnceLock::new(),
                 mirror_pointers: OnceLock::new(),
                 reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+                funded_distributors: OnceLock::new(),
+            funded_distributors: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -6373,6 +6492,8 @@ mod tests {
                 node_peer_id: OnceLock::new(),
                 mirror_pointers: OnceLock::new(),
                 reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+                funded_distributors: OnceLock::new(),
+            funded_distributors: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -9854,6 +9975,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
         };
 
         let before = handle_rpc(
@@ -17010,6 +17132,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
             ..node
         };
         // A holder for this EXACT content is known via the DHT.
@@ -17062,6 +17185,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
             ..node
         };
         // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
@@ -17113,6 +17237,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
             ..node
         };
 
@@ -17146,6 +17271,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -17188,6 +17314,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -17232,6 +17359,7 @@ mod tests {
             node_peer_id: OnceLock::new(),
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
+            funded_distributors: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
