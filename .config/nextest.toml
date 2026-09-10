@@ -8,13 +8,14 @@
 # per-test override here rather than removing this backstop.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 3 }
+# THROWAWAY (Finding 3 revert-check diagnostic, never merged): CI invokes cargo nextest
+# run WITHOUT --profile, so [profile.ci] settings never applied here -- fail-fast must
+# live on [profile.default] to disable it, so a deliberately reverted enforcement does
+# not cancel the rest of the suite before the other under-test config.rs tests run.
+fail-fast = false
 
 # CI runs `cargo llvm-cov nextest` with `--retries 2`; the same backstop must apply there so a hang
 # on CI is terminated identically to a local run.
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 3 }
 retries = 2
-# THROWAWAY (Finding 3 revert-check diagnostic, never merged): disable fail-fast so a deliberately
-# reverted enforcement's failure doesn't cancel the rest of the suite before the other four
-# under-test config.rs tests get a chance to run.
-fail-fast = false
