@@ -66,15 +66,19 @@ pub struct ClaimEngine<P, H> {
     /// F7: when the last cycle that ran to completion finished -- the cadence gate's clock. See
     /// [`super::config::RewardsClaimConfig::last_cycle_completed_at`].
     last_cycle_completed_at: Option<u64>,
-    /// F8/F10: set by [`Self::with_persisted_fee_window`] when the loaded
-    /// [`RewardsClaimConfig`] was [`RewardsClaimConfig::corrupt`] (unreadable, unparsable, or a
-    /// spend exceeding its own budget), OR discovered at the top of [`Self::run_cycle`] when
-    /// either persisted clock reads AFTER `now` (a future-dated clock is corrupt state exactly
-    /// the same way, F10). Either way this fails CLOSED: the window reads as fully spent and no
-    /// candidate is evaluated, rather than silently loading [`RewardsClaimConfig::default`] and
-    /// re-granting a budget (F8) or silently freezing forever under a healthy-looking state (the
-    /// pre-F9 reading of F10).
-    fee_window_poisoned: bool,
+    // F16: there used to be a `fee_window_poisoned: bool` field here, set `true` by a corrupt
+    // load or a future-dated clock and never cleared. That is the THIRD instance of one
+    // mechanism -- a per-cycle condition stored as process-lifetime state (pass 3:
+    // `ChainSourceUnavailable` latched forever; pass 4: a cadence gate's early return left a
+    // stale `state` standing) -- and it is the one place where latching was actively wrong: a
+    // future-dated clock is SELF-HEALING (`t > now` goes false the moment real time passes it),
+    // so ORing it into a field that is then set permanently `true` turned a transient RTC glitch
+    // into a permanent refusal to claim. The fix removes the field rather than the bug: with no
+    // `fee_window_poisoned` field on this struct, `self.fee_window_poisoned = true` is a COMPILE
+    // ERROR (E0609, no such field), not a convention a future pass has to remember. See
+    // [`Self::run_cycle`]'s `CycleConditions` -- built fresh at the top of every cycle from `now`
+    // plus a freshly reloaded [`RewardsClaimConfig`], used, and dropped before the function
+    // returns; there is nowhere on `Self` to write it back into.
 }
 
 impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
@@ -100,7 +104,6 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             fee_window_start_unix: None,
             fee_spent_in_window_mojos: 0,
             last_cycle_completed_at: None,
-            fee_window_poisoned: false,
         }
     }
 
@@ -137,12 +140,16 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// F10 (§8.6 floor): also applied here, not just in [`RewardsClaimConfig::load_from`] --
     /// this is a constructor argument, independent of whatever the config file says, and the same
     /// hot-loop hazard applies to whatever caller passes it a degenerate value directly.
+    ///
+    /// F16: this no longer latches `cfg.corrupt` into a field. [`Self::run_cycle`] re-reads
+    /// [`RewardsClaimConfig::load_from`] fresh at the top of every cycle instead, so a file an
+    /// operator fixes or removes between cycles is observed on the VERY NEXT cycle, not only on
+    /// the next process restart -- see that method's `CycleConditions`.
     #[must_use]
     pub fn with_persisted_fee_window(mut self, dir: &Path, cadence_seconds: u64) -> Self {
         let cfg = RewardsClaimConfig::load_from(dir);
         self.fee_window_state_dir = Some(dir.to_path_buf());
         self.cadence_seconds = cadence_seconds.max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
-        self.fee_window_poisoned = cfg.corrupt;
         self.fee_window_start_unix = cfg.fee_window_start_unix;
         self.fee_spent_in_window_mojos = cfg.fee_spent_in_window_mojos;
         self.last_cycle_completed_at = cfg.last_cycle_completed_at;
@@ -219,7 +226,29 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         // F7: the cadence gate and the persisted budget window -- both keyed off
         // `self.fee_window_state_dir`, so a caller that never opted in via
         // `with_persisted_fee_window` sees no change at all (every pre-F7 test).
-        if self.fee_window_state_dir.is_some() {
+        if let Some(dir) = self.fee_window_state_dir.clone() {
+            // F16: `CycleConditions` is built HERE, at the top of this cycle, from `now` plus a
+            // freshly reloaded `RewardsClaimConfig` -- and dropped at the end of this `if let`
+            // block. It is never a field on `Self`, so there is nowhere to latch it: a
+            // future-dated clock is self-healing by construction (`t > now` goes false the
+            // moment real time passes it) and is now recomputed, never remembered, every cycle.
+            // An actually-corrupt file (unreadable, unparsable, or F14's spend-exceeds-budget) is
+            // re-read from disk on every cycle too, so a file an operator fixes or removes is
+            // observed on the VERY NEXT cycle rather than only after a process restart -- see
+            // `RewardsClaimConfig::load_from`'s doc for why re-reading here is cheap and safe
+            // (`persist_fee_window` below already re-reads the same file for the same reason).
+            struct CycleConditions {
+                corrupt: bool,
+                future_dated_clock: bool,
+            }
+            let conditions = {
+                let cfg = RewardsClaimConfig::load_from(&dir);
+                CycleConditions {
+                    corrupt: cfg.corrupt,
+                    future_dated_clock: self.last_cycle_completed_at.is_some_and(|t| t > now)
+                        || self.fee_window_start_unix.is_some_and(|t| t > now),
+                }
+            };
             // F8/F10: a corrupt persisted file, or either persisted clock reading AFTER `now` (a
             // future-dated clock is corrupt state exactly the same way a torn write is -- an
             // ordinary NTP step or clock glitch would otherwise freeze the window forever, F10),
@@ -227,10 +256,7 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             // name, and -- critically -- return BEFORE the cadence gate and the window-roll logic
             // below, which would otherwise happily manufacture a brand-new zeroed window out of
             // untrustworthy state.
-            let future_dated_clock = self.last_cycle_completed_at.is_some_and(|t| t > now)
-                || self.fee_window_start_unix.is_some_and(|t| t > now);
-            if self.fee_window_poisoned || future_dated_clock {
-                self.fee_window_poisoned = true;
+            if conditions.corrupt || conditions.future_dated_clock {
                 self.status.state = ClaimLoopState::PersistedStateCorrupt;
                 return Vec::new();
             }
@@ -419,7 +445,17 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
 
         // Defect A4: an all-faulted cycle (candidates existed, discovery succeeded, but every one of
         // them faulted) must not stamp `last_cycle_at` either — same staleness reasoning as above.
-        let all_faulted_cycle = any_candidates && outcomes.is_empty() && self.status.fault_reported;
+        //
+        // F17: this used to be `outcomes.is_empty() && self.status.fault_reported` — a predicate
+        // over the OUTCOME STREAM's emptiness. The authorized `ClaimOutcome::Faulted` rework then
+        // started pushing an outcome at every one of the five per-candidate fault sites, so
+        // `outcomes` is never empty when a per-candidate fault occurs and this predicate silently
+        // went permanently false, letting `last_cycle_at` get stamped on a cycle where every
+        // candidate faulted and nothing was submitted. Never test a stream for emptiness to infer
+        // a property of its contents — ask what actually happened instead: no submissions this
+        // cycle, and at least one fault reported.
+        let all_faulted_cycle =
+            any_candidates && submitted_this_cycle == 0 && self.status.fault_reported;
 
         self.status.distributors_with_own_entry = with_entry;
         self.status.distributors_claimable = claimable;
@@ -763,6 +799,11 @@ mod tests {
         /// `Err(ClaimPortError::Other(_))` -- simulates a submission that definitely never
         /// broadcast.
         fail_submit_for: Mutex<std::collections::HashSet<Bytes32>>,
+        /// F17: launcher ids whose `reserve_asset_id` must return `Err(ClaimPortError::Other(_))`
+        /// -- simulates a per-candidate chain-read fault reached during discovery success, the
+        /// scenario `repeated_discovery_faults_never_read_as_nominal` does NOT cover (that test
+        /// fails discovery itself, a different and already-correct path).
+        fail_reserve_asset_for: Mutex<std::collections::HashSet<Bytes32>>,
         /// F15: when set, `submit_initiate_payout` snapshots the persisted spend at this
         /// directory into `submit_snapshots` BEFORE returning -- proving the write already
         /// landed on disk before the chain call resolves, not just before `run_cycle` returns.
@@ -782,6 +823,7 @@ mod tests {
                 submitted: Mutex::new(Vec::new()),
                 own_entry_reads: Mutex::new(0),
                 fail_submit_for: Mutex::new(std::collections::HashSet::new()),
+                fail_reserve_asset_for: Mutex::new(std::collections::HashSet::new()),
                 submit_snapshot_dir: Mutex::new(None),
                 submit_snapshots: Mutex::new(Vec::new()),
             }
@@ -790,6 +832,13 @@ mod tests {
         /// F12: makes `submit_initiate_payout` for `id` return `Err(Other(_))` instead of `Ok`.
         fn fail_submit_for(&self, id: Bytes32) {
             self.fail_submit_for.lock().unwrap().insert(id);
+        }
+
+        /// F17: makes `reserve_asset_id` for `id` return `Err(Other(_))` instead of `Ok` -- `id`
+        /// still appears in `discover_distributors`' output (discovery itself succeeds), so this
+        /// simulates a per-candidate fault reached AFTER discovery, not a discovery failure.
+        fn fail_reserve_asset_for(&self, id: Bytes32) {
+            self.fail_reserve_asset_for.lock().unwrap().insert(id);
         }
 
         /// F15: arms the pre-submit snapshot hook against `dir`.
@@ -833,6 +882,14 @@ mod tests {
         }
 
         async fn reserve_asset_id(&self, launcher_id: Bytes32) -> Result<Bytes32, ClaimPortError> {
+            if self
+                .fail_reserve_asset_for
+                .lock()
+                .unwrap()
+                .contains(&launcher_id)
+            {
+                return Err(ClaimPortError::Other("simulated reserve_asset_id fault".into()));
+            }
             self.distributors
                 .lock()
                 .unwrap()
@@ -1318,6 +1375,48 @@ mod tests {
                 "cycle {cycle}: consecutive fault count must track the streak"
             );
         }
+    }
+
+    /// Finding 2 regression: discovery SUCCEEDS (unlike
+    /// `repeated_discovery_faults_never_read_as_nominal`, which fails discovery itself -- a
+    /// different and already-correct path), every candidate faults on a per-candidate chain read,
+    /// and `last_cycle_at` must NOT be stamped. Must go red with `all_faulted_cycle` restored to
+    /// its old `outcomes.is_empty() && self.status.fault_reported` proxy -- a `ClaimOutcome::Faulted`
+    /// IS an outcome, so `outcomes` is never empty here and the old proxy silently stamped
+    /// `last_cycle_at` on a cycle where nothing was actually claimed.
+    #[tokio::test]
+    async fn all_candidates_faulted_does_not_stamp_last_cycle_at() {
+        let launcher_id = Bytes32::new([2u8; 32]);
+        let port = FakeChainPort::new(vec![one_distributor(None, 1_000, 10)]);
+        port.fail_reserve_asset_for(launcher_id);
+        let mut e = ClaimEngine::new(
+            port,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        );
+
+        let outcomes = e.run_cycle(1_000).await;
+
+        assert_eq!(
+            outcomes,
+            vec![ClaimOutcome::Faulted {
+                launcher_id,
+                reversed_fee_mojos: None,
+                reason: "simulated reserve_asset_id fault".to_string(),
+            }],
+            "discovery succeeded (the candidate was found) but its only chain read faulted"
+        );
+        assert_eq!(e.status().claims_submitted_this_cycle, 0);
+        assert_eq!(
+            e.status().last_cycle_at,
+            None,
+            "an all-faulted cycle (candidates existed, discovery succeeded, nothing submitted) \
+             must not stamp last_cycle_at -- never infer 'nothing happened' from outcomes being \
+             empty, because a Faulted outcome is still an outcome"
+        );
     }
 
     /// Defect A4 regression: a failed discovery must leave `last_discovery_at` unchanged (a reader
@@ -1975,13 +2074,17 @@ mod tests {
         );
     }
 
-    /// F10 regression: a future-dated `last_cycle_completed_at` (an NTP step, a clock glitch, or
-    /// corrupt state) must not silently freeze the loop forever while reading healthy -- it must
-    /// be a REPORTED condition. Must go red with only the `future_dated_clock` check removed (the
-    /// old behaviour: `saturating_sub` yields 0, the cadence gate blocks the cycle, and — with F9
-    /// fixed — that reads as `CadenceNotElapsed`, never `PersistedStateCorrupt` as asserted here).
+    /// F10/F16 regression -- THE anti-latch test for Finding 1. A future-dated
+    /// `last_cycle_completed_at` (an NTP step, a clock glitch) must (a) refuse cycle 1, reported as
+    /// `PersistedStateCorrupt`, never silent, and (b) — this is the part the ONE-cycle version of
+    /// this test could never prove — self-heal the moment real time catches up: cycle 2, run after
+    /// the clock has caught up AND the cadence has elapsed, MUST claim. A single-cycle version of
+    /// this test is green whether the latch bug is present or not, because it never gives the
+    /// latch a second cycle to prove it never clears. Must go red against the pre-F16 engine (the
+    /// `fee_window_poisoned` field latching `future_dated_clock` permanently `true`), and green
+    /// once that field is gone and `future_dated_clock` is recomputed fresh every cycle.
     #[tokio::test]
-    async fn f10_a_future_dated_clock_is_reported_not_silent() {
+    async fn f10_a_future_dated_clock_refuses_then_self_heals_next_cycle() {
         const CYCLE_BUDGET: u64 = 1_000_000;
         const CADENCE_SECONDS: u64 = 86_400;
         let dir = tempfile::Builder::new()
@@ -2009,10 +2112,11 @@ mod tests {
         )
         .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
 
-        let outcomes = e.run_cycle(1_000).await;
-
+        // Cycle 1: `now` (1_000) is nowhere near `far_future` -- the clock reads as future-dated,
+        // and must refuse.
+        let cycle1 = e.run_cycle(1_000).await;
         assert_eq!(
-            outcomes,
+            cycle1,
             Vec::new(),
             "a future-dated clock must submit nothing this cycle"
         );
@@ -2022,6 +2126,24 @@ mod tests {
             "a future-dated clock must be its own reported condition, never silent, and never \
              read as CadenceNotElapsed (which is what the old unvalidated saturating_sub bug \
              would produce once F9 is fixed)"
+        );
+
+        // Cycle 2: real time has now passed `far_future` (self-healing the clock condition) AND
+        // the cadence has elapsed since `far_future` (satisfying the cadence gate too) -- a
+        // genuinely healthy cycle that a permanent latch would still refuse forever.
+        let caught_up = far_future + CADENCE_SECONDS + 1;
+        let cycle2 = e.run_cycle(caught_up).await;
+        assert_eq!(
+            cycle2,
+            vec![ClaimOutcome::Submitted { launcher_id }],
+            "once the clock has genuinely caught up, the next cycle MUST claim -- a latched \
+             `fee_window_poisoned` would refuse this cycle forever, long after the glitch that \
+             caused it stopped being true"
+        );
+        assert_ne!(
+            e.status().state,
+            ClaimLoopState::PersistedStateCorrupt,
+            "a self-healed clock must not still read as corrupt"
         );
     }
 

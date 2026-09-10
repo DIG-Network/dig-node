@@ -152,12 +152,19 @@ pub enum ClaimLoopState {
     /// The chain seam reported [`super::port::ClaimPortError::Unavailable`] — see the module doc's
     /// "chain seam" section. Zero cycles ran; this is the true state, not a silent no-op.
     ChainSourceUnavailable,
-    /// F8/F10, fund-safety: the persisted rewards-claim state (`RewardsClaimConfig`) was
+    /// F8/F10/F16, fund-safety: the persisted rewards-claim state (`RewardsClaimConfig`) was
     /// unreadable, unparsable, carried a spend exceeding its own budget (F14), or carried a
-    /// future-dated clock (F10) — corrupt state, not a fresh peer. The engine treats the window
-    /// as fully spent and submits nothing until an operator fixes or removes the file; this state
-    /// exists so that refusal is visible rather than a silent, permanent freeze that reads as
-    /// `Nominal` (the pre-F9 shape of the F10 defect).
+    /// future-dated clock (F10) — corrupt state, not a fresh peer. The engine treats the window as
+    /// fully spent and submits nothing THIS CYCLE. What happens next differs by cause, and both are
+    /// re-checked fresh on every cycle (F16), never latched:
+    /// - an unreadable/unparsable file or an over-budget spend needs an operator to fix or remove
+    ///   it, and stays `PersistedStateCorrupt` until they do;
+    /// - a future-dated clock is SELF-HEALING — `t > now` goes false the moment real time passes
+    ///   the stored timestamp, so the very next cycle after catch-up reads as whatever
+    ///   `compute_state` decides (typically `Nominal`), never stuck here.
+    /// This state exists so that refusal is visible rather than a silent, permanent freeze that
+    /// reads as `Nominal` (the pre-F9 shape of the F10 defect) — or, before F16, a permanent freeze
+    /// of its OWN under a different name once the clock had already caught up.
     PersistedStateCorrupt,
     /// F9: the cadence has not yet elapsed since the last cycle that ran to completion — a
     /// DELIBERATE skip, its own named condition rather than the absence of one. Without this, the
