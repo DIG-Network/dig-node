@@ -225,7 +225,7 @@ impl RewardsClaimConfig {
             }
         };
         match serde_json::from_str::<RewardsClaimConfig>(&text) {
-            Ok(mut cfg) => {
+            Ok(cfg) => {
                 // F10 (§8.6 floor): an operator-supplied cadence below the floor is clamped, not
                 // corrupt -- see `CLAIM_CADENCE_FLOOR_SECONDS`'s doc for why this is the one F7
                 // field that is safe to correct upward rather than fail closed over.
