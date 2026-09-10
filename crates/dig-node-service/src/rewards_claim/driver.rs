@@ -36,8 +36,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chia_protocol::Bytes32;
 
-use super::cadence::{next_interval_seconds, JitterSource};
-use super::config::RewardsClaimConfig;
+use super::cadence::{next_interval_seconds, JitterSource, CLAIM_JITTER_SECONDS_DEFAULT};
+use super::config::{RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT};
 use super::engine::ClaimEngine;
 use super::hints::{DistributorHintSource, NoHintSource};
 use super::port::{ClaimChainPort, UnavailableClaimChainPort};
@@ -301,6 +301,69 @@ async fn run_claim_driver(handle: ClaimLoopHandle) {
 /// Generic over `P` so a test can drive this real body against a fake port; production always
 /// passes [`UnavailableClaimChainPort`] (see the module doc -- there is deliberately no second
 /// production adapter until #3249 lands).
+/// The largest schedule value this driver will honour, in seconds: 31 days. Chosen to sit
+/// comfortably above every documented default -- [`CLAIM_CADENCE_SECONDS_DEFAULT`] is 86,400s
+/// (1 day) and [`CLAIM_JITTER_SECONDS_DEFAULT`] is 3,600s (1 hour) -- and above any plausible
+/// operator choice ("claim monthly" is 30 days), while excluding every value that means NEVER.
+///
+/// # Why a ceiling exists at all
+/// [`next_interval_seconds`] saturates rather than panicking, so a persisted
+/// `jitter_seconds = u64::MAX` (or a cadence of the same shape) no longer crashes the node -- it
+/// schedules the next cycle roughly 585 billion years out. That is strictly WORSE than a panic for
+/// this ticket: the claim loop never fires again, so no cycle, no `log_cycle` line, and the
+/// cycle counter reads a permanent, reassuring `0`. #594 shipped an engine that was inert and
+/// green; a config value must not be able to put this driver back in that state silently.
+const CLAIM_SCHEDULE_SECONDS_MAX: u64 = 31 * 24 * 60 * 60;
+
+/// Replace a schedule value that would switch the loop off (or spin it) with its documented
+/// default, saying so at `WARN` -- never silently accept it, and never silently accept the
+/// default either. Returns `(cadence_seconds, jitter_seconds)` fit to schedule with.
+///
+/// A zero cadence is rejected for the opposite reason to a huge one: it would busy-loop the claim
+/// engine as fast as the runtime can poll it. A zero JITTER is legitimate (it means "no jitter")
+/// and is left alone.
+fn sanitized_schedule(cadence_seconds: u64, jitter_seconds: u64) -> (u64, u64) {
+    let cadence = if cadence_seconds == 0 || cadence_seconds > CLAIM_SCHEDULE_SECONDS_MAX {
+        tracing::warn!(
+            target: "rewards_claim",
+            field = "cadence_seconds",
+            rejected = cadence_seconds,
+            substituted = CLAIM_CADENCE_SECONDS_DEFAULT,
+            max = CLAIM_SCHEDULE_SECONDS_MAX,
+            "{}",
+            concat!(
+                "rewards_claim.cadence_seconds is outside the honoured range and was IGNORED; ",
+                "the documented default is used instead -- a value that large would stop the ",
+                "claim loop from ever firing again, and zero would busy-loop it"
+            )
+        );
+        CLAIM_CADENCE_SECONDS_DEFAULT
+    } else {
+        cadence_seconds
+    };
+
+    let jitter = if jitter_seconds > CLAIM_SCHEDULE_SECONDS_MAX {
+        tracing::warn!(
+            target: "rewards_claim",
+            field = "jitter_seconds",
+            rejected = jitter_seconds,
+            substituted = CLAIM_JITTER_SECONDS_DEFAULT,
+            max = CLAIM_SCHEDULE_SECONDS_MAX,
+            "{}",
+            concat!(
+                "rewards_claim.jitter_seconds is outside the honoured range and was IGNORED; ",
+                "the documented default is used instead -- a value that large saturates the ",
+                "next interval and the claim loop would never fire again"
+            )
+        );
+        CLAIM_JITTER_SECONDS_DEFAULT
+    } else {
+        jitter_seconds
+    };
+
+    (cadence, jitter)
+}
+
 async fn run_claim_driver_in<P>(
     state_dir: &Path,
     own_payout_puzzle_hash: Bytes32,
@@ -316,6 +379,11 @@ async fn run_claim_driver_in<P>(
     // here instead would report NOTHING at all, which is the exact silent failure this ticket
     // exists to prevent -- a corrupt file must stay visible, not vanish into "never started".
 
+    // The config is operator-writable and unclamped at rest (`config.rs` deliberately reports what
+    // is on disk). Sanitize HERE, at the read, before either value can reach the scheduler.
+    let (cadence_seconds, jitter_seconds) =
+        sanitized_schedule(cfg.cadence_seconds, cfg.jitter_seconds);
+
     let engine = ClaimEngine::new(
         port,
         NoHintSource,
@@ -325,12 +393,12 @@ async fn run_claim_driver_in<P>(
         dig_mirror_coin::DIG_ASSET_ID,
     )
     .with_rotation_cursor(cfg.rotation_cursor)
-    .with_persisted_fee_window(state_dir, cfg.cadence_seconds);
+    .with_persisted_fee_window(state_dir, cadence_seconds);
 
     drive(
         engine,
-        cfg.cadence_seconds,
-        cfg.jitter_seconds,
+        cadence_seconds,
+        jitter_seconds,
         &OsJitter,
         unix_now_seconds,
         handle,
@@ -1217,5 +1285,97 @@ mod tests {
             offset <= bound,
             "the draw must stay within 0..=bound; got {offset}"
         );
+    }
+
+    // ---- the config-read sanitizer: a value must not be able to switch the loop off ---------
+
+    /// Write a config with BOTH schedule fields chosen by the caller, so a test can persist a
+    /// value production would otherwise honour to the letter.
+    fn write_schedule_config(dir: &Path, cadence_seconds: u64, jitter_seconds: u64) {
+        RewardsClaimConfig {
+            enabled: true,
+            cadence_seconds,
+            jitter_seconds,
+            ..RewardsClaimConfig::default()
+        }
+        .save_to(dir)
+        .unwrap();
+    }
+
+    /// An out-of-range `cadence_seconds` must be REPLACED by the documented default, and the
+    /// substitution must be visible: a value this large means "never fire again", and silently
+    /// honouring it reopens #594's inert-but-green shape one level up, in the config file.
+    #[test]
+    fn an_out_of_range_cadence_is_replaced_by_the_default_and_warned() {
+        let (logs, _guard) = capture_logs();
+
+        let rejected = std::hint::black_box(u64::MAX);
+        let (cadence, jitter) = sanitized_schedule(rejected, 0);
+
+        assert_eq!(
+            cadence, CLAIM_CADENCE_SECONDS_DEFAULT,
+            "an out-of-range cadence must fall back to the documented default"
+        );
+        assert_eq!(jitter, 0, "a legitimate zero jitter is left alone");
+
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("WARN"),
+            "ignoring a configured value is a warning, not routine chatter; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("cadence_seconds"),
+            "the warning must name the FIELD that was ignored; got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&rejected.to_string())
+                && rendered.contains(&CLAIM_CADENCE_SECONDS_DEFAULT.to_string()),
+            "and both the rejected and the substituted value; got: {rendered}"
+        );
+    }
+
+    /// The same for `jitter_seconds` -- and, through the REAL production body, that the loop still
+    /// drives counted cycles instead of never firing again. Without the sanitizer,
+    /// `next_interval_seconds` saturates on this value and no cycle is ever driven: green, silent
+    /// and unpaid.
+    #[tokio::test(start_paused = true)]
+    async fn an_out_of_range_jitter_is_replaced_and_the_loop_still_drives_cycles() {
+        let (logs, _guard) = capture_logs();
+
+        let cadence = 100u64;
+        let dir = tempfile::tempdir().unwrap();
+        write_schedule_config(dir.path(), cadence, std::hint::black_box(u64::MAX));
+
+        let handle = ClaimLoopHandle::default();
+        let h = handle.clone();
+        let state_dir = dir.path().to_path_buf();
+        let driver = tokio::spawn(async move {
+            run_claim_driver_in(&state_dir, Bytes32::from([1u8; 32]), EmptyPort, h).await;
+        });
+
+        settle().await;
+        // The substituted jitter is the DEFAULT hour, so one interval is at most cadence + 3600s.
+        tokio::time::advance(Duration::from_secs(cadence + CLAIM_JITTER_SECONDS_DEFAULT)).await;
+        settle().await;
+
+        assert!(
+            handle.cycles_driven() >= 1,
+            concat!(
+                "an out-of-range jitter must not switch the claim loop off: with the default ",
+                "substituted, at least one cycle is driven within cadence + the default jitter"
+            )
+        );
+
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("WARN") && rendered.contains("jitter_seconds"),
+            "the ignored jitter field must be named at WARN; got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&CLAIM_JITTER_SECONDS_DEFAULT.to_string()),
+            "and the substituted default must be readable; got: {rendered}"
+        );
+
+        driver.abort();
     }
 }
