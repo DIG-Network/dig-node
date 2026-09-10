@@ -1647,3 +1647,4 @@ Two things worth carrying forward:
   difference is not scrutiny of the record — it is whether a wrong record can ever, by itself,
   produce a wrong outcome. Here it cannot: `Unbonded`/`Unverified` from the re-check discards the
   candidate no matter how confidently the record states it.
+
