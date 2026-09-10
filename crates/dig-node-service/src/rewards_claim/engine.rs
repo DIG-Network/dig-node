@@ -2149,6 +2149,89 @@ mod tests {
         );
     }
 
+    /// F16 regression: a corrupt file, repaired mid-run to VALID values carrying a large
+    /// already-spent amount and a recent completed-cycle time, must resume from those DISK
+    /// values on the very next cycle -- never from `poisoned()`'s `None`/`0`/`None` placeholders
+    /// that `with_persisted_fee_window` copied into the engine while the file was still corrupt.
+    /// Cycle 2 must neither get a fresh budget (the repaired file says the window is already
+    /// fully spent) nor skip the cadence gate (the repaired file names a `last_cycle_completed_at`
+    /// only 10 seconds before cycle 2's `now`, far short of the cadence). Must go red against the
+    /// pre-fix engine, which loads the fee-window fields ONCE at construction
+    /// (`with_persisted_fee_window`) and never refreshes them from the freshly-reloaded `cfg`
+    /// inside `run_cycle`'s `CycleConditions` -- so cycle 2 sees its own construction-time `None`s
+    /// for `last_cycle_completed_at` and `fee_window_start_unix`, skips the cadence gate entirely,
+    /// rolls a brand-new zeroed window and submits.
+    #[tokio::test]
+    async fn f16_a_repaired_file_resumes_from_disk_values_not_placeholders() {
+        const CYCLE_BUDGET: u64 = 1_000_000;
+        const CADENCE_SECONDS: u64 = 86_400;
+        let dir = tempfile::Builder::new()
+            .prefix("dig-node-f16-repair-mid-run-")
+            .tempdir()
+            .expect("a scratch dir");
+
+        std::fs::write(
+            dir.path().join("rewards-claim.json"),
+            b"{ this is not json, or a torn write mid-object",
+        )
+        .expect("seed a corrupt file");
+
+        let launcher_id = Bytes32::new([0x79u8; 32]);
+        let mut e = ClaimEngine::new(
+            FakeChainPort::new(vec![budget_consuming_distributor(launcher_id, 10)]),
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        )
+        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
+
+        // Cycle 1: the file is corrupt -- must refuse, submit nothing.
+        let cycle1 = e.run_cycle(1_000).await;
+        assert_eq!(
+            cycle1,
+            Vec::new(),
+            "a corrupt file must submit nothing this cycle"
+        );
+        assert_eq!(e.status().state, ClaimLoopState::PersistedStateCorrupt);
+
+        // The operator's remedy: repair the file with VALID values -- a window already fully
+        // spent, and a completed cycle only 10 seconds ago.
+        let repaired = RewardsClaimConfig {
+            cadence_seconds: CADENCE_SECONDS,
+            max_cycle_fee_budget_mojos: CYCLE_BUDGET,
+            fee_window_start_unix: Some(1_000),
+            fee_spent_in_window_mojos: CYCLE_BUDGET,
+            last_cycle_completed_at: Some(1_000),
+            ..RewardsClaimConfig::default()
+        };
+        repaired.save_to(dir.path()).expect("repair the file");
+
+        // Cycle 2, 10 seconds later -- far short of the 86_400s cadence, and the window the
+        // repaired file names is already fully spent. Must neither claim nor roll a fresh window.
+        let cycle2 = e.run_cycle(1_010).await;
+        assert_eq!(
+            cycle2,
+            Vec::new(),
+            "a just-repaired file must resume from its OWN disk values, not the placeholders \
+             `with_persisted_fee_window` saw while the file was still corrupt -- a fresh budget \
+             or a skipped cadence gate here is the F16 stale-read defect"
+        );
+        assert_eq!(
+            e.status().state,
+            ClaimLoopState::CadenceNotElapsed,
+            "the repaired file's own last_cycle_completed_at must still gate this cycle"
+        );
+
+        let persisted = RewardsClaimConfig::load_from(dir.path());
+        assert_eq!(
+            persisted.fee_spent_in_window_mojos, CYCLE_BUDGET,
+            "a cycle that never ran must never overwrite the repaired disk values with a fresh \
+             zeroed window"
+        );
+    }
+
     /// F12 regression: a submission that DEFINITELY failed (the call returned `Err`, so it never
     /// broadcast) must not permanently inflate the persisted window -- that is free denial-of-
     /// service for an attacker running K always-failing submissions. Must go red with the
