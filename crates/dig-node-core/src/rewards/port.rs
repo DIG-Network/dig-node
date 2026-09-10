@@ -11,24 +11,35 @@
 //!
 //! `dig-rewards-coin` 0.2.0 is published and adds real types — `DistributorSnapshot` /
 //! `DistributorSlots` (its `state` module) plus `clawback`, `comment`, `constants`, `eligibility`,
-//! `entries`, `epoch`, `fund`, `launch`, `payout`. **It still ships no chain reader.** 0.2.0's own
-//! `state.rs` module doc says so directly: SPEC §12.1's `read_distributor` "does not publish one,
-//! deliberately" — the implementation that existed applied
+//! `entries`, `epoch`, `fund`, `launch`, `payout`. **It still ships no chain reader — blocker 1.**
+//! 0.2.0's own `state.rs:1-31` module doc says so directly: SPEC §12.1's `read_distributor` "does not
+//! publish one, deliberately" — the implementation that existed applied
 //! `RewardDistributor::from_parent_spend` to the eve coin's spend (the launch inner puzzle) instead
 //! of `from_eve_coin_spend`, so every read reported `Malformed`; the correct hop additionally needs
 //! `reserve_parent_id`/`reserve_lineage_proof` provenance a reader starting from a launcher id cannot
 //! currently discover. That is tracked as real design work at
-//! <https://github.com/DIG-Network/dig_ecosystem/issues/3267> and 0.2.0's own doc states the rule the
-//! future reader must honour: "every `ChainSource` error MUST become `RewardsError::ChainUnavailable`
-//! … a distributor whose read failed MUST NOT render as 'no entries' or 'nothing accrued'".
+//! <https://github.com/DIG-Network/dig_ecosystem/issues/3267> — as of this unit, open, with a PR up
+//! (`DIG-Network/dig-rewards-coin#6`, `feat/3267-chain-reader`, +950/-80, targeting `0.3.0`) — and
+//! 0.2.0's own doc states the rule the future reader must honour: "every `ChainSource` error MUST
+//! become `RewardsError::ChainUnavailable` … a distributor whose read failed MUST NOT render as 'no
+//! entries' or 'nothing accrued'". Read this adapter against `0.3.0`'s actual reader shape when it
+//! ships, not against this description.
 //!
-//! Separately, and independent of #3267: **nothing in this codebase today records which distributors
-//! this node funds.** `funded_distributors` (below) needs that identity set as its starting point —
-//! there is no chain-wide "list every distributor and filter to mine" call this crate can make (that
-//! is the CLAIM side's `discover_distributors`, a different trait, a different filter, in
-//! `dig-node-service`'s `rewards_claim::port::ClaimChainPort`) — and no local registry populates it
-//! either (no launch flow, no config, no persisted launcher-id list was found in this crate or in
-//! `dig-node-service`).
+//! **Blocker 2, independent of #3267:** nothing in this codebase today records which distributors
+//! this node funds. `funded_distributors` (below) needs that identity set as its starting point —
+//! there is no chain-wide "list every distributor and filter to mine" call this crate can make. The
+//! only adjacent registry is the CLAIM side's `ClaimChainPort::discover_distributors` in
+//! `dig-node-service`'s `rewards_claim::port` — a **different trait**, filtering by mirror-admission
+//! (which distributors this node might claim FROM), not by funder ownership (which distributors this
+//! node funds); it is not a substitute. A repo-wide search for a funder-ownership registry —
+//! `grep -rln "funded_launcher_ids\|FundedDistributor\|reward_distributor_registry\|create_distributor\|launch_distributor" crates/ --include=*.rs`
+//! — returned **no matches** as of this unit's tip (worth re-running before assuming this is still
+//! true; a negative search is a claim about a point in time, not a permanent fact). No launch flow, no
+//! config, no persisted launcher-id list exists in this crate or in `dig-node-service` today. Tracked
+//! as a separate ticket, parallel to #3267 (not downstream of it): a working reader tells a caller HOW
+//! to read one distributor; it does not tell the caller WHICH launcher ids are its own. Both must land
+//! before any of `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments` /
+//! `dig.listRewardDistributors`'s `funded` half can answer honestly.
 //!
 //! So a "real" `RewardsChainPort` adapter over 0.2.0 cannot honestly answer ANY of the four trait
 //! methods with live chain data yet: `funded_distributors` has no identity source, and
@@ -37,9 +48,17 @@
 //! reimplementing `read_distributor` myself or by inventing a funded-distributor registry with no
 //! writer — would be exactly the kind of restated, unreviewed money-shape work SPEC §0.1 clause 1 and
 //! this crate's own withholding of a broken reader argue against, and is the shape fork this ticket's
-//! kernel invariant 6 says to escalate rather than guess. **Escalated to the L1; see this unit's
-//! RETURN.** [`UnavailableChainPort`] remains the only production adapter for now — still correct,
-//! since every real call would fail for one of the two reasons above regardless.
+//! kernel invariant 6 says to escalate rather than guess. Escalated to the L1, and settled: no new
+//! adapter and no dispatch arm land until a reader (0.3.0+) and the funder-ownership registry both
+//! exist. **`dig.listRewardDistributors` stays `-32601` deliberately** — serving it through
+//! `UnavailableChainPort` was considered and rejected: it would be a false capability signal (a
+//! feature-probe or `rpc.discover` reading the method as implemented when it always errors) and the
+//! exact "dispatch surface with no function behind it" pattern DIG-Network/dig-node#593 was the last
+//! PR allowed to land on. `UnavailableChainPort` remains the only production adapter for now — still
+//! correct, since every real call would fail for one of the two reasons above regardless. No
+//! `dig-rewards-coin` dependency is added by this unit: an unused dependency with no consumer is
+//! inert weight and would want whichever version ships the reader (0.3.0+), not 0.2 — add it in the
+//! unit that actually consumes it.
 
 use super::admission::AdmittedPeer;
 use async_trait::async_trait;
