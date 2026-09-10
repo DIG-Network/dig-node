@@ -32,19 +32,22 @@
 //! prevent (SPEC §2.4): with the unavailable adapter wired, zero claims IS the true state, so the
 //! status surface must say so by name, not by omission.
 //!
-//! # Not yet wired into node startup (Defect D — stated, not fixed here)
-//! Nothing in this codebase constructs a [`ClaimEngine`] outside this module's own tests: there is
-//! no scheduler that drives [`ClaimEngine::run_cycle`] on a cadence, and no RPC method exposes
-//! [`ClaimStatus`] to an operator, even though [`RewardsClaimConfig::enabled`] defaults to `true`.
-//! Wiring this into node startup — picking a concrete [`ClaimChainPort`] adapter, starting the
-//! cadence loop, and exposing `ClaimStatus` over RPC — is a separate unit of work with its own
-//! review surface, deferred out of this PR on purpose: the only production adapter available today
-//! is [`UnavailableClaimChainPort`], and the real one arrives with
-//! DIG-Network/dig_ecosystem#3249. Until that wiring lands, this module compiles, is fully tested
-//! against the fake chain port, and does nothing in a running node.
+//! # Wired into node startup (DIG-Network/dig_ecosystem#3268)
+//! [`driver::spawn_claim_driver_from_config`] is the one call `dig-node-service::server`'s
+//! `serve_with_shutdown` makes: it is gated on `RewardsClaimConfig::enabled` AND
+//! `Config::enable_chain_sync` (the same flag `spawn_collateral_census` and
+//! `mirror::bond_verify::spawn_bond_verifier_install` already gate on), and when both are true it
+//! spawns a detached task that drives [`ClaimEngine::run_cycle`] on a jittered cadence forever.
+//! [`driver::handle`] is the IN-PROCESS accessor a future RPC can read once DIG-Network/dig_ecosystem#3249
+//! lands a real [`ClaimChainPort`] adapter and the `ClaimStatus` wire semantics are re-derived
+//! against it — this module puts nothing on the wire itself (see `driver`'s own module doc for
+//! why). Until #3249 lands, the only production adapter is still [`UnavailableClaimChainPort`], so
+//! every real cycle reports [`ClaimLoopState::ChainSourceUnavailable`] and submits nothing — the
+//! honest state, not a silent no-op.
 
 mod cadence;
 mod config;
+mod driver;
 mod engine;
 mod hints;
 mod parser;
@@ -56,6 +59,7 @@ pub use config::{
     RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT, CLAIM_CYCLE_FEE_BUDGET_MOJOS_DEFAULT,
     CLAIM_FEE_CEILING_MOJOS_DEFAULT,
 };
+pub use driver::{handle, spawn_claim_driver_from_config, ClaimDriverRefusal, ClaimLoopHandle};
 pub use engine::ClaimEngine;
 pub use hints::{DistributorHint, DistributorHintSource, NoHintSource};
 pub use parser::parse_launch_comment;
