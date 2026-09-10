@@ -763,6 +763,11 @@ mod tests {
         /// `Err(ClaimPortError::Other(_))` -- simulates a submission that definitely never
         /// broadcast.
         fail_submit_for: Mutex<std::collections::HashSet<Bytes32>>,
+        /// F17: launcher ids whose `reserve_asset_id` must return `Err(ClaimPortError::Other(_))`
+        /// -- simulates a per-candidate chain-read fault reached during discovery success, the
+        /// scenario `repeated_discovery_faults_never_read_as_nominal` does NOT cover (that test
+        /// fails discovery itself, a different and already-correct path).
+        fail_reserve_asset_for: Mutex<std::collections::HashSet<Bytes32>>,
         /// F15: when set, `submit_initiate_payout` snapshots the persisted spend at this
         /// directory into `submit_snapshots` BEFORE returning -- proving the write already
         /// landed on disk before the chain call resolves, not just before `run_cycle` returns.
@@ -782,6 +787,7 @@ mod tests {
                 submitted: Mutex::new(Vec::new()),
                 own_entry_reads: Mutex::new(0),
                 fail_submit_for: Mutex::new(std::collections::HashSet::new()),
+                fail_reserve_asset_for: Mutex::new(std::collections::HashSet::new()),
                 submit_snapshot_dir: Mutex::new(None),
                 submit_snapshots: Mutex::new(Vec::new()),
             }
@@ -790,6 +796,13 @@ mod tests {
         /// F12: makes `submit_initiate_payout` for `id` return `Err(Other(_))` instead of `Ok`.
         fn fail_submit_for(&self, id: Bytes32) {
             self.fail_submit_for.lock().unwrap().insert(id);
+        }
+
+        /// F17: makes `reserve_asset_id` for `id` return `Err(Other(_))` instead of `Ok` -- `id`
+        /// still appears in `discover_distributors`' output (discovery itself succeeds), so this
+        /// simulates a per-candidate fault reached AFTER discovery, not a discovery failure.
+        fn fail_reserve_asset_for(&self, id: Bytes32) {
+            self.fail_reserve_asset_for.lock().unwrap().insert(id);
         }
 
         /// F15: arms the pre-submit snapshot hook against `dir`.
@@ -833,6 +846,14 @@ mod tests {
         }
 
         async fn reserve_asset_id(&self, launcher_id: Bytes32) -> Result<Bytes32, ClaimPortError> {
+            if self
+                .fail_reserve_asset_for
+                .lock()
+                .unwrap()
+                .contains(&launcher_id)
+            {
+                return Err(ClaimPortError::Other("simulated reserve_asset_id fault".into()));
+            }
             self.distributors
                 .lock()
                 .unwrap()
@@ -1318,6 +1339,48 @@ mod tests {
                 "cycle {cycle}: consecutive fault count must track the streak"
             );
         }
+    }
+
+    /// Finding 2 regression: discovery SUCCEEDS (unlike
+    /// `repeated_discovery_faults_never_read_as_nominal`, which fails discovery itself -- a
+    /// different and already-correct path), every candidate faults on a per-candidate chain read,
+    /// and `last_cycle_at` must NOT be stamped. Must go red with `all_faulted_cycle` restored to
+    /// its old `outcomes.is_empty() && self.status.fault_reported` proxy -- a `ClaimOutcome::Faulted`
+    /// IS an outcome, so `outcomes` is never empty here and the old proxy silently stamped
+    /// `last_cycle_at` on a cycle where nothing was actually claimed.
+    #[tokio::test]
+    async fn all_candidates_faulted_does_not_stamp_last_cycle_at() {
+        let launcher_id = Bytes32::new([2u8; 32]);
+        let port = FakeChainPort::new(vec![one_distributor(None, 1_000, 10)]);
+        port.fail_reserve_asset_for(launcher_id);
+        let mut e = ClaimEngine::new(
+            port,
+            NoHintSource,
+            OUR_PAYOUT_PUZZLE_HASH,
+            FEE_CEILING,
+            CYCLE_BUDGET,
+            DIG_ASSET_ID,
+        );
+
+        let outcomes = e.run_cycle(1_000).await;
+
+        assert_eq!(
+            outcomes,
+            vec![ClaimOutcome::Faulted {
+                launcher_id,
+                reversed_fee_mojos: None,
+                reason: "simulated reserve_asset_id fault".to_string(),
+            }],
+            "discovery succeeded (the candidate was found) but its only chain read faulted"
+        );
+        assert_eq!(e.status().claims_submitted_this_cycle, 0);
+        assert_eq!(
+            e.status().last_cycle_at,
+            None,
+            "an all-faulted cycle (candidates existed, discovery succeeded, nothing submitted) \
+             must not stamp last_cycle_at -- never infer 'nothing happened' from outcomes being \
+             empty, because a Faulted outcome is still an outcome"
+        );
     }
 
     /// Defect A4 regression: a failed discovery must leave `last_discovery_at` unchanged (a reader
@@ -1975,13 +2038,17 @@ mod tests {
         );
     }
 
-    /// F10 regression: a future-dated `last_cycle_completed_at` (an NTP step, a clock glitch, or
-    /// corrupt state) must not silently freeze the loop forever while reading healthy -- it must
-    /// be a REPORTED condition. Must go red with only the `future_dated_clock` check removed (the
-    /// old behaviour: `saturating_sub` yields 0, the cadence gate blocks the cycle, and — with F9
-    /// fixed — that reads as `CadenceNotElapsed`, never `PersistedStateCorrupt` as asserted here).
+    /// F10/F16 regression -- THE anti-latch test for Finding 1. A future-dated
+    /// `last_cycle_completed_at` (an NTP step, a clock glitch) must (a) refuse cycle 1, reported as
+    /// `PersistedStateCorrupt`, never silent, and (b) — this is the part the ONE-cycle version of
+    /// this test could never prove — self-heal the moment real time catches up: cycle 2, run after
+    /// the clock has caught up AND the cadence has elapsed, MUST claim. A single-cycle version of
+    /// this test is green whether the latch bug is present or not, because it never gives the
+    /// latch a second cycle to prove it never clears. Must go red against the pre-F16 engine (the
+    /// `fee_window_poisoned` field latching `future_dated_clock` permanently `true`), and green
+    /// once that field is gone and `future_dated_clock` is recomputed fresh every cycle.
     #[tokio::test]
-    async fn f10_a_future_dated_clock_is_reported_not_silent() {
+    async fn f10_a_future_dated_clock_refuses_then_self_heals_next_cycle() {
         const CYCLE_BUDGET: u64 = 1_000_000;
         const CADENCE_SECONDS: u64 = 86_400;
         let dir = tempfile::Builder::new()
@@ -2009,10 +2076,11 @@ mod tests {
         )
         .with_persisted_fee_window(dir.path(), CADENCE_SECONDS);
 
-        let outcomes = e.run_cycle(1_000).await;
-
+        // Cycle 1: `now` (1_000) is nowhere near `far_future` -- the clock reads as future-dated,
+        // and must refuse.
+        let cycle1 = e.run_cycle(1_000).await;
         assert_eq!(
-            outcomes,
+            cycle1,
             Vec::new(),
             "a future-dated clock must submit nothing this cycle"
         );
@@ -2022,6 +2090,24 @@ mod tests {
             "a future-dated clock must be its own reported condition, never silent, and never \
              read as CadenceNotElapsed (which is what the old unvalidated saturating_sub bug \
              would produce once F9 is fixed)"
+        );
+
+        // Cycle 2: real time has now passed `far_future` (self-healing the clock condition) AND
+        // the cadence has elapsed since `far_future` (satisfying the cadence gate too) -- a
+        // genuinely healthy cycle that a permanent latch would still refuse forever.
+        let caught_up = far_future + CADENCE_SECONDS + 1;
+        let cycle2 = e.run_cycle(caught_up).await;
+        assert_eq!(
+            cycle2,
+            vec![ClaimOutcome::Submitted { launcher_id }],
+            "once the clock has genuinely caught up, the next cycle MUST claim -- a latched \
+             `fee_window_poisoned` would refuse this cycle forever, long after the glitch that \
+             caused it stopped being true"
+        );
+        assert_ne!(
+            e.status().state,
+            ClaimLoopState::PersistedStateCorrupt,
+            "a self-healed clock must not still read as corrupt"
         );
     }
 
