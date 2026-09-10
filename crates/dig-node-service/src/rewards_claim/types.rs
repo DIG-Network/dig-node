@@ -162,9 +162,9 @@ pub enum ClaimLoopState {
     /// - a future-dated clock is SELF-HEALING — `t > now` goes false the moment real time passes
     ///   the stored timestamp, so the very next cycle after catch-up reads as whatever
     ///   `compute_state` decides (typically `Nominal`), never stuck here.
-    /// This state exists so that refusal is visible rather than a silent, permanent freeze that
-    /// reads as `Nominal` (the pre-F9 shape of the F10 defect) — or, before F16, a permanent freeze
-    /// of its OWN under a different name once the clock had already caught up.
+    ///   This state exists so that refusal is visible rather than a silent, permanent freeze that
+    ///   reads as `Nominal` (the pre-F9 shape of the F10 defect) — or, before F16, a permanent freeze
+    ///   of its OWN under a different name once the clock had already caught up.
     PersistedStateCorrupt,
     /// F9: the cadence has not yet elapsed since the last cycle that ran to completion — a
     /// DELIBERATE skip, its own named condition rather than the absence of one. Without this, the

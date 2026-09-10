@@ -888,7 +888,9 @@ mod tests {
                 .unwrap()
                 .contains(&launcher_id)
             {
-                return Err(ClaimPortError::Other("simulated reserve_asset_id fault".into()));
+                return Err(ClaimPortError::Other(
+                    "simulated reserve_asset_id fault".into(),
+                ));
             }
             self.distributors
                 .lock()
