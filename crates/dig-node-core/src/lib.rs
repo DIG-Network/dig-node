@@ -9640,9 +9640,11 @@ mod tests {
         let (node, _td) = test_node(None);
         let launcher_id = [0x11u8; 32];
         let report = sample_distributor_report(0x11, vec![]);
-        assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
-            reports: std::collections::HashMap::from([(launcher_id, Ok(report.clone()))]),
-        })));
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report.clone()))]),
+            }))
+        );
 
         let resp = rt().block_on(handle_rpc(
             &node,
@@ -9652,8 +9654,12 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         ));
         let result = &resp["result"];
-        let keys: std::collections::BTreeSet<&str> =
-            result.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: std::collections::BTreeSet<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             keys,
             std::collections::BTreeSet::from([
@@ -9675,21 +9681,33 @@ mod tests {
             "the wire body's key SET must be exactly this — a struct assertion cannot see a wrong \
              key name or an extra field"
         );
-        assert_eq!(result["launcher_id"], json!(hex::encode(report.launcher_id)));
+        assert_eq!(
+            result["launcher_id"],
+            json!(hex::encode(report.launcher_id))
+        );
         assert_eq!(result["store_id"], json!(hex::encode(report.store_id)));
         assert_eq!(result["root"], json!(hex::encode(report.root)));
         assert_eq!(result["epoch_seconds"], json!(report.epoch_seconds));
         assert_eq!(result["first_epoch_start"], json!(report.first_epoch_start));
         assert_eq!(result["payout_threshold"], json!(report.payout_threshold));
         assert_eq!(result["fee_bps"], json!(report.fee_bps));
-        assert_eq!(result["withdrawal_share_bps"], json!(report.withdrawal_share_bps));
-        assert_eq!(result["reserve_base_units"], json!(report.reserve_base_units));
+        assert_eq!(
+            result["withdrawal_share_bps"],
+            json!(report.withdrawal_share_bps)
+        );
+        assert_eq!(
+            result["reserve_base_units"],
+            json!(report.reserve_base_units)
+        );
         assert_eq!(result["entry_count"], json!(report.entry_count));
         assert_eq!(
             result["current_distributor_epoch"],
             json!(report.current_distributor_epoch)
         );
-        assert_eq!(result["last_entry_write_at"], json!(report.last_entry_write_at));
+        assert_eq!(
+            result["last_entry_write_at"],
+            json!(report.last_entry_write_at)
+        );
         assert_eq!(result["entry_set_stale"], json!(report.entry_set_stale));
         assert_eq!(result["observed_at"], json!(report.observed_at));
     }
@@ -9711,9 +9729,11 @@ mod tests {
             recoverable_base_units: 900,
         };
         let report = sample_distributor_report(0x22, vec![slot.clone()]);
-        assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
-            reports: std::collections::HashMap::from([(launcher_id, Ok(report.clone()))]),
-        })));
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report.clone()))]),
+            }))
+        );
 
         let resp = rt().block_on(handle_rpc(
             &node,
@@ -9723,8 +9743,12 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         ));
         let result = &resp["result"];
-        let keys: std::collections::BTreeSet<&str> =
-            result.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: std::collections::BTreeSet<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             keys,
             std::collections::BTreeSet::from([
@@ -9735,14 +9759,24 @@ mod tests {
                 "observed_at",
             ])
         );
-        assert_eq!(result["launcher_id"], json!(hex::encode(report.launcher_id)));
-        assert_eq!(result["withdrawal_share_bps"], json!(report.withdrawal_share_bps));
+        assert_eq!(
+            result["launcher_id"],
+            json!(hex::encode(report.launcher_id))
+        );
+        assert_eq!(
+            result["withdrawal_share_bps"],
+            json!(report.withdrawal_share_bps)
+        );
         assert_eq!(result["epoch_seconds"], json!(report.epoch_seconds));
         assert_eq!(result["observed_at"], json!(report.observed_at));
         let commitments = result["commitments"].as_array().unwrap();
         assert_eq!(commitments.len(), 1);
-        let row_keys: std::collections::BTreeSet<&str> =
-            commitments[0].as_object().unwrap().keys().map(String::as_str).collect();
+        let row_keys: std::collections::BTreeSet<&str> = commitments[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             row_keys,
             std::collections::BTreeSet::from([
@@ -9772,7 +9806,10 @@ mod tests {
         let (node, _td) = test_node(None);
         let launcher_id = [0x44u8; 32];
 
-        for method in ["dig.getRewardDistributor", "dig.listRewardDistributorCommitments"] {
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
             let resp = rt().block_on(handle_rpc(
                 &node,
                 json!({"jsonrpc":"2.0","id":1,"method":method,
@@ -9780,8 +9817,14 @@ mod tests {
                 crate::download::ReadOrigin::Local,
                 crate::download::RequestProvenance::FirstParty,
             ));
-            assert!(resp.get("result").is_none(), "{method}: must not answer a result at all");
-            assert_eq!(resp["error"]["data"]["code"], json!("REWARD_CHAIN_UNAVAILABLE"));
+            assert!(
+                resp.get("result").is_none(),
+                "{method}: must not answer a result at all"
+            );
+            assert_eq!(
+                resp["error"]["data"]["code"],
+                json!("REWARD_CHAIN_UNAVAILABLE")
+            );
             assert_ne!(
                 resp["error"]["data"]["code"],
                 json!("REWARD_INVALID_WITHDRAWAL_SHARE"),
@@ -9803,14 +9846,19 @@ mod tests {
     fn reward_distributor_methods_refuse_whole_call_on_invalid_withdrawal_share() {
         let (node, _td) = test_node(None);
         let launcher_id = [0x55u8; 32];
-        assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
-            reports: std::collections::HashMap::from([(
-                launcher_id,
-                Err(crate::rewards::port::ChainPortError::InvalidWithdrawalShare),
-            )]),
-        })));
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(
+                    launcher_id,
+                    Err(crate::rewards::port::ChainPortError::InvalidWithdrawalShare),
+                )]),
+            }))
+        );
 
-        for method in ["dig.getRewardDistributor", "dig.listRewardDistributorCommitments"] {
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
             let resp = rt().block_on(handle_rpc(
                 &node,
                 json!({"jsonrpc":"2.0","id":1,"method":method,
@@ -9818,7 +9866,10 @@ mod tests {
                 crate::download::ReadOrigin::Local,
                 crate::download::RequestProvenance::FirstParty,
             ));
-            assert!(resp.get("result").is_none(), "{method}: must refuse the whole call");
+            assert!(
+                resp.get("result").is_none(),
+                "{method}: must refuse the whole call"
+            );
             assert_eq!(
                 resp["error"]["data"]["code"],
                 json!("REWARD_INVALID_WITHDRAWAL_SHARE")
@@ -9836,9 +9887,11 @@ mod tests {
             let launcher_id = [seed; 32];
             let mut report = sample_distributor_report(seed, vec![]);
             report.entry_set_stale = expect_stale;
-            assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
-                reports: std::collections::HashMap::from([(launcher_id, Ok(report))]),
-            })));
+            assert!(
+                node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                    reports: std::collections::HashMap::from([(launcher_id, Ok(report))]),
+                }))
+            );
             let resp = rt().block_on(handle_rpc(
                 &node,
                 json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardDistributor",
@@ -9875,12 +9928,14 @@ mod tests {
         };
         let report_a = sample_distributor_report(0x70, vec![slot_a]);
         let report_b = sample_distributor_report(0x71, vec![slot_b]);
-        assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
-            reports: std::collections::HashMap::from([
-                (launcher_a, Ok(report_a)),
-                (launcher_b, Ok(report_b)),
-            ]),
-        })));
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([
+                    (launcher_a, Ok(report_a)),
+                    (launcher_b, Ok(report_b)),
+                ]),
+            }))
+        );
 
         let resp_a = rt().block_on(handle_rpc(
             &node,
