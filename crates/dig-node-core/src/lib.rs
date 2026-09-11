@@ -9941,6 +9941,101 @@ mod tests {
         }
     }
 
+    /// **Proves:** a `withdrawal_share_bps` ABOVE the legitimate `0..=10_000` range refuses the
+    /// WHOLE call on BOTH reward-distributor methods, and the out-of-range figure reaches no
+    /// response body. The fake port hands back an `Ok` report carrying `10_001` - exactly what a
+    /// wrapped narrowing (`74_536 as u16` = `9_000`) or a buggy adapter would look like from this
+    /// seam - so the refusal proved here is the HANDLER's, with no adapter cooperation
+    /// (dig_ecosystem#3284).
+    /// **Catches:** the handler emitting the figure verbatim, and the tempting "safe" fix of
+    /// clamping it to `10_000`, which would report a confident 100% recoverable share for a
+    /// distributor whose real constant is nonsense. Both are asserted against by name.
+    #[test]
+    fn reward_distributor_methods_refuse_a_withdrawal_share_above_the_legitimate_range() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x78u8; 32];
+        let mut report = sample_distributor_report(0x78, vec![]);
+        report.withdrawal_share_bps = 10_001;
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report))]),
+            }))
+        );
+
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(
+                resp.get("result").is_none(),
+                "{method}: an out-of-range withdrawal share must refuse the whole call: {resp}"
+            );
+            assert_eq!(
+                resp["error"]["data"]["code"],
+                json!("REWARD_INVALID_WITHDRAWAL_SHARE"),
+                "{method}: {resp}"
+            );
+            let body = resp.to_string();
+            assert!(
+                !body.contains("10001"),
+                "{method}: the out-of-range figure must not reach the wire: {body}"
+            );
+            assert!(
+                !body.contains("10000"),
+                "{method}: a clamp to 100% is a money lie, not a safe default: {body}"
+            );
+        }
+    }
+
+    /// **Proves:** the boundary is `> 10_000`, not `>= 10_000`: 10,000 basis points IS a
+    /// legitimate 100% withdrawal share, and both methods still ANSWER for it.
+    /// **Catches:** the refusal above widening into a blanket refusal - an off-by-one that would
+    /// blind every distributor whose funder takes the whole share, while the refusal test above
+    /// stayed green. Neither test alone shows the guard is selective.
+    #[test]
+    fn reward_distributor_methods_answer_at_the_ten_thousand_bps_boundary() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x79u8; 32];
+        let mut report = sample_distributor_report(0x79, vec![]);
+        // Stated as a LITERAL, not read from the dispatch module's constant: the bound is a
+        // contract figure (10,000 bps = 100%), so a change to that constant must fail here.
+        report.withdrawal_share_bps = 10_000;
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report))]),
+            }))
+        );
+
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(
+                resp.get("error").is_none(),
+                "{method}: a 100% share is legitimate and must be answered: {resp}"
+            );
+            assert_eq!(
+                resp["result"]["withdrawal_share_bps"],
+                json!(10_000),
+                "{method}: the boundary value must be reported verbatim: {resp}"
+            );
+        }
+    }
+
     /// **Proves:** `entry_set_stale` is threaded through, both `true` and `false`, straight from
     /// the port's chain-derived figure — never hardcoded, never inverted — with BOTH cases served
     /// by ONE port installed ONCE on ONE node, answered by the REQUESTED launcher id. Each

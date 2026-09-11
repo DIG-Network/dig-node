@@ -17,7 +17,7 @@
 
 use serde_json::{json, Value};
 
-use crate::rewards::port::ChainPortError;
+use crate::rewards::port::{ChainPortError, DistributorReport};
 use crate::Node;
 // The relocated body below calls a number of crate-root private helpers (`rpc_err`,
 // `parse_store_id_arg`, `pin_request_root`, …) UNQUALIFIED, exactly as it did when it lived in
@@ -80,6 +80,32 @@ fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value
             "data": { "code": "CONTROL_ERROR", "origin": "control" }
         }}),
     }
+}
+
+/// The largest legitimate `withdrawal_share_bps`: 10,000 basis points IS 100%, so this is an
+/// inclusive bound and `10_000` itself is a valid distributor constant, not an error.
+const MAX_WITHDRAWAL_SHARE_BPS: u16 = 10_000;
+
+/// Refuses a report whose `withdrawal_share_bps` is outside the legitimate `0..=10_000` range
+/// before any part of it reaches the wire (dig_ecosystem#3284).
+///
+/// The port's own adapter is contracted to refuse this (`ChainPortError::InvalidWithdrawalShare`),
+/// but that contract is enforced NOWHERE at this seam unless it is checked here: a chain constant
+/// of `74_536` narrowed into the wire's `u16` renders as `9_000` — an ordinary-looking 90% share —
+/// and `65_536` renders as `0`. Either is a figure a funder reads before deciding whether to claw
+/// back, and neither looks wrong, so the handler cannot delegate the check to the thing it is
+/// reading from.
+///
+/// Refuses rather than CLAMPS deliberately. Clamping `74_536` to `10_000` would hand back a
+/// confident "100% recoverable" for a distributor whose real constant is nonsense — a money lie
+/// dressed as a safe default. Refusing the WHOLE call costs no good data either:
+/// `withdrawal_share_bps` is curried once per distributor at launch, so every commitment slot in
+/// one response shares the one invalid value and there is no honest row to keep.
+fn range_checked_report(report: DistributorReport) -> Result<DistributorReport, ChainPortError> {
+    if report.withdrawal_share_bps > MAX_WITHDRAWAL_SHARE_BPS {
+        return Err(ChainPortError::InvalidWithdrawalShare);
+    }
+    Ok(report)
 }
 
 /// Parses `params.launcher_id` (64-hex) into the port's own `[u8; 32]` shape
@@ -921,7 +947,13 @@ impl RpcDispatch for Node {
                 let Some(port) = node.reward_chain_port() else {
                     return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
                 };
-                let report = match port.distributor_report(launcher_id).await {
+                // Range-check at THIS seam, not only in the adapter: see
+                // `range_checked_report` for why an out-of-range share must refuse here.
+                let report = match port
+                    .distributor_report(launcher_id)
+                    .await
+                    .and_then(range_checked_report)
+                {
                     Ok(report) => report,
                     Err(e) => return reward_chain_port_error_response(&id, &e),
                 };
@@ -957,7 +989,13 @@ impl RpcDispatch for Node {
                 let Some(port) = node.reward_chain_port() else {
                     return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
                 };
-                let report = match port.distributor_report(launcher_id).await {
+                // Range-check at THIS seam, not only in the adapter: see
+                // `range_checked_report` for why an out-of-range share must refuse here.
+                let report = match port
+                    .distributor_report(launcher_id)
+                    .await
+                    .and_then(range_checked_report)
+                {
                     Ok(report) => report,
                     Err(e) => return reward_chain_port_error_response(&id, &e),
                 };
