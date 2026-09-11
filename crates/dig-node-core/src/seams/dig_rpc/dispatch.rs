@@ -17,6 +17,7 @@
 
 use serde_json::{json, Value};
 
+use crate::rewards::port::ChainPortError;
 use crate::Node;
 // The relocated body below calls a number of crate-root private helpers (`rpc_err`,
 // `parse_store_id_arg`, `pin_request_root`, …) UNQUALIFIED, exactly as it did when it lived in
@@ -33,6 +34,63 @@ use crate::*;
 /// `dig-node-service`'s `ErrorCode::EngineWarming` mints the SAME numeric code independently on its
 /// own surface.
 const ENGINE_WARMING: i64 = -32002;
+
+/// `REWARD_CHAIN_UNAVAILABLE` (dig_ecosystem#3269): no reward-distributor chain-read adapter is
+/// wired yet (`rewards::port::ChainPortError::Unavailable`, or no adapter installed at all).
+/// Distinct from [`REWARD_INVALID_WITHDRAWAL_SHARE`] below — a caller must be able to tell "ask me
+/// again once the adapter lands" apart from "this distributor's own constant is out of range".
+/// Reuses [`CONTROL_ERROR`]'s numeric code (both are control-plane runtime errors, `-32032`), but
+/// carries its own `data.code` machine string so the two are still distinguishable in the body.
+const REWARD_CHAIN_UNAVAILABLE_MACHINE: &str = "REWARD_CHAIN_UNAVAILABLE";
+
+/// `REWARD_INVALID_WITHDRAWAL_SHARE` (dig_ecosystem#3269/#3284/#3303): the distributor's
+/// `withdrawal_share_bps` does not fit the wire's `u16` domain or exceeds the legitimate
+/// `0..=10_000` range. Refuses the WHOLE call — see `rewards::port::ChainPortError::InvalidWithdrawalShare`'s
+/// doc for why a per-distributor curried value makes that the correct shape, never a `0` or an
+/// omitted field.
+const REWARD_INVALID_WITHDRAWAL_SHARE: i64 = -32033;
+
+/// Maps a [`ChainPortError`] to the JSON-RPC error response for both reward-distributor read
+/// methods (dig_ecosystem#3269 unit 2) — one mapping so `dig.getRewardDistributor` and
+/// `dig.listRewardDistributorCommitments` can never disagree about how a given port failure reads
+/// on the wire.
+fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value {
+    match error {
+        ChainPortError::Unavailable => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": "reward-distributor chain read is unavailable: no chain-read adapter is wired yet",
+            "data": { "code": REWARD_CHAIN_UNAVAILABLE_MACHINE, "origin": "control" }
+        }}),
+        ChainPortError::InvalidWithdrawalShare => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": REWARD_INVALID_WITHDRAWAL_SHARE,
+            "message": "distributor's withdrawal_share_bps is out of range (must fit u16 and be <= 10000)",
+            "data": { "code": "REWARD_INVALID_WITHDRAWAL_SHARE", "origin": "control" }
+        }}),
+        ChainPortError::Other(msg) => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": format!("reward-distributor chain read failed: {msg}"),
+            "data": { "code": "CONTROL_ERROR", "origin": "control" }
+        }}),
+    }
+}
+
+/// Parses `params.launcher_id` (64-hex) into the port's own `[u8; 32]` shape
+/// (`rewards::port::Bytes32`) for `dig.getRewardDistributor` /
+/// `dig.listRewardDistributorCommitments`.
+fn parse_launcher_id_arg(params: &Value) -> Result<[u8; 32], String> {
+    let s = params
+        .get("launcher_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "params.launcher_id must be a 64-hex string".to_string())?;
+    let h = s.trim_start_matches("0x");
+    if h.len() != 64 {
+        return Err(format!("launcher_id must be 64-hex: {s}"));
+    }
+    let bytes = hex::decode(h).map_err(|_| format!("launcher_id is not hex: {s}"))?;
+    bytes
+        .try_into()
+        .map_err(|_: Vec<u8>| format!("launcher_id must be 32 bytes (64 hex): {s}"))
+}
 
 /// Decide the miss error for a request that fell all the way through with no configured upstream
 /// (dig_ecosystem#2097): `(code, message)`.
@@ -838,6 +896,80 @@ impl RpcDispatch for Node {
                     .map(reward_prover_status_to_wire)
                     .collect();
                 let result = dig_rpc_protocol::types::GetRewardProverStatusResult { statuses };
+                return json!({"jsonrpc":"2.0","id":id,"result": result});
+            }
+            // dig.getRewardDistributor (dig_ecosystem#3269 unit 2, SPEC §2.6/§12.4) — CONTROL
+            // plane: loopback admin / in-process FFI ONLY, absent from `is_peer_reachable_method`
+            // (`reward_methods_tier_guard.rs` fails closed on that). Chain-derived state ONLY —
+            // never the local prover loop's self-reported state (see `GetRewardProverStatus`
+            // above for that). Goes entirely through `rewards::port::RewardsChainPort`: this
+            // crate never calls `dig-rewards-coin` itself (dig_ecosystem#3269 unit 0).
+            Some(Method::GetRewardDistributor) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                let launcher_id = match parse_launcher_id_arg(&params) {
+                    Ok(id) => id,
+                    Err(msg) => return rpc_err(&id, -32602, &msg),
+                };
+                let Some(port) = node.reward_chain_port() else {
+                    return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                };
+                let report = match port.distributor_report(launcher_id).await {
+                    Ok(report) => report,
+                    Err(e) => return reward_chain_port_error_response(&id, &e),
+                };
+                let result = dig_rpc_protocol::types::GetRewardDistributorResult {
+                    launcher_id: hex::encode(report.launcher_id),
+                    store_id: hex::encode(report.store_id),
+                    root: hex::encode(report.root),
+                    epoch_seconds: report.epoch_seconds,
+                    first_epoch_start: report.first_epoch_start,
+                    payout_threshold: report.payout_threshold,
+                    fee_bps: report.fee_bps,
+                    withdrawal_share_bps: report.withdrawal_share_bps,
+                    reserve_base_units: report.reserve_base_units,
+                    entry_count: report.entry_count,
+                    current_distributor_epoch: report.current_distributor_epoch,
+                    last_entry_write_at: report.last_entry_write_at,
+                    entry_set_stale: report.entry_set_stale,
+                    observed_at: report.observed_at,
+                };
+                return json!({"jsonrpc":"2.0","id":id,"result": result});
+            }
+            // dig.listRewardDistributorCommitments (dig_ecosystem#3269 unit 2, SPEC §7.4 clause 5)
+            // — CONTROL plane, same guard shape as `GetRewardDistributor` above. `commitments`
+            // empty is legitimate (a donation-only distributor); `recoverable_base_units` per slot
+            // is ALWAYS the port's pre-computed figure -- this handler never recomputes it (see
+            // `rewards::port::CommitmentSlot`'s doc for why that arithmetic never lives here).
+            Some(Method::ListRewardDistributorCommitments) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                let launcher_id = match parse_launcher_id_arg(&params) {
+                    Ok(id) => id,
+                    Err(msg) => return rpc_err(&id, -32602, &msg),
+                };
+                let Some(port) = node.reward_chain_port() else {
+                    return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                };
+                let report = match port.distributor_report(launcher_id).await {
+                    Ok(report) => report,
+                    Err(e) => return reward_chain_port_error_response(&id, &e),
+                };
+                let commitments: Vec<dig_rpc_protocol::types::RewardDistributorCommitment> = report
+                    .commitments
+                    .iter()
+                    .map(|c| dig_rpc_protocol::types::RewardDistributorCommitment {
+                        epoch_start: c.epoch_start,
+                        clawback_puzzle_hash: hex::encode(c.clawback_puzzle_hash),
+                        rewards_base_units: c.rewards_base_units,
+                        recoverable_base_units: c.recoverable_base_units,
+                    })
+                    .collect();
+                let result = dig_rpc_protocol::types::ListRewardDistributorCommitmentsResult {
+                    launcher_id: hex::encode(report.launcher_id),
+                    withdrawal_share_bps: report.withdrawal_share_bps,
+                    epoch_seconds: report.epoch_seconds,
+                    commitments,
+                    observed_at: report.observed_at,
+                };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
             Some(Method::CacheSetCapBytes) => {

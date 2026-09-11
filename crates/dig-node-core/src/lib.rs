@@ -590,6 +590,16 @@ pub struct Node {
     /// [`rewards::funded::NotConfiguredReason::NoStateDirectory`] — UNKNOWN, deliberately never an
     /// empty funded set.
     funded_distributors: OnceLock<rewards::funded::FundedDistributorRegistry>,
+    /// The chain seam `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`
+    /// (dig_ecosystem#3269 units 1-2) read through — [`rewards::port::RewardsChainPort`].
+    ///
+    /// A slot rather than a constructor argument for the same reason [`Node::mirror_pointers`] is
+    /// one. Nothing installs a real adapter yet: the one that calls `dig-rewards-coin` lives in
+    /// `dig-node-service` (dig_ecosystem#3268, a sibling unit this crate never depends on — see
+    /// `rewards::port`'s module doc). Until it is installed, both handlers answer
+    /// [`rewards::port::ChainPortError::Unavailable`] — a real "no chain source is wired yet",
+    /// never a silent zero or empty list.
+    reward_chain_port: OnceLock<Arc<dyn rewards::port::RewardsChainPort>>,
 }
 
 impl Node {
@@ -661,6 +671,28 @@ impl Node {
                 rewards::funded::NotConfiguredReason::NoStateDirectory,
             ),
         }
+    }
+
+    /// Install this node's reward-distributor chain-read adapter (dig_ecosystem#3269 units 1-2),
+    /// once. Returns `false` if one is already installed, in which case NOTHING changed — mirrors
+    /// [`Node::install_funded_distributor_registry`]'s same one-shot discipline.
+    ///
+    /// Called from tests today: the startup path that would install the real adapter belongs to
+    /// dig_ecosystem#3268's files (`dig-node-service`), so clippy's non-test lib target sees no
+    /// production caller yet.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn install_reward_chain_port(
+        &self,
+        port: Arc<dyn rewards::port::RewardsChainPort>,
+    ) -> bool {
+        self.reward_chain_port.set(port).is_ok()
+    }
+
+    /// The installed reward-distributor chain-read adapter, or `None` when nothing has installed
+    /// one — `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments` must treat `None`
+    /// exactly like [`rewards::port::ChainPortError::Unavailable`], never a zero or empty answer.
+    pub(crate) fn reward_chain_port(&self) -> Option<&Arc<dyn rewards::port::RewardsChainPort>> {
+        self.reward_chain_port.get()
     }
 }
 
@@ -4911,6 +4943,7 @@ impl Node {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         })
     }
 
@@ -5252,6 +5285,7 @@ pub(crate) mod test_support {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         };
         (Arc::new(node), td)
     }
@@ -6106,6 +6140,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         };
         (node, td)
     }
@@ -6242,6 +6277,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         };
 
         // Missing before the pull.
@@ -6312,6 +6348,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -6413,6 +6450,7 @@ mod tests {
                 mirror_pointers: OnceLock::new(),
                 reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
                 funded_distributors: OnceLock::new(),
+                reward_chain_port: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -6492,6 +6530,7 @@ mod tests {
                 mirror_pointers: OnceLock::new(),
                 reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
                 funded_distributors: OnceLock::new(),
+                reward_chain_port: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -9504,6 +9543,377 @@ mod tests {
         assert_eq!(all["result"]["statuses"].as_array().unwrap().len(), 2);
     }
 
+    /// An in-memory `RewardsChainPort` for `dig.getRewardDistributor` /
+    /// `dig.listRewardDistributorCommitments` dispatch tests (dig_ecosystem#3269 unit 2) — keyed
+    /// per launcher id so two distinct distributors can be driven through the SAME dispatch path
+    /// with distinct answers, exactly the shape the money-figure subject test needs.
+    struct FakeRewardsChainPort {
+        reports: std::collections::HashMap<
+            [u8; 32],
+            Result<crate::rewards::port::DistributorReport, crate::rewards::port::ChainPortError>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::rewards::port::RewardsChainPort for FakeRewardsChainPort {
+        async fn funded_distributors(
+            &self,
+        ) -> Result<Vec<crate::rewards::port::DistributorRef>, crate::rewards::port::ChainPortError>
+        {
+            Err(crate::rewards::port::ChainPortError::Unavailable)
+        }
+
+        async fn distributor_state(
+            &self,
+            _launcher_id: crate::rewards::port::Bytes32,
+        ) -> Result<crate::rewards::port::DistributorChainState, crate::rewards::port::ChainPortError>
+        {
+            Err(crate::rewards::port::ChainPortError::Unavailable)
+        }
+
+        async fn submit_entry_writes(
+            &self,
+            _bundle: crate::rewards::port::EntryWriteBundle,
+        ) -> Result<(), crate::rewards::port::ChainPortError> {
+            Err(crate::rewards::port::ChainPortError::Unavailable)
+        }
+
+        async fn spend_new_epoch(
+            &self,
+            _launcher_id: crate::rewards::port::Bytes32,
+        ) -> Result<(), crate::rewards::port::ChainPortError> {
+            Err(crate::rewards::port::ChainPortError::Unavailable)
+        }
+
+        async fn distributor_report(
+            &self,
+            launcher_id: crate::rewards::port::Bytes32,
+        ) -> Result<crate::rewards::port::DistributorReport, crate::rewards::port::ChainPortError>
+        {
+            self.reports
+                .get(&launcher_id)
+                .cloned()
+                .unwrap_or(Err(crate::rewards::port::ChainPortError::Unavailable))
+        }
+    }
+
+    /// A `DistributorReport` with every field distinctly derived from `seed`, so two reports built
+    /// from two different seeds can never accidentally collide on a real field.
+    fn sample_distributor_report(
+        seed: u8,
+        commitments: Vec<crate::rewards::port::CommitmentSlot>,
+    ) -> crate::rewards::port::DistributorReport {
+        crate::rewards::port::DistributorReport {
+            launcher_id: [seed; 32],
+            store_id: [seed.wrapping_add(1); 32],
+            root: [seed.wrapping_add(2); 32],
+            epoch_seconds: 604_800 + seed as u64,
+            first_epoch_start: 1_700_000_000 + seed as u64,
+            payout_threshold: 1_000_000 + seed as u64,
+            fee_bps: 100 + seed as u16,
+            withdrawal_share_bps: 9_000 + seed as u16,
+            reserve_base_units: 10_000_000 + seed as u64 * 1_000,
+            entry_count: 3 + seed as u64,
+            current_distributor_epoch: 5 + seed as u64,
+            last_entry_write_at: Some(1_700_100_000 + seed as u64),
+            entry_set_stale: seed % 2 == 0,
+            commitments,
+            observed_at: 1_700_200_000 + seed as u64,
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// **Proves:** `dig.getRewardDistributor` answers with the port's real values through the
+    /// REAL dispatch path (`handle_rpc` -> `handle_rpc_as` -> `RpcDispatch::dispatch`), asserted on
+    /// the serialized JSON body's key SET, not a Rust struct (a struct assertion cannot see a
+    /// serde rename or an extra field — dig_ecosystem#3269's evidence bar).
+    /// **Catches:** a handler that drops a field, mis-cases a key, or answers from a stub instead
+    /// of the port.
+    #[test]
+    fn get_reward_distributor_answers_with_real_values_through_dispatch() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x11u8; 32];
+        let report = sample_distributor_report(0x11, vec![]);
+        assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+            reports: std::collections::HashMap::from([(launcher_id, Ok(report.clone()))]),
+        })));
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardDistributor",
+                   "params":{"launcher_id": hex::encode(launcher_id)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let result = &resp["result"];
+        let keys: std::collections::BTreeSet<&str> =
+            result.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "launcher_id",
+                "store_id",
+                "root",
+                "epoch_seconds",
+                "first_epoch_start",
+                "payout_threshold",
+                "fee_bps",
+                "withdrawal_share_bps",
+                "reserve_base_units",
+                "entry_count",
+                "current_distributor_epoch",
+                "last_entry_write_at",
+                "entry_set_stale",
+                "observed_at",
+            ]),
+            "the wire body's key SET must be exactly this — a struct assertion cannot see a wrong \
+             key name or an extra field"
+        );
+        assert_eq!(result["launcher_id"], json!(hex::encode(report.launcher_id)));
+        assert_eq!(result["store_id"], json!(hex::encode(report.store_id)));
+        assert_eq!(result["root"], json!(hex::encode(report.root)));
+        assert_eq!(result["epoch_seconds"], json!(report.epoch_seconds));
+        assert_eq!(result["first_epoch_start"], json!(report.first_epoch_start));
+        assert_eq!(result["payout_threshold"], json!(report.payout_threshold));
+        assert_eq!(result["fee_bps"], json!(report.fee_bps));
+        assert_eq!(result["withdrawal_share_bps"], json!(report.withdrawal_share_bps));
+        assert_eq!(result["reserve_base_units"], json!(report.reserve_base_units));
+        assert_eq!(result["entry_count"], json!(report.entry_count));
+        assert_eq!(
+            result["current_distributor_epoch"],
+            json!(report.current_distributor_epoch)
+        );
+        assert_eq!(result["last_entry_write_at"], json!(report.last_entry_write_at));
+        assert_eq!(result["entry_set_stale"], json!(report.entry_set_stale));
+        assert_eq!(result["observed_at"], json!(report.observed_at));
+    }
+
+    /// **Proves:** `dig.listRewardDistributorCommitments` answers with the port's real values
+    /// through the real dispatch path, asserted on the serialized body's key set and per-slot
+    /// values — including the legitimate empty-`commitments` case being distinguishable from an
+    /// error (it is a real `result`, not an `error`).
+    /// **Catches:** a handler that restates `recoverable_base_units` itself instead of echoing the
+    /// port's pre-computed figure, or mis-cases a key.
+    #[test]
+    fn list_reward_distributor_commitments_answers_with_real_values_through_dispatch() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x22u8; 32];
+        let slot = crate::rewards::port::CommitmentSlot {
+            epoch_start: 42,
+            clawback_puzzle_hash: [0x33u8; 32],
+            rewards_base_units: 1_000,
+            recoverable_base_units: 900,
+        };
+        let report = sample_distributor_report(0x22, vec![slot.clone()]);
+        assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+            reports: std::collections::HashMap::from([(launcher_id, Ok(report.clone()))]),
+        })));
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributorCommitments",
+                   "params":{"launcher_id": hex::encode(launcher_id)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let result = &resp["result"];
+        let keys: std::collections::BTreeSet<&str> =
+            result.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "launcher_id",
+                "withdrawal_share_bps",
+                "epoch_seconds",
+                "commitments",
+                "observed_at",
+            ])
+        );
+        assert_eq!(result["launcher_id"], json!(hex::encode(report.launcher_id)));
+        assert_eq!(result["withdrawal_share_bps"], json!(report.withdrawal_share_bps));
+        assert_eq!(result["epoch_seconds"], json!(report.epoch_seconds));
+        assert_eq!(result["observed_at"], json!(report.observed_at));
+        let commitments = result["commitments"].as_array().unwrap();
+        assert_eq!(commitments.len(), 1);
+        let row_keys: std::collections::BTreeSet<&str> =
+            commitments[0].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            row_keys,
+            std::collections::BTreeSet::from([
+                "epoch_start",
+                "clawback_puzzle_hash",
+                "rewards_base_units",
+                "recoverable_base_units",
+            ])
+        );
+        assert_eq!(commitments[0]["epoch_start"], json!(42));
+        assert_eq!(
+            commitments[0]["clawback_puzzle_hash"],
+            json!(hex::encode([0x33u8; 32]))
+        );
+        assert_eq!(commitments[0]["rewards_base_units"], json!(1_000));
+        assert_eq!(commitments[0]["recoverable_base_units"], json!(900));
+    }
+
+    /// **Proves:** with no chain-read adapter installed, BOTH reward-distributor methods answer a
+    /// distinct error — never a zero, never an empty list — and it is NOT the same machine code as
+    /// the `withdrawal_share_bps` refusal (so a caller can tell "try again later" apart from "this
+    /// distributor's own constant is broken").
+    /// **Catches:** a handler that defaults to `Default::default()` or an empty result on a `None`
+    /// port instead of erroring.
+    #[test]
+    fn reward_distributor_methods_chain_unavailable_is_a_distinct_error_never_a_zero_or_empty() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x44u8; 32];
+
+        for method in ["dig.getRewardDistributor", "dig.listRewardDistributorCommitments"] {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(resp.get("result").is_none(), "{method}: must not answer a result at all");
+            assert_eq!(resp["error"]["data"]["code"], json!("REWARD_CHAIN_UNAVAILABLE"));
+            assert_ne!(
+                resp["error"]["data"]["code"],
+                json!("REWARD_INVALID_WITHDRAWAL_SHARE"),
+                "{method}: chain-unavailable must not share a machine code with the \
+                 withdrawal-share refusal"
+            );
+        }
+    }
+
+    /// **Proves:** when the port refuses because `withdrawal_share_bps` is out of range (either
+    /// side: doesn't fit `u16`, the caller narrows before calling this port, or the adapter's own
+    /// `0..=10_000` domain check), BOTH methods refuse the WHOLE call with a distinct machine code
+    /// — never a `0`, never an empty `commitments` list standing in for the refusal.
+    /// **Mutation-probe:** flipping `reward_chain_port_error_response`'s
+    /// `InvalidWithdrawalShare` arm to instead answer a `withdrawal_share_bps: 0` result turns this
+    /// RED (see the accompanying report for the before/after run) — proving the test is not
+    /// vacuously green under the defect it exists to catch.
+    #[test]
+    fn reward_distributor_methods_refuse_whole_call_on_invalid_withdrawal_share() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x55u8; 32];
+        assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+            reports: std::collections::HashMap::from([(
+                launcher_id,
+                Err(crate::rewards::port::ChainPortError::InvalidWithdrawalShare),
+            )]),
+        })));
+
+        for method in ["dig.getRewardDistributor", "dig.listRewardDistributorCommitments"] {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(resp.get("result").is_none(), "{method}: must refuse the whole call");
+            assert_eq!(
+                resp["error"]["data"]["code"],
+                json!("REWARD_INVALID_WITHDRAWAL_SHARE")
+            );
+            assert_ne!(resp["error"]["code"], json!(0));
+        }
+    }
+
+    /// **Proves:** `entry_set_stale` is threaded through, both `true` and `false`, straight from
+    /// the port's chain-derived figure — never hardcoded, never inverted.
+    #[test]
+    fn get_reward_distributor_threads_entry_set_stale_both_ways() {
+        let (node, _td) = test_node(None);
+        for (seed, expect_stale) in [(0x60u8, true), (0x61u8, false)] {
+            let launcher_id = [seed; 32];
+            let mut report = sample_distributor_report(seed, vec![]);
+            report.entry_set_stale = expect_stale;
+            assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report))]),
+            })));
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardDistributor",
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert_eq!(resp["result"]["entry_set_stale"], json!(expect_stale));
+        }
+    }
+
+    /// **Proves:** two distinct distributors' money figures never cross-contaminate — the class of
+    /// defect dig-app#403's rewards pane shipped (a per-distributor total silently summed or
+    /// swapped). Reads BOTH distributors' `dig.listRewardDistributorCommitments` in the same test
+    /// and asserts neither the summed nor the swapped figure appears in either response.
+    /// **Mutation-probe:** swapping the two `FakeRewardsChainPort` entries' `recoverable_base_units`
+    /// turns this RED (see the accompanying report).
+    #[test]
+    fn commitment_money_figures_stay_attributed_to_their_own_distributor() {
+        let (node, _td) = test_node(None);
+        let launcher_a = [0x70u8; 32];
+        let launcher_b = [0x71u8; 32];
+        let slot_a = crate::rewards::port::CommitmentSlot {
+            epoch_start: 1,
+            clawback_puzzle_hash: [0xaau8; 32],
+            rewards_base_units: 5_000,
+            recoverable_base_units: 4_500,
+        };
+        let slot_b = crate::rewards::port::CommitmentSlot {
+            epoch_start: 2,
+            clawback_puzzle_hash: [0xbbu8; 32],
+            rewards_base_units: 7_000,
+            recoverable_base_units: 6_300,
+        };
+        let report_a = sample_distributor_report(0x70, vec![slot_a]);
+        let report_b = sample_distributor_report(0x71, vec![slot_b]);
+        assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+            reports: std::collections::HashMap::from([
+                (launcher_a, Ok(report_a)),
+                (launcher_b, Ok(report_b)),
+            ]),
+        })));
+
+        let resp_a = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributorCommitments",
+                   "params":{"launcher_id": hex::encode(launcher_a)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let resp_b = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.listRewardDistributorCommitments",
+                   "params":{"launcher_id": hex::encode(launcher_b)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        let recoverable_a = resp_a["result"]["commitments"][0]["recoverable_base_units"]
+            .as_u64()
+            .unwrap();
+        let recoverable_b = resp_b["result"]["commitments"][0]["recoverable_base_units"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(recoverable_a, 4_500);
+        assert_eq!(recoverable_b, 6_300);
+        let summed = 4_500 + 6_300;
+        let swapped_a = 6_300;
+        let swapped_b = 4_500;
+        assert_ne!(recoverable_a, summed);
+        assert_ne!(recoverable_b, summed);
+        assert_ne!(recoverable_a, swapped_a);
+        assert_ne!(recoverable_b, swapped_b);
+    }
+
     /// **Proves:** `total_paid_out_base_units`/`reserve_base_units` stay attributed to the
     /// `launcher_id` (distributor) that reported them — never summed across distributors, never
     /// cross-attributed to the other one. **Catches:** the class of defect a sibling adversarial
@@ -9974,6 +10384,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         };
 
         let before = handle_rpc(
@@ -17131,6 +17542,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         // A holder for this EXACT content is known via the DHT.
@@ -17184,6 +17596,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
@@ -17236,6 +17649,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
 
@@ -17270,6 +17684,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -17313,6 +17728,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -17358,6 +17774,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
