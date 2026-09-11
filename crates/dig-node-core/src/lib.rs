@@ -5527,6 +5527,124 @@ mod tests {
         }
     }
 
+    /// Every `-32xxx` wire number that appears anywhere in this crate's own sources, DISCOVERED by
+    /// reading them rather than by hand-listing them - the list is derived from the emitting sites,
+    /// so it cannot fall behind them.
+    ///
+    /// Comment-only lines are skipped: the docs in this crate legitimately DISCUSS numbers it does
+    /// not emit (another implementation's assignment, a rejected proposal), and requiring those to
+    /// be registered would push the guard towards being weakened rather than kept.
+    ///
+    /// A code mentioned in live code but never actually emitted - a test asserting one, say - is
+    /// still required to be classified. That is deliberate: classification is cheap, and the
+    /// alternative is teaching the scanner to recognise an "emitting site", which is exactly the
+    /// judgement call a forgotten registration hides behind.
+    fn wire_codes_mentioned_in_this_crate() -> std::collections::BTreeSet<i64> {
+        fn scan_line(line: &str, out: &mut std::collections::BTreeSet<i64>) {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                return;
+            }
+            // Scanned as BYTES, not by slicing the &str: these sources carry non-ASCII prose, and
+            // an arbitrary byte index into a `&str` is not guaranteed to be a char boundary.
+            let bytes = line.as_bytes();
+            for start in 0..bytes.len().saturating_sub(5) {
+                if &bytes[start..start + 3] != b"-32" {
+                    continue;
+                }
+                let digits = &bytes[start + 3..start + 6];
+                // Exactly three digits: `-32000`..`-32999` is the band. A longer digit run is some
+                // other number that merely begins this way and is not a wire code.
+                if !digits.iter().all(u8::is_ascii_digit)
+                    || bytes.get(start + 6).is_some_and(u8::is_ascii_digit)
+                {
+                    continue;
+                }
+                let text = std::str::from_utf8(&bytes[start..start + 6])
+                    .expect("six ASCII bytes are valid UTF-8");
+                if let Ok(code) = text.parse::<i64>() {
+                    out.insert(code);
+                }
+            }
+        }
+
+        fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeSet<i64>) {
+            let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}"));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+                    for line in text.lines() {
+                        scan_line(line, out);
+                    }
+                }
+            }
+        }
+
+        let mut found = std::collections::BTreeSet::new();
+        walk(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut found,
+        );
+        found
+    }
+
+    /// **Proves:** every wire number these sources contain is accounted for - either declared by
+    /// the taxonomy owner (`dig_rpc_protocol::ErrorCode::ALL`, resolved through
+    /// `seams::dig_rpc::errors::taxonomy_code` so the taxonomy is never restated here) or listed in
+    /// [`LOCAL_WIRE_CODES`] as a number this crate occupies that upstream does not declare.
+    ///
+    /// **Catches:** the defect that defeated the collision guard beside it - a number nobody
+    /// registered is invisible to a guard built over a registry. `-32033` was emitted by this crate
+    /// while already being `dig-node-service`'s `ControlIngressLimited`, and the old
+    /// `LOCAL_WIRE_CODES.len() >= 10` assertion stayed green because the number was never added.
+    /// Under THIS test it would have gone red without anyone remembering to register it.
+    #[test]
+    fn every_wire_code_this_crate_mentions_is_classified() {
+        let found = wire_codes_mentioned_in_this_crate();
+
+        // Scanner-liveness first: a walk that read nothing, or a comment filter that ate every
+        // line, would make the loop below vacuously true - the same failure mode being fixed here.
+        assert!(
+            found.len() >= 25,
+            "the source scan found only {} wire codes; it is not reading these sources",
+            found.len()
+        );
+        for known in [CONTROL_ERROR, RESOURCE_NOT_AVAILABLE, -32602] {
+            assert!(
+                found.contains(&known),
+                "the scan missed {known}, which is emitted in these sources; it is not reading what it claims"
+            );
+        }
+
+        for number in &found {
+            let canonical = crate::seams::dig_rpc::errors::taxonomy_code(*number);
+            let local = LOCAL_WIRE_CODES.iter().find(|(n, _)| n == number);
+            assert!(
+                canonical.is_some() || local.is_some(),
+                "wire code {number} appears in this crate's sources but is neither declared by                  dig-rpc-protocol nor registered in LOCAL_WIRE_CODES - register it (with the                  condition it names) or emit a declared code instead"
+            );
+        }
+
+        // Non-vacuity, without writing the number as a literal: writing `-32033` here would itself
+        // be a mention this scan must classify, which is the mechanism having teeth. Built by
+        // arithmetic instead, it shows the classifier REJECTS the number that slipped through, so
+        // re-introducing it anywhere in these sources fails the loop above.
+        let slipped_through = CONTROL_ERROR - 1;
+        assert!(
+            crate::seams::dig_rpc::errors::taxonomy_code(slipped_through).is_none()
+                && !LOCAL_WIRE_CODES.iter().any(|(n, _)| *n == slipped_through),
+            "{slipped_through} must be unclassified, or this test cannot fail on it"
+        );
+        assert!(
+            !found.contains(&slipped_through),
+            "{slipped_through} is back in these sources; it is already another surface's code"
+        );
+    }
+
     /// A per-THREAD counting allocator, installed process-wide only for the test binary.
     ///
     /// The #2160 acceptance bar is MEASURED, not reasoned: the peak-RSS test drives one cold decode
