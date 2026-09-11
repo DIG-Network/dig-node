@@ -5438,9 +5438,18 @@ mod tests {
     /// ([`RESOURCE_UNAVAILABLE`] and [`RESOURCE_NOT_AVAILABLE`]) are correctly read as one condition
     /// under two names rather than as a collision.
     ///
-    /// Deliberately NOT exhaustive yet: the chat band (`-32050`..`-32052`) is undeclared upstream
-    /// entirely. That is pre-existing and out of this change; adding it is a follow-up that has to
-    /// resolve the condition, not the table.
+    /// Holds the numbers this crate emits that `dig_rpc_protocol::ErrorCode::ALL` does NOT declare,
+    /// plus the locally-named constants for numbers it DOES declare (so a local re-spelling of a
+    /// canonical condition cannot drift from the owner's name). What makes it COMPLETE is not this
+    /// list: it is [`every_wire_code_this_crate_mentions_is_classified`], which scans these sources
+    /// and requires every `-32xxx` it finds to be canonically declared or listed here. Forgetting to
+    /// register a number is therefore what fails - the previous version of this guard asserted
+    /// `len() >= 10`, a measure of SIZE rather than completeness, and stayed green at 1134/3402
+    /// while this crate emitted `-32033`, already `dig-node-service`'s `ControlIngressLimited`.
+    ///
+    /// The chat band (`-32050`..`-32052`) is no longer a gap: `dig-rpc-protocol` 0.11 declares
+    /// `NoIdentity`/`NoPeerNetwork`/`SendFailed` for exactly those numbers, so the taxonomy answers
+    /// the collision question for them and the scan classifies them canonically.
     ///
     /// `content_serve::SERVE_UNREADABLE` used to be named here as a second `-32000` gap. It was not
     /// one: its code field's only sink answered `502` from the message and never read the number, so
@@ -5465,6 +5474,21 @@ mod tests {
         (CONTROL_UNAUTHORIZED, "UNAUTHORIZED"),
         (CONTROL_NOT_SUPPORTED, "NOT_SUPPORTED"),
         (CONTROL_ERROR, "CONTROL_ERROR"),
+        // The two below are LITERALS because each lives behind a constant in a private module
+        // (`seams::capsule::push_capsule`, `seams::dig_rpc::dispatch`) this test module cannot
+        // name. Both are undeclared upstream, so the canonical leg has nothing to compare them
+        // against and the condition string exists only to make a local collision visible.
+        //
+        // `-32001`: the push surface's authorization refusal. `seams::dig_rpc::errors` deliberately
+        // emits it with NO `data.code` (an invented machine name is worse than an absent one), so
+        // this condition name is internal to this guard and is not a wire name.
+        (
+            -32001,
+            "PUSH_AUTHORITY_REFUSED (local, undeclared upstream)",
+        ),
+        // `-32002`: `ENGINE_WARMING` - the peer tier has genuinely not been consulted yet. Distinct
+        // from `-32004`, which means it WAS consulted and the content is still not found.
+        (-32002, "ENGINE_WARMING (local, undeclared upstream)"),
     ];
 
     /// **Proves:** no number this node emits is already spoken for — neither by
@@ -5491,9 +5515,13 @@ mod tests {
     fn no_local_wire_code_collides_with_a_different_canonical_code() {
         // Side effects first: a table that has silently shrunk to nothing, or lost the code under
         // review, would make every assertion below vacuously true.
-        assert!(
-            LOCAL_WIRE_CODES.len() >= 10,
-            "the local wire-code table lost entries; a shrinking table makes this guard vacuous"
+        // An EXACT count, not a floor: a floor cannot see a table that grew by an entry nobody
+        // checked, and `>= 10` is what let a real collision through. Changing this number is a
+        // deliberate act that says the table below was re-read.
+        assert_eq!(
+            LOCAL_WIRE_CODES.len(),
+            12,
+            "the local wire-code table changed size; re-read it and update this count"
         );
         // `CONTENT_MISS_INCONCLUSIVE` deliberately LEFT this table: `dig-rpc-protocol` 0.10 declares
         // it, so it is no longer a local number and the owner answers the collision question for it.
