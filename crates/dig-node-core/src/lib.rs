@@ -583,13 +583,29 @@ pub struct Node {
     /// A slot rather than a constructor argument for the same reason [`Node::mirror_pointers`] is
     /// one: the FFI/browser path has no state directory and must keep constructing a `Node`
     /// without one. Nothing installs it in production yet — nothing in dig-node funds a
-    /// distributor today (`rewards::port`'s module doc, blocker 2), and the startup wiring that
-    /// would call [`Node::install_funded_distributor_registry`] with the node's state directory
-    /// belongs to dig_ecosystem#3268. Until then the slot stays empty, and
+    /// distributor today (`rewards::port`'s module doc, blocker 2). WHICH ticket owns the startup
+    /// wiring that would call [`Node::install_funded_distributor_registry`] with the node's state
+    /// directory is tracked separately, and it is NOT dig_ecosystem#3268, whose scope is the claim
+    /// loop and `ClaimStatus` and which names neither this registry nor that call. Until a ticket
+    /// wires it the slot stays empty, and
     /// [`Node::funded_distributors_read`] answers
     /// [`rewards::funded::NotConfiguredReason::NoStateDirectory`] — UNKNOWN, deliberately never an
     /// empty funded set.
     funded_distributors: OnceLock<rewards::funded::FundedDistributorRegistry>,
+    /// The chain seam `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`
+    /// (dig_ecosystem#3269 units 1-2) read through — [`rewards::port::RewardsChainPort`].
+    ///
+    /// A slot rather than a constructor argument for the same reason [`Node::mirror_pointers`] is
+    /// one. Nothing installs a real adapter yet: the one that calls `dig-rewards-coin` lives in
+    /// `dig-node-service`, a sibling unit this crate never depends on (see `rewards::port`'s
+    /// module doc). WHICH ticket carries that adapter is an OPEN question — it is tracked
+    /// separately from dig_ecosystem#3268, whose scope is the claim loop and `ClaimStatus` and
+    /// which names neither `distributor_report` nor this installer. Do not read a ticket number
+    /// into this comment that nobody has verified. Until the adapter is installed, both handlers
+    /// answer
+    /// [`rewards::port::ChainPortError::Unavailable`] — a real "no chain source is wired yet",
+    /// never a silent zero or empty list.
+    reward_chain_port: OnceLock<Arc<dyn rewards::port::RewardsChainPort>>,
 }
 
 impl Node {
@@ -626,9 +642,11 @@ impl Node {
     /// if a registry is already installed, in which case NOTHING changed — a second install must
     /// not be able to swap a live registry for an inert one behind a caller's back.
     ///
-    /// Called from tests today: the startup path that would install a real one lives in
-    /// dig_ecosystem#3268's files, so clippy's non-test lib target sees no production caller yet.
-    /// `allow(dead_code)` stands in for that missing caller — remove it when #3268 wires the call.
+    /// Called from tests today: no production startup path installs one, so clippy's non-test
+    /// lib target sees no production caller and `allow(dead_code)` stands in for it. Remove the
+    /// attribute when that wiring lands. Its owning ticket is tracked separately and is NOT
+    /// dig_ecosystem#3268 (claim loop + `ClaimStatus`), which names neither this registry nor this
+    /// call — do not read the attribute as a claim about #3268's scope.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn install_funded_distributor_registry(
         &self,
@@ -661,6 +679,34 @@ impl Node {
                 rewards::funded::NotConfiguredReason::NoStateDirectory,
             ),
         }
+    }
+
+    /// Install this node's reward-distributor chain-read adapter (dig_ecosystem#3269 units 1-2),
+    /// once. Returns `false` if one is already installed, in which case NOTHING changed — mirrors
+    /// [`Node::install_funded_distributor_registry`]'s same one-shot discipline.
+    ///
+    /// `pub` because this is the INJECTION POINT, and the adapter is built one crate UP:
+    /// `dig-node-service` constructs it over `dig-rewards-coin` and injects it downward
+    /// (dig_ecosystem#3310, which names both `distributor_report` and this function). A
+    /// `pub(crate)` setter made that architecture unbuildable while its own doc described it, and
+    /// the `#[cfg_attr(not(test), allow(dead_code))]` that used to sit here was hiding the
+    /// unreachability rather than standing in for a merely-absent caller.
+    ///
+    /// Being callable from outside does NOT relax the single-install discipline: a second install
+    /// must not be able to swap a live adapter for an inert one behind a caller's back, so the
+    /// second call returns `false` and changes nothing.
+    pub fn install_reward_chain_port(
+        &self,
+        port: Arc<dyn rewards::port::RewardsChainPort>,
+    ) -> bool {
+        self.reward_chain_port.set(port).is_ok()
+    }
+
+    /// The installed reward-distributor chain-read adapter, or `None` when nothing has installed
+    /// one — `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments` must treat `None`
+    /// exactly like [`rewards::port::ChainPortError::Unavailable`], never a zero or empty answer.
+    pub(crate) fn reward_chain_port(&self) -> Option<&Arc<dyn rewards::port::RewardsChainPort>> {
+        self.reward_chain_port.get()
     }
 }
 
@@ -4911,6 +4957,7 @@ impl Node {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         })
     }
 
@@ -5252,6 +5299,7 @@ pub(crate) mod test_support {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         };
         (Arc::new(node), td)
     }
@@ -5390,9 +5438,18 @@ mod tests {
     /// ([`RESOURCE_UNAVAILABLE`] and [`RESOURCE_NOT_AVAILABLE`]) are correctly read as one condition
     /// under two names rather than as a collision.
     ///
-    /// Deliberately NOT exhaustive yet: the chat band (`-32050`..`-32052`) is undeclared upstream
-    /// entirely. That is pre-existing and out of this change; adding it is a follow-up that has to
-    /// resolve the condition, not the table.
+    /// Holds the numbers this crate emits that `dig_rpc_protocol::ErrorCode::ALL` does NOT declare,
+    /// plus the locally-named constants for numbers it DOES declare (so a local re-spelling of a
+    /// canonical condition cannot drift from the owner's name). What makes it COMPLETE is not this
+    /// list: it is [`every_wire_code_this_crate_mentions_is_classified`], which scans these sources
+    /// and requires every `-32xxx` it finds to be canonically declared or listed here. Forgetting to
+    /// register a number is therefore what fails - the previous version of this guard asserted
+    /// `len() >= 10`, a measure of SIZE rather than completeness, and stayed green at 1134/3402
+    /// while this crate emitted `-32033`, already `dig-node-service`'s `ControlIngressLimited`.
+    ///
+    /// The chat band (`-32050`..`-32052`) is no longer a gap: `dig-rpc-protocol` 0.11 declares
+    /// `NoIdentity`/`NoPeerNetwork`/`SendFailed` for exactly those numbers, so the taxonomy answers
+    /// the collision question for them and the scan classifies them canonically.
     ///
     /// `content_serve::SERVE_UNREADABLE` used to be named here as a second `-32000` gap. It was not
     /// one: its code field's only sink answered `502` from the message and never read the number, so
@@ -5417,6 +5474,21 @@ mod tests {
         (CONTROL_UNAUTHORIZED, "UNAUTHORIZED"),
         (CONTROL_NOT_SUPPORTED, "NOT_SUPPORTED"),
         (CONTROL_ERROR, "CONTROL_ERROR"),
+        // The two below are LITERALS because each lives behind a constant in a private module
+        // (`seams::capsule::push_capsule`, `seams::dig_rpc::dispatch`) this test module cannot
+        // name. Both are undeclared upstream, so the canonical leg has nothing to compare them
+        // against and the condition string exists only to make a local collision visible.
+        //
+        // `-32001`: the push surface's authorization refusal. `seams::dig_rpc::errors` deliberately
+        // emits it with NO `data.code` (an invented machine name is worse than an absent one), so
+        // this condition name is internal to this guard and is not a wire name.
+        (
+            -32001,
+            "PUSH_AUTHORITY_REFUSED (local, undeclared upstream)",
+        ),
+        // `-32002`: `ENGINE_WARMING` - the peer tier has genuinely not been consulted yet. Distinct
+        // from `-32004`, which means it WAS consulted and the content is still not found.
+        (-32002, "ENGINE_WARMING (local, undeclared upstream)"),
     ];
 
     /// **Proves:** no number this node emits is already spoken for — neither by
@@ -5443,9 +5515,13 @@ mod tests {
     fn no_local_wire_code_collides_with_a_different_canonical_code() {
         // Side effects first: a table that has silently shrunk to nothing, or lost the code under
         // review, would make every assertion below vacuously true.
-        assert!(
-            LOCAL_WIRE_CODES.len() >= 10,
-            "the local wire-code table lost entries; a shrinking table makes this guard vacuous"
+        // An EXACT count, not a floor: a floor cannot see a table that grew by an entry nobody
+        // checked, and `>= 10` is what let a real collision through. Changing this number is a
+        // deliberate act that says the table below was re-read.
+        assert_eq!(
+            LOCAL_WIRE_CODES.len(),
+            12,
+            "the local wire-code table changed size; re-read it and update this count"
         );
         // `CONTENT_MISS_INCONCLUSIVE` deliberately LEFT this table: `dig-rpc-protocol` 0.10 declares
         // it, so it is no longer a local number and the owner answers the collision question for it.
@@ -5486,6 +5562,124 @@ mod tests {
                 clashing_local.map(|(_, name)| *name).unwrap_or_default()
             );
         }
+    }
+
+    /// Every `-32xxx` wire number that appears anywhere in this crate's own sources, DISCOVERED by
+    /// reading them rather than by hand-listing them - the list is derived from the emitting sites,
+    /// so it cannot fall behind them.
+    ///
+    /// Comment-only lines are skipped: the docs in this crate legitimately DISCUSS numbers it does
+    /// not emit (another implementation's assignment, a rejected proposal), and requiring those to
+    /// be registered would push the guard towards being weakened rather than kept.
+    ///
+    /// A code mentioned in live code but never actually emitted - a test asserting one, say - is
+    /// still required to be classified. That is deliberate: classification is cheap, and the
+    /// alternative is teaching the scanner to recognise an "emitting site", which is exactly the
+    /// judgement call a forgotten registration hides behind.
+    fn wire_codes_mentioned_in_this_crate() -> std::collections::BTreeSet<i64> {
+        fn scan_line(line: &str, out: &mut std::collections::BTreeSet<i64>) {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                return;
+            }
+            // Scanned as BYTES, not by slicing the &str: these sources carry non-ASCII prose, and
+            // an arbitrary byte index into a `&str` is not guaranteed to be a char boundary.
+            let bytes = line.as_bytes();
+            for start in 0..bytes.len().saturating_sub(5) {
+                if &bytes[start..start + 3] != b"-32" {
+                    continue;
+                }
+                let digits = &bytes[start + 3..start + 6];
+                // Exactly three digits: `-32000`..`-32999` is the band. A longer digit run is some
+                // other number that merely begins this way and is not a wire code.
+                if !digits.iter().all(u8::is_ascii_digit)
+                    || bytes.get(start + 6).is_some_and(u8::is_ascii_digit)
+                {
+                    continue;
+                }
+                let text = std::str::from_utf8(&bytes[start..start + 6])
+                    .expect("six ASCII bytes are valid UTF-8");
+                if let Ok(code) = text.parse::<i64>() {
+                    out.insert(code);
+                }
+            }
+        }
+
+        fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeSet<i64>) {
+            let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}"));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+                    for line in text.lines() {
+                        scan_line(line, out);
+                    }
+                }
+            }
+        }
+
+        let mut found = std::collections::BTreeSet::new();
+        walk(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut found,
+        );
+        found
+    }
+
+    /// **Proves:** every wire number these sources contain is accounted for - either declared by
+    /// the taxonomy owner (`dig_rpc_protocol::ErrorCode::ALL`, resolved through
+    /// `seams::dig_rpc::errors::taxonomy_code` so the taxonomy is never restated here) or listed in
+    /// [`LOCAL_WIRE_CODES`] as a number this crate occupies that upstream does not declare.
+    ///
+    /// **Catches:** the defect that defeated the collision guard beside it - a number nobody
+    /// registered is invisible to a guard built over a registry. `-32033` was emitted by this crate
+    /// while already being `dig-node-service`'s `ControlIngressLimited`, and the old
+    /// `LOCAL_WIRE_CODES.len() >= 10` assertion stayed green because the number was never added.
+    /// Under THIS test it would have gone red without anyone remembering to register it.
+    #[test]
+    fn every_wire_code_this_crate_mentions_is_classified() {
+        let found = wire_codes_mentioned_in_this_crate();
+
+        // Scanner-liveness first: a walk that read nothing, or a comment filter that ate every
+        // line, would make the loop below vacuously true - the same failure mode being fixed here.
+        assert!(
+            found.len() >= 25,
+            "the source scan found only {} wire codes; it is not reading these sources",
+            found.len()
+        );
+        for known in [CONTROL_ERROR, RESOURCE_NOT_AVAILABLE, -32602] {
+            assert!(
+                found.contains(&known),
+                "the scan missed {known}, which is emitted in these sources; it is not reading what it claims"
+            );
+        }
+
+        for number in &found {
+            let canonical = crate::seams::dig_rpc::errors::taxonomy_code(*number);
+            let local = LOCAL_WIRE_CODES.iter().find(|(n, _)| n == number);
+            assert!(
+                canonical.is_some() || local.is_some(),
+                "wire code {number} is in these sources but is neither declared by dig-rpc-protocol nor registered in LOCAL_WIRE_CODES"
+            );
+        }
+
+        // Non-vacuity, without writing the number as a literal: writing `-32033` here would itself
+        // be a mention this scan must classify, which is the mechanism having teeth. Built by
+        // arithmetic instead, it shows the classifier REJECTS the number that slipped through, so
+        // re-introducing it anywhere in these sources fails the loop above.
+        let slipped_through = CONTROL_ERROR - 1;
+        assert!(
+            crate::seams::dig_rpc::errors::taxonomy_code(slipped_through).is_none()
+                && !LOCAL_WIRE_CODES.iter().any(|(n, _)| *n == slipped_through),
+            "{slipped_through} must be unclassified, or this test cannot fail on it"
+        );
+        assert!(
+            !found.contains(&slipped_through),
+            "{slipped_through} is back in these sources; it is already another surface's code"
+        );
     }
 
     /// A per-THREAD counting allocator, installed process-wide only for the test binary.
@@ -6011,7 +6205,8 @@ mod tests {
     }
 
     /// dig_ecosystem#3285: a node with no funder registry installed — which is EVERY production
-    /// node until #3268 wires one — must read UNKNOWN, never an empty funded set.
+    /// node today, since no startup path installs one and the ticket that will is tracked
+    /// separately (it is not #3268) — must read UNKNOWN, never an empty funded set.
     /// **Catches:** a `funded_distributors_read` that defaults to `FundsNothing`, or a `Vec`/
     /// `Option` return that a caller would render as `[]`.
     #[test]
@@ -6106,6 +6301,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         };
         (node, td)
     }
@@ -6242,6 +6438,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         };
 
         // Missing before the pull.
@@ -6312,6 +6509,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -6413,6 +6611,7 @@ mod tests {
                 mirror_pointers: OnceLock::new(),
                 reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
                 funded_distributors: OnceLock::new(),
+                reward_chain_port: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -6492,6 +6691,7 @@ mod tests {
                 mirror_pointers: OnceLock::new(),
                 reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
                 funded_distributors: OnceLock::new(),
+                reward_chain_port: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -9504,6 +9704,621 @@ mod tests {
         assert_eq!(all["result"]["statuses"].as_array().unwrap().len(), 2);
     }
 
+    /// An in-memory `RewardsChainPort` for `dig.getRewardDistributor` /
+    /// `dig.listRewardDistributorCommitments` dispatch tests (dig_ecosystem#3269 unit 2) — keyed
+    /// per launcher id so two distinct distributors can be driven through the SAME dispatch path
+    /// with distinct answers, exactly the shape the money-figure subject test needs.
+    struct FakeRewardsChainPort {
+        reports: std::collections::HashMap<
+            [u8; 32],
+            Result<crate::rewards::port::DistributorReport, crate::rewards::port::ChainPortError>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::rewards::port::RewardsChainPort for FakeRewardsChainPort {
+        async fn funded_distributors(
+            &self,
+        ) -> Result<Vec<crate::rewards::port::DistributorRef>, crate::rewards::port::ChainPortError>
+        {
+            Err(crate::rewards::port::ChainPortError::Unavailable)
+        }
+
+        async fn distributor_state(
+            &self,
+            _launcher_id: crate::rewards::port::Bytes32,
+        ) -> Result<crate::rewards::port::DistributorChainState, crate::rewards::port::ChainPortError>
+        {
+            Err(crate::rewards::port::ChainPortError::Unavailable)
+        }
+
+        async fn submit_entry_writes(
+            &self,
+            _bundle: crate::rewards::port::EntryWriteBundle,
+        ) -> Result<(), crate::rewards::port::ChainPortError> {
+            Err(crate::rewards::port::ChainPortError::Unavailable)
+        }
+
+        async fn spend_new_epoch(
+            &self,
+            _launcher_id: crate::rewards::port::Bytes32,
+        ) -> Result<(), crate::rewards::port::ChainPortError> {
+            Err(crate::rewards::port::ChainPortError::Unavailable)
+        }
+
+        async fn distributor_report(
+            &self,
+            launcher_id: crate::rewards::port::Bytes32,
+        ) -> Result<crate::rewards::port::DistributorReport, crate::rewards::port::ChainPortError>
+        {
+            self.reports
+                .get(&launcher_id)
+                .cloned()
+                .unwrap_or(Err(crate::rewards::port::ChainPortError::Unavailable))
+        }
+    }
+
+    /// Derives `entry_set_stale` the way a production adapter MUST (SPEC §12.4): from the
+    /// CHAIN-derived last-entry-write time measured against the exported
+    /// [`crate::rewards::spec_constants::STALE_ENTRY_SET_SECONDS`], through the same
+    /// [`crate::rewards::staleness::is_entry_set_stale`] rule the engine uses — never a hardcoded
+    /// `172_800`, and never a prover's own self-report of its freshness.
+    fn derive_entry_set_stale(
+        reserve_base_units: u64,
+        last_entry_write_at: Option<u64>,
+        observed_at: u64,
+        distributor_created_at: u64,
+    ) -> bool {
+        crate::rewards::staleness::is_entry_set_stale(
+            &crate::rewards::port::DistributorChainState {
+                reserve_base_units,
+                entries: Vec::new(),
+                current_distributor_epoch: 0,
+                last_entry_write_at,
+                total_paid_out_base_units: 0,
+            },
+            observed_at,
+            distributor_created_at,
+        )
+    }
+
+    /// A `DistributorReport` with every field distinctly derived from `seed`, so two reports built
+    /// from two different seeds can never accidentally collide on a real field.
+    ///
+    /// `entry_set_stale` is the one field that is NOT a free function of `seed`: it is derived from
+    /// this report's own `last_entry_write_at`/`observed_at` against the exported staleness bound,
+    /// so no fixture can carry a staleness flag its own chain-derived times contradict. With the
+    /// times below, every seed's report is FRESH (its write is 100_000s old, inside the bound); a
+    /// test that needs the stale side uses [`distributor_report_with_write_age`].
+    fn sample_distributor_report(
+        seed: u8,
+        commitments: Vec<crate::rewards::port::CommitmentSlot>,
+    ) -> crate::rewards::port::DistributorReport {
+        let first_epoch_start = 1_700_000_000 + seed as u64;
+        let reserve_base_units = 10_000_000 + seed as u64 * 1_000;
+        let last_entry_write_at = Some(1_700_100_000 + seed as u64);
+        let observed_at = 1_700_200_000 + seed as u64;
+        crate::rewards::port::DistributorReport {
+            launcher_id: [seed; 32],
+            store_id: [seed.wrapping_add(1); 32],
+            root: [seed.wrapping_add(2); 32],
+            epoch_seconds: 604_800 + seed as u64,
+            first_epoch_start,
+            payout_threshold: 1_000_000 + seed as u64,
+            fee_bps: 100 + seed as u16,
+            withdrawal_share_bps: 9_000 + seed as u16,
+            reserve_base_units,
+            entry_count: 3 + seed as u64,
+            current_distributor_epoch: 5 + seed as u64,
+            last_entry_write_at,
+            entry_set_stale: derive_entry_set_stale(
+                reserve_base_units,
+                last_entry_write_at,
+                observed_at,
+                first_epoch_start,
+            ),
+            commitments,
+            observed_at,
+        }
+    }
+
+    /// [`sample_distributor_report`] with the chain-derived last entry write placed exactly
+    /// `write_age_seconds` before `observed_at`, and `entry_set_stale` re-derived from that age.
+    /// Lets one test drive both sides of the staleness bound without writing the bound's numeric
+    /// value down anywhere.
+    fn distributor_report_with_write_age(
+        seed: u8,
+        write_age_seconds: u64,
+    ) -> crate::rewards::port::DistributorReport {
+        let mut report = sample_distributor_report(seed, vec![]);
+        report.last_entry_write_at = Some(report.observed_at - write_age_seconds);
+        report.entry_set_stale = derive_entry_set_stale(
+            report.reserve_base_units,
+            report.last_entry_write_at,
+            report.observed_at,
+            report.first_epoch_start,
+        );
+        report
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// **Proves:** `dig.getRewardDistributor` answers with the port's real values through the
+    /// REAL dispatch path (`handle_rpc` -> `handle_rpc_as` -> `RpcDispatch::dispatch`), asserted on
+    /// the serialized JSON body's key SET, not a Rust struct (a struct assertion cannot see a
+    /// serde rename or an extra field — dig_ecosystem#3269's evidence bar).
+    /// **Catches:** a handler that drops a field, mis-cases a key, or answers from a stub instead
+    /// of the port.
+    #[test]
+    fn get_reward_distributor_answers_with_real_values_through_dispatch() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x11u8; 32];
+        let report = sample_distributor_report(0x11, vec![]);
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report.clone()))]),
+            }))
+        );
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardDistributor",
+                   "params":{"launcher_id": hex::encode(launcher_id)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let result = &resp["result"];
+        let keys: std::collections::BTreeSet<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "launcher_id",
+                "store_id",
+                "root",
+                "epoch_seconds",
+                "first_epoch_start",
+                "payout_threshold",
+                "fee_bps",
+                "withdrawal_share_bps",
+                "reserve_base_units",
+                "entry_count",
+                "current_distributor_epoch",
+                "last_entry_write_at",
+                "entry_set_stale",
+                "observed_at",
+            ]),
+            "the wire body's key SET must be exactly this — a struct assertion cannot see a wrong \
+             key name or an extra field"
+        );
+        assert_eq!(
+            result["launcher_id"],
+            json!(hex::encode(report.launcher_id))
+        );
+        assert_eq!(result["store_id"], json!(hex::encode(report.store_id)));
+        assert_eq!(result["root"], json!(hex::encode(report.root)));
+        assert_eq!(result["epoch_seconds"], json!(report.epoch_seconds));
+        assert_eq!(result["first_epoch_start"], json!(report.first_epoch_start));
+        assert_eq!(result["payout_threshold"], json!(report.payout_threshold));
+        assert_eq!(result["fee_bps"], json!(report.fee_bps));
+        assert_eq!(
+            result["withdrawal_share_bps"],
+            json!(report.withdrawal_share_bps)
+        );
+        assert_eq!(
+            result["reserve_base_units"],
+            json!(report.reserve_base_units)
+        );
+        assert_eq!(result["entry_count"], json!(report.entry_count));
+        assert_eq!(
+            result["current_distributor_epoch"],
+            json!(report.current_distributor_epoch)
+        );
+        assert_eq!(
+            result["last_entry_write_at"],
+            json!(report.last_entry_write_at)
+        );
+        assert_eq!(result["entry_set_stale"], json!(report.entry_set_stale));
+        assert_eq!(result["observed_at"], json!(report.observed_at));
+    }
+
+    /// **Proves:** `dig.listRewardDistributorCommitments` answers with the port's real values
+    /// through the real dispatch path, asserted on the serialized body's key set and per-slot
+    /// values — including the legitimate empty-`commitments` case being distinguishable from an
+    /// error (it is a real `result`, not an `error`).
+    /// **Catches:** a handler that restates `recoverable_base_units` itself instead of echoing the
+    /// port's pre-computed figure, or mis-cases a key.
+    #[test]
+    fn list_reward_distributor_commitments_answers_with_real_values_through_dispatch() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x22u8; 32];
+        let slot = crate::rewards::port::CommitmentSlot {
+            epoch_start: 42,
+            clawback_puzzle_hash: [0x33u8; 32],
+            rewards_base_units: 1_000,
+            recoverable_base_units: 900,
+        };
+        let report = sample_distributor_report(0x22, vec![slot.clone()]);
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report.clone()))]),
+            }))
+        );
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributorCommitments",
+                   "params":{"launcher_id": hex::encode(launcher_id)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let result = &resp["result"];
+        let keys: std::collections::BTreeSet<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "launcher_id",
+                "withdrawal_share_bps",
+                "epoch_seconds",
+                "commitments",
+                "observed_at",
+            ])
+        );
+        assert_eq!(
+            result["launcher_id"],
+            json!(hex::encode(report.launcher_id))
+        );
+        assert_eq!(
+            result["withdrawal_share_bps"],
+            json!(report.withdrawal_share_bps)
+        );
+        assert_eq!(result["epoch_seconds"], json!(report.epoch_seconds));
+        assert_eq!(result["observed_at"], json!(report.observed_at));
+        let commitments = result["commitments"].as_array().unwrap();
+        assert_eq!(commitments.len(), 1);
+        let row_keys: std::collections::BTreeSet<&str> = commitments[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            row_keys,
+            std::collections::BTreeSet::from([
+                "epoch_start",
+                "clawback_puzzle_hash",
+                "rewards_base_units",
+                "recoverable_base_units",
+            ])
+        );
+        assert_eq!(commitments[0]["epoch_start"], json!(42));
+        assert_eq!(
+            commitments[0]["clawback_puzzle_hash"],
+            json!(hex::encode([0x33u8; 32]))
+        );
+        assert_eq!(commitments[0]["rewards_base_units"], json!(1_000));
+        assert_eq!(commitments[0]["recoverable_base_units"], json!(900));
+    }
+
+    /// **Proves:** with no chain-read adapter installed, BOTH reward-distributor methods answer a
+    /// distinct error — never a zero, never an empty list — and it is NOT the same machine code as
+    /// the `withdrawal_share_bps` refusal (so a caller can tell "try again later" apart from "this
+    /// distributor's own constant is broken").
+    /// **Catches:** a handler that defaults to `Default::default()` or an empty result on a `None`
+    /// port instead of erroring.
+    #[test]
+    fn reward_distributor_methods_chain_unavailable_is_a_distinct_error_never_a_zero_or_empty() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x44u8; 32];
+
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(
+                resp.get("result").is_none(),
+                "{method}: must not answer a result at all"
+            );
+            assert_eq!(
+                resp["error"]["data"]["code"],
+                json!("REWARD_CHAIN_UNAVAILABLE")
+            );
+            assert_ne!(
+                resp["error"]["data"]["code"],
+                json!("REWARD_INVALID_WITHDRAWAL_SHARE"),
+                "{method}: chain-unavailable must not share a machine code with the \
+                 withdrawal-share refusal"
+            );
+        }
+    }
+
+    /// **Proves:** when the port refuses because `withdrawal_share_bps` is out of range (either
+    /// side: doesn't fit `u16`, the caller narrows before calling this port, or the adapter's own
+    /// `0..=10_000` domain check), BOTH methods refuse the WHOLE call with a distinct machine code
+    /// — never a `0`, never an empty `commitments` list standing in for the refusal.
+    /// **Mutation-probe, re-runnable from this repo alone:** in `seams::dig_rpc::dispatch`,
+    /// replace `reward_chain_port_error_response`'s `InvalidWithdrawalShare` arm with a `result`
+    /// carrying `withdrawal_share_bps: 0`, then run
+    /// `cargo test -p dig-node-core --lib reward_distributor_methods_`. This test fails at its
+    /// FIRST assertion, `resp.get("result").is_none()`, for `dig.getRewardDistributor`: a refusal
+    /// has become an answer. Restoring the arm returns it to green with the rest of the suite
+    /// untouched. That is the defect it exists to catch, so it is not vacuously green.
+    #[test]
+    fn reward_distributor_methods_refuse_whole_call_on_invalid_withdrawal_share() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x55u8; 32];
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(
+                    launcher_id,
+                    Err(crate::rewards::port::ChainPortError::InvalidWithdrawalShare),
+                )]),
+            }))
+        );
+
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(
+                resp.get("result").is_none(),
+                "{method}: must refuse the whole call"
+            );
+            assert_eq!(
+                resp["error"]["data"]["code"],
+                json!("REWARD_INVALID_WITHDRAWAL_SHARE")
+            );
+            assert_ne!(resp["error"]["code"], json!(0));
+        }
+    }
+
+    /// **Proves:** a `withdrawal_share_bps` ABOVE the legitimate `0..=10_000` range refuses the
+    /// WHOLE call on BOTH reward-distributor methods, and the out-of-range figure reaches no
+    /// response body. The fake port hands back an `Ok` report carrying `10_001` - exactly what a
+    /// wrapped narrowing (`74_536 as u16` = `9_000`) or a buggy adapter would look like from this
+    /// seam - so the refusal proved here is the HANDLER's, with no adapter cooperation
+    /// (dig_ecosystem#3284).
+    /// **Catches:** the handler emitting the figure verbatim, and the tempting "safe" fix of
+    /// clamping it to `10_000`, which would report a confident 100% recoverable share for a
+    /// distributor whose real constant is nonsense. Both are asserted against by name.
+    #[test]
+    fn reward_distributor_methods_refuse_a_withdrawal_share_above_the_legitimate_range() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x78u8; 32];
+        let mut report = sample_distributor_report(0x78, vec![]);
+        report.withdrawal_share_bps = 10_001;
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report))]),
+            }))
+        );
+
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(
+                resp.get("result").is_none(),
+                "{method}: an out-of-range withdrawal share must refuse the whole call: {resp}"
+            );
+            assert_eq!(
+                resp["error"]["data"]["code"],
+                json!("REWARD_INVALID_WITHDRAWAL_SHARE"),
+                "{method}: {resp}"
+            );
+            // Matched in a JSON VALUE position (`:10001`), not anywhere in the body: the
+            // refusal MESSAGE legitimately names the bound it enforces, and asserting on the
+            // bare digits would fail on the honest text while saying nothing about the figure.
+            let body = resp.to_string();
+            assert!(
+                !body.contains(":10001"),
+                "{method}: the out-of-range figure must not reach the wire: {body}"
+            );
+            assert!(
+                !body.contains(":10000"),
+                "{method}: a clamp to 100% is a money lie, not a safe default: {body}"
+            );
+        }
+    }
+
+    /// **Proves:** the boundary is `> 10_000`, not `>= 10_000`: 10,000 basis points IS a
+    /// legitimate 100% withdrawal share, and both methods still ANSWER for it.
+    /// **Catches:** the refusal above widening into a blanket refusal - an off-by-one that would
+    /// blind every distributor whose funder takes the whole share, while the refusal test above
+    /// stayed green. Neither test alone shows the guard is selective.
+    #[test]
+    fn reward_distributor_methods_answer_at_the_ten_thousand_bps_boundary() {
+        let (node, _td) = test_node(None);
+        let launcher_id = [0x79u8; 32];
+        let mut report = sample_distributor_report(0x79, vec![]);
+        // Stated as a LITERAL, not read from the dispatch module's constant: the bound is a
+        // contract figure (10,000 bps = 100%), so a change to that constant must fail here.
+        report.withdrawal_share_bps = 10_000;
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report))]),
+            }))
+        );
+
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(
+                resp.get("error").is_none(),
+                "{method}: a 100% share is legitimate and must be answered: {resp}"
+            );
+            assert_eq!(
+                resp["result"]["withdrawal_share_bps"],
+                json!(10_000),
+                "{method}: the boundary value must be reported verbatim: {resp}"
+            );
+        }
+    }
+
+    /// **Proves:** `entry_set_stale` is threaded through, both `true` and `false`, straight from
+    /// the port's chain-derived figure — never hardcoded, never inverted — with BOTH cases served
+    /// by ONE port installed ONCE on ONE node, answered by the REQUESTED launcher id. Each
+    /// expectation is derived from that report's own last-entry-write age against the exported
+    /// `STALE_ENTRY_SET_SECONDS`; the bound's numeric value appears nowhere in this test.
+    /// **Catches:** a handler that hardcodes or inverts the flag, and one that answers a DIFFERENT
+    /// distributor's staleness for the requested launcher id.
+    #[test]
+    fn get_reward_distributor_threads_entry_set_stale_both_ways() {
+        let (node, _td) = test_node(None);
+        let bound = crate::rewards::spec_constants::STALE_ENTRY_SET_SECONDS;
+        // SPEC §12.4 compares with `>=`: exactly at the bound is stale, one second inside is not.
+        let stale_report = distributor_report_with_write_age(0x60, bound);
+        let fresh_report = distributor_report_with_write_age(0x61, bound - 1);
+        assert!(
+            stale_report.entry_set_stale && !fresh_report.entry_set_stale,
+            "the fixtures must straddle the staleness bound, or this test proves nothing"
+        );
+
+        let cases = [
+            (stale_report.launcher_id, stale_report.entry_set_stale),
+            (fresh_report.launcher_id, fresh_report.entry_set_stale),
+        ];
+        // ONE install for both cases: `install_reward_chain_port` is single-shot deliberately, and
+        // loosening it so a test could install twice would let a real double-install through.
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([
+                    (stale_report.launcher_id, Ok(stale_report)),
+                    (fresh_report.launcher_id, Ok(fresh_report)),
+                ]),
+            }))
+        );
+
+        for (launcher_id, expect_stale) in cases {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardDistributor",
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert_eq!(
+                resp["result"]["entry_set_stale"],
+                json!(expect_stale),
+                "launcher {} must report its OWN chain-derived staleness",
+                hex::encode(launcher_id)
+            );
+        }
+    }
+
+    /// **Proves:** two distinct distributors' money figures never cross-contaminate — the class of
+    /// defect dig-app#403's rewards pane shipped (a per-distributor total silently summed or
+    /// swapped). Reads BOTH distributors' `dig.listRewardDistributorCommitments` in the same test
+    /// and asserts neither the summed nor the swapped figure appears in either response.
+    /// **Mutation-probe, re-runnable from this repo alone:** swap the two
+    /// `FakeRewardsChainPort` entries' `recoverable_base_units` (give `slot_a` `slot_b`'s figure
+    /// and vice versa) and run `cargo test -p dig-node-core --lib commitment_money_figures`. This
+    /// test fails on the assertion that distributor A's response does not carry B's figure;
+    /// undoing the swap returns it to green. No other test notices the swap, which is why this
+    /// one exists.
+    #[test]
+    fn commitment_money_figures_stay_attributed_to_their_own_distributor() {
+        let (node, _td) = test_node(None);
+        let launcher_a = [0x70u8; 32];
+        let launcher_b = [0x71u8; 32];
+        let slot_a = crate::rewards::port::CommitmentSlot {
+            epoch_start: 1,
+            clawback_puzzle_hash: [0xaau8; 32],
+            rewards_base_units: 5_000,
+            recoverable_base_units: 4_500,
+        };
+        let slot_b = crate::rewards::port::CommitmentSlot {
+            epoch_start: 2,
+            clawback_puzzle_hash: [0xbbu8; 32],
+            rewards_base_units: 7_000,
+            recoverable_base_units: 6_300,
+        };
+        let report_a = sample_distributor_report(0x70, vec![slot_a]);
+        let report_b = sample_distributor_report(0x71, vec![slot_b]);
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([
+                    (launcher_a, Ok(report_a)),
+                    (launcher_b, Ok(report_b)),
+                ]),
+            }))
+        );
+
+        let resp_a = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributorCommitments",
+                   "params":{"launcher_id": hex::encode(launcher_a)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let resp_b = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.listRewardDistributorCommitments",
+                   "params":{"launcher_id": hex::encode(launcher_b)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        let recoverable_a = resp_a["result"]["commitments"][0]["recoverable_base_units"]
+            .as_u64()
+            .unwrap();
+        let recoverable_b = resp_b["result"]["commitments"][0]["recoverable_base_units"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(recoverable_a, 4_500);
+        assert_eq!(recoverable_b, 6_300);
+        let summed = 4_500 + 6_300;
+        let swapped_a = 6_300;
+        let swapped_b = 4_500;
+        assert_ne!(recoverable_a, summed);
+        assert_ne!(recoverable_b, summed);
+        assert_ne!(recoverable_a, swapped_a);
+        assert_ne!(recoverable_b, swapped_b);
+    }
+
     /// **Proves:** `total_paid_out_base_units`/`reserve_base_units` stay attributed to the
     /// `launcher_id` (distributor) that reported them — never summed across distributors, never
     /// cross-attributed to the other one. **Catches:** the class of defect a sibling adversarial
@@ -9974,6 +10789,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
         };
 
         let before = handle_rpc(
@@ -17131,6 +17947,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         // A holder for this EXACT content is known via the DHT.
@@ -17184,6 +18001,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
@@ -17236,6 +18054,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
 
@@ -17270,6 +18089,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -17313,6 +18133,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -17358,6 +18179,7 @@ mod tests {
             mirror_pointers: OnceLock::new(),
             reward_prover_statuses: Arc::new(std::sync::RwLock::new(Vec::new())),
             funded_distributors: OnceLock::new(),
+            reward_chain_port: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
