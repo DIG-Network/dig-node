@@ -147,18 +147,23 @@ pub enum ChainPortError {
 /// needs it.
 ///
 /// `recoverable_base_units` is the adapter's PRE-COMPUTED share — never restated by a caller of
-/// this port, and never recomputed by `dig-node-core` itself. The production adapter lives in
-/// `dig-node-service` (which ticket owns it is an open question tracked separately — not
-/// dig_ecosystem#3268) and is the one crate in this seam that depends on
-/// `dig-rewards-coin` (dig_ecosystem#3269 unit 0 removed that dependency from THIS crate
-/// deliberately); it computes this figure with `dig_rewards_coin::recoverable_base_units` — that
-/// crate's own tested, simulator-bound restatement of the puzzle's share arithmetic (u128
-/// intermediate, multiply-then-divide, truncated; see that function's doc for the equality proof
-/// against `chia-sdk-driver`). If `withdrawal_share_bps` does not fit `u16` or exceeds `10_000`,
-/// the adapter refuses the WHOLE [`RewardsChainPort::distributor_report`] call with
+/// this port, and never recomputed by `dig-node-core` itself. NO production adapter exists yet,
+/// and no crate in this seam depends on `dig-rewards-coin` today: the adapter that WILL compute
+/// this figure is dig_ecosystem#3310's, in `dig-node-service` (that ticket names both
+/// `distributor_report` and `Node::install_reward_chain_port` explicitly), and as of this writing
+/// that crate's manifest declares no such dependency. When it lands it will be the one crate in
+/// this seam that depends on `dig-rewards-coin` (dig_ecosystem#3269 unit 0 removed that dependency
+/// from THIS crate deliberately), and it will compute this figure with
+/// `dig_rewards_coin::recoverable_base_units` — that crate's own tested, simulator-bound
+/// restatement of the puzzle's share arithmetic (u128 intermediate, multiply-then-divide,
+/// truncated; see that function's doc for the equality proof against `chia-sdk-driver`). If
+/// `withdrawal_share_bps` does not fit `u16` or exceeds `10_000`, that adapter must refuse the
+/// WHOLE [`RewardsChainPort::distributor_report`] call with
 /// [`ChainPortError::InvalidWithdrawalShare`] instead of returning a `CommitmentSlot` with a
 /// wrong, zeroed or omitted `recoverable_base_units` — see that variant's doc for why a
-/// per-distributor curried value makes a whole-call refusal the correct shape.
+/// per-distributor curried value makes a whole-call refusal the correct shape. The same range is
+/// ALSO enforced at the dispatch seam (`seams::dig_rpc::dispatch`'s `range_checked_report`,
+/// dig_ecosystem#3284), so an adapter that forgets cannot put an out-of-range share on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitmentSlot {
     /// The distributor epoch this commitment slot funds.

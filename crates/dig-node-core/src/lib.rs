@@ -583,9 +583,11 @@ pub struct Node {
     /// A slot rather than a constructor argument for the same reason [`Node::mirror_pointers`] is
     /// one: the FFI/browser path has no state directory and must keep constructing a `Node`
     /// without one. Nothing installs it in production yet — nothing in dig-node funds a
-    /// distributor today (`rewards::port`'s module doc, blocker 2), and the startup wiring that
-    /// would call [`Node::install_funded_distributor_registry`] with the node's state directory
-    /// belongs to dig_ecosystem#3268. Until then the slot stays empty, and
+    /// distributor today (`rewards::port`'s module doc, blocker 2). WHICH ticket owns the startup
+    /// wiring that would call [`Node::install_funded_distributor_registry`] with the node's state
+    /// directory is tracked separately, and it is NOT dig_ecosystem#3268, whose scope is the claim
+    /// loop and `ClaimStatus` and which names neither this registry nor that call. Until a ticket
+    /// wires it the slot stays empty, and
     /// [`Node::funded_distributors_read`] answers
     /// [`rewards::funded::NotConfiguredReason::NoStateDirectory`] — UNKNOWN, deliberately never an
     /// empty funded set.
@@ -640,9 +642,11 @@ impl Node {
     /// if a registry is already installed, in which case NOTHING changed — a second install must
     /// not be able to swap a live registry for an inert one behind a caller's back.
     ///
-    /// Called from tests today: the startup path that would install a real one lives in
-    /// dig_ecosystem#3268's files, so clippy's non-test lib target sees no production caller yet.
-    /// `allow(dead_code)` stands in for that missing caller — remove it when #3268 wires the call.
+    /// Called from tests today: no production startup path installs one, so clippy's non-test
+    /// lib target sees no production caller and `allow(dead_code)` stands in for it. Remove the
+    /// attribute when that wiring lands. Its owning ticket is tracked separately and is NOT
+    /// dig_ecosystem#3268 (claim loop + `ClaimStatus`), which names neither this registry nor this
+    /// call — do not read the attribute as a claim about #3268's scope.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn install_funded_distributor_registry(
         &self,
@@ -681,12 +685,17 @@ impl Node {
     /// once. Returns `false` if one is already installed, in which case NOTHING changed — mirrors
     /// [`Node::install_funded_distributor_registry`]'s same one-shot discipline.
     ///
-    /// Called from tests today: the startup path that would install the real adapter lives in
-    /// `dig-node-service`, so clippy's non-test lib target sees no production caller yet. Which
-    /// ticket OWNS that adapter and this call site is an open question, tracked separately — it is
-    /// NOT dig_ecosystem#3268 (claim loop + `ClaimStatus`), which names neither.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn install_reward_chain_port(
+    /// `pub` because this is the INJECTION POINT, and the adapter is built one crate UP:
+    /// `dig-node-service` constructs it over `dig-rewards-coin` and injects it downward
+    /// (dig_ecosystem#3310, which names both `distributor_report` and this function). A
+    /// `pub(crate)` setter made that architecture unbuildable while its own doc described it, and
+    /// the `#[cfg_attr(not(test), allow(dead_code))]` that used to sit here was hiding the
+    /// unreachability rather than standing in for a merely-absent caller.
+    ///
+    /// Being callable from outside does NOT relax the single-install discipline: a second install
+    /// must not be able to swap a live adapter for an inert one behind a caller's back, so the
+    /// second call returns `false` and changes nothing.
+    pub fn install_reward_chain_port(
         &self,
         port: Arc<dyn rewards::port::RewardsChainPort>,
     ) -> bool {
@@ -5625,7 +5634,7 @@ mod tests {
             let local = LOCAL_WIRE_CODES.iter().find(|(n, _)| n == number);
             assert!(
                 canonical.is_some() || local.is_some(),
-                "wire code {number} appears in this crate's sources but is neither declared by                  dig-rpc-protocol nor registered in LOCAL_WIRE_CODES - register it (with the                  condition it names) or emit a declared code instead"
+                "wire code {number} is in these sources but is neither declared by dig-rpc-protocol nor registered in LOCAL_WIRE_CODES"
             );
         }
 
@@ -6168,7 +6177,8 @@ mod tests {
     }
 
     /// dig_ecosystem#3285: a node with no funder registry installed — which is EVERY production
-    /// node until #3268 wires one — must read UNKNOWN, never an empty funded set.
+    /// node today, since no startup path installs one and the ticket that will is tracked
+    /// separately (it is not #3268) — must read UNKNOWN, never an empty funded set.
     /// **Catches:** a `funded_distributors_read` that defaults to `FundsNothing`, or a `Vec`/
     /// `Option` return that a caller would render as `[]`.
     #[test]
@@ -10019,10 +10029,13 @@ mod tests {
     /// side: doesn't fit `u16`, the caller narrows before calling this port, or the adapter's own
     /// `0..=10_000` domain check), BOTH methods refuse the WHOLE call with a distinct machine code
     /// — never a `0`, never an empty `commitments` list standing in for the refusal.
-    /// **Mutation-probe:** flipping `reward_chain_port_error_response`'s
-    /// `InvalidWithdrawalShare` arm to instead answer a `withdrawal_share_bps: 0` result turns this
-    /// RED (see the accompanying report for the before/after run) — proving the test is not
-    /// vacuously green under the defect it exists to catch.
+    /// **Mutation-probe, re-runnable from this repo alone:** in `seams::dig_rpc::dispatch`,
+    /// replace `reward_chain_port_error_response`'s `InvalidWithdrawalShare` arm with a `result`
+    /// carrying `withdrawal_share_bps: 0`, then run
+    /// `cargo test -p dig-node-core --lib reward_distributor_methods_`. This test fails at its
+    /// FIRST assertion, `resp.get("result").is_none()`, for `dig.getRewardDistributor`: a refusal
+    /// has become an answer. Restoring the arm returns it to green with the rest of the suite
+    /// untouched. That is the defect it exists to catch, so it is not vacuously green.
     #[test]
     fn reward_distributor_methods_refuse_whole_call_on_invalid_withdrawal_share() {
         let (node, _td) = test_node(None);
@@ -10100,13 +10113,16 @@ mod tests {
                 json!("REWARD_INVALID_WITHDRAWAL_SHARE"),
                 "{method}: {resp}"
             );
+            // Matched in a JSON VALUE position (`:10001`), not anywhere in the body: the
+            // refusal MESSAGE legitimately names the bound it enforces, and asserting on the
+            // bare digits would fail on the honest text while saying nothing about the figure.
             let body = resp.to_string();
             assert!(
-                !body.contains("10001"),
+                !body.contains(":10001"),
                 "{method}: the out-of-range figure must not reach the wire: {body}"
             );
             assert!(
-                !body.contains("10000"),
+                !body.contains(":10000"),
                 "{method}: a clamp to 100% is a money lie, not a safe default: {body}"
             );
         }
@@ -10209,8 +10225,12 @@ mod tests {
     /// defect dig-app#403's rewards pane shipped (a per-distributor total silently summed or
     /// swapped). Reads BOTH distributors' `dig.listRewardDistributorCommitments` in the same test
     /// and asserts neither the summed nor the swapped figure appears in either response.
-    /// **Mutation-probe:** swapping the two `FakeRewardsChainPort` entries' `recoverable_base_units`
-    /// turns this RED (see the accompanying report).
+    /// **Mutation-probe, re-runnable from this repo alone:** swap the two
+    /// `FakeRewardsChainPort` entries' `recoverable_base_units` (give `slot_a` `slot_b`'s figure
+    /// and vice versa) and run `cargo test -p dig-node-core --lib commitment_money_figures`. This
+    /// test fails on the assertion that distributor A's response does not carry B's figure;
+    /// undoing the swap returns it to green. No other test notices the swap, which is why this
+    /// one exists.
     #[test]
     fn commitment_money_figures_stay_attributed_to_their_own_distributor() {
         let (node, _td) = test_node(None);
