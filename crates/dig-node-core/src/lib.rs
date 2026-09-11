@@ -9597,29 +9597,87 @@ mod tests {
         }
     }
 
+    /// Derives `entry_set_stale` the way a production adapter MUST (SPEC §12.4): from the
+    /// CHAIN-derived last-entry-write time measured against the exported
+    /// [`crate::rewards::spec_constants::STALE_ENTRY_SET_SECONDS`], through the same
+    /// [`crate::rewards::staleness::is_entry_set_stale`] rule the engine uses — never a hardcoded
+    /// `172_800`, and never a prover's own self-report of its freshness.
+    fn derive_entry_set_stale(
+        reserve_base_units: u64,
+        last_entry_write_at: Option<u64>,
+        observed_at: u64,
+        distributor_created_at: u64,
+    ) -> bool {
+        crate::rewards::staleness::is_entry_set_stale(
+            &crate::rewards::port::DistributorChainState {
+                reserve_base_units,
+                entries: Vec::new(),
+                current_distributor_epoch: 0,
+                last_entry_write_at,
+                total_paid_out_base_units: 0,
+            },
+            observed_at,
+            distributor_created_at,
+        )
+    }
+
     /// A `DistributorReport` with every field distinctly derived from `seed`, so two reports built
     /// from two different seeds can never accidentally collide on a real field.
+    ///
+    /// `entry_set_stale` is the one field that is NOT a free function of `seed`: it is derived from
+    /// this report's own `last_entry_write_at`/`observed_at` against the exported staleness bound,
+    /// so no fixture can carry a staleness flag its own chain-derived times contradict. With the
+    /// times below, every seed's report is FRESH (its write is 100_000s old, inside the bound); a
+    /// test that needs the stale side uses [`distributor_report_with_write_age`].
     fn sample_distributor_report(
         seed: u8,
         commitments: Vec<crate::rewards::port::CommitmentSlot>,
     ) -> crate::rewards::port::DistributorReport {
+        let first_epoch_start = 1_700_000_000 + seed as u64;
+        let reserve_base_units = 10_000_000 + seed as u64 * 1_000;
+        let last_entry_write_at = Some(1_700_100_000 + seed as u64);
+        let observed_at = 1_700_200_000 + seed as u64;
         crate::rewards::port::DistributorReport {
             launcher_id: [seed; 32],
             store_id: [seed.wrapping_add(1); 32],
             root: [seed.wrapping_add(2); 32],
             epoch_seconds: 604_800 + seed as u64,
-            first_epoch_start: 1_700_000_000 + seed as u64,
+            first_epoch_start,
             payout_threshold: 1_000_000 + seed as u64,
             fee_bps: 100 + seed as u16,
             withdrawal_share_bps: 9_000 + seed as u16,
-            reserve_base_units: 10_000_000 + seed as u64 * 1_000,
+            reserve_base_units,
             entry_count: 3 + seed as u64,
             current_distributor_epoch: 5 + seed as u64,
-            last_entry_write_at: Some(1_700_100_000 + seed as u64),
-            entry_set_stale: seed % 2 == 0,
+            last_entry_write_at,
+            entry_set_stale: derive_entry_set_stale(
+                reserve_base_units,
+                last_entry_write_at,
+                observed_at,
+                first_epoch_start,
+            ),
             commitments,
-            observed_at: 1_700_200_000 + seed as u64,
+            observed_at,
         }
+    }
+
+    /// [`sample_distributor_report`] with the chain-derived last entry write placed exactly
+    /// `write_age_seconds` before `observed_at`, and `entry_set_stale` re-derived from that age.
+    /// Lets one test drive both sides of the staleness bound without writing the bound's numeric
+    /// value down anywhere.
+    fn distributor_report_with_write_age(
+        seed: u8,
+        write_age_seconds: u64,
+    ) -> crate::rewards::port::DistributorReport {
+        let mut report = sample_distributor_report(seed, vec![]);
+        report.last_entry_write_at = Some(report.observed_at - write_age_seconds);
+        report.entry_set_stale = derive_entry_set_stale(
+            report.reserve_base_units,
+            report.last_entry_write_at,
+            report.observed_at,
+            report.first_epoch_start,
+        );
+        report
     }
 
     fn rt() -> tokio::runtime::Runtime {
@@ -9879,19 +9937,40 @@ mod tests {
     }
 
     /// **Proves:** `entry_set_stale` is threaded through, both `true` and `false`, straight from
-    /// the port's chain-derived figure — never hardcoded, never inverted.
+    /// the port's chain-derived figure — never hardcoded, never inverted — with BOTH cases served
+    /// by ONE port installed ONCE on ONE node, answered by the REQUESTED launcher id. Each
+    /// expectation is derived from that report's own last-entry-write age against the exported
+    /// `STALE_ENTRY_SET_SECONDS`; the bound's numeric value appears nowhere in this test.
+    /// **Catches:** a handler that hardcodes or inverts the flag, and one that answers a DIFFERENT
+    /// distributor's staleness for the requested launcher id.
     #[test]
     fn get_reward_distributor_threads_entry_set_stale_both_ways() {
         let (node, _td) = test_node(None);
-        for (seed, expect_stale) in [(0x60u8, true), (0x61u8, false)] {
-            let launcher_id = [seed; 32];
-            let mut report = sample_distributor_report(seed, vec![]);
-            report.entry_set_stale = expect_stale;
-            assert!(
-                node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
-                    reports: std::collections::HashMap::from([(launcher_id, Ok(report))]),
-                }))
-            );
+        let bound = crate::rewards::spec_constants::STALE_ENTRY_SET_SECONDS;
+        // SPEC §12.4 compares with `>=`: exactly at the bound is stale, one second inside is not.
+        let stale_report = distributor_report_with_write_age(0x60, bound);
+        let fresh_report = distributor_report_with_write_age(0x61, bound - 1);
+        assert!(
+            stale_report.entry_set_stale && !fresh_report.entry_set_stale,
+            "the fixtures must straddle the staleness bound, or this test proves nothing"
+        );
+
+        let cases = [
+            (stale_report.launcher_id, stale_report.entry_set_stale),
+            (fresh_report.launcher_id, fresh_report.entry_set_stale),
+        ];
+        // ONE install for both cases: `install_reward_chain_port` is single-shot deliberately, and
+        // loosening it so a test could install twice would let a real double-install through.
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([
+                    (stale_report.launcher_id, Ok(stale_report)),
+                    (fresh_report.launcher_id, Ok(fresh_report)),
+                ]),
+            }))
+        );
+
+        for (launcher_id, expect_stale) in cases {
             let resp = rt().block_on(handle_rpc(
                 &node,
                 json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardDistributor",
@@ -9899,7 +9978,12 @@ mod tests {
                 crate::download::ReadOrigin::Local,
                 crate::download::RequestProvenance::FirstParty,
             ));
-            assert_eq!(resp["result"]["entry_set_stale"], json!(expect_stale));
+            assert_eq!(
+                resp["result"]["entry_set_stale"],
+                json!(expect_stale),
+                "launcher {} must report its OWN chain-derived staleness",
+                hex::encode(launcher_id)
+            );
         }
     }
 
