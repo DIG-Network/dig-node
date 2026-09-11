@@ -37,10 +37,11 @@ const ENGINE_WARMING: i64 = -32002;
 
 /// `REWARD_CHAIN_UNAVAILABLE` (dig_ecosystem#3269): no reward-distributor chain-read adapter is
 /// wired yet (`rewards::port::ChainPortError::Unavailable`, or no adapter installed at all).
-/// Distinct from [`REWARD_INVALID_WITHDRAWAL_SHARE`] below — a caller must be able to tell "ask me
-/// again once the adapter lands" apart from "this distributor's own constant is out of range".
-/// Reuses [`CONTROL_ERROR`]'s numeric code (both are control-plane runtime errors, `-32032`), but
-/// carries its own `data.code` machine string so the two are still distinguishable in the body.
+/// Distinct from [`REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE`] below — a caller must be able to tell
+/// "ask me again once the adapter lands" apart from "this distributor's own constant is out of
+/// range". Reuses [`CONTROL_ERROR`]'s numeric code (both are control-plane runtime errors,
+/// `-32032`), but carries its own `data.code` machine string so the two are still distinguishable
+/// in the body.
 const REWARD_CHAIN_UNAVAILABLE_MACHINE: &str = "REWARD_CHAIN_UNAVAILABLE";
 
 /// `REWARD_INVALID_WITHDRAWAL_SHARE` (dig_ecosystem#3269/#3284/#3303): the distributor's
@@ -48,7 +49,14 @@ const REWARD_CHAIN_UNAVAILABLE_MACHINE: &str = "REWARD_CHAIN_UNAVAILABLE";
 /// `0..=10_000` range. Refuses the WHOLE call — see `rewards::port::ChainPortError::InvalidWithdrawalShare`'s
 /// doc for why a per-distributor curried value makes that the correct shape, never a `0` or an
 /// omitted field.
-const REWARD_INVALID_WITHDRAWAL_SHARE: i64 = -32033;
+///
+/// Discriminated by `data.code` on [`CONTROL_ERROR`]'s `-32032`, exactly like
+/// [`REWARD_CHAIN_UNAVAILABLE_MACHINE`]: the shared wire taxonomy (`lib.rs`'s canonical catalogue)
+/// registers no code beyond `-32032`, and minting a fresh number locally would put this node
+/// outside the byte-identical contract it declares it follows — another implementation would have
+/// no way to read it. The next number is not even free: `dig-node-service` already spends it on an
+/// unrelated ingress refusal.
+const REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE: &str = "REWARD_INVALID_WITHDRAWAL_SHARE";
 
 /// Maps a [`ChainPortError`] to the JSON-RPC error response for both reward-distributor read
 /// methods (dig_ecosystem#3269 unit 2) — one mapping so `dig.getRewardDistributor` and
@@ -62,9 +70,9 @@ fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value
             "data": { "code": REWARD_CHAIN_UNAVAILABLE_MACHINE, "origin": "control" }
         }}),
         ChainPortError::InvalidWithdrawalShare => json!({"jsonrpc":"2.0","id":id,"error":{
-            "code": REWARD_INVALID_WITHDRAWAL_SHARE,
+            "code": CONTROL_ERROR,
             "message": "distributor's withdrawal_share_bps is out of range (must fit u16 and be <= 10000)",
-            "data": { "code": "REWARD_INVALID_WITHDRAWAL_SHARE", "origin": "control" }
+            "data": { "code": REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE, "origin": "control" }
         }}),
         ChainPortError::Other(msg) => json!({"jsonrpc":"2.0","id":id,"error":{
             "code": CONTROL_ERROR,

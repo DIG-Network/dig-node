@@ -595,8 +595,12 @@ pub struct Node {
     ///
     /// A slot rather than a constructor argument for the same reason [`Node::mirror_pointers`] is
     /// one. Nothing installs a real adapter yet: the one that calls `dig-rewards-coin` lives in
-    /// `dig-node-service` (dig_ecosystem#3268, a sibling unit this crate never depends on — see
-    /// `rewards::port`'s module doc). Until it is installed, both handlers answer
+    /// `dig-node-service`, a sibling unit this crate never depends on (see `rewards::port`'s
+    /// module doc). WHICH ticket carries that adapter is an OPEN question — it is tracked
+    /// separately from dig_ecosystem#3268, whose scope is the claim loop and `ClaimStatus` and
+    /// which names neither `distributor_report` nor this installer. Do not read a ticket number
+    /// into this comment that nobody has verified. Until the adapter is installed, both handlers
+    /// answer
     /// [`rewards::port::ChainPortError::Unavailable`] — a real "no chain source is wired yet",
     /// never a silent zero or empty list.
     reward_chain_port: OnceLock<Arc<dyn rewards::port::RewardsChainPort>>,
@@ -677,9 +681,10 @@ impl Node {
     /// once. Returns `false` if one is already installed, in which case NOTHING changed — mirrors
     /// [`Node::install_funded_distributor_registry`]'s same one-shot discipline.
     ///
-    /// Called from tests today: the startup path that would install the real adapter belongs to
-    /// dig_ecosystem#3268's files (`dig-node-service`), so clippy's non-test lib target sees no
-    /// production caller yet.
+    /// Called from tests today: the startup path that would install the real adapter lives in
+    /// `dig-node-service`, so clippy's non-test lib target sees no production caller yet. Which
+    /// ticket OWNS that adapter and this call site is an open question, tracked separately — it is
+    /// NOT dig_ecosystem#3268 (claim loop + `ClaimStatus`), which names neither.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn install_reward_chain_port(
         &self,

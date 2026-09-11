@@ -147,8 +147,9 @@ pub enum ChainPortError {
 /// needs it.
 ///
 /// `recoverable_base_units` is the adapter's PRE-COMPUTED share — never restated by a caller of
-/// this port, and never recomputed by `dig-node-core` itself. The production adapter
-/// (`dig-node-service`, dig_ecosystem#3268) is the one crate in this seam that depends on
+/// this port, and never recomputed by `dig-node-core` itself. The production adapter lives in
+/// `dig-node-service` (which ticket owns it is an open question tracked separately — not
+/// dig_ecosystem#3268) and is the one crate in this seam that depends on
 /// `dig-rewards-coin` (dig_ecosystem#3269 unit 0 removed that dependency from THIS crate
 /// deliberately); it computes this figure with `dig_rewards_coin::recoverable_base_units` — that
 /// crate's own tested, simulator-bound restatement of the puzzle's share arithmetic (u128
