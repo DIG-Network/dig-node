@@ -7,11 +7,27 @@
 //! the production adapter reports [`ChainPortError::Unavailable`] and runs no cycles. See
 //! [`UnavailableChainPort`] for that adapter.
 //!
-//! # dig_ecosystem#3269 unit 2 — the driver shipped, but still with no reader (blocking finding)
+//! # The reader HAS shipped (corrected: the text here was written against 0.2.0)
 //!
-//! `dig-rewards-coin` 0.2.0 is published and adds real types — `DistributorSnapshot` /
-//! `DistributorSlots` (its `state` module) plus `clawback`, `comment`, `constants`, `eligibility`,
-//! `entries`, `epoch`, `fund`, `launch`, `payout`. **It still ships no chain reader — blocker 1.**
+//! `dig-rewards-coin` publishes **0.4.1** (latest on the crates.io index as this was written; 0.4.0
+//! read first-hand from the local registry cache, since this crate deliberately does not depend on
+//! it) and it ships the chain reader the paragraph below said it withheld:
+//! `state::read_distributor(&impl ChainSource, launcher_id) -> Result<Option<DistributorSnapshot>,
+//! RewardsError>`, plus `clawback::recoverable_base_units(rewards_base_units,
+//! withdrawal_share_bps) -> Option<u64>`, which refuses above `10_000` bps exactly as this seam's
+//! own range check does. **Blocker 1 is CLOSED**, and what follows it described a crate two
+//! releases old; it is kept only because the SHAPE argument it makes still holds.
+//!
+//! What dig-node still lacks is an ADAPTER, which is a different thing from a reader:
+//! `read_distributor` takes a caller-supplied `ChainSource` and does no socket I/O of its own, so
+//! something must hold the chain source, call the reader and map its answers onto this trait. That
+//! is dig_ecosystem#3310's job, in `dig-node-service`, injected down through
+//! [`crate::Node::install_reward_chain_port`]. It is NOT #3249, the driver ticket: a crate that
+//! does no I/O can never be the adapter, so every "until #3249 lands" written about an adapter was
+//! a pointer at a ticket that structurally cannot ship it — and a blocker filed on such a ticket
+//! is never read.
+//!
+//! The historical 0.2.0 finding, for the reasoning it carries:
 //! 0.2.0's own `state.rs:1-31` module doc says so directly: SPEC §12.1's `read_distributor` "does not
 //! publish one, deliberately" — the implementation that existed applied
 //! `RewardDistributor::from_parent_spend` to the eve coin's spend (the launch inner puzzle) instead
@@ -41,24 +57,24 @@
 //! before any of `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments` /
 //! `dig.listRewardDistributors`'s `funded` half can answer honestly.
 //!
-//! So a "real" `RewardsChainPort` adapter over 0.2.0 cannot honestly answer ANY of the four trait
-//! methods with live chain data yet: `funded_distributors` has no identity source, and
-//! `distributor_state`/`submit_entry_writes`/`spend_new_epoch` all need the withheld reader (a spend
-//! needs the live singleton coin `read_distributor` would supply). Writing one anyway — either by
+//! So no adapter can honestly live HERE, which is a narrower claim than the one this paragraph used
+//! to make: `funded_distributors` still has no identity source (blocker 2, below, and still true),
+//! and the reader 0.4 does ship needs a `ChainSource` that `dig-node-core` deliberately does not
+//! hold — wiring one up in this crate would re-add the `dig-rewards-coin` dependency unit 0 removed. Writing one anyway — either by
 //! reimplementing `read_distributor` myself or by inventing a funded-distributor registry with no
 //! writer — would be exactly the kind of restated, unreviewed money-shape work SPEC §0.1 clause 1 and
 //! this crate's own withholding of a broken reader argue against, and is the shape fork this ticket's
 //! kernel invariant 6 says to escalate rather than guess. Escalated to the L1, and settled: no new
-//! adapter and no dispatch arm land until a reader (0.3.0+) and the funder-ownership registry both
-//! exist. **`dig.listRewardDistributors` stays `-32601` deliberately** — serving it through
+//! adapter and no dispatch arm land here until the funder-ownership registry exists and #3310's
+//! adapter lands in `dig-node-service`. The reader half of that condition is now met. **`dig.listRewardDistributors` stays `-32601` deliberately** — serving it through
 //! `UnavailableChainPort` was considered and rejected: it would be a false capability signal (a
 //! feature-probe or `rpc.discover` reading the method as implemented when it always errors) and the
 //! exact "dispatch surface with no function behind it" pattern DIG-Network/dig-node#593 was the last
 //! PR allowed to land on. `UnavailableChainPort` remains the only production adapter for now — still
 //! correct, since every real call would fail for one of the two reasons above regardless. No
 //! `dig-rewards-coin` dependency is added by this unit: an unused dependency with no consumer is
-//! inert weight and would want whichever version ships the reader (0.3.0+), not 0.2 — add it in the
-//! unit that actually consumes it.
+//! inert weight; the version it will want is whatever is current when #3310 adds it in
+//! `dig-node-service`, the unit that actually consumes it. Do not add it here.
 
 use super::admission::AdmittedPeer;
 use async_trait::async_trait;
@@ -255,13 +271,18 @@ pub trait RewardsChainPort: Send + Sync {
     ) -> Result<DistributorReport, ChainPortError>;
 }
 
-/// The production adapter until DIG-Network/dig_ecosystem#3249 lands: reports
+/// The production adapter until dig_ecosystem#3310 lands: reports
 /// [`ChainPortError::Unavailable`] on every call and runs no cycles.
 ///
 /// This is the named state `ChainSourceUnavailable` (SPEC §2.3), not a silent no-op — a no-op that
-/// reported progress would be the exact honesty violation §2.4 forbids. When #3249 ships, this
-/// adapter is replaced with one that calls the real driver through this same trait; nothing above
-/// this seam changes.
+/// reported progress would be the exact honesty violation §2.4 forbids. #3310 replaces it with an
+/// adapter built in `dig-node-service` over `dig-rewards-coin`'s reader and injected through
+/// [`crate::Node::install_reward_chain_port`]; nothing above this seam changes.
+///
+/// This used to cite #3249, the `dig-rewards-coin` DRIVER ticket. That was a dead pointer: the
+/// driver crate does no socket I/O — `read_distributor` takes a caller-supplied `ChainSource` — so
+/// it can never be this adapter, and #3310 is the ticket that owns it (it names both
+/// `distributor_report` and the install call).
 pub struct UnavailableChainPort;
 
 #[async_trait]
