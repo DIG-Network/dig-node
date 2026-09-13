@@ -3,9 +3,11 @@
 //! # Byte-identical contract
 //!
 //! Every value below is copied verbatim from the normative spec, each tagged with the clause it
-//! comes from. They live here — not scattered across the engine — because `dig-rewards-coin` is
-//! still SPEC-only (`pub mod distributor {}`, DIG-Network/dig_ecosystem#3249): the moment #3249
-//! lands and publishes these as its own constants, this file MUST be deleted and every reference
+//! comes from. They live here — not scattered across the engine — because `dig-rewards-coin` does
+//! not publish these prover-side numbers: 0.4.1 ships the reader (`state::read_distributor`) and
+//! the share arithmetic (`clawback::recoverable_base_units`), and its `constants` module carries
+//! distributor-side values only. Should the crate ever publish these as its own constants, this
+//! file MUST be deleted and every reference
 //! MUST move to `dig_rewards_coin::*`. That migration is the parent's call, not this lane's — do
 //! not relitigate it here and do not let a second copy of any of these numbers exist anywhere else
 //! in this crate.
