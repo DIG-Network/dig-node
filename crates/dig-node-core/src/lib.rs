@@ -9515,61 +9515,20 @@ mod tests {
         );
     }
 
-    /// **Proves:** a zeroed `launcher_id` OR `store_id` — what an uninitialised/never-assigned
-    /// registry slot hex-encodes to — is never rendered as a real distributor with a
-    /// plausible-looking id, AND that dropping it is never silent: a `tracing::warn!` fires
-    /// naming the SPECIFIC zeroed field(s), so a registration bug is observable rather than
-    /// swallowed. This is the money-hole class the `dig-rewards-coin` driver's adversarial gates
-    /// found three times (an unset field that reads fine and costs the operator), plus the SPEC
-    /// §2.4 clause 1 defect a security + adversarial gate found in the first version of this
-    /// filter: an all-zero-`launcher_id`-only check that silently destroyed the evidence of a bad
-    /// registration, and never checked `store_id` at all.
-    ///
-    /// Distinguishes IDENTITY fields (`launcher_id`, `store_id` — a record missing either cannot
-    /// be attributed to any distributor, so it is EXCLUDED and logged at `WARN`) from the
-    /// OBSERVATION field (`root` — legitimately zero before a prover's first cycle, so it is
-    /// logged at `DEBUG`, never `WARN`, and never causes exclusion on its own; see the third case
-    /// below). The level split matters, not just the exclusion split: security measured that an
-    /// undifferentiated `warn!` for both cases turns steady-state log volume into (uncycled
-    /// provers) x (poll rate) lines an operator cannot distinguish from a real registration bug.
-    ///
-    /// **Catches:** (1) a boundary that lets an uninitialised slot answer as if it were a real
-    /// distributor; (2) a filter that only checks `launcher_id`, missing a registration bug that
-    /// zeroes `store_id` beside an otherwise-valid `launcher_id` (the exact gap security named);
-    /// (3) a fix that goes back to dropping the bad record with no log line at all; (4) a fix
-    /// that over-corrects by excluding on a zeroed `root` too, which would make a healthy,
-    /// just-not-yet-cycled prover invisible; (5) a fix that returns the zeroed-root record but logs
-    /// it at the SAME level (`warn!`) as a real identity fault, defeating the operator's ability to
-    /// tell the two apart; (6) a log assertion that only checks the field NAME `launcher_id`
-    /// appears somewhere in the log line — true unconditionally, since the log always includes
-    /// `launcher_id = %hex::encode(...)` as a structured field regardless of which field was
-    /// actually zero — rather than checking the `zeroed_fields=[...]` value AND the level.
+    /// **Proves:** a zeroed `root` alone (an OBSERVATION field, not an identity field) never
+    /// causes exclusion or a whole-call refusal — a freshly-registered prover that has not
+    /// completed its first cycle is a legitimate state, and a `tracing::debug!` (never `warn!`)
+    /// fires naming `root`, distinct from the missing-identity refusal covered by the two tests
+    /// below. **Catches:** an over-correction that starts refusing on a zeroed `root` too, which
+    /// would make a healthy, just-not-yet-cycled prover invisible.
     #[test]
-    fn get_reward_prover_status_logs_and_excludes_a_zeroed_identity_field() {
+    fn get_reward_prover_status_returns_a_zeroed_root_record_with_a_debug_log() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let (node, _td) = test_node(None);
 
-        // Case 1: launcher_id itself is zeroed (the original, narrower gap).
-        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
-            sample_reward_prover_status([0u8; 32]),
-        ));
-
-        // Case 2: launcher_id is VALID, but store_id is zeroed — the gap security named, which
-        // the launcher_id-only filter would have let straight through as a plausible record.
-        let valid_but_zeroed_store = [0xccu8; 32];
-        let mut zeroed_store_status = sample_reward_prover_status(valid_but_zeroed_store);
-        zeroed_store_status.store_id = [0u8; 32];
-        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
-            zeroed_store_status,
-        ));
-
-        // Case 3: launcher_id AND store_id are both valid, but root is zeroed — a plausible
-        // "registered, not yet cycled" prover. Must still be RETURNED (root is not an identity
-        // field), and a DEBUG (never WARN) still fires naming `root` so the state stays
-        // observable without polluting warn-level volume with an ordinary, expected state.
         let valid_but_zeroed_root = [0xbbu8; 32];
         let mut zeroed_root_status = sample_reward_prover_status(valid_but_zeroed_root);
         zeroed_root_status.root = [0u8; 32];
@@ -9577,8 +9536,6 @@ mod tests {
             zeroed_root_status,
         ));
 
-        // A real, fully-valid entry alongside all three, to prove the guard is selective, not a
-        // by-product of the registry being otherwise empty.
         let real_id = [0xaau8; 32];
         node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
             sample_reward_prover_status(real_id),
@@ -9591,55 +9548,105 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         )));
 
+        assert_eq!(
+            resp["result"]["statuses"]["outcome"],
+            json!("consulted"),
+            "a zeroed root alone must never trigger the missing-identity refusal: {resp}"
+        );
         let statuses = resp["result"]["statuses"]["items"]
             .as_array()
             .expect("result.statuses.items is an array");
-        assert_eq!(
-            statuses.len(),
-            2,
-            "the fully-valid entry AND the zeroed-root-only entry are both returned; only the \
-             zeroed-launcher_id and zeroed-store_id entries are excluded: {resp}"
-        );
-        let returned_ids: std::collections::BTreeSet<String> = statuses
-            .iter()
-            .map(|s| s["launcher_id"].as_str().unwrap().to_string())
-            .collect();
-        assert!(returned_ids.contains(&hex::encode(real_id)));
-        assert!(returned_ids.contains(&hex::encode(valid_but_zeroed_root)));
-
-        // The observable signal: a warning naming the SPECIFIC zeroed field(s), for EACH bad
-        // registration — asserted on the actual `zeroed_fields=[...]` value, not merely on the
-        // field NAME `launcher_id` appearing somewhere (that would pass even for the store_id or
-        // root cases, since the warn always logs `launcher_id = ...` as a structured field
-        // regardless of which field was actually zero — the exact tautology a correctness gate
-        // found in an earlier version of this assertion).
-        assert!(
-            logs.contains("WARN") && logs.contains(r#"zeroed_fields=["launcher_id"]"#),
-            "expected a WARN naming exactly launcher_id as zeroed, got: {logs}"
-        );
-        assert!(
-            logs.contains("WARN") && logs.contains(r#"zeroed_fields=["store_id"]"#),
-            "expected a WARN naming exactly store_id as zeroed, got: {logs}"
-        );
-        // A zeroed root alone must be DEBUG, not WARN — it is an ordinary pre-first-cycle state,
-        // not a registration bug, and sharing warn-level volume with a real identity fault would
-        // make an operator polling this endpoint unable to tell them apart (the exact security
-        // finding that split these into two levels).
+        assert_eq!(statuses.len(), 2, "both entries are returned: {resp}");
         assert!(
             logs.contains("DEBUG") && logs.contains(r#"zeroed_fields=["root"]"#),
-            "expected a DEBUG line naming exactly root as zeroed, distinct from the WARN level \
-             used for a missing identity field, even though the record is still returned: {logs}"
+            "expected a DEBUG line naming exactly root as zeroed: {logs}"
         );
-        assert_eq!(
-            logs.matches("missing an identity field").count(),
-            2,
-            "expected exactly one WARN per identity-missing registration (2 here: launcher_id, \
-             store_id) — the zeroed-root-only case must never count as one: {logs}"
+        assert!(
+            !logs.contains("WARN"),
+            "a zeroed root alone must never log at WARN: {logs}"
         );
+    }
+
+    /// **Proves (dig_ecosystem#3269 fix939 — the silent-drop defect):** a record with a missing
+    /// identity field (`launcher_id` or `store_id`), when the caller narrows the request with
+    /// `params.launcher_id` naming exactly that record, makes `dig.getRewardProverStatus` refuse
+    /// the WHOLE call with `REWARD_ZERO_IDENTITY` — never `{"outcome":"consulted","items":[]}`,
+    /// which `dig-rpc-protocol` 0.12.0's `Half::Consulted` contracts as "the complete answer"
+    /// (`types.rs:1666`). A filtered empty list under `Consulted` reads as "I looked, there is
+    /// nothing" when the truth is "I looked, found it, and discarded it" — exactly the defect
+    /// class this epic exists to kill. Matches `range_checked_report`'s whole-call refusal for
+    /// the three sibling reward-distributor handlers, asserted on the SERIALIZED JSON body
+    /// through the real `handle_rpc` -> `handle_rpc_as` -> `RpcDispatch::dispatch` path.
+    /// **Catches:** a `.filter()` that silently drops the record instead of refusing the call.
+    #[test]
+    fn get_reward_prover_status_refuses_whole_call_when_filtered_record_has_missing_identity() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+
+        // launcher_id is VALID (so it can be named by the filter), but store_id is zeroed.
+        let launcher_id = [0xccu8; 32];
+        let mut zeroed_store_status = sample_reward_prover_status(launcher_id);
+        zeroed_store_status.store_id = [0u8; 32];
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            zeroed_store_status,
+        ));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus",
+                   "params":{"launcher_id": hex::encode(launcher_id)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
         assert_eq!(
-            logs.matches("zeroed root").count(),
-            1,
-            "expected exactly one DEBUG for the zeroed-root-only registration: {logs}"
+            resp["error"]["data"]["code"],
+            json!("REWARD_ZERO_IDENTITY"),
+            "expected a whole-call refusal naming REWARD_ZERO_IDENTITY, got: {resp}"
+        );
+        assert!(
+            resp.get("result").is_none(),
+            "a refusal must carry no result at all, not an empty/consulted one: {resp}"
+        );
+    }
+
+    /// **Proves (dig_ecosystem#3269 fix939):** the same whole-call refusal fires with NO filter
+    /// applied, against a MIXED registry (one missing-identity record beside an otherwise-valid
+    /// one) — the survivors must never be returned as a "complete" `Consulted` answer just
+    /// because at least one record was fine. **Catches:** a fix that only refuses when the
+    /// missing-identity record is the ONLY one present, still silently dropping it out of a
+    /// mixed set.
+    #[test]
+    fn get_reward_prover_status_refuses_whole_call_for_a_mixed_set_unfiltered() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status([0u8; 32]), // launcher_id itself zeroed
+        ));
+        let real_id = [0xaau8; 32];
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status(real_id),
+        ));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            resp["error"]["data"]["code"],
+            json!("REWARD_ZERO_IDENTITY"),
+            "a mixed set with one missing-identity record must refuse the WHOLE call, not \
+             return the valid survivor as a complete Consulted answer: {resp}"
         );
     }
 

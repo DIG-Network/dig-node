@@ -894,40 +894,49 @@ impl RpcDispatch for Node {
                     .get("launcher_id")
                     .and_then(Value::as_str)
                     .map(str::to_ascii_lowercase);
-                let statuses: Vec<dig_rpc_protocol::types::RewardProverStatus> = node
-                    .reward_prover_status_snapshots()
+                let snapshots = node.reward_prover_status_snapshots();
+                // dig_ecosystem#3269 fix939: a zeroed `launcher_id` or `store_id` is never a real
+                // distributor's or module's IDENTITY — see `is_missing_identity`/`zeroed_fields`.
+                // An earlier version of this handler EXCLUDED such a record with a `warn!` and
+                // still answered `Half::Consulted` with the survivors — but `Consulted`'s
+                // contract (dig-rpc-protocol 0.12.0 `types.rs:1666`) is "the complete answer", so
+                // that exclusion was itself the silent-drop defect this epic exists to kill: the
+                // wire said "I looked, there is nothing" when the truth was "I looked, found it,
+                // and discarded it." This now REFUSES THE WHOLE CALL instead — matching
+                // `range_checked_report`'s whole-call refusal for the three sibling
+                // reward-distributor handlers above — checked before the `launcher_id` filter is
+                // applied, so a caller who narrows to exactly the bad record is refused too, not
+                // handed a reassuring empty list.
+                for s in &snapshots {
+                    let zeroed = zeroed_fields(s);
+                    if is_missing_identity(&zeroed) {
+                        tracing::warn!(
+                            launcher_id = %hex::encode(s.launcher_id),
+                            store_id = %hex::encode(s.store_id),
+                            root = %hex::encode(s.root),
+                            zeroed_fields = ?zeroed,
+                            "reward-prover status registration is missing an identity field; refusing dig.getRewardProverStatus rather than answering a Consulted result with it silently dropped"
+                        );
+                        return reward_chain_port_error_response(
+                            &id,
+                            &ChainPortError::ZeroIdentity,
+                        );
+                    }
+                }
+                let statuses: Vec<dig_rpc_protocol::types::RewardProverStatus> = snapshots
                     .into_iter()
-                    // A zeroed `launcher_id` or `store_id` is never a real distributor's or
-                    // module's IDENTITY — see `is_missing_identity`/`zeroed_fields`. Excluding
-                    // such a record rather than presenting it as a real one avoids the money-hole
-                    // class the driver's gates found three times (an unset field that reads fine
-                    // and costs the operator), BUT exclusion alone would silently destroy the
-                    // evidence that a registration bug happened — the exact §2.4 clause 1
-                    // violation a security + adversarial gate found in the first version of this
-                    // filter (dig-node#595 review round). So this is never a silent drop: a
-                    // `tracing::warn!` fires naming which field(s) were zero, making a bad
-                    // registration observable, and the record is excluded.
-                    //
-                    // A zeroed `root` alone is different: it is an OBSERVATION (the prover's most
-                    // recent cycle), not an identity, and a freshly-registered prover that has not
-                    // completed its first cycle plausibly has a zero `root` legitimately. Excluding
-                    // it on that basis alone would make a healthy, just-not-yet-cycled prover
-                    // invisible — worse than the defect this guard exists to prevent. So this case
-                    // is `tracing::debug!`, not `warn!`: an ordinary, expected state rather than a
-                    // fault, kept out of `warn!`-level volume so an operator polling this endpoint
-                    // is never shown (uncycled provers) x (poll rate) lines indistinguishable from
-                    // a real registration bug. The record is still returned either way.
+                    // A zeroed `root` alone is different from a missing identity: it is an
+                    // OBSERVATION (the prover's most recent cycle), not an identity, and a
+                    // freshly-registered prover that has not completed its first cycle plausibly
+                    // has a zero `root` legitimately. Refusing on that basis would make a healthy,
+                    // just-not-yet-cycled prover invisible — worse than the defect this guard
+                    // exists to prevent. So this case is `tracing::debug!`, not `warn!`, and the
+                    // record is still returned. (Every record reaching this point has already
+                    // passed the missing-identity check above, so `zeroed_fields` here can only
+                    // ever name `root`.)
                     .filter(|s| {
                         let zeroed = zeroed_fields(s);
-                        if is_missing_identity(&zeroed) {
-                            tracing::warn!(
-                                launcher_id = %hex::encode(s.launcher_id),
-                                store_id = %hex::encode(s.store_id),
-                                root = %hex::encode(s.root),
-                                zeroed_fields = ?zeroed,
-                                "reward-prover status registration is missing an identity field; excluding it from dig.getRewardProverStatus rather than presenting it as a real distributor"
-                            );
-                        } else if !zeroed.is_empty() {
+                        if !zeroed.is_empty() {
                             tracing::debug!(
                                 launcher_id = %hex::encode(s.launcher_id),
                                 store_id = %hex::encode(s.store_id),
@@ -936,7 +945,7 @@ impl RpcDispatch for Node {
                                 "reward-prover status has a zeroed root; likely no cycle observed yet, returning it anyway"
                             );
                         }
-                        !is_missing_identity(&zeroed)
+                        true
                     })
                     .filter(|s| match &filter_launcher_id {
                         Some(want) => hex::encode(s.launcher_id).eq_ignore_ascii_case(want),
