@@ -153,6 +153,15 @@ pub enum ChainPortError {
     /// whole call here therefore blinds zero good rows and needs no wire change — see the module
     /// doc on [`DistributorReport`].
     InvalidWithdrawalShare,
+    /// dig_ecosystem#3269 unit 5: the report's `launcher_id` or `store_id` is the all-zero
+    /// `Bytes32` — never a real distributor's or module's identity, only what an
+    /// uninitialised/never-assigned slot hex-encodes to. `dig-rewards-coin@v0.4.0` itself refuses
+    /// to create a distributor with a zero identity (#3308/#3309), so a chain-derived report
+    /// naming one is not a legitimate "young distributor" case the way a zeroed `root` alone can
+    /// be — it is a malformed answer, and every reward-distributor read handler (`GetRewardDistributor`,
+    /// `ListRewardDistributorCommitments`, `ListRewardDistributors`) refuses the whole call rather
+    /// than render it, matching the zeroed-identity guard `GetRewardProverStatus` already applies.
+    ZeroIdentity,
     /// A chain answered but the call failed for a reason worth a message (bounded before logging —
     /// SPEC §3.7 clause 4 applies to every attacker-adjacent string, and a chain error is not
     /// exempt).

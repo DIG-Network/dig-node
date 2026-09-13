@@ -9427,9 +9427,14 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         ));
 
-        let statuses = resp["result"]["statuses"]
+        assert_eq!(
+            resp["result"]["statuses"]["outcome"],
+            json!("consulted"),
+            "the in-process registry read always succeeds: {resp}"
+        );
+        let statuses = resp["result"]["statuses"]["items"]
             .as_array()
-            .expect("result.statuses is an array");
+            .expect("result.statuses.items is an array");
         assert_eq!(statuses.len(), 1, "one registered handle: {resp}");
         let s = &statuses[0];
 
@@ -9502,9 +9507,10 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         ));
 
+        assert_eq!(resp["result"]["statuses"]["outcome"], json!("consulted"));
         assert_eq!(
-            resp["result"],
-            json!({"statuses": []}),
+            resp["result"]["statuses"]["items"],
+            json!([]),
             "explicit empty list: {resp}"
         );
     }
@@ -9585,9 +9591,9 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         )));
 
-        let statuses = resp["result"]["statuses"]
+        let statuses = resp["result"]["statuses"]["items"]
             .as_array()
-            .expect("result.statuses is an array");
+            .expect("result.statuses.items is an array");
         assert_eq!(
             statuses.len(),
             2,
@@ -9691,7 +9697,7 @@ mod tests {
             crate::download::ReadOrigin::Local,
             crate::download::RequestProvenance::FirstParty,
         ));
-        let filtered = filtered["result"]["statuses"].as_array().unwrap();
+        let filtered = filtered["result"]["statuses"]["items"].as_array().unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["launcher_id"], json!(hex::encode(a)));
 
@@ -9701,7 +9707,10 @@ mod tests {
             crate::download::ReadOrigin::Local,
             crate::download::RequestProvenance::FirstParty,
         ));
-        assert_eq!(all["result"]["statuses"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            all["result"]["statuses"]["items"].as_array().unwrap().len(),
+            2
+        );
     }
 
     /// An in-memory `RewardsChainPort` for `dig.getRewardDistributor` /
@@ -10012,6 +10021,290 @@ mod tests {
         );
         assert_eq!(commitments[0]["rewards_base_units"], json!(1_000));
         assert_eq!(commitments[0]["recoverable_base_units"], json!(900));
+    }
+
+    /// **Proves:** `dig.listRewardDistributors` is CONTROL-tier and NOT peer-reachable, and is
+    /// dispatched through the `Method` enum match rather than the pre-`Method::from_name` string
+    /// block (dig_ecosystem#3269 unit 2; #3261's money-hole rule).
+    #[test]
+    fn list_reward_distributors_is_control_tier_and_not_peer_reachable() {
+        use dig_rpc_protocol::Method;
+        assert_eq!(
+            Method::from_name("dig.listRewardDistributors"),
+            Some(Method::ListRewardDistributors)
+        );
+        assert_eq!(
+            Method::ListRewardDistributors.tier(),
+            dig_rpc_protocol::Tier::Control
+        );
+        assert!(!peer::is_peer_reachable_method(
+            "dig.listRewardDistributors"
+        ));
+    }
+
+    /// **Proves:** with no funder registry installed, `dig.listRewardDistributors` answers
+    /// `NotConsulted` for BOTH halves — never `Consulted { items: [] }`, which would claim this
+    /// node checked and found nothing (SPEC §12.5 clause 6's "reassuring zero").
+    /// **Catches:** a handler defaulting an unconfigured registry to an empty, "consulted" list.
+    #[test]
+    fn list_reward_distributors_with_no_registry_is_not_consulted_on_both_halves() {
+        let (node, _td) = test_node(None);
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributors"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert_eq!(
+            resp["result"]["funded"]["outcome"],
+            json!("not_consulted"),
+            "unconfigured registry must read UNKNOWN, never an empty funded set: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["claimable"]["outcome"],
+            json!("not_consulted"),
+            "no claimable tracking exists in this crate yet — must never fabricate a checked zero: {resp}"
+        );
+    }
+
+    /// **Proves:** a registry that genuinely funds nothing (`FundsNothing`, the one legitimate
+    /// empty case) renders `funded` as `Consulted { items: [] }` — a real, checked empty list, not
+    /// `NotConsulted` — while `claimable` still reads `NotConsulted` since nothing here tracks it.
+    #[test]
+    fn list_reward_distributors_with_a_genuinely_empty_registry_is_consulted_empty() {
+        let state_dir = tempfile::tempdir().unwrap();
+        // An intact record naming nobody is the ONE legitimate empty answer (`FundsNothing`) —
+        // distinct from no record ever written at all, which reads `NotConfigured`.
+        std::fs::write(
+            state_dir
+                .path()
+                .join(crate::rewards::funded::FUNDED_DISTRIBUTORS_FILE),
+            r#"{"version": 1, "distributors": []}"#,
+        )
+        .unwrap();
+        let registry =
+            crate::rewards::funded::FundedDistributorRegistry::with_state_dir(state_dir.path());
+        let (node, _td) = test_node(None);
+        assert!(node.install_funded_distributor_registry(registry));
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributors"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert_eq!(resp["result"]["funded"]["outcome"], json!("consulted"));
+        assert_eq!(resp["result"]["funded"]["items"], json!([]));
+        assert_eq!(
+            resp["result"]["claimable"]["outcome"],
+            json!("not_consulted")
+        );
+    }
+
+    /// **Proves:** a funded identity resolved through the chain port renders as a real
+    /// `RewardDistributorRef` inside `funded.items`, through the REAL dispatch path.
+    /// **Catches:** a handler that fabricates `store_id`/`root` instead of resolving them via
+    /// `RewardsChainPort::distributor_report`.
+    #[test]
+    fn list_reward_distributors_resolves_a_funded_identity_through_the_chain_port() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let funded = crate::rewards::funded::FundedDistributor {
+            launcher_id: [0x55u8; 32],
+            store_id: None,
+        };
+        let registry =
+            crate::rewards::funded::FundedDistributorRegistry::with_state_dir(state_dir.path());
+        assert_eq!(
+            registry.record(&funded),
+            crate::rewards::funded::RecordOutcome::Recorded
+        );
+        let (node, _td) = test_node(None);
+        assert!(node.install_funded_distributor_registry(registry));
+
+        let report = sample_distributor_report(0x55, vec![]);
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([([0x55u8; 32], Ok(report.clone()))]),
+            }))
+        );
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributors"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert_eq!(resp["result"]["funded"]["outcome"], json!("consulted"));
+        let items = resp["result"]["funded"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]["launcher_id"],
+            json!(hex::encode(report.launcher_id))
+        );
+        assert_eq!(items[0]["store_id"], json!(hex::encode(report.store_id)));
+        assert_eq!(items[0]["root"], json!(hex::encode(report.root)));
+        assert_eq!(
+            resp["result"]["claimable"]["outcome"],
+            json!("not_consulted")
+        );
+    }
+
+    /// **Proves:** a funded identity whose per-item chain report fails refuses the WHOLE call
+    /// (the same `ChainPortError` response the sibling reward-distributor handlers use), rather
+    /// than emitting a partial list or a fabricated ref (dig_ecosystem#3308/#3309).
+    #[test]
+    fn list_reward_distributors_refuses_the_whole_call_on_a_chain_report_failure() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let funded = crate::rewards::funded::FundedDistributor {
+            launcher_id: [0x66u8; 32],
+            store_id: None,
+        };
+        let registry =
+            crate::rewards::funded::FundedDistributorRegistry::with_state_dir(state_dir.path());
+        assert_eq!(
+            registry.record(&funded),
+            crate::rewards::funded::RecordOutcome::Recorded
+        );
+        let (node, _td) = test_node(None);
+        assert!(node.install_funded_distributor_registry(registry));
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::new(),
+            }))
+        );
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributors"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert!(
+            resp.get("result").is_none(),
+            "a per-item chain failure must refuse the whole call, not answer a partial result: {resp}"
+        );
+        assert!(
+            resp.get("error").is_some(),
+            "expected an error response: {resp}"
+        );
+    }
+
+    /// **Proves:** `dig.getPayeeRewardClaimStatus` is CONTROL-tier, NOT peer-reachable, dispatched
+    /// through the `Method` enum match, and its exact serialized JSON body: `subject` is the
+    /// literal `"payee"`, `claim_log` is `NotConsulted` (no claim log exists in this crate yet),
+    /// and there is never a monetary amount or payout puzzle hash anywhere in the body.
+    #[test]
+    fn get_payee_reward_claim_status_answers_the_exact_wire_shape() {
+        use dig_rpc_protocol::Method;
+        assert_eq!(
+            Method::from_name("dig.getPayeeRewardClaimStatus"),
+            Some(Method::GetPayeeRewardClaimStatus)
+        );
+        assert_eq!(
+            Method::GetPayeeRewardClaimStatus.tier(),
+            dig_rpc_protocol::Tier::Control
+        );
+        assert!(!peer::is_peer_reachable_method(
+            "dig.getPayeeRewardClaimStatus"
+        ));
+
+        let (node, _td) = test_node(None);
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getPayeeRewardClaimStatus"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let result = &resp["result"];
+        let keys: std::collections::BTreeSet<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["subject", "claim_log"]),
+            "no monetary amount, no payout puzzle hash — ever: {resp}"
+        );
+        assert_eq!(result["subject"], json!("payee"));
+        assert_eq!(result["claim_log"]["outcome"], json!("not_consulted"));
+        assert!(
+            result["claim_log"].get("claims_submitted_count").is_none(),
+            "claims_submitted_count must live INSIDE Consulted only, never beside NotConsulted: {resp}"
+        );
+    }
+
+    /// **Proves:** dig_ecosystem#3269 unit 5 — a chain-derived report with a ZEROED `launcher_id`
+    /// (never a real distributor's identity, only what an uninitialised slot hex-encodes to, and
+    /// `dig-rewards-coin@v0.4.0` refuses to create one this way — #3308/#3309) refuses the WHOLE
+    /// call for every reward-distributor read method, rather than rendering the zero as though it
+    /// were real.
+    /// **Catches:** a handler that hex-encodes whatever the port returns with no identity check.
+    #[test]
+    fn reward_distributor_methods_refuse_a_zeroed_identity_rather_than_render_it() {
+        let launcher_id = [0u8; 32];
+        let report = sample_distributor_report(0, vec![]);
+        assert_eq!(
+            report.launcher_id, [0u8; 32],
+            "fixture premise: seed 0 zeroes launcher_id"
+        );
+
+        let (node, _td) = test_node(None);
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher_id, Ok(report))]),
+            }))
+        );
+
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
+            let resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(
+                resp.get("result").is_none(),
+                "{method} must refuse a zeroed identity, not render it: {resp}"
+            );
+            assert_eq!(
+                resp["error"]["data"]["code"],
+                json!("REWARD_ZERO_IDENTITY"),
+                "{method}: {resp}"
+            );
+        }
+
+        // Same guard for the new list method, which resolves identity through the SAME
+        // `distributor_report` + `range_checked_report` path.
+        let state_dir = tempfile::tempdir().unwrap();
+        let funded = crate::rewards::funded::FundedDistributor {
+            launcher_id,
+            store_id: None,
+        };
+        let registry =
+            crate::rewards::funded::FundedDistributorRegistry::with_state_dir(state_dir.path());
+        assert_eq!(
+            registry.record(&funded),
+            crate::rewards::funded::RecordOutcome::Recorded
+        );
+        assert!(node.install_funded_distributor_registry(registry));
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributors"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert!(
+            resp.get("result").is_none(),
+            "dig.listRewardDistributors must refuse a zeroed identity, not render it: {resp}"
+        );
+        assert_eq!(resp["error"]["data"]["code"], json!("REWARD_ZERO_IDENTITY"));
     }
 
     /// **Proves:** with no chain-read adapter installed, BOTH reward-distributor methods answer a
@@ -10355,7 +10648,7 @@ mod tests {
             crate::download::ReadOrigin::Local,
             crate::download::RequestProvenance::FirstParty,
         ));
-        let statuses = resp["result"]["statuses"].as_array().unwrap();
+        let statuses = resp["result"]["statuses"]["items"].as_array().unwrap();
         assert_eq!(statuses.len(), 2);
 
         let find = |launcher_id: [u8; 32]| {

@@ -58,6 +58,11 @@ const REWARD_CHAIN_UNAVAILABLE_MACHINE: &str = "REWARD_CHAIN_UNAVAILABLE";
 /// unrelated ingress refusal.
 const REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE: &str = "REWARD_INVALID_WITHDRAWAL_SHARE";
 
+/// dig_ecosystem#3269 unit 5: the machine code for [`ChainPortError::ZeroIdentity`] — a
+/// zeroed `launcher_id`/`store_id` refused rather than rendered, matching
+/// `REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE`'s sibling shape.
+const REWARD_ZERO_IDENTITY_MACHINE: &str = "REWARD_ZERO_IDENTITY";
+
 /// Maps a [`ChainPortError`] to the JSON-RPC error response for both reward-distributor read
 /// methods (dig_ecosystem#3269 unit 2) — one mapping so `dig.getRewardDistributor` and
 /// `dig.listRewardDistributorCommitments` can never disagree about how a given port failure reads
@@ -73,6 +78,11 @@ fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value
             "code": CONTROL_ERROR,
             "message": "distributor's withdrawal_share_bps is out of range (must fit u16 and be <= 10000)",
             "data": { "code": REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE, "origin": "control" }
+        }}),
+        ChainPortError::ZeroIdentity => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": "distributor report carries a zeroed launcher_id or store_id, which is never a real identity",
+            "data": { "code": REWARD_ZERO_IDENTITY_MACHINE, "origin": "control" }
         }}),
         ChainPortError::Other(msg) => json!({"jsonrpc":"2.0","id":id,"error":{
             "code": CONTROL_ERROR,
@@ -104,6 +114,11 @@ const MAX_WITHDRAWAL_SHARE_BPS: u16 = 10_000;
 fn range_checked_report(report: DistributorReport) -> Result<DistributorReport, ChainPortError> {
     if report.withdrawal_share_bps > MAX_WITHDRAWAL_SHARE_BPS {
         return Err(ChainPortError::InvalidWithdrawalShare);
+    }
+    // dig_ecosystem#3269 unit 5: a zeroed `launcher_id` or `store_id` is never a real distributor's
+    // or module's identity (see `ChainPortError::ZeroIdentity`'s doc) — refuse rather than render.
+    if report.launcher_id == [0u8; 32] || report.store_id == [0u8; 32] {
+        return Err(ChainPortError::ZeroIdentity);
     }
     Ok(report)
 }
@@ -929,7 +944,18 @@ impl RpcDispatch for Node {
                     })
                     .map(reward_prover_status_to_wire)
                     .collect();
-                let result = dig_rpc_protocol::types::GetRewardProverStatusResult { statuses };
+                // dig-rpc-protocol 0.12.0 migration: `statuses` moved from a bare `Vec` to
+                // `Half<RewardProverStatus>` (SPEC §12.5 clause 6's "reassuring zero" rule).
+                // This registry read never fails — it is an in-process `RwLock` read, not a
+                // fallible chain or disk read — so it is always `Consulted`, dated at the
+                // moment this response was assembled.
+                use crate::rewards::state::Clock as _;
+                let result = dig_rpc_protocol::types::GetRewardProverStatusResult {
+                    statuses: dig_rpc_protocol::types::Half::Consulted {
+                        observed_at: crate::rewards::state::SystemClock.now_unix_seconds(),
+                        items: statuses,
+                    },
+                };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
             // dig.getRewardDistributor (dig_ecosystem#3269 unit 2, SPEC §2.6/§12.4) — CONTROL
@@ -1015,6 +1041,120 @@ impl RpcDispatch for Node {
                     epoch_seconds: report.epoch_seconds,
                     commitments,
                     observed_at: report.observed_at,
+                };
+                return json!({"jsonrpc":"2.0","id":id,"result": result});
+            }
+            // dig.listRewardDistributors (dig_ecosystem#3269 unit 2, SPEC §2.6) — CONTROL plane,
+            // same guard shape as the other reward handlers above. Two independently-consulted
+            // halves (`funded` / `claimable`), each a `Half<RewardDistributorRef>` — SPEC §12.5
+            // clause 6's "reassuring zero" rule applies to EACH half separately.
+            //
+            // `funded`: this node's OWN identity registry
+            // (`rewards::funded::FundedDistributorRegistry`, dig_ecosystem#3285) says WHICH
+            // launcher ids this node funds; `Node::funded_distributors_read` is matched with no
+            // wildcard arm so a future variant added to `FundedDistributorsRead` fails this match
+            // at compile time instead of silently falling into the wrong half. Once the identity
+            // set answers, each launcher id's CURRENT `(store_id, root)` is resolved through the
+            // same chain-read port `dig.getRewardDistributor` uses
+            // (`RewardsChainPort::distributor_report`) — `FundedDistributor` carries identity
+            // only (see that module's doc), never a root, so a ref cannot be assembled from the
+            // registry alone. A per-item chain-report failure refuses the WHOLE call with the
+            // same `ChainPortError` response the sibling handlers use, rather than emitting a
+            // partial list or a fabricated store_id/root (dig_ecosystem#3308/#3309: a zero hash
+            // rendered as though real is the same defect family as an empty list standing in for
+            // an error).
+            //
+            // `claimable`: distributors this node holds a MIRROR claim to but does not fund. No
+            // such tracking exists anywhere in this crate today (see the module search backing
+            // this comment — dig_ecosystem#3269 unit 2 wires only the funder side), so this half
+            // is honestly `NotConsulted`: nothing looked, because nothing here can look yet. It
+            // is NOT `Consulted { items: [] }` — that would claim this node checked and found no
+            // claimable distributor, which is not true; the truth is no check exists.
+            Some(Method::ListRewardDistributors) => {
+                use crate::rewards::state::Clock as _;
+                let now = crate::rewards::state::SystemClock.now_unix_seconds();
+
+                let identities: Vec<crate::rewards::funded::FundedDistributor> =
+                    match node.funded_distributors_read() {
+                        crate::rewards::funded::FundedDistributorsRead::Funded(v) => v,
+                        crate::rewards::funded::FundedDistributorsRead::FundsNothing => Vec::new(),
+                        crate::rewards::funded::FundedDistributorsRead::NotConfigured(_)
+                        | crate::rewards::funded::FundedDistributorsRead::PersistedStateCorrupt {
+                            ..
+                        }
+                        | crate::rewards::funded::FundedDistributorsRead::IoFailed { .. } => {
+                            return json!({"jsonrpc":"2.0","id":id,"result":
+                                dig_rpc_protocol::types::ListRewardDistributorsResult {
+                                    funded: dig_rpc_protocol::types::Half::NotConsulted {
+                                        observed_at: now,
+                                    },
+                                    claimable: dig_rpc_protocol::types::Half::NotConsulted {
+                                        observed_at: now,
+                                    },
+                                }
+                            });
+                        }
+                    };
+
+                let mut funded_refs = Vec::with_capacity(identities.len());
+                for identity in identities {
+                    let Some(port) = node.reward_chain_port() else {
+                        return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                    };
+                    let report = match port
+                        .distributor_report(identity.launcher_id)
+                        .await
+                        .and_then(range_checked_report)
+                    {
+                        Ok(report) => report,
+                        Err(e) => return reward_chain_port_error_response(&id, &e),
+                    };
+                    funded_refs.push(dig_rpc_protocol::types::RewardDistributorRef {
+                        launcher_id: hex::encode(report.launcher_id),
+                        store_id: hex::encode(report.store_id),
+                        root: hex::encode(report.root),
+                    });
+                }
+
+                let result = dig_rpc_protocol::types::ListRewardDistributorsResult {
+                    funded: dig_rpc_protocol::types::Half::Consulted {
+                        observed_at: now,
+                        items: funded_refs,
+                    },
+                    claimable: dig_rpc_protocol::types::Half::NotConsulted { observed_at: now },
+                };
+                return json!({"jsonrpc":"2.0","id":id,"result": result});
+            }
+            // dig.getPayeeRewardClaimStatus (dig_ecosystem#3268/#3269 unit 3, SPEC §12.5) —
+            // CONTROL plane: loopback admin / in-process FFI ONLY, absent from
+            // `is_peer_reachable_method` (`reward_methods_tier_guard.rs` fails closed on that).
+            // Dispatched through `Method::from_name(..)` like every other reward method — never
+            // the string pre-match above the enum, which bypasses this tier guard entirely
+            // (dig_ecosystem#3261: a reward RPC reachable by a peer is a money hole).
+            //
+            // `subject` is always the literal `PayeeSubject::Payee` (SPEC §12.5: this node
+            // answers as a payee, never as a funder — see `PayeeClaimStatus`'s doc for the
+            // 250x-overstatement defect that shipped when a renderer inferred the subject from
+            // the endpoint instead of reading it off the payload).
+            //
+            // `claim_log`: this crate holds no claim log anywhere — the claim-submission adapter
+            // is dig_ecosystem#3310's, in `dig-node-service`, injected downward (see
+            // `rewards::port`'s module doc; #3249 is a dead pointer for it, see the doc there).
+            // So `claims_submitted_count` has never been read here and the honest answer is
+            // `NotConsulted`, dated at the moment this responder established it has no log to
+            // read — never `Consulted { claims_submitted_count: 0 }`, which would be exactly the
+            // "reassuring zero" SPEC §12.5 clause 6 forbids: a confident zero beside a fresh
+            // timestamp, indistinguishable from "read the log, found nothing".
+            //
+            // No monetary amount, ever, and no payout puzzle hash — see `PayeeClaimStatus`'s doc.
+            // No params type: this call takes none.
+            Some(Method::GetPayeeRewardClaimStatus) => {
+                use crate::rewards::state::Clock as _;
+                let result = dig_rpc_protocol::types::PayeeClaimStatus {
+                    subject: dig_rpc_protocol::types::PayeeSubject::Payee,
+                    claim_log: dig_rpc_protocol::types::ClaimLogObservation::NotConsulted {
+                        observed_at: crate::rewards::state::SystemClock.now_unix_seconds(),
+                    },
                 };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
