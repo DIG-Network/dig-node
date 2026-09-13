@@ -882,10 +882,11 @@ impl RpcDispatch for Node {
             // mTLS peer surface (absent from `is_peer_reachable_method`;
             // `reward_methods_tier_guard.rs` fails closed on that). Reads the node's live
             // `reward_prover_statuses` registry (empty until dig_ecosystem#3265 spawns a prover
-            // loop) — a REAL read of a real, currently-empty registry, so `{"statuses": []}`
-            // means "this node runs no prover loops" and stays true right up until #3265
-            // registers one, at which point this same read starts returning it with no dispatch
-            // change. Never serializes the internal `rewards::state::RewardProverStatus`
+            // loop) — a REAL read of a real, currently-empty registry, so
+            // `{"statuses":{"outcome":"consulted","observed_at":N,"items":[]}}` means "this node
+            // runs no prover loops", genuinely read rather than assumed: an empty `items` under a
+            // `consulted` outcome. It stays true right up until #3265 registers one, at which
+            // point this same read starts returning it with no dispatch change. Never serializes the internal `rewards::state::RewardProverStatus`
             // directly (it is `camelCase`-tagged; the wire struct is snake_case) — every field is
             // mapped explicitly by `reward_prover_status_to_wire`.
             Some(Method::GetRewardProverStatus) => {

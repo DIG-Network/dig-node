@@ -65,13 +65,17 @@
 //! writer — would be exactly the kind of restated, unreviewed money-shape work SPEC §0.1 clause 1 and
 //! this crate's own withholding of a broken reader argue against, and is the shape fork this ticket's
 //! kernel invariant 6 says to escalate rather than guess. Escalated to the L1, and settled: no new
-//! adapter and no dispatch arm land here until the funder-ownership registry exists and #3310's
-//! adapter lands in `dig-node-service`. The reader half of that condition is now met. **`dig.listRewardDistributors` stays `-32601` deliberately** — serving it through
-//! `UnavailableChainPort` was considered and rejected: it would be a false capability signal (a
-//! feature-probe or `rpc.discover` reading the method as implemented when it always errors) and the
-//! exact "dispatch surface with no function behind it" pattern DIG-Network/dig-node#593 was the last
-//! PR allowed to land on. `UnavailableChainPort` remains the only production adapter for now — still
-//! correct, since every real call would fail for one of the two reasons above regardless. No
+//! ADAPTER lands here until #3310 wires one in `dig-node-service`. The DISPATCH half of that
+//! settlement has since been revisited and has landed: **`dig.listRewardDistributors` is served**,
+//! by `Some(Method::ListRewardDistributors)` in `seams/dig_rpc/dispatch.rs`, and it is honest about
+//! what it knows — the `funded` half reads this node's own funded-distributor identities, and the
+//! `claimable` half is always `NotConsulted` because no claim-side tracking exists here to consult.
+//! What is still missing is the adapter: `install_reward_chain_port` has no non-test caller
+//! (dig_ecosystem#3310), so `UnavailableChainPort` remains the only production adapter and every
+//! port-backed method answers `REWARD_CHAIN_UNAVAILABLE` in production. That is a truthful
+//! unavailability signal from a method that exists, not the "dispatch surface with no function
+//! behind it" pattern DIG-Network/dig-node#593 was the last PR allowed to land on: the dispatch arm
+//! does real reads and names precisely what it could not reach. No
 //! `dig-rewards-coin` dependency is added by this unit: an unused dependency with no consumer is
 //! inert weight; the version it will want is whatever is current when #3310 adds it in
 //! `dig-node-service`, the unit that actually consumes it. Do not add it here.
