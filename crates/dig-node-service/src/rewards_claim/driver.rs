@@ -1360,6 +1360,95 @@ mod tests {
         driver.abort();
     }
 
+    /// F2/#3336, MONEY, THE JOINT VERSION: [`the_gate_tracks_the_clamped_cadence_while_the_fee_window_tracks_the_raw_one`]
+    /// proves the gate/window split by hand-assembling `drive` directly. This test proves the SAME
+    /// property through [`run_claim_driver_in_with_clock`] -- the actual production body, the one
+    /// that threads `sanitized_schedule`'s CLAMPED cadence and the RAW `cfg.cadence_seconds` into
+    /// [`ClaimEngine::with_persisted_fee_window`] at driver.rs's one call site. Transposing the two
+    /// arguments there (the #3336 defect) is invisible to a hand-assembled `drive` test but would
+    /// flip both counts this test asserts: the fee window would roll at tick 2 instead of tick 3
+    /// (doubling the window count -- the "doubles the fee ceiling" half of the defect), and/or the
+    /// gate would stop opening every clamped tick (the "restores the no-op gate #3306 fixed" half).
+    ///
+    /// Uses a written config with a 60-day RAW cadence (`5_184_000`s, clamped to the 31-day
+    /// `CLAIM_SCHEDULE_SECONDS_MAX`, `2_678_400`s) and a clock that advances one clamped interval
+    /// per invocation, matching the scheduler's own tick -- the same pattern
+    /// [`the_gate_tracks_the_clamped_cadence_while_the_fee_window_tracks_the_raw_one`] uses, but
+    /// driven through the production body instead of a hand-built engine.
+    #[tokio::test(start_paused = true)]
+    async fn the_production_body_tracks_the_clamped_gate_and_the_raw_fee_window() {
+        let configured_cadence = 60 * 24 * 60 * 60u64; // 5_184_000, RAW -- sizes the fee window.
+        let effective_cadence = 31 * 24 * 60 * 60u64; // 2_678_400, CLAMPED -- sizes the gate.
+        assert_eq!(configured_cadence, 5_184_000);
+        assert_eq!(effective_cadence, 2_678_400);
+
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), configured_cadence);
+
+        let handle = ClaimLoopHandle::default();
+        let h = handle.clone();
+        let state_dir = dir.path().to_path_buf();
+        let driver = tokio::spawn(async move {
+            run_claim_driver_in_with_clock(
+                &state_dir,
+                Bytes32::from([1u8; 32]),
+                EmptyPort,
+                h,
+                {
+                    let mut t = 0u64;
+                    move || {
+                        t += effective_cadence;
+                        t
+                    }
+                },
+            )
+            .await;
+        });
+
+        settle().await;
+        assert_eq!(handle.cycles_driven(), 0, "no interval has elapsed yet");
+
+        // Tick 1: the window opens for the first time.
+        tokio::time::advance(Duration::from_secs(effective_cadence)).await;
+        settle().await;
+        assert_eq!(handle.cycles_driven(), 1);
+        let after_tick_1 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
+        assert_eq!(after_tick_1, Some(effective_cadence), "the window opens on tick 1");
+
+        // Tick 2: one clamped interval since tick 1 -- the GATE must open (it tracks the clamped
+        // schedule the loop actually ticks on) but the WINDOW must NOT roll yet (only one clamped
+        // interval, 2_678_400s, of its raw 5_184_000s length has elapsed).
+        tokio::time::advance(Duration::from_secs(effective_cadence)).await;
+        settle().await;
+        assert_eq!(
+            handle.cycles_driven(),
+            2,
+            "#3336: the production body's gate must track the CLAMPED cadence -- a transposed \
+             call to with_persisted_fee_window would gate on the raw 5_184_000s cadence instead \
+             and this cycle would never run, restoring the no-op gate #3306 fixed"
+        );
+        let after_tick_2 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
+        assert_eq!(
+            after_tick_2, after_tick_1,
+            "#3336: the fee window must NOT have rolled yet -- only one clamped interval has \
+             elapsed against its raw 5_184_000s length. A transposed call would roll it here, \
+             doubling the operator's configured fee-window count"
+        );
+
+        // Tick 3: two clamped intervals (5_356_800s) since the window opened -- past its raw
+        // 5_184_000s length. The window must finally roll.
+        tokio::time::advance(Duration::from_secs(effective_cadence)).await;
+        settle().await;
+        assert_eq!(handle.cycles_driven(), 3);
+        let after_tick_3 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
+        assert_ne!(
+            after_tick_3, after_tick_1,
+            "#3336: the window must have rolled once the RAW 5_184_000s cadence elapsed"
+        );
+
+        driver.abort();
+    }
+
     // ---- the cycle log: the only reader of the status surface in a shipped binary ----------
 
     /// An in-memory sink a `tracing_subscriber::fmt` layer renders records into, so a test can
