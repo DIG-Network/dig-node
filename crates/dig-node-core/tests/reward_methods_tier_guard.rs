@@ -42,6 +42,21 @@ fn reward_methods_exist_and_are_found_by_the_prefix_scan() {
         "expected at least one Reward-prefixed method in Method::ALL; found none — the prefix scan \
          itself may be broken, or the wire naming convention changed"
     );
+    // dig_ecosystem#3269 unit 3: pins the count so the guard cannot silently start policing FEWER
+    // methods than actually exist (a non-empty check alone would still pass on 4 of 5, or on a
+    // renamed variant the filter stopped matching). Update this number deliberately when
+    // `dig-rpc-protocol` adds or removes a reward method.
+    //
+    // Bumped 4 -> 5 (dig_ecosystem#3269, final leg): dig-rpc-protocol 0.12.0 added
+    // `dig.getPayeeRewardClaimStatus`, whose name also contains "Reward".
+    assert_eq!(
+        methods.len(),
+        5,
+        "expected exactly 5 Reward-prefixed methods (dig.listRewardDistributors, \
+         dig.getRewardProverStatus, dig.getRewardDistributor, \
+         dig.listRewardDistributorCommitments, dig.getPayeeRewardClaimStatus); got {}",
+        methods.len()
+    );
 }
 
 #[test]
