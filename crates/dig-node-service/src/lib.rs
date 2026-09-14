@@ -103,18 +103,18 @@ pub mod peers;
 /// The passthrough relay guard (#1997): whether this node relays an unimplemented method to an
 /// upstream, and the bring-up probe that proves an upstream is not this node itself. See [`relay`].
 pub mod relay;
-/// The node's PEER-SIDE reward claim loop (DIG-Network/dig_ecosystem#3251): discovers the
-/// reward distributors covering the `(store_id, root)`s this node mirrors and submits
-/// `InitiatePayout` on a jittered cadence, default 24h. The other half of the reward-distributor
-/// lifecycle from `dig_node_core::rewards` (#3250, the funder-side prover, a sibling lane). See
-/// [`rewards_claim`].
-pub mod rewards_claim;
 /// The node's FUNDER-SIDE `RewardsChainPort` adapter (DIG-Network/dig_ecosystem#3310): the
 /// production implementation of `dig_node_core::rewards::port::RewardsChainPort` over
 /// `dig-wallet`'s `CorroboratedChainSource` and `dig-rewards-coin`'s `state::read_distributor`,
 /// installed once at startup via `dig_node_core::Node::install_reward_chain_port`. See
 /// [`rewards::chain_port::RealRewardsChainPort`].
 pub mod rewards;
+/// The node's PEER-SIDE reward claim loop (DIG-Network/dig_ecosystem#3251): discovers the
+/// reward distributors covering the `(store_id, root)`s this node mirrors and submits
+/// `InitiatePayout` on a jittered cadence, default 24h. The other half of the reward-distributor
+/// lifecycle from `dig_node_core::rewards` (#3250, the funder-side prover, a sibling lane). See
+/// [`rewards_claim`].
+pub mod rewards_claim;
 pub mod rpc;
 /// The offline `wallet export-seed` rescue command: a local read of this node's
 /// encrypted seed file. Adds no network surface, and is removed with node-side custody.

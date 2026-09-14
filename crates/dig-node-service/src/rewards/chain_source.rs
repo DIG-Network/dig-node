@@ -123,7 +123,10 @@ where
 pub(crate) fn read_launch_constants<S>(
     source: &S,
     launcher_id: Bytes32,
-) -> Option<(chia_sdk_driver::RewardDistributorConstants, chia_sdk_driver::RewardDistributorState)>
+) -> Option<(
+    chia_sdk_driver::RewardDistributorConstants,
+    chia_sdk_driver::RewardDistributorState,
+)>
 where
     S: ChainSource,
 {
@@ -179,8 +182,10 @@ fn parse_launch_comment(
 ) -> Result<LaunchComment, LaunchCommentError> {
     let mut allocator = Allocator::new();
 
-    let puzzle_ptr = program_to_node(&mut allocator, &creating_spend.puzzle_reveal)
-        .map_err(|error| LaunchCommentError::Malformed(format!("undecodable puzzle reveal: {error}")))?;
+    let puzzle_ptr =
+        program_to_node(&mut allocator, &creating_spend.puzzle_reveal).map_err(|error| {
+            LaunchCommentError::Malformed(format!("undecodable puzzle reveal: {error}"))
+        })?;
     let solution_ptr = program_to_node(&mut allocator, &creating_spend.solution)
         .map_err(|error| LaunchCommentError::Malformed(format!("undecodable solution: {error}")))?;
 
@@ -195,10 +200,12 @@ fn parse_launch_comment(
     let parent_puzzle = Puzzle::parse(&allocator, puzzle_ptr);
     let _ = parent_puzzle; // parsed only to prove `puzzle_ptr` is a real puzzle tree; unused otherwise.
 
-    let output = run_puzzle(&mut allocator, puzzle_ptr, solution_ptr)
-        .map_err(|error| LaunchCommentError::Malformed(format!("parent puzzle did not run: {error}")))?;
-    let conditions = Conditions::<NodePtr>::from_clvm(&allocator, output)
-        .map_err(|error| LaunchCommentError::Malformed(format!("undecodable conditions: {error}")))?;
+    let output = run_puzzle(&mut allocator, puzzle_ptr, solution_ptr).map_err(|error| {
+        LaunchCommentError::Malformed(format!("parent puzzle did not run: {error}"))
+    })?;
+    let conditions = Conditions::<NodePtr>::from_clvm(&allocator, output).map_err(|error| {
+        LaunchCommentError::Malformed(format!("undecodable conditions: {error}"))
+    })?;
 
     let parent_id = creating_spend.coin.coin_id();
     for condition in conditions {
@@ -242,7 +249,8 @@ fn program_to_node(
     allocator: &mut Allocator,
     program: &chia_protocol::Program,
 ) -> Result<NodePtr, String> {
-    clvmr::serde::node_from_bytes_backrefs(allocator, program.as_ref()).map_err(|error| error.to_string())
+    clvmr::serde::node_from_bytes_backrefs(allocator, program.as_ref())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

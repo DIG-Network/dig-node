@@ -77,7 +77,9 @@ impl RewardsChainPort for RealRewardsChainPort {
         // prevents the hang itself -- see `chain_source.rs`'s module doc).
         tokio::task::spawn_blocking(move || build_report(source.as_ref(), launcher_id))
             .await
-            .map_err(|join_error| ChainPortError::Other(format!("report task panicked: {join_error}")))?
+            .map_err(|join_error| {
+                ChainPortError::Other(format!("report task panicked: {join_error}"))
+            })?
     }
 }
 
@@ -95,11 +97,12 @@ fn build_report(
     let comment = read_launch_comment(source, launcher_id)
         .map_err(|error| ChainPortError::Other(format!("launch comment unreadable: {error:?}")))?;
 
-    let (_constants, first_epoch_state) = read_launch_constants(source, launcher_id).ok_or_else(|| {
-        ChainPortError::Other(
-            "launch constants unreadable after a successful guarded read".to_string(),
-        )
-    })?;
+    let (_constants, first_epoch_state) =
+        read_launch_constants(source, launcher_id).ok_or_else(|| {
+            ChainPortError::Other(
+                "launch constants unreadable after a successful guarded read".to_string(),
+            )
+        })?;
     let first_epoch_start = first_epoch_state.round_time_info.last_update;
 
     report_from_snapshot(&snapshot, launcher_id, comment, first_epoch_start)
@@ -205,7 +208,9 @@ fn guarded_read_error_to_port_error(error: GuardedReadError) -> ChainPortError {
 fn reader_error_to_port_error(error: RewardsError) -> ChainPortError {
     match error {
         RewardsError::ChainUnavailable(_) => ChainPortError::Unavailable,
-        RewardsError::UnreadableDistributorConstants { .. } => ChainPortError::InvalidWithdrawalShare,
+        RewardsError::UnreadableDistributorConstants { .. } => {
+            ChainPortError::InvalidWithdrawalShare
+        }
         other => ChainPortError::Other(other.to_string()),
     }
 }

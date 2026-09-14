@@ -2147,7 +2147,10 @@ where
         // census and mirror passes above are — a harness with `enable_chain_sync: false` gets no
         // chain source to build this over, and `install_reward_chain_port`'s `OnceLock` means a
         // second call here (there is none) would simply be refused, not double-installed.
-        match state.wallet_chain.corroborated_chain_source(tokio::runtime::Handle::current()) {
+        match state
+            .wallet_chain
+            .corroborated_chain_source(tokio::runtime::Handle::current())
+        {
             Ok(source) => {
                 let port: std::sync::Arc<dyn dig_node_core::rewards::port::RewardsChainPort> =
                     std::sync::Arc::new(crate::rewards::RealRewardsChainPort::new(
