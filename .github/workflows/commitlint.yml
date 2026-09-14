@@ -28,7 +28,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Lint PR commits
+      # A main-base PR is a develop -> main release cut: every commit in main..develop
+      # was already linted at its own PR, while that commit was still mutable and its
+      # author could still fix it. Re-linting the whole inherited range at cut time adds
+      # no information and cannot be satisfied (the commits are now immutable, pinned by
+      # gitlinks and rev-pinned deps). Lint only what THIS PR introduces: its own commit(s).
+      - name: Lint PR commits (release cut — this PR's own commits only)
+        if: github.base_ref == 'main'
+        uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: commitlint.config.mjs
+          commitDepth: 1
+
+      - name: Lint PR commits (feature branch — full PR range)
+        if: github.base_ref != 'main'
         uses: wagoid/commitlint-github-action@v6
         with:
           configFile: commitlint.config.mjs
@@ -37,9 +50,13 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           # Install both @commitlint/cli AND the extended shareable config so the
           # `extends: ['@commitlint/config-conventional']` in commitlint.config.mjs resolves.
-          echo "$PR_TITLE" | npx --yes -p @commitlint/cli -p @commitlint/config-conventional \
+          # GitHub's squash merge lands "$PR_TITLE (#$PR_NUMBER)" as the commit subject —
+          # lint that exact string, not the title alone, or a title within the length
+          # limit can still produce an over-limit commit subject once merged.
+          printf '%s (#%s)\n' "$PR_TITLE" "$PR_NUMBER" | npx --yes -p @commitlint/cli -p @commitlint/config-conventional \
             commitlint --config commitlint.config.mjs
