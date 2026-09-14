@@ -95,11 +95,12 @@ impl<S: ChainSource + Send + Sync + 'static> RewardsChainPort for RealRewardsCha
         // blocking-pool thread keeps a slow read from stalling the async runtime it is called
         // from, without using `spawn_blocking` as a hang REMEDY (the guard, not this, is what
         // prevents the hang itself -- see `chain_source.rs`'s module doc).
-        let result = tokio::task::spawn_blocking(move || build_report(source.as_ref(), launcher_id))
-            .await
-            .map_err(|join_error| {
-                ChainPortError::Other(format!("report task panicked: {join_error}"))
-            })?;
+        let result =
+            tokio::task::spawn_blocking(move || build_report(source.as_ref(), launcher_id))
+                .await
+                .map_err(|join_error| {
+                    ChainPortError::Other(format!("report task panicked: {join_error}"))
+                })?;
 
         // R4 (dig_ecosystem#3310 gate leg 3, §4): a failing chain source must be observable, not
         // only correctly typed. `swap` both reads and sets `report_degraded` atomically, so the

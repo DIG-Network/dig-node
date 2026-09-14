@@ -365,11 +365,21 @@ fn install_reward_chain_port_refuses_a_second_install_with_a_warn() {
     // refusal is supposed to surface actually lives there, in the non-test region -- the same
     // shape `adapter_source_never_imports_withdraw_committed_incentives` already uses in
     // `chain_port.rs`. Mutation-proved: deleting `server.rs`'s warn line turns this assertion
-    // red (see the PR description's RED/GREEN observation); restoring it turns it green again.
+    // red; restoring it turns it green again (see the PR description's RED/GREEN observation).
+    //
+    // NOTE this is a SOURCE-TEXT assertion, not a behavioural one: it proves the warn string is
+    // written in `server.rs`, not that it is actually emitted when the second `if` branch runs at
+    // runtime. A behavioural assertion (capturing tracing output from the real call site) is not
+    // reachable here without either restructuring `server.rs`'s install block to be independently
+    // callable from an integration test, or duplicating production control flow into the test --
+    // both are new production surface this ticket does not need. Read this test as "the warn this
+    // refusal depends on has not silently rotted out of the source", not as proof the call site
+    // fires it on every run.
     let server_source = production_region(include_str!("../src/server.rs"));
     assert!(
         server_source.contains("declined a second install"),
-        "server.rs's production install-path warn must contain \"declined a second install\",          so this refused-install path is not silently unlogged"
+        "server.rs's production install-path warn must contain \"declined a second install\", \
+         so this refused-install path is not silently unlogged"
     );
 }
 
