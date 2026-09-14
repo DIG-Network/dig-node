@@ -189,10 +189,12 @@ async fn drive<P, H>(
 /// itself emits. Without this, an operator reading any one cycle log line has no way to learn the
 /// schedule in force differs from the one they configured.
 fn log_cycle(status: &ClaimStatus, cycles_driven: u64, adjustment: &ScheduleAdjustment) {
-    let (configured_cadence_seconds, effective_cadence_seconds) =
-        adjustment.cadence.map_or((None, None), |(c, e)| (Some(c), Some(e)));
-    let (configured_jitter_seconds, effective_jitter_seconds) =
-        adjustment.jitter.map_or((None, None), |(c, e)| (Some(c), Some(e)));
+    let (configured_cadence_seconds, effective_cadence_seconds) = adjustment
+        .cadence
+        .map_or((None, None), |(c, e)| (Some(c), Some(e)));
+    let (configured_jitter_seconds, effective_jitter_seconds) = adjustment
+        .jitter
+        .map_or((None, None), |(c, e)| (Some(c), Some(e)));
 
     if status.state == ClaimLoopState::Nominal {
         tracing::info!(
@@ -765,7 +767,7 @@ mod tests {
             drive(
                 empty_engine(),
                 cadence,
-                  0,
+                0,
                 ScheduleAdjustment::none(),
                 &super::super::cadence::FixedJitter(0),
                 {
@@ -1246,7 +1248,7 @@ mod tests {
             drive(
                 empty_engine(),
                 cadence,
-                  0,
+                0,
                 ScheduleAdjustment::none(),
                 &super::super::cadence::FixedJitter(0),
                 {
@@ -1308,7 +1310,7 @@ mod tests {
                     Bytes32::from([2u8; 32]),
                 ),
                 cadence,
-                  0,
+                0,
                 ScheduleAdjustment::none(),
                 &super::super::cadence::FixedJitter(0),
                 {
@@ -1426,7 +1428,10 @@ mod tests {
             "an out-of-range jitter must clamp to the maximum, never the 1-hour default"
         );
         assert_eq!(adjustment.cadence, None, "cadence was not adjusted");
-        assert_eq!(adjustment.jitter, Some((rejected, CLAIM_SCHEDULE_SECONDS_MAX)));
+        assert_eq!(
+            adjustment.jitter,
+            Some((rejected, CLAIM_SCHEDULE_SECONDS_MAX))
+        );
 
         let rendered = logs.rendered();
         assert!(
@@ -1516,7 +1521,11 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(effective_cadence)).await;
         settle().await;
-        assert_eq!(handle.cycles_driven(), 1, "one clamped interval drove one cycle");
+        assert_eq!(
+            handle.cycles_driven(),
+            1,
+            "one clamped interval drove one cycle"
+        );
 
         tokio::time::advance(Duration::from_secs(effective_cadence)).await;
         settle().await;
