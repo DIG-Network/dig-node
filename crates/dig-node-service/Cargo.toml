@@ -143,20 +143,26 @@ chia-protocol = "0.36.1"
 # and `Copy` against an attacker-chosen string. Same 0.36.1 line as every other chia primitive here
 # -- a second line would be a second `Sha256`.
 chia-sha2 = "0.36.1"
-chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-driver = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
 # `MAINNET_CONSTANTS` -- the Chia L1 `AGG_SIG_ME` domain every mirror-coin spend is signed under
 # (`mirror::lifecycle::mirror_agg_sig_data`, dig-node#447). This is the crate `chia_wallet_sdk::types`
 # re-exports, named directly so this crate does not pull the whole SDK for one constant. Already a
 # dev-dependency at this exact version, so no second line enters the tree.
-chia-sdk-types = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-types = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
 # The CAT puzzle-hash currying, for deriving the coin a mirror RECLAIM creates before it exists.
 # Same chia 0.36 set as the crates around it -- a mirror coin's collateral is $DIG, so the returned
 # coin sits at the CAT puzzle hash and never at the bare owner puzzle hash.
-chia-puzzle-types = "0.36.1"
+chia-puzzle-types = "=0.36.1"
 # `ToTreeHash`, to re-derive an owner puzzle hash from the key a mirror create is built for, so the
 # signer can refuse spends that are not its own wallet's rather than trusting the call site to have
 # passed the right key. Part of the same chia set above -- `chia-sdk-driver` already resolves it.
 clvm-utils = "0.36.1"
+# `rewards/chain_source.rs`'s launch-comment recovery (dig_ecosystem#3310) decodes a `CoinSpend`'s
+# puzzle reveal, solution and run output as raw CLVM: `FromClvm`/`ToClvm` for `Conditions`/`Memos`
+# and the `Allocator`/`NodePtr` they run over. Same 0.36.1/0.16 line every chia crate above already
+# resolves -- `chia-sdk-driver`/`dig-rewards-coin` both depend on exactly these versions.
+clvm-traits = "0.36.1"
+clvmr = "0.16"
 # The epoch term of a mirror hint is a `BigInt`, not a `u64`: the morph is arithmetic over
 # 32-byte values and the crate's API says so. Same line as `dig-mirror-coin`'s own.
 num-bigint = "0.4.6"
@@ -190,6 +196,17 @@ dig-rpc-protocol = "0.12"
 # extension-reachable loopback (`POST /{method}`, 9778) + the mTLS 9776 listener, and bridges the
 # bidirectional WS wallet+control transport (#369) onto it.
 dig-wallet = { path = "../dig-wallet" }
+
+# The chain-side reader for the reward-distributor SPEC surface (dig_ecosystem#3310):
+# `state::read_distributor` + `clawback::recoverable_base_units`, over a caller-supplied
+# `ChainSource`. This is the ONE crate in this seam that depends on it — `dig-node-core`
+# deliberately does not (see `dig_node_core::rewards::port`'s module doc) because the
+# reader takes a `ChainSource` it has no seam to hold; this crate does (`dig-wallet`'s
+# `CorroboratedChainSource`), so the adapter lives here. `0.5`, not the `0.4` the ticket
+# names (stale): 0.5.0 is the release that already refuses `epoch_seconds == 0` inside
+# `read_distributor` itself (see `rewards/chain_source.rs`'s module doc for the exact
+# line, and why this crate ALSO refuses at its own edge as defence in depth).
+dig-rewards-coin = "0.5"
 
 # HTTP stack: the same axum/tokio the node itself uses, so there is one async runtime
 # and one server framework across the node and the service shell. `ws` enables
@@ -357,9 +374,29 @@ chia-protocol = "0.36.1"
 # Every version here is the one `dig-mirror-coin` 0.9 itself compiles against, and the whole set
 # moves together: the chia ceiling is not one number, and a crate split across two chia lines
 # compiles only until something crosses a public signature.
-chia-puzzle-types = "0.36.1"
-chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
-chia-sdk-types = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+chia-puzzle-types = "=0.36.1"
+chia-sdk-driver = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-types = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
+# `rewards/chain_port.rs`'s A3 acceptance test (dig_ecosystem#3310): a real distributor launched
+# via `dig_rewards_coin::launch_dig_distributor` against `Simulator`'s peer-simulator, so
+# `distributor_report` is exercised over authentic coin records/spends rather than a hand-built
+# double. Same version + feature `dig-wallet` already builds its own simulator-backed tests on.
+chia-sdk-test = { version = "0.36.0", features = ["peer-simulator"] }
+# The SAME `dig-chainsource-interface` line as the normal dependency above, with its `testing`
+# feature turned on for THIS crate's own tests only: Cargo unions features across a crate's
+# normal- and dev-dependency edges rather than resolving two copies, so this cannot split the
+# version the normal dependency already pins. `MockChainSource` is the published, in-memory
+# `ChainSource` double `dig-rewards-coin`'s own upstream simulator tests use for the identical
+# substitution (replace the network transport, not the reader) -- reused here rather than
+# hand-rolled, so the A3 test's double is the ecosystem's one sanctioned mock, not a second one.
+dig-chainsource-interface = { version = "0.3", features = ["testing"] }
+# `chia-consensus`/`chia-puzzles`/`clvm-traits` for the A3 test's own launch bundle: the exact
+# `RewardDistributorConstants`/`Offer`/CAT-issuance calls `dig-rewards-coin`'s own upstream
+# simulator tests use, at the SAME 0.36.1/0.20.3 lines `chia-sdk-driver`/`chia-sdk-types` (both
+# already pinned above) compile against -- already present in `Cargo.lock` transitively, so this
+# only opens a direct edge for the test file to name them, it splits no version.
+chia-consensus = "=0.36.1"
+chia-puzzles = "=0.20.3"
 clvm-utils = "0.36.1"
 num-bigint = "0.4.6"
 hex = "0.4"

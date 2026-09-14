@@ -2140,6 +2140,33 @@ where
             state.mirror_bonds.clone(),
             config.enable_live_broadcast,
         );
+
+        // The funder-side `RewardsChainPort` (DIG-Network/dig_ecosystem#3310): the only
+        // production caller of `Node::install_reward_chain_port`, so `UnavailableChainPort`
+        // stops being the sole adapter once `enable_chain_sync` is true. Gated the same way the
+        // census and mirror passes above are — a harness with `enable_chain_sync: false` gets no
+        // chain source to build this over, and `install_reward_chain_port`'s `OnceLock` means a
+        // second call here (there is none) would simply be refused, not double-installed.
+        match state
+            .wallet_chain
+            .corroborated_chain_source(tokio::runtime::Handle::current())
+        {
+            Ok(source) => {
+                let port: std::sync::Arc<dyn dig_node_core::rewards::port::RewardsChainPort> =
+                    std::sync::Arc::new(crate::rewards::RealRewardsChainPort::new(
+                        std::sync::Arc::new(source),
+                    ));
+                if !state.node.install_reward_chain_port(port) {
+                    tracing::warn!(
+                        "install_reward_chain_port declined a second install: a reward chain \
+                         port was already installed on this Node"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not build a CorroboratedChainSource for the reward chain port; reward-distributor reads stay Unavailable");
+            }
+        }
     }
 
     // §14 autonomous sync (#213): bring up the L7 peer network — the connected peer
