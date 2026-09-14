@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chia_protocol::Bytes32;
 
-use super::cadence::{next_interval_seconds, JitterSource, CLAIM_JITTER_SECONDS_DEFAULT};
+use super::cadence::{next_interval_seconds, JitterSource};
 use super::config::{RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT};
 use super::engine::ClaimEngine;
 use super::hints::{DistributorHintSource, NoHintSource};
