@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use dig_chainsource_interface::ChainSource;
 use dig_node_core::rewards::port::{
     Bytes32 as PortBytes32, ChainPortError, CommitmentSlot, DistributorChainState, DistributorRef,
     DistributorReport, EntryWriteBundle, RewardsChainPort,
@@ -23,26 +24,35 @@ use super::chain_source::{
     read_distributor_guarded, read_launch_comment, read_launch_constants, GuardedReadError,
 };
 
-/// The funder-side `RewardsChainPort` over `dig-wallet`'s `CorroboratedChainSource`. Construct with
-/// [`RealRewardsChainPort::new`] and install once via `dig_node_core::Node::install_reward_chain_port`
-/// -- see `server.rs`'s `enable_chain_sync` install site.
-pub struct RealRewardsChainPort {
-    source: Arc<CorroboratedChainSource>,
+/// The funder-side `RewardsChainPort` over a [`ChainSource`] -- `dig-wallet`'s
+/// `CorroboratedChainSource` in production (the default `S`, and the only type `server.rs`'s
+/// `enable_chain_sync` install site ever names). Construct with [`RealRewardsChainPort::new`] and
+/// install once via `dig_node_core::Node::install_reward_chain_port`.
+///
+/// Generic over `S` (rather than hard-wired to `CorroboratedChainSource`) so `distributor_report`
+/// -- the real adapter body, over the real `read_distributor_guarded` -- can be driven directly in
+/// tests by a source whose coin records/spends came from a real `chia-sdk-test` simulator launch
+/// (dig_ecosystem#3310 acceptance A3, `tests/rewards_chain_port_a3.rs`), without also having to
+/// fake `dig-wallet`'s peer-corroboration transport. That double replaces the socket only: every
+/// byte the adapter reads still comes from `dig_rewards_coin::state::read_distributor` parsing a
+/// genuine, simulator-produced `CoinSpend`.
+pub struct RealRewardsChainPort<S: ChainSource + Send + Sync + 'static = CorroboratedChainSource> {
+    source: Arc<S>,
 }
 
-impl RealRewardsChainPort {
-    /// Wraps an already-constructed `CorroboratedChainSource` (`ChainTransport::corroborated_chain_source`).
-    /// Takes ownership via `Arc` rather than borrowing: the port trait's `install_reward_chain_port`
-    /// stores `Arc<dyn RewardsChainPort>` for the process's remaining life, so the source must
-    /// outlive it too.
+impl<S: ChainSource + Send + Sync + 'static> RealRewardsChainPort<S> {
+    /// Wraps an already-constructed chain source (`ChainTransport::corroborated_chain_source` in
+    /// production). Takes ownership via `Arc` rather than borrowing: the port trait's
+    /// `install_reward_chain_port` stores `Arc<dyn RewardsChainPort>` for the process's remaining
+    /// life, so the source must outlive it too.
     #[must_use]
-    pub fn new(source: Arc<CorroboratedChainSource>) -> Self {
+    pub fn new(source: Arc<S>) -> Self {
         Self { source }
     }
 }
 
 #[async_trait]
-impl RewardsChainPort for RealRewardsChainPort {
+impl<S: ChainSource + Send + Sync + 'static> RewardsChainPort for RealRewardsChainPort<S> {
     async fn funded_distributors(&self) -> Result<Vec<DistributorRef>, ChainPortError> {
         // dig_node_core::rewards::port's own module doc, "Blocker 2": no funder-ownership
         // registry exists anywhere in this codebase yet. Answering here would mean inventing one
@@ -84,10 +94,13 @@ impl RewardsChainPort for RealRewardsChainPort {
 }
 
 /// The synchronous body of `distributor_report`, run off the async runtime by `spawn_blocking`.
-fn build_report(
-    source: &CorroboratedChainSource,
+fn build_report<S>(
+    source: &S,
     launcher_id: PortBytes32,
-) -> Result<DistributorReport, ChainPortError> {
+) -> Result<DistributorReport, ChainPortError>
+where
+    S: ChainSource,
+{
     let launcher_id = chia_protocol::Bytes32::new(launcher_id);
 
     let snapshot = read_distributor_guarded(source, launcher_id)

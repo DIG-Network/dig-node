@@ -382,6 +382,21 @@ chia-sdk-types = { version = "=0.36.0", features = ["chip-0035", "action-layer"]
 # `distributor_report` is exercised over authentic coin records/spends rather than a hand-built
 # double. Same version + feature `dig-wallet` already builds its own simulator-backed tests on.
 chia-sdk-test = { version = "0.36.0", features = ["peer-simulator"] }
+# The SAME `dig-chainsource-interface` line as the normal dependency above, with its `testing`
+# feature turned on for THIS crate's own tests only: Cargo unions features across a crate's
+# normal- and dev-dependency edges rather than resolving two copies, so this cannot split the
+# version the normal dependency already pins. `MockChainSource` is the published, in-memory
+# `ChainSource` double `dig-rewards-coin`'s own upstream simulator tests use for the identical
+# substitution (replace the network transport, not the reader) -- reused here rather than
+# hand-rolled, so the A3 test's double is the ecosystem's one sanctioned mock, not a second one.
+dig-chainsource-interface = { version = "0.3", features = ["testing"] }
+# `chia-consensus`/`chia-puzzles`/`clvm-traits` for the A3 test's own launch bundle: the exact
+# `RewardDistributorConstants`/`Offer`/CAT-issuance calls `dig-rewards-coin`'s own upstream
+# simulator tests use, at the SAME 0.36.1/0.20.3 lines `chia-sdk-driver`/`chia-sdk-types` (both
+# already pinned above) compile against -- already present in `Cargo.lock` transitively, so this
+# only opens a direct edge for the test file to name them, it splits no version.
+chia-consensus = "=0.36.1"
+chia-puzzles = "=0.20.3"
 clvm-utils = "0.36.1"
 num-bigint = "0.4.6"
 hex = "0.4"
