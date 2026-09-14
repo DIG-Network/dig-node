@@ -1069,7 +1069,10 @@ mod tests {
         );
 
         // The two configurations must be visibly different -- the whole point of F2.
-        assert_ne!(cfg_raw.fee_window_start_unix, cfg_clamped.fee_window_start_unix);
+        assert_ne!(
+            cfg_raw.fee_window_start_unix,
+            cfg_clamped.fee_window_start_unix
+        );
     }
 
     #[tokio::test]
