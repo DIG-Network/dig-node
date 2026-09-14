@@ -403,3 +403,9 @@ async-trait = "0.1"
 # into a mock `dig.getContent` window, so the node's RPC tier verifies-then-fails-closed and records
 # the failed entry. `base64` matches dig-node-core's version.
 base64 = "0.22"
+
+# Compiles the branded DIG icon (`../../assets/dig.rc`) into a Windows resource that
+# `build.rs` links into `dig-node`/`dign` (dig_ecosystem#2917). Not a `dig-*`/`chia-*`
+# crate, so no cross-repo version lockstep applies here.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
