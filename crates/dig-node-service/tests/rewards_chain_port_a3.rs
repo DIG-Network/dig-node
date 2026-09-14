@@ -27,8 +27,13 @@
 //! `store_id`/`root` are not part of the distributor's own puzzle state — they are a CLVM memo on
 //! the `CREATE_COIN` that creates the launcher coin (`chain_source.rs`'s module doc). Recovering
 //! them requires reading the launcher's PARENT (creating) spend, running that puzzle for real, and
-//! decoding its memos. No fixture value can produce the right `store_id`/`root` without that
-//! parse actually happening — asserted below against the exact values this test launched with.
+//! decoding its memos, asserted below against the exact values this test launched with.
+//!
+//! One caveat on that claim: the asserted `store_id`/`root` (`[0xaa; 32]`, `[0xbb; 32]`) are
+//! test-chosen low-entropy constants. They are unguessable-by-accident TODAY only because no
+//! rival code path in this file could produce them — not because of any entropy in the fixture
+//! itself. That is true of this test as written; it is not a structural guarantee, and would stop
+//! being true the moment a second source of those fields is added here.
 
 use std::sync::Arc;
 
@@ -338,29 +343,6 @@ async fn distributor_report_reflects_a_real_simulator_launch() {
 /// `RealRewardsChainPort::new(Arc::new(source))`).
 #[test]
 fn install_reward_chain_port_refuses_a_second_install_with_a_warn() {
-    use std::io::Write;
-    use std::sync::{Arc as StdArc, Mutex};
-
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone, Default)]
-    struct CaptureBuffer(StdArc<Mutex<Vec<u8>>>);
-    impl Write for CaptureBuffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> MakeWriter<'a> for CaptureBuffer {
-        type Writer = CaptureBuffer;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     // `Node` exposes no lighter test constructor to an external integration-test crate --
     // `Node::from_env()` is the same constructor `openrpc_drift_guard.rs`'s own integration test
     // uses for the identical reason. Only its `install_reward_chain_port` OnceLock is read below.
@@ -373,26 +355,31 @@ fn install_reward_chain_port_refuses_a_second_install_with_a_warn() {
     let first_install = node.install_reward_chain_port(Arc::clone(&port));
     assert!(first_install, "the first install must be accepted");
 
-    let buffer = CaptureBuffer::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(buffer.clone())
-        .finish();
-    let second_install = tracing::subscriber::with_default(subscriber, || {
-        let installed = node.install_reward_chain_port(Arc::clone(&port));
-        if !installed {
-            tracing::warn!(
-                "install_reward_chain_port declined a second install: a reward chain \
-                 port was already installed on this Node"
-            );
-        }
-        installed
-    });
-
+    let second_install = node.install_reward_chain_port(Arc::clone(&port));
     assert!(!second_install, "the second install must be refused");
-    let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
+
+    // R2 (dig_ecosystem#3310 gate leg 3, remedy R2): this test must not capture and assert
+    // against a warn it emits ITSELF -- that is self-certifying (deleting `server.rs`'s real
+    // warn would leave this test green, proving nothing about the production call site).
+    // Instead it reads `server.rs`'s own shipped source and checks the warn string this
+    // refusal is supposed to surface actually lives there, in the non-test region -- the same
+    // shape `adapter_source_never_imports_withdraw_committed_incentives` already uses in
+    // `chain_port.rs`. Mutation-proved: deleting `server.rs`'s warn line turns this assertion
+    // red (see the PR description's RED/GREEN observation); restoring it turns it green again.
+    let server_source = production_region(include_str!("../src/server.rs"));
     assert!(
-        logged.contains("declined a second install"),
-        "the second call must warn the way server.rs's own call site does, got: {logged:?}"
+        server_source.contains("declined a second install"),
+        "server.rs's production install-path warn must contain \"declined a second install\",          so this refused-install path is not silently unlogged"
     );
+}
+
+/// The slice of a source file before its own `#[cfg(test)]` module -- i.e. what actually ships.
+/// Mirrors `chain_port.rs`'s identical helper; duplicated here because this integration test is
+/// a separate compilation unit and cannot import a private `#[cfg(test)]` helper from the crate
+/// under test.
+fn production_region(source: &str) -> &str {
+    match source.find("#[cfg(test)]") {
+        Some(test_module_start) => &source[..test_module_start],
+        None => source,
+    }
 }
