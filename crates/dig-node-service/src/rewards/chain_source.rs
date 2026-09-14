@@ -143,12 +143,21 @@ where
 /// Why `launcher_id`'s launch comment (`store_id`/`root`) could not be recovered.
 #[derive(Debug)]
 pub(crate) enum LaunchCommentError {
-    /// The source could not answer the launcher's creating (parent) spend at all.
+    /// The source could not answer the launcher's creating (parent) spend at all -- an actual
+    /// transport error from `ChainSource::parent_spend`.
     ChainSource(String),
     /// The creating spend was read, but its puzzle reveal, solution, or emitted conditions could
     /// not be interpreted -- the read is untrustworthy, so this fails closed rather than treating
     /// the comment as absent.
     Malformed(String),
+    /// `ChainSource::parent_spend` answered `Ok(None)`: the source does not (yet) hold the
+    /// launcher's creating spend. This is a GAP, not a classification -- every launcher coin
+    /// created by a security coin has a parent spend on a complete chain, so `Ok(None)` here means
+    /// the source is lagging or pruned, never that the distributor is definitively not DIG's
+    /// (dig_ecosystem#3310 gate leg 3, R5). Maps to `ChainPortError::Unavailable` in
+    /// `chain_port.rs`, the same variant `read_distributor_guarded`'s own `Ok(None)` already
+    /// produces, so both absence paths agree.
+    ParentSpendUnavailable,
     /// The creating spend was read and understood, and it simply carries no DIG rewards launch
     /// comment: a CHIP-0051 distributor legitimately launched for a purpose other than DIG's own
     /// (`dig_rewards_coin::comment`'s module doc), so this is a genuine classification, not a
@@ -165,6 +174,10 @@ impl std::fmt::Display for LaunchCommentError {
         match self {
             Self::ChainSource(reason) => write!(f, "chain source unavailable: {reason}"),
             Self::Malformed(reason) => write!(f, "malformed launch comment data: {reason}"),
+            Self::ParentSpendUnavailable => write!(
+                f,
+                "chain source does not (yet) hold the launcher's parent spend"
+            ),
             Self::NotADigDistributor => {
                 write!(
                     f,
@@ -188,7 +201,7 @@ where
     let creating_spend = source
         .parent_spend(launcher_id)
         .map_err(|error| LaunchCommentError::ChainSource(error.to_string()))?
-        .ok_or(LaunchCommentError::NotADigDistributor)?;
+        .ok_or(LaunchCommentError::ParentSpendUnavailable)?;
 
     parse_launch_comment(&creating_spend, launcher_id)
 }
