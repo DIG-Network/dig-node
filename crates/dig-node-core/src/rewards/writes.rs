@@ -241,7 +241,8 @@ pub trait WriteBoundStore: Send + Sync {
 /// The fail-closed default until a real backend is wired: every call errors, so
 /// [`PersistedEntryWriter::decide`] refuses to submit anything rather than run the write bounds
 /// unbounded across a restart. This is deliberately the production default TODAY — the chain port
-/// itself is `UnavailableChainPort` until #3249 lands, so this adapter costs nothing operationally
+/// itself is `UnavailableChainPort` until #3310 lands the `RewardsChainPort` adapter (it names
+/// both `distributor_report` and `install_reward_chain_port`), so this adapter costs nothing operationally
 /// yet and closes the money hole the moment either seam is wired.
 pub struct NoPersistence;
 

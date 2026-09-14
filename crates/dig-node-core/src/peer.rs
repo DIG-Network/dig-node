@@ -5652,6 +5652,23 @@ pub(crate) mod tests {
             !reward_methods.is_empty(),
             "expected at least one Reward-named method in Method::ALL; found none"
         );
+        // dig_ecosystem#3269 unit 3: a non-empty check alone would still pass if the catalogue
+        // grew a sixth reward method that the filter silently stopped matching (or a variant were
+        // renamed out from under `.contains("Reward")`) — this pins the count so the guard cannot
+        // start policing FEWER methods than actually exist without failing loudly. Update this
+        // number, deliberately, the moment `dig-rpc-protocol` adds or removes a reward method.
+        //
+        // Bumped 4 -> 5 (dig_ecosystem#3269, final leg): dig-rpc-protocol 0.12.0 added
+        // `dig.getPayeeRewardClaimStatus`, whose name also contains "Reward".
+        assert_eq!(
+            reward_methods.len(),
+            5,
+            "expected exactly 5 Reward-named methods in Method::ALL (dig.listRewardDistributors, \
+             dig.getRewardProverStatus, dig.getRewardDistributor, \
+             dig.listRewardDistributorCommitments, dig.getPayeeRewardClaimStatus); got {}: a \
+             catalogue change must update this guard deliberately, not silently narrow it",
+            reward_methods.len()
+        );
         for m in reward_methods {
             assert!(
                 !is_peer_reachable_method(m.name()),

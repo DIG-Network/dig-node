@@ -8,13 +8,20 @@
 //! ([`staleness`]).
 //!
 //! The chain seam ([`port`]'s `RewardsChainPort`) is UNIMPLEMENTED pending
-//! DIG-Network/dig_ecosystem#3249 — `dig-rewards-coin` is SPEC-only today (its `distributor`
-//! module is an empty placeholder). The production adapter wired into this crate is
+//! DIG-Network/dig_ecosystem#3310. What is missing is an ADAPTER, not a reader:
+//! `dig-rewards-coin` 0.4.1 already ships `state::read_distributor(&impl ChainSource,
+//! launcher_id) -> Result<Option<DistributorSnapshot>, RewardsError>` plus `ChainObservation` and
+//! `clawback::recoverable_base_units`, but that reader does no socket I/O of its own — it takes a
+//! caller-supplied `ChainSource` — so something must hold the chain source, drive the reader and
+//! map its answers onto this trait. That adapter is built in `dig-node-service` and injected down
+//! through [`crate::Node::install_reward_chain_port`] (#3310); the claim-side chain adapter is
+//! tracked separately in #3307. Until then the production adapter wired into this crate is
 //! `port::UnavailableChainPort`, which runs no cycles and reports
 //! `port::ChainPortError::Unavailable` rather than a silent no-op. Every value this engine
 //! compares against the SPEC's numeric bounds lives in [`spec_constants`], tagged with its
-//! clause, so #3249 landing its own constants is a single, deliberate migration rather than a
-//! scattered one.
+//! clause, so should the crate ever publish these prover-side numbers itself — 0.4.1's
+//! `constants` module carries distributor-side values only, not these — the migration is a
+//! single, deliberate one rather than a scattered one.
 //!
 //! # The worst-case spend, stated where a human reads it
 //!

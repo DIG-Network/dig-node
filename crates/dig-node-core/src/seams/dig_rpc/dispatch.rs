@@ -17,6 +17,7 @@
 
 use serde_json::{json, Value};
 
+use crate::rewards::port::{ChainPortError, DistributorReport};
 use crate::Node;
 // The relocated body below calls a number of crate-root private helpers (`rpc_err`,
 // `parse_store_id_arg`, `pin_request_root`, …) UNQUALIFIED, exactly as it did when it lived in
@@ -33,6 +34,112 @@ use crate::*;
 /// `dig-node-service`'s `ErrorCode::EngineWarming` mints the SAME numeric code independently on its
 /// own surface.
 const ENGINE_WARMING: i64 = -32002;
+
+/// `REWARD_CHAIN_UNAVAILABLE` (dig_ecosystem#3269): no reward-distributor chain-read adapter is
+/// wired yet (`rewards::port::ChainPortError::Unavailable`, or no adapter installed at all).
+/// Distinct from [`REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE`] below — a caller must be able to tell
+/// "ask me again once the adapter lands" apart from "this distributor's own constant is out of
+/// range". Reuses [`CONTROL_ERROR`]'s numeric code (both are control-plane runtime errors,
+/// `-32032`), but carries its own `data.code` machine string so the two are still distinguishable
+/// in the body.
+const REWARD_CHAIN_UNAVAILABLE_MACHINE: &str = "REWARD_CHAIN_UNAVAILABLE";
+
+/// `REWARD_INVALID_WITHDRAWAL_SHARE` (dig_ecosystem#3269/#3284/#3303): the distributor's
+/// `withdrawal_share_bps` does not fit the wire's `u16` domain or exceeds the legitimate
+/// `0..=10_000` range. Refuses the WHOLE call — see `rewards::port::ChainPortError::InvalidWithdrawalShare`'s
+/// doc for why a per-distributor curried value makes that the correct shape, never a `0` or an
+/// omitted field.
+///
+/// Discriminated by `data.code` on [`CONTROL_ERROR`]'s `-32032`, exactly like
+/// [`REWARD_CHAIN_UNAVAILABLE_MACHINE`]: the shared wire taxonomy (`lib.rs`'s canonical catalogue)
+/// registers no code beyond `-32032`, and minting a fresh number locally would put this node
+/// outside the byte-identical contract it declares it follows — another implementation would have
+/// no way to read it. The next number is not even free: `dig-node-service` already spends it on an
+/// unrelated ingress refusal.
+const REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE: &str = "REWARD_INVALID_WITHDRAWAL_SHARE";
+
+/// dig_ecosystem#3269 unit 5: the machine code for [`ChainPortError::ZeroIdentity`] — a
+/// zeroed `launcher_id`/`store_id` refused rather than rendered, matching
+/// `REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE`'s sibling shape.
+const REWARD_ZERO_IDENTITY_MACHINE: &str = "REWARD_ZERO_IDENTITY";
+
+/// Maps a [`ChainPortError`] to the JSON-RPC error response for both reward-distributor read
+/// methods (dig_ecosystem#3269 unit 2) — one mapping so `dig.getRewardDistributor` and
+/// `dig.listRewardDistributorCommitments` can never disagree about how a given port failure reads
+/// on the wire.
+fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value {
+    match error {
+        ChainPortError::Unavailable => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": "reward-distributor chain read is unavailable: no chain-read adapter is wired yet",
+            "data": { "code": REWARD_CHAIN_UNAVAILABLE_MACHINE, "origin": "control" }
+        }}),
+        ChainPortError::InvalidWithdrawalShare => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": "distributor's withdrawal_share_bps is out of range (must fit u16 and be <= 10000)",
+            "data": { "code": REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE, "origin": "control" }
+        }}),
+        ChainPortError::ZeroIdentity => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": "distributor report carries a zeroed launcher_id or store_id, which is never a real identity",
+            "data": { "code": REWARD_ZERO_IDENTITY_MACHINE, "origin": "control" }
+        }}),
+        ChainPortError::Other(msg) => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": format!("reward-distributor chain read failed: {msg}"),
+            "data": { "code": "CONTROL_ERROR", "origin": "control" }
+        }}),
+    }
+}
+
+/// The largest legitimate `withdrawal_share_bps`: 10,000 basis points IS 100%, so this is an
+/// inclusive bound and `10_000` itself is a valid distributor constant, not an error.
+const MAX_WITHDRAWAL_SHARE_BPS: u16 = 10_000;
+
+/// Refuses a report whose `withdrawal_share_bps` is outside the legitimate `0..=10_000` range
+/// before any part of it reaches the wire (dig_ecosystem#3284).
+///
+/// The port's own adapter is contracted to refuse this (`ChainPortError::InvalidWithdrawalShare`),
+/// but that contract is enforced NOWHERE at this seam unless it is checked here: a chain constant
+/// of `74_536` narrowed into the wire's `u16` renders as `9_000` — an ordinary-looking 90% share —
+/// and `65_536` renders as `0`. Either is a figure a funder reads before deciding whether to claw
+/// back, and neither looks wrong, so the handler cannot delegate the check to the thing it is
+/// reading from.
+///
+/// Refuses rather than CLAMPS deliberately. Clamping `74_536` to `10_000` would hand back a
+/// confident "100% recoverable" for a distributor whose real constant is nonsense — a money lie
+/// dressed as a safe default. Refusing the WHOLE call costs no good data either:
+/// `withdrawal_share_bps` is curried once per distributor at launch, so every commitment slot in
+/// one response shares the one invalid value and there is no honest row to keep.
+fn range_checked_report(report: DistributorReport) -> Result<DistributorReport, ChainPortError> {
+    if report.withdrawal_share_bps > MAX_WITHDRAWAL_SHARE_BPS {
+        return Err(ChainPortError::InvalidWithdrawalShare);
+    }
+    // dig_ecosystem#3269 unit 5: a zeroed `launcher_id` or `store_id` is never a real distributor's
+    // or module's identity (see `ChainPortError::ZeroIdentity`'s doc) — refuse rather than render.
+    if report.launcher_id == [0u8; 32] || report.store_id == [0u8; 32] {
+        return Err(ChainPortError::ZeroIdentity);
+    }
+    Ok(report)
+}
+
+/// Parses `params.launcher_id` (64-hex) into the port's own `[u8; 32]` shape
+/// (`rewards::port::Bytes32`) for `dig.getRewardDistributor` /
+/// `dig.listRewardDistributorCommitments`.
+fn parse_launcher_id_arg(params: &Value) -> Result<[u8; 32], String> {
+    let s = params
+        .get("launcher_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "params.launcher_id must be a 64-hex string".to_string())?;
+    let h = s.trim_start_matches("0x");
+    if h.len() != 64 {
+        return Err(format!("launcher_id must be 64-hex: {s}"));
+    }
+    let bytes = hex::decode(h).map_err(|_| format!("launcher_id is not hex: {s}"))?;
+    bytes
+        .try_into()
+        .map_err(|_: Vec<u8>| format!("launcher_id must be 32 bytes (64 hex): {s}"))
+}
 
 /// Decide the miss error for a request that fell all the way through with no configured upstream
 /// (dig_ecosystem#2097): `(code, message)`.
@@ -775,10 +882,11 @@ impl RpcDispatch for Node {
             // mTLS peer surface (absent from `is_peer_reachable_method`;
             // `reward_methods_tier_guard.rs` fails closed on that). Reads the node's live
             // `reward_prover_statuses` registry (empty until dig_ecosystem#3265 spawns a prover
-            // loop) — a REAL read of a real, currently-empty registry, so `{"statuses": []}`
-            // means "this node runs no prover loops" and stays true right up until #3265
-            // registers one, at which point this same read starts returning it with no dispatch
-            // change. Never serializes the internal `rewards::state::RewardProverStatus`
+            // loop) — a REAL read of a real, currently-empty registry, so
+            // `{"statuses":{"outcome":"consulted","observed_at":N,"items":[]}}` means "this node
+            // runs no prover loops", genuinely read rather than assumed: an empty `items` under a
+            // `consulted` outcome. It stays true right up until #3265 registers one, at which
+            // point this same read starts returning it with no dispatch change. Never serializes the internal `rewards::state::RewardProverStatus`
             // directly (it is `camelCase`-tagged; the wire struct is snake_case) — every field is
             // mapped explicitly by `reward_prover_status_to_wire`.
             Some(Method::GetRewardProverStatus) => {
@@ -787,40 +895,49 @@ impl RpcDispatch for Node {
                     .get("launcher_id")
                     .and_then(Value::as_str)
                     .map(str::to_ascii_lowercase);
-                let statuses: Vec<dig_rpc_protocol::types::RewardProverStatus> = node
-                    .reward_prover_status_snapshots()
+                let snapshots = node.reward_prover_status_snapshots();
+                // dig_ecosystem#3269 fix939: a zeroed `launcher_id` or `store_id` is never a real
+                // distributor's or module's IDENTITY — see `is_missing_identity`/`zeroed_fields`.
+                // An earlier version of this handler EXCLUDED such a record with a `warn!` and
+                // still answered `Half::Consulted` with the survivors — but `Consulted`'s
+                // contract (dig-rpc-protocol 0.12.0 `types.rs:1666`) is "the complete answer", so
+                // that exclusion was itself the silent-drop defect this epic exists to kill: the
+                // wire said "I looked, there is nothing" when the truth was "I looked, found it,
+                // and discarded it." This now REFUSES THE WHOLE CALL instead — matching
+                // `range_checked_report`'s whole-call refusal for the three sibling
+                // reward-distributor handlers above — checked before the `launcher_id` filter is
+                // applied, so a caller who narrows to exactly the bad record is refused too, not
+                // handed a reassuring empty list.
+                for s in &snapshots {
+                    let zeroed = zeroed_fields(s);
+                    if is_missing_identity(&zeroed) {
+                        tracing::warn!(
+                            launcher_id = %hex::encode(s.launcher_id),
+                            store_id = %hex::encode(s.store_id),
+                            root = %hex::encode(s.root),
+                            zeroed_fields = ?zeroed,
+                            "reward-prover status registration is missing an identity field; refusing dig.getRewardProverStatus rather than answering a Consulted result with it silently dropped"
+                        );
+                        return reward_chain_port_error_response(
+                            &id,
+                            &ChainPortError::ZeroIdentity,
+                        );
+                    }
+                }
+                let statuses: Vec<dig_rpc_protocol::types::RewardProverStatus> = snapshots
                     .into_iter()
-                    // A zeroed `launcher_id` or `store_id` is never a real distributor's or
-                    // module's IDENTITY — see `is_missing_identity`/`zeroed_fields`. Excluding
-                    // such a record rather than presenting it as a real one avoids the money-hole
-                    // class the driver's gates found three times (an unset field that reads fine
-                    // and costs the operator), BUT exclusion alone would silently destroy the
-                    // evidence that a registration bug happened — the exact §2.4 clause 1
-                    // violation a security + adversarial gate found in the first version of this
-                    // filter (dig-node#595 review round). So this is never a silent drop: a
-                    // `tracing::warn!` fires naming which field(s) were zero, making a bad
-                    // registration observable, and the record is excluded.
-                    //
-                    // A zeroed `root` alone is different: it is an OBSERVATION (the prover's most
-                    // recent cycle), not an identity, and a freshly-registered prover that has not
-                    // completed its first cycle plausibly has a zero `root` legitimately. Excluding
-                    // it on that basis alone would make a healthy, just-not-yet-cycled prover
-                    // invisible — worse than the defect this guard exists to prevent. So this case
-                    // is `tracing::debug!`, not `warn!`: an ordinary, expected state rather than a
-                    // fault, kept out of `warn!`-level volume so an operator polling this endpoint
-                    // is never shown (uncycled provers) x (poll rate) lines indistinguishable from
-                    // a real registration bug. The record is still returned either way.
+                    // A zeroed `root` alone is different from a missing identity: it is an
+                    // OBSERVATION (the prover's most recent cycle), not an identity, and a
+                    // freshly-registered prover that has not completed its first cycle plausibly
+                    // has a zero `root` legitimately. Refusing on that basis would make a healthy,
+                    // just-not-yet-cycled prover invisible — worse than the defect this guard
+                    // exists to prevent. So this case is `tracing::debug!`, not `warn!`, and the
+                    // record is still returned. (Every record reaching this point has already
+                    // passed the missing-identity check above, so `zeroed_fields` here can only
+                    // ever name `root`.)
                     .filter(|s| {
                         let zeroed = zeroed_fields(s);
-                        if is_missing_identity(&zeroed) {
-                            tracing::warn!(
-                                launcher_id = %hex::encode(s.launcher_id),
-                                store_id = %hex::encode(s.store_id),
-                                root = %hex::encode(s.root),
-                                zeroed_fields = ?zeroed,
-                                "reward-prover status registration is missing an identity field; excluding it from dig.getRewardProverStatus rather than presenting it as a real distributor"
-                            );
-                        } else if !zeroed.is_empty() {
+                        if !zeroed.is_empty() {
                             tracing::debug!(
                                 launcher_id = %hex::encode(s.launcher_id),
                                 store_id = %hex::encode(s.store_id),
@@ -829,7 +946,7 @@ impl RpcDispatch for Node {
                                 "reward-prover status has a zeroed root; likely no cycle observed yet, returning it anyway"
                             );
                         }
-                        !is_missing_identity(&zeroed)
+                        true
                     })
                     .filter(|s| match &filter_launcher_id {
                         Some(want) => hex::encode(s.launcher_id).eq_ignore_ascii_case(want),
@@ -837,7 +954,218 @@ impl RpcDispatch for Node {
                     })
                     .map(reward_prover_status_to_wire)
                     .collect();
-                let result = dig_rpc_protocol::types::GetRewardProverStatusResult { statuses };
+                // dig-rpc-protocol 0.12.0 migration: `statuses` moved from a bare `Vec` to
+                // `Half<RewardProverStatus>` (SPEC §12.5 clause 6's "reassuring zero" rule).
+                // This registry read never fails — it is an in-process `RwLock` read, not a
+                // fallible chain or disk read — so it is always `Consulted`, dated at the
+                // moment this response was assembled.
+                use crate::rewards::state::Clock as _;
+                let result = dig_rpc_protocol::types::GetRewardProverStatusResult {
+                    statuses: dig_rpc_protocol::types::Half::Consulted {
+                        observed_at: crate::rewards::state::SystemClock.now_unix_seconds(),
+                        items: statuses,
+                    },
+                };
+                return json!({"jsonrpc":"2.0","id":id,"result": result});
+            }
+            // dig.getRewardDistributor (dig_ecosystem#3269 unit 2, SPEC §2.6/§12.4) — CONTROL
+            // plane: loopback admin / in-process FFI ONLY, absent from `is_peer_reachable_method`
+            // (`reward_methods_tier_guard.rs` fails closed on that). Chain-derived state ONLY —
+            // never the local prover loop's self-reported state (see `GetRewardProverStatus`
+            // above for that). Goes entirely through `rewards::port::RewardsChainPort`: this
+            // crate never calls `dig-rewards-coin` itself (dig_ecosystem#3269 unit 0).
+            Some(Method::GetRewardDistributor) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                let launcher_id = match parse_launcher_id_arg(&params) {
+                    Ok(id) => id,
+                    Err(msg) => return rpc_err(&id, -32602, &msg),
+                };
+                let Some(port) = node.reward_chain_port() else {
+                    return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                };
+                // Range-check at THIS seam, not only in the adapter: see
+                // `range_checked_report` for why an out-of-range share must refuse here.
+                let report = match port
+                    .distributor_report(launcher_id)
+                    .await
+                    .and_then(range_checked_report)
+                {
+                    Ok(report) => report,
+                    Err(e) => return reward_chain_port_error_response(&id, &e),
+                };
+                let result = dig_rpc_protocol::types::GetRewardDistributorResult {
+                    launcher_id: hex::encode(report.launcher_id),
+                    store_id: hex::encode(report.store_id),
+                    root: hex::encode(report.root),
+                    epoch_seconds: report.epoch_seconds,
+                    first_epoch_start: report.first_epoch_start,
+                    payout_threshold: report.payout_threshold,
+                    fee_bps: report.fee_bps,
+                    withdrawal_share_bps: report.withdrawal_share_bps,
+                    reserve_base_units: report.reserve_base_units,
+                    entry_count: report.entry_count,
+                    current_distributor_epoch: report.current_distributor_epoch,
+                    last_entry_write_at: report.last_entry_write_at,
+                    entry_set_stale: report.entry_set_stale,
+                    observed_at: report.observed_at,
+                };
+                return json!({"jsonrpc":"2.0","id":id,"result": result});
+            }
+            // dig.listRewardDistributorCommitments (dig_ecosystem#3269 unit 2, SPEC §7.4 clause 5)
+            // — CONTROL plane, same guard shape as `GetRewardDistributor` above. `commitments`
+            // empty is legitimate (a donation-only distributor); `recoverable_base_units` per slot
+            // is ALWAYS the port's pre-computed figure -- this handler never recomputes it (see
+            // `rewards::port::CommitmentSlot`'s doc for why that arithmetic never lives here).
+            Some(Method::ListRewardDistributorCommitments) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                let launcher_id = match parse_launcher_id_arg(&params) {
+                    Ok(id) => id,
+                    Err(msg) => return rpc_err(&id, -32602, &msg),
+                };
+                let Some(port) = node.reward_chain_port() else {
+                    return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                };
+                // Range-check at THIS seam, not only in the adapter: see
+                // `range_checked_report` for why an out-of-range share must refuse here.
+                let report = match port
+                    .distributor_report(launcher_id)
+                    .await
+                    .and_then(range_checked_report)
+                {
+                    Ok(report) => report,
+                    Err(e) => return reward_chain_port_error_response(&id, &e),
+                };
+                let commitments: Vec<dig_rpc_protocol::types::RewardDistributorCommitment> = report
+                    .commitments
+                    .iter()
+                    .map(|c| dig_rpc_protocol::types::RewardDistributorCommitment {
+                        epoch_start: c.epoch_start,
+                        clawback_puzzle_hash: hex::encode(c.clawback_puzzle_hash),
+                        rewards_base_units: c.rewards_base_units,
+                        recoverable_base_units: c.recoverable_base_units,
+                    })
+                    .collect();
+                let result = dig_rpc_protocol::types::ListRewardDistributorCommitmentsResult {
+                    launcher_id: hex::encode(report.launcher_id),
+                    withdrawal_share_bps: report.withdrawal_share_bps,
+                    epoch_seconds: report.epoch_seconds,
+                    commitments,
+                    observed_at: report.observed_at,
+                };
+                return json!({"jsonrpc":"2.0","id":id,"result": result});
+            }
+            // dig.listRewardDistributors (dig_ecosystem#3269 unit 2, SPEC §2.6) — CONTROL plane,
+            // same guard shape as the other reward handlers above. Two independently-consulted
+            // halves (`funded` / `claimable`), each a `Half<RewardDistributorRef>` — SPEC §12.5
+            // clause 6's "reassuring zero" rule applies to EACH half separately.
+            //
+            // `funded`: this node's OWN identity registry
+            // (`rewards::funded::FundedDistributorRegistry`, dig_ecosystem#3285) says WHICH
+            // launcher ids this node funds; `Node::funded_distributors_read` is matched with no
+            // wildcard arm so a future variant added to `FundedDistributorsRead` fails this match
+            // at compile time instead of silently falling into the wrong half. Once the identity
+            // set answers, each launcher id's CURRENT `(store_id, root)` is resolved through the
+            // same chain-read port `dig.getRewardDistributor` uses
+            // (`RewardsChainPort::distributor_report`) — `FundedDistributor` carries identity
+            // only (see that module's doc), never a root, so a ref cannot be assembled from the
+            // registry alone. A per-item chain-report failure refuses the WHOLE call with the
+            // same `ChainPortError` response the sibling handlers use, rather than emitting a
+            // partial list or a fabricated store_id/root (dig_ecosystem#3308/#3309: a zero hash
+            // rendered as though real is the same defect family as an empty list standing in for
+            // an error).
+            //
+            // `claimable`: distributors this node holds a MIRROR claim to but does not fund. No
+            // such tracking exists anywhere in this crate today (see the module search backing
+            // this comment — dig_ecosystem#3269 unit 2 wires only the funder side), so this half
+            // is honestly `NotConsulted`: nothing looked, because nothing here can look yet. It
+            // is NOT `Consulted { items: [] }` — that would claim this node checked and found no
+            // claimable distributor, which is not true; the truth is no check exists.
+            Some(Method::ListRewardDistributors) => {
+                use crate::rewards::state::Clock as _;
+                let now = crate::rewards::state::SystemClock.now_unix_seconds();
+
+                let identities: Vec<crate::rewards::funded::FundedDistributor> =
+                    match node.funded_distributors_read() {
+                        crate::rewards::funded::FundedDistributorsRead::Funded(v) => v,
+                        crate::rewards::funded::FundedDistributorsRead::FundsNothing => Vec::new(),
+                        crate::rewards::funded::FundedDistributorsRead::NotConfigured(_)
+                        | crate::rewards::funded::FundedDistributorsRead::PersistedStateCorrupt {
+                            ..
+                        }
+                        | crate::rewards::funded::FundedDistributorsRead::IoFailed { .. } => {
+                            return json!({"jsonrpc":"2.0","id":id,"result":
+                                dig_rpc_protocol::types::ListRewardDistributorsResult {
+                                    funded: dig_rpc_protocol::types::Half::NotConsulted {
+                                        observed_at: now,
+                                    },
+                                    claimable: dig_rpc_protocol::types::Half::NotConsulted {
+                                        observed_at: now,
+                                    },
+                                }
+                            });
+                        }
+                    };
+
+                let mut funded_refs = Vec::with_capacity(identities.len());
+                for identity in identities {
+                    let Some(port) = node.reward_chain_port() else {
+                        return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                    };
+                    let report = match port
+                        .distributor_report(identity.launcher_id)
+                        .await
+                        .and_then(range_checked_report)
+                    {
+                        Ok(report) => report,
+                        Err(e) => return reward_chain_port_error_response(&id, &e),
+                    };
+                    funded_refs.push(dig_rpc_protocol::types::RewardDistributorRef {
+                        launcher_id: hex::encode(report.launcher_id),
+                        store_id: hex::encode(report.store_id),
+                        root: hex::encode(report.root),
+                    });
+                }
+
+                let result = dig_rpc_protocol::types::ListRewardDistributorsResult {
+                    funded: dig_rpc_protocol::types::Half::Consulted {
+                        observed_at: now,
+                        items: funded_refs,
+                    },
+                    claimable: dig_rpc_protocol::types::Half::NotConsulted { observed_at: now },
+                };
+                return json!({"jsonrpc":"2.0","id":id,"result": result});
+            }
+            // dig.getPayeeRewardClaimStatus (dig_ecosystem#3268/#3269 unit 3, SPEC §12.5) —
+            // CONTROL plane: loopback admin / in-process FFI ONLY, absent from
+            // `is_peer_reachable_method` (`reward_methods_tier_guard.rs` fails closed on that).
+            // Dispatched through `Method::from_name(..)` like every other reward method — never
+            // the string pre-match above the enum, which bypasses this tier guard entirely
+            // (dig_ecosystem#3261: a reward RPC reachable by a peer is a money hole).
+            //
+            // `subject` is always the literal `PayeeSubject::Payee` (SPEC §12.5: this node
+            // answers as a payee, never as a funder — see `PayeeClaimStatus`'s doc for the
+            // 250x-overstatement defect that shipped when a renderer inferred the subject from
+            // the endpoint instead of reading it off the payload).
+            //
+            // `claim_log`: this crate holds no claim log anywhere — the claim-submission adapter
+            // is dig_ecosystem#3310's, in `dig-node-service`, injected downward (see
+            // `rewards::port`'s module doc; #3249 is a dead pointer for it, see the doc there).
+            // So `claims_submitted_count` has never been read here and the honest answer is
+            // `NotConsulted`, dated at the moment this responder established it has no log to
+            // read — never `Consulted { claims_submitted_count: 0 }`, which would be exactly the
+            // "reassuring zero" SPEC §12.5 clause 6 forbids: a confident zero beside a fresh
+            // timestamp, indistinguishable from "read the log, found nothing".
+            //
+            // No monetary amount, ever, and no payout puzzle hash — see `PayeeClaimStatus`'s doc.
+            // No params type: this call takes none.
+            Some(Method::GetPayeeRewardClaimStatus) => {
+                use crate::rewards::state::Clock as _;
+                let result = dig_rpc_protocol::types::PayeeClaimStatus {
+                    subject: dig_rpc_protocol::types::PayeeSubject::Payee,
+                    claim_log: dig_rpc_protocol::types::ClaimLogObservation::NotConsulted {
+                        observed_at: crate::rewards::state::SystemClock.now_unix_seconds(),
+                    },
+                };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
             Some(Method::CacheSetCapBytes) => {
