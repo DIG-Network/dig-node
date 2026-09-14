@@ -1402,7 +1402,7 @@ mod tests {
             "the warning must name the FIELD that was clamped; got: {rendered}"
         );
         assert!(
-            rendered.contains("clamped"),
+            rendered.contains("CLAMPED"),
             "the above-max branch must say CLAMPED, not substituted; got: {rendered}"
         );
         assert!(
@@ -1434,7 +1434,7 @@ mod tests {
             "the clamped jitter field must be named at WARN; got: {rendered}"
         );
         assert!(
-            rendered.contains("clamped"),
+            rendered.contains("CLAMPED"),
             "the above-max branch must say CLAMPED, not substituted; got: {rendered}"
         );
         assert!(
