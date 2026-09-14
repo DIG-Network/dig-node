@@ -157,6 +157,12 @@ chia-puzzle-types = "=0.36.1"
 # signer can refuse spends that are not its own wallet's rather than trusting the call site to have
 # passed the right key. Part of the same chia set above -- `chia-sdk-driver` already resolves it.
 clvm-utils = "0.36.1"
+# `rewards/chain_source.rs`'s launch-comment recovery (dig_ecosystem#3310) decodes a `CoinSpend`'s
+# puzzle reveal, solution and run output as raw CLVM: `FromClvm`/`ToClvm` for `Conditions`/`Memos`
+# and the `Allocator`/`NodePtr` they run over. Same 0.36.1/0.16 line every chia crate above already
+# resolves -- `chia-sdk-driver`/`dig-rewards-coin` both depend on exactly these versions.
+clvm-traits = "0.36.1"
+clvmr = "0.16"
 # The epoch term of a mirror hint is a `BigInt`, not a `u64`: the morph is arithmetic over
 # 32-byte values and the crate's API says so. Same line as `dig-mirror-coin`'s own.
 num-bigint = "0.4.6"
@@ -371,6 +377,11 @@ chia-protocol = "0.36.1"
 chia-puzzle-types = "=0.36.1"
 chia-sdk-driver = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
 chia-sdk-types = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
+# `rewards/chain_port.rs`'s A3 acceptance test (dig_ecosystem#3310): a real distributor launched
+# via `dig_rewards_coin::launch_dig_distributor` against `Simulator`'s peer-simulator, so
+# `distributor_report` is exercised over authentic coin records/spends rather than a hand-built
+# double. Same version + feature `dig-wallet` already builds its own simulator-backed tests on.
+chia-sdk-test = { version = "0.36.0", features = ["peer-simulator"] }
 clvm-utils = "0.36.1"
 num-bigint = "0.4.6"
 hex = "0.4"

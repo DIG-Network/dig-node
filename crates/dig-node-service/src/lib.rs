@@ -109,6 +109,12 @@ pub mod relay;
 /// lifecycle from `dig_node_core::rewards` (#3250, the funder-side prover, a sibling lane). See
 /// [`rewards_claim`].
 pub mod rewards_claim;
+/// The node's FUNDER-SIDE `RewardsChainPort` adapter (DIG-Network/dig_ecosystem#3310): the
+/// production implementation of `dig_node_core::rewards::port::RewardsChainPort` over
+/// `dig-wallet`'s `CorroboratedChainSource` and `dig-rewards-coin`'s `state::read_distributor`,
+/// installed once at startup via `dig_node_core::Node::install_reward_chain_port`. See
+/// [`rewards::chain_port::RealRewardsChainPort`].
+pub mod rewards;
 pub mod rpc;
 /// The offline `wallet export-seed` rescue command: a local read of this node's
 /// encrypted seed file. Adds no network surface, and is removed with node-side custody.
