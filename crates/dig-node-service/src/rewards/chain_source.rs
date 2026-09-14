@@ -156,6 +156,25 @@ pub(crate) enum LaunchCommentError {
     NotADigDistributor,
 }
 
+/// Manual (not derived) `Display`: reads the `String` payload of `ChainSource`/`Malformed` into
+/// the message a caller logs. A derived `Debug` alone does not count, to rustc's own dead-code
+/// analysis, as a genuine read of a private tuple field -- see `chain_port.rs`'s
+/// `build_report`, the only caller, which now formats via `{error}` rather than `{error:?}`.
+impl std::fmt::Display for LaunchCommentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChainSource(reason) => write!(f, "chain source unavailable: {reason}"),
+            Self::Malformed(reason) => write!(f, "malformed launch comment data: {reason}"),
+            Self::NotADigDistributor => {
+                write!(
+                    f,
+                    "not a DIG rewards distributor (no matching launch comment)"
+                )
+            }
+        }
+    }
+}
+
 /// Recovers `launcher_id`'s `(store_id, root)` from the `CREATE_COIN` memo on the spend that
 /// CREATES the launcher coin -- see the module doc's second section for why this cannot come from
 /// `dig_rewards_coin` itself.
@@ -319,6 +338,13 @@ mod tests {
         let launcher_coin = Coin::new(Bytes32::from([7u8; 32]), Bytes32::from([9u8; 32]), 1);
         let launcher_id = launcher_coin.coin_id();
 
+        // `.with_launcher_id(launcher_id)` is not a formality: it recomputes
+        // `reserve_inner_puzzle_hash`/`reserve_full_puzzle_hash` from `launcher_id` and
+        // `reserve_asset_id` (curried tree hashes). `from_launcher_solution` rejects any
+        // constants for which `constants != constants.with_launcher_id(launcher_id)` -- leaving
+        // those two fields zeroed here made that comparison fail on every call, deterministically
+        // (never actually flaky), which sent every read down the guard's deliberately-permissive
+        // "could not decode" path instead of exercising the epoch_seconds check at all.
         let constants = RewardDistributorConstants {
             launcher_id,
             reward_distributor_type: RewardDistributorType::Managed {
@@ -335,7 +361,8 @@ mod tests {
             reserve_asset_id: Bytes32::default(),
             reserve_inner_puzzle_hash: Bytes32::default(),
             reserve_full_puzzle_hash: Bytes32::default(),
-        };
+        }
+        .with_launcher_id(launcher_id);
 
         let mut ctx = SpendContext::new();
         let solution = ctx

@@ -95,7 +95,7 @@ fn build_report(
         .ok_or(ChainPortError::Unavailable)?;
 
     let comment = read_launch_comment(source, launcher_id)
-        .map_err(|error| ChainPortError::Other(format!("launch comment unreadable: {error:?}")))?;
+        .map_err(|error| ChainPortError::Other(format!("launch comment unreadable: {error}")))?;
 
     let (_constants, first_epoch_state) =
         read_launch_constants(source, launcher_id).ok_or_else(|| {
@@ -221,18 +221,33 @@ mod tests {
     /// withdraw-incentives driver call -- that is #3250's prover-cycle surface, not this ticket's.
     /// A literal-string check rather than a compile-time one because the point is to catch the
     /// import even if it compiled (e.g. via a re-export or a fully qualified path elsewhere).
+    ///
+    /// Scoped to the NON-TEST region of each file (everything before its own `#[cfg(test)]`
+    /// marker): this very test's name and assertion messages contain the literal string, so an
+    /// unscoped `contains` over the whole file (this one included) can never pass -- it would be
+    /// self-defeating, not a real containment check.
     #[test]
     fn adapter_source_never_imports_withdraw_committed_incentives() {
-        let chain_port_src = include_str!("chain_port.rs");
-        let chain_source_src = include_str!("chain_source.rs");
+        let chain_port_production_src = production_region(include_str!("chain_port.rs"));
+        let chain_source_production_src = production_region(include_str!("chain_source.rs"));
 
         assert!(
-            !chain_port_src.contains("withdraw_committed_incentives"),
+            !chain_port_production_src.contains("withdraw_committed_incentives"),
             "chain_port.rs must not reference withdraw_committed_incentives (out of #3310's scope)"
         );
         assert!(
-            !chain_source_src.contains("withdraw_committed_incentives"),
+            !chain_source_production_src.contains("withdraw_committed_incentives"),
             "chain_source.rs must not reference withdraw_committed_incentives (out of #3310's scope)"
         );
+    }
+
+    /// The slice of a source file before its own `#[cfg(test)]` module -- i.e. what actually
+    /// ships. Falls back to the whole file if there is no such marker (there always is one here,
+    /// but a missing marker should widen the scan, not silently skip it).
+    fn production_region(source: &str) -> &str {
+        match source.find("#[cfg(test)]") {
+            Some(test_module_start) => &source[..test_module_start],
+            None => source,
+        }
     }
 }
