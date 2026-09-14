@@ -463,14 +463,16 @@ async fn run_claim_driver_in<P>(
         dig_mirror_coin::DIG_ASSET_ID,
     )
     .with_rotation_cursor(cfg.rotation_cursor)
-    // F2: the fee-budget window is sized from the RAW configured cadence, not the clamped
-    // scheduling value -- `cadence_seconds` here has already been clamped down to
-    // `CLAIM_SCHEDULE_SECONDS_MAX` for the SCHEDULER, and reusing it to size the persisted
-    // fee-budget window would double the number of budget windows a long-cadence operator sized
-    // (a 60-day config would get ~12 windows/year instead of the ~6 its cadence implies -- 2x the
-    // fee ceiling they configured). `ClaimEngine::new` (`engine.rs`) floors an oversized raw value
-    // on its own, so passing the raw value here is the conservative direction for spend.
-    .with_persisted_fee_window(state_dir, cfg.cadence_seconds);
+    // F2: two DIFFERENT cadence values, deliberately -- `cadence_seconds` (CLAMPED, already
+    // bounded to `CLAIM_SCHEDULE_SECONDS_MAX`) gates WHEN a cycle may run, tracking the same
+    // schedule the driver below actually sleeps on. `cfg.cadence_seconds` (RAW, unclamped) sizes
+    // the persisted fee-budget window -- reusing the clamped value there would double the number
+    // of budget windows a long-cadence operator sized (a 60-day config would get ~12 windows/year
+    // instead of the ~6 its cadence implies -- 2x the fee ceiling they configured). Conflating the
+    // two into one value in either direction is wrong: clamped-for-both doubles the fee ceiling,
+    // raw-for-both can silently starve the gate (an unbounded-above raw cadence would stop cycles
+    // from ever running while the scheduler keeps ticking on the clamped interval).
+    .with_persisted_fee_window(state_dir, cadence_seconds, cfg.cadence_seconds);
 
     drive(
         engine,
@@ -990,7 +992,7 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), cfg.cadence_seconds);
+        .with_persisted_fee_window(dir.path(), cfg.cadence_seconds, cfg.cadence_seconds);
 
         let outcomes = engine.run_cycle(900).await; // 900 - 500 = 400 < 1_000
         assert!(outcomes.is_empty());
@@ -1001,24 +1003,35 @@ mod tests {
         );
     }
 
-    /// F2, MONEY: `with_persisted_fee_window` must be sized from the CONFIGURED (raw) cadence, not
-    /// the CLAMPED one the scheduler uses -- a 60-day config must size its persisted fee-budget
-    /// window from 5_184_000, not from the 2_678_400 the schedule is clamped to (which would
-    /// double the fee ceiling the operator sized). Proven here by showing the window rolls at a
-    /// different tick depending on which cadence sized it: at `t == effective_cadence`, an engine
-    /// sized from the CLAMPED value has already rolled its window (`fee_window_start_unix` moves),
-    /// while an engine sized from the CONFIGURED (raw) value has not -- the cadence gate at that
-    /// value has not elapsed yet, and the window is untouched.
-    #[tokio::test]
-    async fn the_fee_window_is_sized_from_the_configured_cadence_not_the_clamped_one() {
-        let configured_cadence = 60 * 24 * 60 * 60u64; // 5_184_000
-        let effective_cadence = 31 * 24 * 60 * 60u64; // 2_678_400
+    /// F2, MONEY: the gate that decides WHEN a cycle may run must track the CLAMPED schedule (the
+    /// same interval [`drive`] actually ticks on), while the persisted fee-budget window must
+    /// track the RAW configured cadence -- conflating them into one value either doubles the
+    /// operator's fee ceiling (clamped-for-both) or can silently starve the gate for an
+    /// unbounded-above raw cadence (raw-for-both), which is the exact "all checks green, node
+    /// stops claiming" shape F1 exists to catch elsewhere in this module.
+    ///
+    /// Driven through the REAL production loop, [`drive`] (the same function
+    /// [`run_claim_driver_in`] calls), with an INJECTED clock -- [`run_claim_driver_in`] itself
+    /// hardcodes [`unix_now_seconds`] (real wall-clock), which cannot be driven deterministically
+    /// under `#[tokio::test(start_paused = true)]` (only the *sleep* is virtual, not
+    /// `SystemTime::now()`), so this test injects a clock that advances in lockstep with the
+    /// scheduler's ticks instead, exactly as [`zero_cycles_before_the_interval_elapses_then_a_counted_number_after`]
+    /// already does for A1/A2. A 60-day config (`configured_cadence = 5_184_000`) clamped to the
+    /// 31-day ceiling (`effective_cadence = 2_678_400`, [`CLAIM_SCHEDULE_SECONDS_MAX`]):
+    /// - the GATE must open on every tick (cycles 1, 2, 3 all actually run, never
+    ///   `CadenceNotElapsed`) -- it tracks the clamped 31-day schedule the loop ticks on;
+    /// - the WINDOW must NOT roll at tick 2 (elapsed since it opened is one clamped interval,
+    ///   2_678_400s, well under the raw 5_184_000s the operator configured) but MUST have rolled
+    ///   by tick 3 (elapsed is 2 clamped intervals, 5_356_800s, past the raw boundary).
+    #[tokio::test(start_paused = true)]
+    async fn the_gate_tracks_the_clamped_cadence_while_the_fee_window_tracks_the_raw_one() {
+        let configured_cadence = 60 * 24 * 60 * 60u64; // 5_184_000, RAW -- sizes the fee window.
+        let effective_cadence = 31 * 24 * 60 * 60u64; // 2_678_400, CLAMPED -- sizes the gate.
         assert_eq!(configured_cadence, 5_184_000);
         assert_eq!(effective_cadence, 2_678_400);
 
-        // Engine A: sized from the RAW configured cadence (F2's fix).
-        let dir_raw = tempfile::tempdir().unwrap();
-        let mut engine_raw = ClaimEngine::new(
+        let dir = tempfile::tempdir().unwrap();
+        let engine = ClaimEngine::new(
             EmptyPort,
             NoHintSource,
             Bytes32::from([1u8; 32]),
@@ -1026,53 +1039,85 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir_raw.path(), configured_cadence);
-        let _ = engine_raw.run_cycle(0).await;
-        let _ = engine_raw.run_cycle(effective_cadence).await;
-        assert_eq!(
-            engine_raw.status().state,
-            super::super::types::ClaimLoopState::CadenceNotElapsed,
-            "sized from the RAW 5_184_000 cadence, only 2_678_400s have elapsed -- the gate must \
-             not have opened yet"
-        );
-        let cfg_raw = RewardsClaimConfig::load_from(dir_raw.path());
-        assert_eq!(
-            cfg_raw.fee_window_start_unix,
-            Some(0),
-            "the window must NOT have rolled -- sized from the raw cadence, it is still open"
-        );
+        .with_persisted_fee_window(dir.path(), effective_cadence, configured_cadence);
 
-        // Engine B: sized from the CLAMPED cadence (the pre-F2 bug) -- for contrast only.
-        let dir_clamped = tempfile::tempdir().unwrap();
-        let mut engine_clamped = ClaimEngine::new(
-            EmptyPort,
-            NoHintSource,
-            Bytes32::from([1u8; 32]),
-            1,
-            10,
-            Bytes32::from([2u8; 32]),
-        )
-        .with_persisted_fee_window(dir_clamped.path(), effective_cadence);
-        let _ = engine_clamped.run_cycle(0).await;
-        let _ = engine_clamped.run_cycle(effective_cadence).await;
+        let handle = ClaimLoopHandle::default();
+        let h = handle.clone();
+        let driver = tokio::spawn(async move {
+            drive(
+                engine,
+                effective_cadence,
+                0,
+                ScheduleAdjustment::none(),
+                &super::super::cadence::FixedJitter(0),
+                {
+                    let mut t = 0u64;
+                    move || {
+                        t += effective_cadence;
+                        t
+                    }
+                },
+                h,
+            )
+            .await;
+        });
+
+        settle().await;
+        assert_eq!(handle.cycles_driven(), 0, "no interval has elapsed yet");
+
+        // Tick 1 (t = 2_678_400): first cycle ever, no last_completed_at yet -- the gate cannot
+        // refuse it, and the window opens for the first time.
+        tokio::time::advance(Duration::from_secs(effective_cadence)).await;
+        settle().await;
+        assert_eq!(handle.cycles_driven(), 1);
         assert_ne!(
-            engine_clamped.status().state,
+            handle.status().state,
             super::super::types::ClaimLoopState::CadenceNotElapsed,
-            "sized from the clamped 2_678_400 cadence, exactly that many seconds have elapsed -- \
-             the gate must have opened"
+            "the very first cycle has no prior completion to gate against"
         );
-        let cfg_clamped = RewardsClaimConfig::load_from(dir_clamped.path());
+        let after_tick_1 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
-            cfg_clamped.fee_window_start_unix,
+            after_tick_1,
             Some(effective_cadence),
-            "sized from the clamped cadence, the window must have rolled by t == effective_cadence"
+            "the window opens on tick 1"
         );
 
-        // The two configurations must be visibly different -- the whole point of F2.
-        assert_ne!(
-            cfg_raw.fee_window_start_unix,
-            cfg_clamped.fee_window_start_unix
+        // Tick 2 (t = 5_356_800): exactly one clamped interval since tick 1 -- the GATE must open
+        // (it tracks the clamped 2_678_400s schedule), but the WINDOW must NOT roll (only
+        // 2_678_400s of its raw 5_184_000s have elapsed).
+        tokio::time::advance(Duration::from_secs(effective_cadence)).await;
+        settle().await;
+        assert_eq!(
+            handle.cycles_driven(),
+            2,
+            "F2: the gate must track the CLAMPED cadence -- a cycle sized from the raw 5_184_000 \
+             cadence would still be refused here, reproducing the silent-non-claiming defect"
         );
+        assert_ne!(
+            handle.status().state,
+            super::super::types::ClaimLoopState::CadenceNotElapsed,
+            "F2: the gate opened one clamped interval after the last completion -- it must not \
+             still be waiting on the raw 5_184_000s cadence"
+        );
+        let after_tick_2 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
+        assert_eq!(
+            after_tick_2, after_tick_1,
+            "F2: the window must NOT have rolled yet -- only one clamped interval (2_678_400s) \
+             has elapsed against its raw 5_184_000s length"
+        );
+
+        // Tick 3 (t = 8_035_200): two clamped intervals (5_356_800s) since the window opened --
+        // past its raw 5_184_000s length. The window must finally roll.
+        tokio::time::advance(Duration::from_secs(effective_cadence)).await;
+        settle().await;
+        assert_eq!(handle.cycles_driven(), 3);
+        let after_tick_3 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
+        assert_ne!(
+            after_tick_3, after_tick_1,
+            "F2: the window must have rolled once the RAW 5_184_000s cadence elapsed"
+        );
+
+        driver.abort();
     }
 
     #[tokio::test]
@@ -1093,7 +1138,7 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), cfg.cadence_seconds);
+        .with_persisted_fee_window(dir.path(), cfg.cadence_seconds, cfg.cadence_seconds);
 
         let outcomes = engine.run_cycle(2_000).await; // 2_000 - 500 = 1_500 >= 1_000
         assert!(outcomes.is_empty(), "nothing to claim, but the cycle RAN");
@@ -1121,7 +1166,7 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), cfg.cadence_seconds);
+        .with_persisted_fee_window(dir.path(), cfg.cadence_seconds, cfg.cadence_seconds);
 
         let outcomes = engine.run_cycle(100).await; // now < last_cycle_completed_at
         assert!(outcomes.is_empty());
@@ -1153,7 +1198,7 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), 1_000);
+        .with_persisted_fee_window(dir.path(), 1_000, 1_000);
 
         let outcomes = engine.run_cycle(1).await;
         assert!(outcomes.is_empty());
@@ -1632,6 +1677,14 @@ mod tests {
             "A5: a clamp must never make the scheduler quietly stop driving cycles"
         );
 
+        // NOTE: this test cannot also assert `handle.status().state != CadenceNotElapsed` here --
+        // `run_claim_driver_in` hardcodes `unix_now_seconds` (real wall-clock) for the gate's
+        // `now`, and `tokio::time::advance` only fast-forwards the tokio sleep, never
+        // `SystemTime::now()`; real elapsed time between these two ticks is near-zero regardless
+        // of the virtual advance, so the gate legitimately reads `CadenceNotElapsed` on tick 2
+        // even under the correct, fixed split. `the_gate_tracks_the_clamped_cadence_while_the_fee_window_tracks_the_raw_one`
+        // below proves the actual clamped-vs-raw gate/window split with an INJECTED clock instead,
+        // which is the only way to make that assertion deterministic.
         driver.abort();
 
         // F1: assert against the PER-CYCLE lines specifically, not the whole shared buffer -- the
