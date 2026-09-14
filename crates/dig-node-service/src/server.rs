@@ -2157,10 +2157,7 @@ where
                         std::sync::Arc::new(source),
                     ));
                 if !state.node.install_reward_chain_port(port) {
-                    tracing::warn!(
-                        "install_reward_chain_port declined a second install: a reward chain \
-                         port was already installed on this Node"
-                    );
+                    // MUTATION: warn deleted for R2 red-proof
                 }
             }
             Err(error) => {
