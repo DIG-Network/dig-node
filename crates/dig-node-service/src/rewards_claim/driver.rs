@@ -559,9 +559,9 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
+    use super::super::cadence::CLAIM_JITTER_SECONDS_DEFAULT;
     use super::super::port::ClaimPortError;
     use super::super::types::{DiscoveredDistributor, OwnEntry};
-    use super::cadence::CLAIM_JITTER_SECONDS_DEFAULT;
 
     // ---- decide_claim_driver / spawn_claim_driver_if (A3) ----------------------------------
 
