@@ -3041,20 +3041,25 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.258.0"
+version = "0.259.0"
 dependencies = [
  "async-trait",
  "axum",
  "axum-server",
  "base64",
  "chia-bls 0.36.1",
+ "chia-consensus 0.36.1",
  "chia-protocol 0.36.1",
  "chia-puzzle-types 0.36.1",
+ "chia-puzzles",
  "chia-sdk-driver 0.36.0",
+ "chia-sdk-test 0.36.0",
  "chia-sdk-types 0.36.0",
  "chia-sha2 0.36.1",
  "clap",
+ "clvm-traits 0.36.1",
  "clvm-utils 0.36.1",
+ "clvmr 0.16.4",
  "dig-cert",
  "dig-chainsource-interface 0.3.3",
  "dig-constants 0.13.1",
@@ -3064,6 +3069,7 @@ dependencies = [
  "dig-node-control-interface",
  "dig-node-core",
  "dig-node-service",
+ "dig-rewards-coin",
  "dig-rpc-protocol",
  "dig-stun",
  "dig-urn-resolver",
@@ -3207,6 +3213,26 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dig-rewards-coin"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0bb94b1f02239b4ad8072c5b1d37a00cca366cfeca73b34fcecd94a2470fdd0"
+dependencies = [
+ "chia-bls 0.36.1",
+ "chia-consensus 0.36.1",
+ "chia-protocol 0.36.1",
+ "chia-puzzle-types 0.36.1",
+ "chia-sdk-driver 0.36.0",
+ "chia-sdk-types 0.36.0",
+ "clvm-traits 0.36.1",
+ "clvmr 0.16.4",
+ "dig-chainsource-interface 0.3.3",
+ "dig-constants 0.13.1",
+ "hex",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
