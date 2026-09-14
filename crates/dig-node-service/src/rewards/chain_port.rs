@@ -22,6 +22,7 @@ use dig_wallet::sage::corroborated_source::CorroboratedChainSource;
 
 use super::chain_source::{
     read_distributor_guarded, read_launch_comment, read_launch_constants, GuardedReadError,
+    LaunchCommentError,
 };
 
 /// The funder-side `RewardsChainPort` over a [`ChainSource`] -- `dig-wallet`'s
@@ -38,6 +39,12 @@ use super::chain_source::{
 /// genuine, simulator-produced `CoinSpend`.
 pub struct RealRewardsChainPort<S: ChainSource + Send + Sync + 'static = CorroboratedChainSource> {
     source: Arc<S>,
+    /// Set once `distributor_report` fails, cleared on its next success -- so the WARN in
+    /// `distributor_report` below fires once per failure->success transition, not once per call
+    /// (dig_ecosystem#3310 gate leg 3, R4). A caller may poll this every few seconds; without this
+    /// a degraded chain source would either log nothing (the defect the gate found) or flood the
+    /// log on every single poll -- neither of which an operator can act on.
+    report_degraded: std::sync::atomic::AtomicBool,
 }
 
 impl<S: ChainSource + Send + Sync + 'static> RealRewardsChainPort<S> {
@@ -47,7 +54,10 @@ impl<S: ChainSource + Send + Sync + 'static> RealRewardsChainPort<S> {
     /// life, so the source must outlive it too.
     #[must_use]
     pub fn new(source: Arc<S>) -> Self {
-        Self { source }
+        Self {
+            source,
+            report_degraded: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
@@ -85,11 +95,36 @@ impl<S: ChainSource + Send + Sync + 'static> RewardsChainPort for RealRewardsCha
         // blocking-pool thread keeps a slow read from stalling the async runtime it is called
         // from, without using `spawn_blocking` as a hang REMEDY (the guard, not this, is what
         // prevents the hang itself -- see `chain_source.rs`'s module doc).
-        tokio::task::spawn_blocking(move || build_report(source.as_ref(), launcher_id))
+        let result = tokio::task::spawn_blocking(move || build_report(source.as_ref(), launcher_id))
             .await
             .map_err(|join_error| {
                 ChainPortError::Other(format!("report task panicked: {join_error}"))
-            })?
+            })?;
+
+        // R4 (dig_ecosystem#3310 gate leg 3, §4): a failing chain source must be observable, not
+        // only correctly typed. `swap` both reads and sets `report_degraded` atomically, so the
+        // warn fires exactly once per failure->success transition even under concurrent callers.
+        match &result {
+            Ok(_) => {
+                self.report_degraded
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(port_error) => {
+                let was_already_degraded = self
+                    .report_degraded
+                    .swap(true, std::sync::atomic::Ordering::Relaxed);
+                if !was_already_degraded {
+                    tracing::warn!(
+                        launcher_id = %hex::encode(launcher_id),
+                        error = ?port_error,
+                        "distributor_report failed; reward-distributor reads for this launcher \
+                         stay refused until the chain source recovers"
+                    );
+                }
+            }
+        }
+
+        result
     }
 }
 
@@ -107,8 +142,8 @@ where
         .map_err(guarded_read_error_to_port_error)?
         .ok_or(ChainPortError::Unavailable)?;
 
-    let comment = read_launch_comment(source, launcher_id)
-        .map_err(|error| ChainPortError::Other(format!("launch comment unreadable: {error}")))?;
+    let comment =
+        read_launch_comment(source, launcher_id).map_err(launch_comment_error_to_port_error)?;
 
     let (_constants, first_epoch_state) =
         read_launch_constants(source, launcher_id).ok_or_else(|| {
@@ -156,7 +191,7 @@ fn report_from_snapshot(
     // `read_distributor_guarded` succeeded, and that call refuses `epoch_seconds == 0` twice over
     // (this crate's own guard, then `dig-rewards-coin`'s `state.rs:1015`) before ever returning
     // `Ok(Some(..))`.
-    let current_distributor_epoch = epoch_end.saturating_sub(first_epoch_start) / epoch_seconds;
+    let current_distributor_epoch = epoch_ordinal(epoch_end, first_epoch_start, epoch_seconds);
 
     let commitments = snapshot
         .slots()
@@ -198,6 +233,16 @@ fn report_from_snapshot(
     })
 }
 
+/// The report's only non-trivial computed field, pulled out of [`report_from_snapshot`] so it can
+/// be unit-tested directly (dig_ecosystem#3310 gate leg 3, R3): a gut that replaces
+/// `current_distributor_epoch` with a constant leaves every test in this crate green unless this
+/// function's own tests catch it, because at a bare launch `epoch_end == first_epoch_start` and
+/// the CORRECT answer is already `0` -- indistinguishable from the gutted value on that one case
+/// alone. `epoch_seconds == 0` never reaches here -- see the caller's comment.
+fn epoch_ordinal(epoch_end: u64, first_epoch_start: u64, epoch_seconds: u64) -> u64 {
+    epoch_end.saturating_sub(first_epoch_start) / epoch_seconds
+}
+
 /// Maps [`GuardedReadError`] onto [`ChainPortError`] -- see the module's own mapping table
 /// (dig_ecosystem#3310 brief): `RewardsError::ChainUnavailable` is the ONLY variant that becomes
 /// [`ChainPortError::Unavailable`]; `RewardsError::UnreadableDistributorConstants` becomes
@@ -217,6 +262,19 @@ fn guarded_read_error_to_port_error(error: GuardedReadError) -> ChainPortError {
     }
 }
 
+/// Maps [`LaunchCommentError`] onto [`ChainPortError`] (dig_ecosystem#3310 gate leg 3, R5).
+/// `ParentSpendUnavailable` is a chain-source GAP (the source does not yet hold the launcher's
+/// parent spend), not a classification of the distributor's identity -- it maps onto the same
+/// `Unavailable` `read_distributor_guarded`'s own `Ok(None)` already answers with, not `Other`,
+/// which would render it to a caller as a definitive "not a DIG distributor". Every other variant
+/// genuinely is a refused/malformed read, or a real classification, so it stays `Other`.
+fn launch_comment_error_to_port_error(error: LaunchCommentError) -> ChainPortError {
+    match error {
+        LaunchCommentError::ParentSpendUnavailable => ChainPortError::Unavailable,
+        other => ChainPortError::Other(format!("launch comment unreadable: {other}")),
+    }
+}
+
 /// The `RewardsError` half of [`guarded_read_error_to_port_error`]'s mapping table.
 fn reader_error_to_port_error(error: RewardsError) -> ChainPortError {
     match error {
@@ -230,6 +288,105 @@ fn reader_error_to_port_error(error: RewardsError) -> ChainPortError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use dig_chainsource_interface::{ChainSourceError, MockChainSource};
+    use dig_node_core::rewards::port::{ChainPortError, RewardsChainPort};
+
+    use super::RealRewardsChainPort;
+
+    /// R3 (dig_ecosystem#3310 gate leg 3, §2/§3.2): a bare launch has `epoch_end ==
+    /// first_epoch_start`, so `0` is the CORRECT answer there, not just what a gutted
+    /// implementation would also return -- this test proves the non-zero, multi-epoch case
+    /// instead, which a `0`-returning gut cannot pass.
+    #[test]
+    fn epoch_ordinal_counts_whole_epochs_elapsed_since_first_epoch_start() {
+        let first_epoch_start = 1_000;
+        let epoch_seconds = 100;
+        let epoch_end = first_epoch_start + 3 * epoch_seconds + 40; // partway into epoch 3
+
+        assert_eq!(
+            super::epoch_ordinal(epoch_end, first_epoch_start, epoch_seconds),
+            3
+        );
+    }
+
+    /// The `saturating_sub` branch: a clock-skewed or not-yet-advanced read can have
+    /// `epoch_end < first_epoch_start`. Must refuse to underflow and answer epoch `0`, not panic
+    /// or wrap.
+    #[test]
+    fn epoch_ordinal_saturates_to_zero_when_epoch_end_precedes_first_epoch_start() {
+        assert_eq!(super::epoch_ordinal(500, 1_000, 100), 0);
+    }
+
+    /// The bare-launch case itself: `epoch_end == first_epoch_start` -- correctly `0`, and named
+    /// here so the two tests above are read as a PAIR, not as this single (weak, gut-indistinct)
+    /// case alone.
+    #[test]
+    fn epoch_ordinal_is_zero_at_a_bare_launch() {
+        assert_eq!(super::epoch_ordinal(1_234, 1_234, 100), 0);
+    }
+
+    /// This ticket's own filed complaint (dig_ecosystem#3310): a failing chain source must
+    /// surface as a NAMED error, never as reassuring emptiness -- an `Ok` carrying a
+    /// zero/default-valued report. `MockChainSource::fail_with` forces every read `Err`
+    /// (`ChainSourceError::Timeout`), which `dig_rewards_coin::state::read_distributor` maps to
+    /// `RewardsError::ChainUnavailable`, which this adapter's own `reader_error_to_port_error`
+    /// maps to `ChainPortError::Unavailable` -- checked here end to end through the public
+    /// `RewardsChainPort::distributor_report` call, not just the internal mapping function, so a
+    /// future refactor of `build_report`'s plumbing cannot silently reopen the gap.
+    #[tokio::test]
+    async fn a_failing_chain_source_reports_a_named_unavailable_never_an_ok_default() {
+        let source = MockChainSource::new().fail_with(ChainSourceError::Timeout);
+        let port = RealRewardsChainPort::<MockChainSource>::new(Arc::new(source));
+
+        let result = port.distributor_report([0x11; 32]).await;
+
+        assert_eq!(
+            result,
+            Err(ChainPortError::Unavailable),
+            "a failing chain source must report the named Unavailable variant, never Ok(_) with \
+             a default-valued report, got {result:?}"
+        );
+    }
+
+    /// The adjacent guard this crate's own `epoch_seconds == 0` refusal must keep: that refusal is
+    /// a NAMED distributor-level refusal (`ChainPortError::Other`), never conflated with
+    /// `ChainPortError::Unavailable` -- which must mean the CHAIN SOURCE could not answer, not
+    /// that a read was refused for a reason unrelated to reachability. Regresses a case where
+    /// `GuardedReadError::NonTerminatingEpochSeconds` maps onto the same variant an offline chain
+    /// would report, which would let a caller mistake "chain source is fine, this distributor
+    /// carries a replay hazard" for "the chain source itself is unreachable".
+    #[test]
+    fn non_terminating_epoch_seconds_is_not_reported_as_chain_unavailable() {
+        let mapped = super::guarded_read_error_to_port_error(
+            super::super::chain_source::GuardedReadError::NonTerminatingEpochSeconds,
+        );
+
+        assert_ne!(
+            mapped,
+            ChainPortError::Unavailable,
+            "epoch_seconds == 0 is a named refusal, not an absent/unreachable chain, got {mapped:?}"
+        );
+    }
+
+    /// R5's regression (dig_ecosystem#3310 gate leg 3): a chain-source GAP on the launcher's
+    /// parent spend must never be reported as the definitive "not a DIG distributor" verdict --
+    /// it must agree with the OTHER absence path (`read_distributor_guarded`'s own `Ok(None)`),
+    /// which answers `Unavailable`.
+    #[test]
+    fn parent_spend_gap_is_reported_as_unavailable_not_as_a_distributor_identity_verdict() {
+        let mapped = super::launch_comment_error_to_port_error(
+            super::super::chain_source::LaunchCommentError::ParentSpendUnavailable,
+        );
+
+        assert_eq!(
+            mapped,
+            ChainPortError::Unavailable,
+            "a missing parent spend is a chain-source gap, not an identity verdict, got {mapped:?}"
+        );
+    }
+
     /// dig_ecosystem#3310 acceptance A4: neither adapter file in this module may import the
     /// withdraw-incentives driver call -- that is #3250's prover-cycle surface, not this ticket's.
     /// A literal-string check rather than a compile-time one because the point is to catch the
