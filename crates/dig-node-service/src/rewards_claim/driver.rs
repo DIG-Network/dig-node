@@ -363,13 +363,17 @@ impl ScheduleAdjustment {
 /// Sanitize a persisted schedule pair, at the read, before either value can reach the scheduler.
 /// Returns `(cadence_seconds, jitter_seconds, ScheduleAdjustment)`.
 ///
-/// A zero cadence has no direction to clamp toward -- it would busy-loop the claim engine as fast
-/// as the runtime can poll it -- so it is SUBSTITUTED with the documented default, same as before,
-/// at `WARN`. An in-range-but-too-large cadence, or an out-of-range jitter, has an obvious
-/// direction: down. Those are CLAMPED to [`CLAIM_SCHEDULE_SECONDS_MAX`] instead of replaced by an
-/// unrelated default -- a 60-day configured cadence must run every 31 days, the closest the
-/// operator's intent can be honoured, not every 1 day (the default). A zero JITTER is legitimate
-/// (it means "no jitter") and is left alone.
+/// A zero cadence has no direction to clamp toward -- if it ever reached the claim engine it
+/// would busy-loop it as fast as the runtime can poll -- so it is SUBSTITUTED with the documented
+/// default, same as before, at `WARN`. F3: in production this branch is defence in depth, not the
+/// primary guard -- `RewardsClaimConfig::load_from` (`config.rs`) already floors
+/// `cadence_seconds` to `CLAIM_CADENCE_FLOOR_SECONDS` (60) at the read, before this function ever
+/// sees the value, so zero only reaches here if that floor is removed or bypassed. An
+/// in-range-but-too-large cadence, or an out-of-range jitter, has an obvious direction: down.
+/// Those are CLAMPED to [`CLAIM_SCHEDULE_SECONDS_MAX`] instead of replaced by an unrelated default
+/// -- a 60-day configured cadence must run every 31 days, the closest the operator's intent can be
+/// honoured, not every 1 day (the default). A zero JITTER is legitimate (it means "no jitter") and
+/// is left alone.
 fn sanitized_schedule(cadence_seconds: u64, jitter_seconds: u64) -> (u64, u64, ScheduleAdjustment) {
     let mut adjustment = ScheduleAdjustment::none();
 
@@ -442,8 +446,11 @@ async fn run_claim_driver_in<P>(
     // here instead would report NOTHING at all, which is the exact silent failure this ticket
     // exists to prevent -- a corrupt file must stay visible, not vanish into "never started".
 
-    // The config is operator-writable and unclamped at rest (`config.rs` deliberately reports what
-    // is on disk). Sanitize HERE, at the read, before either value can reach the scheduler.
+    // F4: the config is operator-writable, and `jitter_seconds` is unclamped at rest (`config.rs`
+    // deliberately reports what is on disk for it). `cadence_seconds` is the one exception --
+    // `config.rs` already floors it to `CLAIM_CADENCE_FLOOR_SECONDS` before it reaches this
+    // function -- but it is still unclamped at the TOP end here, so sanitize HERE, at the read,
+    // before either value can reach the scheduler.
     let (cadence_seconds, jitter_seconds, adjustment) =
         sanitized_schedule(cfg.cadence_seconds, cfg.jitter_seconds);
 
@@ -456,7 +463,14 @@ async fn run_claim_driver_in<P>(
         dig_mirror_coin::DIG_ASSET_ID,
     )
     .with_rotation_cursor(cfg.rotation_cursor)
-    .with_persisted_fee_window(state_dir, cadence_seconds);
+    // F2: the fee-budget window is sized from the RAW configured cadence, not the clamped
+    // scheduling value -- `cadence_seconds` here has already been clamped down to
+    // `CLAIM_SCHEDULE_SECONDS_MAX` for the SCHEDULER, and reusing it to size the persisted
+    // fee-budget window would double the number of budget windows a long-cadence operator sized
+    // (a 60-day config would get ~12 windows/year instead of the ~6 its cadence implies -- 2x the
+    // fee ceiling they configured). `ClaimEngine::new` (`engine.rs`) floors an oversized raw value
+    // on its own, so passing the raw value here is the conservative direction for spend.
+    .with_persisted_fee_window(state_dir, cfg.cadence_seconds);
 
     drive(
         engine,
@@ -987,6 +1001,77 @@ mod tests {
         );
     }
 
+    /// F2, MONEY: `with_persisted_fee_window` must be sized from the CONFIGURED (raw) cadence, not
+    /// the CLAMPED one the scheduler uses -- a 60-day config must size its persisted fee-budget
+    /// window from 5_184_000, not from the 2_678_400 the schedule is clamped to (which would
+    /// double the fee ceiling the operator sized). Proven here by showing the window rolls at a
+    /// different tick depending on which cadence sized it: at `t == effective_cadence`, an engine
+    /// sized from the CLAMPED value has already rolled its window (`fee_window_start_unix` moves),
+    /// while an engine sized from the CONFIGURED (raw) value has not -- the cadence gate at that
+    /// value has not elapsed yet, and the window is untouched.
+    #[tokio::test]
+    async fn the_fee_window_is_sized_from_the_configured_cadence_not_the_clamped_one() {
+        let configured_cadence = 60 * 24 * 60 * 60u64; // 5_184_000
+        let effective_cadence = 31 * 24 * 60 * 60u64; // 2_678_400
+        assert_eq!(configured_cadence, 5_184_000);
+        assert_eq!(effective_cadence, 2_678_400);
+
+        // Engine A: sized from the RAW configured cadence (F2's fix).
+        let dir_raw = tempfile::tempdir().unwrap();
+        let mut engine_raw = ClaimEngine::new(
+            EmptyPort,
+            NoHintSource,
+            Bytes32::from([1u8; 32]),
+            1,
+            10,
+            Bytes32::from([2u8; 32]),
+        )
+        .with_persisted_fee_window(dir_raw.path(), configured_cadence);
+        let _ = engine_raw.run_cycle(0).await;
+        let _ = engine_raw.run_cycle(effective_cadence).await;
+        assert_eq!(
+            engine_raw.status().state,
+            super::super::types::ClaimLoopState::CadenceNotElapsed,
+            "sized from the RAW 5_184_000 cadence, only 2_678_400s have elapsed -- the gate must \
+             not have opened yet"
+        );
+        let cfg_raw = RewardsClaimConfig::load_from(dir_raw.path());
+        assert_eq!(
+            cfg_raw.fee_window_start_unix,
+            Some(0),
+            "the window must NOT have rolled -- sized from the raw cadence, it is still open"
+        );
+
+        // Engine B: sized from the CLAMPED cadence (the pre-F2 bug) -- for contrast only.
+        let dir_clamped = tempfile::tempdir().unwrap();
+        let mut engine_clamped = ClaimEngine::new(
+            EmptyPort,
+            NoHintSource,
+            Bytes32::from([1u8; 32]),
+            1,
+            10,
+            Bytes32::from([2u8; 32]),
+        )
+        .with_persisted_fee_window(dir_clamped.path(), effective_cadence);
+        let _ = engine_clamped.run_cycle(0).await;
+        let _ = engine_clamped.run_cycle(effective_cadence).await;
+        assert_ne!(
+            engine_clamped.status().state,
+            super::super::types::ClaimLoopState::CadenceNotElapsed,
+            "sized from the clamped 2_678_400 cadence, exactly that many seconds have elapsed -- \
+             the gate must have opened"
+        );
+        let cfg_clamped = RewardsClaimConfig::load_from(dir_clamped.path());
+        assert_eq!(
+            cfg_clamped.fee_window_start_unix,
+            Some(effective_cadence),
+            "sized from the clamped cadence, the window must have rolled by t == effective_cadence"
+        );
+
+        // The two configurations must be visibly different -- the whole point of F2.
+        assert_ne!(cfg_raw.fee_window_start_unix, cfg_clamped.fee_window_start_unix);
+    }
+
     #[tokio::test]
     async fn restart_with_an_elapsed_completion_runs_a_cycle() {
         let dir = tempfile::tempdir().unwrap();
@@ -1449,10 +1534,14 @@ mod tests {
         );
     }
 
-    /// ACCEPTANCE A3: `cadence_seconds == 0` has no direction to clamp toward (it would busy-loop
-    /// the engine), so it keeps substituting the documented default -- decided by the parent lane,
-    /// not re-litigated here. The zero-branch WARN must say "substituted", distinctly from the
-    /// above-max branch's "clamped", so the two are separately assertable.
+    /// ACCEPTANCE A3: `cadence_seconds == 0` has no direction to clamp toward (if it ever reached
+    /// this function it would busy-loop the engine), so it keeps substituting the documented
+    /// default -- decided by the parent lane, not re-litigated here. F3: this branch is defence in
+    /// depth in production -- `config.rs`'s `RewardsClaimConfig::load_from` already floors
+    /// `cadence_seconds` to `CLAIM_CADENCE_FLOOR_SECONDS` (60) before this function ever sees it,
+    /// so `sanitized_schedule(0, _)` is exercised directly here, not through the floored
+    /// production path. The zero-branch WARN must say "substituted", distinctly from the
+    /// above-max branch's "CLAMPED", so the two are separately assertable.
     #[test]
     fn a_zero_cadence_still_substitutes_the_default_and_says_so() {
         let (logs, _guard) = capture_logs();
@@ -1475,8 +1564,12 @@ mod tests {
             rendered.contains("substituted"),
             "the zero-cadence branch must say SUBSTITUTED, not clamped; got: {rendered}"
         );
+        // F3: `!rendered.contains("clamped")` (lowercase) was vacuously true -- every clamp
+        // message in this module uses uppercase `CLAMPED`, so that assertion could never fail and
+        // protected nothing. Assert against the actual string the above-max branch uses instead,
+        // which genuinely distinguishes the two branches.
         assert!(
-            !rendered.contains("clamped"),
+            !rendered.contains("CLAMPED"),
             "the zero-cadence branch is a substitution, not a clamp; got: {rendered}"
         );
     }
@@ -1538,14 +1631,32 @@ mod tests {
 
         driver.abort();
 
+        // F1: assert against the PER-CYCLE lines specifically, not the whole shared buffer -- the
+        // once-per-spawn `sanitized_schedule` WARN already contains both bare numbers, so a bare
+        // `rendered.contains(...)` over the full buffer would pass even with every per-cycle field
+        // deleted from `log_cycle`. Filtering to `claim cycle complete` lines and requiring at
+        // least two of them, then asserting the FIELD NAMES `log_cycle` actually emits, makes this
+        // test about the per-cycle surface (this ticket's H4 acceptance item), not the spawn-time
+        // WARN.
         let rendered = logs.rendered();
+        let cycle_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.contains("claim cycle complete"))
+            .collect();
         assert!(
-            rendered.contains(&configured_cadence.to_string()),
-            "A4: the per-cycle line must name the CONFIGURED cadence the operator set; got: {rendered}"
+            cycle_lines.len() >= 2,
+            "one cycle line is not a per-cycle surface; got {} line(s): {rendered}",
+            cycle_lines.len()
         );
-        assert!(
-            rendered.contains(&effective_cadence.to_string()),
-            "A4: and the EFFECTIVE cadence actually driving the schedule; got: {rendered}"
-        );
+        for line in &cycle_lines {
+            assert!(
+                line.contains(&format!("configured_cadence_seconds={configured_cadence}")),
+                "A4: every per-cycle line must name the CONFIGURED cadence by field name; got: {line}"
+            );
+            assert!(
+                line.contains(&format!("effective_cadence_seconds={effective_cadence}")),
+                "A4: and the EFFECTIVE cadence by field name; got: {line}"
+            );
+        }
     }
 }
