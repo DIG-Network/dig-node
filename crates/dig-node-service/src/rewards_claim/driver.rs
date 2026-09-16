@@ -38,7 +38,7 @@ use chia_protocol::Bytes32;
 
 use super::cadence::{next_interval_seconds, JitterSource};
 use super::config::{RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT};
-use super::engine::ClaimEngine;
+use super::engine::{ClaimEngine, FeeWindowCadenceSeconds, GateCadenceSeconds};
 use super::hints::{DistributorHintSource, NoHintSource};
 use super::port::{ClaimChainPort, UnavailableClaimChainPort};
 use super::types::{ClaimLoopState, ClaimStatus};
@@ -439,6 +439,42 @@ async fn run_claim_driver_in<P>(
 ) where
     P: ClaimChainPort,
 {
+    run_claim_driver_in_with_clock(
+        state_dir,
+        own_payout_puzzle_hash,
+        port,
+        handle,
+        unix_now_seconds,
+    )
+    .await;
+}
+
+/// The same production body as [`run_claim_driver_in`], with the clock [`drive`] ticks on taken
+/// as a parameter instead of hardcoded to [`unix_now_seconds`] (real wall-clock).
+///
+/// # DIG-Network/dig_ecosystem#3336: why this seam exists
+/// `tokio::time::advance` (the mechanism every other test in this module uses to fast-forward
+/// [`drive`]'s `sleep`, under `#[tokio::test(start_paused = true)]`) moves ONLY the tokio virtual
+/// clock -- it cannot move [`SystemTime::now()`], which is what [`unix_now_seconds`] reads. Before
+/// this seam, [`run_claim_driver_in`] was therefore untestable for anything that depends on the
+/// VALUE `now()` returns each cycle (the restart-safety gate, the persisted fee-budget window's
+/// roll condition) -- a test could advance the scheduler's ticks but every cycle would still see
+/// the same real `now()`, so a defect in either cadence value threaded through
+/// [`ClaimEngine::with_persisted_fee_window`] could not be observed through THIS function, only by
+/// hand-assembling `drive` directly (see `the_gate_tracks_the_clamped_cadence_while_the_fee_window_tracks_the_raw_one`,
+/// which had to do exactly that before this seam existed).
+///
+/// [`run_claim_driver_in`] stays a thin wrapper that passes the real clock, so no caller of it --
+/// including `run_claim_driver`, the only production caller -- changes at all.
+async fn run_claim_driver_in_with_clock<P>(
+    state_dir: &Path,
+    own_payout_puzzle_hash: Bytes32,
+    port: P,
+    handle: ClaimLoopHandle,
+    now: impl FnMut() -> u64,
+) where
+    P: ClaimChainPort,
+{
     let cfg = RewardsClaimConfig::load_from(state_dir);
     // A4/F8: a corrupt config is not a reason to refuse to SPAWN -- `ClaimEngine::run_cycle`
     // already fails closed and reports `PersistedStateCorrupt` by name on every cycle until an
@@ -472,7 +508,11 @@ async fn run_claim_driver_in<P>(
     // two into one value in either direction is wrong: clamped-for-both doubles the fee ceiling,
     // raw-for-both can silently starve the gate (an unbounded-above raw cadence would stop cycles
     // from ever running while the scheduler keeps ticking on the clamped interval).
-    .with_persisted_fee_window(state_dir, cadence_seconds, cfg.cadence_seconds);
+    .with_persisted_fee_window(
+        state_dir,
+        GateCadenceSeconds(cadence_seconds),
+        FeeWindowCadenceSeconds(cfg.cadence_seconds),
+    );
 
     drive(
         engine,
@@ -480,7 +520,7 @@ async fn run_claim_driver_in<P>(
         jitter_seconds,
         adjustment,
         &OsJitter,
-        unix_now_seconds,
+        now,
         handle,
     )
     .await;
@@ -992,7 +1032,7 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), cfg.cadence_seconds, cfg.cadence_seconds);
+        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(cfg.cadence_seconds), FeeWindowCadenceSeconds(cfg.cadence_seconds));
 
         let outcomes = engine.run_cycle(900).await; // 900 - 500 = 400 < 1_000
         assert!(outcomes.is_empty());
@@ -1039,7 +1079,7 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), effective_cadence, configured_cadence);
+        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(effective_cadence), FeeWindowCadenceSeconds(configured_cadence));
 
         let handle = ClaimLoopHandle::default();
         let h = handle.clone();
@@ -1138,7 +1178,7 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), cfg.cadence_seconds, cfg.cadence_seconds);
+        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(cfg.cadence_seconds), FeeWindowCadenceSeconds(cfg.cadence_seconds));
 
         let outcomes = engine.run_cycle(2_000).await; // 2_000 - 500 = 1_500 >= 1_000
         assert!(outcomes.is_empty(), "nothing to claim, but the cycle RAN");
@@ -1166,7 +1206,7 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), cfg.cadence_seconds, cfg.cadence_seconds);
+        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(cfg.cadence_seconds), FeeWindowCadenceSeconds(cfg.cadence_seconds));
 
         let outcomes = engine.run_cycle(100).await; // now < last_cycle_completed_at
         assert!(outcomes.is_empty());
@@ -1198,7 +1238,7 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), 1_000, 1_000);
+        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(1_000), FeeWindowCadenceSeconds(1_000));
 
         let outcomes = engine.run_cycle(1).await;
         assert!(outcomes.is_empty());
