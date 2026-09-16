@@ -1032,7 +1032,11 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(cfg.cadence_seconds), FeeWindowCadenceSeconds(cfg.cadence_seconds));
+        .with_persisted_fee_window(
+            dir.path(),
+            GateCadenceSeconds(cfg.cadence_seconds),
+            FeeWindowCadenceSeconds(cfg.cadence_seconds),
+        );
 
         let outcomes = engine.run_cycle(900).await; // 900 - 500 = 400 < 1_000
         assert!(outcomes.is_empty());
@@ -1079,7 +1083,11 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(effective_cadence), FeeWindowCadenceSeconds(configured_cadence));
+        .with_persisted_fee_window(
+            dir.path(),
+            GateCadenceSeconds(effective_cadence),
+            FeeWindowCadenceSeconds(configured_cadence),
+        );
 
         let handle = ClaimLoopHandle::default();
         let h = handle.clone();
@@ -1178,7 +1186,11 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(cfg.cadence_seconds), FeeWindowCadenceSeconds(cfg.cadence_seconds));
+        .with_persisted_fee_window(
+            dir.path(),
+            GateCadenceSeconds(cfg.cadence_seconds),
+            FeeWindowCadenceSeconds(cfg.cadence_seconds),
+        );
 
         let outcomes = engine.run_cycle(2_000).await; // 2_000 - 500 = 1_500 >= 1_000
         assert!(outcomes.is_empty(), "nothing to claim, but the cycle RAN");
@@ -1206,7 +1218,11 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(cfg.cadence_seconds), FeeWindowCadenceSeconds(cfg.cadence_seconds));
+        .with_persisted_fee_window(
+            dir.path(),
+            GateCadenceSeconds(cfg.cadence_seconds),
+            FeeWindowCadenceSeconds(cfg.cadence_seconds),
+        );
 
         let outcomes = engine.run_cycle(100).await; // now < last_cycle_completed_at
         assert!(outcomes.is_empty());
@@ -1238,7 +1254,11 @@ mod tests {
             10,
             Bytes32::from([2u8; 32]),
         )
-        .with_persisted_fee_window(dir.path(), GateCadenceSeconds(1_000), FeeWindowCadenceSeconds(1_000));
+        .with_persisted_fee_window(
+            dir.path(),
+            GateCadenceSeconds(1_000),
+            FeeWindowCadenceSeconds(1_000),
+        );
 
         let outcomes = engine.run_cycle(1).await;
         assert!(outcomes.is_empty());
@@ -1389,19 +1409,13 @@ mod tests {
         let h = handle.clone();
         let state_dir = dir.path().to_path_buf();
         let driver = tokio::spawn(async move {
-            run_claim_driver_in_with_clock(
-                &state_dir,
-                Bytes32::from([1u8; 32]),
-                EmptyPort,
-                h,
-                {
-                    let mut t = 0u64;
-                    move || {
-                        t += effective_cadence;
-                        t
-                    }
-                },
-            )
+            run_claim_driver_in_with_clock(&state_dir, Bytes32::from([1u8; 32]), EmptyPort, h, {
+                let mut t = 0u64;
+                move || {
+                    t += effective_cadence;
+                    t
+                }
+            })
             .await;
         });
 
@@ -1413,7 +1427,11 @@ mod tests {
         settle().await;
         assert_eq!(handle.cycles_driven(), 1);
         let after_tick_1 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
-        assert_eq!(after_tick_1, Some(effective_cadence), "the window opens on tick 1");
+        assert_eq!(
+            after_tick_1,
+            Some(effective_cadence),
+            "the window opens on tick 1"
+        );
 
         // Tick 2: one clamped interval since tick 1 -- the GATE must open (it tracks the clamped
         // schedule the loop actually ticks on) but the WINDOW must NOT roll yet (only one clamped
