@@ -351,6 +351,27 @@ mod tests {
         );
     }
 
+    /// dig_ecosystem#3342, the money-surface defect: a chain source that ANSWERS and holds no
+    /// reward distributor at `launcher_id` is an ABSENCE, never an OUTAGE. An empty
+    /// `MockChainSource` answers every read successfully with `None`, which
+    /// `dig_rewards_coin::state::read_distributor` reports as `Ok(None)` -- the chain saying
+    /// "nothing here", not "I could not look". A funder deciding whether to claw back must be
+    /// able to tell that apart from an unreachable chain, so it must NOT be `Unavailable`.
+    #[tokio::test]
+    async fn an_answering_chain_with_no_distributor_is_an_absence_not_an_outage() {
+        let source = MockChainSource::new();
+        let port = RealRewardsChainPort::<MockChainSource>::new(Arc::new(source));
+
+        let result = port.distributor_report([0x22; 32]).await;
+
+        assert_ne!(
+            result,
+            Err(ChainPortError::Unavailable),
+            "an answering chain that holds no distributor is an absence, not an unreachable \
+             chain, got {result:?}"
+        );
+    }
+
     /// The adjacent guard this crate's own `epoch_seconds == 0` refusal must keep: that refusal is
     /// a NAMED distributor-level refusal (`ChainPortError::Other`), never conflated with
     /// `ChainPortError::Unavailable` -- which must mean the CHAIN SOURCE could not answer, not
