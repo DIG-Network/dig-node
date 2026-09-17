@@ -10402,18 +10402,20 @@ mod tests {
                 "{method}: no-port-installed case must say so: {absent_resp}"
             );
 
-            assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
-                reports: std::collections::HashMap::from([
-                    (
-                        missing_launcher_id,
-                        Err(crate::rewards::port::ChainPortError::NotADistributor),
-                    ),
-                    (
-                        outage_launcher_id,
-                        Err(crate::rewards::port::ChainPortError::Unavailable),
-                    ),
-                ]),
-            })));
+            assert!(
+                node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                    reports: std::collections::HashMap::from([
+                        (
+                            missing_launcher_id,
+                            Err(crate::rewards::port::ChainPortError::NotADistributor),
+                        ),
+                        (
+                            outage_launcher_id,
+                            Err(crate::rewards::port::ChainPortError::Unavailable),
+                        ),
+                    ]),
+                }))
+            );
 
             // Case 2: the chain answered -- no distributor there.
             let missing_resp = rt().block_on(handle_rpc(
@@ -10463,8 +10465,7 @@ mod tests {
 
             // The wire distinction actually exists: these two must differ.
             assert_ne!(
-                missing_resp["error"]["data"]["code"],
-                outage_resp["error"]["data"]["code"],
+                missing_resp["error"]["data"]["code"], outage_resp["error"]["data"]["code"],
                 "{method}: not-a-distributor and chain-unavailable must be distinguishable on \
                  the wire"
             );
