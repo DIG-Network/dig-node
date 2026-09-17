@@ -1118,7 +1118,8 @@ mod tests {
         assert_eq!(
             handle.status().state,
             super::super::types::ClaimLoopState::Nominal,
-            "the very first cycle has no prior completion to gate against, so it must run to completion \n             and report Nominal"
+            "the very first cycle has no prior completion to gate against, so it must run to \
+             completion and report Nominal"
         );
         let after_tick_1 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
@@ -1141,7 +1142,11 @@ mod tests {
         assert_eq!(
             handle.status().state,
             super::super::types::ClaimLoopState::Nominal,
-            "F2: the gate opened one clamped interval after the last completion -- it must not still be \n             waiting on the raw 5_184_000s cadence. Asserting the exact state, not merely \n             `!= CadenceNotElapsed`: that exclusion is equally satisfied by PersistedStateCorrupt \n             and ChainSourceUnavailable, whose early returns sit above the window-roll block too, \n             so it would go vacuous the moment one of those fired instead"
+            "F2: the gate opened one clamped interval after the last completion -- it must not \
+             still be waiting on the raw 5_184_000s cadence. Asserting the exact state, not \
+             merely `!= CadenceNotElapsed`: that exclusion is equally satisfied by \
+             PersistedStateCorrupt and ChainSourceUnavailable, whose early returns sit above the \
+             window-roll block too, so it would go vacuous the moment one of those fired instead"
         );
         let after_tick_2 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
@@ -1426,7 +1431,8 @@ mod tests {
         assert_eq!(
             handle.status().state,
             super::super::types::ClaimLoopState::Nominal,
-            "the very first cycle has no prior completion to gate against, so it must run to completion \n             and report Nominal"
+            "the very first cycle has no prior completion to gate against, so it must run to \
+             completion and report Nominal"
         );
         let after_tick_1 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
@@ -1448,7 +1454,14 @@ mod tests {
         assert_eq!(
             handle.status().state,
             super::super::types::ClaimLoopState::Nominal,
-            "#3336: the production body's gate must track the CLAMPED cadence -- a transposed call to \n             with_persisted_fee_window would gate on the raw 5_184_000s cadence and report \n             CadenceNotElapsed here, restoring the no-op gate #3306 fixed. Asserting the exact \n             state, not merely `!= CadenceNotElapsed`: that exclusion is equally satisfied by \n             PersistedStateCorrupt and ChainSourceUnavailable, whose early returns also sit above \n             the window-roll block, so it would go vacuous the moment one of those fired instead. \n             `cycles_driven()` cannot see any of this: it counts every drive loop iteration, \n             including ones the internal gate refused"
+            "#3336: the production body's gate must track the CLAMPED cadence -- a transposed call to \
+             with_persisted_fee_window would gate on the raw 5_184_000s cadence and report \
+             CadenceNotElapsed here, restoring the no-op gate #3306 fixed. Asserting the exact \
+             state, not merely `!= CadenceNotElapsed`: that exclusion is equally satisfied by \
+             PersistedStateCorrupt and ChainSourceUnavailable, whose early returns also sit above \
+             the window-roll block, so it would go vacuous the moment one of those fired instead. \
+             `cycles_driven()` cannot see any of this: it counts every drive loop iteration, \
+             including ones the internal gate refused"
         );
         let after_tick_2 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
