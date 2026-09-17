@@ -997,12 +997,19 @@ impl RpcDispatch for Node {
                 };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
-            // dig.getRewardDistributor (dig_ecosystem#3269 unit 2, SPEC §2.6/§12.4) — CONTROL
-            // plane: loopback admin / in-process FFI ONLY, absent from `is_peer_reachable_method`
-            // (`reward_methods_tier_guard.rs` fails closed on that). Chain-derived state ONLY —
-            // never the local prover loop's self-reported state (see `GetRewardProverStatus`
-            // above for that). Goes entirely through `rewards::port::RewardsChainPort`: this
-            // crate never calls `dig-rewards-coin` itself (dig_ecosystem#3269 unit 0).
+            // dig.getRewardDistributor (dig_ecosystem#3269 unit 2, SPEC §2.6/§12.4) — `Tier::Control`
+            // in dig-rpc-protocol's sense: served ONLY by the local `handle_rpc` dispatch (the
+            // service's `POST /` and the in-process FFI), NEVER over the mTLS peer surface (absent
+            // from `is_peer_reachable_method`; `reward_methods_tier_guard.rs` fails closed on that).
+            // NOT token-gated (dig_ecosystem#3351): an OPEN read of public on-chain state keyed by
+            // the caller's `launcher_id`, answered to any caller that reaches `POST /` — anonymous
+            // remote callers included on a node bound with `DIG_NODE_ALLOW_REMOTE=1` — for the same
+            // reason `control.wallet.balance` is open (#1851, `control::is_open_control_read`).
+            // Pinned by `reward_distributor_reads_answer_on_post_slash_without_a_token` in
+            // dig-node-service `tests/server.rs`. Chain-derived state ONLY — never the local prover
+            // loop's self-reported state (see `GetRewardProverStatus` above for that). Goes entirely
+            // through `rewards::port::RewardsChainPort`: this crate never calls `dig-rewards-coin`
+            // itself (dig_ecosystem#3269 unit 0).
             Some(Method::GetRewardDistributor) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
                 let launcher_id = match parse_launcher_id_arg(&params) {
@@ -1041,7 +1048,8 @@ impl RpcDispatch for Node {
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
             // dig.listRewardDistributorCommitments (dig_ecosystem#3269 unit 2, SPEC §7.4 clause 5)
-            // — CONTROL plane, same guard shape as `GetRewardDistributor` above. `commitments`
+            // — same guard shape as `GetRewardDistributor` above (`Tier::Control`, not token-gated,
+            // OPEN on `POST /`; dig_ecosystem#3351). `commitments`
             // empty is legitimate (a donation-only distributor); `recoverable_base_units` per slot
             // is ALWAYS the port's pre-computed figure -- this handler never recomputes it (see
             // `rewards::port::CommitmentSlot`'s doc for why that arithmetic never lives here).
