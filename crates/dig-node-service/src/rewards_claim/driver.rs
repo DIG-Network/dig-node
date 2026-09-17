@@ -1037,7 +1037,9 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(cfg.cadence_seconds)),
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(
+                    cfg.cadence_seconds,
+                )),
                 fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
             },
         );
@@ -1195,7 +1197,9 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(cfg.cadence_seconds)),
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(
+                    cfg.cadence_seconds,
+                )),
                 fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
             },
         );
@@ -1229,7 +1233,9 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(cfg.cadence_seconds)),
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(
+                    cfg.cadence_seconds,
+                )),
                 fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
             },
         );

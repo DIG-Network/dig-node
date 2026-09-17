@@ -1922,7 +1922,9 @@ mod tests {
             .with_persisted_fee_window(
                 dir.path(),
                 ClaimCadences {
-                    gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                    gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(
+                        CADENCE_SECONDS,
+                    )),
                     fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
                 },
             );
