@@ -35,14 +35,25 @@ use crate::*;
 /// own surface.
 const ENGINE_WARMING: i64 = -32002;
 
-/// `REWARD_CHAIN_UNAVAILABLE` (dig_ecosystem#3269): no reward-distributor chain-read adapter is
-/// wired yet (`rewards::port::ChainPortError::Unavailable`, or no adapter installed at all).
+/// `REWARD_CHAIN_UNAVAILABLE` (dig_ecosystem#3269, corrected by dig_ecosystem#3342): the
+/// reward-distributor chain read could not complete — either no adapter is installed at all (the
+/// `let Some(port) = … else` arms below, via [`reward_chain_port_absent_response`]), or an
+/// installed adapter's `ChainPortError::Unavailable` means the chain source itself could not
+/// answer. It no longer means "the chain answered and there is nothing there" — that is
+/// [`ChainPortError::NotADistributor`], reported under [`REWARD_NOT_A_DISTRIBUTOR_MACHINE`].
 /// Distinct from [`REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE`] below — a caller must be able to tell
-/// "ask me again once the adapter lands" apart from "this distributor's own constant is out of
-/// range". Reuses [`CONTROL_ERROR`]'s numeric code (both are control-plane runtime errors,
-/// `-32032`), but carries its own `data.code` machine string so the two are still distinguishable
-/// in the body.
+/// "the chain could not be reached" apart from "this distributor's own constant is out of range".
+/// Reuses [`CONTROL_ERROR`]'s numeric code (both are control-plane runtime errors, `-32032`), but
+/// carries its own `data.code` machine string so the two are still distinguishable in the body.
 const REWARD_CHAIN_UNAVAILABLE_MACHINE: &str = "REWARD_CHAIN_UNAVAILABLE";
+
+/// `REWARD_NOT_A_DISTRIBUTOR` (dig_ecosystem#3342): the chain source answered, and no reward
+/// distributor exists at the requested launcher id. Kept distinct from
+/// [`REWARD_CHAIN_UNAVAILABLE_MACHINE`] on purpose — see [`ChainPortError::NotADistributor`]'s own
+/// doc for why collapsing the two is a money-surface defect, not a cosmetic one. Reuses
+/// [`CONTROL_ERROR`]'s numeric code, matching every other reward-distributor machine code here; no
+/// wire-protocol change is needed since `data.code` alone carries the distinction.
+const REWARD_NOT_A_DISTRIBUTOR_MACHINE: &str = "REWARD_NOT_A_DISTRIBUTOR";
 
 /// `REWARD_INVALID_WITHDRAWAL_SHARE` (dig_ecosystem#3269/#3284/#3303): the distributor's
 /// `withdrawal_share_bps` does not fit the wire's `u16` domain or exceeds the legitimate
@@ -71,8 +82,13 @@ fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value
     match error {
         ChainPortError::Unavailable => json!({"jsonrpc":"2.0","id":id,"error":{
             "code": CONTROL_ERROR,
-            "message": "reward-distributor chain read is unavailable: no chain-read adapter is wired yet",
+            "message": "reward-distributor chain read is unavailable: the chain source could not answer",
             "data": { "code": REWARD_CHAIN_UNAVAILABLE_MACHINE, "origin": "control" }
+        }}),
+        ChainPortError::NotADistributor => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": "no reward distributor exists at this launcher id on chain",
+            "data": { "code": REWARD_NOT_A_DISTRIBUTOR_MACHINE, "origin": "control" }
         }}),
         ChainPortError::InvalidWithdrawalShare => json!({"jsonrpc":"2.0","id":id,"error":{
             "code": CONTROL_ERROR,
@@ -90,6 +106,19 @@ fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value
             "data": { "code": "CONTROL_ERROR", "origin": "control" }
         }}),
     }
+}
+
+/// The response for the ONE case where "no chain-read adapter is wired yet" is actually true: no
+/// `rewards::port::RewardsChainPort` has been installed on this `Node` at all
+/// (dig_ecosystem#3342). Kept separate from [`reward_chain_port_error_response`] so that
+/// function's `Unavailable` arm never has to carry a sentence that is false whenever an installed
+/// adapter reports its own `Unavailable` for a chain-source outage.
+fn reward_chain_port_absent_response(id: &Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"error":{
+        "code": CONTROL_ERROR,
+        "message": "reward-distributor chain read is unavailable: no chain-read adapter is wired yet",
+        "data": { "code": REWARD_CHAIN_UNAVAILABLE_MACHINE, "origin": "control" }
+    }})
 }
 
 /// The largest legitimate `withdrawal_share_bps`: 10,000 basis points IS 100%, so this is an
@@ -981,7 +1010,7 @@ impl RpcDispatch for Node {
                     Err(msg) => return rpc_err(&id, -32602, &msg),
                 };
                 let Some(port) = node.reward_chain_port() else {
-                    return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                    return reward_chain_port_absent_response(&id);
                 };
                 // Range-check at THIS seam, not only in the adapter: see
                 // `range_checked_report` for why an out-of-range share must refuse here.
@@ -1023,7 +1052,7 @@ impl RpcDispatch for Node {
                     Err(msg) => return rpc_err(&id, -32602, &msg),
                 };
                 let Some(port) = node.reward_chain_port() else {
-                    return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                    return reward_chain_port_absent_response(&id);
                 };
                 // Range-check at THIS seam, not only in the adapter: see
                 // `range_checked_report` for why an out-of-range share must refuse here.
@@ -1109,7 +1138,7 @@ impl RpcDispatch for Node {
                 let mut funded_refs = Vec::with_capacity(identities.len());
                 for identity in identities {
                     let Some(port) = node.reward_chain_port() else {
-                        return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                        return reward_chain_port_absent_response(&id);
                     };
                     let report = match port
                         .distributor_report(identity.launcher_id)

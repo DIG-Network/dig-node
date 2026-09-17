@@ -61,6 +61,17 @@ impl<S: ChainSource + Send + Sync + 'static> RealRewardsChainPort<S> {
     }
 }
 
+#[cfg(test)]
+impl<S: ChainSource + Send + Sync + 'static> RealRewardsChainPort<S> {
+    /// Test-only read of the degradation latch (dig_ecosystem#3342, gate H2) -- a direct load of
+    /// the real field, not a re-derivation, so a test can prove the latch's actual state rather
+    /// than scraping it back out of `tracing`'s output.
+    fn is_degraded(&self) -> bool {
+        self.report_degraded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[async_trait]
 impl<S: ChainSource + Send + Sync + 'static> RewardsChainPort for RealRewardsChainPort<S> {
     async fn funded_distributors(&self) -> Result<Vec<DistributorRef>, ChainPortError> {
@@ -105,11 +116,20 @@ impl<S: ChainSource + Send + Sync + 'static> RewardsChainPort for RealRewardsCha
         // R4 (dig_ecosystem#3310 gate leg 3, §4): a failing chain source must be observable, not
         // only correctly typed. `swap` both reads and sets `report_degraded` atomically, so the
         // warn fires exactly once per failure->success transition even under concurrent callers.
+        //
+        // `NotADistributor` (dig_ecosystem#3342, gate H2) is excluded from BOTH the latch and the
+        // warn: the chain answered fine and simply holds nothing at this launcher id, which is not
+        // a degradation of the chain source at all. Arming the latch on it would (a) blind a
+        // GENUINE outage that follows -- the warn only fires on a false->true transition, so the
+        // real failure would log nothing until some later `Ok` reset it -- and (b) misreport an
+        // ordinary "not mine" probe as chain trouble. `Ok` still clears the latch as before,
+        // matching a real recovery.
         match &result {
             Ok(_) => {
                 self.report_degraded
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
+            Err(ChainPortError::NotADistributor) => {}
             Err(port_error) => {
                 let was_already_degraded = self
                     .report_degraded
@@ -141,7 +161,7 @@ where
 
     let snapshot = read_distributor_guarded(source, launcher_id)
         .map_err(guarded_read_error_to_port_error)?
-        .ok_or(ChainPortError::Unavailable)?;
+        .ok_or(ChainPortError::NotADistributor)?;
 
     let comment =
         read_launch_comment(source, launcher_id).map_err(launch_comment_error_to_port_error)?;
@@ -264,11 +284,16 @@ fn guarded_read_error_to_port_error(error: GuardedReadError) -> ChainPortError {
 }
 
 /// Maps [`LaunchCommentError`] onto [`ChainPortError`] (dig_ecosystem#3310 gate leg 3, R5).
-/// `ParentSpendUnavailable` is a chain-source GAP (the source does not yet hold the launcher's
-/// parent spend), not a classification of the distributor's identity -- it maps onto the same
-/// `Unavailable` `read_distributor_guarded`'s own `Ok(None)` already answers with, not `Other`,
-/// which would render it to a caller as a definitive "not a DIG distributor". Every other variant
-/// genuinely is a refused/malformed read, or a real classification, so it stays `Other`.
+/// `ParentSpendUnavailable` is a chain-source GAP: the source does not yet hold the launcher's
+/// parent spend, so this call cannot say anything about the distributor's identity at all -- that
+/// is an outage of the read, not an answer from it, so it maps onto [`ChainPortError::Unavailable`]
+/// on its own merit (dig_ecosystem#3342: it no longer piggybacks on
+/// `read_distributor_guarded`'s `Ok(None)` path, which now reports
+/// [`ChainPortError::NotADistributor`] instead -- a chain source that never reached the parent
+/// spend is a different failure from one that reached the chain and found no distributor there).
+/// It is not `Other`, which would render it to a caller as a definitive "not a DIG distributor".
+/// Every other variant genuinely is a refused/malformed read, or a real classification, so it
+/// stays `Other`.
 fn launch_comment_error_to_port_error(error: LaunchCommentError) -> ChainPortError {
     match error {
         LaunchCommentError::ParentSpendUnavailable => ChainPortError::Unavailable,
@@ -351,6 +376,144 @@ mod tests {
         );
     }
 
+    /// dig_ecosystem#3342, the money-surface defect: a chain source that ANSWERS and holds no
+    /// reward distributor at `launcher_id` is an ABSENCE, never an OUTAGE. An empty
+    /// `MockChainSource` answers every read successfully with `None`, which
+    /// `dig_rewards_coin::state::read_distributor` reports as `Ok(None)` -- the chain saying
+    /// "nothing here", not "I could not look". A funder deciding whether to claw back must be
+    /// able to tell that apart from an unreachable chain, so it must NOT be `Unavailable`.
+    #[tokio::test]
+    async fn an_answering_chain_with_no_distributor_is_an_absence_not_an_outage() {
+        let source = MockChainSource::new();
+        let port = RealRewardsChainPort::<MockChainSource>::new(Arc::new(source));
+
+        let result = port.distributor_report([0x22; 32]).await;
+
+        assert_eq!(
+            result,
+            Err(ChainPortError::NotADistributor),
+            "an answering chain that holds no distributor is an absence, not an unreachable \
+             chain, got {result:?}"
+        );
+    }
+
+    /// A `ChainSource` that starts answering like an empty chain (every read `Ok` with nothing
+    /// found -- the `NotADistributor` shape) and can be flipped, mid-test, to fail every read (the
+    /// `Unavailable` shape). Lets [`a_not_a_distributor_result_never_arms_the_latch_and_never_blinds_a_later_outage`]
+    /// drive a SINGLE `RealRewardsChainPort` instance through the exact absence-then-outage
+    /// sequence dig_ecosystem#3342 gate H2 is about, instead of two instances that could never
+    /// prove the exclusion is scoped to `NotADistributor` alone.
+    #[derive(Default)]
+    struct SwitchableChainSource {
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl SwitchableChainSource {
+        fn switch_to_failing(&self) {
+            self.failing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn guard(&self) -> Result<(), ChainSourceError> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(ChainSourceError::Timeout)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl dig_chainsource_interface::ChainSource for SwitchableChainSource {
+        type Error = ChainSourceError;
+
+        fn coin_record(
+            &self,
+            _coin_id: chia_protocol::Bytes32,
+        ) -> Result<Option<dig_chainsource_interface::CoinRecord>, Self::Error> {
+            self.guard()?;
+            Ok(None)
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: chia_protocol::Bytes32,
+            _include_spent: bool,
+        ) -> Result<Vec<dig_chainsource_interface::CoinRecord>, Self::Error> {
+            self.guard()?;
+            Ok(Vec::new())
+        }
+
+        fn coin_records_by_parent(
+            &self,
+            _parent_coin_id: chia_protocol::Bytes32,
+        ) -> Result<Vec<dig_chainsource_interface::CoinRecord>, Self::Error> {
+            self.guard()?;
+            Ok(Vec::new())
+        }
+
+        fn coin_spend(
+            &self,
+            _coin_id: chia_protocol::Bytes32,
+        ) -> Result<Option<chia_protocol::CoinSpend>, Self::Error> {
+            self.guard()?;
+            Ok(None)
+        }
+
+        fn resolve_singleton_lineage(
+            &self,
+            _launcher_id: chia_protocol::Bytes32,
+        ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error> {
+            self.guard()?;
+            Ok(None)
+        }
+
+        fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+            self.guard()?;
+            Ok(None)
+        }
+
+        fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
+            self.guard()?;
+            Ok(None)
+        }
+    }
+
+    /// **Proves (dig_ecosystem#3342, gate H2):** a `NotADistributor` result must not arm the
+    /// degradation latch -- so a genuine outage that follows still transitions the latch
+    /// false->true and still would warn, exactly as if the `NotADistributor` call had never
+    /// happened. Before the fix, EVERY `Err(_)` armed the latch, so the outage below would find it
+    /// already `true` and treat itself as a no-op continuation of an existing degradation.
+    /// **Mutation-probe:** in `RealRewardsChainPort::distributor_report`, delete the
+    /// `Err(ChainPortError::NotADistributor) => {}` arm (folding it back into the general `Err`
+    /// arm) and this test's first `assert!(!port.is_degraded())` goes red.
+    #[tokio::test]
+    async fn a_not_a_distributor_result_never_arms_the_latch_and_never_blinds_a_later_outage() {
+        let source = Arc::new(SwitchableChainSource::default());
+        let port = RealRewardsChainPort::<SwitchableChainSource>::new(Arc::clone(&source));
+
+        // Phase 1: the chain answers, no distributor here -- an absence, not a degradation.
+        let absence_result = port.distributor_report([0x33; 32]).await;
+        assert_eq!(absence_result, Err(ChainPortError::NotADistributor));
+        assert!(
+            !port.is_degraded(),
+            "a NotADistributor result must never arm the degradation latch"
+        );
+
+        // Phase 2: the chain source itself now fails -- a genuine outage.
+        source.switch_to_failing();
+        let outage_result = port.distributor_report([0x33; 32]).await;
+        assert_eq!(
+            outage_result,
+            Err(ChainPortError::Unavailable),
+            "a failing chain source must still report Unavailable after a prior absence"
+        );
+        assert!(
+            port.is_degraded(),
+            "a genuine outage must still arm the latch even after a preceding NotADistributor \
+             result -- that is exactly the blinding H2 guards against"
+        );
+    }
+
     /// The adjacent guard this crate's own `epoch_seconds == 0` refusal must keep: that refusal is
     /// a NAMED distributor-level refusal (`ChainPortError::Other`), never conflated with
     /// `ChainPortError::Unavailable` -- which must mean the CHAIN SOURCE could not answer, not
@@ -371,10 +534,11 @@ mod tests {
         );
     }
 
-    /// R5's regression (dig_ecosystem#3310 gate leg 3): a chain-source GAP on the launcher's
-    /// parent spend must never be reported as the definitive "not a DIG distributor" verdict --
-    /// it must agree with the OTHER absence path (`read_distributor_guarded`'s own `Ok(None)`),
-    /// which answers `Unavailable`.
+    /// R5's regression (dig_ecosystem#3310 gate leg 3, corrected by dig_ecosystem#3342): a
+    /// chain-source GAP on the launcher's parent spend must never be reported as the definitive
+    /// "not a DIG distributor" verdict -- it stands on its own merit as an unreachable read
+    /// (`Unavailable`), independent of `read_distributor_guarded`'s `Ok(None)` path, which since
+    /// #3342 answers `ChainPortError::NotADistributor` instead: a genuine absence, not an outage.
     #[test]
     fn parent_spend_gap_is_reported_as_unavailable_not_as_a_distributor_identity_verdict() {
         let mapped = super::launch_comment_error_to_port_error(
