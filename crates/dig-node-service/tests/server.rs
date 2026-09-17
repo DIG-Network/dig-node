@@ -3853,3 +3853,53 @@ async fn a_client_can_register_and_deregister_the_addresses_the_node_follows() {
         "deregistering one key must stop following exactly it, and leave the other followed"
     );
 }
+
+/// **Proves:** `dig.getRewardDistributor` and `dig.listRewardDistributorCommitments` are answered
+/// on `POST /` with NO control token presented — `Tier::Control` in dig-rpc-protocol's sense means
+/// "loopback / in-process dispatch only, never over the mTLS peer surface", NOT token-gated
+/// (dig_ecosystem#3351). Both requests must pass every ingress gate (no `-32030`/`UNAUTHORIZED`) and
+/// reach the reward handler itself, which then reports `REWARD_CHAIN_UNAVAILABLE` because this
+/// ephemeral test node has no chain-read adapter wired — proving dispatch, not a passthrough relay
+/// or a method-not-found stub, answered the call.
+/// **Catches:** a future gate added at the `server.rs` ingress (e.g. folded into the cache-trio
+/// token check) that silently demotes these reads to token-gated — breaking the anonymous callers
+/// nobody can enumerate — and a doc claiming they are gated when the enforced behaviour is open.
+#[tokio::test]
+async fn reward_distributor_reads_answer_on_post_slash_without_a_token() {
+    let (addr, _hold) = start_node("").await;
+    let launcher_id = "11".repeat(32);
+
+    for method in ["dig.getRewardDistributor", "dig.listRewardDistributorCommitments"] {
+        let resp: Value = client()
+            .post(format!("http://{addr}/"))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": { "launcher_id": launcher_id }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_ne!(
+            resp["error"]["code"],
+            json!(-32030),
+            "{method} must not be Unauthorized when no token is presented: {resp}"
+        );
+        assert_ne!(
+            resp["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} must not be gated by the control token: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["data"]["code"],
+            json!("REWARD_CHAIN_UNAVAILABLE"),
+            "{method} must reach the reward handler (no chain port wired on this ephemeral node), \
+             not a passthrough or a method-not-found stub: {resp}"
+        );
+    }
+}
