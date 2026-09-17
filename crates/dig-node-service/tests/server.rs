@@ -3869,7 +3869,10 @@ async fn reward_distributor_reads_answer_on_post_slash_without_a_token() {
     let (addr, _hold) = start_node("").await;
     let launcher_id = "11".repeat(32);
 
-    for method in ["dig.getRewardDistributor", "dig.listRewardDistributorCommitments"] {
+    for method in [
+        "dig.getRewardDistributor",
+        "dig.listRewardDistributorCommitments",
+    ] {
         let resp: Value = client()
             .post(format!("http://{addr}/"))
             .json(&json!({
