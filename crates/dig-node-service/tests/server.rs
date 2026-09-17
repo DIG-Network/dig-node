@@ -1535,6 +1535,59 @@ async fn cache_list_cached_is_not_routable_over_ws() {
     );
 }
 
+/// **Proves (dig_ecosystem#3351, WS parity):** `dig.getRewardDistributor` and
+/// `dig.listRewardDistributorCommitments` are OPEN reads on the HTTP transport (no token required),
+/// but that openness must not accidentally widen into a SECOND, WS-reachable path. The `ws_dispatch`
+/// fall-through routes an unrecognized method to `WalletBackend::dispatch`, whose match has no
+/// `dig.*` arm, so both methods come back as an unknown-method error over `/ws` -- never as
+/// `UNAUTHORIZED` (that would mean WS gates them where HTTP does not, which is its own bug) and
+/// never as a real result (that would mean the reward-chain answer leaked over an unaudited
+/// transport).
+///
+/// **Catches:** a wallet-backend or `ws_dispatch` arm that starts routing `dig.*` reward reads over
+/// `/ws` without the tier decision being revisited.
+#[tokio::test]
+async fn reward_distributor_reads_are_not_routable_over_ws() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _backend, _hold) = start_node_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await; // drain the initial sync_status snapshot
+
+    for (idx, method) in [
+        "dig.getRewardDistributor",
+        "dig.listRewardDistributorCommitments",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // No token: these reads are OPEN on HTTP, but that has no bearing on WS routability.
+        ws.send(Message::Text(
+            json!({ "id": format!("rd{idx}"), "type": "request", "method": method }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let resp = next_ws_json(&mut ws).await;
+        assert_eq!(resp["id"], json!(format!("rd{idx}")));
+        assert_eq!(
+            resp["ok"],
+            json!(false),
+            "{method} is not a WS method, got {resp:?}"
+        );
+        let is_unauthorized = resp
+            .pointer("/error/code")
+            .is_some_and(|c| c == &json!("UNAUTHORIZED"));
+        assert!(
+            !is_unauthorized,
+            "{method} over WS must fail as unknown-method, not UNAUTHORIZED -- \
+             a WS gate would contradict the HTTP-side open-read decision, got {resp:?}"
+        );
+    }
+}
+
 /// **A person can add, list and remove a trusted Chia peer, end to end over the REAL control plane.**
 ///
 /// The whole round trip through the real server, the real token gate, the real wallet backend and
