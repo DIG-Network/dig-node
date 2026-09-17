@@ -14,17 +14,16 @@ use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus};
 /// The two cadence values [`ClaimEngine::with_persisted_fee_window`] needs, bundled into ONE
 /// value rather than passed as a pair of positional arguments.
 ///
-/// # DIG-Network/dig_ecosystem#3336 (money) -- why one struct, not two newtypes
-/// An earlier shape used two distinct single-field newtypes (`GateCadenceSeconds` /
-/// `FeeWindowCadenceSeconds`) at two adjacent call-site arguments -- that closed the *positional*
-/// swap (transposing them was a compile error) but left the *value* swap open: nothing stopped a
-/// caller from writing `GateCadenceSeconds(raw)` / `FeeWindowCadenceSeconds(clamped)` -- still
-/// two well-typed newtypes in the right argument slots, just constructed from the wrong sources.
-/// That value swap still compiled AND passed every test written against the newtype shape, because
-/// nothing about the call site's SHAPE forced the right value into the right name. Bundling the
-/// two into one struct with named fields removes the pair of adjacent arguments a swap could
-/// target at all -- there is one call-site argument, and each field is written once, next to its
-/// own name, not matched positionally against a sibling argument.
+/// # DIG-Network/dig_ecosystem#3336 (money) -- why one struct, AND why its fields are typed
+/// An earlier shape used two distinct single-field newtypes at two adjacent call-site arguments
+/// -- that closed the *positional* swap (transposing them was a compile error) but left the
+/// *value* swap open: both newtypes wrapped a plain `u64`, so nothing stopped a caller
+/// constructing the gate's newtype from the raw source and the window's newtype from the clamped
+/// one. Bundling the two into one struct with named fields (this pass) closed the positional
+/// hazard again, but plain `u64` fields still let the wrong VALUE reach either name. Typing the
+/// fields as [`ClampedGateCadence`] / [`FeeWindowCadenceSeconds`] closes that too:
+/// `ClampedGateCadence`'s field is private and [`ClampedGateCadence::clamp`] is its only
+/// constructor, so a raw value has no path into `gate_clamped` at all -- see that type's doc.
 ///
 /// - `gate_clamped`: the schedule-CLAMPED cadence, in seconds, that [`ClaimEngine::run_cycle`]'s
 ///   restart-safety gate is measured against -- the same interval [`super::driver::drive`]
@@ -38,8 +37,44 @@ use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus};
 ///   implies), doubling the fee ceiling they configured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClaimCadences {
-    pub gate_clamped: u64,
-    pub fee_window_raw: u64,
+    pub gate_clamped: ClampedGateCadence,
+    pub fee_window_raw: FeeWindowCadenceSeconds,
+}
+
+/// The RAW, operator-writable cadence in seconds (`RewardsClaimConfig::cadence_seconds` as
+/// persisted) -- unbounded above. This is the source [`ClampedGateCadence::clamp`] clamps FROM;
+/// it is never itself a value the restart-safety gate should be measured against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeeWindowCadenceSeconds(pub u64);
+
+/// The schedule-CLAMPED cadence (bounded to [`super::driver::CLAIM_SCHEDULE_SECONDS_MAX`]) that
+/// [`ClaimEngine::run_cycle`]'s restart-safety gate is measured against -- the same interval
+/// [`super::driver::drive`] actually sleeps on.
+///
+/// # DIG-Network/dig_ecosystem#3336 -- why the field is private
+/// The earlier `ClaimCadences { gate_clamped: u64, fee_window_raw: u64 }` shape closed the
+/// *positional* swap but left the *value* swap open: nothing stopped a caller writing the RAW
+/// cadence into `gate_clamped` and the CLAMPED one into `fee_window_raw` -- both fields were the
+/// same type, so the wrong assignment still compiled and passed every test written against that
+/// shape. Making the field here private removes that path entirely: [`Self::clamp`] is the ONLY
+/// way to produce a `ClampedGateCadence`, and it always applies the clamp, so there is no value a
+/// caller can hand this slot that skips it. A raw value literally has no constructor to reach
+/// this type through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClampedGateCadence(u64);
+
+impl ClampedGateCadence {
+    /// The ONLY constructor. Bounds `raw` to `CLAIM_SCHEDULE_SECONDS_MAX` (31 days) -- e.g. a
+    /// 60-day raw cadence in yields the 31-day ceiling out, the same bound
+    /// [`super::driver::sanitized_schedule`] applies at the config read.
+    #[must_use]
+    pub fn clamp(raw: FeeWindowCadenceSeconds) -> Self {
+        ClampedGateCadence(raw.0.min(super::driver::CLAIM_SCHEDULE_SECONDS_MAX))
+    }
+
+    fn seconds(self) -> u64 {
+        self.0
+    }
 }
 
 /// Drives one claim cycle for this node against a [`ClaimChainPort`] + [`DistributorHintSource`]
@@ -214,9 +249,11 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         self.fee_window_state_dir = Some(dir.to_path_buf());
         self.gate_cadence_seconds = cadences
             .gate_clamped
+            .seconds()
             .max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
         self.fee_window_seconds = cadences
             .fee_window_raw
+            .0
             .max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
         self
     }
@@ -1809,8 +1846,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
         let first_outcomes = first.run_cycle(1_000).await;
@@ -1840,8 +1877,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
         let second_outcomes = second.run_cycle(1_010).await;
@@ -1885,8 +1922,8 @@ mod tests {
             .with_persisted_fee_window(
                 dir.path(),
                 ClaimCadences {
-                    gate_clamped: CADENCE_SECONDS,
-                    fee_window_raw: CADENCE_SECONDS,
+                    gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                    fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
                 },
             );
             let outcomes = e.run_cycle(1_000 + u64::from(i)).await;
@@ -1931,8 +1968,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
         let first_outcomes = first.run_cycle(1_000).await;
@@ -1960,8 +1997,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
         let second_outcomes = second.run_cycle(later).await;
@@ -1999,8 +2036,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
         let first_outcomes = first.run_cycle(1_000).await;
@@ -2022,8 +2059,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
         let second_outcomes = second.run_cycle(1_050).await;
@@ -2064,8 +2101,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
 
@@ -2119,8 +2156,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
 
@@ -2183,8 +2220,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
 
@@ -2229,8 +2266,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
         let first_outcomes = first.run_cycle(1_000).await;
@@ -2257,8 +2294,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
         let second_outcomes = second.run_cycle(1_010).await;
@@ -2315,8 +2352,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
 
@@ -2394,8 +2431,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
 
@@ -2472,8 +2509,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
 
@@ -2526,8 +2563,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: CADENCE_SECONDS,
-                fee_window_raw: CADENCE_SECONDS,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(CADENCE_SECONDS)),
+                fee_window_raw: FeeWindowCadenceSeconds(CADENCE_SECONDS),
             },
         );
 

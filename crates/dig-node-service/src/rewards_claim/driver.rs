@@ -38,7 +38,7 @@ use chia_protocol::Bytes32;
 
 use super::cadence::{next_interval_seconds, JitterSource};
 use super::config::{RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT};
-use super::engine::{ClaimCadences, ClaimEngine};
+use super::engine::{ClaimCadences, ClaimEngine, ClampedGateCadence, FeeWindowCadenceSeconds};
 use super::hints::{DistributorHintSource, NoHintSource};
 use super::port::{ClaimChainPort, UnavailableClaimChainPort};
 use super::types::{ClaimLoopState, ClaimStatus};
@@ -335,7 +335,7 @@ async fn run_claim_driver(handle: ClaimLoopHandle) {
 /// this ticket: the claim loop never fires again, so no cycle, no `log_cycle` line, and the
 /// cycle counter reads a permanent, reassuring `0`. #594 shipped an engine that was inert and
 /// green; a config value must not be able to put this driver back in that state silently.
-const CLAIM_SCHEDULE_SECONDS_MAX: u64 = 31 * 24 * 60 * 60;
+pub(crate) const CLAIM_SCHEDULE_SECONDS_MAX: u64 = 31 * 24 * 60 * 60;
 
 /// [`sanitized_schedule`]'s call-scoped report of what it changed, threaded into [`drive`] and
 /// on into [`log_cycle`] -- NEVER stored on [`ClaimEngine`] as a field (see this module's SHAPE
@@ -511,8 +511,8 @@ async fn run_claim_driver_in_with_clock<P>(
     .with_persisted_fee_window(
         state_dir,
         ClaimCadences {
-            gate_clamped: cadence_seconds,
-            fee_window_raw: cfg.cadence_seconds,
+            gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(cadence_seconds)),
+            fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
         },
     );
 
@@ -1037,8 +1037,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: cfg.cadence_seconds,
-                fee_window_raw: cfg.cadence_seconds,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(cfg.cadence_seconds)),
+                fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
             },
         );
 
@@ -1090,8 +1090,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: effective_cadence,
-                fee_window_raw: configured_cadence,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(effective_cadence)),
+                fee_window_raw: FeeWindowCadenceSeconds(configured_cadence),
             },
         );
 
@@ -1195,8 +1195,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: cfg.cadence_seconds,
-                fee_window_raw: cfg.cadence_seconds,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(cfg.cadence_seconds)),
+                fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
             },
         );
 
@@ -1229,8 +1229,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: cfg.cadence_seconds,
-                fee_window_raw: cfg.cadence_seconds,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(cfg.cadence_seconds)),
+                fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
             },
         );
 
@@ -1267,8 +1267,8 @@ mod tests {
         .with_persisted_fee_window(
             dir.path(),
             ClaimCadences {
-                gate_clamped: 1_000,
-                fee_window_raw: 1_000,
+                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(1_000)),
+                fee_window_raw: FeeWindowCadenceSeconds(1_000),
             },
         );
 
