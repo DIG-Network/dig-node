@@ -11,29 +11,36 @@ use super::hints::DistributorHintSource;
 use super::port::{ClaimChainPort, ClaimPortError};
 use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus};
 
-/// The schedule-CLAMPED cadence, in seconds, that [`ClaimEngine::run_cycle`]'s restart-safety gate
-/// is measured against -- the same interval [`super::driver::drive`] actually sleeps on.
+/// The two cadence values [`ClaimEngine::with_persisted_fee_window`] needs, bundled into ONE
+/// value rather than passed as a pair of positional arguments.
 ///
-/// # DIG-Network/dig_ecosystem#3336 (money)
-/// A bare `u64` here is interchangeable with [`FeeWindowCadenceSeconds`] at the call site
-/// ([`ClaimEngine::with_persisted_fee_window`]) and nothing stops the two from being transposed --
-/// swapping them silently RESTORES the no-op gate DIG-Network/dig_ecosystem#3306 fixed: the gate
-/// would be measured against the RAW, unclamped operator cadence instead of the clamped one the
-/// scheduler actually runs on, so an operator's 60-day config would gate on 60 days again even
-/// though the loop keeps ticking every 31.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GateCadenceSeconds(pub u64);
-
-/// The RAW configured cadence, in seconds, that sizes how long the persisted aggregate
-/// fee-budget window stays open before rolling -- deliberately never the clamped value.
+/// # DIG-Network/dig_ecosystem#3336 (money) -- why one struct, not two newtypes
+/// An earlier shape used two distinct single-field newtypes (`GateCadenceSeconds` /
+/// `FeeWindowCadenceSeconds`) at two adjacent call-site arguments -- that closed the *positional*
+/// swap (transposing them was a compile error) but left the *value* swap open: nothing stopped a
+/// caller from writing `GateCadenceSeconds(raw)` / `FeeWindowCadenceSeconds(clamped)` -- still
+/// two well-typed newtypes in the right argument slots, just constructed from the wrong sources.
+/// That value swap still compiled AND passed every test written against the newtype shape, because
+/// nothing about the call site's SHAPE forced the right value into the right name. Bundling the
+/// two into one struct with named fields removes the pair of adjacent arguments a swap could
+/// target at all -- there is one call-site argument, and each field is written once, next to its
+/// own name, not matched positionally against a sibling argument.
 ///
-/// # DIG-Network/dig_ecosystem#3336 (money)
-/// Swapping this with [`GateCadenceSeconds`] at the [`ClaimEngine::with_persisted_fee_window`]
-/// call site DOUBLES the number of fee-budget windows a long-cadence operator sized (a 60-day
-/// config would get ~12 windows/year instead of the ~6 its cadence implies), doubling the fee
-/// ceiling they configured.
+/// - `gate_clamped`: the schedule-CLAMPED cadence, in seconds, that [`ClaimEngine::run_cycle`]'s
+///   restart-safety gate is measured against -- the same interval [`super::driver::drive`]
+///   actually sleeps on. Using the RAW value here would restore the no-op gate
+///   DIG-Network/dig_ecosystem#3306 fixed: an operator's 60-day config would gate on 60 days
+///   again even though the loop keeps ticking every 31.
+/// - `fee_window_raw`: the RAW configured cadence, in seconds, that sizes how long the persisted
+///   aggregate fee-budget window stays open before rolling -- deliberately never the clamped
+///   value. Using the CLAMPED value here doubles the number of fee-budget windows a long-cadence
+///   operator sized (a 60-day config would get ~12 windows/year instead of the ~6 its cadence
+///   implies), doubling the fee ceiling they configured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FeeWindowCadenceSeconds(pub u64);
+pub struct ClaimCadences {
+    pub gate_clamped: u64,
+    pub fee_window_raw: u64,
+}
 
 /// Drives one claim cycle for this node against a [`ClaimChainPort`] + [`DistributorHintSource`]
 /// and the anti-silence status surface across calls to [`Self::run_cycle`].
@@ -200,22 +207,16 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// is never even taken.
     ///
     /// # DIG-Network/dig_ecosystem#3336
-    /// `gate_cadence_seconds` and `fee_window_seconds` are distinct newtypes ([`GateCadenceSeconds`]
-    /// / [`FeeWindowCadenceSeconds`]), not two bare `u64`s, precisely so transposing them at a call
-    /// site is a compile error rather than a silent money defect -- see both types' docs.
+    /// Takes ONE [`ClaimCadences`] value, not two positional arguments -- see that type's doc for
+    /// why this is stronger than two distinct newtypes at two adjacent call-site slots.
     #[must_use]
-    pub fn with_persisted_fee_window(
-        mut self,
-        dir: &Path,
-        gate_cadence_seconds: GateCadenceSeconds,
-        fee_window_seconds: FeeWindowCadenceSeconds,
-    ) -> Self {
+    pub fn with_persisted_fee_window(mut self, dir: &Path, cadences: ClaimCadences) -> Self {
         self.fee_window_state_dir = Some(dir.to_path_buf());
-        self.gate_cadence_seconds = gate_cadence_seconds
-            .0
+        self.gate_cadence_seconds = cadences
+            .gate_clamped
             .max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
-        self.fee_window_seconds = fee_window_seconds
-            .0
+        self.fee_window_seconds = cadences
+            .fee_window_raw
             .max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
         self
     }
@@ -1807,8 +1808,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
         let first_outcomes = first.run_cycle(1_000).await;
         assert_eq!(
@@ -1836,8 +1839,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
         let second_outcomes = second.run_cycle(1_010).await;
 
@@ -1879,8 +1884,10 @@ mod tests {
             )
             .with_persisted_fee_window(
                 dir.path(),
-                GateCadenceSeconds(CADENCE_SECONDS),
-                FeeWindowCadenceSeconds(CADENCE_SECONDS),
+                ClaimCadences {
+                    gate_clamped: CADENCE_SECONDS,
+                    fee_window_raw: CADENCE_SECONDS,
+                },
             );
             let outcomes = e.run_cycle(1_000 + u64::from(i)).await;
             if outcomes
@@ -1923,8 +1930,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
         let first_outcomes = first.run_cycle(1_000).await;
         assert_eq!(
@@ -1950,8 +1959,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
         let second_outcomes = second.run_cycle(later).await;
 
@@ -1987,8 +1998,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
         let first_outcomes = first.run_cycle(1_000).await;
         assert_eq!(
@@ -2008,8 +2021,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
         let second_outcomes = second.run_cycle(1_050).await;
 
@@ -2048,8 +2063,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
 
         let outcomes = e.run_cycle(1_000).await;
@@ -2101,8 +2118,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
 
         let outcomes = e.run_cycle(1_000).await;
@@ -2163,8 +2182,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
 
         // Still well inside the seeded window (`1_000 + 5 - 1_000 = 5 < CADENCE_SECONDS`), so the
@@ -2207,8 +2228,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
         let first_outcomes = first.run_cycle(1_000).await;
         assert_eq!(
@@ -2233,8 +2256,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
         let second_outcomes = second.run_cycle(1_010).await;
 
@@ -2289,8 +2314,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
 
         // Cycle 1: `now` (1_000) is nowhere near `far_future` -- the clock reads as future-dated,
@@ -2366,8 +2393,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
 
         // Cycle 1: the file is corrupt -- must refuse, submit nothing.
@@ -2442,8 +2471,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
 
         let outcomes = e.run_cycle(1_000).await;
@@ -2494,8 +2525,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(CADENCE_SECONDS),
-            FeeWindowCadenceSeconds(CADENCE_SECONDS),
+            ClaimCadences {
+                gate_clamped: CADENCE_SECONDS,
+                fee_window_raw: CADENCE_SECONDS,
+            },
         );
 
         let outcomes = e.run_cycle(1_000).await;

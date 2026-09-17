@@ -38,7 +38,7 @@ use chia_protocol::Bytes32;
 
 use super::cadence::{next_interval_seconds, JitterSource};
 use super::config::{RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT};
-use super::engine::{ClaimEngine, FeeWindowCadenceSeconds, GateCadenceSeconds};
+use super::engine::{ClaimCadences, ClaimEngine};
 use super::hints::{DistributorHintSource, NoHintSource};
 use super::port::{ClaimChainPort, UnavailableClaimChainPort};
 use super::types::{ClaimLoopState, ClaimStatus};
@@ -510,8 +510,10 @@ async fn run_claim_driver_in_with_clock<P>(
     // from ever running while the scheduler keeps ticking on the clamped interval).
     .with_persisted_fee_window(
         state_dir,
-        GateCadenceSeconds(cadence_seconds),
-        FeeWindowCadenceSeconds(cfg.cadence_seconds),
+        ClaimCadences {
+            gate_clamped: cadence_seconds,
+            fee_window_raw: cfg.cadence_seconds,
+        },
     );
 
     drive(
@@ -1034,8 +1036,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(cfg.cadence_seconds),
-            FeeWindowCadenceSeconds(cfg.cadence_seconds),
+            ClaimCadences {
+                gate_clamped: cfg.cadence_seconds,
+                fee_window_raw: cfg.cadence_seconds,
+            },
         );
 
         let outcomes = engine.run_cycle(900).await; // 900 - 500 = 400 < 1_000
@@ -1085,8 +1089,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(effective_cadence),
-            FeeWindowCadenceSeconds(configured_cadence),
+            ClaimCadences {
+                gate_clamped: effective_cadence,
+                fee_window_raw: configured_cadence,
+            },
         );
 
         let handle = ClaimLoopHandle::default();
@@ -1188,8 +1194,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(cfg.cadence_seconds),
-            FeeWindowCadenceSeconds(cfg.cadence_seconds),
+            ClaimCadences {
+                gate_clamped: cfg.cadence_seconds,
+                fee_window_raw: cfg.cadence_seconds,
+            },
         );
 
         let outcomes = engine.run_cycle(2_000).await; // 2_000 - 500 = 1_500 >= 1_000
@@ -1220,8 +1228,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(cfg.cadence_seconds),
-            FeeWindowCadenceSeconds(cfg.cadence_seconds),
+            ClaimCadences {
+                gate_clamped: cfg.cadence_seconds,
+                fee_window_raw: cfg.cadence_seconds,
+            },
         );
 
         let outcomes = engine.run_cycle(100).await; // now < last_cycle_completed_at
@@ -1256,8 +1266,10 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            GateCadenceSeconds(1_000),
-            FeeWindowCadenceSeconds(1_000),
+            ClaimCadences {
+                gate_clamped: 1_000,
+                fee_window_raw: 1_000,
+            },
         );
 
         let outcomes = engine.run_cycle(1).await;
@@ -1425,7 +1437,16 @@ mod tests {
         // Tick 1: the window opens for the first time.
         tokio::time::advance(Duration::from_secs(effective_cadence)).await;
         settle().await;
+        // `cycles_driven()` alone is NOT gate evidence: `drive` increments it unconditionally
+        // after every `run_cycle` call returns, whatever that cycle's outcome was -- a cycle the
+        // internal gate REFUSED (`ClaimLoopState::CadenceNotElapsed`) still increments it. Assert
+        // on the reported STATE, which the gate's early `return` in `run_cycle` actually controls.
         assert_eq!(handle.cycles_driven(), 1);
+        assert_ne!(
+            handle.status().state,
+            super::super::types::ClaimLoopState::CadenceNotElapsed,
+            "the very first cycle has no prior completion to gate against"
+        );
         let after_tick_1 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
             after_tick_1,
@@ -1441,16 +1462,28 @@ mod tests {
         assert_eq!(
             handle.cycles_driven(),
             2,
+            "the driver's loop iterated a second time"
+        );
+        assert_ne!(
+            handle.status().state,
+            super::super::types::ClaimLoopState::CadenceNotElapsed,
             "#3336: the production body's gate must track the CLAMPED cadence -- a transposed \
-             call to with_persisted_fee_window would gate on the raw 5_184_000s cadence instead \
-             and this cycle would never run, restoring the no-op gate #3306 fixed"
+             call to with_persisted_fee_window would gate on the raw 5_184_000s cadence instead, \
+             and `run_cycle` would report CadenceNotElapsed here, restoring the no-op gate #3306 \
+             fixed. `cycles_driven()` cannot see this: it counts every `drive` loop iteration \
+             (sleep-wake-record), including ones the internal gate refused -- the STATE is the \
+             only signal a cycle actually ran past the gate."
         );
         let after_tick_2 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
             after_tick_2, after_tick_1,
             "#3336: the fee window must NOT have rolled yet -- only one clamped interval has \
              elapsed against its raw 5_184_000s length. A transposed call would roll it here, \
-             doubling the operator's configured fee-window count"
+             doubling the operator's configured fee-window count. This assertion alone cannot \
+             distinguish 'gate opened, window correctly held' from 'gate refused, window-roll \
+             code never reached' (the gate's early return in `run_cycle` sits before the \
+             window-roll block) -- it is only meaningful paired with the state assertion above,\
+             which proves the gate did NOT refuse this cycle."
         );
 
         // Tick 3: two clamped intervals (5_356_800s) since the window opened -- past its raw
