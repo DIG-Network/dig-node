@@ -141,7 +141,7 @@ where
 
     let snapshot = read_distributor_guarded(source, launcher_id)
         .map_err(guarded_read_error_to_port_error)?
-        .ok_or(ChainPortError::Unavailable)?;
+        .ok_or(ChainPortError::NotADistributor)?;
 
     let comment =
         read_launch_comment(source, launcher_id).map_err(launch_comment_error_to_port_error)?;
@@ -264,11 +264,16 @@ fn guarded_read_error_to_port_error(error: GuardedReadError) -> ChainPortError {
 }
 
 /// Maps [`LaunchCommentError`] onto [`ChainPortError`] (dig_ecosystem#3310 gate leg 3, R5).
-/// `ParentSpendUnavailable` is a chain-source GAP (the source does not yet hold the launcher's
-/// parent spend), not a classification of the distributor's identity -- it maps onto the same
-/// `Unavailable` `read_distributor_guarded`'s own `Ok(None)` already answers with, not `Other`,
-/// which would render it to a caller as a definitive "not a DIG distributor". Every other variant
-/// genuinely is a refused/malformed read, or a real classification, so it stays `Other`.
+/// `ParentSpendUnavailable` is a chain-source GAP: the source does not yet hold the launcher's
+/// parent spend, so this call cannot say anything about the distributor's identity at all -- that
+/// is an outage of the read, not an answer from it, so it maps onto [`ChainPortError::Unavailable`]
+/// on its own merit (dig_ecosystem#3342: it no longer piggybacks on
+/// `read_distributor_guarded`'s `Ok(None)` path, which now reports
+/// [`ChainPortError::NotADistributor`] instead -- a chain source that never reached the parent
+/// spend is a different failure from one that reached the chain and found no distributor there).
+/// It is not `Other`, which would render it to a caller as a definitive "not a DIG distributor".
+/// Every other variant genuinely is a refused/malformed read, or a real classification, so it
+/// stays `Other`.
 fn launch_comment_error_to_port_error(error: LaunchCommentError) -> ChainPortError {
     match error {
         LaunchCommentError::ParentSpendUnavailable => ChainPortError::Unavailable,
@@ -392,10 +397,11 @@ mod tests {
         );
     }
 
-    /// R5's regression (dig_ecosystem#3310 gate leg 3): a chain-source GAP on the launcher's
-    /// parent spend must never be reported as the definitive "not a DIG distributor" verdict --
-    /// it must agree with the OTHER absence path (`read_distributor_guarded`'s own `Ok(None)`),
-    /// which answers `Unavailable`.
+    /// R5's regression (dig_ecosystem#3310 gate leg 3, corrected by dig_ecosystem#3342): a
+    /// chain-source GAP on the launcher's parent spend must never be reported as the definitive
+    /// "not a DIG distributor" verdict -- it stands on its own merit as an unreachable read
+    /// (`Unavailable`), independent of `read_distributor_guarded`'s `Ok(None)` path, which since
+    /// #3342 answers `ChainPortError::NotADistributor` instead: a genuine absence, not an outage.
     #[test]
     fn parent_spend_gap_is_reported_as_unavailable_not_as_a_distributor_identity_verdict() {
         let mapped = super::launch_comment_error_to_port_error(
