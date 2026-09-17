@@ -38,7 +38,7 @@ use chia_protocol::Bytes32;
 
 use super::cadence::{next_interval_seconds, JitterSource};
 use super::config::{RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT};
-use super::engine::{ClaimCadences, ClaimEngine, ClampedGateCadence, FeeWindowCadenceSeconds};
+use super::engine::{ClaimCadences, ClaimEngine, RawConfiguredCadence};
 use super::hints::{DistributorHintSource, NoHintSource};
 use super::port::{ClaimChainPort, UnavailableClaimChainPort};
 use super::types::{ClaimLoopState, ClaimStatus};
@@ -510,10 +510,7 @@ async fn run_claim_driver_in_with_clock<P>(
     // from ever running while the scheduler keeps ticking on the clamped interval).
     .with_persisted_fee_window(
         state_dir,
-        ClaimCadences {
-            gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(cadence_seconds)),
-            fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
-        },
+        ClaimCadences::from_raw(RawConfiguredCadence(cfg.cadence_seconds)),
     );
 
     drive(
@@ -1036,12 +1033,7 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            ClaimCadences {
-                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(
-                    cfg.cadence_seconds,
-                )),
-                fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
-            },
+            ClaimCadences::from_raw(RawConfiguredCadence(cfg.cadence_seconds)),
         );
 
         let outcomes = engine.run_cycle(900).await; // 900 - 500 = 400 < 1_000
@@ -1091,10 +1083,7 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            ClaimCadences {
-                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(effective_cadence)),
-                fee_window_raw: FeeWindowCadenceSeconds(configured_cadence),
-            },
+            ClaimCadences::from_raw(RawConfiguredCadence(configured_cadence)),
         );
 
         let handle = ClaimLoopHandle::default();
@@ -1126,10 +1115,10 @@ mod tests {
         tokio::time::advance(Duration::from_secs(effective_cadence)).await;
         settle().await;
         assert_eq!(handle.cycles_driven(), 1);
-        assert_ne!(
+        assert_eq!(
             handle.status().state,
-            super::super::types::ClaimLoopState::CadenceNotElapsed,
-            "the very first cycle has no prior completion to gate against"
+            super::super::types::ClaimLoopState::Nominal,
+            "the very first cycle has no prior completion to gate against, so it must run to completion \n             and report Nominal"
         );
         let after_tick_1 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
@@ -1149,11 +1138,10 @@ mod tests {
             "F2: the gate must track the CLAMPED cadence -- a cycle sized from the raw 5_184_000 \
              cadence would still be refused here, reproducing the silent-non-claiming defect"
         );
-        assert_ne!(
+        assert_eq!(
             handle.status().state,
-            super::super::types::ClaimLoopState::CadenceNotElapsed,
-            "F2: the gate opened one clamped interval after the last completion -- it must not \
-             still be waiting on the raw 5_184_000s cadence"
+            super::super::types::ClaimLoopState::Nominal,
+            "F2: the gate opened one clamped interval after the last completion -- it must not still be \n             waiting on the raw 5_184_000s cadence. Asserting the exact state, not merely \n             `!= CadenceNotElapsed`: that exclusion is equally satisfied by PersistedStateCorrupt \n             and ChainSourceUnavailable, whose early returns sit above the window-roll block too, \n             so it would go vacuous the moment one of those fired instead"
         );
         let after_tick_2 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
@@ -1196,12 +1184,7 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            ClaimCadences {
-                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(
-                    cfg.cadence_seconds,
-                )),
-                fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
-            },
+            ClaimCadences::from_raw(RawConfiguredCadence(cfg.cadence_seconds)),
         );
 
         let outcomes = engine.run_cycle(2_000).await; // 2_000 - 500 = 1_500 >= 1_000
@@ -1232,12 +1215,7 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            ClaimCadences {
-                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(
-                    cfg.cadence_seconds,
-                )),
-                fee_window_raw: FeeWindowCadenceSeconds(cfg.cadence_seconds),
-            },
+            ClaimCadences::from_raw(RawConfiguredCadence(cfg.cadence_seconds)),
         );
 
         let outcomes = engine.run_cycle(100).await; // now < last_cycle_completed_at
@@ -1272,10 +1250,7 @@ mod tests {
         )
         .with_persisted_fee_window(
             dir.path(),
-            ClaimCadences {
-                gate_clamped: ClampedGateCadence::clamp(FeeWindowCadenceSeconds(1_000)),
-                fee_window_raw: FeeWindowCadenceSeconds(1_000),
-            },
+            ClaimCadences::from_raw(RawConfiguredCadence(1_000)),
         );
 
         let outcomes = engine.run_cycle(1).await;
@@ -1448,10 +1423,10 @@ mod tests {
         // internal gate REFUSED (`ClaimLoopState::CadenceNotElapsed`) still increments it. Assert
         // on the reported STATE, which the gate's early `return` in `run_cycle` actually controls.
         assert_eq!(handle.cycles_driven(), 1);
-        assert_ne!(
+        assert_eq!(
             handle.status().state,
-            super::super::types::ClaimLoopState::CadenceNotElapsed,
-            "the very first cycle has no prior completion to gate against"
+            super::super::types::ClaimLoopState::Nominal,
+            "the very first cycle has no prior completion to gate against, so it must run to completion \n             and report Nominal"
         );
         let after_tick_1 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
@@ -1470,15 +1445,10 @@ mod tests {
             2,
             "the driver's loop iterated a second time"
         );
-        assert_ne!(
+        assert_eq!(
             handle.status().state,
-            super::super::types::ClaimLoopState::CadenceNotElapsed,
-            "#3336: the production body's gate must track the CLAMPED cadence -- a transposed \
-             call to with_persisted_fee_window would gate on the raw 5_184_000s cadence instead, \
-             and `run_cycle` would report CadenceNotElapsed here, restoring the no-op gate #3306 \
-             fixed. `cycles_driven()` cannot see this: it counts every `drive` loop iteration \
-             (sleep-wake-record), including ones the internal gate refused -- the STATE is the \
-             only signal a cycle actually ran past the gate."
+            super::super::types::ClaimLoopState::Nominal,
+            "#3336: the production body's gate must track the CLAMPED cadence -- a transposed call to \n             with_persisted_fee_window would gate on the raw 5_184_000s cadence and report \n             CadenceNotElapsed here, restoring the no-op gate #3306 fixed. Asserting the exact \n             state, not merely `!= CadenceNotElapsed`: that exclusion is equally satisfied by \n             PersistedStateCorrupt and ChainSourceUnavailable, whose early returns also sit above \n             the window-roll block, so it would go vacuous the moment one of those fired instead. \n             `cycles_driven()` cannot see any of this: it counts every drive loop iteration, \n             including ones the internal gate refused"
         );
         let after_tick_2 = RewardsClaimConfig::load_from(dir.path()).fee_window_start_unix;
         assert_eq!(
