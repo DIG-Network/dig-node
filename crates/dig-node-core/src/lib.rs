@@ -10353,6 +10353,124 @@ mod tests {
         }
     }
 
+    /// **Proves (dig_ecosystem#3342, gate H1):** the wire actually carries the not-a-distributor /
+    /// chain-unavailable split, through the REAL dispatch path — not just the port-level enum. An
+    /// installed port answering `Err(NotADistributor)` must reach `data.code ==
+    /// "REWARD_NOT_A_DISTRIBUTOR"`; an installed port answering `Err(Unavailable)` must reach
+    /// `data.code == "REWARD_CHAIN_UNAVAILABLE"`; the two must differ; and neither response body
+    /// may contain the substring `"adapter is wired"` — that sentence is reserved for the ONE case
+    /// where no port is installed at all.
+    /// **Mutation-probe:** in `seams::dig_rpc::dispatch::reward_chain_port_error_response`, point
+    /// the `NotADistributor` arm's `data.code` at `REWARD_CHAIN_UNAVAILABLE_MACHINE` (re-collapsing
+    /// the split) and this test's `assert_ne!` on the two codes fails.
+    /// **Catches:** a future edit that re-merges the two wire codes while the port-level enum
+    /// variant, and everything else, stays green. Tests BOTH `dig.getRewardDistributor` and
+    /// `dig.listRewardDistributorCommitments` -- separate handlers that could drift independently.
+    #[test]
+    fn reward_distributor_methods_pin_the_not_a_distributor_wire_code_distinct_from_unavailable() {
+        let absent_launcher_id = [0x90u8; 32];
+        let missing_launcher_id = [0x91u8; 32];
+        let outage_launcher_id = [0x92u8; 32];
+
+        for method in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+        ] {
+            // A fresh node per method: `install_reward_chain_port` is once-only (backed by a
+            // `OnceLock`), and the "no port installed" case below must be true independently for
+            // each method, not just the first one through the loop.
+            let (node, _td) = test_node(None);
+
+            // Case 1: no port installed at all -- the ONE case allowed to say "adapter is wired".
+            let absent_resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,
+                       "params":{"launcher_id": hex::encode(absent_launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert_eq!(
+                absent_resp["error"]["data"]["code"],
+                json!("REWARD_CHAIN_UNAVAILABLE"),
+                "{method}"
+            );
+            assert!(
+                absent_resp["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("adapter is wired"),
+                "{method}: no-port-installed case must say so: {absent_resp}"
+            );
+
+            assert!(node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([
+                    (
+                        missing_launcher_id,
+                        Err(crate::rewards::port::ChainPortError::NotADistributor),
+                    ),
+                    (
+                        outage_launcher_id,
+                        Err(crate::rewards::port::ChainPortError::Unavailable),
+                    ),
+                ]),
+            })));
+
+            // Case 2: the chain answered -- no distributor there.
+            let missing_resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":2,"method":method,
+                       "params":{"launcher_id": hex::encode(missing_launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(
+                missing_resp.get("result").is_none(),
+                "{method}: {missing_resp}"
+            );
+            assert_eq!(
+                missing_resp["error"]["data"]["code"],
+                json!("REWARD_NOT_A_DISTRIBUTOR"),
+                "{method}"
+            );
+            assert!(
+                !missing_resp.to_string().contains("adapter is wired"),
+                "{method}: an installed adapter's own answer must never claim none is wired: \
+                 {missing_resp}"
+            );
+
+            // Case 3: the chain source itself could not be reached.
+            let outage_resp = rt().block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":3,"method":method,
+                       "params":{"launcher_id": hex::encode(outage_launcher_id)}}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            assert!(
+                outage_resp.get("result").is_none(),
+                "{method}: {outage_resp}"
+            );
+            assert_eq!(
+                outage_resp["error"]["data"]["code"],
+                json!("REWARD_CHAIN_UNAVAILABLE"),
+                "{method}"
+            );
+            assert!(
+                !outage_resp.to_string().contains("adapter is wired"),
+                "{method}: an installed adapter's own outage must never claim none is wired: \
+                 {outage_resp}"
+            );
+
+            // The wire distinction actually exists: these two must differ.
+            assert_ne!(
+                missing_resp["error"]["data"]["code"],
+                outage_resp["error"]["data"]["code"],
+                "{method}: not-a-distributor and chain-unavailable must be distinguishable on \
+                 the wire"
+            );
+        }
+    }
+
     /// **Proves:** when the port refuses because `withdrawal_share_bps` is out of range (either
     /// side: doesn't fit `u16`, the caller narrows before calling this port, or the adapter's own
     /// `0..=10_000` domain check), BOTH methods refuse the WHOLE call with a distinct machine code
