@@ -907,7 +907,8 @@ impl RpcDispatch for Node {
             "count": set.len()}});
             }
             // dig.getRewardProverStatus (dig_ecosystem#3269, dig-rewards-coin SPEC.md
-            // §2.3/§2.4) — CONTROL plane: loopback admin / in-process FFI ONLY, NEVER over the
+            // §2.3/§2.4) — CONTROL plane: loopback admin / in-process FFI ONLY (the token tier of
+            // this NODE-LOCAL read is dig_ecosystem#3352's decision, not #3351's), NEVER over the
             // mTLS peer surface (absent from `is_peer_reachable_method`;
             // `reward_methods_tier_guard.rs` fails closed on that). Reads the node's live
             // `reward_prover_statuses` registry (empty until dig_ecosystem#3265 spawns a prover
@@ -1002,9 +1003,9 @@ impl RpcDispatch for Node {
             // service's `POST /` and the in-process FFI), NEVER over the mTLS peer surface (absent
             // from `is_peer_reachable_method`; `reward_methods_tier_guard.rs` fails closed on that).
             // NOT token-gated (dig_ecosystem#3351): an OPEN read of public on-chain state keyed by
-            // the caller's `launcher_id`, answered to any caller that reaches `POST /` — anonymous
-            // remote callers included on a node bound with `DIG_NODE_ALLOW_REMOTE=1` — for the same
-            // reason `control.wallet.balance` is open (#1851, `control::is_open_control_read`).
+            // the caller's `launcher_id`, answered to any caller that reaches `POST /` with no
+            // token — the disclosure rule SPEC §7.2 applies to every non-`control.*` method, the
+            // same reason `control.wallet.balance` is open (#1851, `control::is_open_control_read`).
             // Pinned by `reward_distributor_reads_answer_on_post_slash_without_a_token` in
             // dig-node-service `tests/server.rs`. Chain-derived state ONLY — never the local prover
             // loop's self-reported state (see `GetRewardProverStatus` above for that). Goes entirely
