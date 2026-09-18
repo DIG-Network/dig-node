@@ -11,6 +11,99 @@ use super::hints::DistributorHintSource;
 use super::port::{ClaimChainPort, ClaimPortError};
 use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus};
 
+/// The two cadences [`ClaimEngine::with_persisted_fee_window`] needs, DERIVED together from the
+/// single raw configured value they both come from.
+///
+/// # DIG-Network/dig_ecosystem#3336 (money) -- what this shape closes, and what it does not
+/// Earlier shapes handed the engine two numbers the CALLER had already chosen: first two bare
+/// `u64` arguments, then two distinct newtypes, then this struct with two typed fields.
+///
+/// TYPE-ENFORCED: the gate and the fee window cannot disagree with EACH OTHER.
+/// [`Self::from_raw`] is the only constructor, both fields are private (so a struct literal is
+/// not an alternative path from outside this module), and it derives `gate_clamped` by clamping
+/// the very [`RawConfiguredCadence`] it stores as `fee_window_raw`. There is no pairing in which
+/// the window sizes off one number and the gate off another.
+///
+/// NOT type-enforced, and no type here can be: WHICH `u64` the call site labels raw.
+/// `from_raw(RawConfiguredCadence(cadence_seconds))` -- the already-clamped local instead of
+/// `cfg.cadence_seconds` -- has the same type and compiles. It halves the fee window: measured,
+/// the window rolls one tick early, `Some(5356800)` becoming `Some(2678400)`, exactly 2x the
+/// number of fee-budget windows the operator sized. Exactly ONE test catches that, and it is
+/// `driver::tests::the_production_body_tracks_the_clamped_gate_and_the_raw_fee_window`, which
+/// drives the production call site. Do not delete it on the belief that a type stands behind it
+/// -- nothing does.
+///
+/// - `gate_clamped`: the schedule-CLAMPED cadence, in seconds, that [`ClaimEngine::run_cycle`]'s
+///   restart-safety gate is measured against -- the same interval [`super::driver::drive`]
+///   actually sleeps on. The RAW value here would restore the no-op gate
+///   DIG-Network/dig_ecosystem#3306 fixed: an operator's 60-day config would gate on 60 days
+///   again even though the loop keeps ticking every 31.
+/// - `fee_window_raw`: the RAW configured cadence, in seconds, that sizes how long the persisted
+///   aggregate fee-budget window stays open before rolling -- deliberately never the clamped
+///   value. The CLAMPED value here doubles the number of fee-budget windows a long-cadence
+///   operator sized (a 60-day config would get ~12 windows/year instead of the ~6 its cadence
+///   implies), doubling the fee ceiling they configured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClaimCadences {
+    gate_clamped: ClampedGateCadence,
+    fee_window_raw: RawConfiguredCadence,
+}
+
+impl ClaimCadences {
+    /// The ONLY constructor. The gate cadence is derived from the window's own raw source, so the
+    /// two can never be paired with each other's value -- that much the types enforce. What
+    /// nothing here enforces is that `raw` really is the raw configured value; see the
+    /// [`ClaimCadences`] #3336 section for the single test that does.
+    #[must_use]
+    pub(crate) fn from_raw(raw: RawConfiguredCadence) -> Self {
+        Self {
+            gate_clamped: ClampedGateCadence::clamp(raw),
+            fee_window_raw: raw,
+        }
+    }
+}
+
+/// The RAW, operator-writable cadence in seconds (`RewardsClaimConfig::cadence_seconds` as
+/// persisted) -- unbounded above. The single input [`ClaimCadences::from_raw`] takes: it sizes
+/// the fee window directly and, through [`ClampedGateCadence::clamp`], the gate as well.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RawConfiguredCadence(pub(crate) u64);
+
+/// The schedule-CLAMPED cadence (bounded to [`super::driver::CLAIM_SCHEDULE_SECONDS_MAX`]) that
+/// [`ClaimEngine::run_cycle`]'s restart-safety gate is measured against -- the same interval
+/// [`super::driver::drive`] actually sleeps on.
+///
+/// # DIG-Network/dig_ecosystem#3336 -- why the field is private
+/// [`Self::clamp`] is the only way to produce this type, it is private to this module, it always
+/// applies the bound, and the only caller of `clamp` is [`ClaimCadences::from_raw`]. So every
+/// number that reaches the gate has been through the clamp -- which bounds its MAGNITUDE and
+/// nothing else. It is not evidence about where the number came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClampedGateCadence(u64);
+
+impl ClampedGateCadence {
+    /// Bounds `raw` to `CLAIM_SCHEDULE_SECONDS_MAX` (31 days) -- e.g. a 60-day raw cadence in
+    /// yields the 31-day ceiling out, so the gate tracks the schedule the driver really sleeps
+    /// on.
+    ///
+    /// That is the same CEILING [`super::driver::sanitized_schedule`] applies at the config read,
+    /// but only its clamp arm: `sanitized_schedule` ALSO substitutes
+    /// `super::config::CLAIM_CADENCE_SECONDS_DEFAULT` for a zero cadence, and `clamp` has no such
+    /// arm. The two agree only under an unnamed-until-now precondition -- a zero never reaches
+    /// here, because [`super::config::RewardsClaimConfig::load_from`] floors `cadence_seconds` to
+    /// `super::config::CLAIM_CADENCE_FLOOR_SECONDS` (60) on its parse-success path and yields
+    /// `CLAIM_CADENCE_SECONDS_DEFAULT` (86_400) on its other four exits. A caller that builds a
+    /// cadence from anything but a loaded config breaks that precondition, and the equivalence
+    /// with it.
+    fn clamp(raw: RawConfiguredCadence) -> Self {
+        ClampedGateCadence(raw.0.min(super::driver::CLAIM_SCHEDULE_SECONDS_MAX))
+    }
+
+    fn seconds(self) -> u64 {
+        self.0
+    }
+}
+
 /// Drives one claim cycle for this node against a [`ClaimChainPort`] + [`DistributorHintSource`]
 /// and the anti-silence status surface across calls to [`Self::run_cycle`].
 ///
@@ -142,15 +235,6 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// arms this engine to keep persisting them there after every submission and every completed
     /// cycle (never batched to cycle end — see [`Self::run_cycle`]'s "F7" doc section for why).
     ///
-    /// F2 (money): takes TWO cadence values, deliberately not one -- `gate_cadence_seconds` (the
-    /// CLAMPED value the driver's schedule actually runs on) gates WHEN a cycle is allowed to
-    /// start; `fee_window_seconds` (the RAW configured value) sizes how long the persisted
-    /// fee-budget window stays open. Conflating them into a single cadence (the pre-F2 shape)
-    /// either doubled the operator's fee ceiling (reusing the clamped value for the window) or
-    /// silently starved the gate to the raw value -- for an unbounded-above raw cadence, the gate
-    /// could stop opening at all while the scheduler kept ticking on the clamped interval. See
-    /// [`Self::gate_cadence_seconds`] and [`Self::fee_window_seconds`]'s field docs.
-    ///
     /// Without this call, the engine is exactly as it was before F7: a fresh
     /// [`Self::cycle_fee_budget_mojos`] and no cadence gate on every construction. That is
     /// deliberately still true for a caller that has not opted in (every pre-F7 test), but it is
@@ -174,18 +258,27 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// of every cycle unconditionally (its `CycleConditions`), so a construction-time copy was
     /// pure overhead: it was never trusted past the first cycle anyway once F16 landed, and now it
     /// is never even taken.
+    ///
+    /// # DIG-Network/dig_ecosystem#3336
+    /// Takes ONE [`ClaimCadences`], which the caller can only build with
+    /// [`ClaimCadences::from_raw`] -- so the two cadences are derived together, from one value,
+    /// and cannot contradict each other. WHICH value that is is still the call site's choice, and
+    /// is test-guarded only; see the [`ClaimCadences`] #3336 section.
+    ///
+    /// `pub(crate)`, not `pub`: [`ClaimCadences`] is crate-private (it is the argument type, so a
+    /// `pub` method taking it would be uncallable from outside anyway), and no out-of-crate
+    /// caller exists.
     #[must_use]
-    pub fn with_persisted_fee_window(
-        mut self,
-        dir: &Path,
-        gate_cadence_seconds: u64,
-        fee_window_seconds: u64,
-    ) -> Self {
+    pub(crate) fn with_persisted_fee_window(mut self, dir: &Path, cadences: ClaimCadences) -> Self {
         self.fee_window_state_dir = Some(dir.to_path_buf());
-        self.gate_cadence_seconds =
-            gate_cadence_seconds.max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
-        self.fee_window_seconds =
-            fee_window_seconds.max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
+        self.gate_cadence_seconds = cadences
+            .gate_clamped
+            .seconds()
+            .max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
+        self.fee_window_seconds = cadences
+            .fee_window_raw
+            .0
+            .max(super::config::CLAIM_CADENCE_FLOOR_SECONDS);
         self
     }
 
@@ -1774,7 +1867,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
         let first_outcomes = first.run_cycle(1_000).await;
         assert_eq!(
             first_outcomes,
@@ -1799,7 +1895,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
         let second_outcomes = second.run_cycle(1_010).await;
 
         let second_submitted = second_outcomes
@@ -1838,7 +1937,10 @@ mod tests {
                 CYCLE_BUDGET,
                 DIG_ASSET_ID,
             )
-            .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+            .with_persisted_fee_window(
+                dir.path(),
+                ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+            );
             let outcomes = e.run_cycle(1_000 + u64::from(i)).await;
             if outcomes
                 .iter()
@@ -1878,7 +1980,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
         let first_outcomes = first.run_cycle(1_000).await;
         assert_eq!(
             first_outcomes,
@@ -1901,7 +2006,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
         let second_outcomes = second.run_cycle(later).await;
 
         assert_eq!(
@@ -1934,7 +2042,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
         let first_outcomes = first.run_cycle(1_000).await;
         assert_eq!(
             first_outcomes,
@@ -1951,7 +2062,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
         let second_outcomes = second.run_cycle(1_050).await;
 
         assert_eq!(
@@ -1987,7 +2101,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
 
         let outcomes = e.run_cycle(1_000).await;
         let submitted: u64 = outcomes
@@ -2036,7 +2153,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
 
         let outcomes = e.run_cycle(1_000).await;
         assert_eq!(
@@ -2094,7 +2214,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
 
         // Still well inside the seeded window (`1_000 + 5 - 1_000 = 5 < CADENCE_SECONDS`), so the
         // gate cannot be what refuses this -- only the window accumulator can.
@@ -2134,7 +2257,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
         let first_outcomes = first.run_cycle(1_000).await;
         assert_eq!(
             first_outcomes,
@@ -2156,7 +2282,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
         let second_outcomes = second.run_cycle(1_010).await;
 
         assert_eq!(
@@ -2208,7 +2337,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
 
         // Cycle 1: `now` (1_000) is nowhere near `far_future` -- the clock reads as future-dated,
         // and must refuse.
@@ -2281,7 +2413,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
 
         // Cycle 1: the file is corrupt -- must refuse, submit nothing.
         let cycle1 = e.run_cycle(1_000).await;
@@ -2353,7 +2488,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
 
         let outcomes = e.run_cycle(1_000).await;
         assert_eq!(
@@ -2401,7 +2539,10 @@ mod tests {
             CYCLE_BUDGET,
             DIG_ASSET_ID,
         )
-        .with_persisted_fee_window(dir.path(), CADENCE_SECONDS, CADENCE_SECONDS);
+        .with_persisted_fee_window(
+            dir.path(),
+            ClaimCadences::from_raw(RawConfiguredCadence(CADENCE_SECONDS)),
+        );
 
         let outcomes = e.run_cycle(1_000).await;
 
