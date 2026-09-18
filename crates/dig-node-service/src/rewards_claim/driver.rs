@@ -499,15 +499,15 @@ async fn run_claim_driver_in_with_clock<P>(
         dig_mirror_coin::DIG_ASSET_ID,
     )
     .with_rotation_cursor(cfg.rotation_cursor)
-    // F2: two DIFFERENT cadence values, deliberately -- `cadence_seconds` (CLAMPED, already
-    // bounded to `CLAIM_SCHEDULE_SECONDS_MAX`) gates WHEN a cycle may run, tracking the same
-    // schedule the driver below actually sleeps on. `cfg.cadence_seconds` (RAW, unclamped) sizes
-    // the persisted fee-budget window -- reusing the clamped value there would double the number
-    // of budget windows a long-cadence operator sized (a 60-day config would get ~12 windows/year
-    // instead of the ~6 its cadence implies -- 2x the fee ceiling they configured). Conflating the
-    // two into one value in either direction is wrong: clamped-for-both doubles the fee ceiling,
-    // raw-for-both can silently starve the gate (an unbounded-above raw cadence would stop cycles
-    // from ever running while the scheduler keeps ticking on the clamped interval).
+    // F2 (money): ONE argument, and it must be the RAW `cfg.cadence_seconds`. `ClaimCadences`
+    // derives both halves from it -- the CLAMPED gate (bounded to `CLAIM_SCHEDULE_SECONDS_MAX`,
+    // so WHEN a cycle may run tracks the same schedule the driver below actually sleeps on) and
+    // the RAW fee window (how long the persisted fee-budget window stays open). The one argument
+    // makes them impossible to transpose, but NOT impossible to get wrong: passing the clamped
+    // local `cadence_seconds` here instead of `cfg.cadence_seconds` has the same type, compiles,
+    // and halves the fee window -- ~12 budget windows a year for a 60-day operator instead of the
+    // ~6 their cadence implies, i.e. 2x the fee ceiling they configured. Exactly one test catches
+    // that: `tests::the_production_body_tracks_the_clamped_gate_and_the_raw_fee_window`.
     .with_persisted_fee_window(
         state_dir,
         ClaimCadences::from_raw(RawConfiguredCadence(cfg.cadence_seconds)),
@@ -1065,6 +1065,12 @@ mod tests {
     /// - the WINDOW must NOT roll at tick 2 (elapsed since it opened is one clamped interval,
     ///   2_678_400s, well under the raw 5_184_000s the operator configured) but MUST have rolled
     ///   by tick 3 (elapsed is 2 clamped intervals, 5_356_800s, past the raw boundary).
+    ///
+    /// This test builds its `ClaimCadences` itself, so it stays GREEN if the PRODUCTION call site
+    /// in [`run_claim_driver_in`] is mutated to pass the clamped local instead of the raw
+    /// `cfg.cadence_seconds`. It is therefore not a duplicate of
+    /// [`the_production_body_tracks_the_clamped_gate_and_the_raw_fee_window`], which is the only
+    /// test that catches that mutation -- do not delete that one as redundant with this one.
     #[tokio::test(start_paused = true)]
     async fn the_gate_tracks_the_clamped_cadence_while_the_fee_window_tracks_the_raw_one() {
         let configured_cadence = 60 * 24 * 60 * 60u64; // 5_184_000, RAW -- sizes the fee window.

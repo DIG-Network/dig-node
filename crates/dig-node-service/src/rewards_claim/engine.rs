@@ -83,8 +83,18 @@ pub(crate) struct ClampedGateCadence(u64);
 
 impl ClampedGateCadence {
     /// Bounds `raw` to `CLAIM_SCHEDULE_SECONDS_MAX` (31 days) -- e.g. a 60-day raw cadence in
-    /// yields the 31-day ceiling out, the same bound [`super::driver::sanitized_schedule`]
-    /// applies at the config read, so the gate tracks the schedule the driver really sleeps on.
+    /// yields the 31-day ceiling out, so the gate tracks the schedule the driver really sleeps
+    /// on.
+    ///
+    /// That is the same CEILING [`super::driver::sanitized_schedule`] applies at the config read,
+    /// but only its clamp arm: `sanitized_schedule` ALSO substitutes
+    /// `super::config::CLAIM_CADENCE_SECONDS_DEFAULT` for a zero cadence, and `clamp` has no such
+    /// arm. The two agree only under an unnamed-until-now precondition -- a zero never reaches
+    /// here, because [`super::config::RewardsClaimConfig::load_from`] floors `cadence_seconds` to
+    /// `super::config::CLAIM_CADENCE_FLOOR_SECONDS` (60) on its parse-success path and yields
+    /// `CLAIM_CADENCE_SECONDS_DEFAULT` (86_400) on its other two exits. A caller that builds a
+    /// cadence from anything but a loaded config breaks that precondition, and the equivalence
+    /// with it.
     fn clamp(raw: RawConfiguredCadence) -> Self {
         ClampedGateCadence(raw.0.min(super::driver::CLAIM_SCHEDULE_SECONDS_MAX))
     }
@@ -224,15 +234,6 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// F7: restores the persisted aggregate-fee-budget window and cadence clock from `dir` and
     /// arms this engine to keep persisting them there after every submission and every completed
     /// cycle (never batched to cycle end — see [`Self::run_cycle`]'s "F7" doc section for why).
-    ///
-    /// F2 (money): takes TWO cadence values, deliberately not one -- `gate_cadence_seconds` (the
-    /// CLAMPED value the driver's schedule actually runs on) gates WHEN a cycle is allowed to
-    /// start; `fee_window_seconds` (the RAW configured value) sizes how long the persisted
-    /// fee-budget window stays open. Conflating them into a single cadence (the pre-F2 shape)
-    /// either doubled the operator's fee ceiling (reusing the clamped value for the window) or
-    /// silently starved the gate to the raw value -- for an unbounded-above raw cadence, the gate
-    /// could stop opening at all while the scheduler kept ticking on the clamped interval. See
-    /// [`Self::gate_cadence_seconds`] and [`Self::fee_window_seconds`]'s field docs.
     ///
     /// Without this call, the engine is exactly as it was before F7: a fresh
     /// [`Self::cycle_fee_budget_mojos`] and no cadence gate on every construction. That is
