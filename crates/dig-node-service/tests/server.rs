@@ -1535,6 +1535,62 @@ async fn cache_list_cached_is_not_routable_over_ws() {
     );
 }
 
+/// **Proves (dig_ecosystem#3351, WS parity):** `dig.getRewardDistributor` and
+/// `dig.listRewardDistributorCommitments` are OPEN reads on the HTTP transport (no token required),
+/// but that openness must not accidentally widen into a SECOND, WS-reachable path. The `ws_dispatch`
+/// fall-through routes an unrecognized method to `WalletBackend::dispatch`, whose match has no
+/// `dig.*` arm, so both methods come back as an unknown-method error over `/ws` -- never as
+/// `UNAUTHORIZED` (that would mean WS gates them where HTTP does not, which is its own bug) and
+/// never as a real result (that would mean the reward-chain answer leaked over an unaudited
+/// transport).
+///
+/// **Catches:** a wallet-backend or `ws_dispatch` arm that starts routing `dig.*` reward reads over
+/// `/ws` without the tier decision being revisited.
+#[tokio::test]
+async fn reward_distributor_reads_are_not_routable_over_ws() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _backend, _hold) = start_node_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await; // drain the initial sync_status snapshot
+
+    for (idx, method) in [
+        "dig.getRewardDistributor",
+        "dig.listRewardDistributorCommitments",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // No token: these reads are OPEN on HTTP, but that has no bearing on WS routability.
+        ws.send(Message::Text(
+            json!({ "id": format!("rd{idx}"), "type": "request", "method": method }).to_string(),
+        ))
+        .await
+        .unwrap();
+        let resp = next_ws_json(&mut ws).await;
+        assert_eq!(resp["id"], json!(format!("rd{idx}")));
+        assert_eq!(
+            resp["ok"],
+            json!(false),
+            "{method} is not a WS method, got {resp:?}"
+        );
+        // `ws_err` emits `error.code` as the NUMERIC control-plane code (`ErrorCode::code()`,
+        // -32030 for Unauthorized) while `ws_from_jsonrpc` surfaces the string name; a gate
+        // added on either path must trip this, so reject BOTH spellings.
+        let is_unauthorized = resp
+            .pointer("/error/code")
+            .is_some_and(|c| c == &json!("UNAUTHORIZED") || c == &json!(-32030));
+        assert!(
+            !is_unauthorized,
+            "{method} over WS must fail as unknown-method, not UNAUTHORIZED -- \
+             a WS gate would contradict the HTTP-side open-read decision, got {resp:?}"
+        );
+    }
+}
+
 /// **A person can add, list and remove a trusted Chia peer, end to end over the REAL control plane.**
 ///
 /// The whole round trip through the real server, the real token gate, the real wallet backend and
@@ -3852,4 +3908,57 @@ async fn a_client_can_register_and_deregister_the_addresses_the_node_follows() {
         json!([second]),
         "deregistering one key must stop following exactly it, and leave the other followed"
     );
+}
+
+/// **Proves:** `dig.getRewardDistributor` and `dig.listRewardDistributorCommitments` are answered
+/// on `POST /` with NO control token presented — `Tier::Control` in dig-rpc-protocol's sense means
+/// "loopback / in-process dispatch only, never over the mTLS peer surface", NOT token-gated
+/// (dig_ecosystem#3351). Both requests must pass every ingress gate (no `-32030`/`UNAUTHORIZED`) and
+/// reach the reward handler itself, which then reports `REWARD_CHAIN_UNAVAILABLE` because this
+/// ephemeral test node has no chain-read adapter wired — proving dispatch, not a passthrough relay
+/// or a method-not-found stub, answered the call.
+/// **Catches:** a future gate added at the `server.rs` ingress (e.g. folded into the cache-trio
+/// token check) that silently demotes these reads to token-gated — breaking the anonymous callers
+/// nobody can enumerate — and a doc claiming they are gated when the enforced behaviour is open.
+#[tokio::test]
+async fn reward_distributor_reads_answer_on_post_slash_without_a_token() {
+    let (addr, _hold) = start_node("").await;
+    let launcher_id = "11".repeat(32);
+
+    for method in [
+        "dig.getRewardDistributor",
+        "dig.listRewardDistributorCommitments",
+    ] {
+        let resp: Value = client()
+            .post(format!("http://{addr}/"))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": { "launcher_id": launcher_id }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_ne!(
+            resp["error"]["code"],
+            json!(-32030),
+            "{method} must not be Unauthorized when no token is presented: {resp}"
+        );
+        assert_ne!(
+            resp["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} must not be gated by the control token: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["data"]["code"],
+            json!("REWARD_CHAIN_UNAVAILABLE"),
+            "{method} must reach the reward handler (no chain port wired on this ephemeral node), \
+             not a passthrough or a method-not-found stub: {resp}"
+        );
+    }
 }
