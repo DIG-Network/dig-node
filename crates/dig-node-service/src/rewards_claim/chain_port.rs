@@ -254,7 +254,7 @@ where
                     ClaimPortError::Other(bounded("not a distributor: launcher coin unspent"))
                 })?;
 
-            let Some(entry) = snapshot
+            let Some(_entry) = snapshot
                 .slots()
                 .entries
                 .iter()
@@ -333,21 +333,12 @@ impl LauncherIndex for HintedLauncherIndex {
         // hash literal -- the identical discipline `dig_rewards_coin::discovery`'s own decode
         // applies to the same constant.
         let mut allocator = clvmr::Allocator::new();
-        let hint_ptr = clvmr::serde::node_from_bytes(
-            &mut allocator,
-            &clvm_traits::ToClvm::to_clvm(&"Reward Distributor v1", &mut allocator)
-                .map_err(|error| {
-                    ClaimPortError::Other(bounded(format!(
-                        "could not allocate the launcher hint literal: {error}"
-                    )))
-                })?
-                .to_bytes(&allocator),
-        )
-        .map_err(|error| {
-            ClaimPortError::Other(bounded(format!(
-                "could not re-decode the launcher hint literal: {error}"
-            )))
-        })?;
+        let hint_ptr = clvm_traits::ToClvm::to_clvm(&"Reward Distributor v1", &mut allocator)
+            .map_err(|error| {
+                ClaimPortError::Other(bounded(format!(
+                    "could not allocate the launcher hint literal: {error}"
+                )))
+            })?;
         let hint: chia_protocol::Bytes32 = clvm_utils::tree_hash(&allocator, hint_ptr).into();
         let hint_hex = hex::encode(hint.to_bytes());
 
