@@ -1577,9 +1577,12 @@ async fn reward_distributor_reads_are_not_routable_over_ws() {
             json!(false),
             "{method} is not a WS method, got {resp:?}"
         );
+        // `ws_err` emits `error.code` as the NUMERIC control-plane code (`ErrorCode::code()`,
+        // -32030 for Unauthorized) while `ws_from_jsonrpc` surfaces the string name; a gate
+        // added on either path must trip this, so reject BOTH spellings.
         let is_unauthorized = resp
             .pointer("/error/code")
-            .is_some_and(|c| c == &json!("UNAUTHORIZED"));
+            .is_some_and(|c| c == &json!("UNAUTHORIZED") || c == &json!(-32030));
         assert!(
             !is_unauthorized,
             "{method} over WS must fail as unknown-method, not UNAUTHORIZED -- \
