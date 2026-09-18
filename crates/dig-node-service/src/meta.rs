@@ -789,6 +789,14 @@ pub enum ErrorCode {
     /// leave the next person debugging a refusal unable to tell which bound they hit. Retriable:
     /// the caller should back off. Shell error (minted before dispatch). (Control range `-3203x`.)
     ControlIngressLimited,
+    /// `-32034` — an OPEN `pairing.request` was refused: either the pending-pairing slot budget is
+    /// already at its cap (a pending request the node already accepted is never displaced to make
+    /// room for a later one), or this node's pairing-request rate bound for the window is
+    /// exhausted. ONE code for both, because the remedy is identical either way — back off; a slot
+    /// frees itself as an existing pairing is approved or expires. Distinct from
+    /// `CONTROL_INGRESS_LIMITED` (bounds token-less READS) and `WALLET_RATE_LIMITED` (bounds egress
+    /// to a third-party chain oracle). Retriable. Node error. (Control range `-3203x`.)
+    PairingPendingLimited,
 }
 
 /// The numeric code the shared wire contract assigns, widened to the `i64` the JSON-RPC
@@ -838,6 +846,7 @@ impl ErrorCode {
             ErrorCode::PeerPingRefused => -32060,
             ErrorCode::PushPendingLimited => -32016,
             ErrorCode::ControlIngressLimited => -32033,
+            ErrorCode::PairingPendingLimited => -32034,
         }
     }
 
@@ -872,6 +881,7 @@ impl ErrorCode {
             ErrorCode::PeerPingRefused => "PEER_PING_REFUSED",
             ErrorCode::PushPendingLimited => "PUSH_PENDING_LIMITED",
             ErrorCode::ControlIngressLimited => "CONTROL_INGRESS_LIMITED",
+            ErrorCode::PairingPendingLimited => "PAIRING_PENDING_LIMITED",
         }
     }
 
@@ -906,7 +916,9 @@ impl ErrorCode {
             // The peer ping is run BY the node's own peer network, so the refusal is the node's.
             | ErrorCode::PeerPingRefused
             // The push-reassembly bound is enforced by the node's own capsule seam.
-            | ErrorCode::PushPendingLimited => "node",
+            | ErrorCode::PushPendingLimited
+            // The pairing-slot bound is enforced by the node's own pairing plane.
+            | ErrorCode::PairingPendingLimited => "node",
             // INVALID_PARAMS is returned by the embedded read path's locally-served
             // read methods (bad store_id / retrieval_key) before any I/O.
             ErrorCode::InvalidParams => "node",
@@ -991,6 +1003,11 @@ impl ErrorCode {
                 "An open, token-less control read was refused at ingress: this source's request \
                  bound is exhausted. Distinct from WALLET_RATE_LIMITED, which bounds chain egress."
             }
+            ErrorCode::PairingPendingLimited => {
+                "A pairing.request was refused: the pending-pairing slot budget is at its cap, or \
+                 this node's pairing-request rate bound is exhausted. Back off and retry; a slot \
+                 frees itself as an existing pairing is approved or expires."
+            }
         }
     }
 
@@ -1019,6 +1036,7 @@ impl ErrorCode {
             ErrorCode::PeerPingRefused,
             ErrorCode::PushPendingLimited,
             ErrorCode::ControlIngressLimited,
+            ErrorCode::PairingPendingLimited,
         ]
     }
 }
