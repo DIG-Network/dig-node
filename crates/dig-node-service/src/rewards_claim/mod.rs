@@ -60,7 +60,10 @@ pub use config::{
     RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT, CLAIM_CYCLE_FEE_BUDGET_MOJOS_DEFAULT,
     CLAIM_FEE_CEILING_MOJOS_DEFAULT,
 };
-pub use driver::{handle, spawn_claim_driver_from_config, ClaimDriverRefusal, ClaimLoopHandle};
+pub use driver::{
+    handle, run_claim_driver_in, spawn_claim_driver_from_config, ClaimDriverRefusal,
+    ClaimLoopHandle,
+};
 pub use engine::ClaimEngine;
 pub use hints::{DistributorHint, DistributorHintSource, NoHintSource};
 pub use parser::parse_launch_comment;

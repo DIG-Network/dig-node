@@ -471,7 +471,12 @@ fn sanitized_schedule(cadence_seconds: u64, jitter_seconds: u64) -> (u64, u64, S
     (cadence, jitter, adjustment)
 }
 
-async fn run_claim_driver_in<P>(
+/// Public ONLY for DIG-Network/dig_ecosystem#3347's acceptance integration test
+/// (`tests/rewards_claim_chain_port_3347.rs`), which needs to drive the real production body end
+/// to end against a real `RealClaimChainPort`. Not part of this crate's public API otherwise --
+/// every other caller reaches this exclusively through [`spawn_claim_driver_from_config`].
+#[doc(hidden)]
+pub async fn run_claim_driver_in<P>(
     state_dir: &Path,
     own_payout_puzzle_hash: Bytes32,
     port: P,

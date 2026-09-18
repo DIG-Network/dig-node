@@ -986,7 +986,8 @@ mod tests {
     }
 
     /// A full in-memory fake standing in for the real chain adapter (see the module doc's "chain
-    /// seam" section) — the ONLY thing #3249 landing changes is which struct implements this trait.
+    /// seam" section) — #3249 landed `RealClaimChainPort` as the production implementer of this
+    /// trait; this fake stays as the engine's own unit-test double.
     struct FakeChainPort {
         distributors: Mutex<HashMap<Bytes32, FakeDistributor>>,
         submitted: Mutex<Vec<(Bytes32, Bytes32, u64)>>,

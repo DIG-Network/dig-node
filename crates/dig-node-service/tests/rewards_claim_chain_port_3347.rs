@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use chia_protocol::Bytes32;
 use dig_chainsource_interface::MockChainSource;
 use dig_node_service::rewards_claim::{
-    ClaimChainPort, ClaimPortError, LauncherIndex, RealClaimChainPort,
+    run_claim_driver_in, ClaimChainPort, ClaimLoopHandle, ClaimLoopState, ClaimPortError,
+    LauncherIndex, RealClaimChainPort, RewardsClaimConfig,
 };
 use dig_rewards_coin::constants::PAYOUT_THRESHOLD_BASE_UNITS;
 
@@ -174,5 +175,88 @@ async fn a_failing_source_reports_unavailable_everywhere() {
     assert_eq!(
         port.resolve_launch_comment(launcher_id).await,
         Err(ClaimPortError::Unavailable)
+    );
+}
+
+/// The 3347 acceptance proof itself: driving the REAL production body
+/// (`run_claim_driver_in`, the same function [`dig_node_service::rewards_claim::spawn_claim_driver_from_config`]
+/// spawns in production) with a real `RealClaimChainPort` over the fixture's real launch reaches
+/// an actual chain read -- not `ClaimLoopState::ChainSourceUnavailable`, and it actually discovers
+/// the one real distributor and its one (entry-less) cycle outcome. This is the one test in this
+/// file that proves the WIRING, not just the adapter in isolation.
+#[tokio::test(start_paused = true)]
+async fn a_driven_cycle_over_the_real_adapter_reaches_a_real_chain_read() {
+    let fixture = launch_fixture().expect("a real distributor launches cleanly in the simulator");
+    let source = mock_chain_source(&fixture);
+    let port = RealClaimChainPort::new(
+        Arc::new(source),
+        FixtureLauncherIndex(vec![fixture.launcher_id]),
+    );
+
+    let state_dir_guard = tempfile::tempdir().expect("a temp state dir");
+    let state_dir = state_dir_guard.path().to_path_buf();
+    let cfg = RewardsClaimConfig {
+        enabled: true,
+        cadence_seconds: 3_600,
+        jitter_seconds: 0,
+        ..RewardsClaimConfig::default()
+    };
+    cfg.save_to(&state_dir)
+        .expect("the config must save before the driver reads it");
+
+    let handle = ClaimLoopHandle::default();
+    let handle_for_task = handle.clone();
+    let own_payout_puzzle_hash = Bytes32::from([0x42; 32]);
+
+    tokio::spawn(async move {
+        run_claim_driver_in(&state_dir, own_payout_puzzle_hash, port, handle_for_task).await;
+    });
+
+    // Let the spawned task run far enough to register its first `sleep` BEFORE advancing the
+    // virtual clock -- `tokio::time::advance` only fires timers already registered.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    // The driver's first pass sleeps `cadence_seconds + jitter` before running its first cycle
+    // (see `driver.rs`'s own `drive` doc) -- jitter is pinned to 0 above, so this is exact.
+    tokio::time::advance(std::time::Duration::from_secs(3_600)).await;
+    // Let the woken task actually run its cycle (real chain reads go through
+    // `tokio::task::spawn_blocking`, which runs on a real OS thread unaffected by the paused
+    // virtual clock) before reading the handle back.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+
+    let status = handle.status();
+    // Per `rewards_chain_port_a3.rs`'s own module doc: this fixture's reserve asset is the
+    // SIMULATOR's own freshly minted CAT, never the real (unmintable-in-a-simulator)
+    // `dig_mirror_coin::DIG_ASSET_ID` -- `run_claim_driver_in` hardcodes that real asset id, so
+    // the engine correctly reads this real distributor, sees its asset does not match, and drops
+    // it as `NotOurs` (SPEC 9.3) BEFORE the entry-slot read -- it is never faulted, never
+    // read as chain-unavailable, and never fabricated as claimable. That is still real proof the
+    // production body reached a real chain read through `RealClaimChainPort`: a fabricated,
+    // no-adapter or wrongly-wired path could not produce "discovered exactly one, asset mismatch,
+    // cycle completed cleanly" -- it would read either zero known or chain-unavailable instead.
+    assert_ne!(
+        status.state,
+        ClaimLoopState::ChainSourceUnavailable,
+        "a real, launched fixture must not be read as chain-unavailable"
+    );
+    assert_eq!(
+        status.distributors_known, 1,
+        "discovery must find the one real distributor this fixture launched"
+    );
+    assert!(
+        !status.fault_reported,
+        "a real asset-id mismatch is a clean NotOurs drop, never a fault"
+    );
+    assert!(
+        status.last_cycle_at.is_some(),
+        "a cycle must have actually completed, not merely been scheduled"
     );
 }
