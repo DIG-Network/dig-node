@@ -1382,11 +1382,19 @@ mod tests {
     /// proves the gate/window split by hand-assembling `drive` directly. This test proves the SAME
     /// property through [`run_claim_driver_in_with_clock`] -- the actual production body, the one
     /// that threads `sanitized_schedule`'s CLAMPED cadence and the RAW `cfg.cadence_seconds` into
-    /// [`ClaimEngine::with_persisted_fee_window`] at driver.rs's one call site. Transposing the two
-    /// arguments there (the #3336 defect) is invisible to a hand-assembled `drive` test but would
-    /// flip both counts this test asserts: the fee window would roll at tick 2 instead of tick 3
-    /// (doubling the window count -- the "doubles the fee ceiling" half of the defect), and/or the
-    /// gate would stop opening every clamped tick (the "restores the no-op gate #3306 fixed" half).
+    /// [`ClaimEngine::with_persisted_fee_window`] at driver.rs's one call site.
+    ///
+    /// THIS IS THE ONLY TEST THAT CATCHES THE ONE MUTATION STILL LEFT AT THAT CALL SITE. The call
+    /// takes a single argument now, so the historic two-argument transposition cannot be written
+    /// at all. What still compiles is passing the already-clamped local as the raw value --
+    /// `ClaimCadences::from_raw(RawConfiguredCadence(cadence_seconds))`. Measured: the fee window
+    /// then rolls at tick 2 instead of tick 3, failing the tick-2 assertion below with
+    /// `left: Some(5356800)`, `right: Some(2678400)` -- half the window length, so 2x the
+    /// fee-budget windows the operator sized. The gate is NOT affected (clamping an
+    /// already-clamped value is the identity), and
+    /// [`the_gate_tracks_the_clamped_cadence_while_the_fee_window_tracks_the_raw_one`] stays GREEN
+    /// under that mutation, because it hand-assembles `drive` and never traverses the production
+    /// call site.
     ///
     /// Uses a written config with a 60-day RAW cadence (`5_184_000`s, clamped to the 31-day
     /// `CLAIM_SCHEDULE_SECONDS_MAX`, `2_678_400`s) and a clock that advances one clamped interval
@@ -1454,9 +1462,9 @@ mod tests {
         assert_eq!(
             handle.status().state,
             super::super::types::ClaimLoopState::Nominal,
-            "#3336: the production body's gate must track the CLAMPED cadence -- a transposed call to \
-             with_persisted_fee_window would gate on the raw 5_184_000s cadence and report \
-             CadenceNotElapsed here, restoring the no-op gate #3306 fixed. Asserting the exact \
+            "#3336: the production body's gate must track the CLAMPED cadence -- a body that gated \
+             on the raw 5_184_000s cadence would report CadenceNotElapsed here, restoring the \
+             no-op gate #3306 fixed. Asserting the exact \
              state, not merely `!= CadenceNotElapsed`: that exclusion is equally satisfied by \
              PersistedStateCorrupt and ChainSourceUnavailable, whose early returns also sit above \
              the window-roll block, so it would go vacuous the moment one of those fired instead. \
@@ -1467,11 +1475,12 @@ mod tests {
         assert_eq!(
             after_tick_2, after_tick_1,
             "#3336: the fee window must NOT have rolled yet -- only one clamped interval has \
-             elapsed against its raw 5_184_000s length. A transposed call would roll it here, \
-             doubling the operator's configured fee-window count. This assertion alone cannot \
+             elapsed against its raw 5_184_000s length. Sizing the window off the CLAMPED value \
+             instead rolls it here (left Some(5356800), right Some(2678400)), halving the window \
+             and doubling the operator's configured fee-window count. This assertion alone cannot \
              distinguish 'gate opened, window correctly held' from 'gate refused, window-roll \
              code never reached' (the gate's early return in `run_cycle` sits before the \
-             window-roll block) -- it is only meaningful paired with the state assertion above,\
+             window-roll block) -- it is only meaningful paired with the state assertion above, \
              which proves the gate did NOT refuse this cycle."
         );
 

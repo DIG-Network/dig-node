@@ -14,15 +14,24 @@ use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus};
 /// The two cadences [`ClaimEngine::with_persisted_fee_window`] needs, DERIVED together from the
 /// single raw configured value they both come from.
 ///
-/// # DIG-Network/dig_ecosystem#3336 (money) -- why one value, constructed one way
+/// # DIG-Network/dig_ecosystem#3336 (money) -- what this shape closes, and what it does not
 /// Earlier shapes handed the engine two numbers the CALLER had already chosen: first two bare
-/// `u64` arguments, then two distinct newtypes, then this struct with two typed fields. Each
-/// closed the *positional* swap and left the *value* swap open -- the caller still decided which
-/// number went into the fee-window slot, and writing the CLAMPED value there compiled and halved
-/// the fee window an operator configured. [`Self::from_raw`] removes the choice: the caller hands
-/// over the raw configured cadence once, and the clamp is applied here, on this side of the
-/// boundary. Both fields are private, so a struct literal is not an alternative path to them
-/// from outside this module.
+/// `u64` arguments, then two distinct newtypes, then this struct with two typed fields.
+///
+/// TYPE-ENFORCED: the gate and the fee window cannot disagree with EACH OTHER.
+/// [`Self::from_raw`] is the only constructor, both fields are private (so a struct literal is
+/// not an alternative path from outside this module), and it derives `gate_clamped` by clamping
+/// the very [`RawConfiguredCadence`] it stores as `fee_window_raw`. There is no pairing in which
+/// the window sizes off one number and the gate off another.
+///
+/// NOT type-enforced, and no type here can be: WHICH `u64` the call site labels raw.
+/// `from_raw(RawConfiguredCadence(cadence_seconds))` -- the already-clamped local instead of
+/// `cfg.cadence_seconds` -- has the same type and compiles. It halves the fee window: measured,
+/// the window rolls one tick early, `Some(5356800)` becoming `Some(2678400)`, exactly 2x the
+/// number of fee-budget windows the operator sized. Exactly ONE test catches that, and it is
+/// `driver::tests::the_production_body_tracks_the_clamped_gate_and_the_raw_fee_window`, which
+/// drives the production call site. Do not delete it on the belief that a type stands behind it
+/// -- nothing does.
 ///
 /// - `gate_clamped`: the schedule-CLAMPED cadence, in seconds, that [`ClaimEngine::run_cycle`]'s
 ///   restart-safety gate is measured against -- the same interval [`super::driver::drive`]
@@ -41,8 +50,10 @@ pub(crate) struct ClaimCadences {
 }
 
 impl ClaimCadences {
-    /// The ONLY constructor: the gate cadence is derived from the window's own raw source, so the
-    /// two can never be paired with each other's value.
+    /// The ONLY constructor. The gate cadence is derived from the window's own raw source, so the
+    /// two can never be paired with each other's value -- that much the types enforce. What
+    /// nothing here enforces is that `raw` really is the raw configured value; see the
+    /// [`ClaimCadences`] #3336 section for the single test that does.
     #[must_use]
     pub(crate) fn from_raw(raw: RawConfiguredCadence) -> Self {
         Self {
@@ -63,9 +74,10 @@ pub(crate) struct RawConfiguredCadence(pub(crate) u64);
 /// [`super::driver::drive`] actually sleeps on.
 ///
 /// # DIG-Network/dig_ecosystem#3336 -- why the field is private
-/// [`Self::clamp`] is the only way to produce this type, it is private to this module, and it
-/// always applies the bound. So the only cadence that can reach the gate is one this module
-/// clamped, and the only caller of `clamp` is [`ClaimCadences::from_raw`].
+/// [`Self::clamp`] is the only way to produce this type, it is private to this module, it always
+/// applies the bound, and the only caller of `clamp` is [`ClaimCadences::from_raw`]. So every
+/// number that reaches the gate has been through the clamp -- which bounds its MAGNITUDE and
+/// nothing else. It is not evidence about where the number came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClampedGateCadence(u64);
 
@@ -248,8 +260,9 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     ///
     /// # DIG-Network/dig_ecosystem#3336
     /// Takes ONE [`ClaimCadences`], which the caller can only build with
-    /// [`ClaimCadences::from_raw`] -- so the gate cadence and the fee-window cadence are derived
-    /// here, together, from the one raw config value, rather than chosen at the call site.
+    /// [`ClaimCadences::from_raw`] -- so the two cadences are derived together, from one value,
+    /// and cannot contradict each other. WHICH value that is is still the call site's choice, and
+    /// is test-guarded only; see the [`ClaimCadences`] #3336 section.
     ///
     /// `pub(crate)`, not `pub`: [`ClaimCadences`] is crate-private (it is the argument type, so a
     /// `pub` method taking it would be uncallable from outside anyway), and no out-of-crate
