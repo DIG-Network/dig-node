@@ -787,8 +787,11 @@ mod tests {
             return; // this machine HAS an operator wallet; the refusal branch is unreachable here
         }
         let handle = ClaimLoopHandle::default();
-        run_claim_driver(handle.clone(), Arc::new(dig_wallet::sage::chain::ChainTransport::new()))
-            .await;
+        run_claim_driver(
+            handle.clone(),
+            Arc::new(dig_wallet::sage::chain::ChainTransport::new()),
+        )
+        .await;
         assert_eq!(
             handle.refusal(),
             Some(ClaimDriverRefusal::NoOperatorWallet),
@@ -809,8 +812,11 @@ mod tests {
             return; // no operator wallet on this machine: the earlier refusal fires first
         }
         let handle = ClaimLoopHandle::default();
-        run_claim_driver(handle.clone(), Arc::new(dig_wallet::sage::chain::ChainTransport::new()))
-            .await;
+        run_claim_driver(
+            handle.clone(),
+            Arc::new(dig_wallet::sage::chain::ChainTransport::new()),
+        )
+        .await;
         assert_eq!(
             handle.refusal(),
             Some(ClaimDriverRefusal::ChainSourceUnbuildable),

@@ -19,7 +19,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chia_protocol::Bytes32;
 use dig_chainsource_interface::MockChainSource;
-use dig_node_service::rewards_claim::{ClaimChainPort, ClaimPortError, LauncherIndex, RealClaimChainPort};
+use dig_node_service::rewards_claim::{
+    ClaimChainPort, ClaimPortError, LauncherIndex, RealClaimChainPort,
+};
 use dig_rewards_coin::constants::PAYOUT_THRESHOLD_BASE_UNITS;
 
 use common::rewards_fixture::{launch_fixture, mock_chain_source};
@@ -100,8 +102,7 @@ async fn reserve_asset_id_and_payout_threshold_are_read_from_chain() {
         .await
         .expect("a real launched distributor's reserve asset id must read");
     assert_eq!(
-        reserve_asset_id,
-        fixture.constants.reserve_asset_id,
+        reserve_asset_id, fixture.constants.reserve_asset_id,
         "must be the fixture's OWN minted CAT asset id, not any literal"
     );
 
@@ -151,11 +152,10 @@ async fn kind_names_the_real_adapter() {
 /// could not be read".
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_source_reports_unavailable_everywhere() {
-    let source = MockChainSource::new().fail_with(
-        dig_chainsource_interface::ChainSourceError::Transport(
+    let source =
+        MockChainSource::new().fail_with(dig_chainsource_interface::ChainSourceError::Transport(
             "simulated transport failure".into(),
-        ),
-    );
+        ));
     let port = RealClaimChainPort::new(Arc::new(source), FixtureLauncherIndex(vec![]));
 
     let launcher_id = Bytes32::from([1u8; 32]);

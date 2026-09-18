@@ -214,7 +214,9 @@ where
         })
         .await
         .map_err(|join_error| {
-            ClaimPortError::Other(bounded(format!("reserve_asset_id task panicked: {join_error}")))
+            ClaimPortError::Other(bounded(format!(
+                "reserve_asset_id task panicked: {join_error}"
+            )))
         })?
     }
 
@@ -236,7 +238,9 @@ where
         })
         .await
         .map_err(|join_error| {
-            ClaimPortError::Other(bounded(format!("payout_threshold task panicked: {join_error}")))
+            ClaimPortError::Other(bounded(format!(
+                "payout_threshold task panicked: {join_error}"
+            )))
         })?
     }
 
