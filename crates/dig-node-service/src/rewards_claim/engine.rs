@@ -92,7 +92,7 @@ impl ClampedGateCadence {
     /// arm. The two agree only under an unnamed-until-now precondition -- a zero never reaches
     /// here, because [`super::config::RewardsClaimConfig::load_from`] floors `cadence_seconds` to
     /// `super::config::CLAIM_CADENCE_FLOOR_SECONDS` (60) on its parse-success path and yields
-    /// `CLAIM_CADENCE_SECONDS_DEFAULT` (86_400) on its other two exits. A caller that builds a
+    /// `CLAIM_CADENCE_SECONDS_DEFAULT` (86_400) on its other four exits. A caller that builds a
     /// cadence from anything but a loaded config breaks that precondition, and the equivalence
     /// with it.
     fn clamp(raw: RawConfiguredCadence) -> Self {

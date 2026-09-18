@@ -1067,7 +1067,7 @@ mod tests {
     ///   by tick 3 (elapsed is 2 clamped intervals, 5_356_800s, past the raw boundary).
     ///
     /// This test builds its `ClaimCadences` itself, so it stays GREEN if the PRODUCTION call site
-    /// in [`run_claim_driver_in`] is mutated to pass the clamped local instead of the raw
+    /// in [`run_claim_driver_in_with_clock`] is mutated to pass the clamped local instead of the raw
     /// `cfg.cadence_seconds`. It is therefore not a duplicate of
     /// [`the_production_body_tracks_the_clamped_gate_and_the_raw_fee_window`], which is the only
     /// test that catches that mutation -- do not delete that one as redundant with this one.
