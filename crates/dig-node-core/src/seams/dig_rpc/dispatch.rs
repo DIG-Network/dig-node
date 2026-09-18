@@ -1003,9 +1003,12 @@ impl RpcDispatch for Node {
             // service's `POST /` and the in-process FFI), NEVER over the mTLS peer surface (absent
             // from `is_peer_reachable_method`; `reward_methods_tier_guard.rs` fails closed on that).
             // NOT token-gated (dig_ecosystem#3351): an OPEN read of public on-chain state keyed by
-            // the caller's `launcher_id`, answered to any caller that reaches `POST /` with no
-            // token — the disclosure rule SPEC §7.2 applies to every non-`control.*` method, the
-            // same reason `control.wallet.balance` is open (#1851, `control::is_open_control_read`).
+            // the caller's `launcher_id`, answered to any caller that reaches `POST /` with no token:
+            // only the `control.` prefix is token-gated (SPEC §7.2 `is_control_method`; §5.5
+            // `requires_auth: false` for every non-`control.*` method), and the read passes §7.2's
+            // WHO-NAMES-THE-SUBJECT test the same way `control.wallet.balance` does (#1851,
+            // `control::is_open_control_read`): the subject arrives in the request, so the answer
+            // discloses no node-local association.
             // Pinned by `reward_distributor_reads_answer_on_post_slash_without_a_token` in
             // dig-node-service `tests/server.rs`. Chain-derived state ONLY — never the local prover
             // loop's self-reported state (see `GetRewardProverStatus` above for that). Goes entirely
