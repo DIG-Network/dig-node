@@ -67,11 +67,17 @@ pub trait ClaimChainPort: Send + Sync {
         payout_puzzle_hash: Bytes32,
         fee_mojos: u64,
     ) -> Result<(), ClaimPortError>;
+
+    /// Names which adapter is installed, so a running node's own log line can say which one --
+    /// no default impl, so a new adapter must choose its own name rather than silently inheriting
+    /// one that describes a different adapter.
+    fn kind(&self) -> &'static str;
 }
 
-/// The production adapter until DIG-Network/dig_ecosystem#3249 lands: reports
-/// [`ClaimPortError::Unavailable`] on every call and runs zero cycles — the named state
-/// `ChainSourceUnavailable` (see the module doc), never a silent no-op.
+/// The engine's test double: reports [`ClaimPortError::Unavailable`] on every call and runs zero
+/// cycles — the named state `ChainSourceUnavailable` (see the module doc), never a silent no-op.
+/// No production path constructs this any more; the real adapter is
+/// [`super::chain_port::RealClaimChainPort`].
 pub struct UnavailableClaimChainPort;
 
 #[async_trait]
@@ -114,6 +120,10 @@ impl ClaimChainPort for UnavailableClaimChainPort {
         _fee_mojos: u64,
     ) -> Result<(), ClaimPortError> {
         Err(ClaimPortError::Unavailable)
+    }
+
+    fn kind(&self) -> &'static str {
+        "unavailable"
     }
 }
 

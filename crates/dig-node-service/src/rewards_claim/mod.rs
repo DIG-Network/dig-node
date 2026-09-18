@@ -19,33 +19,33 @@
 //!
 //! # The chain seam
 //!
-//! `dig-rewards-coin` is v0.1.3, published on crates.io, and still SPEC-only (`src/` is
-//! `error.rs` + `lib.rs`); its driver is
-//! DIG-Network/dig_ecosystem#3249, still open. So the whole engine here is built against the narrow
-//! [`ClaimChainPort`] trait derived from the SPEC's described surface, tested with a full in-memory
-//! fake, and the production adapter — until #3249 ships — is [`UnavailableClaimChainPort`], which
-//! reports the named state `ChainSourceUnavailable` and runs zero cycles. This mirrors #3250's own
-//! `UnavailableChainPort` exactly. When #3249 lands, one adapter is written against
-//! `ClaimChainPort` and nothing above this seam changes.
+//! `dig-rewards-coin` 0.7.0 ships a real driver (`discovery`, `payout`, `state`), landed by
+//! DIG-Network/dig_ecosystem#3249. The production adapter is [`RealClaimChainPort`]
+//! (`chain_port.rs`), built over this node's own corroborated chain source; [`UnavailableClaimChainPort`]
+//! remains only as the engine's test double now. Two methods still refuse rather than answer:
+//! `own_entry`'s accrued amount and `submit_initiate_payout` both need a chain-backed spendable
+//! entry slot and a real reserve lineage proof that 0.7.0's read model does not carry — see
+//! `chain_port.rs`'s own module doc, blocked on DIG-Network/dig_ecosystem#3356.
 //!
 //! A silent no-op that reported progress instead would be the exact defect this ticket exists to
-//! prevent (SPEC §2.4): with the unavailable adapter wired, zero claims IS the true state, so the
-//! status surface must say so by name, not by omission.
+//! prevent (SPEC §2.4): a refused method reports a NAMED [`ClaimPortError`] or
+//! [`super::types::ClaimOutcome::Faulted`], never a fabricated success.
 //!
 //! # Wired into node startup (DIG-Network/dig_ecosystem#3268)
 //! [`driver::spawn_claim_driver_from_config`] is the one call `dig-node-service::server`'s
 //! `serve_with_shutdown` makes: it is gated on `RewardsClaimConfig::enabled` AND
 //! `Config::enable_chain_sync` (the same flag `spawn_collateral_census` and
 //! `mirror::bond_verify::spawn_bond_verifier_install` already gate on), and when both are true it
-//! spawns a detached task that drives [`ClaimEngine::run_cycle`] on a jittered cadence forever.
-//! [`driver::handle`] is the IN-PROCESS accessor a future RPC can read once DIG-Network/dig_ecosystem#3249
-//! lands a real [`ClaimChainPort`] adapter and the `ClaimStatus` wire semantics are re-derived
-//! against it — this module puts nothing on the wire itself (see `driver`'s own module doc for
-//! why). Until #3249 lands, the only production adapter is still [`UnavailableClaimChainPort`], so
-//! every real cycle reports [`ClaimLoopState::ChainSourceUnavailable`] and submits nothing — the
-//! honest state, not a silent no-op.
+//! spawns a detached task that drives [`ClaimEngine::run_cycle`] on a jittered cadence forever,
+//! over a [`RealClaimChainPort`] built from `state.wallet_chain`'s corroborated source. If that
+//! source cannot be built (offline, no peers), the loop reports the named refusal
+//! `ClaimDriverRefusal::ChainSourceUnbuildable` and runs zero cycles rather than installing
+//! [`UnavailableClaimChainPort`] silently. [`driver::handle`] is the IN-PROCESS accessor a future
+//! RPC can read against the `ClaimStatus` wire semantics — this module puts nothing on the wire
+//! itself (see `driver`'s own module doc for why).
 
 mod cadence;
+mod chain_port;
 mod config;
 mod driver;
 mod engine;
@@ -59,6 +59,7 @@ pub use config::{
     RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT, CLAIM_CYCLE_FEE_BUDGET_MOJOS_DEFAULT,
     CLAIM_FEE_CEILING_MOJOS_DEFAULT,
 };
+pub use chain_port::{HintedLauncherIndex, LauncherIndex, RealClaimChainPort};
 pub use driver::{handle, spawn_claim_driver_from_config, ClaimDriverRefusal, ClaimLoopHandle};
 pub use engine::ClaimEngine;
 pub use hints::{DistributorHint, DistributorHintSource, NoHintSource};

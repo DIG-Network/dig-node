@@ -153,6 +153,12 @@ chia-sdk-types = { version = "=0.36.0", features = ["chip-0035", "action-layer"]
 # Same chia 0.36 set as the crates around it -- a mirror coin's collateral is $DIG, so the returned
 # coin sits at the CAT puzzle hash and never at the bare owner puzzle hash.
 chia-puzzle-types = "=0.36.1"
+# `SINGLETON_LAUNCHER_HASH` -- `rewards_claim::chain_port::HintedLauncherIndex` filters a hinted
+# coin candidate down to an actual singleton-launcher coin before ever handing its id to
+# `dig_rewards_coin::discover_distributor` (dig_ecosystem#3347). Promoted from a dev-only edge to
+# a normal one at the SAME `=0.20.3` pin the dev-dependency section below already resolves -- no
+# second version enters the tree.
+chia-puzzles = "=0.20.3"
 # `ToTreeHash`, to re-derive an owner puzzle hash from the key a mirror create is built for, so the
 # signer can refuse spends that are not its own wallet's rather than trusting the call site to have
 # passed the right key. Part of the same chia set above -- `chia-sdk-driver` already resolves it.
@@ -202,11 +208,14 @@ dig-wallet = { path = "../dig-wallet" }
 # `ChainSource`. This is the ONE crate in this seam that depends on it — `dig-node-core`
 # deliberately does not (see `dig_node_core::rewards::port`'s module doc) because the
 # reader takes a `ChainSource` it has no seam to hold; this crate does (`dig-wallet`'s
-# `CorroboratedChainSource`), so the adapter lives here. `0.5`, not the `0.4` the ticket
-# names (stale): 0.5.0 is the release that already refuses `epoch_seconds == 0` inside
-# `read_distributor` itself (see `rewards/chain_source.rs`'s module doc for the exact
-# line, and why this crate ALSO refuses at its own edge as defence in depth).
-dig-rewards-coin = "0.5"
+# `CorroboratedChainSource`), so the adapter lives here. 0.5.0 was the release that first
+# refused `epoch_seconds == 0` inside `read_distributor` itself (see `rewards/chain_source.rs`'s
+# module doc for the exact line, and why this crate ALSO refuses at its own edge as defence in
+# depth). Bumped to 0.7 for dig_ecosystem#3347: 0.7.0 adds `discovery::discover_distributor` (the
+# real parent-spend memo decode `rewards_claim::chain_port::RealClaimChainPort` needs) and stays
+# on the same chia 0.36 line (chia-sdk-driver `=0.36.0`, chia-protocol 0.36.1) every other
+# dependency in this crate is already pinned to.
+dig-rewards-coin = "0.7"
 
 # HTTP stack: the same axum/tokio the node itself uses, so there is one async runtime
 # and one server framework across the node and the service shell. `ws` enables

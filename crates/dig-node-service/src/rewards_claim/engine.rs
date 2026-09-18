@@ -231,6 +231,13 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         self.rotation_cursor
     }
 
+    /// Which [`ClaimChainPort`] adapter this engine is driving against -- surfaced so a running
+    /// node's own log line can name it (DIG-Network/dig_ecosystem#3347), never left implicit.
+    #[must_use]
+    pub fn port_kind(&self) -> &'static str {
+        self.port.kind()
+    }
+
     /// F7: restores the persisted aggregate-fee-budget window and cadence clock from `dir` and
     /// arms this engine to keep persisting them there after every submission and every completed
     /// cycle (never batched to cycle end — see [`Self::run_cycle`]'s "F7" doc section for why).
@@ -1140,6 +1147,10 @@ mod tests {
                 .push((launcher_id, payout_puzzle_hash, fee_mojos));
             Ok(())
         }
+
+        fn kind(&self) -> &'static str {
+            "test-fake"
+        }
     }
 
     fn one_distributor(
@@ -1452,6 +1463,10 @@ mod tests {
             ) -> Result<(), ClaimPortError> {
                 self.0.submit_initiate_payout(l, p, f).await
             }
+
+            fn kind(&self) -> &'static str {
+                self.0.kind()
+            }
         }
 
         let port = HintOnlyPort(FakeChainPort::new(vec![d]));
@@ -1536,6 +1551,10 @@ mod tests {
             _fee_mojos: u64,
         ) -> Result<(), ClaimPortError> {
             Err(ClaimPortError::Other("unreachable".into()))
+        }
+
+        fn kind(&self) -> &'static str {
+            "test-always-faulting-discovery"
         }
     }
 
@@ -2850,6 +2869,10 @@ mod tests {
                 .submit_initiate_payout(launcher_id, payout_puzzle_hash, fee_mojos)
                 .await
         }
+
+        fn kind(&self) -> &'static str {
+            self.inner.kind()
+        }
     }
 
     /// **F1 regression -- the anti-latch test.** `ChainSourceUnavailable` must be a PER-CYCLE
@@ -2954,6 +2977,10 @@ mod tests {
             self.inner
                 .submit_initiate_payout(launcher_id, payout_puzzle_hash, fee_mojos)
                 .await
+        }
+
+        fn kind(&self) -> &'static str {
+            self.inner.kind()
         }
     }
 
@@ -3073,6 +3100,10 @@ mod tests {
             self.0
                 .submit_initiate_payout(launcher_id, payout_puzzle_hash, fee_mojos)
                 .await
+        }
+
+        fn kind(&self) -> &'static str {
+            self.0.kind()
         }
     }
 
