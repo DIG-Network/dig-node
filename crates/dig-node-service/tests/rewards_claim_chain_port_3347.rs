@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chia_protocol::Bytes32;
+use chia_puzzle_types::cat::CatArgs;
 use dig_chainsource_interface::MockChainSource;
 use dig_node_service::rewards_claim::{
     run_claim_driver_in, ClaimChainPort, ClaimLoopHandle, ClaimLoopState, ClaimPortError,
@@ -24,7 +25,10 @@ use dig_node_service::rewards_claim::{
 use dig_rewards_coin::constants::PAYOUT_THRESHOLD_BASE_UNITS;
 use dig_wallet::sage::spend::MockBroadcaster;
 
-use common::rewards_fixture::{launch_fixture, mock_chain_source};
+use common::rewards_fixture::{
+    launch_fixture, launch_funded_admitted_fixture, mock_chain_source,
+    mock_chain_source_for_funded_fixture,
+};
 
 /// An index that proposes exactly the ids it is built with -- no re-verification of its own; that
 /// is `RealClaimChainPort::discover_distributors`'s job, which this file's tests exercise.
@@ -273,5 +277,93 @@ async fn a_driven_cycle_over_the_real_adapter_reaches_a_real_chain_read() {
     assert!(
         status.last_cycle_at.is_some(),
         "a cycle must have actually completed, not merely been scheduled"
+    );
+}
+
+/// The 3347 closure proof at the adapter level: `submit_initiate_payout` over a real, funded,
+/// admitted distributor builds a bundle the SIMULATOR actually accepts (never merely well-formed),
+/// and the entry's own accrued figure -- read via `own_entry` -- is what the simulator pays out.
+/// Ported from `dig-rewards-coin` 0.8.0's own
+/// `tests/simulator.rs::a_claim_built_entirely_from_a_chain_read_is_accepted`, with the production
+/// `RealClaimChainPort` (built with a `MockBroadcaster`) standing in for that test's hand-rolled
+/// `initiate_payout` + `finish_spend` + `spend_coins` call sequence.
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_initiate_payout_builds_a_bundle_the_simulator_accepts_and_pays_the_entry() {
+    let payout_puzzle_hash = Bytes32::from([0x77; 32]);
+    let mut fixture = launch_funded_admitted_fixture(payout_puzzle_hash)
+        .expect("a funded, admitted distributor launches cleanly in the simulator");
+    let source = mock_chain_source_for_funded_fixture(&fixture);
+    let broadcaster = Arc::new(MockBroadcaster::default());
+    let port = RealClaimChainPort::new(
+        Arc::new(source),
+        FixtureLauncherIndex(vec![fixture.launcher_id]),
+        broadcaster.clone(),
+    );
+
+    assert_eq!(
+        fixture.payout_puzzle_hash, payout_puzzle_hash,
+        "the fixture must have admitted the same payout puzzle hash this test drives against"
+    );
+
+    let entry = port
+        .own_entry(fixture.launcher_id, payout_puzzle_hash)
+        .await
+        .expect("the admitted entry must read")
+        .expect("the fixture admitted exactly this payout puzzle hash");
+    assert!(
+        entry.accrued_base_units > 0,
+        "half an epoch with one entry must have accrued something"
+    );
+    assert!(
+        entry.accrued_base_units >= fixture.constants.payout_threshold,
+        "the fixture must fund enough that the entry clears its own launched threshold"
+    );
+
+    port.submit_initiate_payout(fixture.launcher_id, payout_puzzle_hash, 0)
+        .await
+        .expect("a real accrued entry, submitted with zero fee, must build and broadcast");
+
+    // Fee refused -- `required_fee_mojos` is 0 for this adapter and it has nowhere to pay one from.
+    let fee_refusal = port
+        .submit_initiate_payout(fixture.launcher_id, payout_puzzle_hash, 1)
+        .await;
+    assert!(
+        matches!(fee_refusal, Err(ClaimPortError::Other(_))),
+        "a non-zero fee must be refused by name, never silently dropped or paid"
+    );
+
+    let sent = broadcaster.sent.lock().expect("the broadcaster's own lock");
+    assert_eq!(
+        sent.len(),
+        1,
+        "exactly one bundle must have been broadcast -- the fee-refused call must never reach \
+         the broadcaster"
+    );
+    let bundle = sent[0].clone();
+    drop(sent);
+
+    // The assertion the whole test exists for: a bundle built by the PRODUCTION adapter is
+    // actually ACCEPTED by the simulator, never merely well-formed.
+    fixture
+        .sim
+        .spend_coins(bundle.coin_spends.clone(), &[])
+        .expect("the production adapter's bundle must be accepted by the simulator");
+
+    let reserve_asset_id = fixture.constants.reserve_asset_id;
+    let payee_puzzle_hash: Bytes32 =
+        CatArgs::curry_tree_hash(reserve_asset_id, payout_puzzle_hash.into()).into();
+    let children = fixture.sim.children(fixture.reserve_tip_id);
+    let payee_coins: Vec<_> = children
+        .iter()
+        .filter(|state| state.coin.puzzle_hash == payee_puzzle_hash)
+        .collect();
+    assert_eq!(
+        payee_coins.len(),
+        1,
+        "exactly one payee CAT coin must exist on chain at the entry's payout puzzle hash"
+    );
+    assert_eq!(
+        payee_coins[0].coin.amount, entry.accrued_base_units,
+        "the payee's on-chain CAT coin amount must equal the entry's own accrued figure"
     );
 }
