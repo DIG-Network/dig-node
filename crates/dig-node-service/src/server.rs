@@ -2241,10 +2241,11 @@ where
     // `rewards_claim::RealClaimChainPort`, built from this node's own `wallet_chain`'s
     // corroborated source (the same call the funder-side reward-chain-port install above makes) --
     // a source that fails to build is a named refusal (`ClaimDriverRefusal::ChainSourceUnbuildable`),
-    // never a silent `UnavailableClaimChainPort` substitution. Two methods still refuse:
-    // `own_entry`'s accrued amount and `submit_initiate_payout`, both blocked on
-    // DIG-Network/dig_ecosystem#3356 (`dig-rewards-coin` 0.7.0 has no chain-backed spendable entry
-    // slot or real reserve lineage proof).
+    // paired with a real `Broadcaster` (`ClaimDriverRefusal::BroadcasterUnbuildable` if that fails
+    // to build), never a silent `UnavailableClaimChainPort` substitution. `own_entry`'s accrued
+    // amount and `submit_initiate_payout` are both real over `dig-rewards-coin` 0.8.0
+    // (DIG-Network/dig_ecosystem#3347): a chain-backed spendable entry slot via
+    // `dig_rewards_coin::ChainEntrySlotSource` and a real `InitiatePayout` broadcast.
     crate::rewards_claim::spawn_claim_driver_from_config(
         config.enable_chain_sync,
         state.wallet_chain.clone(),

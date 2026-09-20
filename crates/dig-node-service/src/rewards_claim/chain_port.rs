@@ -1,48 +1,44 @@
 //! `RealClaimChainPort` -- the production [`super::port::ClaimChainPort`] adapter over
-//! `dig-rewards-coin` 0.7.0 and this node's own [`dig_wallet::sage::corroborated_source::CorroboratedChainSource`]
+//! `dig-rewards-coin` 0.8.0 and this node's own [`dig_wallet::sage::corroborated_source::CorroboratedChainSource`]
 //! (DIG-Network/dig_ecosystem#3347). Until this file existed, [`super::port::UnavailableClaimChainPort`]
 //! was the ONLY adapter this trait had, so every real cycle reported `ChainSourceUnavailable` --
 //! see [`super`]'s module doc, "the chain seam", for the history.
 //!
-//! # What this adapter can and cannot do on 0.7.0
+//! # Every method is a real chain read or a real broadcast
 //!
 //! Discovery, comment resolution, the reserve asset id and the chain-curried payout threshold are
-//! all real reads. [`RealClaimChainPort::own_entry`] is real for `payout_puzzle_hash` and
-//! `counter`, but 0.7.0 exposes no PUBLIC, PURE function that computes an entry's accrued amount
-//! without also spending it -- the only place that arithmetic exists is
-//! `chia_sdk_driver::RewardDistributorInitiatePayoutAction::spend`, which mutates the distributor
-//! and the entry slot as a side effect of computing it. Re-deriving the same
-//! `shares * (cumulative_payout - initial_cumulative_payout) / precision` formula here would be
-//! the exact hand-rolled-money-arithmetic-in-the-wrong-layer shape DIG-Network/dig_ecosystem#3286
-//! named, and returning `0` would misreport a real accrual as "below threshold" -- so `own_entry`
-//! refuses instead, naming the blocker: `dig_ecosystem#3356`.
+//! all real reads. [`RealClaimChainPort::own_entry`] reads the real accrued amount via
+//! `dig_rewards_coin::accrued_base_units` -- a public, pure function 0.8.0 added -- applied to a
+//! freshly chain-read entry slot; it never fabricates `0` and never caches across calls.
+//! [`RealClaimChainPort::submit_initiate_payout`] builds and broadcasts a real `InitiatePayout`
+//! spend: the entry slot comes ONLY from `dig_rewards_coin::ChainEntrySlotSource` (a fresh,
+//! authenticated chain walk, `SPEC.md` §12.5 clause 3a on `dig-rewards-coin`'s side) -- **never**
+//! `RewardDistributor::created_slot_value_to_slot` on a chain-rebuilt distributor, which derives a
+//! well-formed but PHANTOM `LineageProof` for a slot an earlier generation created
+//! (DIG-Network/dig_ecosystem#3357). `initiate_payout`'s returned `conditions` are a CALLER-SIDE
+//! assertion for a coin the caller would add to the same bundle; this adapter adds no coin of its
+//! own (no fee coin, no key, nothing to sign -- `required_fee_mojos` is `0`), so it drops them --
+//! the simulator acceptance test in `tests/rewards_claim_chain_port_3347.rs` is the proof the
+//! resulting bundle is accepted without them.
 //!
-//! [`RealClaimChainPort::submit_initiate_payout`] refuses for a harder reason: 0.7.0's
-//! `payout::initiate_payout` needs an `EntrySlotSource` yielding a `Slot<RewardDistributorEntrySlotValue>`
-//! carrying the CREATING distributor coin's real `LineageProof`, and `state.rs`'s own module doc
-//! says its reader fabricates a dummy (all-zero) `LineageProof` for exactly this shape --
-//! `DistributorSnapshot` is a READ model, not a spendable one. Building a real proof here would be
-//! reconstructing spend machinery in the wrong crate layer, so this refuses too, naming the same
-//! blocker.
-//!
-//! Both refusals map, via `ClaimEngine`, to a NAMED `ClaimOutcome::Faulted` -- visible on the
-//! status surface, never a silent success.
+//! A silent no-op would be the exact defect this ticket exists to prevent -- a refused method
+//! reports a NAMED [`ClaimPortError`], never a fabricated success.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chia_protocol::Bytes32;
+use chia_protocol::{Bytes32, SpendBundle};
+use chia_sdk_driver::{RewardDistributorConstants, RewardDistributorState, SpendContext};
+use chia_sdk_types::puzzles::RewardDistributorEntrySlotValue;
 use dig_chainsource_interface::ChainSource;
+use dig_rewards_coin::payout::{initiate_payout, PayoutOutcome};
+use dig_rewards_coin::ChainEntrySlotSource;
+use dig_wallet::sage::spend::Broadcaster;
 
 use crate::rewards::chain_source::{read_distributor_guarded, GuardedReadError};
 
 use super::port::{ClaimChainPort, ClaimPortError};
 use super::types::{DiscoveredDistributor, OwnEntry};
-
-/// DIG-Network/dig_ecosystem#3356 -- the `dig-rewards-coin` 0.8.0 ticket this adapter's two
-/// unbuildable methods are blocked on. Named once so both refusal strings (and any future one)
-/// stay in agreement about which ticket to point at.
-const ACCRUED_AND_SUBMIT_BLOCKER: &str = "dig_ecosystem#3356";
 
 /// The longest a chain port's own error text is allowed to carry before it is truncated -- the
 /// same 200-char discipline [`super::types::ClaimOutcome::Faulted`]'s `reason` field documents,
@@ -83,6 +79,7 @@ where
 {
     source: Arc<S>,
     index: I,
+    broadcaster: Arc<dyn Broadcaster>,
 }
 
 impl<S, I> RealClaimChainPort<S, I>
@@ -90,32 +87,45 @@ where
     S: ChainSource + Send + Sync + 'static,
     I: LauncherIndex,
 {
-    /// Wraps an already-constructed chain source and launcher index. Takes the source by `Arc`
-    /// (mirroring `rewards::chain_port::RealRewardsChainPort::new`) since a blocking read clones it
-    /// into a `spawn_blocking` closure on every call.
+    /// Wraps an already-constructed chain source, launcher index and broadcaster. Takes the source
+    /// by `Arc` (mirroring `rewards::chain_port::RealRewardsChainPort::new`) since a blocking read
+    /// clones it into a `spawn_blocking` closure on every call.
     #[must_use]
-    pub fn new(source: Arc<S>, index: I) -> Self {
-        Self { source, index }
+    pub fn new(source: Arc<S>, index: I, broadcaster: Arc<dyn Broadcaster>) -> Self {
+        Self {
+            source,
+            index,
+            broadcaster,
+        }
     }
 }
 
 /// The pure decision [`RealClaimChainPort::own_entry`] delegates to once it has (or has not)
 /// found a matching entry slot -- kept separate from the chain read itself so it is unit-testable
-/// without a real launch: `None` means no entry, `Ok(None)`, honestly; `Some(entry)` means an
-/// entry WAS found, and this refuses by name rather than fabricating an accrued amount (see this
-/// module's doc). Never returns `Ok(Some(_))` for a found entry -- 0.7.0 has no public, pure
-/// function to compute what it has accrued without also spending it.
+/// without a real launch: no entry means `Ok(None)`, honestly; a found entry's accrual is computed
+/// via `dig_rewards_coin::accrued_base_units`, the puzzle's own arithmetic (never re-derived here,
+/// per DIG-Network/dig_ecosystem#3286) -- `None` from THAT means the arithmetic overflowed or
+/// underflowed, refused by name rather than reported as a fabricated `0`.
 fn own_entry_from_slot(
-    entry: Option<&chia_sdk_types::puzzles::RewardDistributorEntrySlotValue>,
+    payout_puzzle_hash: Bytes32,
+    constants: &RewardDistributorConstants,
+    state: &RewardDistributorState,
+    entry: Option<&RewardDistributorEntrySlotValue>,
 ) -> Result<Option<OwnEntry>, ClaimPortError> {
-    if entry.is_none() {
+    let Some(entry) = entry else {
         return Ok(None);
+    };
+
+    match dig_rewards_coin::accrued_base_units(constants, state, entry) {
+        Some(accrued_base_units) => Ok(Some(OwnEntry {
+            payout_puzzle_hash,
+            counter: entry.counter,
+            accrued_base_units,
+        })),
+        None => Err(ClaimPortError::Other(bounded(
+            "accrued amount overflowed the puzzle's arithmetic; refusing rather than reporting 0",
+        ))),
     }
-    Err(ClaimPortError::Other(bounded(format!(
-        "accrued amount unreadable on dig-rewards-coin 0.7.0: no public function computes \
-         an entry's accrued base units without spending it; blocked on \
-         {ACCRUED_AND_SUBMIT_BLOCKER}"
-    ))))
 }
 
 /// Maps a [`GuardedReadError`] (this crate's own `epoch_seconds == 0` refusal, or
@@ -278,11 +288,14 @@ where
                 })?;
 
             let entry = snapshot
-                .slots()
-                .entries
-                .iter()
-                .find(|e| e.payout_puzzle_hash == payout_puzzle_hash);
-            own_entry_from_slot(entry)
+                .entry_slot(payout_puzzle_hash)
+                .map_err(rewards_error_to_claim_port_error)?;
+            own_entry_from_slot(
+                payout_puzzle_hash,
+                &snapshot.distributor().info.constants,
+                &snapshot.distributor().info.state,
+                entry.map(|slot| &slot.info.value),
+            )
         })
         .await
         .map_err(|join_error| {
@@ -300,18 +313,87 @@ where
 
     async fn submit_initiate_payout(
         &self,
-        _launcher_id: Bytes32,
-        _payout_puzzle_hash: Bytes32,
-        _fee_mojos: u64,
+        launcher_id: Bytes32,
+        payout_puzzle_hash: Bytes32,
+        fee_mojos: u64,
     ) -> Result<(), ClaimPortError> {
-        // See this module's doc: 0.7.0 exposes no chain-backed spendable entry slot and no real
-        // reserve lineage proof -- `DistributorSnapshot` is a read model. Reconstructing one here
-        // would be hand-rolled spend machinery in the wrong crate layer. Refused, named, visible
-        // via `ClaimEngine`'s mapping to `ClaimOutcome::Faulted` -- never a silent success.
-        Err(ClaimPortError::Other(bounded(format!(
-            "payout submission blocked on {ACCRUED_AND_SUBMIT_BLOCKER}: dig-rewards-coin 0.7.0 has \
-             no chain-backed spendable entry slot or real reserve lineage proof"
-        ))))
+        // This adapter attaches no fee coin (see `required_fee_mojos`'s doc): a non-zero fee has
+        // nowhere to be paid from here, so refuse by name rather than silently dropping it.
+        if fee_mojos != 0 {
+            return Err(ClaimPortError::Other(bounded(
+                "this adapter attaches no fee coin; required_fee_mojos is 0 and a non-zero fee \
+                 cannot be paid here",
+            )));
+        }
+
+        let source = Arc::clone(&self.source);
+        let built = tokio::task::spawn_blocking(move || {
+            // SPEC §10.2/§12.5: fresh on EVERY call -- the same guarded, authenticated read every
+            // other method here uses.
+            let snapshot = read_distributor_guarded(source.as_ref(), launcher_id)
+                .map_err(guarded_read_error_to_claim_port_error)?
+                .ok_or_else(|| {
+                    ClaimPortError::Other(bounded("not a distributor: launcher coin unspent"))
+                })?;
+
+            // NEVER `snapshot.distributor().created_slot_value_to_slot(..)` -- that derives a
+            // well-formed but PHANTOM `LineageProof` for a slot an earlier generation created
+            // (DIG-Network/dig_ecosystem#3357, this module's doc). The entry slot for THIS spend
+            // comes only from a fresh `ChainEntrySlotSource` walk.
+            let mut distributor = snapshot.distributor().clone();
+            let mut ctx = SpendContext::new();
+            let slots = ChainEntrySlotSource::new(source.as_ref(), launcher_id);
+
+            let outcome = initiate_payout(&mut ctx, &mut distributor, &slots, payout_puzzle_hash)
+                .map_err(rewards_error_to_claim_port_error)?;
+
+            let (_conditions, amount_base_units, counter) =
+                match outcome {
+                    PayoutOutcome::Paid {
+                        conditions,
+                        amount_base_units,
+                        counter,
+                    } => (conditions, amount_base_units, counter),
+                    PayoutOutcome::EntrySlotAbsent => return Err(ClaimPortError::Other(bounded(
+                        "entry slot absent at submission; the entry set moved between own_entry \
+                         and submit",
+                    ))),
+                };
+            // `conditions` is a CALLER-SIDE assertion for a coin the caller would add to the same
+            // bundle (this module's doc) -- this adapter adds none, so it is dropped here rather
+            // than threaded into a bundle with nothing to satisfy it.
+
+            let (_distributor, signature) = distributor
+                .finish_spend(&mut ctx, vec![])
+                .map_err(|error| ClaimPortError::Other(bounded(error.to_string())))?;
+
+            let bundle = SpendBundle::new(ctx.take(), signature);
+            Ok::<_, ClaimPortError>((bundle, amount_base_units, counter))
+        })
+        .await
+        .map_err(|join_error| {
+            ClaimPortError::Other(bounded(format!(
+                "submit_initiate_payout task panicked: {join_error}"
+            )))
+        })??;
+
+        let (bundle, amount_base_units, counter) = built;
+        let coin_spends = bundle.coin_spends.len();
+
+        self.broadcaster.broadcast(&bundle).await.map_err(|error| {
+            ClaimPortError::Other(bounded(format!("broadcast refused: {error}")))
+        })?;
+
+        tracing::info!(
+            target: "rewards_claim",
+            %launcher_id,
+            amount_base_units,
+            counter,
+            coin_spends,
+            "InitiatePayout submitted"
+        );
+
+        Ok(())
     }
 }
 
@@ -378,38 +460,138 @@ impl LauncherIndex for HintedLauncherIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chia_sdk_driver::{RewardDistributorType, RoundRewardInfo, RoundTimeInfo};
     use chia_sdk_types::puzzles::RewardDistributorEntrySlotValue;
+
+    fn some_constants(precision: u64) -> RewardDistributorConstants {
+        RewardDistributorConstants {
+            launcher_id: Bytes32::new([1; 32]),
+            reward_distributor_type: RewardDistributorType::Managed {
+                manager_singleton_launcher_id: Bytes32::new([7; 32]),
+            },
+            fee_payout_puzzle_hash: Bytes32::new([2; 32]),
+            epoch_seconds: 1,
+            precision,
+            max_seconds_offset: 0,
+            payout_threshold: 0,
+            require_payout_approval: false,
+            fee_bps: 0,
+            withdrawal_share_bps: 0,
+            reserve_asset_id: Bytes32::new([3; 32]),
+            reserve_inner_puzzle_hash: Bytes32::new([4; 32]),
+            reserve_full_puzzle_hash: Bytes32::new([5; 32]),
+        }
+    }
+
+    fn some_state(cumulative_payout: u128) -> RewardDistributorState {
+        RewardDistributorState {
+            total_reserves: 0,
+            active_shares: 0,
+            round_reward_info: RoundRewardInfo {
+                cumulative_payout,
+                remaining_rewards: 0,
+            },
+            round_time_info: RoundTimeInfo {
+                last_update: 0,
+                epoch_end: 0,
+            },
+        }
+    }
 
     /// No matching entry slot reads `Ok(None)` -- "no entry", never fabricated.
     #[test]
     fn no_entry_reads_ok_none() {
-        assert_eq!(own_entry_from_slot(None), Ok(None));
+        let constants = some_constants(100);
+        let state = some_state(1_000);
+        assert_eq!(
+            own_entry_from_slot(Bytes32::from([0x42; 32]), &constants, &state, None),
+            Ok(None)
+        );
     }
 
-    /// SHAPE guard: a FOUND entry slot must refuse by name (blocked on
-    /// `dig_ecosystem#3356`), never fabricate `Some(OwnEntry { accrued_base_units: 0, .. })`.
-    /// Mutation-proved: replacing this function's `Err(..)` arm with
-    /// `Ok(Some(OwnEntry { payout_puzzle_hash: entry.payout_puzzle_hash, counter: entry.counter,
-    /// accrued_base_units: 0 }))` turns this test red.
+    /// SHAPE guard: a found entry's accrued amount comes from `dig_rewards_coin::accrued_base_units`
+    /// -- the puzzle's own arithmetic -- never a fabricated `0`. Mutation-proved: replacing this
+    /// function's `Some(accrued_base_units)` arm with `Some(0)` turns this test red.
     #[test]
-    fn a_found_entry_refuses_rather_than_fabricates_zero_accrued() {
+    fn a_found_entry_reports_the_real_accrued_amount_never_zero() {
+        let constants = some_constants(100);
+        let state = some_state(1_000);
+        let payout_puzzle_hash = Bytes32::from([0x42; 32]);
         let entry = RewardDistributorEntrySlotValue {
             counter: 1,
-            payout_puzzle_hash: Bytes32::from([0x42; 32]),
-            initial_cumulative_payout: 0,
-            shares: 1,
+            payout_puzzle_hash,
+            initial_cumulative_payout: 200,
+            shares: 10,
         };
-        let result = own_entry_from_slot(Some(&entry));
+
+        let result = own_entry_from_slot(payout_puzzle_hash, &constants, &state, Some(&entry));
+
+        // (1_000 - 200) * 10 / 100 = 80 -- the puzzle's own figure, mirroring
+        // `dig_rewards_coin::payout`'s own equality-tested arithmetic.
+        assert_eq!(
+            result,
+            Ok(Some(OwnEntry {
+                payout_puzzle_hash,
+                counter: 1,
+                accrued_base_units: 80,
+            }))
+        );
+    }
+
+    /// A diverged read (`state`'s cumulative payout behind the entry's own) refuses rather than
+    /// reporting a wrapped or fabricated figure.
+    #[test]
+    fn a_diverged_read_refuses_rather_than_wraps() {
+        let constants = some_constants(100);
+        let state = some_state(50);
+        let payout_puzzle_hash = Bytes32::from([0x42; 32]);
+        let entry = RewardDistributorEntrySlotValue {
+            counter: 1,
+            payout_puzzle_hash,
+            initial_cumulative_payout: 200,
+            shares: 10,
+        };
+
+        let result = own_entry_from_slot(payout_puzzle_hash, &constants, &state, Some(&entry));
         assert!(
             matches!(result, Err(ClaimPortError::Other(_))),
-            "a found entry must refuse by name, never answer Ok at all: got {result:?}"
+            "an overflowed/underflowed accrual must refuse by name, never answer Ok at all: \
+             got {result:?}"
         );
-        let Err(ClaimPortError::Other(message)) = result else {
-            unreachable!()
-        };
+    }
+
+    /// #3357's phantom-slot trap: `RewardDistributor::created_slot_value_to_slot` on a
+    /// chain-rebuilt distributor derives a well-formed but PHANTOM `LineageProof` for a slot an
+    /// earlier generation created. This adapter must read every entry slot through
+    /// `ChainEntrySlotSource`/`snapshot.entry_slot(..)`, never that method. A literal-string check
+    /// rather than a compile-time one so it still catches the call even via a re-export or a fully
+    /// qualified path.
+    ///
+    /// Scoped to CODE lines only (comment lines, `//`/`///`/`//!`, are dropped first) -- the module
+    /// doc and this file's own inline warning both name the trap in prose, which must not trip the
+    /// guard meant to catch an actual call. Also scoped to the file's own non-test region: this
+    /// test's name/assertion text contains the literal string, so an unscoped scan over the whole
+    /// file would be self-defeating.
+    #[test]
+    fn adapter_source_never_calls_created_slot_value_to_slot() {
+        let production_src = production_region(include_str!("chain_port.rs"));
+        let code_only: String = production_src
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            message.contains(ACCRUED_AND_SUBMIT_BLOCKER),
-            "the refusal must name the blocker ticket: {message}"
+            !code_only.contains("created_slot_value_to_slot"),
+            "chain_port.rs must never call created_slot_value_to_slot -- #3357 phantom-slot trap"
         );
+    }
+
+    /// The slice of this source file before its own `#[cfg(test)]` module -- i.e. what actually
+    /// ships. Falls back to the whole file if there is no such marker.
+    fn production_region(source: &str) -> &str {
+        match source.find("#[cfg(test)]") {
+            Some(test_module_start) => &source[..test_module_start],
+            None => source,
+        }
     }
 }

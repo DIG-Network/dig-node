@@ -7,10 +7,8 @@
 //! Discovery (through an untrusted [`LauncherIndex`]), `reserve_asset_id`, and `payout_threshold`
 //! are all real reads, proven end to end against a real launch. `own_entry` for an unknown payout
 //! puzzle hash correctly reads `Ok(None)` (there is no entry keyed to a hash this fixture never
-//! launched with). This file does NOT prove the accrued-amount or submit paths -- see
-//! `chain_port.rs`'s own module doc for why both are structurally blocked on
-//! DIG-Network/dig_ecosystem#3356 on `dig-rewards-coin` 0.7.0, and refuse by name rather than
-//! guessing.
+//! launched with). The accrued-amount and submit paths are proven separately, against a funded,
+//! admitted distributor -- see this file's own DIG-Network/dig_ecosystem#3347 tests below.
 
 mod common;
 
@@ -24,6 +22,7 @@ use dig_node_service::rewards_claim::{
     LauncherIndex, RealClaimChainPort, RewardsClaimConfig,
 };
 use dig_rewards_coin::constants::PAYOUT_THRESHOLD_BASE_UNITS;
+use dig_wallet::sage::spend::MockBroadcaster;
 
 use common::rewards_fixture::{launch_fixture, mock_chain_source};
 
@@ -48,6 +47,7 @@ async fn discover_distributors_returns_exactly_the_real_launch() {
     let port = RealClaimChainPort::new(
         Arc::new(source),
         FixtureLauncherIndex(vec![fixture.launcher_id]),
+        Arc::new(MockBroadcaster::default()),
     );
 
     let discovered = port
@@ -72,6 +72,7 @@ async fn a_bogus_index_entry_is_dropped_not_echoed() {
     let port = RealClaimChainPort::new(
         Arc::new(source),
         FixtureLauncherIndex(vec![bogus_id, fixture.launcher_id]),
+        Arc::new(MockBroadcaster::default()),
     );
 
     let discovered = port
@@ -96,6 +97,7 @@ async fn reserve_asset_id_and_payout_threshold_are_read_from_chain() {
     let port = RealClaimChainPort::new(
         Arc::new(source),
         FixtureLauncherIndex(vec![fixture.launcher_id]),
+        Arc::new(MockBroadcaster::default()),
     );
 
     let reserve_asset_id = port
@@ -112,9 +114,15 @@ async fn reserve_asset_id_and_payout_threshold_are_read_from_chain() {
         .await
         .expect("a real launched distributor's payout threshold must read");
     assert_eq!(
-        payout_threshold, PAYOUT_THRESHOLD_BASE_UNITS,
-        "must be the chain-curried value the fixture launched with, read via \
+        payout_threshold, fixture.constants.payout_threshold,
+        "must be the chain-curried value the fixture launched with (deliberately NOT \
+         PAYOUT_THRESHOLD_BASE_UNITS, the default -- see rewards_fixture.rs), read via \
          dig_rewards_coin::payout::payout_threshold_base_units, never a literal"
+    );
+    assert_ne!(
+        payout_threshold, PAYOUT_THRESHOLD_BASE_UNITS,
+        "the fixture must diverge from the default, or a port that ignored the chain and \
+         returned the default constant would read as correct by coincidence"
     );
 }
 
@@ -127,6 +135,7 @@ async fn own_entry_reads_none_for_an_unknown_payout_puzzle_hash() {
     let port = RealClaimChainPort::new(
         Arc::new(source),
         FixtureLauncherIndex(vec![fixture.launcher_id]),
+        Arc::new(MockBroadcaster::default()),
     );
 
     let entry = port
@@ -144,6 +153,7 @@ async fn kind_names_the_real_adapter() {
     let port = RealClaimChainPort::new(
         Arc::new(source),
         FixtureLauncherIndex(vec![fixture.launcher_id]),
+        Arc::new(MockBroadcaster::default()),
     );
     assert_eq!(port.kind(), "real-corroborated");
 }
@@ -157,7 +167,11 @@ async fn a_failing_source_reports_unavailable_everywhere() {
         MockChainSource::new().fail_with(dig_chainsource_interface::ChainSourceError::Transport(
             "simulated transport failure".into(),
         ));
-    let port = RealClaimChainPort::new(Arc::new(source), FixtureLauncherIndex(vec![]));
+    let port = RealClaimChainPort::new(
+        Arc::new(source),
+        FixtureLauncherIndex(vec![]),
+        Arc::new(MockBroadcaster::default()),
+    );
 
     let launcher_id = Bytes32::from([1u8; 32]);
     assert_eq!(
@@ -191,6 +205,7 @@ async fn a_driven_cycle_over_the_real_adapter_reaches_a_real_chain_read() {
     let port = RealClaimChainPort::new(
         Arc::new(source),
         FixtureLauncherIndex(vec![fixture.launcher_id]),
+        Arc::new(MockBroadcaster::default()),
     );
 
     let state_dir_guard = tempfile::tempdir().expect("a temp state dir");

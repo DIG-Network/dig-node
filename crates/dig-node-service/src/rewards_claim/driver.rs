@@ -90,6 +90,10 @@ pub enum ClaimDriverRefusal {
     /// no chain source to build [`super::RealClaimChainPort`] with. Never silently substitutes
     /// [`super::UnavailableClaimChainPort`] instead (SHAPE: a named refusal, not a fallback).
     ChainSourceUnbuildable,
+    /// `enabled = true`, chain sync is on, this node has a chain source, but
+    /// `wallet_chain.broadcaster(..)` itself errored -- there is no broadcaster to submit a real
+    /// `InitiatePayout` spend with. Never silently proceeds without one.
+    BroadcasterUnbuildable,
 }
 
 impl ClaimLoopHandle {
@@ -316,11 +320,12 @@ pub fn own_payout_puzzle_hash(owner_inner_puzzle_hash: Bytes32) -> Bytes32 {
 fn production_claim_port(
     source: std::sync::Arc<dig_wallet::sage::corroborated_source::CorroboratedChainSource>,
     index: HintedLauncherIndex,
+    broadcaster: std::sync::Arc<dyn dig_wallet::sage::spend::Broadcaster>,
 ) -> RealClaimChainPort<
     dig_wallet::sage::corroborated_source::CorroboratedChainSource,
     HintedLauncherIndex,
 > {
-    let port = RealClaimChainPort::new(source, index);
+    let port = RealClaimChainPort::new(source, index, broadcaster);
     port
 }
 
@@ -358,9 +363,27 @@ async fn run_claim_driver(
             return;
         }
     };
+
+    // A named refusal, never a silent proceed-without-broadcast -- see `ClaimDriverRefusal`'s doc.
+    let broadcaster = match wallet_chain.broadcaster().await {
+        Ok(broadcaster) => broadcaster,
+        Err(error) => {
+            tracing::warn!(
+                target: "rewards_claim",
+                %error,
+                "could not build a broadcaster, so this node has no way to submit a real \
+                 InitiatePayout spend; the claim loop is NOT started -- rewards_claim.enabled \
+                 stays true but no cycle will ever run until this node can broadcast"
+            );
+            handle.set_refusal(ClaimDriverRefusal::BroadcasterUnbuildable);
+            return;
+        }
+    };
+
     let port = production_claim_port(
         std::sync::Arc::new(source),
         HintedLauncherIndex::new(wallet_chain),
+        broadcaster,
     );
 
     run_claim_driver_in(
@@ -866,7 +889,11 @@ mod tests {
         }
 
         let source = dig_chainsource_interface::MockChainSource::new();
-        let port = RealClaimChainPort::new(Arc::new(source), NoLauncherIds);
+        let port = RealClaimChainPort::new(
+            Arc::new(source),
+            NoLauncherIds,
+            Arc::new(dig_wallet::sage::spend::MockBroadcaster::default()),
+        );
         assert_eq!(
             ClaimChainPort::kind(&port),
             "real-corroborated",
@@ -917,6 +944,7 @@ mod tests {
     const _: fn(
         std::sync::Arc<dig_wallet::sage::corroborated_source::CorroboratedChainSource>,
         HintedLauncherIndex,
+        std::sync::Arc<dyn dig_wallet::sage::spend::Broadcaster>,
     ) -> RealClaimChainPort<
         dig_wallet::sage::corroborated_source::CorroboratedChainSource,
         HintedLauncherIndex,

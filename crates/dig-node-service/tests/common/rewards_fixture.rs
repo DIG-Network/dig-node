@@ -150,7 +150,11 @@ pub fn launch_fixture() -> Result<LaunchedFixture, Box<dyn std::error::Error>> {
         TEST_EPOCH_SECONDS,
         u64::MAX,
         MAX_SECONDS_OFFSET,
-        PAYOUT_THRESHOLD_BASE_UNITS,
+        // Deliberately NOT `PAYOUT_THRESHOLD_BASE_UNITS` (the distributor's default launch
+        // value) -- #3347 mutation proof (iv) needs a fixture whose on-chain threshold DIFFERS
+        // from the default, or a port that ignores the chain and returns the default constant
+        // reads as correct by coincidence. See `reserve_asset_id_and_payout_threshold_are_read_from_chain`.
+        PAYOUT_THRESHOLD_BASE_UNITS.saturating_add(1_000_000),
         false,
         0,
         WITHDRAWAL_SHARE_BPS,

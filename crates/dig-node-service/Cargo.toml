@@ -211,11 +211,12 @@ dig-wallet = { path = "../dig-wallet" }
 # `CorroboratedChainSource`), so the adapter lives here. 0.5.0 was the release that first
 # refused `epoch_seconds == 0` inside `read_distributor` itself (see `rewards/chain_source.rs`'s
 # module doc for the exact line, and why this crate ALSO refuses at its own edge as defence in
-# depth). Bumped to 0.7 for dig_ecosystem#3347: 0.7.0 adds `discovery::discover_distributor` (the
-# real parent-spend memo decode `rewards_claim::chain_port::RealClaimChainPort` needs) and stays
-# on the same chia 0.36 line (chia-sdk-driver `=0.36.0`, chia-protocol 0.36.1) every other
-# dependency in this crate is already pinned to.
-dig-rewards-coin = "0.7"
+# depth). Bumped to 0.8 for dig_ecosystem#3347: 0.8.0 adds `payout::accrued_base_units` (a public,
+# pure accrual read) and `payout::ChainEntrySlotSource` (a chain-backed `EntrySlotSource`), which
+# is what makes `RealClaimChainPort::own_entry` and `submit_initiate_payout` real instead of
+# refusals. Still the same chia 0.36 line (chia-sdk-driver `=0.36.0`, chia-protocol 0.36.1) every
+# other dependency in this crate is already pinned to.
+dig-rewards-coin = "0.8"
 
 # HTTP stack: the same axum/tokio the node itself uses, so there is one async runtime
 # and one server framework across the node and the service shell. `ws` enables

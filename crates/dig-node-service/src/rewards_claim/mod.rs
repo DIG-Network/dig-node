@@ -19,13 +19,15 @@
 //!
 //! # The chain seam
 //!
-//! `dig-rewards-coin` 0.7.0 ships a real driver (`discovery`, `payout`, `state`), landed by
-//! DIG-Network/dig_ecosystem#3249. The production adapter is [`RealClaimChainPort`]
-//! (`chain_port.rs`), built over this node's own corroborated chain source; [`UnavailableClaimChainPort`]
-//! remains only as the engine's test double now. Two methods still refuse rather than answer:
-//! `own_entry`'s accrued amount and `submit_initiate_payout` both need a chain-backed spendable
-//! entry slot and a real reserve lineage proof that 0.7.0's read model does not carry — see
-//! `chain_port.rs`'s own module doc, blocked on DIG-Network/dig_ecosystem#3356.
+//! `dig-rewards-coin` 0.8.0 ships a real driver (`discovery`, `payout`, `state`), landed by
+//! DIG-Network/dig_ecosystem#3249 and extended for DIG-Network/dig_ecosystem#3347. The production
+//! adapter is [`RealClaimChainPort`] (`chain_port.rs`), built over this node's own corroborated
+//! chain source and a real [`dig_wallet::sage::spend::Broadcaster`]; [`UnavailableClaimChainPort`]
+//! remains only as the engine's test double. `own_entry` reads the real accrued amount via
+//! `dig_rewards_coin::accrued_base_units`, and `submit_initiate_payout` builds, signs and
+//! broadcasts a real `InitiatePayout` spend via `dig_rewards_coin::payout::initiate_payout` and
+//! `RewardDistributor::finish_spend` — see `chain_port.rs`'s own module doc for the #3357
+//! phantom-slot trap both must avoid.
 //!
 //! A silent no-op that reported progress instead would be the exact defect this ticket exists to
 //! prevent (SPEC §2.4): a refused method reports a NAMED [`ClaimPortError`] or
