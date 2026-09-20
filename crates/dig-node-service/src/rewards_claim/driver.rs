@@ -21,13 +21,15 @@
 //! runs a cycle, then repeats — the counter is genuinely `0` until the first interval elapses.
 //!
 //! # No RPC surface here (SCOPE)
-//! [`handle`] is an IN-PROCESS accessor only — a future RPC (blocked on DIG-Network/dig_ecosystem#3249
-//! re-deriving the `ClaimStatus` wire semantics) can read it; this module puts nothing on the wire
-//! and adds no RPC method, dispatch-table row or handler.
+//! [`handle`] is an IN-PROCESS accessor only — no RPC reads it yet; this module puts nothing on
+//! the wire and adds no RPC method, dispatch-table row or handler.
 //!
-//! # The only production adapter is [`super::UnavailableClaimChainPort`]
-//! #3249 has not landed, so every real cycle this driver runs reports [`super::ClaimLoopState::ChainSourceUnavailable`]
-//! and submits nothing — the honest state, not an invented adapter.
+//! # The production adapter is [`super::RealClaimChainPort`]
+//! Built from `wallet_chain.corroborated_chain_source(..)` -- the SAME call `server.rs`'s
+//! funder-side install already makes -- paired with [`super::HintedLauncherIndex`]. If that source
+//! cannot be built (offline, no peers), [`run_claim_driver`] records
+//! [`ClaimDriverRefusal::ChainSourceUnbuildable`] and never builds an engine at all, rather than
+//! falling back to [`super::UnavailableClaimChainPort`] silently.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,10 +39,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chia_protocol::Bytes32;
 
 use super::cadence::{next_interval_seconds, JitterSource};
+use super::chain_port::{HintedLauncherIndex, RealClaimChainPort};
 use super::config::{RewardsClaimConfig, CLAIM_CADENCE_SECONDS_DEFAULT};
 use super::engine::{ClaimCadences, ClaimEngine, RawConfiguredCadence};
 use super::hints::{DistributorHintSource, NoHintSource};
-use super::port::{ClaimChainPort, UnavailableClaimChainPort};
+use super::port::ClaimChainPort;
+#[cfg(test)]
+use super::port::UnavailableClaimChainPort;
 use super::types::{ClaimLoopState, ClaimStatus};
 
 /// The in-process accessor onto the running claim loop (SCOPE: never exposed over the wire here).
@@ -80,6 +85,15 @@ pub enum ClaimDriverRefusal {
     /// `enabled = true`, chain sync is on, but this node has no operator wallet to derive
     /// [`own_payout_puzzle_hash`] from -- there is no puzzle hash to build an engine with at all.
     NoOperatorWallet,
+    /// `enabled = true`, chain sync is on, this node HAS an operator wallet, but
+    /// `wallet_chain.corroborated_chain_source(..)` itself errored (offline, no peers) -- there is
+    /// no chain source to build [`super::RealClaimChainPort`] with. Never silently substitutes
+    /// [`super::UnavailableClaimChainPort`] instead (SHAPE: a named refusal, not a fallback).
+    ChainSourceUnbuildable,
+    /// `enabled = true`, chain sync is on, this node has a chain source, but
+    /// `wallet_chain.broadcaster(..)` itself errored -- there is no broadcaster to submit a real
+    /// `InitiatePayout` spend with. Never silently proceeds without one.
+    BroadcasterUnbuildable,
 }
 
 impl ClaimLoopHandle {
@@ -139,7 +153,7 @@ impl ClaimLoopHandle {
 /// "not spawned yet" as a THIRD state distinct from `Idle` -- it is the same state, honestly.
 static HANDLE: OnceLock<ClaimLoopHandle> = OnceLock::new();
 
-/// The in-process accessor a future RPC (blocked on #3249) reads. Never wired onto the wire here.
+/// The in-process accessor a future RPC could read. Never wired onto the wire here.
 #[must_use]
 pub fn handle() -> ClaimLoopHandle {
     HANDLE.get_or_init(ClaimLoopHandle::default).clone()
@@ -162,6 +176,7 @@ async fn drive<P, H>(
     P: ClaimChainPort,
     H: DistributorHintSource,
 {
+    let adapter = engine.port_kind();
     loop {
         let interval = next_interval_seconds(cadence_seconds, jitter_seconds, jitter);
         tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -169,15 +184,15 @@ async fn drive<P, H>(
         engine.run_cycle(t).await;
         let status = engine.status();
         handle.record(status);
-        log_cycle(&status, handle.cycles_driven(), &adjustment);
+        log_cycle(&status, handle.cycles_driven(), &adjustment, adapter);
     }
 }
 
 /// Emit the ONE record that makes a driven cycle observable in a running node.
 ///
 /// Without this, the whole status surface has no reader in a shipped binary: [`handle`] is
-/// in-process only and deliberately carries no RPC (deferred to DIG-Network/dig_ecosystem#3249),
-/// so a node whose claim loop can never claim a single reward would produce output IDENTICAL to a
+/// in-process only and deliberately carries no RPC yet, so a node whose claim loop can never
+/// claim a single reward would produce output IDENTICAL to a
 /// healthy one -- silence. A status nobody can read is a doc claim, not a measurement.
 ///
 /// [`ClaimLoopState::Nominal`] is the routine case (`info`). Every other state means this peer is
@@ -188,7 +203,12 @@ async fn drive<P, H>(
 /// named on every single cycle line, not just in the once-per-spawn WARN `sanitized_schedule`
 /// itself emits. Without this, an operator reading any one cycle log line has no way to learn the
 /// schedule in force differs from the one they configured.
-fn log_cycle(status: &ClaimStatus, cycles_driven: u64, adjustment: &ScheduleAdjustment) {
+fn log_cycle(
+    status: &ClaimStatus,
+    cycles_driven: u64,
+    adjustment: &ScheduleAdjustment,
+    adapter: &'static str,
+) {
     let (configured_cadence_seconds, effective_cadence_seconds) = adjustment
         .cadence
         .map_or((None, None), |(c, e)| (Some(c), Some(e)));
@@ -199,6 +219,7 @@ fn log_cycle(status: &ClaimStatus, cycles_driven: u64, adjustment: &ScheduleAdju
     if status.state == ClaimLoopState::Nominal {
         tracing::info!(
             target: "rewards_claim",
+            adapter,
             state = ?status.state,
             cycles_driven,
             distributors_known = status.distributors_known,
@@ -213,6 +234,7 @@ fn log_cycle(status: &ClaimStatus, cycles_driven: u64, adjustment: &ScheduleAdju
     } else {
         tracing::warn!(
             target: "rewards_claim",
+            adapter,
             state = ?status.state,
             cycles_driven,
             distributors_known = status.distributors_known,
@@ -281,15 +303,36 @@ pub fn own_payout_puzzle_hash(owner_inner_puzzle_hash: Bytes32) -> Bytes32 {
 
 /// The real, detached claim-loop task: derive this node's own payout puzzle hash from its operator
 /// wallet (the same public, no-unseal-required derivation [`crate::server::spawn_mirror_passes`]
-/// falls back to), load [`RewardsClaimConfig`], build a [`ClaimEngine`] against the only
-/// production adapter that exists ([`UnavailableClaimChainPort`] -- see this module's doc), and
-/// drive it forever.
+/// falls back to), load [`RewardsClaimConfig`], build a [`ClaimEngine`] against the production
+/// [`super::RealClaimChainPort`] adapter (see this module's doc), and drive it forever.
 ///
 /// Never called directly by `server.rs` -- see [`spawn_claim_driver_if`], the tested gate that
 /// decides WHETHER to call this. `handle` is INJECTED (never the [`handle`] singleton read
 /// directly) so a test can drive this against a private, non-shared handle instead of the
 /// process-wide one.
-async fn run_claim_driver(handle: ClaimLoopHandle) {
+/// The production chain-port factory, split out of [`run_claim_driver`] so its return TYPE can be
+/// pinned by `const _: fn(...) = production_claim_port;` in the test module -- a retyped factory
+/// (e.g. one that starts returning [`super::UnavailableClaimChainPort`]) is then a COMPILE error,
+/// not just a string-guard failure. See `run_claim_drivers_happy_path_actually_constructs_the_real_adapter`
+/// for the companion source-reading guard, which catches a bypass of this factory entirely.
+#[allow(clippy::let_and_return)] // the local `port` binding is the literal string the guard test
+                                 // in `production_region` searches this source for.
+fn production_claim_port(
+    source: std::sync::Arc<dig_wallet::sage::corroborated_source::CorroboratedChainSource>,
+    index: HintedLauncherIndex,
+    broadcaster: std::sync::Arc<dyn dig_wallet::sage::spend::Broadcaster>,
+) -> RealClaimChainPort<
+    dig_wallet::sage::corroborated_source::CorroboratedChainSource,
+    HintedLauncherIndex,
+> {
+    let port = RealClaimChainPort::new(source, index, broadcaster);
+    port
+}
+
+async fn run_claim_driver(
+    handle: ClaimLoopHandle,
+    wallet_chain: std::sync::Arc<dig_wallet::sage::chain::ChainTransport>,
+) {
     let paths = dig_wallet::autoseed::default_paths();
     let Some(owner_inner_puzzle_hash) = dig_wallet::operator_wallet::operator_puzzle_hash(&paths)
     else {
@@ -304,10 +347,50 @@ async fn run_claim_driver(handle: ClaimLoopHandle) {
     };
     let own_payout_puzzle_hash = own_payout_puzzle_hash(owner_inner_puzzle_hash);
 
+    // The SAME call server.rs's funder-side install already makes -- see this module's doc.
+    // A named refusal, never a silent fallback to `UnavailableClaimChainPort`.
+    let source = match wallet_chain.corroborated_chain_source(tokio::runtime::Handle::current()) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!(
+                target: "rewards_claim",
+                %error,
+                "could not build a corroborated chain source, so this node has no chain to claim \
+                 against; the claim loop is NOT started -- rewards_claim.enabled stays true but no \
+                 cycle will ever run until this node has peer reads to corroborate against"
+            );
+            handle.set_refusal(ClaimDriverRefusal::ChainSourceUnbuildable);
+            return;
+        }
+    };
+
+    // A named refusal, never a silent proceed-without-broadcast -- see `ClaimDriverRefusal`'s doc.
+    let broadcaster = match wallet_chain.broadcaster().await {
+        Ok(broadcaster) => broadcaster,
+        Err(error) => {
+            tracing::warn!(
+                target: "rewards_claim",
+                %error,
+                "could not build a broadcaster, so this node has no way to submit a real \
+                 InitiatePayout spend; the claim loop is NOT started -- rewards_claim.enabled \
+                 stays true but no cycle will ever run until this node can broadcast"
+            );
+            handle.set_refusal(ClaimDriverRefusal::BroadcasterUnbuildable);
+            return;
+        }
+    };
+
+    let port = production_claim_port(
+        std::sync::Arc::new(source),
+        HintedLauncherIndex::new(wallet_chain),
+        broadcaster,
+    );
+
     run_claim_driver_in(
         &crate::state::state_dir(),
         own_payout_puzzle_hash,
-        UnavailableClaimChainPort,
+        dig_mirror_coin::DIG_ASSET_ID,
+        port,
         handle,
     )
     .await;
@@ -320,9 +403,8 @@ async fn run_claim_driver(handle: ClaimLoopHandle) {
 /// tested gate and the tested [`drive`] loop was previously the only UNTESTED link in the chain,
 /// and an untested joint is exactly how #594's claim engine shipped complete and inert.
 ///
-/// Generic over `P` so a test can drive this real body against a fake port; production always
-/// passes [`UnavailableClaimChainPort`] (see the module doc -- there is deliberately no second
-/// production adapter until #3249 lands).
+/// Generic over `P` so a test can drive this real body against a fake port; production passes
+/// [`super::RealClaimChainPort`] (see the module doc).
 /// The largest schedule value this driver will honour, in seconds: 31 days. Chosen to sit
 /// comfortably above every documented default -- [`CLAIM_CADENCE_SECONDS_DEFAULT`] is 86,400s
 /// (1 day) and [`CLAIM_JITTER_SECONDS_DEFAULT`] is 3,600s (1 hour) -- and above any plausible
@@ -431,9 +513,15 @@ fn sanitized_schedule(cadence_seconds: u64, jitter_seconds: u64) -> (u64, u64, S
     (cadence, jitter, adjustment)
 }
 
-async fn run_claim_driver_in<P>(
+/// Public ONLY for DIG-Network/dig_ecosystem#3347's acceptance integration test
+/// (`tests/rewards_claim_chain_port_3347.rs`), which needs to drive the real production body end
+/// to end against a real `RealClaimChainPort`. Not part of this crate's public API otherwise --
+/// every other caller reaches this exclusively through [`spawn_claim_driver_from_config`].
+#[doc(hidden)]
+pub async fn run_claim_driver_in<P>(
     state_dir: &Path,
     own_payout_puzzle_hash: Bytes32,
+    reserve_asset_id: Bytes32,
     port: P,
     handle: ClaimLoopHandle,
 ) where
@@ -442,6 +530,7 @@ async fn run_claim_driver_in<P>(
     run_claim_driver_in_with_clock(
         state_dir,
         own_payout_puzzle_hash,
+        reserve_asset_id,
         port,
         handle,
         unix_now_seconds,
@@ -469,6 +558,7 @@ async fn run_claim_driver_in<P>(
 async fn run_claim_driver_in_with_clock<P>(
     state_dir: &Path,
     own_payout_puzzle_hash: Bytes32,
+    reserve_asset_id: Bytes32,
     port: P,
     handle: ClaimLoopHandle,
     now: impl FnMut() -> u64,
@@ -496,7 +586,7 @@ async fn run_claim_driver_in_with_clock<P>(
         own_payout_puzzle_hash,
         cfg.max_fee_mojos,
         cfg.max_cycle_fee_budget_mojos,
-        dig_mirror_coin::DIG_ASSET_ID,
+        reserve_asset_id,
     )
     .with_rotation_cursor(cfg.rotation_cursor)
     // F2 (money): ONE argument, and it must be the RAW `cfg.cadence_seconds`. `ClaimCadences`
@@ -528,8 +618,11 @@ async fn run_claim_driver_in_with_clock<P>(
 /// Spawn the real claim-loop task, detached, against `handle` -- injected, never the [`handle`]
 /// singleton read from inside, so the only place the process-wide singleton is named is
 /// [`spawn_claim_driver_from_config`].
-fn spawn_claim_driver(handle: ClaimLoopHandle) {
-    tokio::spawn(run_claim_driver(handle));
+fn spawn_claim_driver(
+    handle: ClaimLoopHandle,
+    wallet_chain: std::sync::Arc<dig_wallet::sage::chain::ChainTransport>,
+) {
+    tokio::spawn(run_claim_driver(handle, wallet_chain));
 }
 
 /// Why [`spawn_claim_driver_if`] declined to spawn -- named so the caller can log a reason instead
@@ -596,14 +689,20 @@ fn spawn_claim_driver_if(
 
 /// Reads [`RewardsClaimConfig::load`] (the node's own state-dir config) and `enable_chain_sync`,
 /// and calls [`spawn_claim_driver_if`] -- the exact one call `serve_with_shutdown` makes.
-pub fn spawn_claim_driver_from_config(enable_chain_sync: bool) {
+/// `wallet_chain` is this node's own wallet chain transport, the SAME `Arc` `server.rs` holds as
+/// `state.wallet_chain` -- threaded through to [`run_claim_driver`] to build the production
+/// [`super::RealClaimChainPort`].
+pub fn spawn_claim_driver_from_config(
+    enable_chain_sync: bool,
+    wallet_chain: std::sync::Arc<dig_wallet::sage::chain::ChainTransport>,
+) {
     let cfg = RewardsClaimConfig::load();
     // The ONE place the process-wide singleton is read: everything below it takes an injected
     // handle so it stays testable in-process.
     let process_handle = handle();
     let driver_handle = process_handle.clone();
     spawn_claim_driver_if(cfg.enabled, enable_chain_sync, &process_handle, move || {
-        spawn_claim_driver(driver_handle);
+        spawn_claim_driver(driver_handle, wallet_chain);
     });
 }
 
@@ -738,7 +837,11 @@ mod tests {
             return; // this machine HAS an operator wallet; the refusal branch is unreachable here
         }
         let handle = ClaimLoopHandle::default();
-        run_claim_driver(handle.clone()).await;
+        run_claim_driver(
+            handle.clone(),
+            Arc::new(dig_wallet::sage::chain::ChainTransport::new()),
+        )
+        .await;
         assert_eq!(
             handle.refusal(),
             Some(ClaimDriverRefusal::NoOperatorWallet),
@@ -746,6 +849,135 @@ mod tests {
         );
         assert_eq!(handle.cycles_driven(), 0, "and it must drive no cycle");
     }
+
+    /// SHAPE guard: when this node HAS an operator wallet but its wallet chain transport cannot
+    /// build a corroborated source (offline, no peers -- `ChainTransport::new()`'s bare default),
+    /// `run_claim_driver` must record the named `ChainSourceUnbuildable` refusal, never fall back
+    /// to `UnavailableClaimChainPort` silently. Skipped on a machine with no operator wallet at
+    /// all -- that is the OTHER, earlier refusal, proven above.
+    #[tokio::test]
+    async fn an_unbuildable_chain_source_is_a_distinct_named_refusal() {
+        let paths = dig_wallet::autoseed::default_paths();
+        if dig_wallet::operator_wallet::operator_puzzle_hash(&paths).is_none() {
+            return; // no operator wallet on this machine: the earlier refusal fires first
+        }
+        let handle = ClaimLoopHandle::default();
+        run_claim_driver(
+            handle.clone(),
+            Arc::new(dig_wallet::sage::chain::ChainTransport::new()),
+        )
+        .await;
+        assert_eq!(
+            handle.refusal(),
+            Some(ClaimDriverRefusal::ChainSourceUnbuildable),
+            "a chain transport with no peer reads must be a named refusal, not a silent \
+             UnavailableClaimChainPort substitution"
+        );
+        assert_eq!(handle.cycles_driven(), 0, "and it must drive no cycle");
+    }
+
+    /// SHAPE (6d, the #3310-class trap "compiles, nothing constructs it"): [`RealClaimChainPort`]
+    /// itself, built against a mock source with the fixture-provided [`LauncherIndex`], names
+    /// itself `"real-corroborated"`. This does NOT exercise `run_claim_driver`'s own construction
+    /// line -- see `run_claim_drivers_happy_path_actually_constructs_the_real_adapter` below for
+    /// the guard on THAT (this machine has no operator wallet, so `run_claim_driver`'s happy path
+    /// cannot be driven end to end here; that guard reads its own shipped source instead).
+    #[tokio::test]
+    async fn the_production_factory_builds_a_real_corroborated_port() {
+        struct NoLauncherIds;
+        #[async_trait]
+        impl super::super::chain_port::LauncherIndex for NoLauncherIds {
+            async fn launcher_ids(&self) -> Result<Vec<Bytes32>, ClaimPortError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let source = dig_chainsource_interface::MockChainSource::new();
+        let port = RealClaimChainPort::new(
+            Arc::new(source),
+            NoLauncherIds,
+            Arc::new(dig_wallet::sage::spend::MockBroadcaster::default()),
+        );
+        assert_eq!(
+            ClaimChainPort::kind(&port),
+            "real-corroborated",
+            "the production adapter must name itself, not inherit UnavailableClaimChainPort's name"
+        );
+    }
+
+    /// SHAPE guard: `run_claim_driver`'s happy-path construction line must actually build
+    /// [`RealClaimChainPort`], never [`UnavailableClaimChainPort`] -- checked by reading this
+    /// module's own SHIPPED source (the production region, before this `#[cfg(test)]` module),
+    /// the same shape `rewards_chain_port_a3.rs`'s `install_reward_chain_port_refuses_a_second_install_with_a_warn`
+    /// and `chain_port.rs`'s `adapter_source_never_imports_withdraw_committed_incentives` already
+    /// use for a call site no test on this machine can drive behaviourally (this machine has no
+    /// operator wallet, so `run_claim_driver`'s happy path -- past both named refusals -- is
+    /// unreachable here). Mutation-proved: replacing the production `let port =
+    /// RealClaimChainPort::new(` line with `UnavailableClaimChainPort` turns this assertion red.
+    #[test]
+    fn run_claim_drivers_happy_path_actually_constructs_the_real_adapter() {
+        let source = production_region(include_str!("driver.rs"));
+        assert!(
+            source.contains("let port = RealClaimChainPort::new("),
+            "run_claim_driver's happy path must construct RealClaimChainPort, not silently fall \
+             back to UnavailableClaimChainPort or anything else"
+        );
+    }
+
+    /// #3347/U3 SHAPE guard: `run_claim_driver`, the only production caller of
+    /// [`run_claim_driver_in`], must pass the REAL reserve asset, `dig_mirror_coin::DIG_ASSET_ID`
+    /// -- never a placeholder like `Bytes32::default()`, which would silently make the engine
+    /// treat every real distributor as `NotOurs`. Same shape as
+    /// `run_claim_drivers_happy_path_actually_constructs_the_real_adapter` above: a call site no
+    /// test on this machine can drive behaviourally (no operator wallet here), so read the
+    /// SHIPPED source instead. Mutation-proved: replacing the production
+    /// `dig_mirror_coin::DIG_ASSET_ID` argument with `Bytes32::default()` turns this assertion red.
+    #[test]
+    fn run_claim_driver_passes_the_real_reserve_asset_id() {
+        // CRLF-normalized: this file is checked out with `\r\n` line endings, which would break a
+        // literal `\n`-joined needle otherwise.
+        let source = production_region(include_str!("driver.rs")).replace("\r\n", "\n");
+        assert!(
+            source.contains(
+                "run_claim_driver_in(\n        &crate::state::state_dir(),\n        \
+                 own_payout_puzzle_hash,\n        dig_mirror_coin::DIG_ASSET_ID,"
+            ),
+            "run_claim_driver must pass dig_mirror_coin::DIG_ASSET_ID as run_claim_driver_in's \
+             reserve_asset_id argument, not a placeholder"
+        );
+    }
+
+    /// The slice of this file before its own `#[cfg(test)] mod tests` block -- i.e. what actually
+    /// ships. Searches for `"#[cfg(test)]\nmod tests"` specifically, never the bare
+    /// `"#[cfg(test)]"` marker: this file also has an EARLIER `#[cfg(test)] use` gating a single
+    /// test-only import, which the bare marker would match first and cut the slice off far too
+    /// early, before the very production code this helper exists to check.
+    fn production_region(source: &str) -> &str {
+        match source.find("#[cfg(test)]\nmod tests") {
+            Some(test_module_start) => &source[..test_module_start],
+            None => source,
+        }
+    }
+
+    /// Compile-time companion to `run_claim_drivers_happy_path_actually_constructs_the_real_adapter`:
+    /// pins [`production_claim_port`]'s TYPE, not just its source text. The string guard above
+    /// catches a bypass of the factory (some other construction spliced into `run_claim_driver`);
+    /// this catches the factory itself being RETYPED to return
+    /// [`super::UnavailableClaimChainPort`] (or anything else) -- a change the string guard cannot
+    /// see because `UnavailableClaimChainPort`'s own construction line would satisfy no textual
+    /// assertion this file makes, but a retyped factory would still compile and run. Mutation-proved:
+    /// changing `production_claim_port`'s return type is a compile error here.
+    type ProductionClaimPortFactory = fn(
+        std::sync::Arc<dig_wallet::sage::corroborated_source::CorroboratedChainSource>,
+        HintedLauncherIndex,
+        std::sync::Arc<dyn dig_wallet::sage::spend::Broadcaster>,
+    ) -> RealClaimChainPort<
+        dig_wallet::sage::corroborated_source::CorroboratedChainSource,
+        HintedLauncherIndex,
+    >;
+
+    #[allow(dead_code)] // referenced only for its type, never called
+    const _: ProductionClaimPortFactory = production_claim_port;
 
     // ---- A1 + A2: the anti-silence cycle counter through the real drive() loop -------------
 
@@ -790,6 +1022,10 @@ mod tests {
             _fee_mojos: u64,
         ) -> Result<(), ClaimPortError> {
             Ok(())
+        }
+
+        fn kind(&self) -> &'static str {
+            "test-empty"
         }
     }
 
@@ -951,6 +1187,10 @@ mod tests {
             _fee_mojos: u64,
         ) -> Result<(), ClaimPortError> {
             Ok(())
+        }
+
+        fn kind(&self) -> &'static str {
+            "test-one-distributor"
         }
     }
 
@@ -1307,7 +1547,14 @@ mod tests {
         let h = handle.clone();
         let state_dir = dir.path().to_path_buf();
         let driver = tokio::spawn(async move {
-            run_claim_driver_in(&state_dir, Bytes32::from([1u8; 32]), EmptyPort, h).await;
+            run_claim_driver_in(
+                &state_dir,
+                Bytes32::from([1u8; 32]),
+                dig_mirror_coin::DIG_ASSET_ID,
+                EmptyPort,
+                h,
+            )
+            .await;
         });
 
         settle().await;
@@ -1339,12 +1586,11 @@ mod tests {
         driver.abort();
     }
 
-    /// The same production body against the port production ACTUALLY passes it
-    /// ([`UnavailableClaimChainPort`], the only adapter until #3249) reports
-    /// [`ClaimLoopState::ChainSourceUnavailable`] by name once a cycle has been driven -- the
-    /// honest state of a real node today. Proves the real adapter path is reached, not only a fake
-    /// one: a counted cycle whose outcome names the missing chain source, never a reassuring
-    /// `Nominal` and never silence.
+    /// The same production body [`run_claim_driver_in`] runs, against [`UnavailableClaimChainPort`]
+    /// (now only the engine's test double -- production passes [`super::RealClaimChainPort`]),
+    /// reports [`ClaimLoopState::ChainSourceUnavailable`] by name once a cycle has been driven: a
+    /// counted cycle whose outcome names the missing chain source, never a reassuring `Nominal`
+    /// and never silence.
     #[tokio::test(start_paused = true)]
     async fn the_production_adapter_reports_chain_source_unavailable_by_name() {
         let cadence = 100u64;
@@ -1358,6 +1604,7 @@ mod tests {
             run_claim_driver_in(
                 &state_dir,
                 Bytes32::from([1u8; 32]),
+                dig_mirror_coin::DIG_ASSET_ID,
                 UnavailableClaimChainPort,
                 h,
             )
@@ -1421,13 +1668,20 @@ mod tests {
         let h = handle.clone();
         let state_dir = dir.path().to_path_buf();
         let driver = tokio::spawn(async move {
-            run_claim_driver_in_with_clock(&state_dir, Bytes32::from([1u8; 32]), EmptyPort, h, {
-                let mut t = 0u64;
-                move || {
-                    t += effective_cadence;
-                    t
-                }
-            })
+            run_claim_driver_in_with_clock(
+                &state_dir,
+                Bytes32::from([1u8; 32]),
+                dig_mirror_coin::DIG_ASSET_ID,
+                EmptyPort,
+                h,
+                {
+                    let mut t = 0u64;
+                    move || {
+                        t += effective_cadence;
+                        t
+                    }
+                },
+            )
             .await;
         });
 
@@ -1839,7 +2093,14 @@ mod tests {
         let h = handle.clone();
         let state_dir = dir.path().to_path_buf();
         let driver = tokio::spawn(async move {
-            run_claim_driver_in(&state_dir, Bytes32::from([1u8; 32]), EmptyPort, h).await;
+            run_claim_driver_in(
+                &state_dir,
+                Bytes32::from([1u8; 32]),
+                dig_mirror_coin::DIG_ASSET_ID,
+                EmptyPort,
+                h,
+            )
+            .await;
         });
 
         settle().await;

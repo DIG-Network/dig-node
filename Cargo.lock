@@ -3217,9 +3217,9 @@ dependencies = [
 
 [[package]]
 name = "dig-rewards-coin"
-version = "0.5.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0bb94b1f02239b4ad8072c5b1d37a00cca366cfeca73b34fcecd94a2470fdd0"
+checksum = "7afdbc8cf70e84ad13779824948d165577df91e0409cd65a40130f5421e99f5b"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-consensus 0.36.1",
