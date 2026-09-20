@@ -389,6 +389,7 @@ async fn run_claim_driver(
     run_claim_driver_in(
         &crate::state::state_dir(),
         own_payout_puzzle_hash,
+        dig_mirror_coin::DIG_ASSET_ID,
         port,
         handle,
     )
@@ -520,6 +521,7 @@ fn sanitized_schedule(cadence_seconds: u64, jitter_seconds: u64) -> (u64, u64, S
 pub async fn run_claim_driver_in<P>(
     state_dir: &Path,
     own_payout_puzzle_hash: Bytes32,
+    reserve_asset_id: Bytes32,
     port: P,
     handle: ClaimLoopHandle,
 ) where
@@ -528,6 +530,7 @@ pub async fn run_claim_driver_in<P>(
     run_claim_driver_in_with_clock(
         state_dir,
         own_payout_puzzle_hash,
+        reserve_asset_id,
         port,
         handle,
         unix_now_seconds,
@@ -555,6 +558,7 @@ pub async fn run_claim_driver_in<P>(
 async fn run_claim_driver_in_with_clock<P>(
     state_dir: &Path,
     own_payout_puzzle_hash: Bytes32,
+    reserve_asset_id: Bytes32,
     port: P,
     handle: ClaimLoopHandle,
     now: impl FnMut() -> u64,
@@ -582,7 +586,7 @@ async fn run_claim_driver_in_with_clock<P>(
         own_payout_puzzle_hash,
         cfg.max_fee_mojos,
         cfg.max_cycle_fee_budget_mojos,
-        dig_mirror_coin::DIG_ASSET_ID,
+        reserve_asset_id,
     )
     .with_rotation_cursor(cfg.rotation_cursor)
     // F2 (money): ONE argument, and it must be the RAW `cfg.cadence_seconds`. `ClaimCadences`
@@ -917,6 +921,29 @@ mod tests {
             source.contains("let port = RealClaimChainPort::new("),
             "run_claim_driver's happy path must construct RealClaimChainPort, not silently fall \
              back to UnavailableClaimChainPort or anything else"
+        );
+    }
+
+    /// #3347/U3 SHAPE guard: `run_claim_driver`, the only production caller of
+    /// [`run_claim_driver_in`], must pass the REAL reserve asset, `dig_mirror_coin::DIG_ASSET_ID`
+    /// -- never a placeholder like `Bytes32::default()`, which would silently make the engine
+    /// treat every real distributor as `NotOurs`. Same shape as
+    /// `run_claim_drivers_happy_path_actually_constructs_the_real_adapter` above: a call site no
+    /// test on this machine can drive behaviourally (no operator wallet here), so read the
+    /// SHIPPED source instead. Mutation-proved: replacing the production
+    /// `dig_mirror_coin::DIG_ASSET_ID` argument with `Bytes32::default()` turns this assertion red.
+    #[test]
+    fn run_claim_driver_passes_the_real_reserve_asset_id() {
+        // CRLF-normalized: this file is checked out with `\r\n` line endings, which would break a
+        // literal `\n`-joined needle otherwise.
+        let source = production_region(include_str!("driver.rs")).replace("\r\n", "\n");
+        assert!(
+            source.contains(
+                "run_claim_driver_in(\n        &crate::state::state_dir(),\n        \
+                 own_payout_puzzle_hash,\n        dig_mirror_coin::DIG_ASSET_ID,"
+            ),
+            "run_claim_driver must pass dig_mirror_coin::DIG_ASSET_ID as run_claim_driver_in's \
+             reserve_asset_id argument, not a placeholder"
         );
     }
 
@@ -1520,7 +1547,14 @@ mod tests {
         let h = handle.clone();
         let state_dir = dir.path().to_path_buf();
         let driver = tokio::spawn(async move {
-            run_claim_driver_in(&state_dir, Bytes32::from([1u8; 32]), EmptyPort, h).await;
+            run_claim_driver_in(
+                &state_dir,
+                Bytes32::from([1u8; 32]),
+                dig_mirror_coin::DIG_ASSET_ID,
+                EmptyPort,
+                h,
+            )
+            .await;
         });
 
         settle().await;
@@ -1570,6 +1604,7 @@ mod tests {
             run_claim_driver_in(
                 &state_dir,
                 Bytes32::from([1u8; 32]),
+                dig_mirror_coin::DIG_ASSET_ID,
                 UnavailableClaimChainPort,
                 h,
             )
@@ -1633,13 +1668,20 @@ mod tests {
         let h = handle.clone();
         let state_dir = dir.path().to_path_buf();
         let driver = tokio::spawn(async move {
-            run_claim_driver_in_with_clock(&state_dir, Bytes32::from([1u8; 32]), EmptyPort, h, {
-                let mut t = 0u64;
-                move || {
-                    t += effective_cadence;
-                    t
-                }
-            })
+            run_claim_driver_in_with_clock(
+                &state_dir,
+                Bytes32::from([1u8; 32]),
+                dig_mirror_coin::DIG_ASSET_ID,
+                EmptyPort,
+                h,
+                {
+                    let mut t = 0u64;
+                    move || {
+                        t += effective_cadence;
+                        t
+                    }
+                },
+            )
             .await;
         });
 
@@ -2051,7 +2093,14 @@ mod tests {
         let h = handle.clone();
         let state_dir = dir.path().to_path_buf();
         let driver = tokio::spawn(async move {
-            run_claim_driver_in(&state_dir, Bytes32::from([1u8; 32]), EmptyPort, h).await;
+            run_claim_driver_in(
+                &state_dir,
+                Bytes32::from([1u8; 32]),
+                dig_mirror_coin::DIG_ASSET_ID,
+                EmptyPort,
+                h,
+            )
+            .await;
         });
 
         settle().await;

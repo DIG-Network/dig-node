@@ -282,14 +282,17 @@ pub fn mock_chain_source(fixture: &LaunchedFixture) -> MockChainSource {
 // ---------------------------------------------------------------------------------------------
 
 /// $DIG committed to the first epoch -- the SAME figure `dig-rewards-coin`'s own golden test uses.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 const COMMITTED_BASE_UNITS: u64 = 1_000_000;
 
 /// The mirror-collateral epoch [`verdict_for`] judges against. Any ordinal will do; what matters is
 /// that the same one is asked and advertised.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 const TEST_MIRROR_COLLATERAL_EPOCH: u32 = 7;
 
 /// A mirror coin that passes every eligibility check and pays out to one hash -- mirrors
 /// `dig-rewards-coin`'s own `EligibleMirrorCoin` test double.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 struct EligibleMirrorCoin {
     payout_puzzle_hash: Bytes32,
 }
@@ -310,6 +313,7 @@ impl MirrorCoinFacts for EligibleMirrorCoin {
 
 /// Judge a candidate whose mirror coin pays out to `payout_puzzle_hash`, and take the verdict --
 /// the only way `add_entry` can be handed a payout hash at all.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 fn verdict_for(payout_puzzle_hash: Bytes32) -> dig_rewards_coin::eligibility::EligiblePayoutHash {
     let question = EligibilityQuestion {
         store_launcher_id: LAUNCH_STORE_ID,
@@ -326,6 +330,7 @@ fn verdict_for(payout_puzzle_hash: Bytes32) -> dig_rewards_coin::eligibility::El
 /// A test manager singleton with an inner puzzle of `1` -- mirrors `dig-rewards-coin`'s own
 /// `TestSingleton`. The cheapest singleton that can deliver conditions; nothing here depends on
 /// which inner puzzle it is.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 struct TestSingleton {
     launcher_id: Bytes32,
     coin: Coin,
@@ -334,6 +339,7 @@ struct TestSingleton {
     puzzle: NodePtr,
 }
 
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 fn launch_test_singleton(
     ctx: &mut SpendContext,
     sim: &mut Simulator,
@@ -363,6 +369,7 @@ fn launch_test_singleton(
 
 /// Deliver `output_conditions` from the manager singleton, recreating it for the next spend --
 /// mirrors `dig-rewards-coin`'s own `spend_manager_singleton`.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 fn spend_manager_singleton(
     ctx: &mut SpendContext,
     singleton: &TestSingleton,
@@ -394,6 +401,7 @@ fn spend_manager_singleton(
 
 /// Assert a permissionless action's conditions via a zero-value checker coin -- mirrors
 /// `dig-rewards-coin`'s own `ensure_conditions_met`.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 fn ensure_conditions_met(
     ctx: &mut SpendContext,
     sim: &mut Simulator,
@@ -407,6 +415,7 @@ fn ensure_conditions_met(
 
 /// As [`ensure_conditions_met`], but for the OPTIONAL `Sync` conditions an entry-set write may or
 /// may not carry.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 fn ensure_optional_conditions_met(
     ctx: &mut SpendContext,
     sim: &mut Simulator,
@@ -420,9 +429,14 @@ fn ensure_optional_conditions_met(
 
 /// A real launch, funded, with one admitted entry -- everything
 /// `RealClaimChainPort::submit_initiate_payout` needs to build a claim the simulator will accept.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 pub struct FundedFixture {
     pub sim: Simulator,
     pub launcher_id: Bytes32,
+    /// The launcher's own parent (its "security coin") -- the spend that CREATES the launcher
+    /// coin, which `dig_rewards_coin::discover_distributor`'s `source.parent_spend(launcher_id)`
+    /// needs. Same derivation as `LaunchedFixture::security_coin_id`.
+    pub security_coin_id: Bytes32,
     /// Every singleton generation's coin id, launcher first, tip last -- what `mock_chain_source`
     /// needs to build a `SingletonLineage`.
     pub singleton_members: Vec<Bytes32>,
@@ -440,6 +454,7 @@ pub struct FundedFixture {
 /// epoch's midpoint -- so the entry has accrued something, comfortably above
 /// `PAYOUT_THRESHOLD_BASE_UNITS`, entirely from real puzzle arithmetic. Mirrors
 /// `dig-rewards-coin` 0.8.0's own `a_claim_built_entirely_from_a_chain_read_is_accepted` harness.
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 pub fn launch_funded_admitted_fixture(
     payout_puzzle_hash: Bytes32,
 ) -> Result<FundedFixture, Box<dyn std::error::Error>> {
@@ -570,6 +585,14 @@ pub fn launch_funded_admitted_fixture(
     let first_epoch_slot = launched.first_distributor_epoch_slot;
     source_cat = launched.refund_cat;
 
+    // Same derivation as `LaunchedFixture::security_coin_id` above: the launcher's own parent is
+    // the spend that CREATES the launcher coin, which `discover_distributor` reads.
+    let security_coin_id = sim
+        .coin_state(launcher_id)
+        .expect("the launcher coin was confirmed by the launch spend")
+        .coin
+        .parent_coin_info;
+
     let reserve_launch_id = distributor.reserve.coin.coin_id();
     let reserve_parent_id = distributor.reserve.coin.parent_coin_info;
 
@@ -655,6 +678,7 @@ pub fn launch_funded_admitted_fixture(
     Ok(FundedFixture {
         sim,
         launcher_id,
+        security_coin_id,
         singleton_members,
         reserve_launch_id,
         reserve_parent_id,
@@ -668,6 +692,7 @@ pub fn launch_funded_admitted_fixture(
 /// general form `mock_chain_source` above cannot serve, since a funded/admitted fixture has more
 /// than one post-launch generation. Mirrors `dig-rewards-coin`'s own `mock_chain_source` (the
 /// general `sim`/`singleton_members`/`extra_coin_ids` form, `tests/simulator.rs`).
+#[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 pub fn mock_chain_source_for_funded_fixture(fixture: &FundedFixture) -> MockChainSource {
     let eve_coin_id = fixture
         .sim
@@ -676,6 +701,7 @@ pub fn mock_chain_source_for_funded_fixture(fixture: &FundedFixture) -> MockChai
         .map(|state| state.coin.coin_id());
 
     let extra_ids = [
+        fixture.security_coin_id,
         fixture.reserve_launch_id,
         fixture.reserve_parent_id,
         fixture.reserve_tip_id,

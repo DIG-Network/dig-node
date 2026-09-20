@@ -228,7 +228,14 @@ async fn a_driven_cycle_over_the_real_adapter_reaches_a_real_chain_read() {
     let own_payout_puzzle_hash = Bytes32::from([0x42; 32]);
 
     tokio::spawn(async move {
-        run_claim_driver_in(&state_dir, own_payout_puzzle_hash, port, handle_for_task).await;
+        run_claim_driver_in(
+            &state_dir,
+            own_payout_puzzle_hash,
+            dig_mirror_coin::DIG_ASSET_ID,
+            port,
+            handle_for_task,
+        )
+        .await;
     });
 
     // Let the spawned task run far enough to register its first `sleep` BEFORE advancing the
@@ -254,7 +261,8 @@ async fn a_driven_cycle_over_the_real_adapter_reaches_a_real_chain_read() {
     let status = handle.status();
     // Per `rewards_chain_port_a3.rs`'s own module doc: this fixture's reserve asset is the
     // SIMULATOR's own freshly minted CAT, never the real (unmintable-in-a-simulator)
-    // `dig_mirror_coin::DIG_ASSET_ID` -- `run_claim_driver_in` hardcodes that real asset id, so
+    // `dig_mirror_coin::DIG_ASSET_ID` -- this call passes that real asset id (the same value
+    // `run_claim_driver` passes in production, since #3347's U3), so
     // the engine correctly reads this real distributor, sees its asset does not match, and drops
     // it as `NotOurs` (SPEC 9.3) BEFORE the entry-slot read -- it is never faulted, never
     // read as chain-unavailable, and never fabricated as claimable. That is still real proof the
@@ -364,6 +372,144 @@ async fn submit_initiate_payout_builds_a_bundle_the_simulator_accepts_and_pays_t
     );
     assert_eq!(
         payee_coins[0].coin.amount, entry.accrued_base_units,
+        "the payee's on-chain CAT coin amount must equal the entry's own accrued figure"
+    );
+}
+
+/// DIG-Network/dig_ecosystem#3347's CLOSURE ARTIFACT: drives the whole PRODUCTION BODY
+/// (`run_claim_driver_in`, the same function `run_claim_driver` calls in production, over a real
+/// `RealClaimChainPort`) against a real, funded, admitted distributor -- and asserts the payout
+/// coin the simulator actually accepted, not merely `cycles_driven()`. Where
+/// `a_driven_cycle_over_the_real_adapter_reaches_a_real_chain_read` above stops at a clean
+/// `NotOurs` (asset mismatch) and
+/// `submit_initiate_payout_builds_a_bundle_the_simulator_accepts_and_pays_the_entry` drives the
+/// adapter directly, this test is the two combined: the production loop itself finds the entry,
+/// builds and broadcasts the spend, and the simulator pays this peer.
+#[tokio::test(start_paused = true)]
+async fn a_driven_cycle_over_a_funded_admitted_distributor_pays_this_peer() {
+    let payout_puzzle_hash = Bytes32::from([0x99; 32]);
+    let mut fixture = launch_funded_admitted_fixture(payout_puzzle_hash)
+        .expect("a funded, admitted distributor launches cleanly in the simulator");
+    let source = mock_chain_source_for_funded_fixture(&fixture);
+    let broadcaster = Arc::new(MockBroadcaster::default());
+    let port = RealClaimChainPort::new(
+        Arc::new(source),
+        FixtureLauncherIndex(vec![fixture.launcher_id]),
+        broadcaster.clone(),
+    );
+
+    // Read the entry's own accrued figure directly through the adapter, BEFORE handing `port` to
+    // the driver -- this is the figure the driven cycle below must actually pay, independent of
+    // whatever the engine does with it.
+    let expected_accrued = port
+        .own_entry(fixture.launcher_id, payout_puzzle_hash)
+        .await
+        .expect("the admitted entry must read")
+        .expect("the fixture admitted exactly this payout puzzle hash")
+        .accrued_base_units;
+    assert!(
+        expected_accrued > 0,
+        "half an epoch with one entry must have accrued something"
+    );
+
+    let discovered = port
+        .discover_distributors()
+        .await
+        .expect("discovery must not error");
+    assert_eq!(
+        discovered.len(),
+        1,
+        "discovery must find the one real distributor this fixture launched"
+    );
+
+    let state_dir_guard = tempfile::tempdir().expect("a temp state dir");
+    let state_dir = state_dir_guard.path().to_path_buf();
+    let cfg = RewardsClaimConfig {
+        enabled: true,
+        cadence_seconds: 3_600,
+        jitter_seconds: 0,
+        ..RewardsClaimConfig::default()
+    };
+    cfg.save_to(&state_dir)
+        .expect("the config must save before the driver reads it");
+
+    let handle = ClaimLoopHandle::default();
+    let handle_for_task = handle.clone();
+    let reserve_asset_id = fixture.constants.reserve_asset_id;
+
+    tokio::spawn(async move {
+        run_claim_driver_in(
+            &state_dir,
+            payout_puzzle_hash,
+            reserve_asset_id,
+            port,
+            handle_for_task,
+        )
+        .await;
+    });
+
+    // Same settle pattern as `a_driven_cycle_over_the_real_adapter_reaches_a_real_chain_read`:
+    // reach the driver's first `sleep` before advancing, then let the real chain read (a
+    // `spawn_blocking`, unaffected by the paused virtual clock) actually complete.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(std::time::Duration::from_secs(3_600)).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+
+    let status = handle.status();
+    assert_ne!(
+        status.state,
+        ClaimLoopState::ChainSourceUnavailable,
+        "a real, funded, admitted distributor must not be read as chain-unavailable"
+    );
+    assert_eq!(
+        status.claims_submitted, 1,
+        "one cadence over one admitted, thresholded entry must submit exactly one claim"
+    );
+    assert_eq!(
+        status.distributors_claimable, 1,
+        "the one real distributor, with its entry cleared for payout, must count as claimable"
+    );
+    assert!(
+        !status.fault_reported,
+        "a real, correctly-built submission must never be reported as a fault"
+    );
+
+    let sent = broadcaster.sent.lock().expect("the broadcaster's own lock");
+    assert_eq!(
+        sent.len(),
+        1,
+        "the production driver must have broadcast exactly one bundle"
+    );
+    let bundle = sent[0].clone();
+    drop(sent);
+
+    fixture
+        .sim
+        .spend_coins(bundle.coin_spends.clone(), &[])
+        .expect("the bundle the production driver broadcast must be accepted by the simulator");
+
+    let payee_puzzle_hash: Bytes32 =
+        CatArgs::curry_tree_hash(reserve_asset_id, payout_puzzle_hash.into()).into();
+    let children = fixture.sim.children(fixture.reserve_tip_id);
+    let payee_coins: Vec<_> = children
+        .iter()
+        .filter(|state| state.coin.puzzle_hash == payee_puzzle_hash)
+        .collect();
+    assert_eq!(
+        payee_coins.len(),
+        1,
+        "exactly one payee CAT coin must exist on chain at this peer's payout puzzle hash"
+    );
+    assert_eq!(
+        payee_coins[0].coin.amount, expected_accrued,
         "the payee's on-chain CAT coin amount must equal the entry's own accrued figure"
     );
 }
