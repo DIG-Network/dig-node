@@ -43,7 +43,7 @@ use dig_chainsource_interface::MockChainSource;
 use dig_node_core::rewards::port::RewardsChainPort;
 use dig_node_core::Node;
 use dig_node_service::rewards::RealRewardsChainPort;
-use dig_rewards_coin::constants::{PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS};
+use dig_rewards_coin::constants::WITHDRAWAL_SHARE_BPS;
 
 use common::rewards_fixture::{
     launch_fixture, mock_chain_source, FIRST_EPOCH_START, TEST_EPOCH_SECONDS,
@@ -78,7 +78,11 @@ async fn distributor_report_reflects_a_real_simulator_launch() {
 
     assert_eq!(report.epoch_seconds, TEST_EPOCH_SECONDS);
     assert_eq!(report.first_epoch_start, FIRST_EPOCH_START);
-    assert_eq!(report.payout_threshold, PAYOUT_THRESHOLD_BASE_UNITS);
+    assert_eq!(
+        report.payout_threshold, fixture.constants.payout_threshold,
+        "the report must echo the threshold the distributor was actually launched with, not a \
+         constant -- the fixture launches with a non-default threshold (#3347 mutation proof iv)"
+    );
     assert_eq!(report.fee_bps, 0);
     assert_eq!(
         report.withdrawal_share_bps,

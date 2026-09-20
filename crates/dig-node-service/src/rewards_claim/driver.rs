@@ -940,15 +940,17 @@ mod tests {
     /// see because `UnavailableClaimChainPort`'s own construction line would satisfy no textual
     /// assertion this file makes, but a retyped factory would still compile and run. Mutation-proved:
     /// changing `production_claim_port`'s return type is a compile error here.
-    #[allow(dead_code)] // referenced only for its type, never called
-    const _: fn(
+    type ProductionClaimPortFactory = fn(
         std::sync::Arc<dig_wallet::sage::corroborated_source::CorroboratedChainSource>,
         HintedLauncherIndex,
         std::sync::Arc<dyn dig_wallet::sage::spend::Broadcaster>,
     ) -> RealClaimChainPort<
         dig_wallet::sage::corroborated_source::CorroboratedChainSource,
         HintedLauncherIndex,
-    > = production_claim_port;
+    >;
+
+    #[allow(dead_code)] // referenced only for its type, never called
+    const _: ProductionClaimPortFactory = production_claim_port;
 
     // ---- A1 + A2: the anti-silence cycle counter through the real drive() loop -------------
 
