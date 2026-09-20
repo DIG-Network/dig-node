@@ -99,6 +99,25 @@ where
     }
 }
 
+/// The pure decision [`RealClaimChainPort::own_entry`] delegates to once it has (or has not)
+/// found a matching entry slot -- kept separate from the chain read itself so it is unit-testable
+/// without a real launch: `None` means no entry, `Ok(None)`, honestly; `Some(entry)` means an
+/// entry WAS found, and this refuses by name rather than fabricating an accrued amount (see this
+/// module's doc). Never returns `Ok(Some(_))` for a found entry -- 0.7.0 has no public, pure
+/// function to compute what it has accrued without also spending it.
+fn own_entry_from_slot(
+    entry: Option<&chia_sdk_types::puzzles::RewardDistributorEntrySlotValue>,
+) -> Result<Option<OwnEntry>, ClaimPortError> {
+    if entry.is_none() {
+        return Ok(None);
+    }
+    Err(ClaimPortError::Other(bounded(format!(
+        "accrued amount unreadable on dig-rewards-coin 0.7.0: no public function computes \
+         an entry's accrued base units without spending it; blocked on \
+         {ACCRUED_AND_SUBMIT_BLOCKER}"
+    ))))
+}
+
 /// Maps a [`GuardedReadError`] (this crate's own `epoch_seconds == 0` refusal, or
 /// `dig_rewards_coin::state::read_distributor`'s own error) onto [`ClaimPortError`].
 fn guarded_read_error_to_claim_port_error(error: GuardedReadError) -> ClaimPortError {
@@ -258,23 +277,12 @@ where
                     ClaimPortError::Other(bounded("not a distributor: launcher coin unspent"))
                 })?;
 
-            let Some(_entry) = snapshot
+            let entry = snapshot
                 .slots()
                 .entries
                 .iter()
-                .find(|e| e.payout_puzzle_hash == payout_puzzle_hash)
-            else {
-                return Ok(None);
-            };
-
-            // See this module's doc: 0.7.0 has no public, pure function to compute what this entry
-            // has accrued without also spending it, and this adapter refuses to re-derive the
-            // money arithmetic itself or to fabricate a `0`.
-            Err(ClaimPortError::Other(bounded(format!(
-                "accrued amount unreadable on dig-rewards-coin 0.7.0: no public function computes \
-                 an entry's accrued base units without spending it; blocked on \
-                 {ACCRUED_AND_SUBMIT_BLOCKER}"
-            ))))
+                .find(|e| e.payout_puzzle_hash == payout_puzzle_hash);
+            own_entry_from_slot(entry)
         })
         .await
         .map_err(|join_error| {
@@ -364,5 +372,44 @@ impl LauncherIndex for HintedLauncherIndex {
                     .map(Bytes32::from)
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chia_sdk_types::puzzles::RewardDistributorEntrySlotValue;
+
+    /// No matching entry slot reads `Ok(None)` -- "no entry", never fabricated.
+    #[test]
+    fn no_entry_reads_ok_none() {
+        assert_eq!(own_entry_from_slot(None), Ok(None));
+    }
+
+    /// SHAPE guard: a FOUND entry slot must refuse by name (blocked on
+    /// `dig_ecosystem#3356`), never fabricate `Some(OwnEntry { accrued_base_units: 0, .. })`.
+    /// Mutation-proved: replacing this function's `Err(..)` arm with
+    /// `Ok(Some(OwnEntry { payout_puzzle_hash: entry.payout_puzzle_hash, counter: entry.counter,
+    /// accrued_base_units: 0 }))` turns this test red.
+    #[test]
+    fn a_found_entry_refuses_rather_than_fabricates_zero_accrued() {
+        let entry = RewardDistributorEntrySlotValue {
+            counter: 1,
+            payout_puzzle_hash: Bytes32::from([0x42; 32]),
+            initial_cumulative_payout: 0,
+            shares: 1,
+        };
+        let result = own_entry_from_slot(Some(&entry));
+        assert!(
+            matches!(result, Err(ClaimPortError::Other(_))),
+            "a found entry must refuse by name, never answer Ok at all: got {result:?}"
+        );
+        let Err(ClaimPortError::Other(message)) = result else {
+            unreachable!()
+        };
+        assert!(
+            message.contains(ACCRUED_AND_SUBMIT_BLOCKER),
+            "the refusal must name the blocker ticket: {message}"
+        );
     }
 }

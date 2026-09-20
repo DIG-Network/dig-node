@@ -306,6 +306,24 @@ pub fn own_payout_puzzle_hash(owner_inner_puzzle_hash: Bytes32) -> Bytes32 {
 /// decides WHETHER to call this. `handle` is INJECTED (never the [`handle`] singleton read
 /// directly) so a test can drive this against a private, non-shared handle instead of the
 /// process-wide one.
+/// The production chain-port factory, split out of [`run_claim_driver`] so its return TYPE can be
+/// pinned by `const _: fn(...) = production_claim_port;` in the test module -- a retyped factory
+/// (e.g. one that starts returning [`super::UnavailableClaimChainPort`]) is then a COMPILE error,
+/// not just a string-guard failure. See `run_claim_drivers_happy_path_actually_constructs_the_real_adapter`
+/// for the companion source-reading guard, which catches a bypass of this factory entirely.
+#[allow(clippy::let_and_return)] // the local `port` binding is the literal string the guard test
+                                 // in `production_region` searches this source for.
+fn production_claim_port(
+    source: std::sync::Arc<dig_wallet::sage::corroborated_source::CorroboratedChainSource>,
+    index: HintedLauncherIndex,
+) -> RealClaimChainPort<
+    dig_wallet::sage::corroborated_source::CorroboratedChainSource,
+    HintedLauncherIndex,
+> {
+    let port = RealClaimChainPort::new(source, index);
+    port
+}
+
 async fn run_claim_driver(
     handle: ClaimLoopHandle,
     wallet_chain: std::sync::Arc<dig_wallet::sage::chain::ChainTransport>,
@@ -340,7 +358,7 @@ async fn run_claim_driver(
             return;
         }
     };
-    let port = RealClaimChainPort::new(
+    let port = production_claim_port(
         std::sync::Arc::new(source),
         HintedLauncherIndex::new(wallet_chain),
     );
@@ -831,12 +849,12 @@ mod tests {
         assert_eq!(handle.cycles_driven(), 0, "and it must drive no cycle");
     }
 
-    /// SHAPE (6d, the #3310-class trap "compiles, nothing constructs it"): the production factory
-    /// actually builds a [`RealClaimChainPort`] against a mock source with the fixture-provided
-    /// [`LauncherIndex`], and its `kind()` reads `"real-corroborated"` -- proving the substitution
-    /// this ticket makes is reachable, not merely present in the source. Reverting
-    /// `run_claim_driver_in`'s call in `run_claim_driver` back to `UnavailableClaimChainPort` turns
-    /// this test red (`kind()` would read `"unavailable"` instead).
+    /// SHAPE (6d, the #3310-class trap "compiles, nothing constructs it"): [`RealClaimChainPort`]
+    /// itself, built against a mock source with the fixture-provided [`LauncherIndex`], names
+    /// itself `"real-corroborated"`. This does NOT exercise `run_claim_driver`'s own construction
+    /// line -- see `run_claim_drivers_happy_path_actually_constructs_the_real_adapter` below for
+    /// the guard on THAT (this machine has no operator wallet, so `run_claim_driver`'s happy path
+    /// cannot be driven end to end here; that guard reads its own shipped source instead).
     #[tokio::test]
     async fn the_production_factory_builds_a_real_corroborated_port() {
         struct NoLauncherIds;
@@ -855,6 +873,54 @@ mod tests {
             "the production adapter must name itself, not inherit UnavailableClaimChainPort's name"
         );
     }
+
+    /// SHAPE guard: `run_claim_driver`'s happy-path construction line must actually build
+    /// [`RealClaimChainPort`], never [`UnavailableClaimChainPort`] -- checked by reading this
+    /// module's own SHIPPED source (the production region, before this `#[cfg(test)]` module),
+    /// the same shape `rewards_chain_port_a3.rs`'s `install_reward_chain_port_refuses_a_second_install_with_a_warn`
+    /// and `chain_port.rs`'s `adapter_source_never_imports_withdraw_committed_incentives` already
+    /// use for a call site no test on this machine can drive behaviourally (this machine has no
+    /// operator wallet, so `run_claim_driver`'s happy path -- past both named refusals -- is
+    /// unreachable here). Mutation-proved: replacing the production `let port =
+    /// RealClaimChainPort::new(` line with `UnavailableClaimChainPort` turns this assertion red.
+    #[test]
+    fn run_claim_drivers_happy_path_actually_constructs_the_real_adapter() {
+        let source = production_region(include_str!("driver.rs"));
+        assert!(
+            source.contains("let port = RealClaimChainPort::new("),
+            "run_claim_driver's happy path must construct RealClaimChainPort, not silently fall \
+             back to UnavailableClaimChainPort or anything else"
+        );
+    }
+
+    /// The slice of this file before its own `#[cfg(test)] mod tests` block -- i.e. what actually
+    /// ships. Searches for `"#[cfg(test)]\nmod tests"` specifically, never the bare
+    /// `"#[cfg(test)]"` marker: this file also has an EARLIER `#[cfg(test)] use` gating a single
+    /// test-only import, which the bare marker would match first and cut the slice off far too
+    /// early, before the very production code this helper exists to check.
+    fn production_region(source: &str) -> &str {
+        match source.find("#[cfg(test)]\nmod tests") {
+            Some(test_module_start) => &source[..test_module_start],
+            None => source,
+        }
+    }
+
+    /// Compile-time companion to `run_claim_drivers_happy_path_actually_constructs_the_real_adapter`:
+    /// pins [`production_claim_port`]'s TYPE, not just its source text. The string guard above
+    /// catches a bypass of the factory (some other construction spliced into `run_claim_driver`);
+    /// this catches the factory itself being RETYPED to return
+    /// [`super::UnavailableClaimChainPort`] (or anything else) -- a change the string guard cannot
+    /// see because `UnavailableClaimChainPort`'s own construction line would satisfy no textual
+    /// assertion this file makes, but a retyped factory would still compile and run. Mutation-proved:
+    /// changing `production_claim_port`'s return type is a compile error here.
+    #[allow(dead_code)] // referenced only for its type, never called
+    const _: fn(
+        std::sync::Arc<dig_wallet::sage::corroborated_source::CorroboratedChainSource>,
+        HintedLauncherIndex,
+    ) -> RealClaimChainPort<
+        dig_wallet::sage::corroborated_source::CorroboratedChainSource,
+        HintedLauncherIndex,
+    > = production_claim_port;
 
     // ---- A1 + A2: the anti-silence cycle counter through the real drive() loop -------------
 
