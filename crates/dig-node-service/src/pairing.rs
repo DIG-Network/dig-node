@@ -13,22 +13,39 @@
 //! # Flow (compare-codes consent, à la Bluetooth pairing)
 //!
 //! 1. **OPEN** `pairing.request { client_name }` → the node mints a random
-//!    `pairing_id` + a short numeric `pairing_code`, stores it PENDING (with a TTL),
-//!    and returns `{ pairing_id, pairing_code, expires_ms }`. The extension DISPLAYS
-//!    the code.
+//!    `pairing_id` + a short numeric `pairing_code` + a `redemption_secret`, stores
+//!    it PENDING (with a TTL), and returns
+//!    `{ pairing_id, pairing_code, redemption_secret, expires_ms }`. The extension
+//!    DISPLAYS the code and keeps the secret to itself — `pairing_id` is a HANDLE the
+//!    operator may see and type in argv; `redemption_secret` is the credential that
+//!    redeems the token, and it is returned only here, to the requesting client.
 //! 2. The local operator runs `dig-node pair` (which reads the master token — proving
 //!    local-machine control), sees the pending request with its code + `client_name`,
 //!    CONFIRMS the code matches what the extension shows, and approves via
-//!    `control.pairing.approve { pairing_id }` (MASTER-token only).
+//!    `control.pairing.approve { pairing_id }` (MASTER-token only) — `pairing_id`
+//!    alone is the correct handle here, because it is not the redeeming credential.
 //! 3. On approve the node mints a fresh scoped token, PERSISTS it to
 //!    `<config_dir>/paired-tokens.json`, and marks the pending entry approved.
-//! 4. **OPEN** `pairing.poll { pairing_id }` → once approved returns
-//!    `{ status:"approved", token }`; the token is delivered ONCE (the pending entry
-//!    is then consumed). The extension stores it and presents it as
-//!    `X-Dig-Control-Token` on `control.*` calls.
+//! 4. **OPEN** `pairing.poll { pairing_id, redemption_secret }` → once approved
+//!    returns `{ status:"approved", token }`; the token is delivered ONCE (the
+//!    pending entry is then consumed). A poll missing the secret is refused; a poll
+//!    with the wrong secret reads exactly like an unknown id. The extension stores
+//!    the token and presents it as `X-Dig-Control-Token` on `control.*` calls.
 //!
 //! # Security properties
 //!
+//! - **The value the operator handles never redeems a credential.** `pairing_id`
+//!   appears in argv (`dig-node pair approve <pairing_id>`) and in `list()`, so it
+//!   must not double as the bearer that redeems the minted token. `pairing.poll`
+//!   requires a separate `redemption_secret`, returned only in the `pairing.request`
+//!   result, never serialized by `list()` or `approve()`'s result, and compared
+//!   constant-time; a wrong secret reads identically to an unknown id.
+//! - **A pending request is never displaced.** `pairing.request` REFUSES at the
+//!   pending-slot cap rather than evicting an older entry to make room — a request
+//!   the node already accepted is a commitment. A pairing-specific token bucket
+//!   additionally bounds a burst of requests (independent of the cap, and it never
+//!   touches `pairing.poll`), so a flood cannot grow the pending set unbounded or
+//!   starve a legitimate pairing already underway.
 //! - **Loopback bind (enforced)** — the server binds loopback by default; a non-loopback
 //!   `DIG_NODE_HOST` is refused unless `DIG_NODE_ALLOW_REMOTE=1` (#1662). Defense-in-depth
 //!   beneath the token gate (same boundary as `control.*`), not the primary control.
@@ -72,9 +89,24 @@ pub const PAIRED_TOKENS_FILE: &str = "paired-tokens.json";
 const PAIRING_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// Cap on concurrently-pending requests, so a flood of `pairing.request` calls
-/// (e.g. from a rogue page) cannot grow the in-memory map without bound. The oldest
-/// pending entries are dropped past this.
+/// (e.g. from a rogue page) cannot grow the in-memory map without bound. At the cap
+/// a request is REFUSED, never displaced (#3191/B1): a pending request the node
+/// already accepted is a commitment, and quietly dropping it to serve a later
+/// caller is the node partly writing someone else's outcome — the same discipline
+/// [`MAX_CLIENT_NAME`] already applies to a name.
 const MAX_PENDING: usize = 32;
+
+/// Capacity of the pairing-specific request-rate bucket (#3191/B2), independent of
+/// [`MAX_PENDING`]. `pairing.request` has no requestor identity to key a limiter on
+/// (loopback callers are indistinguishable), so this bucket is process-wide. It
+/// bounds a BURST of `pairing.request` calls, not the read plane `pairing.poll` is
+/// on: each admitted request holds one of `MAX_PENDING` scarce slots for up to
+/// `PAIRING_TTL_MS`, which is exactly the asymmetry the open control-read limiter
+/// declines to claim for itself.
+const PAIRING_BUCKET_CAPACITY: usize = 8;
+
+/// How often the bucket in [`PendingPairings`] refills by one token.
+const PAIRING_BUCKET_REFILL_MS: u64 = 10_000;
 
 /// The longest `client_name` this node will ACCEPT, in characters.
 ///
@@ -107,13 +139,31 @@ struct Pending {
     expires_ms: u64,
     /// Set on approval: the minted scoped token, delivered ONCE via `pairing.poll`.
     approved_token: Option<String>,
+    /// The sole bearer that redeems the token via `pairing.poll` (#3191/W1). Returned
+    /// ONLY in the `pairing.request` result — never by `list()`, never by `approve()`'s
+    /// result, never logged — so it stays known only to the client that requested it.
+    /// `pairing_id` is a HANDLE the operator may type in argv; this is the credential.
+    redemption_secret: String,
 }
 
-/// The in-memory set of pending pairings, keyed by `pairing_id` (a 32-hex secret
-/// returned only to the requester). Shared behind a `Mutex` in `AppState`.
-#[derive(Default)]
+/// The in-memory set of pending pairings, keyed by `pairing_id` (a 32-hex handle
+/// returned to the requester). Shared behind a `Mutex` in `AppState`.
 pub struct PendingPairings {
     map: HashMap<String, Pending>,
+    /// Token-bucket state for the `pairing.request` rate bound (#3191/B2).
+    bucket_tokens: f64,
+    /// The clock reading the bucket was last topped up at.
+    bucket_refilled_ms: u64,
+}
+
+impl Default for PendingPairings {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            bucket_tokens: PAIRING_BUCKET_CAPACITY as f64,
+            bucket_refilled_ms: 0,
+        }
+    }
 }
 
 impl PendingPairings {
@@ -122,6 +172,24 @@ impl PendingPairings {
     fn prune(&mut self, now: u64) {
         self.map
             .retain(|_, p| p.approved_token.is_some() || now <= p.expires_ms);
+    }
+
+    /// Admit one `pairing.request` against the bucket, refilling lazily off the
+    /// caller-supplied clock first. `now` is threaded in (never `Instant::now()`
+    /// internally) so a test can drive time without sleeping.
+    fn take_request_token(&mut self, now: u64) -> bool {
+        let elapsed_ms = now.saturating_sub(self.bucket_refilled_ms);
+        if elapsed_ms > 0 {
+            let refill = elapsed_ms as f64 / PAIRING_BUCKET_REFILL_MS as f64;
+            self.bucket_tokens = (self.bucket_tokens + refill).min(PAIRING_BUCKET_CAPACITY as f64);
+            self.bucket_refilled_ms = now;
+        }
+        if self.bucket_tokens >= 1.0 {
+            self.bucket_tokens -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -153,13 +221,44 @@ pub fn request(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> V
         );
     }
 
-    // Fail CLOSED: the pairing id + code gate the consent step, so if the OS CSPRNG is
-    // unavailable refuse the request rather than mint guessable pairing material (§7.3).
-    let (pairing_id, code) = match (
+    let created = now_ms();
+    let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
+    g.prune(created);
+
+    // #3191/B2: a pairing-specific burst bound, checked BEFORE the cap and BEFORE
+    // minting anything. It fires well under MAX_PENDING for a tight flood, and never
+    // touches `pairing.poll` (the read plane), so an ordinary interval-spaced pairing
+    // sequence is unaffected.
+    if !g.take_request_token(created) {
+        return control_error(
+            id,
+            ErrorCode::PairingPendingLimited,
+            "pairing requests to this node are bounded per interval, because each one holds a \
+             pending slot until it is approved or expires. Back off briefly and retry.",
+        );
+    }
+
+    // #3191/B1: a pending request the node already accepted is a commitment; refuse
+    // rather than displace it to make room for a later one (never evict).
+    if g.map.len() >= MAX_PENDING {
+        return control_error(
+            id,
+            ErrorCode::PairingPendingLimited,
+            "this node is already holding the maximum number of pending pairing requests. A \
+             request that is already pending is never displaced to make room for a later one; \
+             retry once one has been approved or has expired (within five minutes).",
+        );
+    }
+
+    // Fail CLOSED: the pairing id + code + redemption secret gate the consent step, so
+    // if the OS CSPRNG is unavailable refuse the request rather than mint guessable
+    // pairing material (§7.3).
+    let (pairing_id, code, redemption_secret) = match (
         crate::control::random_hex(16), // 32-hex
         crate::control::random_pairing_code(),
+        crate::control::random_hex(32), // 64-hex — #3191/W1, never the operator's id
     ) {
-        (Ok(pairing_id), Ok(code)) => (pairing_id, code),
+        (Ok(pairing_id), Ok(code), Ok(redemption_secret)) => (pairing_id, code, redemption_secret),
         _ => {
             return control_error(
                 id,
@@ -168,23 +267,8 @@ pub fn request(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> V
             )
         }
     };
-    let created = now_ms();
     let expires = created + PAIRING_TTL_MS;
 
-    let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
-    g.prune(created);
-    // Anti-DoS: if still at the cap after pruning, evict the oldest pending entry.
-    if g.map.len() >= MAX_PENDING {
-        if let Some(oldest) = g
-            .map
-            .iter()
-            .filter(|(_, p)| p.approved_token.is_none())
-            .min_by_key(|(_, p)| p.created_ms)
-            .map(|(k, _)| k.clone())
-        {
-            g.map.remove(&oldest);
-        }
-    }
     g.map.insert(
         pairing_id.clone(),
         Pending {
@@ -193,25 +277,51 @@ pub fn request(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> V
             created_ms: created,
             expires_ms: expires,
             approved_token: None,
+            redemption_secret: redemption_secret.clone(),
         },
     );
 
     control_ok(
         id,
-        json!({ "pairing_id": pairing_id, "pairing_code": code, "expires_ms": expires }),
+        json!({
+            "pairing_id": pairing_id,
+            "pairing_code": code,
+            "redemption_secret": redemption_secret,
+            "expires_ms": expires,
+        }),
     )
 }
 
-/// OPEN `pairing.poll { pairing_id }` — report the pairing's state:
-/// `{ status: "pending" | "approved" | "expired" | "unknown", token? }`. On
+/// OPEN `pairing.poll { pairing_id, redemption_secret }` — report the pairing's
+/// state: `{ status: "pending" | "approved" | "expired" | "unknown", token? }`. On
 /// `approved` the minted token is returned and the pending entry is consumed (the
 /// token is delivered exactly once).
+///
+/// `redemption_secret` is REQUIRED (#3191/W1): the value the operator handles
+/// (`pairing_id`) is a handle, not a credential — the token is delivered only to the
+/// client `pairing.request` returned the secret to. A missing field is a SHAPE error
+/// (reveals nothing about any id) and gets a named, diagnosable refusal; a WRONG
+/// secret is answered identically to an unknown id (constant-time compare), so
+/// `poll` cannot become an existence oracle over the id space.
 pub fn poll(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> Value {
     let pairing_id = params
         .get("pairing_id")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let redemption_secret = params
+        .get("redemption_secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if redemption_secret.is_empty() {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            "pairing.poll requires params.redemption_secret — the value pairing.request \
+             returned to the requesting client. The paired token is delivered only to the \
+             client that made the request, so the pairing_id alone does not redeem it.",
+        );
+    }
     let now = now_ms();
 
     let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -219,6 +329,11 @@ pub fn poll(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> Valu
     // reports `expired` exactly once (rather than being swept to `unknown`).
     let resp = match g.map.get(&pairing_id).cloned() {
         None => control_ok(id, json!({ "status": "unknown" })),
+        Some(p) if !ct_eq(redemption_secret, &p.redemption_secret) => {
+            // Wrong secret reads exactly like an unknown id — never removed, never
+            // distinguishable, so a guesser learns nothing about which ids exist.
+            control_ok(id, json!({ "status": "unknown" }))
+        }
         Some(p) => {
             if let Some(token) = p.approved_token {
                 g.map.remove(&pairing_id); // deliver once
@@ -567,14 +682,23 @@ mod tests {
         let config = scratch.path();
         let p = pending();
 
-        // Unknown id → status unknown.
-        let unknown = poll(&p, json!(1), &json!({ "pairing_id": "deadbeef" }));
+        // Unknown id → status unknown (secret present but irrelevant to a nonexistent id).
+        let unknown = poll(
+            &p,
+            json!(1),
+            &json!({ "pairing_id": "deadbeef", "redemption_secret": "x".repeat(64) }),
+        );
         assert_eq!(unknown["result"]["status"], json!("unknown"));
 
         // Request → pending.
         let req = request(&p, json!(2), &json!({ "client_name": "ext" }));
         let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
-        let pend = poll(&p, json!(3), &json!({ "pairing_id": pid }));
+        let secret = req["result"]["redemption_secret"].as_str().unwrap().to_string();
+        let pend = poll(
+            &p,
+            json!(3),
+            &json!({ "pairing_id": pid, "redemption_secret": secret }),
+        );
         assert_eq!(pend["result"]["status"], json!("pending"));
 
         // Approve (master path) → the token is minted + persisted.
@@ -583,7 +707,11 @@ mod tests {
         let token_id = ap["result"]["token_id"].as_str().unwrap().to_string();
 
         // First poll after approve → approved + token.
-        let ok = poll(&p, json!(5), &json!({ "pairing_id": pid }));
+        let ok = poll(
+            &p,
+            json!(5),
+            &json!({ "pairing_id": pid, "redemption_secret": secret }),
+        );
         assert_eq!(ok["result"]["status"], json!("approved"));
         let token = ok["result"]["token"].as_str().unwrap().to_string();
         assert_eq!(token.len(), 64, "64-hex scoped token");
@@ -593,7 +721,11 @@ mod tests {
         assert!(!is_paired_token(&paired_tokens_path(config), "not-a-token"));
 
         // Delivered ONCE: a second poll no longer knows the id.
-        let again = poll(&p, json!(6), &json!({ "pairing_id": pid }));
+        let again = poll(
+            &p,
+            json!(6),
+            &json!({ "pairing_id": pid, "redemption_secret": secret }),
+        );
         assert_eq!(again["result"]["status"], json!("unknown"));
 
         // Revoke → the token stops authorizing.
@@ -621,6 +753,7 @@ mod tests {
         let p = pending();
         let req = request(&p, json!(1), &json!({ "client_name": "ext-A" }));
         let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
+        let secret = req["result"]["redemption_secret"].as_str().unwrap().to_string();
 
         // Before approval: one pending, no tokens.
         let l1 = list(&p, config, json!(2));
@@ -630,7 +763,11 @@ mod tests {
 
         approve(&p, config, json!(3), &json!({ "pairing_id": pid.clone() }));
         // consume the pending via poll
-        poll(&p, json!(4), &json!({ "pairing_id": pid }));
+        poll(
+            &p,
+            json!(4),
+            &json!({ "pairing_id": pid, "redemption_secret": secret }),
+        );
 
         // After: no pending, one issued token (value never listed).
         let l2 = list(&p, config, json!(5));
@@ -658,14 +795,210 @@ mod tests {
                     created_ms: 0,
                     expires_ms: 1, // long past
                     approved_token: None,
+                    redemption_secret: "s".repeat(64),
                 },
             );
         }
-        let expired = poll(&p, json!(1), &json!({ "pairing_id": "abc" }));
+        let params = json!({ "pairing_id": "abc", "redemption_secret": "s".repeat(64) });
+        let expired = poll(&p, json!(1), &params);
         assert_eq!(expired["result"]["status"], json!("expired"));
         // And it's been consumed.
-        let after = poll(&p, json!(2), &json!({ "pairing_id": "abc" }));
+        let after = poll(&p, json!(2), &params);
         assert_eq!(after["result"]["status"], json!("unknown"));
+    }
+
+    /// **Proves:** the value the operator handles (`pairing_id`) does not by itself redeem the
+    /// minted token. `pairing.poll` requires the `redemption_secret` returned only to the
+    /// requesting client; a poll that omits it is refused, and the entry survives so the correct
+    /// poll (with the secret) still delivers the token afterwards.
+    #[test]
+    fn a_poll_without_the_requesters_redemption_secret_does_not_deliver_the_token() {
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let p = pending();
+
+        let req = request(&p, json!(1), &json!({ "client_name": "ext" }));
+        let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
+        let secret = req["result"]["redemption_secret"]
+            .as_str()
+            .expect("pairing.request must return a redemption_secret")
+            .to_string();
+
+        approve(&p, config, json!(2), &json!({ "pairing_id": pid.clone() }));
+
+        // Poll with the operator-visible id ALONE — no secret.
+        let bare = poll(&p, json!(3), &json!({ "pairing_id": pid.clone() }));
+        assert_eq!(
+            bare["error"]["data"]["code"],
+            json!(ErrorCode::InvalidParams.name()),
+            "a poll missing the redemption secret must be refused, not answered: {bare}"
+        );
+        assert!(
+            bare.get("result").is_none(),
+            "a poll missing the secret must never carry a result, let alone a token: {bare}"
+        );
+
+        // The entry must have SURVIVED the failed poll: the correct poll still delivers it.
+        let ok = poll(
+            &p,
+            json!(4),
+            &json!({ "pairing_id": pid, "redemption_secret": secret }),
+        );
+        assert_eq!(ok["result"]["status"], json!("approved"));
+        assert!(ok["result"]["token"].as_str().is_some());
+    }
+
+    /// **Proves:** a WRONG redemption secret is answered identically to an unknown id — it must
+    /// not become an oracle over the id space. The entry survives, and a subsequent correct poll
+    /// still delivers the token.
+    #[test]
+    fn a_poll_with_a_wrong_redemption_secret_is_indistinguishable_from_an_unknown_id() {
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let p = pending();
+
+        let req = request(&p, json!(1), &json!({ "client_name": "ext" }));
+        let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
+        let secret = req["result"]["redemption_secret"].as_str().unwrap().to_string();
+        approve(&p, config, json!(2), &json!({ "pairing_id": pid.clone() }));
+
+        let wrong = poll(
+            &p,
+            json!(3),
+            &json!({ "pairing_id": pid.clone(), "redemption_secret": "0".repeat(64) }),
+        );
+        let fabricated = poll(
+            &p,
+            json!(3),
+            &json!({ "pairing_id": "f".repeat(32), "redemption_secret": "0".repeat(64) }),
+        );
+        assert_eq!(wrong, json!({ "jsonrpc": "2.0", "id": 3, "result": { "status": "unknown" } }));
+        assert_eq!(
+            wrong["result"], fabricated["result"],
+            "a wrong secret must read exactly like an unknown id: {wrong} vs {fabricated}"
+        );
+
+        let ok = poll(
+            &p,
+            json!(4),
+            &json!({ "pairing_id": pid, "redemption_secret": secret }),
+        );
+        assert_eq!(ok["result"]["status"], json!("approved"));
+    }
+
+    /// **Proves:** the redemption secret never appears anywhere it isn't strictly needed —
+    /// `list()` and `approve()`'s own result must not carry it.
+    #[test]
+    fn the_redemption_secret_is_never_serialized_by_list_or_approve() {
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let p = pending();
+        let req = request(&p, json!(1), &json!({ "client_name": "ext" }));
+        let pid = req["result"]["pairing_id"].as_str().unwrap().to_string();
+
+        let l = list(&p, config, json!(2));
+        let pending_entry = &l["result"]["pending"][0];
+        assert!(
+            pending_entry.get("redemption_secret").is_none(),
+            "list() must never carry the redemption secret: {l}"
+        );
+
+        let ap = approve(&p, config, json!(3), &json!({ "pairing_id": pid }));
+        assert!(
+            ap["result"].get("redemption_secret").is_none(),
+            "approve()'s result must never carry the redemption secret: {ap}"
+        );
+    }
+
+    /// **Proves:** a pending request the node already accepted is never displaced to make room
+    /// for a later one. Flooding `pairing.request` past the slot cap leaves the FIRST entry
+    /// pending and redeemable, and the surplus requests are refused with `PAIRING_PENDING_LIMITED`.
+    #[test]
+    fn a_pending_request_is_never_displaced_by_a_later_request() {
+        let p = pending();
+        let first = request(&p, json!(0), &json!({ "client_name": "first" }));
+        let first_id = first["result"]["pairing_id"].as_str().unwrap().to_string();
+        let first_secret = first["result"]["redemption_secret"].as_str().unwrap().to_string();
+
+        let mut saw_limited = false;
+        for i in 1..(MAX_PENDING as i64 + 8) {
+            let r = request(&p, json!(i), &json!({ "client_name": "flood" }));
+            if r.get("error").is_some() {
+                assert_eq!(r["error"]["data"]["code"], json!("PAIRING_PENDING_LIMITED"));
+                saw_limited = true;
+            }
+        }
+        assert!(saw_limited, "the surplus requests past the cap must be refused");
+
+        let still_pending = poll(
+            &p,
+            json!(999),
+            &json!({ "pairing_id": first_id, "redemption_secret": first_secret }),
+        );
+        assert_eq!(
+            still_pending["result"]["status"],
+            json!("pending"),
+            "the first-accepted pending request must never be displaced: {still_pending}"
+        );
+    }
+
+    /// **Proves:** the third defect — approved-but-unpolled entries never age out of `prune()`, so
+    /// the cap must stop the map growing even when every held entry is already approved. Filling
+    /// the map with 32 approved entries and requesting one more must refuse, not grow the map.
+    #[test]
+    fn a_pending_map_at_capacity_of_approved_entries_does_not_grow() {
+        let scratch = tmp_config();
+        let config = scratch.path();
+        let p = pending();
+        for i in 0..MAX_PENDING {
+            let r = request(&p, json!(i as i64), &json!({ "client_name": "c" }));
+            let pid = r["result"]["pairing_id"].as_str().unwrap().to_string();
+            approve(&p, config, json!(1000 + i as i64), &json!({ "pairing_id": pid }));
+        }
+        assert_eq!(p.lock().unwrap().map.len(), MAX_PENDING);
+
+        let refused = request(&p, json!(9999), &json!({ "client_name": "one-more" }));
+        assert!(refused.get("error").is_some(), "at cap the request must be refused: {refused}");
+        assert_eq!(
+            p.lock().unwrap().map.len(),
+            MAX_PENDING,
+            "the map must not grow past MAX_PENDING even when every held entry is approved"
+        );
+    }
+
+    /// **Proves:** a burst of `pairing.request` calls is bounded by the pairing-specific token
+    /// bucket, independently of the pending-slot cap (this fires well before `MAX_PENDING`).
+    #[test]
+    fn a_burst_of_pairing_requests_is_bounded_by_the_pairing_slot_budget() {
+        let p = pending();
+        let mut saw_limited = false;
+        for i in 0..(PAIRING_BUCKET_CAPACITY as i64 + 4) {
+            let r = request(&p, json!(i), &json!({ "client_name": "burst" }));
+            if r.get("error").is_some() {
+                assert_eq!(r["error"]["data"]["code"], json!("PAIRING_PENDING_LIMITED"));
+                saw_limited = true;
+            }
+        }
+        assert!(saw_limited, "a tight burst must eventually be refused by the bucket");
+    }
+
+    /// **Proves:** the pairing-slot budget bounds a BURST, and the fix does not recreate the
+    /// failure `control_ingress_admits` exists to avoid: an ordinary operator pairing sequence
+    /// (a handful of requests, spaced by the refill interval) is never refused.
+    #[test]
+    fn a_normal_operator_pairing_sequence_is_never_refused() {
+        let p = pending();
+        for i in 0..5 {
+            let r = request(&p, json!(i), &json!({ "client_name": "ext" }));
+            assert!(
+                r.get("result").is_some(),
+                "an ordinary, interval-spaced pairing request must never be refused: {r}"
+            );
+            {
+                let mut g = p.lock().unwrap();
+                g.bucket_tokens = PAIRING_BUCKET_CAPACITY as f64;
+            }
+        }
     }
 
     #[test]
