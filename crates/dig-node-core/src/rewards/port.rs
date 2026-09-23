@@ -148,6 +148,12 @@ pub enum ChainPortError {
     /// No chain source is wired yet — the [`unavailable`] adapter's only answer, and what any real
     /// adapter should answer for an unreachable chain too (SPEC §12.2 clause 4).
     Unavailable,
+    /// dig_ecosystem#3342: the chain source ANSWERED, and no reward distributor exists at the
+    /// requested `launcher_id`. This is deliberately NOT [`ChainPortError::Unavailable`]: a funder
+    /// deciding whether to claw back must be able to tell "you have nothing there" (this variant)
+    /// apart from "we cannot see the chain" (`Unavailable`) — collapsing both onto one shape turns
+    /// that decision into a guess on a money surface.
+    NotADistributor,
     /// dig_ecosystem#3269/#3284/#3303: the distributor's `withdrawal_share_bps` (a `u64` on the
     /// puzzle) either does not fit the wire's `u16` domain or exceeds the legitimate `0..=10_000`
     /// bps range. The adapter MUST refuse the WHOLE [`RewardsChainPort::distributor_report`] call

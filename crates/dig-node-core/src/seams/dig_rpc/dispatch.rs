@@ -35,14 +35,25 @@ use crate::*;
 /// own surface.
 const ENGINE_WARMING: i64 = -32002;
 
-/// `REWARD_CHAIN_UNAVAILABLE` (dig_ecosystem#3269): no reward-distributor chain-read adapter is
-/// wired yet (`rewards::port::ChainPortError::Unavailable`, or no adapter installed at all).
+/// `REWARD_CHAIN_UNAVAILABLE` (dig_ecosystem#3269, corrected by dig_ecosystem#3342): the
+/// reward-distributor chain read could not complete — either no adapter is installed at all (the
+/// `let Some(port) = … else` arms below, via [`reward_chain_port_absent_response`]), or an
+/// installed adapter's `ChainPortError::Unavailable` means the chain source itself could not
+/// answer. It no longer means "the chain answered and there is nothing there" — that is
+/// [`ChainPortError::NotADistributor`], reported under [`REWARD_NOT_A_DISTRIBUTOR_MACHINE`].
 /// Distinct from [`REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE`] below — a caller must be able to tell
-/// "ask me again once the adapter lands" apart from "this distributor's own constant is out of
-/// range". Reuses [`CONTROL_ERROR`]'s numeric code (both are control-plane runtime errors,
-/// `-32032`), but carries its own `data.code` machine string so the two are still distinguishable
-/// in the body.
+/// "the chain could not be reached" apart from "this distributor's own constant is out of range".
+/// Reuses [`CONTROL_ERROR`]'s numeric code (both are control-plane runtime errors, `-32032`), but
+/// carries its own `data.code` machine string so the two are still distinguishable in the body.
 const REWARD_CHAIN_UNAVAILABLE_MACHINE: &str = "REWARD_CHAIN_UNAVAILABLE";
+
+/// `REWARD_NOT_A_DISTRIBUTOR` (dig_ecosystem#3342): the chain source answered, and no reward
+/// distributor exists at the requested launcher id. Kept distinct from
+/// [`REWARD_CHAIN_UNAVAILABLE_MACHINE`] on purpose — see [`ChainPortError::NotADistributor`]'s own
+/// doc for why collapsing the two is a money-surface defect, not a cosmetic one. Reuses
+/// [`CONTROL_ERROR`]'s numeric code, matching every other reward-distributor machine code here; no
+/// wire-protocol change is needed since `data.code` alone carries the distinction.
+const REWARD_NOT_A_DISTRIBUTOR_MACHINE: &str = "REWARD_NOT_A_DISTRIBUTOR";
 
 /// `REWARD_INVALID_WITHDRAWAL_SHARE` (dig_ecosystem#3269/#3284/#3303): the distributor's
 /// `withdrawal_share_bps` does not fit the wire's `u16` domain or exceeds the legitimate
@@ -71,8 +82,13 @@ fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value
     match error {
         ChainPortError::Unavailable => json!({"jsonrpc":"2.0","id":id,"error":{
             "code": CONTROL_ERROR,
-            "message": "reward-distributor chain read is unavailable: no chain-read adapter is wired yet",
+            "message": "reward-distributor chain read is unavailable: the chain source could not answer",
             "data": { "code": REWARD_CHAIN_UNAVAILABLE_MACHINE, "origin": "control" }
+        }}),
+        ChainPortError::NotADistributor => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": "no reward distributor exists at this launcher id on chain",
+            "data": { "code": REWARD_NOT_A_DISTRIBUTOR_MACHINE, "origin": "control" }
         }}),
         ChainPortError::InvalidWithdrawalShare => json!({"jsonrpc":"2.0","id":id,"error":{
             "code": CONTROL_ERROR,
@@ -90,6 +106,19 @@ fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value
             "data": { "code": "CONTROL_ERROR", "origin": "control" }
         }}),
     }
+}
+
+/// The response for the ONE case where "no chain-read adapter is wired yet" is actually true: no
+/// `rewards::port::RewardsChainPort` has been installed on this `Node` at all
+/// (dig_ecosystem#3342). Kept separate from [`reward_chain_port_error_response`] so that
+/// function's `Unavailable` arm never has to carry a sentence that is false whenever an installed
+/// adapter reports its own `Unavailable` for a chain-source outage.
+fn reward_chain_port_absent_response(id: &Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"error":{
+        "code": CONTROL_ERROR,
+        "message": "reward-distributor chain read is unavailable: no chain-read adapter is wired yet",
+        "data": { "code": REWARD_CHAIN_UNAVAILABLE_MACHINE, "origin": "control" }
+    }})
 }
 
 /// The largest legitimate `withdrawal_share_bps`: 10,000 basis points IS 100%, so this is an
@@ -878,7 +907,8 @@ impl RpcDispatch for Node {
             "count": set.len()}});
             }
             // dig.getRewardProverStatus (dig_ecosystem#3269, dig-rewards-coin SPEC.md
-            // §2.3/§2.4) — CONTROL plane: loopback admin / in-process FFI ONLY, NEVER over the
+            // §2.3/§2.4) — CONTROL plane: loopback admin / in-process FFI ONLY (the token tier of
+            // this NODE-LOCAL read is dig_ecosystem#3352's decision, not #3351's), NEVER over the
             // mTLS peer surface (absent from `is_peer_reachable_method`;
             // `reward_methods_tier_guard.rs` fails closed on that). Reads the node's live
             // `reward_prover_statuses` registry (empty until dig_ecosystem#3265 spawns a prover
@@ -968,12 +998,22 @@ impl RpcDispatch for Node {
                 };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
-            // dig.getRewardDistributor (dig_ecosystem#3269 unit 2, SPEC §2.6/§12.4) — CONTROL
-            // plane: loopback admin / in-process FFI ONLY, absent from `is_peer_reachable_method`
-            // (`reward_methods_tier_guard.rs` fails closed on that). Chain-derived state ONLY —
-            // never the local prover loop's self-reported state (see `GetRewardProverStatus`
-            // above for that). Goes entirely through `rewards::port::RewardsChainPort`: this
-            // crate never calls `dig-rewards-coin` itself (dig_ecosystem#3269 unit 0).
+            // dig.getRewardDistributor (dig_ecosystem#3269 unit 2, SPEC §2.6/§12.4) — `Tier::Control`
+            // in dig-rpc-protocol's sense: served ONLY by the local `handle_rpc` dispatch (the
+            // service's `POST /` and the in-process FFI), NEVER over the mTLS peer surface (absent
+            // from `is_peer_reachable_method`; `reward_methods_tier_guard.rs` fails closed on that).
+            // NOT token-gated (dig_ecosystem#3351): an OPEN read of public on-chain state keyed by
+            // the caller's `launcher_id`, answered to any caller that reaches `POST /` with no token:
+            // only the `control.` prefix is token-gated (SPEC §7.2 `is_control_method`; §5.5
+            // `requires_auth: false` for every non-`control.*` method), and the read passes §7.2's
+            // WHO-NAMES-THE-SUBJECT test the same way `control.wallet.balance` does (#1851,
+            // `control::is_open_control_read`): the subject arrives in the request, so the answer
+            // discloses no node-local association.
+            // Pinned by `reward_distributor_reads_answer_on_post_slash_without_a_token` in
+            // dig-node-service `tests/server.rs`. Chain-derived state ONLY — never the local prover
+            // loop's self-reported state (see `GetRewardProverStatus` above for that). Goes entirely
+            // through `rewards::port::RewardsChainPort`: this crate never calls `dig-rewards-coin`
+            // itself (dig_ecosystem#3269 unit 0).
             Some(Method::GetRewardDistributor) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
                 let launcher_id = match parse_launcher_id_arg(&params) {
@@ -981,7 +1021,7 @@ impl RpcDispatch for Node {
                     Err(msg) => return rpc_err(&id, -32602, &msg),
                 };
                 let Some(port) = node.reward_chain_port() else {
-                    return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                    return reward_chain_port_absent_response(&id);
                 };
                 // Range-check at THIS seam, not only in the adapter: see
                 // `range_checked_report` for why an out-of-range share must refuse here.
@@ -1012,7 +1052,8 @@ impl RpcDispatch for Node {
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
             // dig.listRewardDistributorCommitments (dig_ecosystem#3269 unit 2, SPEC §7.4 clause 5)
-            // — CONTROL plane, same guard shape as `GetRewardDistributor` above. `commitments`
+            // — same guard shape as `GetRewardDistributor` above (`Tier::Control`, not token-gated,
+            // OPEN on `POST /`; dig_ecosystem#3351). `commitments`
             // empty is legitimate (a donation-only distributor); `recoverable_base_units` per slot
             // is ALWAYS the port's pre-computed figure -- this handler never recomputes it (see
             // `rewards::port::CommitmentSlot`'s doc for why that arithmetic never lives here).
@@ -1023,7 +1064,7 @@ impl RpcDispatch for Node {
                     Err(msg) => return rpc_err(&id, -32602, &msg),
                 };
                 let Some(port) = node.reward_chain_port() else {
-                    return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                    return reward_chain_port_absent_response(&id);
                 };
                 // Range-check at THIS seam, not only in the adapter: see
                 // `range_checked_report` for why an out-of-range share must refuse here.
@@ -1109,7 +1150,7 @@ impl RpcDispatch for Node {
                 let mut funded_refs = Vec::with_capacity(identities.len());
                 for identity in identities {
                     let Some(port) = node.reward_chain_port() else {
-                        return reward_chain_port_error_response(&id, &ChainPortError::Unavailable);
+                        return reward_chain_port_absent_response(&id);
                     };
                     let report = match port
                         .distributor_report(identity.launcher_id)
