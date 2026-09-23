@@ -3962,3 +3962,152 @@ async fn reward_distributor_reads_answer_on_post_slash_without_a_token() {
         );
     }
 }
+
+/// Proves (dig_ecosystem#3352): the three NODE-LOCAL reward reads (`dig.getRewardProverStatus`,
+/// `dig.listRewardDistributors`, `dig.getPayeeRewardClaimStatus`) are token-gated at the HTTP
+/// `POST /` ingress exactly like the `cache.*` landing trio: an untokened call is `-32030
+/// UNAUTHORIZED` and the response body carries NONE of the fields the handler would otherwise
+/// return (`statuses`/`funded`/`subject`) -- a demoted gate that still leaked the payload alongside
+/// the error would defeat the whole point. The master control token AND a genuine paired token each
+/// clear the gate and reach the real handler (proven by the handler-specific shape each answers
+/// with on this ephemeral, chain-portless node).
+///
+/// Catches: any of the three reads left OPEN (or newly gated but leaking a body on refusal), and a
+/// paired-token caller wrongly excluded from a gate that (per #3352, unlike wallet mutations) is
+/// master-OR-paired, not master-only.
+#[tokio::test]
+async fn node_local_reward_reads_require_the_control_token() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, master, _hold) = start_node_full(&upstream).await;
+
+    // A genuine paired token, obtained exactly as the extension does (see
+    // `a_paired_token_cannot_grant_itself_a_trusted_chia_peer`).
+    let req = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "pairing.request",
+                "params": { "client_name": "DIG Chrome Extension" } }),
+        None,
+    )
+    .await;
+    let pairing_id = req["result"]["pairing_id"].as_str().unwrap().to_string();
+    let approve = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "control.pairing.approve",
+                "params": { "pairing_id": pairing_id } }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(approve["result"]["approved"], json!(true));
+    let paired = poll_pairing(&addr, &pairing_id).await["result"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let cases: &[(&str, &str)] = &[
+        ("dig.getRewardProverStatus", "statuses"),
+        ("dig.listRewardDistributors", "funded"),
+        ("dig.getPayeeRewardClaimStatus", "subject"),
+    ];
+
+    for (method, leaked_field) in cases {
+        let body = json!({ "jsonrpc": "2.0", "id": 9, "method": method });
+
+        // No token: UNAUTHORIZED, and the payload never leaks alongside the refusal.
+        let rejected = post_rpc(&addr, body.clone(), None).await;
+        assert_eq!(
+            rejected["error"]["code"],
+            json!(-32030),
+            "{method} without a token must be -32030, got {rejected:?}"
+        );
+        assert_eq!(
+            rejected["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} without a token must be UNAUTHORIZED, got {rejected:?}"
+        );
+        assert!(
+            rejected.pointer(&format!("/result/{leaked_field}")).is_none(),
+            "{method} must never leak /result/{leaked_field} on a rejected call, got {rejected:?}"
+        );
+
+        // Master control token: clears the gate, reaches the real handler.
+        let via_master = post_rpc(&addr, body.clone(), Some(&master)).await;
+        assert_ne!(
+            via_master["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} with the master control token must clear the gate, got {via_master:?}"
+        );
+
+        // Paired token: clears the gate too (master-OR-paired, same as the cache trio).
+        let via_paired = post_rpc(&addr, body, Some(&paired)).await;
+        assert_ne!(
+            via_paired["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} with a paired token must clear the gate, got {via_paired:?}"
+        );
+    }
+
+    // Handler-specific shape, proving dispatch (not a stub) answered each authorized call.
+    let prover = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 10, "method": "dig.getRewardProverStatus" }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(
+        prover["result"]["statuses"]["outcome"],
+        json!("consulted"),
+        "got {prover:?}"
+    );
+
+    let listed = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 11, "method": "dig.listRewardDistributors" }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["funded"]["outcome"],
+        json!("consulted"),
+        "got {listed:?}"
+    );
+
+    let payee = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 12, "method": "dig.getPayeeRewardClaimStatus" }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(payee["result"]["subject"], json!("payee"), "got {payee:?}");
+}
+
+/// Proves (dig_ecosystem#3355): the loopback operator, driving the two OPEN chain-keyed reward
+/// reads (`dig.getRewardDistributor`) well past the 32-call burst that bounds a per-source flood, is
+/// NEVER refused with `REWARD_INGRESS_LIMITED` -- the ingress bound exempts `RequestorId::Local`
+/// exactly as the existing `control_ingress` bound does (`control_ingress_admits`). The
+/// non-exempt/anonymous side of this bound cannot be driven over a real loopback TCP connection (the
+/// test client IS the operator), so it is pinned at the predicate/limiter level instead --
+/// `open_reward_chain_reads_are_rate_bounded_per_source` in `server.rs`'s own unit tests, beside the
+/// sibling `control_ingress` tests it mirrors.
+///
+/// Catches: an ingress bound wired onto the OPEN reward reads that forgets the loopback exemption,
+/// reproducing the #3051 failure (a polling operator refused its own reads) one bound over.
+#[tokio::test]
+async fn open_reward_chain_reads_never_limit_the_loopback_operator() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_node(&upstream).await;
+    let launcher_id = "11".repeat(32);
+    for i in 0..40 {
+        let resp = post_rpc(
+            &addr,
+            json!({ "jsonrpc": "2.0", "id": i, "method": "dig.getRewardDistributor",
+                    "params": { "launcher_id": launcher_id } }),
+            None,
+        )
+        .await;
+        assert_ne!(
+            resp["error"]["data"]["code"],
+            json!("REWARD_INGRESS_LIMITED"),
+            "call {i} from the loopback operator must never be -32034, got {resp:?}"
+        );
+    }
+}
