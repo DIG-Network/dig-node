@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 
 use chia_protocol::Bytes32;
 
+use super::chain_port::MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE;
 use super::config::RewardsClaimConfig;
 use super::hints::DistributorHintSource;
 use super::port::{ClaimChainPort, ClaimPortError};
-use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus};
+use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus, Discovery};
 
 /// The two cadences [`ClaimEngine::with_persisted_fee_window`] needs, DERIVED together from the
 /// single raw configured value they both come from.
@@ -359,6 +360,7 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         self.status.distributors_faulted = 0;
         self.status.claims_submitted_this_cycle = 0;
         self.status.no_entry_slot_this_cycle = 0;
+        self.status.discovery_candidates_dropped_this_cycle = 0;
         self.status.last_attempt_at = Some(now);
 
         // F18: this engine's own view of the persisted fee window for this cycle -- there is no
@@ -481,14 +483,32 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
                 // timestamp going stale to notice a wedged discovery path.
                 self.status.fault_reported = true;
                 discovery_failed = true;
-                Vec::new()
+                Discovery::default()
             }
         };
         if !discovery_failed {
             self.status.last_discovery_at = Some(now);
         }
 
-        let mut candidates: Vec<Bytes32> = discovered.iter().map(|d| d.launcher_id).collect();
+        // DIG-Network/dig_ecosystem#3358: a per-cycle reading, never latched -- reset at the top
+        // of this function alongside every other per-cycle counter. Reported unconditionally, and
+        // logged when nonzero: a silently shrunk candidate set is exactly the failure this exists
+        // to prevent.
+        self.status.discovery_candidates_dropped_this_cycle = discovered.candidates_dropped;
+        if discovered.candidates_dropped > 0 {
+            tracing::warn!(
+                target: "rewards_claim",
+                dropped = discovered.candidates_dropped,
+                cap = MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE,
+                "hinted launcher candidates over the per-cycle cap were NOT decoded"
+            );
+        }
+
+        let mut candidates: Vec<Bytes32> = discovered
+            .distributors
+            .iter()
+            .map(|d| d.launcher_id)
+            .collect();
         // F4: a real adapter can plausibly return the same launcher id twice (one distributor
         // reachable via two of the §1.3 launch comments this node scans, across the
         // `(store_id, root)` pairs it mirrors). Without this, phase 2 would evaluate it twice and
@@ -967,7 +987,7 @@ mod tests {
     use super::*;
     use crate::rewards_claim::hints::{DistributorHint, NoHintSource};
     use crate::rewards_claim::parser::parse_launch_comment;
-    use crate::rewards_claim::types::DiscoveredDistributor;
+    use crate::rewards_claim::types::{DiscoveredDistributor, Discovery};
 
     const DIG_ASSET_ID: Bytes32 = Bytes32::new([9u8; 32]);
     const OUR_PAYOUT_PUZZLE_HASH: Bytes32 = Bytes32::new([1u8; 32]);
@@ -1046,20 +1066,21 @@ mod tests {
 
     #[async_trait]
     impl ClaimChainPort for FakeChainPort {
-        async fn discover_distributors(
-            &self,
-        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
-            Ok(self
-                .distributors
-                .lock()
-                .unwrap()
-                .values()
-                .map(|d| DiscoveredDistributor {
-                    launcher_id: d.launcher_id,
-                    store_id: d.store_id,
-                    root: d.root,
-                })
-                .collect())
+        async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
+            Ok(Discovery {
+                distributors: self
+                    .distributors
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|d| DiscoveredDistributor {
+                        launcher_id: d.launcher_id,
+                        store_id: d.store_id,
+                        root: d.root,
+                    })
+                    .collect(),
+                candidates_dropped: 0,
+            })
         }
 
         async fn resolve_launch_comment(
@@ -1429,10 +1450,8 @@ mod tests {
         struct HintOnlyPort(FakeChainPort);
         #[async_trait]
         impl ClaimChainPort for HintOnlyPort {
-            async fn discover_distributors(
-                &self,
-            ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
-                Ok(Vec::new())
+            async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
+                Ok(Discovery::default())
             }
             async fn resolve_launch_comment(
                 &self,
@@ -1518,9 +1537,7 @@ mod tests {
     struct AlwaysFaultingDiscoveryPort;
     #[async_trait]
     impl ClaimChainPort for AlwaysFaultingDiscoveryPort {
-        async fn discover_distributors(
-            &self,
-        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
+        async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
             Err(ClaimPortError::Other("simulated chain fault".into()))
         }
         async fn resolve_launch_comment(
@@ -2829,9 +2846,7 @@ mod tests {
 
     #[async_trait]
     impl ClaimChainPort for FlakyThenHealthyPort {
-        async fn discover_distributors(
-            &self,
-        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
+        async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
             let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if call_number == 1 {
                 return Err(ClaimPortError::Unavailable);
@@ -2938,9 +2953,7 @@ mod tests {
 
     #[async_trait]
     impl ClaimChainPort for HealthyThenUnavailablePort {
-        async fn discover_distributors(
-            &self,
-        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
+        async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
             let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if call_number == 1 {
                 return self.inner.discover_distributors().await;
@@ -3062,13 +3075,11 @@ mod tests {
 
     #[async_trait]
     impl ClaimChainPort for DuplicatingDiscoveryPort {
-        async fn discover_distributors(
-            &self,
-        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
-            let mut v = self.0.discover_distributors().await?;
-            let doubled = v.clone();
-            v.extend(doubled);
-            Ok(v)
+        async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
+            let mut discovery = self.0.discover_distributors().await?;
+            let doubled = discovery.distributors.clone();
+            discovery.distributors.extend(doubled);
+            Ok(discovery)
         }
         async fn resolve_launch_comment(
             &self,

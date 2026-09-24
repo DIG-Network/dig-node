@@ -715,7 +715,7 @@ mod tests {
 
     use super::super::cadence::CLAIM_JITTER_SECONDS_DEFAULT;
     use super::super::port::ClaimPortError;
-    use super::super::types::{DiscoveredDistributor, OwnEntry};
+    use super::super::types::{DiscoveredDistributor, Discovery, OwnEntry};
 
     // ---- decide_claim_driver / spawn_claim_driver_if (A3) ----------------------------------
 
@@ -988,10 +988,8 @@ mod tests {
 
     #[async_trait]
     impl ClaimChainPort for EmptyPort {
-        async fn discover_distributors(
-            &self,
-        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
-            Ok(Vec::new())
+        async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
+            Ok(Discovery::default())
         }
         async fn resolve_launch_comment(
             &self,
@@ -1138,14 +1136,15 @@ mod tests {
 
     #[async_trait]
     impl ClaimChainPort for OneDistributorPort {
-        async fn discover_distributors(
-            &self,
-        ) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
-            Ok(vec![DiscoveredDistributor {
-                launcher_id: Bytes32::from([9u8; 32]),
-                store_id: Bytes32::from([0u8; 32]),
-                root: Bytes32::from([0u8; 32]),
-            }])
+        async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
+            Ok(Discovery {
+                distributors: vec![DiscoveredDistributor {
+                    launcher_id: Bytes32::from([9u8; 32]),
+                    store_id: Bytes32::from([0u8; 32]),
+                    root: Bytes32::from([0u8; 32]),
+                }],
+                candidates_dropped: 0,
+            })
         }
         async fn resolve_launch_comment(
             &self,

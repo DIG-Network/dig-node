@@ -26,8 +26,8 @@ use dig_rewards_coin::constants::PAYOUT_THRESHOLD_BASE_UNITS;
 use dig_wallet::sage::spend::MockBroadcaster;
 
 use common::rewards_fixture::{
-    launch_fixture, launch_funded_admitted_fixture, mock_chain_source,
-    mock_chain_source_for_funded_fixture,
+    launch_fixture, launch_funded_admitted_fixture, launch_funded_admitted_fixture_with_approval,
+    mock_chain_source, mock_chain_source_for_funded_fixture,
 };
 
 /// An index that proposes exactly the ids it is built with -- no re-verification of its own; that
@@ -54,15 +54,19 @@ async fn discover_distributors_returns_exactly_the_real_launch() {
         Arc::new(MockBroadcaster::default()),
     );
 
-    let discovered = port
+    let discovery = port
         .discover_distributors()
         .await
         .expect("a real launched distributor must discover");
 
-    assert_eq!(discovered.len(), 1);
-    assert_eq!(discovered[0].launcher_id, fixture.launcher_id);
-    assert_eq!(discovered[0].store_id, fixture.launch_comment.store_id);
-    assert_eq!(discovered[0].root, fixture.launch_comment.root);
+    assert_eq!(discovery.distributors.len(), 1);
+    assert_eq!(discovery.distributors[0].launcher_id, fixture.launcher_id);
+    assert_eq!(
+        discovery.distributors[0].store_id,
+        fixture.launch_comment.store_id
+    );
+    assert_eq!(discovery.distributors[0].root, fixture.launch_comment.root);
+    assert_eq!(discovery.candidates_dropped, 0);
 }
 
 /// SPEC 13.1 clause 2: an index only PROPOSES. A bogus id mixed in with the real one must be
@@ -79,17 +83,74 @@ async fn a_bogus_index_entry_is_dropped_not_echoed() {
         Arc::new(MockBroadcaster::default()),
     );
 
-    let discovered = port
+    let discovery = port
         .discover_distributors()
         .await
         .expect("a bogus id must be dropped, not fail the whole discovery");
 
     assert_eq!(
-        discovered.len(),
+        discovery.distributors.len(),
         1,
         "an index lie must yield nothing for that id, and never overrule the real one"
     );
-    assert_eq!(discovered[0].launcher_id, fixture.launcher_id);
+    assert_eq!(discovery.distributors[0].launcher_id, fixture.launcher_id);
+}
+
+/// DIG-Network/dig_ecosystem#3358: a candidate cap that lands ON the real launcher id must drop it
+/// and REPORT the drop -- never silently return fewer distributors than the caller can account for.
+/// Uses [`RealClaimChainPort::with_candidate_cap`] pinned to 1 so this proves the drop without
+/// decoding hundreds of candidates; the production constant stays
+/// [`dig_node_service::rewards_claim::RealClaimChainPort`]'s own default (256).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_cycle_drops_the_candidate_past_the_cap_and_reports_it() {
+    let fixture = launch_fixture().expect("a real distributor launches cleanly in the simulator");
+    let source = mock_chain_source(&fixture);
+    let bogus_id = Bytes32::from([0xEE; 32]);
+    let port = RealClaimChainPort::with_candidate_cap(
+        Arc::new(source),
+        FixtureLauncherIndex(vec![bogus_id, fixture.launcher_id]),
+        Arc::new(MockBroadcaster::default()),
+        1,
+    );
+
+    let discovery = port
+        .discover_distributors()
+        .await
+        .expect("a capped cycle must still answer, never error, for the candidates it does try");
+
+    assert_eq!(
+        discovery.distributors.len(),
+        0,
+        "the real launcher id sits past the cap of 1 and must be dropped, not decoded"
+    );
+    assert_eq!(
+        discovery.candidates_dropped, 1,
+        "the one candidate past the cap must be reported, never silently absorbed"
+    );
+}
+
+/// The same cap, sized to admit every candidate -- proves the cap itself never drops anything when
+/// there is nothing to drop (the companion proof to the capped case above).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cap_that_covers_every_candidate_drops_nothing() {
+    let fixture = launch_fixture().expect("a real distributor launches cleanly in the simulator");
+    let source = mock_chain_source(&fixture);
+    let bogus_id = Bytes32::from([0xEE; 32]);
+    let port = RealClaimChainPort::with_candidate_cap(
+        Arc::new(source),
+        FixtureLauncherIndex(vec![fixture.launcher_id, bogus_id]),
+        Arc::new(MockBroadcaster::default()),
+        2,
+    );
+
+    let discovery = port
+        .discover_distributors()
+        .await
+        .expect("a real launched distributor must discover");
+
+    assert_eq!(discovery.distributors.len(), 1);
+    assert_eq!(discovery.distributors[0].launcher_id, fixture.launcher_id);
+    assert_eq!(discovery.candidates_dropped, 0);
 }
 
 /// `reserve_asset_id` and `payout_threshold` are real chain-curried reads, not the crate's own
@@ -171,13 +232,25 @@ async fn a_failing_source_reports_unavailable_everywhere() {
         MockChainSource::new().fail_with(dig_chainsource_interface::ChainSourceError::Transport(
             "simulated transport failure".into(),
         ));
+    let launcher_id = Bytes32::from([1u8; 32]);
+    // DIG-Network/dig_ecosystem#3363: a NON-empty index -- discovery must reach the failing
+    // source's own `Unavailable` answer, not stop short on an empty candidate list (which would
+    // pass this assertion for the wrong reason, without ever driving the source at all).
     let port = RealClaimChainPort::new(
         Arc::new(source),
-        FixtureLauncherIndex(vec![]),
+        FixtureLauncherIndex(vec![launcher_id]),
         Arc::new(MockBroadcaster::default()),
     );
 
-    let launcher_id = Bytes32::from([1u8; 32]);
+    assert_eq!(
+        port.discover_distributors().await,
+        Err(ClaimPortError::Unavailable)
+    );
+    assert_eq!(
+        port.submit_initiate_payout(launcher_id, Bytes32::from([2u8; 32]), 0)
+            .await,
+        Err(ClaimPortError::Unavailable)
+    );
     assert_eq!(
         port.reserve_asset_id(launcher_id).await,
         Err(ClaimPortError::Unavailable)
@@ -376,6 +449,60 @@ async fn submit_initiate_payout_builds_a_bundle_the_simulator_accepts_and_pays_t
     );
 }
 
+/// DIG-Network/dig_ecosystem#3362: a distributor that curries `require_payout_approval = true`
+/// must be REFUSED, by name, before any bundle is built or broadcast -- this adapter drops
+/// `initiate_payout`'s returned `conditions` unconditionally (see `chain_port.rs`'s module doc), so
+/// proceeding here would build a bundle the chain would reject anyway, but only after this
+/// adapter's caller believed the payout had been submitted. A REAL simulator launch with the flag
+/// curried true (never a struct literal -- a fixture starting where production cannot reach hides
+/// the bug), funded and admitted so the refusal is proven against an entry that would otherwise be
+/// perfectly payable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_distributor_requiring_payout_approval_is_refused_by_name_before_any_broadcast() {
+    let payout_puzzle_hash = Bytes32::from([0x55; 32]);
+    let fixture = launch_funded_admitted_fixture_with_approval(payout_puzzle_hash, true).expect(
+        "a funded, admitted distributor with require_payout_approval=true must launch cleanly",
+    );
+    let source = mock_chain_source_for_funded_fixture(&fixture);
+    let broadcaster = Arc::new(MockBroadcaster::default());
+    let port = RealClaimChainPort::new(
+        Arc::new(source),
+        FixtureLauncherIndex(vec![fixture.launcher_id]),
+        broadcaster.clone(),
+    );
+
+    let entry = port
+        .own_entry(fixture.launcher_id, payout_puzzle_hash)
+        .await
+        .expect("the admitted entry must read")
+        .expect("the fixture admitted exactly this payout puzzle hash");
+    assert!(
+        entry.accrued_base_units >= fixture.constants.payout_threshold,
+        "the entry must clear its own threshold -- proving the refusal fires on a distributor that \
+         would otherwise be perfectly payable, not merely an ineligible one"
+    );
+
+    let result = port
+        .submit_initiate_payout(fixture.launcher_id, payout_puzzle_hash, 0)
+        .await;
+    match result {
+        Err(ClaimPortError::Other(msg)) => {
+            assert!(
+                msg.contains("require_payout_approval"),
+                "the refusal must name the reason: {msg}"
+            );
+        }
+        other => panic!("expected a named refusal, got {other:?}"),
+    }
+
+    let sent = broadcaster.sent.lock().expect("the broadcaster's own lock");
+    assert_eq!(
+        sent.len(),
+        0,
+        "a require_payout_approval=true distributor must never reach the broadcaster"
+    );
+}
+
 /// DIG-Network/dig_ecosystem#3347's CLOSURE ARTIFACT: drives the whole PRODUCTION BODY
 /// (`run_claim_driver_in`, the same function `run_claim_driver` calls in production, over a real
 /// `RealClaimChainPort`) against a real, funded, admitted distributor -- and asserts the payout
@@ -412,12 +539,12 @@ async fn a_driven_cycle_over_a_funded_admitted_distributor_pays_this_peer() {
         "half an epoch with one entry must have accrued something"
     );
 
-    let discovered = port
+    let discovery = port
         .discover_distributors()
         .await
         .expect("discovery must not error");
     assert_eq!(
-        discovered.len(),
+        discovery.distributors.len(),
         1,
         "discovery must find the one real distributor this fixture launched"
     );

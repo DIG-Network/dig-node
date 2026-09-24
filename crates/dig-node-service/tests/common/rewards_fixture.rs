@@ -66,6 +66,16 @@ pub struct LaunchedFixture {
 /// `launch_dig_distributor` against a fresh `Simulator` — trimmed from
 /// `dig-rewards-coin::tests::simulator::launch_harness_with_constants_builder`.
 pub fn launch_fixture() -> Result<LaunchedFixture, Box<dyn std::error::Error>> {
+    launch_fixture_with_approval(false)
+}
+
+/// Same as [`launch_fixture`], but with an explicit `require_payout_approval` -- DIG-Network/dig_ecosystem#3362
+/// needs a REAL simulator launch with the flag curried `true` (a fixture starting where production
+/// cannot hides the bug -- a struct literal would never prove the chain-curried value is what the
+/// adapter actually reads).
+pub fn launch_fixture_with_approval(
+    require_payout_approval: bool,
+) -> Result<LaunchedFixture, Box<dyn std::error::Error>> {
     let ctx = &mut SpendContext::new();
     let mut sim = Simulator::new();
 
@@ -163,7 +173,7 @@ pub fn launch_fixture() -> Result<LaunchedFixture, Box<dyn std::error::Error>> {
         // from the default, or a port that ignores the chain and returns the default constant
         // reads as correct by coincidence. See `reserve_asset_id_and_payout_threshold_are_read_from_chain`.
         PAYOUT_THRESHOLD_BASE_UNITS.saturating_add(1_000_000),
-        false,
+        require_payout_approval,
         0,
         WITHDRAWAL_SHARE_BPS,
         source_cat.info.asset_id,
@@ -458,6 +468,18 @@ pub struct FundedFixture {
 pub fn launch_funded_admitted_fixture(
     payout_puzzle_hash: Bytes32,
 ) -> Result<FundedFixture, Box<dyn std::error::Error>> {
+    launch_funded_admitted_fixture_with_approval(payout_puzzle_hash, false)
+}
+
+/// Same as [`launch_funded_admitted_fixture`], but with an explicit `require_payout_approval` --
+/// DIG-Network/dig_ecosystem#3362 needs a REAL simulator launch (funded, admitted, above
+/// threshold) with the flag curried `true`, not a struct literal a production read path could
+/// never actually produce.
+#[allow(dead_code)]
+pub fn launch_funded_admitted_fixture_with_approval(
+    payout_puzzle_hash: Bytes32,
+    require_payout_approval: bool,
+) -> Result<FundedFixture, Box<dyn std::error::Error>> {
     let ctx = &mut SpendContext::new();
     let mut sim = Simulator::new();
 
@@ -553,7 +575,7 @@ pub fn launch_funded_admitted_fixture(
         u64::MAX,
         MAX_SECONDS_OFFSET,
         PAYOUT_THRESHOLD_BASE_UNITS,
-        false,
+        require_payout_approval,
         0,
         WITHDRAWAL_SHARE_BPS,
         source_cat.info.asset_id,
@@ -618,6 +640,12 @@ pub fn launch_funded_admitted_fixture(
         )?,
     );
 
+    // DIG-Network/dig_ecosystem#3357: safe here ONLY because `distributor` is this fixture's own
+    // freshly-built IN-PROCESS value -- these slots come from ITS OWN `pending_spend` this same
+    // generation, never from a distributor rebuilt from chain (where this call would derive a
+    // PHANTOM `LineageProof` for an earlier generation's slot). Production code must never call
+    // this; see `clippy.toml`'s `disallowed-methods` entry for the ban.
+    #[allow(clippy::disallowed_methods)]
     let reward_slots: Vec<_> = distributor
         .pending_spend
         .created_reward_slots
