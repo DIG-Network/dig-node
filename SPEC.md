@@ -1044,7 +1044,7 @@ MUST NOT re-declare method names. Each entry carries a `served` class and `requi
 
 | `served` | Meaning |
 |---|---|
-| `local` | Resolved by the node library (`handle_rpc`). |
+| `local` | Resolved by the node library (`handle_rpc`). `requires_auth: false` except the HTTP-token-gated methods named below, which are `requires_auth: true`. |
 | `passthrough` | Read path returns `-32601`; relayed verbatim to the upstream WHEN one is configured (§5.4), else returned to the caller as `-32601`. |
 | `shell` | Answered by this service itself (`rpc.discover`). |
 | `control` | The gated control plane (§7); always `requires_auth: true`. |
@@ -1056,8 +1056,11 @@ For the current node library (§2.2) the catalogue is:
   `dig.getCollection`, `dig.listCollectionItems`, the L7 peer surface (`dig.getNetworkInfo`,
   `dig.getPeers`, `dig.announce`, `dig.getAvailability`, `dig.listInventory`, `dig.fetchRange`),
   all `cache.*` (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,
-  `cache.removeCached`, `cache.fetchAndCache`, `cache.pushCapsule` — §5.5.3), and the chat subsystem
-  `chat.send` / `chat.poll` (§5.5.2).
+  `cache.removeCached`, `cache.fetchAndCache`, `cache.pushCapsule` — §5.5.3), the chat subsystem
+  `chat.send` / `chat.poll` (§5.5.2), and the reward reads `dig.getRewardProverStatus`,
+  `dig.listRewardDistributors`, `dig.getPayeeRewardClaimStatus`, `dig.getRewardDistributor`,
+  `dig.listRewardDistributorCommitments` (dig_ecosystem#3352 / #3351 / #3355 — see the
+  `requires_auth` clause below).
 - **passthrough**: `dig.listCapsules` (needs a chain generation walk this node does not perform)
   and `dig.getProofStatus` (polls an execution-proof JOB this node does not run — inventing a
   status would be the fabrication the anti-fabrication rule forbids: an absent attestation is
@@ -1077,8 +1080,18 @@ Param/result schemas for the `dig.*`/`cache.*` methods are owned by the digstore
 published on docs.dig.net (Protocol → the L7 read/RPC pages); this repo's OpenRPC document is a
 method + error **discovery** catalogue with intentionally permissive schemas.
 
-Every non-`control.*` method MUST have `requires_auth: false`; every `control.*` method MUST have
-`served: "control"` and `requires_auth: true`.
+Every `control.*` method MUST have `served: "control"` and `requires_auth: true`. A non-`control.*`
+method MUST have `requires_auth: false` UNLESS the HTTP surface token-gates it — today the
+holder-/holdings-revealing `cache.fetchAndCache` / `cache.pushCapsule` / `cache.listCached` (§14.3,
+#2108), the node-identity chat pair `chat.send` / `chat.poll` (#1946), and the NODE-LOCAL reward reads
+`dig.getRewardProverStatus` / `dig.listRewardDistributors` / `dig.getPayeeRewardClaimStatus`
+(dig_ecosystem#3352: each volunteers this node's own prover inventory, funded-distributor set or
+payee claim state, failing §7.2's WHO-NAMES-THE-SUBJECT test). Those keep their `served` class and
+carry `requires_auth: true`. `requires_auth` is the COMPILED statement of the HTTP token gate: the set
+of catalogued methods with `requires_auth: true` MUST equal the set `server.rs` refuses `-32030
+UNAUTHORIZED` without a master or paired token (`requires_http_token`), and a test pins the equality.
+The two chain-keyed reward reads `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`
+are OPEN (dig_ecosystem#3351) and rate-bounded per source (§10, `-32034`).
 
 #### 5.5.0. `dig.getContent` — the window envelope (#2071)
 
@@ -1469,8 +1482,9 @@ Two layers, both REQUIRED:
    mismatched credential is answered `UNAUTHORIZED` (`-32030`, §10). Token comparison MUST be
    constant-time (`ct_eq`) so verification cannot be probed via a timing oracle.
 
-Exactly the `control.` method prefix is gated (`is_control_method`); unknown `control.*` methods
-still pass the auth gate first, then yield `METHOD_NOT_FOUND`. The pairing-administration methods
+The `control.` method prefix is token-gated as a class (`is_control_method`); the HTTP surface
+additionally token-gates the non-`control.*` methods §5.5 enumerates (`requires_http_token`);
+unknown `control.*` methods still pass the auth gate first, then yield `METHOD_NOT_FOUND`. The pairing-administration methods
 (`control.pairing.list`/`approve`/`revoke`, §7.11) require the MASTER token specifically — a paired
 token is NOT accepted for them. The exceptions are the wallet CHAIN READS — `control.wallet.balance`, `control.wallet.coins`,
 `control.wallet.coinById`, `control.wallet.coinSpend`, `control.wallet.coinsByParent`,
@@ -3315,6 +3329,7 @@ method runs, and it MUST NOT be conflated with the wallet's own `-32043` egress 
 | -32031 | `NOT_SUPPORTED` | shell | A control operation this build/pin cannot perform (e.g. §21 sync without an identity). |
 | -32032 | `CONTROL_ERROR` | shell | A control operation failed at runtime (distinct from bad input / absent capability). |
 | -32033 | `CONTROL_INGRESS_LIMITED` | shell | An OPEN, token-less `control.*` read was refused AT INGRESS, before the request reached the dispatcher and before any DB work was done for it: this SOURCE's request bound is exhausted. The open reads present no credential, so without this bound an unauthenticated caller can drive unbounded SQLite work (`.coinById`/`.coinSpend` each run up to two lookups plus an LRU `UPDATE`) simply by asking repeatedly. The bound is PER SOURCE — one flooding source MUST NOT refuse another — and the node's OWN loopback operator is EXEMPT, so this code is only ever seen by a non-loopback caller (i.e. under `DIG_NODE_ALLOW_REMOTE=1`). It MUST stay DISTINCT from `-32043 WALLET_RATE_LIMITED`: that bound is on chain EGRESS and protects the third-party oracle, this one is on REQUESTS and protects this process. They fire for different reasons and have different remedies, so collapsing them would leave a caller unable to tell which bound it hit. Back off and retry. |
+| -32034 | `REWARD_INGRESS_LIMITED` | shell | An OPEN reward chain read (`dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`) was refused AT INGRESS: this SOURCE's request bound is exhausted. Each call is one upstream chain read for any caller-supplied launcher_id, so without this bound an anonymous caller drives unbounded upstream work. The bound is PER SOURCE (`RequestorId` — never the launcher id, which the caller controls); the loopback operator is EXEMPT, so only a `DIG_NODE_ALLOW_REMOTE=1` caller ever sees it. Distinct from -32033 (control-read ingress) and -32043 (wallet chain egress). Back off and retry. |
 | -32040 | `WALLET_NO_CHAIN_SOURCE` | node | a wallet chain read (`control.wallet.balance`/`.coins`/`.coinById`/`.coinSpend`/`.coinsByParent`/`.peak`) or `control.wallet.broadcast` had NO live chain source able to answer an arbitrary (non-wallet) address. Distinct from a truthful `0`. A read the node can answer WITHOUT a chain source MUST NOT be refused with this code: the replica fast path and the node own chain-read cache both answer from bytes already in hand, so on `.coinById`/`.coinSpend` liveness is consulted only on a cache MISS. Refusing a cached answer because a third party is momentarily unreachable gives availability away for nothing on exactly the rows a lineage walk re-reads (a spent coin record is immutable), and the refusal then cascades into the retries that exhaust the `-32043` bound. The refusal MUST stay for a miss, and `.coinSpend` MUST treat a PARTIAL cache hit (spend cached, coin record not) as a miss, because the heights come from the record. |
 | -32041 | `WALLET_NOT_SYNCED` | node | `control.wallet.balance` of the wallet's OWN address while the local DB is still syncing and no live fallback is attached (nothing can answer yet). |
 | -32042 | `WALLET_READ_FAILED` | node | `control.wallet.balance`/`.coins`/`.coinById`/`.coinSpend`/`.coinsByParent`/`.peak` failed at the underlying DB / chain-source layer. On `.coinById` this INCLUDES a chain source that answered with a record for a DIFFERENT coin than the id asked for: a coin id is self-certifying (`SHA256(parent ‖ puzzle_hash ‖ amount)`), so a substituted record is a failed READ -- never that coin's record, and never `coin: null`. On `.coinSpend` it likewise INCLUDES a source that answered with another coin's spend, a puzzle reveal that does not tree-hash to the spent coin's own `puzzle_hash` (or will not parse), and a spend the coin record contradicts (no record, or a record calling the coin unspent) -- each fails CLOSED rather than being served unverified. On `.coinsByParent` it INCLUDES a source that returned a child naming a different parent, which fails the WHOLE page rather than being silently filtered (a filtered page is a lineage with an invisible hole). Distinct from `WALLET_NO_CHAIN_SOURCE` and `WALLET_NOT_SYNCED`. |

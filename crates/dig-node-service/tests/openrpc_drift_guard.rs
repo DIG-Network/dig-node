@@ -272,9 +272,16 @@ fn control_peers_connect_disconnect_are_catalogued_and_not_peer_reachable() {
 fn served_classes_are_well_formed() {
     for m in meta::methods() {
         match m.served {
-            "local" | "passthrough" | "shell" => assert!(
-                !m.requires_auth,
-                "{} is a read/discovery method and must not require auth",
+            // `requires_auth` is the COMPILED statement of the HTTP token gate (SPEC §5.5): the
+            // set of catalogued methods with `requires_auth: true` MUST equal the set
+            // `server::requires_http_token` gates at `POST /` — not merely "false for every
+            // read", since dig_ecosystem#3352 token-gates a handful of non-`control.*` reads
+            // (the cache trio, the chat pair, the three node-local reward reads) that volunteer
+            // node-local state.
+            "local" | "passthrough" | "shell" => assert_eq!(
+                m.requires_auth,
+                dig_node_service::server::requires_http_token(m.name),
+                "{}: catalogued requires_auth must equal requires_http_token",
                 m.name
             ),
             "control" => {
