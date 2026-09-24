@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use chia_protocol::Bytes32;
 
+use super::chain_port::MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE;
 use super::config::RewardsClaimConfig;
 use super::hints::DistributorHintSource;
 use super::port::{ClaimChainPort, ClaimPortError};
-use super::chain_port::MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE;
 use super::types::{ClaimLoopState, ClaimOutcome, ClaimStatus, Discovery};
 
 /// The two cadences [`ClaimEngine::with_persisted_fee_window`] needs, DERIVED together from the
@@ -504,8 +504,11 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
             );
         }
 
-        let mut candidates: Vec<Bytes32> =
-            discovered.distributors.iter().map(|d| d.launcher_id).collect();
+        let mut candidates: Vec<Bytes32> = discovered
+            .distributors
+            .iter()
+            .map(|d| d.launcher_id)
+            .collect();
         // F4: a real adapter can plausibly return the same launcher id twice (one distributor
         // reachable via two of the §1.3 launch comments this node scans, across the
         // `(store_id, root)` pairs it mirrors). Without this, phase 2 would evaluate it twice and
@@ -984,7 +987,7 @@ mod tests {
     use super::*;
     use crate::rewards_claim::hints::{DistributorHint, NoHintSource};
     use crate::rewards_claim::parser::parse_launch_comment;
-    use crate::rewards_claim::types::{Discovery, DiscoveredDistributor};
+    use crate::rewards_claim::types::{DiscoveredDistributor, Discovery};
 
     const DIG_ASSET_ID: Bytes32 = Bytes32::new([9u8; 32]);
     const OUR_PAYOUT_PUZZLE_HASH: Bytes32 = Bytes32::new([1u8; 32]);

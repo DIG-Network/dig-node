@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use chia_protocol::Bytes32;
 
-use super::types::{Discovery, DiscoveredDistributor, OwnEntry};
+use super::types::{DiscoveredDistributor, Discovery, OwnEntry};
 
 /// Why a claim-chain call could not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]

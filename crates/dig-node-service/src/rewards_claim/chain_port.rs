@@ -42,7 +42,7 @@ use dig_wallet::sage::spend::Broadcaster;
 use crate::rewards::chain_source::{read_distributor_guarded, GuardedReadError};
 
 use super::port::{ClaimChainPort, ClaimPortError};
-use super::types::{Discovery, DiscoveredDistributor, OwnEntry};
+use super::types::{DiscoveredDistributor, Discovery, OwnEntry};
 
 /// The longest a chain port's own error text is allowed to carry before it is truncated -- the
 /// same 200-char discipline [`super::types::ClaimOutcome::Faulted`]'s `reason` field documents,
@@ -418,7 +418,12 @@ where
             // would build a bundle the chain rejects, but only AFTER this adapter's caller had
             // already reported `Paid` to whatever recorded the attempt. Refuse by name instead,
             // before any spend is built.
-            if snapshot.distributor().info.constants.require_payout_approval {
+            if snapshot
+                .distributor()
+                .info
+                .constants
+                .require_payout_approval
+            {
                 return Err(ClaimPortError::Other(bounded(
                     "refused: distributor curries require_payout_approval = true; this adapter \
                      carries no approval message (it drops initiate_payout's returned conditions), \

@@ -715,7 +715,7 @@ mod tests {
 
     use super::super::cadence::CLAIM_JITTER_SECONDS_DEFAULT;
     use super::super::port::ClaimPortError;
-    use super::super::types::{Discovery, DiscoveredDistributor, OwnEntry};
+    use super::super::types::{DiscoveredDistributor, Discovery, OwnEntry};
 
     // ---- decide_claim_driver / spawn_claim_driver_if (A3) ----------------------------------
 
