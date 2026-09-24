@@ -1535,17 +1535,18 @@ async fn cache_list_cached_is_not_routable_over_ws() {
     );
 }
 
-/// **Proves (dig_ecosystem#3351, WS parity):** `dig.getRewardDistributor` and
-/// `dig.listRewardDistributorCommitments` are OPEN reads on the HTTP transport (no token required),
-/// but that openness must not accidentally widen into a SECOND, WS-reachable path. The `ws_dispatch`
-/// fall-through routes an unrecognized method to `WalletBackend::dispatch`, whose match has no
-/// `dig.*` arm, so both methods come back as an unknown-method error over `/ws` -- never as
-/// `UNAUTHORIZED` (that would mean WS gates them where HTTP does not, which is its own bug) and
-/// never as a real result (that would mean the reward-chain answer leaked over an unaudited
-/// transport).
+/// **Proves (dig_ecosystem#3351/#3352, WS parity):** ALL FIVE reward reads -- the two OPEN,
+/// chain-keyed reads (`dig.getRewardDistributor`, `dig.listRewardDistributorCommitments`) and the
+/// three HTTP-token-gated, node-local reads (`dig.getRewardProverStatus`,
+/// `dig.listRewardDistributors`, `dig.getPayeeRewardClaimStatus`) -- have no WS-reachable path at
+/// all, regardless of which HTTP tier each carries. The `ws_dispatch` fall-through routes an
+/// unrecognized method to `WalletBackend::dispatch`, whose match has no `dig.*` arm, so every one
+/// comes back as an unknown-method error over `/ws` -- never as `UNAUTHORIZED` (that would mean WS
+/// gates a method where HTTP does not, or vice versa, either of which is its own bug) and never as
+/// a real result (that would mean a reward answer leaked over an unaudited transport).
 ///
-/// **Catches:** a wallet-backend or `ws_dispatch` arm that starts routing `dig.*` reward reads over
-/// `/ws` without the tier decision being revisited.
+/// **Catches:** a wallet-backend or `ws_dispatch` arm that starts routing any `dig.*` reward read
+/// over `/ws` without the tier decision being revisited.
 #[tokio::test]
 async fn reward_distributor_reads_are_not_routable_over_ws() {
     use tokio_tungstenite::tungstenite::Message;
@@ -1560,11 +1561,15 @@ async fn reward_distributor_reads_are_not_routable_over_ws() {
     for (idx, method) in [
         "dig.getRewardDistributor",
         "dig.listRewardDistributorCommitments",
+        "dig.getRewardProverStatus",
+        "dig.listRewardDistributors",
+        "dig.getPayeeRewardClaimStatus",
     ]
     .into_iter()
     .enumerate()
     {
-        // No token: these reads are OPEN on HTTP, but that has no bearing on WS routability.
+        // No token: these reads (OPEN or HTTP-token-gated) have no bearing on WS routability --
+        // the WS transport simply never dispatches ANY reward method (dig_ecosystem#3352/#3355).
         ws.send(Message::Text(
             json!({ "id": format!("rd{idx}"), "type": "request", "method": method }).to_string(),
         ))
@@ -4025,7 +4030,9 @@ async fn node_local_reward_reads_require_the_control_token() {
             "{method} without a token must be UNAUTHORIZED, got {rejected:?}"
         );
         assert!(
-            rejected.pointer(&format!("/result/{leaked_field}")).is_none(),
+            rejected
+                .pointer(&format!("/result/{leaked_field}"))
+                .is_none(),
             "{method} must never leak /result/{leaked_field} on a rejected call, got {rejected:?}"
         );
 
@@ -4065,9 +4072,19 @@ async fn node_local_reward_reads_require_the_control_token() {
         Some(&master),
     )
     .await;
+    // This ephemeral node never writes a funded-distributor registry record, so the honest
+    // answer is "nothing looked" (`not_consulted`), NEVER a "consulted, found nothing" that
+    // would be SPEC §12.5 clause 6's forbidden reassuring zero (`FundedDistributorsRead::
+    // NotConfigured`, dig_ecosystem#3269 unit 2). This still proves dispatch reached the real
+    // handler (a stub or a gate leak would answer neither `funded` nor `claimable` at all).
     assert_eq!(
         listed["result"]["funded"]["outcome"],
-        json!("consulted"),
+        json!("not_consulted"),
+        "got {listed:?}"
+    );
+    assert_eq!(
+        listed["result"]["claimable"]["outcome"],
+        json!("not_consulted"),
         "got {listed:?}"
     );
 

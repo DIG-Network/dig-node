@@ -119,6 +119,13 @@ pub struct AppState {
     /// re-implemented — it is already a per-[`RequestorId`] token-bucket registry with the
     /// identity-cycling table bound this needs.
     control_ingress: Arc<dig_node_core::rate_limit::MissRateLimiter>,
+    /// The per-source INGRESS bound on the two OPEN, chain-keyed reward reads
+    /// (dig_ecosystem#3355): `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`.
+    ///
+    /// A SEPARATE bucket from [`AppState::control_ingress`] (see `is_open_reward_chain_read`'s
+    /// call site): sharing one bucket would let one client's rewards-pane polling refuse its own
+    /// unrelated lineage-walk reads (or vice versa) under a code that names the wrong bound.
+    reward_ingress: Arc<dig_node_core::rate_limit::MissRateLimiter>,
     /// §25.8's bond observation, as the last mirror pass published it (dig-node#412 step 7).
     ///
     /// Held on the shared state rather than rebuilt per request precisely so the control surface
@@ -147,6 +154,18 @@ const CONTROL_INGRESS_REFILL_PER_SEC: f64 = 8.0;
 /// Asserted at COMPILE TIME rather than in a test: the relationship is between two constants, so
 /// lowering the burst should fail the BUILD, not wait for someone to run the right test.
 const _: () = assert!(CONTROL_INGRESS_BURST >= 12.0);
+
+/// Per-source burst for the two OPEN, chain-keyed reward reads (dig_ecosystem#3355):
+/// `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`. Sized identically to
+/// [`CONTROL_INGRESS_BURST`] for the same reason — "one rewards pane, a handful of reads" —
+/// on its OWN bucket (`AppState::reward_ingress`) so it cannot refuse or be refused by the
+/// unrelated control-read bound.
+const REWARD_INGRESS_BURST: f64 = 32.0;
+
+/// Sustained per-source rate for OPEN reward chain reads once the burst is spent. Matches
+/// [`CONTROL_INGRESS_REFILL_PER_SEC`]: comfortably above a human-driven refresh, far below what
+/// makes the upstream chain work matter.
+const REWARD_INGRESS_REFILL_PER_SEC: f64 = 8.0;
 
 /// dig-node's "method not found" error code. `handle_rpc` resolves only
 /// `dig.getContent` / `dig.getAnchoredRoot` / `cache.*` and returns this for
@@ -598,6 +617,10 @@ pub async fn build_state(config: &Config) -> AppState {
         control_ingress: Arc::new(dig_node_core::rate_limit::MissRateLimiter::new(
             CONTROL_INGRESS_BURST,
             CONTROL_INGRESS_REFILL_PER_SEC,
+        )),
+        reward_ingress: Arc::new(dig_node_core::rate_limit::MissRateLimiter::new(
+            REWARD_INGRESS_BURST,
+            REWARD_INGRESS_REFILL_PER_SEC,
         )),
     }
 }
@@ -1317,7 +1340,8 @@ async fn rpc(
     // never refuse its own unrelated wallet reads with a code that says the wrong bound fired. The
     // loopback operator is exempt, identically to `control_ingress` (`control_ingress_admits` is
     // already generic over the limiter).
-    if is_open_reward_chain_read(&method) && !control_ingress_admits(&state.reward_ingress, &requestor)
+    if is_open_reward_chain_read(&method)
+        && !control_ingress_admits(&state.reward_ingress, &requestor)
     {
         return (
             StatusCode::OK,
@@ -1481,7 +1505,9 @@ fn is_gated_chat_method(method: &str) -> bool {
 fn is_node_local_reward_read(method: &str) -> bool {
     matches!(
         method,
-        "dig.getRewardProverStatus" | "dig.listRewardDistributors" | "dig.getPayeeRewardClaimStatus"
+        "dig.getRewardProverStatus"
+            | "dig.listRewardDistributors"
+            | "dig.getPayeeRewardClaimStatus"
     )
 }
 
