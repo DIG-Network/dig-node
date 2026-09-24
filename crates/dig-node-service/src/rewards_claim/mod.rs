@@ -70,7 +70,9 @@ pub use engine::ClaimEngine;
 pub use hints::{DistributorHint, DistributorHintSource, NoHintSource};
 pub use parser::parse_launch_comment;
 pub use port::{ClaimChainPort, ClaimPortError, UnavailableClaimChainPort};
-pub use types::{ClaimLoopState, ClaimOutcome, ClaimStatus, DiscoveredDistributor, OwnEntry};
+pub use types::{
+    ClaimLoopState, ClaimOutcome, ClaimStatus, Discovery, DiscoveredDistributor, OwnEntry,
+};
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,18 @@
+# DIG-Network/dig_ecosystem#3357: bans calling `RewardDistributor::created_slot_value_to_slot`
+# from production code anywhere in this workspace.
+#
+# That method derives a `LineageProof` from the coin it is called ON. For a distributor rebuilt
+# from chain (every production read path), that coin is the TIP -- so a `LineageProof` it derives
+# for a slot an EARLIER generation created is a well-formed but PHANTOM proof. The entry slot for a
+# real spend must come from a fresh, authenticated chain walk instead (see
+# `dig_rewards_coin::ChainEntrySlotSource`, or `DistributorSnapshot::entry_slot` /
+# `commitment_slots` / `reward_slots` for a read).
+#
+# This lint bans the CALL, not the receiver class: clippy cannot tell a chain-rebuilt receiver from
+# an in-process one (a distributor built fresh in the same process this same generation, e.g. a
+# test fixture reading back the reward slots ITS OWN spend just created -- that use is legitimate).
+# Every `#[allow(clippy::disallowed_methods)]` against this entry must carry a comment stating WHY
+# its receiver is in-process this generation, not chain-rebuilt.
+disallowed-methods = [
+    { path = "chia_sdk_driver::RewardDistributor::created_slot_value_to_slot", reason = "derives a LineageProof from the coin it is called on; on a distributor rebuilt from chain that coin is the TIP, so any earlier generation's slot is a PHANTOM (dig_ecosystem#3357). Use DistributorSnapshot::entry_slot / commitment_slots / reward_slots or ChainEntrySlotSource. This lint bans the CALL, not the receiver class: it cannot tell a chain-rebuilt receiver from an in-process one. Every #[allow] must state in a comment WHY its receiver is in-process." },
+]
