@@ -1618,9 +1618,16 @@ mod tests {
                 );
                 assert_eq!(m.served, "control", "{} must be served=control", m.name);
             } else {
-                assert!(
-                    !m.requires_auth,
-                    "non-control method {} must NOT require auth",
+                // Not every non-`control.*` method is a public read: the cache trio,
+                // the chat pair and the three node-local reward reads are gated on
+                // `POST /` (dig_ecosystem#3352, SPEC §5.5) though they carry no
+                // `control.` prefix. `requires_http_token` is the compiled predicate
+                // that actually enforces the gate, so the catalogue must equal it
+                // exactly rather than assume every non-control method is open.
+                assert_eq!(
+                    m.requires_auth,
+                    crate::server::requires_http_token(m.name),
+                    "{} catalogued requires_auth must equal requires_http_token",
                     m.name
                 );
             }
