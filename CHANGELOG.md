@@ -4,36 +4,6 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.261.0] - 2026-09-24
-
-### Reward RPC ingress: token gate and rate bound
-- Token-gate the three NODE-LOCAL reward reads on `POST /` (`dig.getRewardProverStatus`,
-  `dig.listRewardDistributors`, `dig.getPayeeRewardClaimStatus`): a master control token or a valid
-  paired token is now required, `-32030` otherwise. They were already `Tier::Control` (local
-  dispatch only, never the mTLS peer surface); what changed is that the anonymous `POST /` path no
-  longer volunteers node-local state, so the served catalogue's `requires_auth` and the enforced
-  predicate agree (#3352)
-- Rate-bound the two OPEN chain-keyed reward reads per SOURCE at HTTP ingress
-  (`dig.getRewardDistributor`, `dig.listRewardDistributorCommitments`), `-32034
-  REWARD_INGRESS_LIMITED`, so an anonymous caller can no longer drive an unbounded number of
-  upstream chain reads. The limiter is keyed on the source, never on the caller-supplied
-  `launcher_id` (#3355)
-- The served OpenRPC catalogue now reports `requires_auth: true` for five methods that previously
-  advertised `false` while already being enforced as authenticated: `cache.listCached`,
-  `cache.fetchAndCache`, `cache.pushCapsule`, `chat.send` and `chat.poll`. No enforcement changed
-  -- the catalogue was describing these methods wrongly. Every `rpc.discover` consumer that reads
-  `requires_auth` will see the flip (#3352)
-
-### Reward claim port hardening
-- Ban `RewardDistributor::created_slot_value_to_slot` from production code via a workspace
-  `disallowed-methods` clippy lint (phantom `LineageProof` on a chain-rebuilt distributor); allow
-  the one legitimate in-process test-fixture use. This is the dig-node HALF of #3357 only --
-  the ticket also has dig-account and dig-app halves and remains OPEN (#3357)
-- Refuse, by name, a distributor requiring payout approval in `submit_initiate_payout` before
-  building or broadcasting anything (#3362)
-- Fix a claim-port regression test to use a non-empty launcher index so it actually exercises the
-  failing chain source's discovery/submit paths (#3363)
-
 ## [0.255.0] - 2026-09-07
 
 ### Chores
