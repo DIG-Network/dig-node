@@ -4,19 +4,6 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [Unreleased]
-
-### Reward claim port hardening
-- Ban `RewardDistributor::created_slot_value_to_slot` from production code via a workspace
-  `disallowed-methods` clippy lint (phantom `LineageProof` on a chain-rebuilt distributor); allow
-  the one legitimate in-process test-fixture use (#3357)
-- Refuse, by name, a distributor requiring payout approval in `submit_initiate_payout` before
-  building or broadcasting anything (#3362)
-- Bound hinted launcher discovery candidates per cycle and report every drop via
-  `Discovery.candidates_dropped` / `ClaimStatus.discovery_candidates_dropped_this_cycle` (#3358)
-- Fix a claim-port regression test to use a non-empty launcher index so it actually exercises the
-  failing chain source's discovery/submit paths (#3363)
-
 ## [0.255.0] - 2026-09-07
 
 ### Chores

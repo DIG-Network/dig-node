@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use chia_protocol::Bytes32;
 
-use super::chain_port::MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE;
 use super::config::RewardsClaimConfig;
 use super::hints::DistributorHintSource;
 use super::port::{ClaimChainPort, ClaimPortError};
@@ -360,7 +359,6 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         self.status.distributors_faulted = 0;
         self.status.claims_submitted_this_cycle = 0;
         self.status.no_entry_slot_this_cycle = 0;
-        self.status.discovery_candidates_dropped_this_cycle = 0;
         self.status.last_attempt_at = Some(now);
 
         // F18: this engine's own view of the persisted fee window for this cycle -- there is no
@@ -488,20 +486,6 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
         };
         if !discovery_failed {
             self.status.last_discovery_at = Some(now);
-        }
-
-        // DIG-Network/dig_ecosystem#3358: a per-cycle reading, never latched -- reset at the top
-        // of this function alongside every other per-cycle counter. Reported unconditionally, and
-        // logged when nonzero: a silently shrunk candidate set is exactly the failure this exists
-        // to prevent.
-        self.status.discovery_candidates_dropped_this_cycle = discovered.candidates_dropped;
-        if discovered.candidates_dropped > 0 {
-            tracing::warn!(
-                target: "rewards_claim",
-                dropped = discovered.candidates_dropped,
-                cap = MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE,
-                "hinted launcher candidates over the per-cycle cap were NOT decoded"
-            );
         }
 
         let mut candidates: Vec<Bytes32> = discovered
@@ -1079,7 +1063,6 @@ mod tests {
                         root: d.root,
                     })
                     .collect(),
-                candidates_dropped: 0,
             })
         }
 

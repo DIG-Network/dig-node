@@ -27,9 +27,6 @@ pub enum ClaimPortError {
 pub trait ClaimChainPort: Send + Sync {
     /// SPEC §13.1: every CHIP-0051 distributor on chain whose launch comment parses per §1.3 —
     /// before the §9.3 reserve-asset filter, which the engine applies via [`Self::reserve_asset_id`].
-    /// DIG-Network/dig_ecosystem#3358: the returned [`Discovery`] also carries
-    /// `candidates_dropped` -- a port that bounds how many candidates it will decode this call
-    /// MUST report how many it declined, never silently shrink the result.
     async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError>;
 
     /// Re-derive one launcher id's launch comment from chain (SPEC §13.2 clause 1: a gossip hint is

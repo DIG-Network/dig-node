@@ -1143,7 +1143,6 @@ mod tests {
                     store_id: Bytes32::from([0u8; 32]),
                     root: Bytes32::from([0u8; 32]),
                 }],
-                candidates_dropped: 0,
             })
         }
         async fn resolve_launch_comment(

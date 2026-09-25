@@ -66,7 +66,6 @@ async fn discover_distributors_returns_exactly_the_real_launch() {
         fixture.launch_comment.store_id
     );
     assert_eq!(discovery.distributors[0].root, fixture.launch_comment.root);
-    assert_eq!(discovery.candidates_dropped, 0);
 }
 
 /// SPEC 13.1 clause 2: an index only PROPOSES. A bogus id mixed in with the real one must be
@@ -96,51 +95,19 @@ async fn a_bogus_index_entry_is_dropped_not_echoed() {
     assert_eq!(discovery.distributors[0].launcher_id, fixture.launcher_id);
 }
 
-/// DIG-Network/dig_ecosystem#3358: a candidate cap that lands ON the real launcher id must drop it
-/// and REPORT the drop -- never silently return fewer distributors than the caller can account for.
-/// Uses [`RealClaimChainPort::with_candidate_cap`] pinned to 1 so this proves the drop without
-/// decoding hundreds of candidates; the production constant stays
-/// [`dig_node_service::rewards_claim::RealClaimChainPort`]'s own default (256).
+/// Discovery decodes EVERY candidate the index proposes -- there is no per-cycle bound, so a real
+/// launcher is never pushed out of a cycle by the number (or transport order) of the candidates
+/// around it. The companion to `a_bogus_index_entry_is_dropped_not_echoed`, with the real id
+/// FIRST, so neither order can be the only one that works.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_capped_cycle_drops_the_candidate_past_the_cap_and_reports_it() {
+async fn every_candidate_the_index_proposes_is_decoded() {
     let fixture = launch_fixture().expect("a real distributor launches cleanly in the simulator");
     let source = mock_chain_source(&fixture);
     let bogus_id = Bytes32::from([0xEE; 32]);
-    let port = RealClaimChainPort::with_candidate_cap(
-        Arc::new(source),
-        FixtureLauncherIndex(vec![bogus_id, fixture.launcher_id]),
-        Arc::new(MockBroadcaster::default()),
-        1,
-    );
-
-    let discovery = port
-        .discover_distributors()
-        .await
-        .expect("a capped cycle must still answer, never error, for the candidates it does try");
-
-    assert_eq!(
-        discovery.distributors.len(),
-        0,
-        "the real launcher id sits past the cap of 1 and must be dropped, not decoded"
-    );
-    assert_eq!(
-        discovery.candidates_dropped, 1,
-        "the one candidate past the cap must be reported, never silently absorbed"
-    );
-}
-
-/// The same cap, sized to admit every candidate -- proves the cap itself never drops anything when
-/// there is nothing to drop (the companion proof to the capped case above).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_cap_that_covers_every_candidate_drops_nothing() {
-    let fixture = launch_fixture().expect("a real distributor launches cleanly in the simulator");
-    let source = mock_chain_source(&fixture);
-    let bogus_id = Bytes32::from([0xEE; 32]);
-    let port = RealClaimChainPort::with_candidate_cap(
+    let port = RealClaimChainPort::new(
         Arc::new(source),
         FixtureLauncherIndex(vec![fixture.launcher_id, bogus_id]),
         Arc::new(MockBroadcaster::default()),
-        2,
     );
 
     let discovery = port
@@ -150,7 +117,6 @@ async fn a_cap_that_covers_every_candidate_drops_nothing() {
 
     assert_eq!(discovery.distributors.len(), 1);
     assert_eq!(discovery.distributors[0].launcher_id, fixture.launcher_id);
-    assert_eq!(discovery.candidates_dropped, 0);
 }
 
 /// `reserve_asset_id` and `payout_threshold` are real chain-curried reads, not the crate's own

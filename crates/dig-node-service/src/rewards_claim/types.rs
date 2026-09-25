@@ -13,21 +13,11 @@ pub struct DiscoveredDistributor {
     pub root: Bytes32,
 }
 
-/// One `discover_distributors` call's result: the distributors found AND how many candidates the
-/// port declined to even decode -- DIG-Network/dig_ecosystem#3358. A bound on discovery that
-/// silently swallowed the dropped count would be a censorship primitive (a cap that starves the
-/// work it protects, never reported); this struct makes that count a first-class, always-present
-/// field instead, so `RealClaimChainPort::discover_distributors` can never answer with fewer
-/// distributors than it actually decoded without saying so.
+/// One `discover_distributors` call's result: every distributor the port decoded and verified.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Discovery {
     /// Every distributor whose candidate id was actually decoded and verified this call.
     pub distributors: Vec<DiscoveredDistributor>,
-    /// Candidates the port's own per-cycle cap declined to decode at all -- SPEC 13.1;
-    /// [`RealClaimChainPort`](super::chain_port::RealClaimChainPort)'s cap is
-    /// `MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE`. `0` for every port that has no such cap (every
-    /// test double and [`super::port::UnavailableClaimChainPort`]).
-    pub candidates_dropped: u32,
 }
 
 /// This node's own entry slot on one distributor (SPEC §10.2): keyed by a payout PUZZLE HASH, never
@@ -284,14 +274,6 @@ pub struct ClaimStatus {
     /// other per-cycle counters, before any early return, so a stalled writer can never leave a
     /// stale count sitting under a fresh timestamp (never a lifetime latch).
     pub no_entry_slot_this_cycle: u32,
-    /// DIG-Network/dig_ecosystem#3358: THIS CYCLE's count of hinted launcher candidates the port's
-    /// own per-cycle cap declined to decode at all -- distinct from [`Self::no_entry_slot_this_cycle`]
-    /// (those WERE decoded and simply had no entry). Reset at the top of every `run_cycle`, same
-    /// per-cycle discipline as every other counter on this struct: a stale nonzero count from a
-    /// PAST cycle must never sit under a fresh `last_attempt_at`. A nonzero reading here means a
-    /// legitimate distributor could have been silently excluded from this cycle's candidate set --
-    /// see [`Discovery::candidates_dropped`], the field this is copied from.
-    pub discovery_candidates_dropped_this_cycle: u32,
     /// Set when a chain call THIS CYCLE returned `ClaimPortError::Other(_)` — reset at the start of
     /// every `run_cycle` (Defect A1: this used to latch true for the rest of the process's life,
     /// which would have permanently suppressed every other state once tripped once).
@@ -321,7 +303,6 @@ impl Default for ClaimStatus {
             claims_refused_payout_mismatch: 0,
             payout_hash_mismatches_this_cycle: 0,
             no_entry_slot_this_cycle: 0,
-            discovery_candidates_dropped_this_cycle: 0,
             fault_reported: false,
             consecutive_faulted_cycles: 0,
             state: ClaimLoopState::Idle,

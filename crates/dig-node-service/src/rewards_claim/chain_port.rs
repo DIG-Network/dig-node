@@ -49,41 +49,6 @@ use super::types::{DiscoveredDistributor, Discovery, OwnEntry};
 /// applied here at the source so every producer of a bounded string agrees on the bound.
 const MAX_ERROR_CHARS: usize = 200;
 
-/// DIG-Network/dig_ecosystem#3358: the most hinted launcher candidates
-/// [`RealClaimChainPort::discover_distributors`] will decode in one call.
-///
-/// # Where the number comes from
-/// `dig_rewards_coin`'s own `DECODE_MAX_SERIALIZED_BYTES` bounds ONE candidate's decode at 64 KiB
-/// (65_536 bytes); `256 * 65_536 = 16_777_216` bytes -- a 16 MiB decode ceiling for one
-/// `discover_distributors` call -- plus 256 parent-spend chain reads, one per candidate.
-///
-/// # What this bound does NOT cover -- read this before assuming discovery is safe
-/// 1. It does not bound gossip hints: `ClaimEngine::run_cycle`'s hint loop (`engine.rs`,
-///    `self.hints.hints()`, feeding `resolve_launch_comment` one candidate at a time) is a
-///    SEPARATE, unbounded path -- out of scope for this cap, named here so it is not mistaken for
-///    covered.
-/// 2. It does not choose WHICH candidates survive: this adapter decodes the index's first N in
-///    WHATEVER ORDER the chain transport returned them, and that order is attacker-influenceable
-///    (`HintedLauncherIndex` proposes every hinted coin its peers have seen) -- a flood of bogus
-///    hinted coins ahead of a legitimate launcher in that order can push the legitimate one past
-///    the cap and out of this cycle's candidate set.
-/// 3. It does not persist "already decoded and rejected" across calls -- a dropped-for-real
-///    candidate is re-attempted (and can be re-dropped) every cycle rather than being remembered
-///    and skipped cheaply; left as a follow-up, not implemented here.
-/// 4. It does not bound the COST of decoding one candidate -- that is
-///    `DECODE_MAX_SERIALIZED_BYTES`'s job, not this cap's.
-/// 5. It authenticates nothing -- every surviving candidate is still re-verified through the real
-///    memo decode in [`resolve_via_chain`] exactly as before this cap existed; this cap only
-///    decides how many candidates get that far.
-///
-/// A drop is never silent: [`RealClaimChainPort::discover_distributors`] reports how many
-/// candidates it declined via [`Discovery::candidates_dropped`], and
-/// [`super::engine::ClaimEngine::run_cycle`] copies that count into
-/// [`super::types::ClaimStatus::discovery_candidates_dropped_this_cycle`] and logs a `warn!` when
-/// it is nonzero -- a silent cap on discovery is the exact censorship-primitive shape this ticket
-/// exists to avoid.
-pub const MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE: usize = 256;
-
 fn bounded(message: impl Into<String>) -> String {
     let message = message.into();
     if message.chars().count() <= MAX_ERROR_CHARS {
@@ -119,11 +84,6 @@ where
     source: Arc<S>,
     index: I,
     broadcaster: Arc<dyn Broadcaster>,
-    /// DIG-Network/dig_ecosystem#3358: how many hinted candidates one `discover_distributors` call
-    /// will decode -- [`MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE`] in production;
-    /// [`Self::with_candidate_cap`] overrides it for a test that needs a small cap to exercise
-    /// dropping without decoding hundreds of candidates.
-    candidate_cap: usize,
 }
 
 impl<S, I> RealClaimChainPort<S, I>
@@ -133,34 +93,13 @@ where
 {
     /// Wraps an already-constructed chain source, launcher index and broadcaster. Takes the source
     /// by `Arc` (mirroring `rewards::chain_port::RealRewardsChainPort::new`) since a blocking read
-    /// clones it into a `spawn_blocking` closure on every call. Uses the production
-    /// [`MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE`] cap -- see [`Self::with_candidate_cap`] to
-    /// override it.
+    /// clones it into a `spawn_blocking` closure on every call.
     #[must_use]
     pub fn new(source: Arc<S>, index: I, broadcaster: Arc<dyn Broadcaster>) -> Self {
         Self {
             source,
             index,
             broadcaster,
-            candidate_cap: MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE,
-        }
-    }
-
-    /// Same as [`Self::new`] with an explicit candidate cap -- production never calls this; it
-    /// exists so a test can pin a small cap and prove the drop-and-report behaviour without
-    /// decoding hundreds of candidates.
-    #[must_use]
-    pub fn with_candidate_cap(
-        source: Arc<S>,
-        index: I,
-        broadcaster: Arc<dyn Broadcaster>,
-        candidate_cap: usize,
-    ) -> Self {
-        Self {
-            source,
-            index,
-            broadcaster,
-            candidate_cap,
         }
     }
 }
@@ -258,17 +197,10 @@ where
     async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
         let candidate_ids = self.index.launcher_ids().await?;
         let source = Arc::clone(&self.source);
-        let candidate_cap = self.candidate_cap;
 
         tokio::task::spawn_blocking(move || {
-            // DIG-Network/dig_ecosystem#3358: bound how many candidates one call will decode --
-            // see MAX_HINTED_LAUNCHER_CANDIDATES_PER_CYCLE's doc for what this does and does not
-            // protect. The drop count is REPORTED, never silently absorbed.
-            let total = candidate_ids.len();
-            let candidates_dropped = total.saturating_sub(candidate_cap) as u32;
-
             let mut discovered = Vec::new();
-            for launcher_id in candidate_ids.into_iter().take(candidate_cap) {
+            for launcher_id in candidate_ids {
                 // SPEC 13.1 clause 6: the index only PROPOSES; every id is re-verified through the
                 // real memo decode. An id the decode rejects (unknown to `source`, or a spend that
                 // is not a DIG rewards launch) is DROPPED, never echoed back.
@@ -281,7 +213,6 @@ where
             }
             Ok(Discovery {
                 distributors: discovered,
-                candidates_dropped,
             })
         })
         .await
