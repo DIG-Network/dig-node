@@ -4,7 +4,20 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [Unreleased]
+## [0.261.0] - 2026-09-24
+
+### Reward RPC ingress: token gate and rate bound
+- Token-gate the three NODE-LOCAL reward reads on `POST /` (`dig.getRewardProverStatus`,
+  `dig.listRewardDistributors`, `dig.getPayeeRewardClaimStatus`): a master control token or a valid
+  paired token is now required, `-32030` otherwise. They were already `Tier::Control` (local
+  dispatch only, never the mTLS peer surface); what changed is that the anonymous `POST /` path no
+  longer volunteers node-local state, so the served catalogue's `requires_auth` and the enforced
+  predicate agree (#3352)
+- Rate-bound the two OPEN chain-keyed reward reads per SOURCE at HTTP ingress
+  (`dig.getRewardDistributor`, `dig.listRewardDistributorCommitments`), `-32034
+  REWARD_INGRESS_LIMITED`, so an anonymous caller can no longer drive an unbounded number of
+  upstream chain reads. The limiter is keyed on the source, never on the caller-supplied
+  `launcher_id` (#3355)
 
 ### Reward claim port hardening
 - Ban `RewardDistributor::created_slot_value_to_slot` from production code via a workspace
