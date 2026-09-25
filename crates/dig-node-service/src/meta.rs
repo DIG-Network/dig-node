@@ -154,7 +154,7 @@ pub fn methods() -> &'static [MethodInfo] {
             name: "cache.listCached",
             served: "local",
             summary: "List cached capsules (storeId:rootHash).",
-            requires_auth: false,
+            requires_auth: true,
         },
         MethodInfo {
             name: "cache.removeCached",
@@ -166,7 +166,7 @@ pub fn methods() -> &'static [MethodInfo] {
             name: "cache.fetchAndCache",
             served: "local",
             summary: "Pre-fetch and cache a capsule.",
-            requires_auth: false,
+            requires_auth: true,
         },
         MethodInfo {
             // #1476: the publish→seed push. Local-only by default; the HTTP surface adds a control-token
@@ -181,7 +181,7 @@ pub fn methods() -> &'static [MethodInfo] {
             summary: "Push a freshly-committed capsule's bytes to seed this node as a holder \
                       (control-token gated over loopback; §21.9 authorized-writer signature when \
                       DIG_NODE_PUSH_OPEN=true).",
-            requires_auth: false,
+            requires_auth: true,
         },
         MethodInfo {
             name: "cache.stats",
@@ -601,7 +601,7 @@ pub fn methods() -> &'static [MethodInfo] {
                       (base64 48-byte BLS G1 sealing key), peer_id (64-hex gossip target), \
                       envelope (base64 opaque DIGCHAT1) }; result { message_id (64-hex) }. \
                       recipient_pub + peer_id are app-supplied pending the key directory.",
-            requires_auth: false,
+            requires_auth: true,
         },
         MethodInfo {
             name: "chat.poll",
@@ -609,6 +609,53 @@ pub fn methods() -> &'static [MethodInfo] {
             summary: "Drain the node's inbound chat inbox. No params; result { messages: \
                       [{ sender_did (64-hex), message_id (64-hex), envelope (base64 opaque \
                       DIGCHAT1) }] } in arrival order.",
+            requires_auth: true,
+        },
+        // -- reward reads (dig_ecosystem#3352 / #3355) — the three NODE-LOCAL reads volunteer this
+        // node's own prover inventory, funded-distributor set or payee claim state and are
+        // token-gated (`requires_http_token`); the two chain-keyed reads are OPEN (#3351) and
+        // rate-bounded per source at ingress instead (`-32034`). ------------------------------
+        MethodInfo {
+            name: "dig.getRewardProverStatus",
+            served: "local",
+            summary: "This node's own reward-prover-loop status registry: { statuses }. \
+                      NODE-LOCAL — volunteers this node's own prover inventory — so it requires \
+                      the local control token or a paired token (dig_ecosystem#3352).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "dig.listRewardDistributors",
+            served: "local",
+            summary: "This node's own funded/claimable reward-distributor identity sets: \
+                      { funded, claimable }. NODE-LOCAL — volunteers this node's own funded-\
+                      distributor set — so it requires the local control token or a paired token \
+                      (dig_ecosystem#3352).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "dig.getPayeeRewardClaimStatus",
+            served: "local",
+            summary: "This node's own payee-side reward claim status. NODE-LOCAL — volunteers this \
+                      node's own claim state — so it requires the local control token or a paired \
+                      token (dig_ecosystem#3352).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "dig.getRewardDistributor",
+            served: "local",
+            summary: "One reward distributor's chain-derived report for a caller-supplied \
+                      launcher_id. OPEN (dig_ecosystem#3351): the subject arrives in the request, \
+                      so no node-local association is disclosed. Rate-bounded per source at \
+                      ingress (`-32034 REWARD_INGRESS_LIMITED`, dig_ecosystem#3355).",
+            requires_auth: false,
+        },
+        MethodInfo {
+            name: "dig.listRewardDistributorCommitments",
+            served: "local",
+            summary: "One reward distributor's clawback commitment slots for a caller-supplied \
+                      launcher_id. OPEN (dig_ecosystem#3351), same guard shape as \
+                      dig.getRewardDistributor: rate-bounded per source at ingress \
+                      (`-32034 REWARD_INGRESS_LIMITED`, dig_ecosystem#3355).",
             requires_auth: false,
         },
     ]
@@ -789,6 +836,16 @@ pub enum ErrorCode {
     /// leave the next person debugging a refusal unable to tell which bound they hit. Retriable:
     /// the caller should back off. Shell error (minted before dispatch). (Control range `-3203x`.)
     ControlIngressLimited,
+    /// `-32034` -- an OPEN reward chain read (`dig.getRewardDistributor` /
+    /// `dig.listRewardDistributorCommitments`) was refused AT INGRESS: this source's request
+    /// bound is exhausted (dig_ecosystem#3355). Each call is one upstream chain read for any
+    /// caller-supplied `launcher_id`, so without this bound an anonymous caller drives unbounded
+    /// upstream work. The bound is PER SOURCE (`RequestorId` -- never the launcher id, which the
+    /// caller controls); the loopback operator is EXEMPT, so only a `DIG_NODE_ALLOW_REMOTE=1`
+    /// caller ever sees it. Distinct from `-32033` (control-read ingress) and `-32043`
+    /// (wallet chain egress). Retriable: the caller should back off. Shell error (minted before
+    /// dispatch). (Control range `-3203x`.)
+    RewardIngressLimited,
 }
 
 /// The numeric code the shared wire contract assigns, widened to the `i64` the JSON-RPC
@@ -838,6 +895,7 @@ impl ErrorCode {
             ErrorCode::PeerPingRefused => -32060,
             ErrorCode::PushPendingLimited => -32016,
             ErrorCode::ControlIngressLimited => -32033,
+            ErrorCode::RewardIngressLimited => -32034,
         }
     }
 
@@ -872,6 +930,7 @@ impl ErrorCode {
             ErrorCode::PeerPingRefused => "PEER_PING_REFUSED",
             ErrorCode::PushPendingLimited => "PUSH_PENDING_LIMITED",
             ErrorCode::ControlIngressLimited => "CONTROL_INGRESS_LIMITED",
+            ErrorCode::RewardIngressLimited => "REWARD_INGRESS_LIMITED",
         }
     }
 
@@ -889,6 +948,7 @@ impl ErrorCode {
             | ErrorCode::ControlError
             // Minted by the control SERVER at ingress, before the request reaches the node.
             | ErrorCode::ControlIngressLimited
+            | ErrorCode::RewardIngressLimited
             // The audit record is a node-private FILE read by the shell, not by the node.
             | ErrorCode::SpendAuditUnreadable
             // Minted by the shell's dispatch gate itself, before the read path is ever asked.
@@ -991,6 +1051,11 @@ impl ErrorCode {
                 "An open, token-less control read was refused at ingress: this source's request \
                  bound is exhausted. Distinct from WALLET_RATE_LIMITED, which bounds chain egress."
             }
+            ErrorCode::RewardIngressLimited => {
+                "An open reward chain read was refused at ingress: this source's request bound is \
+                 exhausted. Distinct from CONTROL_INGRESS_LIMITED (control reads) and \
+                 WALLET_RATE_LIMITED (chain egress)."
+            }
         }
     }
 
@@ -1019,6 +1084,7 @@ impl ErrorCode {
             ErrorCode::PeerPingRefused,
             ErrorCode::PushPendingLimited,
             ErrorCode::ControlIngressLimited,
+            ErrorCode::RewardIngressLimited,
         ]
     }
 }
@@ -1552,9 +1618,16 @@ mod tests {
                 );
                 assert_eq!(m.served, "control", "{} must be served=control", m.name);
             } else {
-                assert!(
-                    !m.requires_auth,
-                    "non-control method {} must NOT require auth",
+                // Not every non-`control.*` method is a public read: the cache trio,
+                // the chat pair and the three node-local reward reads are gated on
+                // `POST /` (dig_ecosystem#3352, SPEC §5.5) though they carry no
+                // `control.` prefix. `requires_http_token` is the compiled predicate
+                // that actually enforces the gate, so the catalogue must equal it
+                // exactly rather than assume every non-control method is open.
+                assert_eq!(
+                    m.requires_auth,
+                    crate::server::requires_http_token(m.name),
+                    "{} catalogued requires_auth must equal requires_http_token",
                     m.name
                 );
             }

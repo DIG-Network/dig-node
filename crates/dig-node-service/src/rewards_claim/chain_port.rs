@@ -17,9 +17,13 @@
 //! well-formed but PHANTOM `LineageProof` for a slot an earlier generation created
 //! (DIG-Network/dig_ecosystem#3357). `initiate_payout`'s returned `conditions` are a CALLER-SIDE
 //! assertion for a coin the caller would add to the same bundle; this adapter adds no coin of its
-//! own (no fee coin, no key, nothing to sign -- `required_fee_mojos` is `0`), so it drops them --
-//! the simulator acceptance test in `tests/rewards_claim_chain_port_3347.rs` is the proof the
-//! resulting bundle is accepted without them.
+//! own (no fee coin, no key, nothing to sign -- `required_fee_mojos` is `0`), so it drops them when
+//! it proceeds -- the simulator acceptance test in `tests/rewards_claim_chain_port_3347.rs` is the
+//! proof the resulting bundle is accepted without them for `require_payout_approval = false`. When
+//! the chain-curried `require_payout_approval` is `true` instead, dropping `conditions` would be
+//! dropping the manager's approval assertion, not a no-op -- [`RealClaimChainPort::submit_initiate_payout`]
+//! REFUSES by name in that case, before building anything, rather than broadcasting a bundle this
+//! adapter cannot honestly satisfy (DIG-Network/dig_ecosystem#3362).
 //!
 //! A silent no-op would be the exact defect this ticket exists to prevent -- a refused method
 //! reports a NAMED [`ClaimPortError`], never a fabricated success.
@@ -38,7 +42,7 @@ use dig_wallet::sage::spend::Broadcaster;
 use crate::rewards::chain_source::{read_distributor_guarded, GuardedReadError};
 
 use super::port::{ClaimChainPort, ClaimPortError};
-use super::types::{DiscoveredDistributor, OwnEntry};
+use super::types::{DiscoveredDistributor, Discovery, OwnEntry};
 
 /// The longest a chain port's own error text is allowed to carry before it is truncated -- the
 /// same 200-char discipline [`super::types::ClaimOutcome::Faulted`]'s `reason` field documents,
@@ -190,7 +194,7 @@ where
         "real-corroborated"
     }
 
-    async fn discover_distributors(&self) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
+    async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
         let candidate_ids = self.index.launcher_ids().await?;
         let source = Arc::clone(&self.source);
 
@@ -207,7 +211,9 @@ where
                     Err(other) => return Err(other),
                 }
             }
-            Ok(discovered)
+            Ok(Discovery {
+                distributors: discovered,
+            })
         })
         .await
         .map_err(|join_error| {
@@ -335,6 +341,26 @@ where
                 .ok_or_else(|| {
                     ClaimPortError::Other(bounded("not a distributor: launcher coin unspent"))
                 })?;
+
+            // DIG-Network/dig_ecosystem#3362: this distributor curries `require_payout_approval =
+            // true`, meaning `InitiatePayout` needs a manager-signed approval assertion in the same
+            // bundle. This adapter has no such assertion to attach and, per this module's doc,
+            // DROPS `initiate_payout`'s returned `conditions` unconditionally -- proceeding here
+            // would build a bundle the chain rejects, but only AFTER this adapter's caller had
+            // already reported `Paid` to whatever recorded the attempt. Refuse by name instead,
+            // before any spend is built.
+            if snapshot
+                .distributor()
+                .info
+                .constants
+                .require_payout_approval
+            {
+                return Err(ClaimPortError::Other(bounded(
+                    "refused: distributor curries require_payout_approval = true; this adapter \
+                     carries no approval message (it drops initiate_payout's returned conditions), \
+                     so the bundle it would build is one the chain rejects after reporting Paid",
+                )));
+            }
 
             // NEVER `snapshot.distributor().created_slot_value_to_slot(..)` -- that derives a
             // well-formed but PHANTOM `LineageProof` for a slot an earlier generation created

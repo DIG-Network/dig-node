@@ -13,6 +13,13 @@ pub struct DiscoveredDistributor {
     pub root: Bytes32,
 }
 
+/// One `discover_distributors` call's result: every distributor the port decoded and verified.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Discovery {
+    /// Every distributor whose candidate id was actually decoded and verified this call.
+    pub distributors: Vec<DiscoveredDistributor>,
+}
+
 /// This node's own entry slot on one distributor (SPEC §10.2): keyed by a payout PUZZLE HASH, never
 /// a pubkey, re-read fresh before every claim (SPEC §12.5 clause 3) and never cached across cycles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

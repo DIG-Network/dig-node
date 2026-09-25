@@ -907,10 +907,11 @@ impl RpcDispatch for Node {
             "count": set.len()}});
             }
             // dig.getRewardProverStatus (dig_ecosystem#3269, dig-rewards-coin SPEC.md
-            // §2.3/§2.4) — CONTROL plane: loopback admin / in-process FFI ONLY (the token tier of
-            // this NODE-LOCAL read is dig_ecosystem#3352's decision, not #3351's), NEVER over the
-            // mTLS peer surface (absent from `is_peer_reachable_method`;
-            // `reward_methods_tier_guard.rs` fails closed on that). Reads the node's live
+            // §2.3/§2.4) — `Tier::Control` = local dispatch only, never the mTLS peer surface
+            // (`reward_methods_tier_guard.rs`); token-GATED on `POST /` at
+            // `server.rs::is_node_local_reward_read` (master or paired token, `-32030`;
+            // dig_ecosystem#3352) because it volunteers node-local state; the in-process FFI path
+            // stays open like `cache.*`. Reads the node's live
             // `reward_prover_statuses` registry (empty until dig_ecosystem#3265 spawns a prover
             // loop) — a REAL read of a real, currently-empty registry, so
             // `{"statuses":{"outcome":"consulted","observed_at":N,"items":[]}}` means "this node
@@ -1013,7 +1014,11 @@ impl RpcDispatch for Node {
             // dig-node-service `tests/server.rs`. Chain-derived state ONLY — never the local prover
             // loop's self-reported state (see `GetRewardProverStatus` above for that). Goes entirely
             // through `rewards::port::RewardsChainPort`: this crate never calls `dig-rewards-coin`
-            // itself (dig_ecosystem#3269 unit 0).
+            // itself (dig_ecosystem#3269 unit 0). Token-LESS does not mean UNBOUNDED: staying open
+            // per dig_ecosystem#3351 above, `POST /` also rate-bounds this read PER SOURCE at
+            // ingress (`-32034 REWARD_INGRESS_LIMITED`, dig_ecosystem#3355,
+            // `server.rs::is_open_reward_chain_read`) — a caller-supplied `launcher_id` is never
+            // the limiter's key, only the source is.
             Some(Method::GetRewardDistributor) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
                 let launcher_id = match parse_launcher_id_arg(&params) {
@@ -1095,8 +1100,11 @@ impl RpcDispatch for Node {
                 };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
-            // dig.listRewardDistributors (dig_ecosystem#3269 unit 2, SPEC §2.6) — CONTROL plane,
-            // same guard shape as the other reward handlers above. Two independently-consulted
+            // dig.listRewardDistributors (dig_ecosystem#3269 unit 2, SPEC §2.6) — `Tier::Control`
+            // = local dispatch only, never the mTLS peer surface (`reward_methods_tier_guard.rs`);
+            // token-GATED on `POST /` at `server.rs::is_node_local_reward_read` (master or paired
+            // token, `-32030`; dig_ecosystem#3352) because it volunteers node-local state; the
+            // in-process FFI path stays open like `cache.*`. Two independently-consulted
             // halves (`funded` / `claimable`), each a `Half<RewardDistributorRef>` — SPEC §12.5
             // clause 6's "reassuring zero" rule applies to EACH half separately.
             //
@@ -1177,8 +1185,11 @@ impl RpcDispatch for Node {
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
             // dig.getPayeeRewardClaimStatus (dig_ecosystem#3268/#3269 unit 3, SPEC §12.5) —
-            // CONTROL plane: loopback admin / in-process FFI ONLY, absent from
-            // `is_peer_reachable_method` (`reward_methods_tier_guard.rs` fails closed on that).
+            // `Tier::Control` = local dispatch only, never the mTLS peer surface
+            // (`reward_methods_tier_guard.rs`); token-GATED on `POST /` at
+            // `server.rs::is_node_local_reward_read` (master or paired token, `-32030`;
+            // dig_ecosystem#3352) because it volunteers node-local state; the in-process FFI path
+            // stays open like `cache.*`.
             // Dispatched through `Method::from_name(..)` like every other reward method — never
             // the string pre-match above the enum, which bypasses this tier guard entirely
             // (dig_ecosystem#3261: a reward RPC reachable by a peer is a money hole).

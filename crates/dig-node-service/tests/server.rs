@@ -1535,17 +1535,18 @@ async fn cache_list_cached_is_not_routable_over_ws() {
     );
 }
 
-/// **Proves (dig_ecosystem#3351, WS parity):** `dig.getRewardDistributor` and
-/// `dig.listRewardDistributorCommitments` are OPEN reads on the HTTP transport (no token required),
-/// but that openness must not accidentally widen into a SECOND, WS-reachable path. The `ws_dispatch`
-/// fall-through routes an unrecognized method to `WalletBackend::dispatch`, whose match has no
-/// `dig.*` arm, so both methods come back as an unknown-method error over `/ws` -- never as
-/// `UNAUTHORIZED` (that would mean WS gates them where HTTP does not, which is its own bug) and
-/// never as a real result (that would mean the reward-chain answer leaked over an unaudited
-/// transport).
+/// **Proves (dig_ecosystem#3351/#3352, WS parity):** ALL FIVE reward reads -- the two OPEN,
+/// chain-keyed reads (`dig.getRewardDistributor`, `dig.listRewardDistributorCommitments`) and the
+/// three HTTP-token-gated, node-local reads (`dig.getRewardProverStatus`,
+/// `dig.listRewardDistributors`, `dig.getPayeeRewardClaimStatus`) -- have no WS-reachable path at
+/// all, regardless of which HTTP tier each carries. The `ws_dispatch` fall-through routes an
+/// unrecognized method to `WalletBackend::dispatch`, whose match has no `dig.*` arm, so every one
+/// comes back as an unknown-method error over `/ws` -- never as `UNAUTHORIZED` (that would mean WS
+/// gates a method where HTTP does not, or vice versa, either of which is its own bug) and never as
+/// a real result (that would mean a reward answer leaked over an unaudited transport).
 ///
-/// **Catches:** a wallet-backend or `ws_dispatch` arm that starts routing `dig.*` reward reads over
-/// `/ws` without the tier decision being revisited.
+/// **Catches:** a wallet-backend or `ws_dispatch` arm that starts routing any `dig.*` reward read
+/// over `/ws` without the tier decision being revisited.
 #[tokio::test]
 async fn reward_distributor_reads_are_not_routable_over_ws() {
     use tokio_tungstenite::tungstenite::Message;
@@ -1560,11 +1561,15 @@ async fn reward_distributor_reads_are_not_routable_over_ws() {
     for (idx, method) in [
         "dig.getRewardDistributor",
         "dig.listRewardDistributorCommitments",
+        "dig.getRewardProverStatus",
+        "dig.listRewardDistributors",
+        "dig.getPayeeRewardClaimStatus",
     ]
     .into_iter()
     .enumerate()
     {
-        // No token: these reads are OPEN on HTTP, but that has no bearing on WS routability.
+        // No token: these reads (OPEN or HTTP-token-gated) have no bearing on WS routability --
+        // the WS transport simply never dispatches ANY reward method (dig_ecosystem#3352/#3355).
         ws.send(Message::Text(
             json!({ "id": format!("rd{idx}"), "type": "request", "method": method }).to_string(),
         ))
@@ -3959,6 +3964,167 @@ async fn reward_distributor_reads_answer_on_post_slash_without_a_token() {
             json!("REWARD_CHAIN_UNAVAILABLE"),
             "{method} must reach the reward handler (no chain port wired on this ephemeral node), \
              not a passthrough or a method-not-found stub: {resp}"
+        );
+    }
+}
+
+/// Proves (dig_ecosystem#3352): the three NODE-LOCAL reward reads (`dig.getRewardProverStatus`,
+/// `dig.listRewardDistributors`, `dig.getPayeeRewardClaimStatus`) are token-gated at the HTTP
+/// `POST /` ingress exactly like the `cache.*` landing trio: an untokened call is `-32030
+/// UNAUTHORIZED` and the response body carries NONE of the fields the handler would otherwise
+/// return (`statuses`/`funded`/`subject`) -- a demoted gate that still leaked the payload alongside
+/// the error would defeat the whole point. The master control token AND a genuine paired token each
+/// clear the gate and reach the real handler (proven by the handler-specific shape each answers
+/// with on this ephemeral, chain-portless node).
+///
+/// Catches: any of the three reads left OPEN (or newly gated but leaking a body on refusal), and a
+/// paired-token caller wrongly excluded from a gate that (per #3352, unlike wallet mutations) is
+/// master-OR-paired, not master-only.
+#[tokio::test]
+async fn node_local_reward_reads_require_the_control_token() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, master, _hold) = start_node_full(&upstream).await;
+
+    // A genuine paired token, obtained exactly as the extension does (see
+    // `a_paired_token_cannot_grant_itself_a_trusted_chia_peer`).
+    let req = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "pairing.request",
+                "params": { "client_name": "DIG Chrome Extension" } }),
+        None,
+    )
+    .await;
+    let pairing_id = req["result"]["pairing_id"].as_str().unwrap().to_string();
+    let approve = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "control.pairing.approve",
+                "params": { "pairing_id": pairing_id } }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(approve["result"]["approved"], json!(true));
+    let paired = poll_pairing(&addr, &pairing_id).await["result"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let cases: &[(&str, &str)] = &[
+        ("dig.getRewardProverStatus", "statuses"),
+        ("dig.listRewardDistributors", "funded"),
+        ("dig.getPayeeRewardClaimStatus", "subject"),
+    ];
+
+    for (method, leaked_field) in cases {
+        let body = json!({ "jsonrpc": "2.0", "id": 9, "method": method });
+
+        // No token: UNAUTHORIZED, and the payload never leaks alongside the refusal.
+        let rejected = post_rpc(&addr, body.clone(), None).await;
+        assert_eq!(
+            rejected["error"]["code"],
+            json!(-32030),
+            "{method} without a token must be -32030, got {rejected:?}"
+        );
+        assert_eq!(
+            rejected["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} without a token must be UNAUTHORIZED, got {rejected:?}"
+        );
+        assert!(
+            rejected
+                .pointer(&format!("/result/{leaked_field}"))
+                .is_none(),
+            "{method} must never leak /result/{leaked_field} on a rejected call, got {rejected:?}"
+        );
+
+        // Master control token: clears the gate, reaches the real handler.
+        let via_master = post_rpc(&addr, body.clone(), Some(&master)).await;
+        assert_ne!(
+            via_master["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} with the master control token must clear the gate, got {via_master:?}"
+        );
+
+        // Paired token: clears the gate too (master-OR-paired, same as the cache trio).
+        let via_paired = post_rpc(&addr, body, Some(&paired)).await;
+        assert_ne!(
+            via_paired["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} with a paired token must clear the gate, got {via_paired:?}"
+        );
+    }
+
+    // Handler-specific shape, proving dispatch (not a stub) answered each authorized call.
+    let prover = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 10, "method": "dig.getRewardProverStatus" }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(
+        prover["result"]["statuses"]["outcome"],
+        json!("consulted"),
+        "got {prover:?}"
+    );
+
+    let listed = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 11, "method": "dig.listRewardDistributors" }),
+        Some(&master),
+    )
+    .await;
+    // This ephemeral node never writes a funded-distributor registry record, so the honest
+    // answer is "nothing looked" (`not_consulted`), NEVER a "consulted, found nothing" that
+    // would be SPEC §12.5 clause 6's forbidden reassuring zero (`FundedDistributorsRead::
+    // NotConfigured`, dig_ecosystem#3269 unit 2). This still proves dispatch reached the real
+    // handler (a stub or a gate leak would answer neither `funded` nor `claimable` at all).
+    assert_eq!(
+        listed["result"]["funded"]["outcome"],
+        json!("not_consulted"),
+        "got {listed:?}"
+    );
+    assert_eq!(
+        listed["result"]["claimable"]["outcome"],
+        json!("not_consulted"),
+        "got {listed:?}"
+    );
+
+    let payee = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 12, "method": "dig.getPayeeRewardClaimStatus" }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(payee["result"]["subject"], json!("payee"), "got {payee:?}");
+}
+
+/// Proves (dig_ecosystem#3355): the loopback operator, driving the two OPEN chain-keyed reward
+/// reads (`dig.getRewardDistributor`) well past the 32-call burst that bounds a per-source flood, is
+/// NEVER refused with `REWARD_INGRESS_LIMITED` -- the ingress bound exempts `RequestorId::Local`
+/// exactly as the existing `control_ingress` bound does (`control_ingress_admits`). The
+/// non-exempt/anonymous side of this bound cannot be driven over a real loopback TCP connection (the
+/// test client IS the operator), so it is pinned at the predicate/limiter level instead --
+/// `open_reward_chain_reads_are_rate_bounded_per_source` in `server.rs`'s own unit tests, beside the
+/// sibling `control_ingress` tests it mirrors.
+///
+/// Catches: an ingress bound wired onto the OPEN reward reads that forgets the loopback exemption,
+/// reproducing the #3051 failure (a polling operator refused its own reads) one bound over.
+#[tokio::test]
+async fn open_reward_chain_reads_never_limit_the_loopback_operator() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_node(&upstream).await;
+    let launcher_id = "11".repeat(32);
+    for i in 0..40 {
+        let resp = post_rpc(
+            &addr,
+            json!({ "jsonrpc": "2.0", "id": i, "method": "dig.getRewardDistributor",
+                    "params": { "launcher_id": launcher_id } }),
+            None,
+        )
+        .await;
+        assert_ne!(
+            resp["error"]["data"]["code"],
+            json!("REWARD_INGRESS_LIMITED"),
+            "call {i} from the loopback operator must never be -32034, got {resp:?}"
         );
     }
 }

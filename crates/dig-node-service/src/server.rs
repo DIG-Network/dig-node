@@ -119,6 +119,13 @@ pub struct AppState {
     /// re-implemented — it is already a per-[`RequestorId`] token-bucket registry with the
     /// identity-cycling table bound this needs.
     control_ingress: Arc<dig_node_core::rate_limit::MissRateLimiter>,
+    /// The per-source INGRESS bound on the two OPEN, chain-keyed reward reads
+    /// (dig_ecosystem#3355): `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`.
+    ///
+    /// A SEPARATE bucket from [`AppState::control_ingress`] (see `is_open_reward_chain_read`'s
+    /// call site): sharing one bucket would let one client's rewards-pane polling refuse its own
+    /// unrelated lineage-walk reads (or vice versa) under a code that names the wrong bound.
+    reward_ingress: Arc<dig_node_core::rate_limit::MissRateLimiter>,
     /// §25.8's bond observation, as the last mirror pass published it (dig-node#412 step 7).
     ///
     /// Held on the shared state rather than rebuilt per request precisely so the control surface
@@ -147,6 +154,18 @@ const CONTROL_INGRESS_REFILL_PER_SEC: f64 = 8.0;
 /// Asserted at COMPILE TIME rather than in a test: the relationship is between two constants, so
 /// lowering the burst should fail the BUILD, not wait for someone to run the right test.
 const _: () = assert!(CONTROL_INGRESS_BURST >= 12.0);
+
+/// Per-source burst for the two OPEN, chain-keyed reward reads (dig_ecosystem#3355):
+/// `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`. Sized identically to
+/// [`CONTROL_INGRESS_BURST`] for the same reason — "one rewards pane, a handful of reads" —
+/// on its OWN bucket (`AppState::reward_ingress`) so it cannot refuse or be refused by the
+/// unrelated control-read bound.
+const REWARD_INGRESS_BURST: f64 = 32.0;
+
+/// Sustained per-source rate for OPEN reward chain reads once the burst is spent. Matches
+/// [`CONTROL_INGRESS_REFILL_PER_SEC`]: comfortably above a human-driven refresh, far below what
+/// makes the upstream chain work matter.
+const REWARD_INGRESS_REFILL_PER_SEC: f64 = 8.0;
 
 /// dig-node's "method not found" error code. `handle_rpc` resolves only
 /// `dig.getContent` / `dig.getAnchoredRoot` / `cache.*` and returns this for
@@ -598,6 +617,10 @@ pub async fn build_state(config: &Config) -> AppState {
         control_ingress: Arc::new(dig_node_core::rate_limit::MissRateLimiter::new(
             CONTROL_INGRESS_BURST,
             CONTROL_INGRESS_REFILL_PER_SEC,
+        )),
+        reward_ingress: Arc::new(dig_node_core::rate_limit::MissRateLimiter::new(
+            REWARD_INGRESS_BURST,
+            REWARD_INGRESS_REFILL_PER_SEC,
         )),
     }
 }
@@ -1259,9 +1282,20 @@ async fn rpc(
     // it never reaches this HTTP `rpc` handler. Anonymous public CONTENT reads remain ungated; only
     // these holder-/holdings-revealing methods are gated. (WS parity: `cache.*` is not routable over
     // `/ws` — the wallet-backend fall-through has no `cache.*` arm — asserted in the server tests.)
+    //
+    // FOLDED IN (dig_ecosystem#3352): the three NODE-LOCAL reward reads (`is_node_local_reward_read`)
+    // — `dig.getRewardProverStatus` (this node's own prover-inventory registry), `dig.listRewardDistributors`
+    // (this node's own funded-distributor identity set), and `dig.getPayeeRewardClaimStatus` (this
+    // node's own payee claim state) — join the SAME gate rather than duplicating the token-extraction
+    // block, because they fail the same WHO-NAMES-THE-SUBJECT test §7.2 already applies here: each
+    // volunteers a node-to-launcher-id or node-to-inventory ASSOCIATION nobody supplied, exactly the
+    // shape `cache.listCached` is gated for. `requires_http_token` is the single pure predicate this
+    // union compiles to; `openrpc_drift_guard`'s `served_classes_are_well_formed` pins the catalogue's
+    // `requires_auth` to it BY EQUALITY.
     if method == "cache.fetchAndCache"
         || method == "cache.pushCapsule"
         || method == "cache.listCached"
+        || is_node_local_reward_read(&method)
     {
         let header_tok = headers
             .get(control::CONTROL_TOKEN_HEADER)
@@ -1281,15 +1315,44 @@ async fn rpc(
                 Json(rpc_error(
                     id,
                     ErrorCode::Unauthorized,
-                    "cache.fetchAndCache / cache.pushCapsule / cache.listCached require the local \
-                     control token (X-Dig-Control-Token header or params._control_token) or a paired \
-                     controller token (see `dig-node pair`): fetchAndCache/pushCapsule make this node \
-                     a durable DHT holder of the requested capsule, and listCached enumerates the \
-                     operator's cached-capsule inventory (deanonymizing consumed content) — none is a \
-                     public read",
+                    "cache.fetchAndCache / cache.pushCapsule / cache.listCached / \
+                     dig.getRewardProverStatus / dig.listRewardDistributors / \
+                     dig.getPayeeRewardClaimStatus require the local control token \
+                     (X-Dig-Control-Token header or params._control_token) or a paired controller \
+                     token (see `dig-node pair`): fetchAndCache/pushCapsule make this node a durable \
+                     DHT holder of the requested capsule, listCached enumerates the operator's \
+                     cached-capsule inventory (deanonymizing consumed content), and the three reward \
+                     reads volunteer a node-to-launcher-id/inventory association nobody supplied — \
+                     none is a public read",
                 )),
             );
         }
+    }
+
+    // OPEN reward-chain INGRESS bound (dig_ecosystem#3355): `dig.getRewardDistributor` and
+    // `dig.listRewardDistributorCommitments` stay OPEN (dig_ecosystem#3351) — each is one chain read
+    // for ANY caller-supplied `launcher_id` — so, exactly like the token-less `control.*` reads above,
+    // an anonymous caller could otherwise drive unbounded upstream chain work simply by asking,
+    // repeatedly, for free. Bounded PER SOURCE (`RequestorId`, never `launcher_id` — the caller
+    // supplies and controls that value, so a limiter keyed on it is a DoS primitive an attacker
+    // rotates around) on a SEPARATE bucket from `control_ingress`: sized for "one rewards pane, a
+    // handful of reads", not shared with the lineage-walk bound, so one client's rewards polling can
+    // never refuse its own unrelated wallet reads with a code that says the wrong bound fired. The
+    // loopback operator is exempt, identically to `control_ingress` (`control_ingress_admits` is
+    // already generic over the limiter).
+    if is_open_reward_chain_read(&method)
+        && !control_ingress_admits(&state.reward_ingress, &requestor)
+    {
+        return (
+            StatusCode::OK,
+            Json(rpc_error(
+                id,
+                ErrorCode::RewardIngressLimited,
+                "open reward chain reads are rate-limited per source; back off and retry. This is \
+                 the INGRESS bound on requests to this node (per-source), distinct from \
+                 CONTROL_INGRESS_LIMITED (open control reads) and WALLET_RATE_LIMITED (chain-egress).",
+            )),
+        );
     }
 
     // CHAT gate (F1, #1946): `chat.send` seals + BLS-signs a directed message as this node's OWN
@@ -1431,6 +1494,47 @@ fn presented_wallet_token(headers: &HeaderMap, body: &str) -> Option<String> {
 /// plane), so both require the control token. PURE.
 fn is_gated_chat_method(method: &str) -> bool {
     matches!(method, "chat.send" | "chat.poll")
+}
+
+/// The three NODE-LOCAL reward reads token-gated at HTTP ingress (dig_ecosystem#3352): each
+/// volunteers a node-to-launcher-id or node-to-inventory ASSOCIATION nobody supplied —
+/// `dig.getRewardProverStatus` (this node's own `reward_prover_statuses` registry),
+/// `dig.listRewardDistributors` (this node's own `FundedDistributorRegistry`), and
+/// `dig.getPayeeRewardClaimStatus` (this node's own payee-side claim state) — failing the same
+/// WHO-NAMES-THE-SUBJECT test §7.2 already applies (SPEC §5.5). PURE.
+fn is_node_local_reward_read(method: &str) -> bool {
+    matches!(
+        method,
+        "dig.getRewardProverStatus"
+            | "dig.listRewardDistributors"
+            | "dig.getPayeeRewardClaimStatus"
+    )
+}
+
+/// The two OPEN, chain-keyed reward reads rate-bounded per source at HTTP ingress
+/// (dig_ecosystem#3355): `dig.getRewardDistributor` and `dig.listRewardDistributorCommitments`, each
+/// one `RewardsChainPort::distributor_report` call for any caller-supplied `launcher_id`. Does NOT
+/// include `dig.listRewardDistributors` — that read does N chain reads too, but it is token-GATED
+/// per dig_ecosystem#3352, so a presented credential is already accountable for it, same as every
+/// `control.*` method. PURE.
+fn is_open_reward_chain_read(method: &str) -> bool {
+    matches!(
+        method,
+        "dig.getRewardDistributor" | "dig.listRewardDistributorCommitments"
+    )
+}
+
+/// Whether `method` requires the HTTP token gate (master control token OR a valid paired token) at
+/// this `POST /` ingress — the COMPILED statement the catalogue's `MethodInfo::requires_auth` must
+/// equal (`openrpc_drift_guard::served_classes_are_well_formed` pins the equality; see SPEC §5.5).
+/// The union: the holder-/holdings-revealing `cache.*` landing trio, the node-owned-identity chat
+/// pair, and the three node-local reward reads (dig_ecosystem#3352). PURE.
+pub fn requires_http_token(method: &str) -> bool {
+    method == "cache.fetchAndCache"
+        || method == "cache.pushCapsule"
+        || method == "cache.listCached"
+        || is_gated_chat_method(method)
+        || is_node_local_reward_read(method)
 }
 
 /// Whether `token` authorizes a gated chat call (F1, #1946): the master control token (constant-time)
@@ -3379,8 +3483,9 @@ fn spawn_collateral_census(chain: Arc<dig_wallet::sage::chain::ChainTransport>) 
 mod tests {
     use super::{
         chat_call_authorized, control_ingress_admits, is_app_origin, is_gated_chat_method,
-        is_local_origin, peer_tier_status, provenance_for, read_origin_for, reflects_origin,
-        requestor_for, served_response, ws_token, ServeProvenance, StorePath, APP_ORIGINS_ENV,
+        is_local_origin, is_node_local_reward_read, is_open_reward_chain_read, peer_tier_status,
+        provenance_for, read_origin_for, reflects_origin, requestor_for, requires_http_token,
+        served_response, ws_token, ServeProvenance, StorePath, APP_ORIGINS_ENV,
         EXPOSED_DIG_HEADERS,
     };
     use axum::http::{HeaderMap, Method};
@@ -3518,6 +3623,118 @@ mod tests {
             ErrorCode::ControlIngressLimited.name(),
             "CONTROL_INGRESS_LIMITED"
         );
+    }
+
+    /// **Proves (dig_ecosystem#3355):** the two OPEN chain-keyed reward reads
+    /// (`dig.getRewardDistributor`, `dig.listRewardDistributorCommitments`) are rate-bounded PER
+    /// SOURCE, never per `launcher_id` — the caller supplies and controls `launcher_id`, so a
+    /// limiter keyed on it would be a DoS primitive an attacker rotates around for free.
+    ///
+    /// Drives the predicate/limiter pair directly, exactly as
+    /// `an_anonymous_flood_is_refused_at_ingress_once_its_burst_is_spent` does for the sibling
+    /// `control_ingress` bound: a real HTTP test can't drive a non-loopback `RequestorId` (the test
+    /// client IS the loopback operator), so the meaningful assertion lives here, at the pair the
+    /// HTTP gate calls.
+    ///
+    /// **Catches (M3):** a limiter keyed on `launcher_id` instead of `RequestorId` — the same
+    /// requestor rotating which `launcher_id` it names in `params` must stay refused once its own
+    /// budget is spent; a different SOURCE must never be touched by another source's burst.
+    #[test]
+    fn open_reward_chain_reads_are_rate_bounded_per_source() {
+        let limiter = MissRateLimiter::new(32.0, 8.0);
+        let source_a = anon("198.51.100.7");
+        let source_b = anon("198.51.100.8");
+
+        for i in 0..32 {
+            assert!(
+                control_ingress_admits(&limiter, &source_a),
+                "call {i} is within the 32-burst and must be admitted"
+            );
+        }
+        assert!(
+            !control_ingress_admits(&limiter, &source_a),
+            "the 33rd call from the same source must be refused: its burst is spent"
+        );
+        assert!(
+            control_ingress_admits(&limiter, &source_b),
+            "a different source draws from its own bucket and is untouched by source_a's burst"
+        );
+        // M3: the SAME requestor rotating which `launcher_id` it names must stay refused — the
+        // limiter is keyed on the connection's `RequestorId`, never on caller-supplied request
+        // content, so nothing about the (unmodelled here) launcher_id can revive its budget.
+        assert!(
+            !control_ingress_admits(&limiter, &source_a),
+            "the same source must stay refused regardless of what launcher_id it names in params"
+        );
+    }
+
+    /// Pins the two OPEN reward reads and no others into `is_open_reward_chain_read` — the
+    /// predicate the ingress bound gates on. `dig.listRewardDistributors` does N chain reads too,
+    /// but it is token-GATED per dig_ecosystem#3352 (a presented credential is accountable, same as
+    /// every `control.*` method), so it must NOT be in this OPEN, per-source-bounded set.
+    #[test]
+    fn is_open_reward_chain_read_is_exactly_the_two_open_reads() {
+        assert!(is_open_reward_chain_read("dig.getRewardDistributor"));
+        assert!(is_open_reward_chain_read(
+            "dig.listRewardDistributorCommitments"
+        ));
+        assert!(
+            !is_open_reward_chain_read("dig.listRewardDistributors"),
+            "listRewardDistributors is token-gated per #3352, not ingress-bounded"
+        );
+        assert!(!is_open_reward_chain_read("dig.getRewardProverStatus"));
+        assert!(!is_open_reward_chain_read("dig.getPayeeRewardClaimStatus"));
+        assert!(!is_open_reward_chain_read("dig.getContent"));
+    }
+
+    /// Pins the three NODE-LOCAL reward reads (and no others) into `is_node_local_reward_read` —
+    /// the predicate the HTTP token gate folds in beside the `cache.*` trio and the chat pair.
+    #[test]
+    fn is_node_local_reward_read_is_exactly_the_three_gated_reads() {
+        assert!(is_node_local_reward_read("dig.getRewardProverStatus"));
+        assert!(is_node_local_reward_read("dig.listRewardDistributors"));
+        assert!(is_node_local_reward_read("dig.getPayeeRewardClaimStatus"));
+        assert!(!is_node_local_reward_read("dig.getRewardDistributor"));
+        assert!(!is_node_local_reward_read(
+            "dig.listRewardDistributorCommitments"
+        ));
+        assert!(!is_node_local_reward_read("dig.getContent"));
+    }
+
+    /// **Proves:** `requires_http_token` is exactly the union of the cache-trio landing gate, the
+    /// gated chat pair, and the three node-local reward reads — the single pure predicate the
+    /// `openrpc_drift_guard` equality test (`served_classes_are_well_formed`) pins the catalogue
+    /// against.
+    ///
+    /// **Catches (M1):** dropping `is_node_local_reward_read` from the union — the three reward
+    /// reads would stop requiring a token here while the catalogue still says they do, and the
+    /// drift-guard equality test (not this one) is what actually trips on that; this test pins the
+    /// union's OWN membership so a future edit to the fold does not silently narrow it.
+    #[test]
+    fn requires_http_token_is_the_gate_plus_reward_reads_union() {
+        for m in [
+            "cache.fetchAndCache",
+            "cache.pushCapsule",
+            "cache.listCached",
+            "chat.send",
+            "chat.poll",
+            "dig.getRewardProverStatus",
+            "dig.listRewardDistributors",
+            "dig.getPayeeRewardClaimStatus",
+        ] {
+            assert!(requires_http_token(m), "{m} must require the HTTP token");
+        }
+        for m in [
+            "dig.getRewardDistributor",
+            "dig.listRewardDistributorCommitments",
+            "dig.getContent",
+            "control.status",
+        ] {
+            assert!(
+                !requires_http_token(m),
+                "{m} must not require the HTTP token via this predicate"
+            );
+        }
     }
 
     /// **Regression (#1763):** the `X-Dig-Peer-Tier` wire value for BOTH tiers, asserted on the real

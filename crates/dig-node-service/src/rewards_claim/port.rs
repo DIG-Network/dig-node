@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use chia_protocol::Bytes32;
 
-use super::types::{DiscoveredDistributor, OwnEntry};
+use super::types::{DiscoveredDistributor, Discovery, OwnEntry};
 
 /// Why a claim-chain call could not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +27,7 @@ pub enum ClaimPortError {
 pub trait ClaimChainPort: Send + Sync {
     /// SPEC §13.1: every CHIP-0051 distributor on chain whose launch comment parses per §1.3 —
     /// before the §9.3 reserve-asset filter, which the engine applies via [`Self::reserve_asset_id`].
-    async fn discover_distributors(&self) -> Result<Vec<DiscoveredDistributor>, ClaimPortError>;
+    async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError>;
 
     /// Re-derive one launcher id's launch comment from chain (SPEC §13.2 clause 1: a gossip hint is
     /// untrusted, so it is verified through this same on-chain path, never trusted directly).
@@ -82,7 +82,7 @@ pub struct UnavailableClaimChainPort;
 
 #[async_trait]
 impl ClaimChainPort for UnavailableClaimChainPort {
-    async fn discover_distributors(&self) -> Result<Vec<DiscoveredDistributor>, ClaimPortError> {
+    async fn discover_distributors(&self) -> Result<Discovery, ClaimPortError> {
         Err(ClaimPortError::Unavailable)
     }
 
