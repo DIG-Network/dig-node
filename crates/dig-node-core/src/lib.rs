@@ -10272,8 +10272,14 @@ mod tests {
             resp["result"]["funded"]["observed_at"],
             json!(1_700_200_000u64 + 0x55)
         );
-        assert_eq!(resp["result"]["funded"]["observed_at"], json!(report_a.observed_at));
-        assert_ne!(resp["result"]["funded"]["observed_at"], json!(report_b.observed_at));
+        assert_eq!(
+            resp["result"]["funded"]["observed_at"],
+            json!(report_a.observed_at)
+        );
+        assert_ne!(
+            resp["result"]["funded"]["observed_at"],
+            json!(report_b.observed_at)
+        );
         assert_eq!(
             resp["result"]["claimable"]["outcome"],
             json!("not_consulted")
