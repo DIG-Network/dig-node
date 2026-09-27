@@ -582,15 +582,16 @@ pub struct Node {
     ///
     /// A slot rather than a constructor argument for the same reason [`Node::mirror_pointers`] is
     /// one: the FFI/browser path has no state directory and must keep constructing a `Node`
-    /// without one. Nothing installs it in production yet — nothing in dig-node funds a
-    /// distributor today (`rewards::port`'s module doc, blocker 2). WHICH ticket owns the startup
-    /// wiring that would call [`Node::install_funded_distributor_registry`] with the node's state
-    /// directory is tracked separately, and it is NOT dig_ecosystem#3268, whose scope is the claim
-    /// loop and `ClaimStatus` and which names neither this registry nor that call. Until a ticket
-    /// wires it the slot stays empty, and
+    /// without one. `dig-node-service`'s startup path installs a real, state-dir-backed registry
+    /// (dig_ecosystem#3292); until that install runs (e.g. a harness with `enable_chain_sync:
+    /// false`, or the FFI/browser path) the slot stays empty and
     /// [`Node::funded_distributors_read`] answers
     /// [`rewards::funded::NotConfiguredReason::NoStateDirectory`] — UNKNOWN, deliberately never an
-    /// empty funded set.
+    /// empty funded set. Even once installed, the registry starts with no record on disk (writing
+    /// one is dig_ecosystem#3291, a separate operator-declaration ticket — the node cannot observe
+    /// its own funding because funding spends from a wallet it never holds), so a fresh production
+    /// node reads [`rewards::funded::NotConfiguredReason::NoRecordWritten`] — still UNKNOWN, by
+    /// design, not a defect of the installer.
     funded_distributors: OnceLock<rewards::funded::FundedDistributorRegistry>,
     /// The chain seam `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`
     /// (dig_ecosystem#3269 units 1-2) read through — [`rewards::port::RewardsChainPort`].
@@ -642,13 +643,12 @@ impl Node {
     /// if a registry is already installed, in which case NOTHING changed — a second install must
     /// not be able to swap a live registry for an inert one behind a caller's back.
     ///
-    /// Called from tests today: no production startup path installs one, so clippy's non-test
-    /// lib target sees no production caller and `allow(dead_code)` stands in for it. Remove the
-    /// attribute when that wiring lands. Its owning ticket is tracked separately and is NOT
-    /// dig_ecosystem#3268 (claim loop + `ClaimStatus`), which names neither this registry nor this
-    /// call — do not read the attribute as a claim about #3268's scope.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn install_funded_distributor_registry(
+    /// `pub` because this is the INJECTION POINT, mirroring
+    /// [`Node::install_reward_chain_port`]: `dig-node-service`'s startup path builds a
+    /// state-dir-backed registry and installs it here (dig_ecosystem#3292). Being callable from
+    /// outside does NOT relax the single-install discipline: a second install still returns
+    /// `false` and changes nothing.
+    pub fn install_funded_distributor_registry(
         &self,
         registry: rewards::funded::FundedDistributorRegistry,
     ) -> bool {
