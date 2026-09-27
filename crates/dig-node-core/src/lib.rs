@@ -9488,6 +9488,77 @@ mod tests {
         }
     }
 
+    /// **Proves:** dig_ecosystem#3280 — a malformed `launcher_id` is refused with `-32602`, the
+    /// same validator `dig.getRewardDistributor` already uses (`parse_launcher_id_arg`), instead
+    /// of silently filtering to an empty `items` list that reads exactly like "I looked and found
+    /// nothing" (SPEC §12.5 clause 6's "reassuring zero", on the input side rather than the read
+    /// side). Registers a handle first so a filter bug that matches everything cannot pass this
+    /// test by accident: the malformed request must be refused before any filter runs.
+    /// **Catches:** a malformed `launcher_id` degrading to `Consulted { items: [] }`.
+    #[test]
+    fn get_reward_prover_status_with_a_malformed_launcher_id_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status([0x11u8; 32]),
+        ));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus",
+                "params": {"launcher_id": "zz"}
+            }),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            resp["error"]["code"],
+            json!(-32602),
+            "a malformed launcher_id must be refused, not filtered to an empty list: {resp}"
+        );
+        assert!(
+            resp.get("result").is_none(),
+            "an error response must carry no result: {resp}"
+        );
+    }
+
+    /// **Proves:** a well-formed but UNKNOWN `launcher_id` still answers `consulted` with an
+    /// empty `items` list — distinct from the malformed case above, which must be `-32602`.
+    /// **Catches:** widening the malformed-input refusal to also swallow legitimate misses.
+    #[test]
+    fn get_reward_prover_status_with_an_unknown_well_formed_launcher_id_is_empty_not_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status([0x11u8; 32]),
+        ));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus",
+                "params": {"launcher_id": hex::encode([0x99u8; 32])}
+            }),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(resp["result"]["statuses"]["outcome"], json!("consulted"));
+        assert_eq!(
+            resp["result"]["statuses"]["items"],
+            json!([]),
+            "an unknown but well-formed id is a legitimate empty answer, not an error: {resp}"
+        );
+    }
+
     /// **Proves:** with nothing registered, `dig.getRewardProverStatus` answers
     /// `{"statuses": []}` — SPEC §2.4 clause 1's "not distributing" render — never blank, `null`,
     /// or an omitted `result`. **Catches:** an absent-record case that renders as nothing rather
