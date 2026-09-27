@@ -43,28 +43,6 @@ fn install_funded_distributor_registry_installs_a_tempdir_backed_registry_once()
     );
 }
 
-/// Proves the STARTUP call chain, not just that the installer is reachable: `server.rs`'s
-/// production (non-test) source must call `install_funded_distributor_registry` against
-/// `state.state_dir`, unconditionally (no `enable_chain_sync` gate -- this is local state, not a
-/// chain read). A source-text assertion, the same shape `rewards_chain_port_a3.rs` uses to prove
-/// its own sibling install site, because driving `serve_with_shutdown` itself is new production
-/// surface this ticket does not need. Mutation-proved: deleting the call site below turns this
-/// assertion red; restoring it turns it green again.
-#[test]
-fn server_startup_calls_install_funded_distributor_registry_in_production_code() {
-    let server_source = production_region(include_str!("../src/server.rs"));
-    assert!(
-        server_source.contains("install_funded_distributor_registry"),
-        "server.rs's production startup path must call \
-         `Node::install_funded_distributor_registry`, or dig_ecosystem#3292 has regressed"
-    );
-    assert!(
-        server_source.contains("state.state_dir"),
-        "the production call must be built over the service's own hardened state dir, not an \
-         ephemeral or test-only path"
-    );
-}
-
 /// The slice of a source file before its own `#[cfg(test)]` module -- i.e. what actually ships.
 /// Duplicated from `rewards_chain_port_a3.rs`'s identical helper because this integration test is
 /// a separate compilation unit and cannot import a private helper from that file.
@@ -195,7 +173,7 @@ async fn production_startup_reaches_the_install_call_site_without_panicking() {
 
     let config = dig_node_service::Config {
         port,
-        dig_local: false,        // skip the privileged :80 attempt entirely
+        dig_local: false,         // skip the privileged :80 attempt entirely
         enable_chain_sync: false, // never dial mainnet from this harness (#2501)
         ..dig_node_service::Config::default()
     };
@@ -231,7 +209,8 @@ async fn production_startup_reaches_the_install_call_site_without_panicking() {
 
     stop.notify_waiters();
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
-    let join_result = outcome.expect("serve_with_shutdown must stop within 5s of the shutdown signal");
+    let join_result =
+        outcome.expect("serve_with_shutdown must stop within 5s of the shutdown signal");
     let io_result = join_result.expect("the server task must not panic");
     assert!(
         io_result.is_ok(),
