@@ -174,7 +174,36 @@ where
         })?;
     let first_epoch_start = first_epoch_state.round_time_info.last_update;
 
-    report_from_snapshot(&snapshot, launcher_id, comment, first_epoch_start)
+    // dig-rpc-protocol 0.14 chain-view anchor (dig_ecosystem#3262/#3329, SPEC §4.5): read the peak
+    // HERE, in the same synchronous `spawn_blocking` body that produced `snapshot` above, never
+    // later at the RPC seam. A peak read independently of the snapshot would anchor the answer to
+    // a height the rest of the report was never read against -- a plausible number beside
+    // possibly-stale data, with nothing erroring. Both reads MUST succeed or the whole call
+    // refuses; see `ChainPortError::ChainPeakUnavailable`'s doc for why `0` is never a stand-in.
+    let chain_peak_height = read_chain_peak(source)?;
+
+    report_from_snapshot(
+        &snapshot,
+        launcher_id,
+        comment,
+        first_epoch_start,
+        chain_peak_height,
+    )
+}
+
+/// Reads the chain peak height and its block timestamp as one pair, refusing rather than
+/// substituting `0` if either leg of the read fails -- SPEC §4.5 forbids a zeroed anchor, and `0`
+/// height is a claim about genesis, not an absence.
+fn read_chain_peak<S: ChainSource>(source: &S) -> Result<(u64, u64), ChainPortError> {
+    let height = source
+        .peak_height()
+        .map_err(|e| ChainPortError::Other(format!("peak height read failed: {e}")))?
+        .ok_or(ChainPortError::ChainPeakUnavailable)?;
+    let timestamp = source
+        .block_timestamp(height)
+        .map_err(|e| ChainPortError::Other(format!("peak timestamp read failed: {e}")))?
+        .ok_or(ChainPortError::ChainPeakUnavailable)?;
+    Ok((u64::from(height), timestamp))
 }
 
 /// Maps a [`DistributorSnapshot`] plus the launch comment onto the port's [`DistributorReport`].
@@ -185,7 +214,9 @@ fn report_from_snapshot(
     launcher_id: chia_protocol::Bytes32,
     comment: dig_rewards_coin::comment::LaunchComment,
     first_epoch_start: u64,
+    chain_peak: (u64, u64),
 ) -> Result<DistributorReport, ChainPortError> {
+    let (chain_peak_height, chain_peak_timestamp) = chain_peak;
     let distributor = snapshot.distributor();
     let constants = distributor.info.constants;
 
@@ -251,6 +282,8 @@ fn report_from_snapshot(
         entry_set_stale: snapshot.entry_set_stale(),
         commitments,
         observed_at,
+        chain_peak_height,
+        chain_peak_timestamp,
     })
 }
 

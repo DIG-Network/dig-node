@@ -9906,6 +9906,10 @@ mod tests {
             ),
             commitments,
             observed_at,
+            // Distinct from `observed_at` (a wall clock) by construction, so a test asserting the
+            // two fields are threaded independently cannot pass by accident on equal values.
+            chain_peak_height: 9_000_000 + seed as u64,
+            chain_peak_timestamp: 1_700_190_000 + seed as u64,
         }
     }
 
@@ -9983,6 +9987,8 @@ mod tests {
                 "last_entry_write_at",
                 "entry_set_stale",
                 "observed_at",
+                "chain_peak_height",
+                "chain_peak_timestamp",
             ]),
             "the wire body's key SET must be exactly this — a struct assertion cannot see a wrong \
              key name or an extra field"
@@ -10016,6 +10022,11 @@ mod tests {
         );
         assert_eq!(result["entry_set_stale"], json!(report.entry_set_stale));
         assert_eq!(result["observed_at"], json!(report.observed_at));
+        assert_eq!(result["chain_peak_height"], json!(report.chain_peak_height));
+        assert_eq!(
+            result["chain_peak_timestamp"],
+            json!(report.chain_peak_timestamp)
+        );
     }
 
     /// **Proves:** `dig.listRewardDistributorCommitments` answers with the port's real values
@@ -10063,6 +10074,8 @@ mod tests {
                 "epoch_seconds",
                 "commitments",
                 "observed_at",
+                "chain_peak_height",
+                "chain_peak_timestamp",
             ])
         );
         assert_eq!(
@@ -10075,6 +10088,11 @@ mod tests {
         );
         assert_eq!(result["epoch_seconds"], json!(report.epoch_seconds));
         assert_eq!(result["observed_at"], json!(report.observed_at));
+        assert_eq!(result["chain_peak_height"], json!(report.chain_peak_height));
+        assert_eq!(
+            result["chain_peak_timestamp"],
+            json!(report.chain_peak_timestamp)
+        );
         let commitments = result["commitments"].as_array().unwrap();
         assert_eq!(commitments.len(), 1);
         let row_keys: std::collections::BTreeSet<&str> = commitments[0]
@@ -10328,8 +10346,12 @@ mod tests {
 
     /// **Proves:** `dig.getPayeeRewardClaimStatus` is CONTROL-tier, NOT peer-reachable, dispatched
     /// through the `Method` enum match, and its exact serialized JSON body: `subject` is the
-    /// literal `"payee"`, `claim_log` is `NotConsulted` (no claim log exists in this crate yet),
-    /// and there is never a monetary amount or payout puzzle hash anywhere in the body.
+    /// literal `"payee"`, `claim_log` and `claim_loop` are both `NotConsulted` (neither a claim
+    /// log nor a claim loop exists in this crate yet — the loop lives in `dig-node-service`'s
+    /// `src/rewards_claim/**`, dig_ecosystem#3268 (wiring, landed) / #3432 (the SPEC §13.2
+    /// off-chain seam), never dig_ecosystem#3421 (that ticket is the prover's
+    /// `RewardsChainPort`) — and
+    /// there is never a monetary amount or payout puzzle hash anywhere in the body.
     #[test]
     fn get_payee_reward_claim_status_answers_the_exact_wire_shape() {
         use dig_rpc_protocol::Method;
@@ -10361,7 +10383,7 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            std::collections::BTreeSet::from(["subject", "claim_log"]),
+            std::collections::BTreeSet::from(["subject", "claim_log", "claim_loop"]),
             "no monetary amount, no payout puzzle hash — ever: {resp}"
         );
         assert_eq!(result["subject"], json!("payee"));
@@ -10369,6 +10391,11 @@ mod tests {
         assert!(
             result["claim_log"].get("claims_submitted_count").is_none(),
             "claims_submitted_count must live INSIDE Consulted only, never beside NotConsulted: {resp}"
+        );
+        assert_eq!(result["claim_loop"]["outcome"], json!("not_consulted"));
+        assert!(
+            result["claim_loop"].get("claims_submitted_count").is_none(),
+            "claim_loop's count must live INSIDE Consulted only, never beside NotConsulted: {resp}"
         );
     }
 
