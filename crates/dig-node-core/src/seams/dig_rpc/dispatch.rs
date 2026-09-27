@@ -1167,6 +1167,12 @@ impl RpcDispatch for Node {
                     };
 
                 let mut funded_refs = Vec::with_capacity(identities.len());
+                // `observed_at` must date the CONSULTATION, never the assembly (dig_ecosystem#3323,
+                // dig-rpc-protocol SPEC §4.4.2's first bullet): each `report.observed_at` postdates
+                // the pre-loop `now` above (the chain port stamps it after its own read, uncached),
+                // so stamping the handler's clock here understates staleness. Fold the reports' own
+                // stamps and keep the OLDEST — a collection is only as fresh as its stalest member.
+                let mut oldest_observed_at: Option<u64> = None;
                 for identity in identities {
                     let Some(port) = node.reward_chain_port() else {
                         return reward_chain_port_absent_response(&id);
@@ -1179,6 +1185,10 @@ impl RpcDispatch for Node {
                         Ok(report) => report,
                         Err(e) => return reward_chain_port_error_response(&id, &e),
                     };
+                    oldest_observed_at = Some(match oldest_observed_at {
+                        Some(oldest) => oldest.min(report.observed_at),
+                        None => report.observed_at,
+                    });
                     funded_refs.push(dig_rpc_protocol::types::RewardDistributorRef {
                         launcher_id: hex::encode(report.launcher_id),
                         store_id: hex::encode(report.store_id),
@@ -1188,7 +1198,10 @@ impl RpcDispatch for Node {
 
                 let result = dig_rpc_protocol::types::ListRewardDistributorsResult {
                     funded: dig_rpc_protocol::types::Half::Consulted {
-                        observed_at: now,
+                        // No reads happened for `FundsNothing` (empty `identities`), so the
+                        // pre-loop handler clock is the honest stamp for that case — it IS the
+                        // consultation. Both `NotConsulted` arms above keep `now` unchanged.
+                        observed_at: oldest_observed_at.unwrap_or(now),
                         items: funded_refs,
                     },
                     claimable: dig_rpc_protocol::types::Half::NotConsulted { observed_at: now },

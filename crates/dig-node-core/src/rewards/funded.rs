@@ -213,7 +213,7 @@ impl FundedDistributorRegistry {
             },
             Ok(None) => FundedDistributorsRead::NotConfigured(self.absent_record_reason()),
             Err(LoadFailure::Corrupt(reason)) => self.report_corrupt(&path, &reason),
-            Err(LoadFailure::Io(error)) => FundedDistributorsRead::IoFailed { path, error },
+            Err(LoadFailure::Io(error)) => self.report_io_failed(path, error),
         }
     }
 
@@ -231,7 +231,7 @@ impl FundedDistributorRegistry {
             },
             Ok(None) => Vec::new(),
             Err(LoadFailure::Corrupt(reason)) => return self.refuse_corrupt(&path, &reason),
-            Err(LoadFailure::Io(error)) => return RecordOutcome::IoFailed { path, error },
+            Err(LoadFailure::Io(error)) => return self.refuse_io_failed(path, error),
         };
 
         let outcome = match merge(&mut set, distributor) {
@@ -243,7 +243,7 @@ impl FundedDistributorRegistry {
         }
         match self.save(&path, &set) {
             Ok(()) => outcome,
-            Err(error) => RecordOutcome::IoFailed { path, error },
+            Err(error) => self.refuse_io_failed(path, error),
         }
     }
 
@@ -325,6 +325,31 @@ impl FundedDistributorRegistry {
             path: path.to_path_buf(),
             quarantined_to,
         }
+    }
+
+    /// Log and report an unreadable/unwritable record to a READER. Mirrors [`Self::report_corrupt`]
+    /// so an operator sees the same signal for either fault: `PersistedStateCorrupt` has logged
+    /// since v0.257.0, but `IoFailed` was constructed bare beside it, and `dispatch.rs` collapses
+    /// both into one wire `NotConsulted` with no log of its own (dig_ecosystem#3324) — so the
+    /// operator saw nothing for a permissions error, a missing mount, or any other I/O fault.
+    fn report_io_failed(&self, path: PathBuf, error: String) -> FundedDistributorsRead {
+        tracing::error!(
+            path = %path.display(),
+            error,
+            "the funded-distributor record could not be read"
+        );
+        FundedDistributorsRead::IoFailed { path, error }
+    }
+
+    /// Log and report an unreadable/unwritable record to a WRITER. Mirrors [`Self::refuse_corrupt`];
+    /// see [`Self::report_io_failed`] for why this arm was silent (dig_ecosystem#3324).
+    fn refuse_io_failed(&self, path: PathBuf, error: String) -> RecordOutcome {
+        tracing::error!(
+            path = %path.display(),
+            error,
+            "the funded-distributor record could not be read or written"
+        );
+        RecordOutcome::IoFailed { path, error }
     }
 
     /// Copy the corrupt record beside itself for the operator, leaving the original in place.
@@ -814,6 +839,69 @@ mod tests {
             read.determined(),
             Some(&[][..]),
             "funds-nothing is the only outcome a caller may render as an empty list"
+        );
+    }
+
+    /// **Proves:** an `IoFailed` read logs the path and the error, mirroring
+    /// [`FundedDistributorRegistry::report_corrupt`]'s `tracing::error!` (dig_ecosystem#3324 — the
+    /// corrupt arm has logged since v0.257.0; the I/O arm was constructed bare, so an operator saw
+    /// nothing for a permissions error or a missing mount). Forces `IoFailed` by making the record
+    /// PATH a directory, so `read_to_string` fails with a non-`NotFound` error — the wildcard
+    /// `PersistedStateCorrupt`/`IoFailed` collapse this fixture must not trip is
+    /// `dispatch.rs`'s wire mapping, untouched here; this test drives the registry directly (not
+    /// `handle_rpc`), because `rt()` may run the handler on a worker thread a thread-scoped
+    /// subscriber never sees.
+    #[test]
+    fn an_io_failed_read_is_logged_with_its_path_and_error() {
+        /// An in-memory sink a `tracing_subscriber::fmt` layer writes formatted records into.
+        #[derive(Clone, Default)]
+        struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+            type Writer = LogCapture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::create_dir(record_path(&dir)).expect("make the record path a directory");
+        let registry = FundedDistributorRegistry::with_state_dir(dir.path());
+
+        let buffer = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false) // plain text: the assertions read the fields as an operator would
+            .with_writer(buffer.clone())
+            .finish();
+
+        // Scoped to this thread only, deliberately: `read()` runs synchronously here, never on a
+        // worker thread a thread-scoped subscriber would miss (dig_ecosystem#3324's note on why
+        // this test does not go through `handle_rpc`).
+        let read = tracing::subscriber::with_default(subscriber, || registry.read());
+
+        assert!(
+            matches!(read, FundedDistributorsRead::IoFailed { .. }),
+            "a directory at the record path must fail as IoFailed, got {read:?}"
+        );
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        let expected_path = record_path(&dir);
+        assert!(
+            logged.contains(&expected_path.display().to_string()),
+            "log did not name the record path: {logged}"
+        );
+        assert!(
+            logged.contains("error"),
+            "log did not name the error field: {logged}"
         );
     }
 
