@@ -582,15 +582,16 @@ pub struct Node {
     ///
     /// A slot rather than a constructor argument for the same reason [`Node::mirror_pointers`] is
     /// one: the FFI/browser path has no state directory and must keep constructing a `Node`
-    /// without one. Nothing installs it in production yet — nothing in dig-node funds a
-    /// distributor today (`rewards::port`'s module doc, blocker 2). WHICH ticket owns the startup
-    /// wiring that would call [`Node::install_funded_distributor_registry`] with the node's state
-    /// directory is tracked separately, and it is NOT dig_ecosystem#3268, whose scope is the claim
-    /// loop and `ClaimStatus` and which names neither this registry nor that call. Until a ticket
-    /// wires it the slot stays empty, and
+    /// without one. `dig-node-service`'s startup path installs a real, state-dir-backed registry
+    /// (dig_ecosystem#3292); until that install runs (e.g. a harness with `enable_chain_sync:
+    /// false`, or the FFI/browser path) the slot stays empty and
     /// [`Node::funded_distributors_read`] answers
     /// [`rewards::funded::NotConfiguredReason::NoStateDirectory`] — UNKNOWN, deliberately never an
-    /// empty funded set.
+    /// empty funded set. Even once installed, the registry starts with no record on disk (writing
+    /// one is dig_ecosystem#3291, a separate operator-declaration ticket — the node cannot observe
+    /// its own funding because funding spends from a wallet it never holds), so a fresh production
+    /// node reads [`rewards::funded::NotConfiguredReason::NoRecordWritten`] — still UNKNOWN, by
+    /// design, not a defect of the installer.
     funded_distributors: OnceLock<rewards::funded::FundedDistributorRegistry>,
     /// The chain seam `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`
     /// (dig_ecosystem#3269 units 1-2) read through — [`rewards::port::RewardsChainPort`].
@@ -642,13 +643,12 @@ impl Node {
     /// if a registry is already installed, in which case NOTHING changed — a second install must
     /// not be able to swap a live registry for an inert one behind a caller's back.
     ///
-    /// Called from tests today: no production startup path installs one, so clippy's non-test
-    /// lib target sees no production caller and `allow(dead_code)` stands in for it. Remove the
-    /// attribute when that wiring lands. Its owning ticket is tracked separately and is NOT
-    /// dig_ecosystem#3268 (claim loop + `ClaimStatus`), which names neither this registry nor this
-    /// call — do not read the attribute as a claim about #3268's scope.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn install_funded_distributor_registry(
+    /// `pub` because this is the INJECTION POINT, mirroring
+    /// [`Node::install_reward_chain_port`]: `dig-node-service`'s startup path builds a
+    /// state-dir-backed registry and installs it here (dig_ecosystem#3292). Being callable from
+    /// outside does NOT relax the single-install discipline: a second install still returns
+    /// `false` and changes nothing.
+    pub fn install_funded_distributor_registry(
         &self,
         registry: rewards::funded::FundedDistributorRegistry,
     ) -> bool {
@@ -9486,6 +9486,77 @@ mod tests {
                 "banned key {banned:?} present: {keys:?}"
             );
         }
+    }
+
+    /// **Proves:** dig_ecosystem#3280 — a malformed `launcher_id` is refused with `-32602`, the
+    /// same validator `dig.getRewardDistributor` already uses (`parse_launcher_id_arg`), instead
+    /// of silently filtering to an empty `items` list that reads exactly like "I looked and found
+    /// nothing" (SPEC §12.5 clause 6's "reassuring zero", on the input side rather than the read
+    /// side). Registers a handle first so a filter bug that matches everything cannot pass this
+    /// test by accident: the malformed request must be refused before any filter runs.
+    /// **Catches:** a malformed `launcher_id` degrading to `Consulted { items: [] }`.
+    #[test]
+    fn get_reward_prover_status_with_a_malformed_launcher_id_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status([0x11u8; 32]),
+        ));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus",
+                "params": {"launcher_id": "zz"}
+            }),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            resp["error"]["code"],
+            json!(-32602),
+            "a malformed launcher_id must be refused, not filtered to an empty list: {resp}"
+        );
+        assert!(
+            resp.get("result").is_none(),
+            "an error response must carry no result: {resp}"
+        );
+    }
+
+    /// **Proves:** a well-formed but UNKNOWN `launcher_id` still answers `consulted` with an
+    /// empty `items` list — distinct from the malformed case above, which must be `-32602`.
+    /// **Catches:** widening the malformed-input refusal to also swallow legitimate misses.
+    #[test]
+    fn get_reward_prover_status_with_an_unknown_well_formed_launcher_id_is_empty_not_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status([0x11u8; 32]),
+        ));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus",
+                "params": {"launcher_id": hex::encode([0x99u8; 32])}
+            }),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(resp["result"]["statuses"]["outcome"], json!("consulted"));
+        assert_eq!(
+            resp["result"]["statuses"]["items"],
+            json!([]),
+            "an unknown but well-formed id is a legitimate empty answer, not an error: {resp}"
+        );
     }
 
     /// **Proves:** with nothing registered, `dig.getRewardProverStatus` answers

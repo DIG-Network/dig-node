@@ -922,10 +922,21 @@ impl RpcDispatch for Node {
             // mapped explicitly by `reward_prover_status_to_wire`.
             Some(Method::GetRewardProverStatus) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
-                let filter_launcher_id = params
-                    .get("launcher_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_ascii_lowercase);
+                // dig_ecosystem#3280: `launcher_id` is OPTIONAL here (unlike
+                // `GetRewardDistributor`'s required param), so absence is "no filter" and is not
+                // itself an error. A PRESENT value goes through the same validator
+                // `GetRewardDistributor` (below) and `ListRewardDistributorCommitments` already
+                // use, so a malformed value is refused with `-32602` instead of silently
+                // filtering to an empty list — the same "reassuring zero" defect this epic exists
+                // to kill, just on the input side rather than the read side.
+                let filter_launcher_id: Option<[u8; 32]> = if params.get("launcher_id").is_some() {
+                    match parse_launcher_id_arg(&params) {
+                        Ok(id) => Some(id),
+                        Err(msg) => return rpc_err(&id, -32602, &msg),
+                    }
+                } else {
+                    None
+                };
                 let snapshots = node.reward_prover_status_snapshots();
                 // dig_ecosystem#3269 fix939: a zeroed `launcher_id` or `store_id` is never a real
                 // distributor's or module's IDENTITY — see `is_missing_identity`/`zeroed_fields`.
@@ -980,7 +991,7 @@ impl RpcDispatch for Node {
                         true
                     })
                     .filter(|s| match &filter_launcher_id {
-                        Some(want) => hex::encode(s.launcher_id).eq_ignore_ascii_case(want),
+                        Some(want) => &s.launcher_id == want,
                         None => true,
                     })
                     .map(reward_prover_status_to_wire)

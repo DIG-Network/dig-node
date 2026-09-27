@@ -176,7 +176,6 @@ impl FundedDistributorRegistry {
 
     /// A registry persisting to `dir`. The directory is created on first write, not here, so
     /// constructing one is infallible and side-effect free.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn with_state_dir(dir: &Path) -> Self {
         Self {
@@ -201,7 +200,6 @@ impl FundedDistributorRegistry {
     /// [`FundedDistributorsRead::PersistedStateCorrupt`] until a human resolves it. That is the
     /// same "leave the corrupt file exactly as it is on disk" posture
     /// `rewards_claim::engine::ClaimEngine::persist_fee_window` takes, plus a forensic copy.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn read(&self) -> FundedDistributorsRead {
         let Some(path) = self.record_path() else {
@@ -819,8 +817,12 @@ mod tests {
         );
     }
 
-    /// **Catches:** a future variant added to the not-an-answer half of
-    /// [`FundedDistributorsRead`] that `determined` reports as a renderable set.
+    /// **Catches:** a regression on the not-an-answer half of [`FundedDistributorsRead`] listed
+    /// below reporting a renderable set. It does NOT by itself catch a future variant added to the
+    /// enum — that would need adding here too. The guard that actually forces the issue is
+    /// [`FundedDistributorsRead::determined`]'s wildcard-free match (this module, above): a new
+    /// variant left unhandled there fails to COMPILE, which is what makes adding a variant without
+    /// updating this array a build error rather than a silent gap.
     #[test]
     fn every_not_an_answer_outcome_is_undetermined() {
         let undetermined = [
