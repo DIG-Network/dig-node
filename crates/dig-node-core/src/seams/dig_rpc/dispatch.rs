@@ -1167,13 +1167,11 @@ impl RpcDispatch for Node {
                     };
 
                 let mut funded_refs = Vec::with_capacity(identities.len());
-                // `observed_at` dates the CONSULTATION, never the assembly (dig-rpc-protocol
-                // SPEC §4.4.2's first bullet; `Half`'s own doc: "Unix seconds the collection was
-                // read"). Each `port.distributor_report` call is its own consultation with its
-                // own stamp (dig_ecosystem#3323); a pre-loop handler clock predates every one of
-                // them, so it understates staleness. Fold the oldest report stamp instead — a
-                // collection is only as fresh as its stalest member — and keep `now` only for the
-                // case where no read happened at all (empty `identities`, dig_ecosystem#3323).
+                // `observed_at` must date the CONSULTATION, never the assembly (dig_ecosystem#3323,
+                // dig-rpc-protocol SPEC §4.4.2's first bullet): each `report.observed_at` postdates
+                // the pre-loop `now` above (the chain port stamps it after its own read, uncached),
+                // so stamping the handler's clock here understates staleness. Fold the reports' own
+                // stamps and keep the OLDEST — a collection is only as fresh as its stalest member.
                 let mut oldest_observed_at: Option<u64> = None;
                 for identity in identities {
                     let Some(port) = node.reward_chain_port() else {
@@ -1200,6 +1198,9 @@ impl RpcDispatch for Node {
 
                 let result = dig_rpc_protocol::types::ListRewardDistributorsResult {
                     funded: dig_rpc_protocol::types::Half::Consulted {
+                        // No reads happened for `FundsNothing` (empty `identities`), so the
+                        // pre-loop handler clock is the honest stamp for that case — it IS the
+                        // consultation. Both `NotConsulted` arms above keep `now` unchanged.
                         observed_at: oldest_observed_at.unwrap_or(now),
                         items: funded_refs,
                     },
