@@ -1167,6 +1167,14 @@ impl RpcDispatch for Node {
                     };
 
                 let mut funded_refs = Vec::with_capacity(identities.len());
+                // `observed_at` dates the CONSULTATION, never the assembly (dig-rpc-protocol
+                // SPEC §4.4.2's first bullet; `Half`'s own doc: "Unix seconds the collection was
+                // read"). Each `port.distributor_report` call is its own consultation with its
+                // own stamp (dig_ecosystem#3323); a pre-loop handler clock predates every one of
+                // them, so it understates staleness. Fold the oldest report stamp instead — a
+                // collection is only as fresh as its stalest member — and keep `now` only for the
+                // case where no read happened at all (empty `identities`, dig_ecosystem#3323).
+                let mut oldest_observed_at: Option<u64> = None;
                 for identity in identities {
                     let Some(port) = node.reward_chain_port() else {
                         return reward_chain_port_absent_response(&id);
@@ -1179,6 +1187,10 @@ impl RpcDispatch for Node {
                         Ok(report) => report,
                         Err(e) => return reward_chain_port_error_response(&id, &e),
                     };
+                    oldest_observed_at = Some(match oldest_observed_at {
+                        Some(oldest) => oldest.min(report.observed_at),
+                        None => report.observed_at,
+                    });
                     funded_refs.push(dig_rpc_protocol::types::RewardDistributorRef {
                         launcher_id: hex::encode(report.launcher_id),
                         store_id: hex::encode(report.store_id),
@@ -1188,7 +1200,7 @@ impl RpcDispatch for Node {
 
                 let result = dig_rpc_protocol::types::ListRewardDistributorsResult {
                     funded: dig_rpc_protocol::types::Half::Consulted {
-                        observed_at: now,
+                        observed_at: oldest_observed_at.unwrap_or(now),
                         items: funded_refs,
                     },
                     claimable: dig_rpc_protocol::types::Half::NotConsulted { observed_at: now },

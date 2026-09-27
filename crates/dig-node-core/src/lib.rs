@@ -10227,6 +10227,59 @@ mod tests {
         );
     }
 
+    /// **Proves:** `funded.observed_at` dates the CONSULTATION (the oldest per-item chain read),
+    /// never the assembly (dig_ecosystem#3323). The handler's pre-loop clock predates every read
+    /// `port.distributor_report` performs, so stamping it there understates staleness; the fix
+    /// folds the reports' own `observed_at` and keeps the oldest (a collection is only as fresh
+    /// as its stalest member). `claimable.observed_at` is untouched — no read happens for it, so
+    /// the handler's own clock remains the honest answer for that `NotConsulted` arm.
+    #[test]
+    fn list_reward_distributors_funded_observed_at_is_the_oldest_report_stamp() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let registry =
+            crate::rewards::funded::FundedDistributorRegistry::with_state_dir(state_dir.path());
+        for launcher_id in [[0x55u8; 32], [0x66u8; 32]] {
+            assert_eq!(
+                registry.record(&crate::rewards::funded::FundedDistributor {
+                    launcher_id,
+                    store_id: None,
+                }),
+                crate::rewards::funded::RecordOutcome::Recorded
+            );
+        }
+        let (node, _td) = test_node(None);
+        assert!(node.install_funded_distributor_registry(registry));
+
+        let report_a = sample_distributor_report(0x55, vec![]);
+        let report_b = sample_distributor_report(0x66, vec![]);
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([
+                    ([0x55u8; 32], Ok(report_a.clone())),
+                    ([0x66u8; 32], Ok(report_b.clone())),
+                ]),
+            }))
+        );
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributors"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert_eq!(resp["result"]["funded"]["outcome"], json!("consulted"));
+        assert_eq!(
+            resp["result"]["funded"]["observed_at"],
+            json!(1_700_200_000u64 + 0x55)
+        );
+        assert_eq!(resp["result"]["funded"]["observed_at"], json!(report_a.observed_at));
+        assert_ne!(resp["result"]["funded"]["observed_at"], json!(report_b.observed_at));
+        assert_eq!(
+            resp["result"]["claimable"]["outcome"],
+            json!("not_consulted")
+        );
+    }
+
     /// **Proves:** a funded identity whose per-item chain report fails refuses the WHOLE call
     /// (the same `ChainPortError` response the sibling reward-distributor handlers use), rather
     /// than emitting a partial list or a fabricated ref (dig_ecosystem#3308/#3309).
