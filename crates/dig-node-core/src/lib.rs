@@ -10074,6 +10074,8 @@ mod tests {
                 "epoch_seconds",
                 "commitments",
                 "observed_at",
+                "chain_peak_height",
+                "chain_peak_timestamp",
             ])
         );
         assert_eq!(
@@ -10086,6 +10088,11 @@ mod tests {
         );
         assert_eq!(result["epoch_seconds"], json!(report.epoch_seconds));
         assert_eq!(result["observed_at"], json!(report.observed_at));
+        assert_eq!(result["chain_peak_height"], json!(report.chain_peak_height));
+        assert_eq!(
+            result["chain_peak_timestamp"],
+            json!(report.chain_peak_timestamp)
+        );
         let commitments = result["commitments"].as_array().unwrap();
         assert_eq!(commitments.len(), 1);
         let row_keys: std::collections::BTreeSet<&str> = commitments[0]
