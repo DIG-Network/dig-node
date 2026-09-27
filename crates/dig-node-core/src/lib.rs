@@ -10283,8 +10283,9 @@ mod tests {
 
     /// **Proves:** `dig.getPayeeRewardClaimStatus` is CONTROL-tier, NOT peer-reachable, dispatched
     /// through the `Method` enum match, and its exact serialized JSON body: `subject` is the
-    /// literal `"payee"`, `claim_log` is `NotConsulted` (no claim log exists in this crate yet),
-    /// and there is never a monetary amount or payout puzzle hash anywhere in the body.
+    /// literal `"payee"`, `claim_log` and `claim_loop` are both `NotConsulted` (neither a claim
+    /// log nor a claim loop exists in this crate yet — the loop is dig_ecosystem#3421's), and
+    /// there is never a monetary amount or payout puzzle hash anywhere in the body.
     #[test]
     fn get_payee_reward_claim_status_answers_the_exact_wire_shape() {
         use dig_rpc_protocol::Method;

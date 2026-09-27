@@ -1128,6 +1128,11 @@ impl RpcDispatch for Node {
                     epoch_seconds: report.epoch_seconds,
                     commitments,
                     observed_at: report.observed_at,
+                    // dig-rpc-protocol 0.14 chain-view anchor, same rule as
+                    // `GetRewardDistributorResult` above: straight from `report`, the SAME chain
+                    // read that produced everything else in this result.
+                    chain_peak_height: report.chain_peak_height,
+                    chain_peak_timestamp: report.chain_peak_timestamp,
                 };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
@@ -1241,12 +1246,24 @@ impl RpcDispatch for Node {
             //
             // No monetary amount, ever, and no payout puzzle hash — see `PayeeClaimStatus`'s doc.
             // No params type: this call takes none.
+            //
+            // `claim_loop` (dig-rpc-protocol 0.13.0, required on the 0.14 wire this crate now
+            // targets, dig_ecosystem#3329): this crate holds no claim loop either -- it is
+            // #3421's, in `dig-node-service`'s `rewards_claim/**`, which this ticket's brief
+            // fences off. Same honesty rule as `claim_log` right above: the loop was never
+            // constructed from here, so the answer is `NotConsulted`, dated at the moment this
+            // responder established it has nothing to read -- never a manufactured `Consulted`
+            // with invented counts.
             Some(Method::GetPayeeRewardClaimStatus) => {
                 use crate::rewards::state::Clock as _;
+                let now = crate::rewards::state::SystemClock.now_unix_seconds();
                 let result = dig_rpc_protocol::types::PayeeClaimStatus {
                     subject: dig_rpc_protocol::types::PayeeSubject::Payee,
                     claim_log: dig_rpc_protocol::types::ClaimLogObservation::NotConsulted {
-                        observed_at: crate::rewards::state::SystemClock.now_unix_seconds(),
+                        observed_at: now,
+                    },
+                    claim_loop: dig_rpc_protocol::types::ClaimLoopObservation::NotConsulted {
+                        observed_at: now,
                     },
                 };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
