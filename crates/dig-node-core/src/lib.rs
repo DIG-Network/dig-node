@@ -10022,10 +10022,7 @@ mod tests {
         );
         assert_eq!(result["entry_set_stale"], json!(report.entry_set_stale));
         assert_eq!(result["observed_at"], json!(report.observed_at));
-        assert_eq!(
-            result["chain_peak_height"],
-            json!(report.chain_peak_height)
-        );
+        assert_eq!(result["chain_peak_height"], json!(report.chain_peak_height));
         assert_eq!(
             result["chain_peak_timestamp"],
             json!(report.chain_peak_timestamp)
