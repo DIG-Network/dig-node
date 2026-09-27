@@ -1248,9 +1248,10 @@ impl RpcDispatch for Node {
             // No params type: this call takes none.
             //
             // `claim_loop` (dig-rpc-protocol 0.13.0, required on the 0.14 wire this crate now
-            // targets, dig_ecosystem#3329): this crate holds no claim loop either -- it is
-            // #3421's, in `dig-node-service`'s `rewards_claim/**`, which this ticket's brief
-            // fences off. Same honesty rule as `claim_log` right above: the loop was never
+            // targets, dig_ecosystem#3329): this crate holds no claim loop either -- it lives in
+            // `dig-node-service`'s `src/rewards_claim/**` (dig_ecosystem#3268 wired it, landed;
+            // #3432 is the SPEC §13.2 off-chain seam), which this ticket's brief fences off. Same
+            // honesty rule as `claim_log` right above: the loop was never
             // constructed from here, so the answer is `NotConsulted`, dated at the moment this
             // responder established it has nothing to read -- never a manufactured `Consulted`
             // with invented counts.

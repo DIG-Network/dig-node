@@ -10284,7 +10284,10 @@ mod tests {
     /// **Proves:** `dig.getPayeeRewardClaimStatus` is CONTROL-tier, NOT peer-reachable, dispatched
     /// through the `Method` enum match, and its exact serialized JSON body: `subject` is the
     /// literal `"payee"`, `claim_log` and `claim_loop` are both `NotConsulted` (neither a claim
-    /// log nor a claim loop exists in this crate yet — the loop is dig_ecosystem#3421's), and
+    /// log nor a claim loop exists in this crate yet — the loop lives in `dig-node-service`'s
+    /// `src/rewards_claim/**`, dig_ecosystem#3268 (wiring, landed) / #3432 (the SPEC §13.2
+    /// off-chain seam), never dig_ecosystem#3421 (that ticket is the prover's
+    /// `RewardsChainPort`) — and
     /// there is never a monetary amount or payout puzzle hash anywhere in the body.
     #[test]
     fn get_payee_reward_claim_status_answers_the_exact_wire_shape() {
@@ -10317,7 +10320,7 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            std::collections::BTreeSet::from(["subject", "claim_log"]),
+            std::collections::BTreeSet::from(["subject", "claim_log", "claim_loop"]),
             "no monetary amount, no payout puzzle hash — ever: {resp}"
         );
         assert_eq!(result["subject"], json!("payee"));
@@ -10325,6 +10328,11 @@ mod tests {
         assert!(
             result["claim_log"].get("claims_submitted_count").is_none(),
             "claims_submitted_count must live INSIDE Consulted only, never beside NotConsulted: {resp}"
+        );
+        assert_eq!(result["claim_loop"]["outcome"], json!("not_consulted"));
+        assert!(
+            result["claim_loop"].get("claims_submitted_count").is_none(),
+            "claim_loop's count must live INSIDE Consulted only, never beside NotConsulted: {resp}"
         );
     }
 
