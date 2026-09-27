@@ -180,14 +180,14 @@ where
     // a height the rest of the report was never read against -- a plausible number beside
     // possibly-stale data, with nothing erroring. Both reads MUST succeed or the whole call
     // refuses; see `ChainPortError::ChainPeakUnavailable`'s doc for why `0` is never a stand-in.
-    let chain_peak_height = read_chain_peak(source)?;
+    let chain_peak = read_chain_peak(source)?;
 
     report_from_snapshot(
         &snapshot,
         launcher_id,
         comment,
         first_epoch_start,
-        chain_peak_height,
+        chain_peak,
     )
 }
 
