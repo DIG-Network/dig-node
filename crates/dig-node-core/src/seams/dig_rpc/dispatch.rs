@@ -929,15 +929,14 @@ impl RpcDispatch for Node {
                 // use, so a malformed value is refused with `-32602` instead of silently
                 // filtering to an empty list — the same "reassuring zero" defect this epic exists
                 // to kill, just on the input side rather than the read side.
-                let filter_launcher_id: Option<[u8; 32]> =
-                    if params.get("launcher_id").is_some() {
-                        match parse_launcher_id_arg(&params) {
-                            Ok(id) => Some(id),
-                            Err(msg) => return rpc_err(&id, -32602, &msg),
-                        }
-                    } else {
-                        None
-                    };
+                let filter_launcher_id: Option<[u8; 32]> = if params.get("launcher_id").is_some() {
+                    match parse_launcher_id_arg(&params) {
+                        Ok(id) => Some(id),
+                        Err(msg) => return rpc_err(&id, -32602, &msg),
+                    }
+                } else {
+                    None
+                };
                 let snapshots = node.reward_prover_status_snapshots();
                 // dig_ecosystem#3269 fix939: a zeroed `launcher_id` or `store_id` is never a real
                 // distributor's or module's IDENTITY — see `is_missing_identity`/`zeroed_fields`.

@@ -16,7 +16,8 @@ use dig_node_core::Node;
 #[test]
 fn install_funded_distributor_registry_installs_a_tempdir_backed_registry_once() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let registry = dig_node_core::rewards::funded::FundedDistributorRegistry::with_state_dir(dir.path());
+    let registry =
+        dig_node_core::rewards::funded::FundedDistributorRegistry::with_state_dir(dir.path());
 
     // Sanity on the registry itself, independent of `Node`: a fresh state dir with no record
     // file reads `NotConfigured(NoRecordWritten)`, not `FundsNothing` -- the property the
@@ -36,7 +37,10 @@ fn install_funded_distributor_registry_installs_a_tempdir_backed_registry_once()
     assert!(first_install, "the first install must be accepted");
 
     let second_install = node.install_funded_distributor_registry(registry);
-    assert!(!second_install, "the second install must be refused, changing nothing");
+    assert!(
+        !second_install,
+        "the second install must be refused, changing nothing"
+    );
 }
 
 /// Proves the STARTUP call chain, not just that the installer is reachable: `server.rs`'s

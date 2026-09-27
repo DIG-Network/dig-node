@@ -2239,12 +2239,9 @@ where
     // node — no record on disk until dig_ecosystem#3291's writer runs — so the correct read right
     // after this call is `NotConfigured(NoRecordWritten)`, not a funded set; that is success, not
     // a bug.
-    if !state
-        .node
-        .install_funded_distributor_registry(dig_node_core::rewards::funded::FundedDistributorRegistry::with_state_dir(
-            &state.state_dir,
-        ))
-    {
+    if !state.node.install_funded_distributor_registry(
+        dig_node_core::rewards::funded::FundedDistributorRegistry::with_state_dir(&state.state_dir),
+    ) {
         tracing::warn!(
             "install_funded_distributor_registry declined a second install: a funder-ownership \
              registry was already installed on this Node"
