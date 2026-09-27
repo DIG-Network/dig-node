@@ -1090,6 +1090,9 @@ payee claim state, failing §7.2's WHO-NAMES-THE-SUBJECT test). Those keep their
 carry `requires_auth: true`. `requires_auth` is the COMPILED statement of the HTTP token gate: the set
 of catalogued methods with `requires_auth: true` MUST equal the set `server.rs` refuses `-32030
 UNAUTHORIZED` without a master or paired token (`requires_http_token`), and a test pins the equality.
+The loop whose records `dig.getRewardProverStatus` reads — the reward prover loop — and the four
+controls it is gated on (default-off, an opt-in that names the daily XCH bound, dry-run, a
+file-driven kill switch) are specified in §26.
 The two chain-keyed reward reads `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`
 are OPEN (dig_ecosystem#3351) and rate-bounded per source (§10, `-32034`).
 
@@ -10182,3 +10185,667 @@ the way dig-node#574 raised for mirror-bond ids.
 * The one direction that fails EXPENSIVE is the unbonded window (§25.13.6), bounded to one confirmation
   plus one round in the common case, identical in kind to the rollover window the lifecycle already
   opens weekly.
+
+---
+
+## 26. Reward prover loop — the spawn, the four controls, and the kill switch (dig_ecosystem#3265)
+
+`dig-node-core::rewards` (dig-node#593, dig_ecosystem#3250) is the funder-side prover ENGINE for
+`dig-rewards-coin`'s reward distributor: admission, the mirror-coin gate, possession challenges,
+bounded entry-set writes, the status record, the cycle deadline and the heartbeat. At tip `69c793a7`
+it is a library with no call site: nothing spawns a periodic loop, nothing composes
+`admit → gate → challenge → writes`, and `Node::register_reward_prover_status`
+(`crates/dig-node-core/src/lib.rs:621-627`) carries `allow(dead_code)` because no production caller
+exists. That absence is the only reason the engine was safe to merge. The PR that adds the spawn is
+the PR in which a system that spends the operator's XCH on a timer is born, and this section is the
+contract that PR is gated on: it locks the shape of the spawn, the configuration file, the four
+controls (default-off, an opt-in that names the number, dry-run, a kill switch), the honesty of the
+status record under every failure the composed system can have, the test that proves the loop runs
+more than once, and the order in which the remaining port work lands relative to the controls.
+
+**The hard truth this section states rather than assumes.** At tip `69c793a7` a spawned prover loop
+faults on EVERY cycle with `ChainSourceUnavailable`: the production `RewardsChainPort`,
+`RealRewardsChainPort` (`crates/dig-node-service/src/rewards/chain_port.rs:77-97`), implements only
+`distributor_report`; `funded_distributors`, `distributor_state`, `submit_entry_writes` and
+`spend_new_epoch` answer `ChainPortError::Unavailable`. No production `MirrorCoinReader`
+(`gate.rs:52`), no production `ChallengeTransport` (`challenge.rs:185`) and no candidate-discovery
+source exist. Those are dig_ecosystem#3421 and dig_ecosystem#3423. The controls in this section are
+verifiable at this tip; distribution is not, and a reader MUST NOT conclude from a spawned loop that
+anything is being distributed (§26.12).
+
+Three times in this epic a loop has spawned, reported an unremarkable state, and distributed nothing:
+the funded-distributor registry that was never installed (dig_ecosystem#3292), the claim loop whose
+`NoHintSource` returned empty in production, and this chain port. A status surface that cannot say
+what it does not know is the epic's signature defect, and every clause in §26.9 exists to make that
+shape unsatisfiable here: a cycle that could not see what it needed to see MUST fault, MUST NOT
+advance `last_cycle_completed_at`, and MUST name the missing seam.
+
+Clauses marked **(target)** are specified here and not implemented at tip `69c793a7`; §26.14 lists
+them with the step that lands each. Every other clause cites the code that already satisfies it.
+
+**Units, named once.** XCH fees are in **mojos** (`1 XCH = 1_000_000_000_000 mojos`, 1e12). Reward
+figures are in **$DIG base units** (`1 $DIG = 1_000 base units`, 3 decimals). Time is Unix seconds.
+A day is `86_400` s (`crates/dig-node-core/src/rewards/writes.rs:27`). Nothing in this section
+converts between XCH and $DIG: the node holds no exchange rate and MUST NOT print one.
+
+### 26.1. Scope, and what this section does NOT specify
+
+This section specifies, for the `dig-node` SERVICE crate:
+
+1. the spawn site and the seam that decides whether to spawn (§26.3);
+2. the operator configuration file `rewards-prover.json`, every key and every default (§26.4);
+3. the four controls, as behaviour an operator can observe in a running node (§26.5-§26.8);
+4. the cycle composition's HONESTY obligations — what a cycle must report when a seam it depends on
+   is absent or unavailable, and what it must never report (§26.9);
+5. the tests the spawning PR MUST carry (§26.10) and the gate the composed system MUST pass before
+   live mode is released (§26.11).
+
+It does NOT specify, and a reader MUST NOT read it as specifying:
+
+- the engine's own rules — cycle period, heartbeat, deadline, admission, gate, challenge windows,
+  strike accounting, the four write bounds, eviction economics. Those are
+  `dig-rewards-coin/SPEC.md` (the published crate's copy, currently 0.8.0) §2-§6 and §12, transcribed
+  as constants in `crates/dig-node-core/src/rewards/spec_constants.rs`. This section names those
+  constants and functions; it restates no formula they own.
+- the wire shape of `dig.getRewardProverStatus`, `RewardProverStatus`, `ProverCounters` or
+  `ProverState`. Those are `dig-rpc-protocol` 0.12.0 (`types.rs:1466-1484`, `:1529`, `:1573`,
+  `Half` at `:1659-1677`), pinned by `crates/dig-node-core/Cargo.toml:201`. **This section adds no
+  RPC method and no wire field.** Two things it would like to say on the wire — that a loop is in
+  dry-run, and that a loop is stopped by the switch rather than by an operator pause — cannot be said
+  in 0.12.0 (`ProverState` is a closed nine-member set that rejects unknown strings;
+  `RewardProverStatus` has no mode field), and this section therefore says them in the LOG only
+  (§26.7 clause 6, §26.8 clause 9). A `mode` field is a `dig-rpc-protocol` change routed through the
+  protocol lane, not through this section.
+- the realisation of the four `RewardsChainPort` methods (dig_ecosystem#3421), the
+  `MirrorCoinReader`, `ChallengeTransport` and discovery source (dig_ecosystem#3423), the `writes.rs`
+  hardening items (dig_ecosystem#3422), or the persistence of the process-local counters
+  (dig_ecosystem#3274). §26.2 orders them; §26.9 states what the composed loop MUST report while
+  each is absent.
+- any signing authority. Live-mode entry-set writes are distributor-singleton spends that need the
+  manager singleton's authority (`dig-rewards-coin/SPEC.md` §7.2). WHERE that key lives and WHO
+  signs is a custody question for dig_ecosystem#3421 and the protocol lane; nothing in this section
+  places a signer in the node, and the spawning PR MUST NOT.
+
+### 26.2. Sequencing — the controls land first, and live mode is released by a gate, not by a merge
+
+1. The spawning PR (dig_ecosystem#3265) MUST land the four controls, the composer, the status
+   honesty of §26.9 and the tests of §26.10 BEFORE any PR realises a `RewardsChainPort` write
+   method, a `MirrorCoinReader`, a `ChallengeTransport` or a discovery source. The controls gate the
+   port work, not the reverse: a port PR that arrives first would make a loop with no switch and no
+   stated bound the first thing an operator could turn on.
+2. At that tip every cycle of a spawned loop faults `ChainSourceUnavailable` at
+   `funded_distributors` (§26.9 clause 4). That is the CORRECT observable behaviour of the spawning
+   PR and MUST be what its review verifies — not "the loop runs", but "the loop runs, and says on
+   every cycle that it cannot see its distributors".
+3. **Live mode is released by a code constant that only the composed-system gate may flip.**
+   `crates/dig-node-service/src/rewards/config.rs` MUST declare
+   `pub const PROVER_LIVE_MODE_RELEASED: bool = false;` **(target)**. `decide_prover_driver`
+   (§26.3) MUST refuse `mode = live` with `ProverDriverRefusal::LiveModeNotReleased` while it is
+   `false`. The constant MAY be set to `true` only by a one-line PR whose description links the
+   passing verdict of the composed-system gate (§26.11) and which lands AFTER dig_ecosystem#3421,
+   #3422 and #3423. A reader MUST NOT conclude from `mode: "live"` in a configuration file that the
+   node will spend: until the constant is `true`, that file produces the named refusal and no loop.
+4. Order of landing, normative: (a) this section's controls + composer (dig_ecosystem#3265);
+   (b) the funded-distributor registry install (dig_ecosystem#3292, a live lane at the time of
+   writing); (c) the four port methods, the state-dir `WriteBoundStore` of §26.9 clause 12, and the
+   §23 audit entry for a live bundle (dig_ecosystem#3421); (d) the `writes.rs` hardening
+   (dig_ecosystem#3422); (e) the reader, transport and discovery source (dig_ecosystem#3423);
+   (f) the composed-system gate (§26.11); (g) the one-line release of clause 3. (c), (d) and (e) MAY
+   land in any order among themselves; (f) MUST follow all of them; (g) MUST follow (f).
+
+### 26.3. The spawn site and the three-function seam
+
+1. The prover loop is spawned from `serve_with_shutdown`
+   (`crates/dig-node-service/src/server.rs:2198`), immediately after the claim-loop spawn
+   `crate::rewards_claim::spawn_claim_driver_from_config(..)` (`server.rs:2353-2356`)
+   **(target)**. By that point the funder-side chain port has been installed on `Node` inside
+   `if config.enable_chain_sync` (`server.rs:2247-2274`), so `Node::reward_chain_port()`
+   (`crates/dig-node-core/src/lib.rs:708`) is `Some` exactly when chain sync is on.
+2. The driver and its configuration live in the SERVICE crate's existing
+   `crates/dig-node-service/src/rewards/` (`mod.rs:24-27` today exports `chain_port`,
+   `chain_source`, `RealRewardsChainPort`): `rewards/config.rs`, `rewards/driver.rs`,
+   `rewards/dry_run.rs` **(target)**. They MUST NOT live in `dig-node-core`: core owns the engine;
+   the service owns spawning, files in the state directory and chain adapters — the same split
+   `rewards_claim/` already has.
+3. The seam MUST mirror the claim loop's three functions at
+   `crates/dig-node-service/src/rewards_claim/driver.rs:645-651`, `:663-687`, `:695-706`
+   **(target)**:
+   - `decide_prover_driver(inputs) -> ProverDriverDecision` — pure, no I/O, no logging; every
+     branch unit-testable. Its inputs are the loaded `RewardsProverConfig` (or its corrupt marker),
+     `enable_chain_sync` (`crates/dig-node-service/src/config.rs:155`), whether the stop sentinel of
+     §26.8 exists, whether `Node::reward_chain_port()` is `Some`, and `PROVER_LIVE_MODE_RELEASED`.
+   - `spawn_prover_driver_if(decision, handle, spawn)` — invokes `spawn` exactly when the decision
+     is `Spawn`; every other branch records its `ProverDriverRefusal` on the injected
+     `ProverLoopHandle` and logs it by name at `warn!` (`target: "rewards_prover"`), never
+     silently. A refused spawn registers NOTHING on `Node`.
+   - `spawn_prover_driver_from_config(enable_chain_sync, node, wallet, ..)` — the ONLY reader of
+     the process-wide handle singleton and the one call `serve_with_shutdown` makes.
+4. `ProverDriverRefusal` MUST be the closed set, in the order the decision checks them:
+   `Disabled` (`enabled = false`, including a missing file), `ConfigCorrupt` (file present, not
+   parseable — §26.4 clause 6), `StopSentinelPresent` (§26.8 clause 4), `ChainSyncDisabled`,
+   `NoStandardFee` (`standard_fee_mojos = 0`), `StandardFeeAboveMaximum`, `LiveModeNotReleased`
+   (§26.2 clause 3), `NoChainPort`, `NoOperatorWallet` (§26.9 clause 7). Each MUST be
+   distinguishable in the log and on the handle; three of them (`Disabled`, `ChainSyncDisabled`,
+   `NoChainPort`) would otherwise collapse into the same "nothing registered" reading, which is the
+   collapse `ClaimDriverRefusal` (`rewards_claim/driver.rs:80-99`) already exists to prevent.
+5. `ProverLoopHandle` **(target)** mirrors `ClaimLoopHandle` (`rewards_claim/driver.rs:65-70`):
+   `cycles_driven() -> u64` (incremented once per scheduler pass, whatever the pass produced — an
+   OBSERVED count, never "the task was spawned"), `refusal() -> Option<ProverDriverRefusal>`,
+   `mode() -> Option<ProverMode>`, and `inventory() -> ProverInventory` (§26.9 clause 5). It is
+   in-process only: nothing in this section puts it on the wire (dig_ecosystem#3261 — no `*Reward*`
+   method may be peer-reachable or non-`Tier::Control`, and this section adds no method at all).
+6. Every clause of `rewards_claim/driver.rs` that this section says to mirror is mirrored for its
+   SHAPE. **Its default is NOT mirrored**: `RewardsClaimConfig::default_enabled()` returns `true`
+   (`rewards_claim/config.rs:140-142`), and a prover configuration copying that line violates
+   §26.5. The claim loop's cadence is operator-configurable and sanitised at three layers
+   (`config.rs:232-239` floors to 60 s at load; `driver.rs:459-500` substitutes the default for a
+   ZERO cadence and CLAMPS an over-maximum cadence or jitter to `CLAIM_SCHEDULE_SECONDS_MAX`,
+   `driver.rs:420`); the prover's cadence is not configurable at all (§26.4 clause 8), so none of
+   that sanitiser is copied either.
+
+### 26.4. The configuration file `rewards-prover.json` — every key, every default
+
+1. **Path.** `<state_dir>/rewards-prover.json`, where `<state_dir>` is
+   `crate::state::state_dir()` (`crates/dig-node-service/src/state.rs:352`; `DIG_NODE_STATE_DIR`
+   overrides, `state.rs:34`) — a sibling of `rewards-claim.json` (`rewards_claim/config.rs:54`).
+   **(target)**
+2. **The node never writes this file.** It carries operator INTENT only. No runtime state — no
+   cursor, no spend, no timestamp — is ever persisted into it; the write bounds live in the store
+   of §26.9 clause 12. A file the node never writes cannot be corrupted by the node, cannot re-grant
+   a budget on a crash, and needs no "corrupt spend" arithmetic of the kind `rewards_claim/config.rs`
+   F8/F14 had to add.
+3. **Keys, types, defaults** — every key `#[serde(default = ..)]`, so a file written before a key
+   existed loads that key's DEFAULT and never a fabricated choice:
+
+   | key | type | default | meaning |
+   |---|---|---|---|
+   | `enabled` | bool | **`false`** | Whether a loop is spawned at all. §26.5. |
+   | `mode` | `"dryRun"` \| `"live"` | **`"dryRun"`** | §26.7. Any other string is a parse error (clause 6), never a default. |
+   | `standard_fee_mojos` | u64 | **`0`** | The operator's standard per-bundle transaction fee, in mojos. `0` means "not stated" and refuses the spawn (`NoStandardFee`). §26.6. |
+
+   There are exactly three keys. A fourth key is a SPEC amendment to this table first.
+4. **Serde shape** **(target)**: `RewardsProverConfig { enabled, mode, standard_fee_mojos }`;
+   `ProverMode { DryRun, Live }` with `#[serde(rename_all = "camelCase")]` (wire strings `dryRun`,
+   `live`), no `#[serde(other)]`, no `Default` that could coerce an unknown string. `enabled`'s
+   default MUST be the constant `PROVER_ENABLED_DEFAULT: bool = false`, and the crate MUST carry a
+   compile-time assertion `const _: () = assert!(!PROVER_ENABLED_DEFAULT, "..");` so the default
+   cannot be flipped without deleting the assertion in the same diff. A `#[test]` MUST additionally
+   prove `RewardsProverConfig::load_from(<empty dir>).enabled == false` and that
+   `decide_prover_driver` on that load is `Disabled`.
+5. **Maximum fee.** `PROVER_STANDARD_FEE_MOJOS_MAX = 100_000_000_000` (0.1 XCH per bundle;
+   2.4 XCH/day/distributor at the §26.6 ceiling) **(target)**. A `standard_fee_mojos` above it MUST
+   be REFUSED (`StandardFeeAboveMaximum`), never clamped: a fee that large is a typo, and clamping
+   a money number silently hides the typo from the person who made it. The maximum is ten times
+   the congested figure §26.6 prints and twenty thousand times a routine one; it exists so the
+   saturation direction noted at `writes.rs:66-78` is unreachable from configuration
+   (dig_ecosystem#3422 owns the arithmetic itself).
+6. **A missing file is a clean default** (`enabled = false`, nothing spawns, nothing logged above
+   `debug!`). **A present file the node cannot parse is a different fact**: `load_from` MUST return
+   a corrupt marker (never `default()`), the spawn MUST be refused as `ConfigCorrupt`, and the
+   refusal MUST be logged at `warn!` with the path — the operator who wrote the file is exactly the
+   person who needs to learn it was not read. Unknown keys are ignored (a mistyped `enable` yields
+   `enabled = false`; a mistyped `mode` yields `dryRun`; a mistyped fee yields `0` and
+   `NoStandardFee`): every typo fails toward not spawning or not spending, which is why
+   `deny_unknown_fields` is not required.
+7. **Example, the smallest file that produces a loop:**
+
+   ```json
+   { "enabled": true, "mode": "dryRun", "standard_fee_mojos": 5000000 }
+   ```
+
+   produces a dry-run loop at a 0.000005 XCH standard fee. Changing `"dryRun"` to `"live"` produces
+   `LiveModeNotReleased` until §26.2 clause 3 is satisfied, and a live loop after.
+8. **Cadence is a constant, not a key.** The cycle period is
+   `PROVER_CYCLE_PERIOD_SECONDS = 3_600`, the heartbeat `PROVER_HEARTBEAT_SECONDS = 60`, the
+   deadline `PROVER_CYCLE_DEADLINE_SECONDS = 900` (`spec_constants.rs:19-26`;
+   `dig-rewards-coin/SPEC.md` §2.5). The scheduler's interval MUST be
+   `rewards_claim::next_interval_seconds(PROVER_CYCLE_PERIOD_SECONDS, PROVER_CYCLE_JITTER_SECONDS_MAX, jitter)`
+   (`rewards_claim/cadence.rs:31`, re-exported at `rewards_claim/mod.rs:57`) with
+   `PROVER_CYCLE_JITTER_SECONDS_MAX = 300` **(target)** and an OS-entropy `JitterSource` in
+   production (`FixedJitter(0)` in tests, `cadence.rs:18`). Jitter exists so funders do not converge
+   on the same second; it MUST NOT be configurable, and a reader MUST NOT conclude the period is.
+9. **Runtime re-read** — §26.8 clause 5: the switch task re-reads `enabled` and the sentinel every
+   `PROVER_HEARTBEAT_SECONDS`. `mode` and `standard_fee_mojos` are read ONCE, at spawn. A runtime
+   change to either is NOT honoured until the node restarts, and the spawn-time line of §26.6 is
+   the only place the operator's mode and fee are ever confirmed back to them: a mode that could flip
+   from dry-run to live without that line being printed would be a silent money escalation.
+
+### 26.5. Control 1 — default off, and what the status surface says when off
+
+1. With no `rewards-prover.json`, or with `enabled = false`, NO loop is spawned, NO
+   `StatusHandle` is registered on `Node`, and `Node::reward_prover_status_snapshots()`
+   (`lib.rs:632`) stays empty. `dig.getRewardProverStatus` then answers
+   `statuses: { outcome: "consulted", observed_at, items: [] }`
+   (`crates/dig-node-core/src/seams/dig_rpc/dispatch.rs:923-1000`, `Half::Consulted` at `:995`),
+   which the wire contract defines as "this node runs no prover loops" — a TRUE statement, read from
+   a real registry, and it MUST stay one: the spawning PR MUST NOT register a placeholder record for
+   a disabled loop, and MUST NOT register anything before `decide_prover_driver` returns `Spawn`.
+2. A refused spawn (any `ProverDriverRefusal`) is observable in exactly two places: the `warn!` line
+   of §26.3 clause 3 and `ProverLoopHandle::refusal()`. It is NOT observable on the wire. That is a
+   limitation of `dig-rpc-protocol` 0.12.0, stated here so nobody papers over it with a fabricated
+   record.
+3. An upgrade MUST NOT start a loop. A node upgraded from a version without this section, with no
+   file, has `enabled = false`. This is the whole content of control 1 and the reason clause 4 of
+   §26.4 makes the default a compile-time assertion rather than a convention.
+
+### 26.6. Control 2 — the opt-in names the number
+
+The enabling surface is the configuration file plus ONE log line the node prints when it spawns.
+`dig-rewards-coin/SPEC.md` §2.2 clause 5 is the governing precedent: *"a risk with a stated bound is
+a decision a funder can make, and a risk without one is only alarming."*
+
+1. **The operator states the fee; the node derives the bound.** `standard_fee_mojos` is the operand
+   `FeeBudget::new(standard_fee_mojos, now)` and `FeeBudget::daily_limit_for(standard_fee_mojos)`
+   take (`writes.rs:47`, `:65`). The daily ceiling is THAT function's answer — the node MUST NOT
+   restate the product anywhere else, and the operator is never asked to type a ceiling and have the
+   node divide it (a second formula is how two paths bound one spend differently, `writes.rs:68-71`).
+   `0` MUST refuse the spawn (`NoStandardFee`): a loop whose logged bundles carry `fee_mojos = 0`
+   would reconcile against nothing.
+2. **The spawn-time line** **(target)**: exactly one `tracing::warn!` (money, not chatter) with
+   `target: "rewards_prover"`, emitted after `decide_prover_driver` returns `Spawn` and before the
+   first cycle, carrying at least these structured fields, each in the unit its name states:
+
+   | field | value | source |
+   |---|---|---|
+   | `mode` | `dryRun` \| `live` | §26.4 |
+   | `standard_fee_mojos` | the configured fee | §26.4 |
+   | `bundles_per_day` | `24` | `writes.rs:33` (`SECONDS_PER_DAY / ENTRY_WRITE_MIN_INTERVAL_SECONDS`) |
+   | `entry_actions_per_day` | `192` | `24 × MAX_ENTRY_WRITES_PER_BUNDLE` (`spec_constants.rs:53`) |
+   | `daily_fee_ceiling_mojos_per_distributor` | `FeeBudget::daily_limit_for(standard_fee_mojos)` | `writes.rs:65` |
+   | `daily_fee_ceiling_xch_per_distributor` | the same figure over 1e12, printed to 6 decimals | — |
+   | `yearly_fee_ceiling_xch_per_distributor` | the daily XCH figure × 365 | — |
+   | `max_removals_per_day` | `192` | every bundle all `Remove` |
+   | `max_churns_per_day` | `96` | one `Remove` + one `Add` per churn |
+   | `full_set_flush_days_pure_eviction` | `1.3` | `250 / 192` (`MAX_ENTRIES_PER_DISTRIBUTOR`, `spec_constants.rs:75`) |
+   | `full_set_flush_days_churn` | `2.6` | `250 / 96` |
+   | `eviction_settles_full_accrued_balance` | `true` | `dig-rewards-coin/SPEC.md` §6.4 |
+
+   and the message text MUST state, in words, that every `Remove` pays the evicted entry its FULL
+   accrued balance from the reserve, ignoring `payout_threshold` (§6.4), so that sustained eviction
+   can flush a full 250-entry set's accrued balance in about 1.3 days, and that every figure is
+   PER FUNDED DISTRIBUTOR — the node's total is that figure times the number of distributors it
+   funds, which is not known until the first inventory read (§26.9 clause 5) and MUST be printed on
+   the per-cycle line once it is.
+3. **The worked figures**, which a test MUST pin (`#[test]` over the rendered fields, not over the
+   prose): at the congested fee `standard_fee_mojos = 10_000_000_000` (0.01 XCH) the ceiling is
+   `240_000_000_000` mojos = **0.24 XCH/day = 87.6 XCH/year** per distributor; at a typical
+   `5_000_000` (0.000005 XCH) it is `120_000_000` mojos = 0.00012 XCH/day = 0.0438 XCH/year.
+4. **The two flush figures are two different numbers and MUST both be printed.** 192 `Remove`
+   actions/day is the pure-eviction ceiling and yields ~1.3 days for 250 entries; 96/day is the
+   evict-and-re-add CHURN ceiling and yields ~2.6 days. The ticket text pairs "96 evictions/day" with
+   "~1.3 days"; that pairing is arithmetically false (250 / 96 = 2.6) and MUST NOT be printed.
+   `crates/dig-node-core/src/rewards/mod.rs` carries the 2.6-day figure today and MUST gain the
+   1.3-day figure in the same PR **(target)**.
+5. **The rate bound and the fee ceiling are ONE control**, as `mod.rs` already states: 24 bundles/day
+   is simultaneously the rate limit and the fee ceiling, and `FeeBudget` adds no second protection
+   on top of it. The spawn-time line MUST NOT describe them as two independent limits.
+
+### 26.7. Control 3 — dry-run
+
+Dry-run runs the full cycle — inventory, chain state, discovery, gate, challenge, decision, the
+write scheduler with its real bounds — and logs the bundle it WOULD submit without submitting it.
+An operator watches the loop make decisions about their money before authorising it to act.
+
+1. `mode = dryRun` is the default (§26.4). A dry-run loop needs `enable_chain_sync = true` and an
+   installed chain port exactly as a live one does: its reads are real.
+2. **The decorator** **(target)**: `DryRunChainPort<P: RewardsChainPort>` in
+   `crates/dig-node-service/src/rewards/dry_run.rs`, wrapping the installed port. It delegates the
+   three reads (`funded_distributors`, `distributor_state`, `distributor_report`) unchanged. For the
+   two writes it MUST NOT call the inner port at all:
+   - `submit_entry_writes(bundle)` MUST log ONE `warn!` (`target: "rewards_prover"`,
+     `mode = "dryRun"`) carrying `launcher_id` (hex), `fee_mojos`, `adds`, `removes`, and for every
+     action its kind and `payout_puzzle_hash` (hex) (`EntryAction`, `port.rs:124-136`;
+     `EntryWriteBundle`, `port.rs:139-144`), with the message stating that each `Remove` WOULD settle
+     that entry's full accrued balance (§6.4); then return `Ok(())`.
+   - `spend_new_epoch(launcher_id)` MUST log the same way and return `Ok(())`.
+   A test MUST prove, with an inner port that panics on either write, that a dry-run cycle reaching
+   a `Bundle` outcome completes without the inner write being called.
+3. **Selection is by construction, once, at spawn**: `spawn_prover_driver_from_config` wraps the
+   installed port in `DryRunChainPort` when `mode = dryRun` and passes the installed port bare when
+   `mode = live`. There is no runtime toggle (§26.4 clause 9).
+4. **Dry-run MUST NOT mutate the live write bounds.** `PersistedEntryWriter::commit`
+   (`writes.rs:408-414`) persists bounds "once the caller has confirmed the chain accepted the
+   bundle"; in dry-run the chain accepted nothing. The dry-run composer therefore runs
+   `PersistedEntryWriter` over a DRY-RUN `WriteBoundStore` **(target)**: an in-memory store,
+   process-lifetime, seeded per distributor by one read-only `load` from the live store of §26.9
+   clause 12 on first use, and never calling the live store's `save`. Consequences a reader MUST
+   hold: the logged bundles honour the live cooldowns and today's live spend as they stood at first
+   use; dry-run accounting resets on restart; switching to live starts from the live bounds exactly
+   as they were. Dry-run MUST NOT advance `spent_mojos_today` in the live store — a dry-run that
+   burned tomorrow's live budget would record mojos never spent, which is a money lie in persisted
+   state.
+5. **Dry-run MUST NOT increment `entries_added` / `entries_removed`** and MUST NOT write a §23
+   audit entry: nothing moved. `last_entry_write_at` is chain-derived (`port.rs:117-119`) and stays
+   honest by construction. The log line of clause 2 is the ONLY record of a would-be bundle.
+6. **Dry-run is log-only, and this section says so rather than implying otherwise.** `dig-rpc-protocol`
+   0.12.0 cannot carry a mode: `ProverState` is a closed set (`types.rs:1466-1484`, and the
+   protocol's own test `prover_state_covers_the_closed_set_and_rejects_unknown`) and
+   `RewardProverStatus` has no mode field. A dry-run loop and a live loop are therefore
+   INDISTINGUISHABLE over `dig.getRewardProverStatus`; the spawn-time line (§26.6) and every
+   per-cycle line (§26.9 clause 10) carry `mode`. Making dry-run wire-visible is a protocol-lane
+   change and MUST NOT be attempted by adding a state string or a field on the node side.
+
+### 26.8. Control 4 — the kill switch
+
+The switch stops the loop without stopping the node, and it MUST be reachable while the loop is
+wedged. It needs no RPC method.
+
+1. **Two tasks, one channel** **(target)**. `spawn_prover_driver` starts a
+   `tokio::sync::watch::channel(false)` and two detached tasks:
+   - the **switch task**, which owns the `Sender`: every `PROVER_HEARTBEAT_SECONDS` it calls
+     `heartbeat_tick` (`cycle.rs:79-81`) on every registered `StatusHandle`, re-reads the two stop
+     conditions of clause 4, and on either sends `true`;
+   - the **cycle task**, which holds a `Receiver`: it sleeps the §26.4 clause 8 interval, then runs
+     the cycle of §26.9 inside `tokio::select!` against `stop.changed()`, so a cycle in flight is
+     DROPPED the instant the switch flips, not at the 900 s deadline.
+   The core `heartbeat_loop` (`cycle.rs:86-105`) is the receiver-side precedent — it already takes
+   `watch::Receiver<bool>` and exits on `true` — but it is not the production ticker here because it
+   cannot read the switch; the switch task calls the same `heartbeat_tick` it does.
+2. **Reachability while wedged.** The switch task never awaits the cycle task and never takes a lock
+   the cycle holds across an `.await`; it is an independent task on the runtime, so a cycle future
+   parked on a socket cannot delay it. The cycle task's `select!` polls `stop.changed()` on every
+   wake, so a parked cycle future is cancelled by drop. The one way this argument fails is a cycle
+   future that BLOCKS its executor thread (a synchronous `ChainSource` call on the async runtime):
+   the `select!` in that task can then not be polled. Therefore every synchronous chain read the
+   cycle makes MUST run under `tokio::task::spawn_blocking`, as `distributor_report` already does
+   (`chain_port.rs:110`), and a review of the spawning PR MUST check the composed cycle for a
+   blocking call on the runtime thread as a blocking finding.
+3. **Latency bound.** From the moment a stop condition becomes true on disk to `Stopped` on every
+   record: at most `PROVER_HEARTBEAT_SECONDS` (60 s) plus one scheduler wake. A test MUST pin it
+   (§26.10 clause 3).
+4. **The two stop conditions**, both read from the state directory by the switch task:
+   - `rewards-prover.json` no longer says `enabled: true` — including the file being missing,
+     unreadable or unparsable at re-read. Fail closed: a file the node cannot read at re-read stops
+     the loop (logged by name); a stop is recoverable and a spend is not.
+   - a sentinel file `<state_dir>/rewards-prover.STOP` exists. Its content is ignored; existence is
+     the signal. It is the switch an operator reaches for when they do not want to edit JSON while
+     something is going wrong, and it is honoured at SPAWN too (`StopSentinelPresent`, §26.3
+     clause 4): a sentinel left in place after a restart keeps the loop off.
+5. **What is re-read and what is not.** Only `enabled` and the sentinel. §26.4 clause 9 governs the
+   other keys.
+6. **The stop is durable and one-way.** On `true`: the switch task writes `prover_state = Stopped`
+   and `prover_state_since = now` on every registered record in one `update`, logs the stop by
+   cause, and both tasks exit. `Stopped` is the wire's "will not run again without an explicit
+   restart" (`dig-rpc-protocol` 0.12.0 `types.rs:1483`), and the restart is a NODE PROCESS restart
+   with the stop conditions cleared. Removing the sentinel or re-writing `enabled: true` while the
+   process runs MUST NOT resume the loop, and the spawning PR MUST NOT add a resume path: a switch
+   that can be un-flipped by the same file it watches is a switch a wedged operator cannot trust.
+7. **The final record is frozen, and that is honest.** After the stop, `observed_at` MUST NOT
+   advance: the record reflects the chain view as of the stop, which is exactly what a stopped loop
+   has. A reader deriving staleness from `observed_at` (`is_wedged`, `cycle.rs:111-113`) will find a
+   `Stopped` record stale, and it is; `prover_state = Stopped` is what tells that reader why. The
+   research note that `observed_at` "keeps ticking" after a stop is WITHDRAWN by this clause — a
+   stopped loop that kept refreshing its chain-view timestamp would be reporting observations it is
+   no longer making.
+8. **`Paused` is not produced.** No operator action in this section yields `ProverState::Paused`;
+   the switch yields `Stopped`. A reader MUST NOT conclude `Paused` is reachable at this tip.
+9. **Why not an RPC.** `control::is_control_method` is a string-prefix check, so a node-local
+   `control.rewardProver.stop` would DISPATCH without a protocol bump — but every `control.*` method
+   is enumerated in `dig-rpc-protocol::Method` with a `tier()` (0.12.0 `method.rs:94-107`,
+   `:162-167`, `:188`), dig_ecosystem#3261 holds every `*Reward*` method at `Tier::Control`, and
+   adding one is a protocol-lane release-first cascade. The file-driven switch removes that
+   cross-repo blocker deliberately; a `dig-node` CLI subcommand that writes the sentinel is a
+   nice-to-have and, if added, MUST write the file and nothing else. A reader MUST NOT conclude that
+   the absence of an RPC makes the switch weaker: it is reachable by any process that can write the
+   state directory, which is the same trust boundary the configuration file already sits on.
+
+### 26.9. The cycle, the status record, and restart honesty
+
+The composer is the per-cycle function the cycle task runs. Its steps are the engine's, in the
+engine's order; this section specifies only what each step MUST REPORT and what it MUST NOT.
+
+1. **Deadline wrapper.** Every per-distributor cycle runs inside `run_cycle_with_deadline`
+   (`cycle.rs:31-77`). Its `cycle_fn` today returns `()` and the wrapper marks every in-time return
+   as a completed cycle (`cycle.rs:58-64`). That is insufficient for a composed cycle that can fail
+   to see the chain: the wrapper MUST take `Fut: Future<Output = CycleOutcome>` **(target)** with
+   `CycleOutcome::Completed(end_state)` for `end_state ∈ { Idle, Unfunded, EntrySetFull,
+   FeeBudgetExhausted }` and `CycleOutcome::Faulted(fault)` for
+   `fault ∈ { ChainSourceUnavailable, LocalCopyMissing }`. On `Completed`: `prover_state =
+   end_state`, `last_cycle_completed_at = now`, `next_cycle_due_at = now +
+   PROVER_CYCLE_PERIOD_SECONDS`, `consecutive_cycle_failures = 0`. On `Faulted`, and on the
+   deadline: `prover_state = fault` (or `Idle` on the deadline, as today), `consecutive_cycle_failures
+   += 1`, and `last_cycle_completed_at` MUST NOT advance. The deadline arm at `cycle.rs:66-75` is
+   unchanged.
+2. **`prover_state_since` moves with `prover_state`.** Every transition MUST set
+   `prover_state_since = now` in the same `StatusHandle::update` (`state.rs:82-90` documents the
+   closure for exactly this). The wrapper does not do so today (`cycle.rs:45-49`, `:58-64`)
+   **(target)**.
+3. **A faulted cycle is a prover fault, never a peer strike.** `StrikeTracker::record_prover_fault`
+   (`challenge.rs:270`) and `dig-rewards-coin/SPEC.md` §2.5 clause 3 / §3.6 clause 4 govern: no
+   candidate's strike count moves in a cycle that faulted.
+4. **Inventory.** The cycle begins with `port.funded_distributors()` (`port.rs:264`). At tip
+   `69c793a7` this answers `Unavailable` (`chain_port.rs:77-82`); dig_ecosystem#3421 realises it
+   over `Node::funded_distributors_read()` (`lib.rs:675`; `FundedDistributorsRead`,
+   `funded.rs:94-115`) plus `distributor_report` for the `(store_id, root)` of each launcher, and
+   MUST map `FundsNothing` to `Ok(vec![])`, and `NotConfigured(_)`, `PersistedStateCorrupt { .. }`
+   and `IoFailed { .. }` to `Err(Unavailable)` — an unknown set is never an empty set
+   (`funded.rs:122-131`). The composer MUST NOT read the registry directly, bypassing the port.
+5. **The inventory outcome is a Node-level fact** **(target)**: core gains
+   `rewards::state::ProverInventory { Undetermined { since, reason }, Determined { count, observed_at } }`
+   and `Node::set_reward_prover_inventory(..)`; the composer sets `Undetermined` at spawn and after
+   every failed inventory read, `Determined` after every successful one. While a loop is spawned and
+   the inventory is `Undetermined`, the `Method::GetRewardProverStatus` arm MUST answer
+   `statuses: Half::NotConsulted { observed_at }` (0.12.0 `types.rs:1671-1677`) — "nothing looked,
+   so there is no answer here to read as none" — and MUST NOT answer `Consulted { items: [] }`,
+   which the wire defines as "this node runs no prover loops" and which would be false. With no loop
+   spawned the arm keeps answering `Consulted` (§26.5 clause 1). Records already registered stay
+   registered and are returned under `Consulted` once the inventory is determined again. This is the
+   node-side answer to the signature defect; it needs no wire change because `Half::NotConsulted`
+   exists for exactly this distinction.
+6. **Registration is on first sight, with a real identity.** The first cycle that sees a
+   `DistributorRef` registers `idle_status(launcher_id, store_id, root, now)` (`state.rs:159-166`)
+   through `Node::register_reward_prover_status`, which MUST become `pub` and lose its
+   `allow(dead_code)` **(target)** (`lib.rs:621-627`). `store_id` and `root` come from the ref, never
+   from zeros: the handler refuses a zeroed identity for the whole call (`dispatch.rs:923-1000`).
+   `next_cycle_due_at` at registration is `Some(now)` — due now — because the first cycle runs
+   immediately (clause 8). A distributor is registered once; the registry is append-only
+   (`lib.rs:613-627`) and a stopped loop's records remain, showing `Stopped`.
+7. **Own identity.** `OwnIdentity` (`admission.rs:35-42`) is this node's own `peer_id` and EVERY
+   puzzle hash its wallet controls. A node with no operator wallet MUST refuse the spawn
+   (`NoOperatorWallet`), and a wallet that enumerates ZERO puzzle hashes MUST be treated the same
+   way — never as an empty exclusion set, because an empty set silently disables the
+   payout-coordinate half of self-exclusion (`dig-rewards-coin/SPEC.md` §5.2; dig-node#261 is the
+   precedent for a self-exclusion honoured on one path and not another).
+8. **The first cycle runs immediately after the spawn-time line**, not after a first interval. The
+   claim loop waits one full cadence first (`rewards_claim/driver.rs:167-189`) as restart-loop
+   protection; the prover's restart protection is the persisted write bounds (clause 12), which
+   already refuse a bundle within `ENTRY_WRITE_MIN_INTERVAL_SECONDS` of the last one, so an
+   immediate first cycle can read and decide but cannot double-spend. An operator who enabled
+   dry-run to watch the loop sees its first decision line within the cycle deadline, not an hour
+   later.
+9. **Absent seams fault; they never complete.** A cycle in which any seam it needs is absent or
+   answers unavailable — a chain-port method (`Unavailable`), the discovery source, the
+   `MirrorCoinReader` (`GateError::EpochOrdinalUnavailable` → `AdmissionDecision::ChainSourceUnavailable`,
+   `admission.rs:123`), the `ChallengeTransport`, or the write-bound store
+   (`PersistedWriteOutcome::PersistenceUnavailable`, `writes.rs:279-288`) — MUST end
+   `Faulted(ChainSourceUnavailable)`. `ChainSourceUnavailable` is the engine's own name for "a
+   dependency this decision needs is not reachable, and this is a prover-side fault"
+   (`writes.rs:280-286`), and it is the ONLY state a loop with a missing seam may show. The local
+   capsule bytes a challenge compares against being absent is `Faulted(LocalCopyMissing)`
+   (`dig-rewards-coin/SPEC.md` §1.4). This clause is what makes "spawns, reports Idle, distributes
+   nothing" unrepresentable: a loop that cannot see cannot say it looked.
+10. **The per-cycle line** **(target)**: after every scheduler pass, ONE `tracing` record
+    (`target: "rewards_prover"`) at `info!` when every distributor ended `Idle` and at `warn!`
+    otherwise, carrying `cycles_driven`, `mode`, the inventory outcome (and, when determined, the
+    count and the node-total daily fee ceiling = count × the per-distributor figure of §26.6), and
+    per distributor its `launcher_id`, end state, `consecutive_cycle_failures` and
+    `pending_entry_writes`. At tip `69c793a7` this line reads, every cycle, `inventory =
+    undetermined(ChainSourceUnavailable)` — which is the truth.
+11. **Counters: chain-derived figures are never local counters.** On every completed cycle,
+    `counters.reserve_base_units`, `counters.total_paid_out_base_units` and `counters.entry_count`
+    MUST be SET from `DistributorChainState` (`port.rs:110-121`: `reserve_base_units`,
+    `total_paid_out_base_units`, `entries.len()`), and `last_entry_write_at` from its
+    `last_entry_write_at`. They MUST NOT be incremented locally and MUST NOT be persisted by the
+    node: a restart cannot understate them because the next completed cycle re-reads them, and until
+    a cycle completes they are `0` beside `last_cycle_completed_at = None`, which
+    `dig-rewards-coin/SPEC.md` §2.4 clause 2 defines as "never ran" and which the wire MUST render
+    as such. The process-local counters (`mirrors_seen`, `challenges_issued`, `challenges_passed`,
+    `challenges_failed`, `entries_added`, `entries_removed`) reset on restart; dig_ecosystem#3274
+    owns whether they persist, and a reader MUST NOT read them as lifetime totals (§26.12).
+12. **The live write-bound store** **(target, dig_ecosystem#3421)**: a `WriteBoundStore`
+    (`writes.rs:236-239`) over `<state_dir>/rewards-prover/bounds/<launcher_id hex>.json`, one file
+    per distributor, carrying `WriteBoundState` (`writes.rs:222-228`) plus `format_version: 1`. A
+    missing file loads `WriteBoundState::default()` (a fresh distributor). An unreadable, unparsable
+    or wrong-version file MUST load as `StoreError` — never as default — so the writer answers
+    `PersistenceUnavailable` and the cycle faults (clause 9), exactly the fail-closed direction
+    `NoPersistence` (`writes.rs:247-261`) has today. Until this store exists the composer MUST be
+    constructed over `NoPersistence`, and the write step of every cycle faults; it MUST NOT be
+    constructed over an in-memory store in production.
+13. **Write ordering and the audit record** **(target, dig_ecosystem#3421/#3422)**. The ordering of
+    reserve (persist the advanced bounds) and broadcast is dig_ecosystem#3422's to fix; whatever
+    ordering it lands, the bounds MUST never be LOOSER after a crash than before it. A live
+    `submit_entry_writes` that broadcast MUST produce a §23 audit entry with `kind = "reward-prover"`
+    (a new producer word, additive to §23.1), `amount_mojos = fee_mojos`, `asset` = XCH,
+    `authority.grant` naming `rewards-prover.json`'s `enabled`/`mode = live`, and a `purpose` that
+    states the adds, the removes, and that each remove settled that entry's accrued balance from the
+    reserve (§6.4). Dry-run produces none (§26.7 clause 5).
+14. **What this PR calls, by name.** The composer MUST reach the engine only through: `admit`
+    (`admission.rs:112`), `SpecMirrorCoinGate` (`gate.rs:120`) over an injected `MirrorCoinReader`
+    and an `EpochContext` (`gate.rs:27-36`) whose `current_epoch` source is dig_ecosystem#3423's to
+    specify (until then `None`, which faults per clause 9 — the composer MUST NOT guess an ordinal,
+    dig_ecosystem#3259), `select_window` / `run_cycle` / `NoRepeatMemory` / `StrikeTracker`
+    (`challenge.rs:124`, `:217`, `:62`, `:234`), `is_entry_set_full` / `is_unfunded`
+    (`writes.rs:418`, `:423`), `PersistedEntryWriter` (`writes.rs:295`), and the port trait
+    (`port.rs:262-297`). It MUST NOT re-derive any bound, window, strike or share those own.
+
+### 26.10. The periodicity test — required shape
+
+An always-on loop is trivially easy to keep green while it never runs. The spawning PR MUST carry
+these tests in `crates/dig-node-service/src/rewards/driver.rs` **(target)**, each under
+`#[tokio::test(start_paused = true)]`, each driving the PRODUCTION body through an injected
+`RewardsChainPort` fake, an injected `Clock` (`state.rs:97-99`, `TestClock`), `FixedJitter(0)` and a
+temporary state directory — never a hand-assembled inner loop that the production body does not use.
+The claim loop's `zero_cycles_before_the_interval_elapses_then_a_counted_number_after`
+(`rewards_claim/driver.rs:1051-1104`) is the reusable shape: `settle()` (eight `yield_now`s) before
+the first `advance`, because the scheduler's timer must be registered before virtual time moves
+(`cycle.rs:223-226` explains the same hazard). Core's `heartbeat_loop_fires_on_its_own_timer`
+(`cycle.rs:215-241`) proves ONE tick and is not a substitute.
+
+1. **Runs more than once, and stops.** With a fake port whose `funded_distributors` answers
+   `Unavailable`: after `settle()`, `cycles_driven() == 1` (the immediate first cycle, §26.9
+   clause 8) and the inventory is `Undetermined`; `advance(PROVER_CYCLE_PERIOD_SECONDS)` + settle
+   → `2`; again → `3`; then flip the switch — ONE variant sends `true` on the channel directly, a
+   SECOND variant writes `<state_dir>/rewards-prover.STOP` and advances `PROVER_HEARTBEAT_SECONDS`
+   — and a further `advance(PROVER_CYCLE_PERIOD_SECONDS)` MUST leave `cycles_driven() == 3`, both
+   task handles resolved, and every registered record `Stopped`. This is the one assertion the
+   claim test lacks and the one that turns "runs periodically" into "runs periodically AND can be
+   stopped".
+2. **A wedged cycle is killed by the switch before the deadline.** With a fake port whose
+   `funded_distributors` is `std::future::pending()`, after the cycle starts (`prover_state ==
+   Running`), send `true`; the cycle task MUST resolve within one `settle()` without advancing
+   virtual time to the 900 s deadline, `last_cycle_completed_at` MUST be `None`, and the record MUST
+   read `Stopped`.
+3. **Latency of the file switch.** Write the sentinel at virtual `t`; the record MUST read `Stopped`
+   by `t + PROVER_HEARTBEAT_SECONDS` plus one settle.
+4. **Default off.** `load_from(<empty dir>)` → `enabled == false`; `decide_prover_driver` →
+   `Disabled`; `spawn_prover_driver_if` calls `spawn` zero times; `Node::reward_prover_status_snapshots()`
+   stays empty. Plus the compile-time assertion of §26.4 clause 4.
+5. **The decision table.** One test per `ProverDriverRefusal` variant, and one for `Spawn`, each
+   through `decide_prover_driver` with every other input at its spawning value — including
+   `mode = Live` with `PROVER_LIVE_MODE_RELEASED == false` → `LiveModeNotReleased`, and
+   `standard_fee_mojos = PROVER_STANDARD_FEE_MOJOS_MAX + 1` → `StandardFeeAboveMaximum`.
+6. **Dry-run never writes.** §26.7 clause 2's panicking inner port, driven to a `Bundle` outcome
+   through the composer, completes; the live store's `save` is never called (a counting store).
+7. **The figures.** §26.6 clause 3's two worked cases, asserted over the structured fields of the
+   spawn-time line (a `tracing` test subscriber), not over prose.
+8. **A faulted cycle does not complete.** Through `run_cycle_with_deadline` with a `cycle_fn`
+   returning `Faulted(ChainSourceUnavailable)`: `prover_state == ChainSourceUnavailable`,
+   `prover_state_since` advanced, `consecutive_cycle_failures == 1`, `last_cycle_completed_at ==
+   None`, `next_cycle_due_at` unchanged (core, `cycle.rs`).
+9. **The status arm under an undetermined inventory** answers `NotConsulted`, and under a determined
+   one `Consulted` with the registered records (core, `dispatch.rs` tests beside the existing
+   `dig.getRewardProverStatus` tests at `lib.rs:9363-9600`).
+
+### 26.11. The composed-system gate
+
+dig-node#593's gates could audit only unreachable library code and said so. The gate that authorises
+live mode MUST be a full triple gate — independent review, security audit, and an adversarial
+`loop-decider` leg — on the COMPOSED system running in a node, after dig_ecosystem#3292, #3421,
+#3422 and #3423 have landed, and MUST observe, in a running node against a Chia simulator or
+testnet, at least:
+
+1. a fresh state directory: no loop, no record, `Consulted { items: [] }` (§26.5);
+2. the spawn-time line with §26.6's figures for the configured fee, and the per-cycle line's
+   node-total once the inventory is determined;
+3. a dry-run cycle that reaches a `Bundle` outcome, logs it, and leaves the simulator mempool empty
+   and the live bounds untouched (§26.7);
+4. the sentinel written while a cycle is parked on a transport that never answers, and `Stopped`
+   within 60 s with the node still serving (§26.8);
+5. a cycle with one seam deliberately removed reporting `ChainSourceUnavailable`, not `Idle`
+   (§26.9 clause 9);
+6. one live bundle, its §23 audit entry, and the persisted bounds after a forced restart being no
+   looser than before it (§26.9 clauses 12-13).
+
+Its passing verdict is the only authority for §26.2 clause 3's one-line release. The gate's ticket
+is filed when the last of (c)-(e) in §26.2 clause 4 lands; it is not this section's to file.
+
+### 26.12. What a reader may NOT conclude
+
+* That a spawned loop distributes anything at tip `69c793a7`. It faults every cycle (§26.2
+  clause 2).
+* That `mode: "live"` in the file makes the node spend. It produces `LiveModeNotReleased` until
+  §26.2 clause 3 is satisfied.
+* That `{"outcome":"consulted","items":[]}` means the loop is off. With a loop spawned and its
+  inventory undetermined the answer is `NotConsulted`; `Consulted` + empty means off OR
+  determined-and-funds-nothing, and the log line distinguishes those two.
+* That `dig.getRewardProverStatus` shows whether a loop is dry-run or live. It cannot (§26.7
+  clause 6). The log does.
+* That `Idle` means "nothing to do". `Idle` means a cycle COMPLETED with every seam answering; a
+  loop with a missing seam never shows it (§26.9 clause 9).
+* That the rate bound and the fee ceiling are two protections. They are one (§26.6 clause 5).
+* That "96 evictions/day" pairs with "~1.3 days". 96/day is churn and pairs with ~2.6 days; ~1.3
+  days pairs with 192 removals/day (§26.6 clause 4).
+* That the per-distributor figures are the node's total. Multiply by the determined inventory
+  count, printed on the per-cycle line.
+* That `mirrors_seen`, `challenges_*`, `entries_added` or `entries_removed` are lifetime totals.
+  They are process-lifetime (§26.9 clause 11). `reserve_base_units`, `total_paid_out_base_units` and
+  `entry_count` ARE chain truths as of `last_cycle_completed_at`, and are meaningless beside
+  `last_cycle_completed_at = None`.
+* That `Paused` is reachable, or that `Stopped` can be undone without a process restart.
+* That an `observed_at` frozen on a `Stopped` record is a wedge. It is a stop (§26.8 clause 7).
+* That the operator's fee is validated against anything but its maximum. A fee the mempool would
+  reject is the chain's refusal to observe, reported through the port, never pre-judged here.
+* That a `control.rewardProver.*` method exists, or that adding one is a node-side change.
+
+### 26.13. Failure directions, stated
+
+* Missing file, missing key, mistyped key, `standard_fee_mojos = 0`, fee above maximum, corrupt
+  file, chain sync off, no port, no wallet, no wallet puzzle hashes, live mode unreleased, sentinel
+  present: every one fails toward NOT SPAWNING, by name.
+* An unreadable file or a sentinel at re-read fails toward STOPPING, by name, within 60 s.
+* A missing or unavailable seam fails toward a FAULTED cycle that names `ChainSourceUnavailable`,
+  never toward a completed one.
+* A missing, unparsable or wrong-version write-bound file fails toward `PersistenceUnavailable`,
+  never toward fresh bounds.
+* Dry-run fails toward the log: nothing is broadcast, nothing is persisted, nothing is audited.
+* The one direction that fails EXPENSIVE is a released live loop with a congested fee, and that
+  direction is bounded by the figure the operator was shown when they enabled it: 24 bundles/day,
+  `FeeBudget::daily_limit_for(standard_fee_mojos)` mojos/day, per funded distributor.
+
+### 26.14. Clause status at tip `69c793a7`
+
+| clause | status | where |
+|---|---|---|
+| §26.2 cl. 3 `PROVER_LIVE_MODE_RELEASED` | target | dig_ecosystem#3265 |
+| §26.3 cl. 1-5 spawn site, seam, refusals, handle | target | dig_ecosystem#3265 |
+| §26.3 cl. 6 the precedent's default is `true` | implemented (as the trap) | `rewards_claim/config.rs:140-142` |
+| §26.4 file, keys, defaults, maximum, corrupt marker, jitter constant | target | dig_ecosystem#3265 |
+| §26.4 cl. 8 period/heartbeat/deadline constants | implemented | `spec_constants.rs:19-26` |
+| §26.5 cl. 1 empty registry answers `Consulted { [] }` | implemented | `dispatch.rs:923-1000` |
+| §26.6 cl. 1 `daily_limit_for` is the one product | implemented | `writes.rs:65-79` |
+| §26.6 cl. 2-4 spawn-time line, worked figures, the 1.3-day figure in `mod.rs` | target | dig_ecosystem#3265 |
+| §26.7 `DryRunChainPort`, dry-run store, no counters | target | dig_ecosystem#3265 |
+| §26.8 cl. 1 receiver-side stop precedent | implemented | `cycle.rs:86-105` |
+| §26.8 cl. 1-7 switch task, sentinel, re-read, `Stopped` | target | dig_ecosystem#3265 |
+| §26.8 cl. 2 `spawn_blocking` precedent | implemented | `chain_port.rs:110` |
+| §26.9 cl. 1-2 `CycleOutcome`, `prover_state_since` | target | dig_ecosystem#3265 (core) |
+| §26.9 cl. 4 four port methods real | target | dig_ecosystem#3421 |
+| §26.9 cl. 5 `ProverInventory`, `NotConsulted` arm | target | dig_ecosystem#3265 (core) |
+| §26.9 cl. 6 `register_reward_prover_status` `pub` | target | dig_ecosystem#3265 (core) |
+| §26.9 cl. 9 fault mapping of `PersistenceUnavailable` | implemented | `writes.rs:279-288` |
+| §26.9 cl. 11 chain-derived counters | target | dig_ecosystem#3265 |
+| §26.9 cl. 12 state-dir `WriteBoundStore` | target | dig_ecosystem#3421 |
+| §26.9 cl. 13 ordering, §23 entry | target | dig_ecosystem#3421 / #3422 |
+| §26.9 cl. 14 reader, transport, discovery, epoch source | target | dig_ecosystem#3423 |
+| §26.10 tests | target | dig_ecosystem#3265 |
+| §26.11 gate | target | filed after §26.2 cl. 4 (e) |
