@@ -9906,6 +9906,10 @@ mod tests {
             ),
             commitments,
             observed_at,
+            // Distinct from `observed_at` (a wall clock) by construction, so a test asserting the
+            // two fields are threaded independently cannot pass by accident on equal values.
+            chain_peak_height: 9_000_000 + seed as u64,
+            chain_peak_timestamp: 1_700_190_000 + seed as u64,
         }
     }
 
@@ -9983,6 +9987,8 @@ mod tests {
                 "last_entry_write_at",
                 "entry_set_stale",
                 "observed_at",
+                "chain_peak_height",
+                "chain_peak_timestamp",
             ]),
             "the wire body's key SET must be exactly this — a struct assertion cannot see a wrong \
              key name or an extra field"
@@ -10016,6 +10022,14 @@ mod tests {
         );
         assert_eq!(result["entry_set_stale"], json!(report.entry_set_stale));
         assert_eq!(result["observed_at"], json!(report.observed_at));
+        assert_eq!(
+            result["chain_peak_height"],
+            json!(report.chain_peak_height)
+        );
+        assert_eq!(
+            result["chain_peak_timestamp"],
+            json!(report.chain_peak_timestamp)
+        );
     }
 
     /// **Proves:** `dig.listRewardDistributorCommitments` answers with the port's real values
