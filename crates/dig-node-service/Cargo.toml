@@ -216,7 +216,7 @@ dig-wallet = { path = "../dig-wallet" }
 # is what makes `RealClaimChainPort::own_entry` and `submit_initiate_payout` real instead of
 # refusals. Still the same chia 0.36 line (chia-sdk-driver `=0.36.0`, chia-protocol 0.36.1) every
 # other dependency in this crate is already pinned to.
-dig-rewards-coin = "0.8"
+dig-rewards-coin = "0.10"
 
 # HTTP stack: the same axum/tokio the node itself uses, so there is one async runtime
 # and one server framework across the node and the service shell. `ws` enables

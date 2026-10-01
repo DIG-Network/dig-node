@@ -1112,16 +1112,28 @@ impl RpcDispatch for Node {
                     Ok(report) => report,
                     Err(e) => return reward_chain_port_error_response(&id, &e),
                 };
-                let commitments: Vec<dig_rpc_protocol::types::RewardDistributorCommitment> = report
-                    .commitments
-                    .iter()
-                    .map(|c| dig_rpc_protocol::types::RewardDistributorCommitment {
+                // TEMPORARY until dig-rpc-protocol 0.15 (dig_ecosystem#3442): wire 0.14 types
+                // `recoverable_base_units` as `u64` and cannot say "the chain refuses this
+                // clawback". A `None` is therefore refused as a whole call -- never rendered as
+                // `0` (a false "recoverable nothing") and never as the share.
+                let mut commitments = Vec::with_capacity(report.commitments.len());
+                for c in &report.commitments {
+                    let Some(recoverable_base_units) = c.recoverable_base_units else {
+                        return reward_chain_port_error_response(
+                            &id,
+                            &ChainPortError::Other(
+                                "a commitment is not recoverable (its epoch has started) and the wire cannot yet express that"
+                                    .to_string(),
+                            ),
+                        );
+                    };
+                    commitments.push(dig_rpc_protocol::types::RewardDistributorCommitment {
                         epoch_start: c.epoch_start,
                         clawback_puzzle_hash: hex::encode(c.clawback_puzzle_hash),
                         rewards_base_units: c.rewards_base_units,
-                        recoverable_base_units: c.recoverable_base_units,
-                    })
-                    .collect();
+                        recoverable_base_units,
+                    });
+                }
                 let result = dig_rpc_protocol::types::ListRewardDistributorCommitmentsResult {
                     launcher_id: hex::encode(report.launcher_id),
                     withdrawal_share_bps: report.withdrawal_share_bps,

@@ -10043,7 +10043,7 @@ mod tests {
             epoch_start: 42,
             clawback_puzzle_hash: [0x33u8; 32],
             rewards_base_units: 1_000,
-            recoverable_base_units: 900,
+            recoverable_base_units: Some(900),
         };
         let report = sample_distributor_report(0x22, vec![slot.clone()]);
         assert!(
@@ -10844,13 +10844,13 @@ mod tests {
             epoch_start: 1,
             clawback_puzzle_hash: [0xaau8; 32],
             rewards_base_units: 5_000,
-            recoverable_base_units: 4_500,
+            recoverable_base_units: Some(4_500),
         };
         let slot_b = crate::rewards::port::CommitmentSlot {
             epoch_start: 2,
             clawback_puzzle_hash: [0xbbu8; 32],
             rewards_base_units: 7_000,
-            recoverable_base_units: 6_300,
+            recoverable_base_units: Some(6_300),
         };
         let report_a = sample_distributor_report(0x70, vec![slot_a]);
         let report_b = sample_distributor_report(0x71, vec![slot_b]);

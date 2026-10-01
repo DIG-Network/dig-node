@@ -480,6 +480,22 @@ pub fn launch_funded_admitted_fixture_with_approval(
     payout_puzzle_hash: Bytes32,
     require_payout_approval: bool,
 ) -> Result<FundedFixture, Box<dyn std::error::Error>> {
+    launch_funded_admitted_fixture_with_shape(
+        payout_puzzle_hash,
+        require_payout_approval,
+        WITHDRAWAL_SHARE_BPS,
+    )
+}
+
+/// Same as [`launch_funded_admitted_fixture_with_approval`], but with the clawback
+/// `withdrawal_share_bps` curried into the distributor -- dig_ecosystem#3442 needs a REAL launch
+/// with `0` to prove a genuine zero share is carried as `Some(0)`, distinct from "not recoverable".
+#[allow(dead_code)]
+pub fn launch_funded_admitted_fixture_with_shape(
+    payout_puzzle_hash: Bytes32,
+    require_payout_approval: bool,
+    withdrawal_share_bps: u64,
+) -> Result<FundedFixture, Box<dyn std::error::Error>> {
     let ctx = &mut SpendContext::new();
     let mut sim = Simulator::new();
 
@@ -577,7 +593,7 @@ pub fn launch_funded_admitted_fixture_with_approval(
         PAYOUT_THRESHOLD_BASE_UNITS,
         require_payout_approval,
         0,
-        WITHDRAWAL_SHARE_BPS,
+        withdrawal_share_bps,
         source_cat.info.asset_id,
     );
 
