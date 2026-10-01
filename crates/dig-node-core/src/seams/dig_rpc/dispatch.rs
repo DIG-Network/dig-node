@@ -1112,28 +1112,20 @@ impl RpcDispatch for Node {
                     Ok(report) => report,
                     Err(e) => return reward_chain_port_error_response(&id, &e),
                 };
-                // TEMPORARY until dig-rpc-protocol 0.15 (dig_ecosystem#3442): wire 0.14 types
-                // `recoverable_base_units` as `u64` and cannot say "the chain refuses this
-                // clawback". A `None` is therefore refused as a whole call -- never rendered as
-                // `0` (a false "recoverable nothing") and never as the share.
-                let mut commitments = Vec::with_capacity(report.commitments.len());
-                for c in &report.commitments {
-                    let Some(recoverable_base_units) = c.recoverable_base_units else {
-                        return reward_chain_port_error_response(
-                            &id,
-                            &ChainPortError::Other(
-                                "a commitment is not recoverable (its epoch has started) and the wire cannot yet express that"
-                                    .to_string(),
-                            ),
-                        );
-                    };
-                    commitments.push(dig_rpc_protocol::types::RewardDistributorCommitment {
+                // dig-rpc-protocol 0.15 (dig_ecosystem#3442): the wire carries
+                // `recoverable_base_units` as `Option<u64>`, so the port's three-state figure
+                // maps straight across -- `None` stays `None` (never `0`, never an error),
+                // `Some(0)` stays `Some(0)`.
+                let commitments = report
+                    .commitments
+                    .iter()
+                    .map(|c| dig_rpc_protocol::types::RewardDistributorCommitment {
                         epoch_start: c.epoch_start,
                         clawback_puzzle_hash: hex::encode(c.clawback_puzzle_hash),
                         rewards_base_units: c.rewards_base_units,
-                        recoverable_base_units,
-                    });
-                }
+                        recoverable_base_units: c.recoverable_base_units,
+                    })
+                    .collect();
                 let result = dig_rpc_protocol::types::ListRewardDistributorCommitmentsResult {
                     launcher_id: hex::encode(report.launcher_id),
                     withdrawal_share_bps: report.withdrawal_share_bps,
