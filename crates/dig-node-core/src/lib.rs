@@ -10934,8 +10934,14 @@ mod tests {
     fn unrecoverable_commitment_serializes_recoverable_as_present_null() {
         let c = serve_one_commitment(None);
         let obj = c.as_object().unwrap();
-        assert!(obj.contains_key("recoverable_base_units"), "key must be present: {c}");
-        assert!(c["recoverable_base_units"].is_null(), "None must be null, not 0: {c}");
+        assert!(
+            obj.contains_key("recoverable_base_units"),
+            "key must be present: {c}"
+        );
+        assert!(
+            c["recoverable_base_units"].is_null(),
+            "None must be null, not 0: {c}"
+        );
     }
 
     /// **Guards dig_ecosystem#3439:** `Some(0)` (recoverable, but the share is zero) is a different
