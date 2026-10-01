@@ -10043,7 +10043,7 @@ mod tests {
             epoch_start: 42,
             clawback_puzzle_hash: [0x33u8; 32],
             rewards_base_units: 1_000,
-            recoverable_base_units: 900,
+            recoverable_base_units: Some(900),
         };
         let report = sample_distributor_report(0x22, vec![slot.clone()]);
         assert!(
@@ -10844,13 +10844,13 @@ mod tests {
             epoch_start: 1,
             clawback_puzzle_hash: [0xaau8; 32],
             rewards_base_units: 5_000,
-            recoverable_base_units: 4_500,
+            recoverable_base_units: Some(4_500),
         };
         let slot_b = crate::rewards::port::CommitmentSlot {
             epoch_start: 2,
             clawback_puzzle_hash: [0xbbu8; 32],
             rewards_base_units: 7_000,
-            recoverable_base_units: 6_300,
+            recoverable_base_units: Some(6_300),
         };
         let report_a = sample_distributor_report(0x70, vec![slot_a]);
         let report_b = sample_distributor_report(0x71, vec![slot_b]);
@@ -10893,6 +10893,70 @@ mod tests {
         assert_ne!(recoverable_b, summed);
         assert_ne!(recoverable_a, swapped_a);
         assert_ne!(recoverable_b, swapped_b);
+    }
+
+    /// Serves ONE commitment carrying `recoverable` through `dig.listRewardDistributorCommitments`
+    /// and returns the serialized `commitments[0]` object, so a test asserts on the wire JSON.
+    fn serve_one_commitment(recoverable: Option<u64>) -> serde_json::Value {
+        let (node, _td) = test_node(None);
+        let launcher = [0x72u8; 32];
+        let slot = crate::rewards::port::CommitmentSlot {
+            epoch_start: 3,
+            clawback_puzzle_hash: [0xccu8; 32],
+            rewards_base_units: 5_000,
+            recoverable_base_units: recoverable,
+        };
+        let report = sample_distributor_report(0x72, vec![slot]);
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher, Ok(report))]),
+            }))
+        );
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributorCommitments",
+                   "params":{"launcher_id": hex::encode(launcher)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert!(
+            resp.get("error").is_none(),
+            "a commitment must never turn the whole call into an error: {resp}"
+        );
+        resp["result"]["commitments"][0].clone()
+    }
+
+    /// **Guards dig_ecosystem#3439 / #3442:** a `None` (the chain REFUSES this clawback, its epoch
+    /// has started) mapped to `0` tells a user they can claw back nothing when the chain actually
+    /// refuses; mapped to an error it hides every other commitment. It must serialize as the key
+    /// PRESENT with JSON `null`.
+    #[test]
+    fn unrecoverable_commitment_serializes_recoverable_as_present_null() {
+        let c = serve_one_commitment(None);
+        let obj = c.as_object().unwrap();
+        assert!(
+            obj.contains_key("recoverable_base_units"),
+            "key must be present: {c}"
+        );
+        assert!(
+            c["recoverable_base_units"].is_null(),
+            "None must be null, not 0: {c}"
+        );
+    }
+
+    /// **Guards dig_ecosystem#3439:** `Some(0)` (recoverable, but the share is zero) is a different
+    /// statement from `None` and must stay the number `0`.
+    #[test]
+    fn zero_recoverable_commitment_serializes_as_zero() {
+        let c = serve_one_commitment(Some(0));
+        assert_eq!(c["recoverable_base_units"], json!(0), "{c}");
+    }
+
+    /// **Guards dig_ecosystem#3439:** a positive recoverable figure passes through verbatim.
+    #[test]
+    fn positive_recoverable_commitment_serializes_verbatim() {
+        let c = serve_one_commitment(Some(4_500));
+        assert_eq!(c["recoverable_base_units"], json!(4_500), "{c}");
     }
 
     /// **Proves:** `total_paid_out_base_units`/`reserve_base_units` stay attributed to the

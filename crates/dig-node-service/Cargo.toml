@@ -194,7 +194,8 @@ getrandom = "0.2"
 # Moved to 0.12 (dig_ecosystem#3269), matching `dig-node-core`'s move to 0.12.0 — 0.12 renamed
 # `RewardSubject` -> `PayeeSubject` and replaced `HalfObservation` with `Half<T>`, and this line
 # staying at 0.11 would duplicate the wire types the paragraph above warns against.
-dig-rpc-protocol = "0.14"
+# Moved to 0.15 (dig_ecosystem#3442): recoverable_base_units becomes Option<u64>.
+dig-rpc-protocol = "0.15"
 
 # The Sage-parity wallet engine (crate `dig_wallet`) — the node-custodied wallet DB + dual-transport
 # dispatch + seed custody. This shell WIRES it into bring-up (#368): it builds one live
@@ -216,7 +217,7 @@ dig-wallet = { path = "../dig-wallet" }
 # is what makes `RealClaimChainPort::own_entry` and `submit_initiate_payout` real instead of
 # refusals. Still the same chia 0.36 line (chia-sdk-driver `=0.36.0`, chia-protocol 0.36.1) every
 # other dependency in this crate is already pinned to.
-dig-rewards-coin = "0.8"
+dig-rewards-coin = "0.10"
 
 # HTTP stack: the same axum/tokio the node itself uses, so there is one async runtime
 # and one server framework across the node and the service shell. `ws` enables
@@ -353,7 +354,7 @@ windows-sys = { version = "0.61", features = [
 # crate name-for-name. Already a normal dependency above; restated here only so the
 # integration-test crate can name it, and pinned to the SAME "0.12" line so the guard can
 # never compare against a different catalogue than the shell compiles against.
-dig-rpc-protocol = "0.14"
+dig-rpc-protocol = "0.15"
 # The `never_log` battery (#277) drives the real seed bootstrap against a temp layout so its
 # sentinels are the ACTUAL minted phrase and device key rather than invented strings. Already a
 # normal dependency above; restated here only so the integration-test crate can name it.

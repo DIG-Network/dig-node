@@ -215,9 +215,13 @@ pub struct CommitmentSlot {
     pub clawback_puzzle_hash: Bytes32,
     /// The committed amount, in base units, as the puzzle records it.
     pub rewards_base_units: u64,
-    /// The amount actually recoverable on clawback, in base units. See the type doc: always
-    /// pre-computed by the adapter, never by a caller of this trait.
-    pub recoverable_base_units: u64,
+    /// The amount actually recoverable on clawback, in base units, pre-computed by the adapter
+    /// (see the type doc), never by a caller of this trait. Three states, all distinct:
+    /// `Some(n)` with `n > 0` is the recoverable share; `Some(0)` is a genuine zero the chain
+    /// accepts (e.g. `withdrawal_share_bps == 0`); `None` means the chain REFUSES the clawback
+    /// (the epoch has already started). An adapter MUST NOT map `None` to `0` or `Some(0)` to
+    /// `None`: `0` would claim a recoverable-nothing the chain never said (dig_ecosystem#3439).
+    pub recoverable_base_units: Option<u64>,
 }
 
 /// One distributor's chain-derived report — everything `dig.getRewardDistributor` and

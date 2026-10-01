@@ -46,7 +46,8 @@ use dig_node_service::rewards::RealRewardsChainPort;
 use dig_rewards_coin::constants::WITHDRAWAL_SHARE_BPS;
 
 use common::rewards_fixture::{
-    launch_fixture, mock_chain_source, FIRST_EPOCH_START, TEST_EPOCH_SECONDS,
+    launch_fixture, launch_funded_admitted_fixture_with_shape, mock_chain_source,
+    mock_chain_source_for_funded_fixture_with_clock, FIRST_EPOCH_START, TEST_EPOCH_SECONDS,
 };
 
 /// A3: `RealRewardsChainPort::distributor_report` — the real production adapter, driven by a
@@ -157,4 +158,46 @@ fn production_region(source: &str) -> &str {
         Some(test_module_start) => &source[..test_module_start],
         None => source,
     }
+}
+
+/// Reads the one commitment of a real funded launch (committed into the first epoch, then rolled
+/// past it) through the real adapter, with the chain clock chosen by the caller.
+async fn read_first_commitment(
+    withdrawal_share_bps: u64,
+    clock: impl Fn(u32) -> u64,
+) -> dig_node_core::rewards::port::CommitmentSlot {
+    let payout = chia_protocol::Bytes32::from([0x77; 32]);
+    let fixture = launch_funded_admitted_fixture_with_shape(payout, false, withdrawal_share_bps)
+        .expect("a funded, admitted distributor launches cleanly in the simulator");
+    let source = mock_chain_source_for_funded_fixture_with_clock(&fixture, clock);
+    let port = RealRewardsChainPort::<MockChainSource>::new(Arc::new(source));
+    let report = port
+        .distributor_report(fixture.launcher_id.into())
+        .await
+        .expect("a real funded distributor must report");
+    report
+        .commitments
+        .into_iter()
+        .find(|c| c.epoch_start == FIRST_EPOCH_START)
+        .expect("the fixture committed rewards into the first epoch")
+}
+
+/// **Guards dig_ecosystem#3439 / #3442:** a commitment whose epoch has STARTED on the chain's own
+/// clock is one the chain refuses to claw back. The adapter must carry that as `None`; a `None`
+/// mapped to `0` tells a user they can recover nothing when the chain actually refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_epoch_started_commitment_is_reported_as_none_not_zero() {
+    // Clock past FIRST_EPOCH_START at every height: the epoch has started.
+    let slot = read_first_commitment(WITHDRAWAL_SHARE_BPS, |h| u64::from(h) * 1_000 + 1_235).await;
+    assert_eq!(slot.recoverable_base_units, None);
+}
+
+/// **Guards dig_ecosystem#3439 / #3442:** a NOT-started commitment on a distributor whose real
+/// `withdrawal_share_bps` is 0 has a genuine zero share: `Some(0)`, distinct from the
+/// refused-claw-back `None`. Collapsing the two is the #3439 defect in the other direction.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_not_started_commitment_with_zero_share_is_reported_as_some_zero() {
+    // Clock before FIRST_EPOCH_START at every height: the epoch has not started.
+    let slot = read_first_commitment(0, u64::from).await;
+    assert_eq!(slot.recoverable_base_units, Some(0));
 }

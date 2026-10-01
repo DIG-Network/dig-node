@@ -1112,7 +1112,11 @@ impl RpcDispatch for Node {
                     Ok(report) => report,
                     Err(e) => return reward_chain_port_error_response(&id, &e),
                 };
-                let commitments: Vec<dig_rpc_protocol::types::RewardDistributorCommitment> = report
+                // dig-rpc-protocol 0.15 (dig_ecosystem#3442): the wire carries
+                // `recoverable_base_units` as `Option<u64>`, so the port's three-state figure
+                // maps straight across -- `None` stays `None` (never `0`, never an error),
+                // `Some(0)` stays `Some(0)`.
+                let commitments = report
                     .commitments
                     .iter()
                     .map(|c| dig_rpc_protocol::types::RewardDistributorCommitment {
