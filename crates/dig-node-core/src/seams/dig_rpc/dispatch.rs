@@ -74,6 +74,13 @@ const REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE: &str = "REWARD_INVALID_WITHDRAWAL
 /// `REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE`'s sibling shape.
 const REWARD_ZERO_IDENTITY_MACHINE: &str = "REWARD_ZERO_IDENTITY";
 
+/// dig_ecosystem#3262/#3329: the machine code for [`ChainPortError::ChainPeakUnavailable`] — the
+/// adapter's distributor read succeeded but it could not anchor a `chain_peak_height`/
+/// `chain_peak_timestamp` from that SAME read, so the whole call is refused rather than answered
+/// with an invented or independently-read peak (SPEC §4.5). Sibling shape to the other
+/// reward-distributor refusals above.
+const REWARD_CHAIN_PEAK_UNAVAILABLE_MACHINE: &str = "REWARD_CHAIN_PEAK_UNAVAILABLE";
+
 /// Maps a [`ChainPortError`] to the JSON-RPC error response for both reward-distributor read
 /// methods (dig_ecosystem#3269 unit 2) — one mapping so `dig.getRewardDistributor` and
 /// `dig.listRewardDistributorCommitments` can never disagree about how a given port failure reads
@@ -104,6 +111,12 @@ fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value
             "code": CONTROL_ERROR,
             "message": format!("reward-distributor chain read failed: {msg}"),
             "data": { "code": "CONTROL_ERROR", "origin": "control" }
+        }}),
+        ChainPortError::ChainPeakUnavailable => json!({"jsonrpc":"2.0","id":id,"error":{
+            "code": CONTROL_ERROR,
+            "message": "distributor read succeeded but no chain peak height/timestamp from that \
+                        same read was available to anchor the result",
+            "data": { "code": REWARD_CHAIN_PEAK_UNAVAILABLE_MACHINE, "origin": "control" }
         }}),
     }
 }
@@ -922,10 +935,21 @@ impl RpcDispatch for Node {
             // mapped explicitly by `reward_prover_status_to_wire`.
             Some(Method::GetRewardProverStatus) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
-                let filter_launcher_id = params
-                    .get("launcher_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_ascii_lowercase);
+                // dig_ecosystem#3280: `launcher_id` is OPTIONAL here (unlike
+                // `GetRewardDistributor`'s required param), so absence is "no filter" and is not
+                // itself an error. A PRESENT value goes through the same validator
+                // `GetRewardDistributor` (below) and `ListRewardDistributorCommitments` already
+                // use, so a malformed value is refused with `-32602` instead of silently
+                // filtering to an empty list — the same "reassuring zero" defect this epic exists
+                // to kill, just on the input side rather than the read side.
+                let filter_launcher_id: Option<[u8; 32]> = if params.get("launcher_id").is_some() {
+                    match parse_launcher_id_arg(&params) {
+                        Ok(id) => Some(id),
+                        Err(msg) => return rpc_err(&id, -32602, &msg),
+                    }
+                } else {
+                    None
+                };
                 let snapshots = node.reward_prover_status_snapshots();
                 // dig_ecosystem#3269 fix939: a zeroed `launcher_id` or `store_id` is never a real
                 // distributor's or module's IDENTITY — see `is_missing_identity`/`zeroed_fields`.
@@ -980,7 +1004,7 @@ impl RpcDispatch for Node {
                         true
                     })
                     .filter(|s| match &filter_launcher_id {
-                        Some(want) => hex::encode(s.launcher_id).eq_ignore_ascii_case(want),
+                        Some(want) => &s.launcher_id == want,
                         None => true,
                     })
                     .map(reward_prover_status_to_wire)
@@ -1053,6 +1077,13 @@ impl RpcDispatch for Node {
                     last_entry_write_at: report.last_entry_write_at,
                     entry_set_stale: report.entry_set_stale,
                     observed_at: report.observed_at,
+                    // dig-rpc-protocol 0.14 chain-view anchor (dig_ecosystem#3262/#3329, SPEC §4.5):
+                    // both come straight from `report`, i.e. the SAME chain read
+                    // `RewardsChainPort::distributor_report` performed — never a fresh
+                    // `peak_height()` call at this seam, which would anchor the answer to a height
+                    // the rest of the data was never read against.
+                    chain_peak_height: report.chain_peak_height,
+                    chain_peak_timestamp: report.chain_peak_timestamp,
                 };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
@@ -1081,7 +1112,11 @@ impl RpcDispatch for Node {
                     Ok(report) => report,
                     Err(e) => return reward_chain_port_error_response(&id, &e),
                 };
-                let commitments: Vec<dig_rpc_protocol::types::RewardDistributorCommitment> = report
+                // dig-rpc-protocol 0.15 (dig_ecosystem#3442): the wire carries
+                // `recoverable_base_units` as `Option<u64>`, so the port's three-state figure
+                // maps straight across -- `None` stays `None` (never `0`, never an error),
+                // `Some(0)` stays `Some(0)`.
+                let commitments = report
                     .commitments
                     .iter()
                     .map(|c| dig_rpc_protocol::types::RewardDistributorCommitment {
@@ -1097,6 +1132,11 @@ impl RpcDispatch for Node {
                     epoch_seconds: report.epoch_seconds,
                     commitments,
                     observed_at: report.observed_at,
+                    // dig-rpc-protocol 0.14 chain-view anchor, same rule as
+                    // `GetRewardDistributorResult` above: straight from `report`, the SAME chain
+                    // read that produced everything else in this result.
+                    chain_peak_height: report.chain_peak_height,
+                    chain_peak_timestamp: report.chain_peak_timestamp,
                 };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});
             }
@@ -1156,6 +1196,12 @@ impl RpcDispatch for Node {
                     };
 
                 let mut funded_refs = Vec::with_capacity(identities.len());
+                // `observed_at` must date the CONSULTATION, never the assembly (dig_ecosystem#3323,
+                // dig-rpc-protocol SPEC §4.4.2's first bullet): each `report.observed_at` postdates
+                // the pre-loop `now` above (the chain port stamps it after its own read, uncached),
+                // so stamping the handler's clock here understates staleness. Fold the reports' own
+                // stamps and keep the OLDEST — a collection is only as fresh as its stalest member.
+                let mut oldest_observed_at: Option<u64> = None;
                 for identity in identities {
                     let Some(port) = node.reward_chain_port() else {
                         return reward_chain_port_absent_response(&id);
@@ -1168,6 +1214,10 @@ impl RpcDispatch for Node {
                         Ok(report) => report,
                         Err(e) => return reward_chain_port_error_response(&id, &e),
                     };
+                    oldest_observed_at = Some(match oldest_observed_at {
+                        Some(oldest) => oldest.min(report.observed_at),
+                        None => report.observed_at,
+                    });
                     funded_refs.push(dig_rpc_protocol::types::RewardDistributorRef {
                         launcher_id: hex::encode(report.launcher_id),
                         store_id: hex::encode(report.store_id),
@@ -1177,7 +1227,10 @@ impl RpcDispatch for Node {
 
                 let result = dig_rpc_protocol::types::ListRewardDistributorsResult {
                     funded: dig_rpc_protocol::types::Half::Consulted {
-                        observed_at: now,
+                        // No reads happened for `FundsNothing` (empty `identities`), so the
+                        // pre-loop handler clock is the honest stamp for that case — it IS the
+                        // consultation. Both `NotConsulted` arms above keep `now` unchanged.
+                        observed_at: oldest_observed_at.unwrap_or(now),
                         items: funded_refs,
                     },
                     claimable: dig_rpc_protocol::types::Half::NotConsulted { observed_at: now },
@@ -1210,12 +1263,25 @@ impl RpcDispatch for Node {
             //
             // No monetary amount, ever, and no payout puzzle hash — see `PayeeClaimStatus`'s doc.
             // No params type: this call takes none.
+            //
+            // `claim_loop` (dig-rpc-protocol 0.13.0, required on the 0.14 wire this crate now
+            // targets, dig_ecosystem#3329): this crate holds no claim loop either -- it lives in
+            // `dig-node-service`'s `src/rewards_claim/**` (dig_ecosystem#3268 wired it, landed;
+            // #3432 is the SPEC §13.2 off-chain seam), which this ticket's brief fences off. Same
+            // honesty rule as `claim_log` right above: the loop was never
+            // constructed from here, so the answer is `NotConsulted`, dated at the moment this
+            // responder established it has nothing to read -- never a manufactured `Consulted`
+            // with invented counts.
             Some(Method::GetPayeeRewardClaimStatus) => {
                 use crate::rewards::state::Clock as _;
+                let now = crate::rewards::state::SystemClock.now_unix_seconds();
                 let result = dig_rpc_protocol::types::PayeeClaimStatus {
                     subject: dig_rpc_protocol::types::PayeeSubject::Payee,
                     claim_log: dig_rpc_protocol::types::ClaimLogObservation::NotConsulted {
-                        observed_at: crate::rewards::state::SystemClock.now_unix_seconds(),
+                        observed_at: now,
+                    },
+                    claim_loop: dig_rpc_protocol::types::ClaimLoopObservation::NotConsulted {
+                        observed_at: now,
                     },
                 };
                 return json!({"jsonrpc":"2.0","id":id,"result": result});

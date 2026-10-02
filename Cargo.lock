@@ -2689,9 +2689,9 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.24.0"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d705dda562d63c03a1a481087c3b9f632b90982676ea8bb4e55f2cd04c4465fc"
+checksum = "8586f4d17592fccaf88e26b0f98e162cf79edbaf8cd27cdb2e29f90f405b682b"
 dependencies = [
  "async-trait",
  "dig-constants 0.11.2",
@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.261.0"
+version = "0.262.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3151,9 +3151,9 @@ dependencies = [
 
 [[package]]
 name = "dig-peer"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01657d5ef42a4ebf038d53b3b398997057417558cd6c059f4f58716e68676f34"
+checksum = "dd816ee4dde0fa218bcc6a5b260b16a0d69132f172a2a57202f1b9b4d67bfd6e"
 dependencies = [
  "chia-protocol 0.36.1",
  "chia-traits 0.36.1",
@@ -3191,9 +3191,9 @@ dependencies = [
 
 [[package]]
 name = "dig-peer-selector"
-version = "0.13.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3be02a4acba35b9580f3655c95cf4e127031e100e684069a17fb2829bb4e68b"
+checksum = "286da77c5d95fc7ba60e81626c6f7f20fda49e4f7d36b38d48ebf7b37b6cdf72"
 dependencies = [
  "dig-dht",
  "dig-nat",
@@ -3217,9 +3217,9 @@ dependencies = [
 
 [[package]]
 name = "dig-rewards-coin"
-version = "0.8.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7afdbc8cf70e84ad13779824948d165577df91e0409cd65a40130f5421e99f5b"
+checksum = "aa83ab0ad468d538c78bcd5fda3abb87116432bb97b115f256860ef81b923bec"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-consensus 0.36.1",
@@ -3237,9 +3237,9 @@ dependencies = [
 
 [[package]]
 name = "dig-rpc-protocol"
-version = "0.12.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eb22a4741239303c9558b00d20c0cb6d9afad965382656bece3d4bbe9641f24"
+checksum = "1160e00673f442119f53557896bc155ec808da0df5eb9d09fc1b0e03f8c6b133"
 dependencies = [
  "serde",
  "serde_json",

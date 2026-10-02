@@ -480,6 +480,22 @@ pub fn launch_funded_admitted_fixture_with_approval(
     payout_puzzle_hash: Bytes32,
     require_payout_approval: bool,
 ) -> Result<FundedFixture, Box<dyn std::error::Error>> {
+    launch_funded_admitted_fixture_with_shape(
+        payout_puzzle_hash,
+        require_payout_approval,
+        WITHDRAWAL_SHARE_BPS,
+    )
+}
+
+/// Same as [`launch_funded_admitted_fixture_with_approval`], but with the clawback
+/// `withdrawal_share_bps` curried into the distributor -- dig_ecosystem#3442 needs a REAL launch
+/// with `0` to prove a genuine zero share is carried as `Some(0)`, distinct from "not recoverable".
+#[allow(dead_code)]
+pub fn launch_funded_admitted_fixture_with_shape(
+    payout_puzzle_hash: Bytes32,
+    require_payout_approval: bool,
+    withdrawal_share_bps: u64,
+) -> Result<FundedFixture, Box<dyn std::error::Error>> {
     let ctx = &mut SpendContext::new();
     let mut sim = Simulator::new();
 
@@ -577,7 +593,7 @@ pub fn launch_funded_admitted_fixture_with_approval(
         PAYOUT_THRESHOLD_BASE_UNITS,
         require_payout_approval,
         0,
-        WITHDRAWAL_SHARE_BPS,
+        withdrawal_share_bps,
         source_cat.info.asset_id,
     );
 
@@ -722,6 +738,18 @@ pub fn launch_funded_admitted_fixture_with_approval(
 /// general `sim`/`singleton_members`/`extra_coin_ids` form, `tests/simulator.rs`).
 #[allow(dead_code)] // rustc compiles `mod common` separately per integration-test binary; this is reachable only from rewards_claim_chain_port_3347.rs, not rewards_chain_port_a3.rs
 pub fn mock_chain_source_for_funded_fixture(fixture: &FundedFixture) -> MockChainSource {
+    mock_chain_source_for_funded_fixture_with_clock(fixture, |height| u64::from(height) * 1_000 + 1)
+}
+
+/// Same as [`mock_chain_source_for_funded_fixture`], but the chain's own clock (the block
+/// timestamp served for each height) is chosen by the caller. dig_ecosystem#3442 needs the SAME
+/// real commitment read once AFTER its epoch started (`None`) and once BEFORE (`Some(share)`),
+/// and the only difference between those reads is the chain clock.
+#[allow(dead_code)]
+pub fn mock_chain_source_for_funded_fixture_with_clock(
+    fixture: &FundedFixture,
+    clock: impl Fn(u32) -> u64,
+) -> MockChainSource {
     let eve_coin_id = fixture
         .sim
         .children(fixture.launcher_id)
@@ -762,7 +790,7 @@ pub fn mock_chain_source_for_funded_fixture(fixture: &FundedFixture) -> MockChai
 
     let peak = fixture.sim.height();
     for height in 0..=peak {
-        source = source.with_timestamp(height, u64::from(height) * 1_000 + 1);
+        source = source.with_timestamp(height, clock(height));
     }
     source.with_peak(peak)
 }

@@ -1622,7 +1622,7 @@ mod tests {
         ) -> Result<Vec<u8>, dig_download::DownloadError> {
             let spend = self
                 .budget
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     (left > 0).then(|| left.saturating_sub(1))
                 });
             if spend.is_err() {

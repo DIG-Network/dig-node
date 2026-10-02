@@ -582,15 +582,16 @@ pub struct Node {
     ///
     /// A slot rather than a constructor argument for the same reason [`Node::mirror_pointers`] is
     /// one: the FFI/browser path has no state directory and must keep constructing a `Node`
-    /// without one. Nothing installs it in production yet — nothing in dig-node funds a
-    /// distributor today (`rewards::port`'s module doc, blocker 2). WHICH ticket owns the startup
-    /// wiring that would call [`Node::install_funded_distributor_registry`] with the node's state
-    /// directory is tracked separately, and it is NOT dig_ecosystem#3268, whose scope is the claim
-    /// loop and `ClaimStatus` and which names neither this registry nor that call. Until a ticket
-    /// wires it the slot stays empty, and
+    /// without one. `dig-node-service`'s startup path installs a real, state-dir-backed registry
+    /// (dig_ecosystem#3292); until that install runs (e.g. a harness with `enable_chain_sync:
+    /// false`, or the FFI/browser path) the slot stays empty and
     /// [`Node::funded_distributors_read`] answers
     /// [`rewards::funded::NotConfiguredReason::NoStateDirectory`] — UNKNOWN, deliberately never an
-    /// empty funded set.
+    /// empty funded set. Even once installed, the registry starts with no record on disk (writing
+    /// one is dig_ecosystem#3291, a separate operator-declaration ticket — the node cannot observe
+    /// its own funding because funding spends from a wallet it never holds), so a fresh production
+    /// node reads [`rewards::funded::NotConfiguredReason::NoRecordWritten`] — still UNKNOWN, by
+    /// design, not a defect of the installer.
     funded_distributors: OnceLock<rewards::funded::FundedDistributorRegistry>,
     /// The chain seam `dig.getRewardDistributor` / `dig.listRewardDistributorCommitments`
     /// (dig_ecosystem#3269 units 1-2) read through — [`rewards::port::RewardsChainPort`].
@@ -642,13 +643,12 @@ impl Node {
     /// if a registry is already installed, in which case NOTHING changed — a second install must
     /// not be able to swap a live registry for an inert one behind a caller's back.
     ///
-    /// Called from tests today: no production startup path installs one, so clippy's non-test
-    /// lib target sees no production caller and `allow(dead_code)` stands in for it. Remove the
-    /// attribute when that wiring lands. Its owning ticket is tracked separately and is NOT
-    /// dig_ecosystem#3268 (claim loop + `ClaimStatus`), which names neither this registry nor this
-    /// call — do not read the attribute as a claim about #3268's scope.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn install_funded_distributor_registry(
+    /// `pub` because this is the INJECTION POINT, mirroring
+    /// [`Node::install_reward_chain_port`]: `dig-node-service`'s startup path builds a
+    /// state-dir-backed registry and installs it here (dig_ecosystem#3292). Being callable from
+    /// outside does NOT relax the single-install discipline: a second install still returns
+    /// `false` and changes nothing.
+    pub fn install_funded_distributor_registry(
         &self,
         registry: rewards::funded::FundedDistributorRegistry,
     ) -> bool {
@@ -9488,6 +9488,77 @@ mod tests {
         }
     }
 
+    /// **Proves:** dig_ecosystem#3280 — a malformed `launcher_id` is refused with `-32602`, the
+    /// same validator `dig.getRewardDistributor` already uses (`parse_launcher_id_arg`), instead
+    /// of silently filtering to an empty `items` list that reads exactly like "I looked and found
+    /// nothing" (SPEC §12.5 clause 6's "reassuring zero", on the input side rather than the read
+    /// side). Registers a handle first so a filter bug that matches everything cannot pass this
+    /// test by accident: the malformed request must be refused before any filter runs.
+    /// **Catches:** a malformed `launcher_id` degrading to `Consulted { items: [] }`.
+    #[test]
+    fn get_reward_prover_status_with_a_malformed_launcher_id_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status([0x11u8; 32]),
+        ));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus",
+                "params": {"launcher_id": "zz"}
+            }),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            resp["error"]["code"],
+            json!(-32602),
+            "a malformed launcher_id must be refused, not filtered to an empty list: {resp}"
+        );
+        assert!(
+            resp.get("result").is_none(),
+            "an error response must carry no result: {resp}"
+        );
+    }
+
+    /// **Proves:** a well-formed but UNKNOWN `launcher_id` still answers `consulted` with an
+    /// empty `items` list — distinct from the malformed case above, which must be `-32602`.
+    /// **Catches:** widening the malformed-input refusal to also swallow legitimate misses.
+    #[test]
+    fn get_reward_prover_status_with_an_unknown_well_formed_launcher_id_is_empty_not_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        node.register_reward_prover_status(crate::rewards::state::StatusHandle::new(
+            sample_reward_prover_status([0x11u8; 32]),
+        ));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"dig.getRewardProverStatus",
+                "params": {"launcher_id": hex::encode([0x99u8; 32])}
+            }),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(resp["result"]["statuses"]["outcome"], json!("consulted"));
+        assert_eq!(
+            resp["result"]["statuses"]["items"],
+            json!([]),
+            "an unknown but well-formed id is a legitimate empty answer, not an error: {resp}"
+        );
+    }
+
     /// **Proves:** with nothing registered, `dig.getRewardProverStatus` answers
     /// `{"statuses": []}` — SPEC §2.4 clause 1's "not distributing" render — never blank, `null`,
     /// or an omitted `result`. **Catches:** an absent-record case that renders as nothing rather
@@ -9835,6 +9906,10 @@ mod tests {
             ),
             commitments,
             observed_at,
+            // Distinct from `observed_at` (a wall clock) by construction, so a test asserting the
+            // two fields are threaded independently cannot pass by accident on equal values.
+            chain_peak_height: 9_000_000 + seed as u64,
+            chain_peak_timestamp: 1_700_190_000 + seed as u64,
         }
     }
 
@@ -9912,6 +9987,8 @@ mod tests {
                 "last_entry_write_at",
                 "entry_set_stale",
                 "observed_at",
+                "chain_peak_height",
+                "chain_peak_timestamp",
             ]),
             "the wire body's key SET must be exactly this — a struct assertion cannot see a wrong \
              key name or an extra field"
@@ -9945,6 +10022,11 @@ mod tests {
         );
         assert_eq!(result["entry_set_stale"], json!(report.entry_set_stale));
         assert_eq!(result["observed_at"], json!(report.observed_at));
+        assert_eq!(result["chain_peak_height"], json!(report.chain_peak_height));
+        assert_eq!(
+            result["chain_peak_timestamp"],
+            json!(report.chain_peak_timestamp)
+        );
     }
 
     /// **Proves:** `dig.listRewardDistributorCommitments` answers with the port's real values
@@ -9961,7 +10043,7 @@ mod tests {
             epoch_start: 42,
             clawback_puzzle_hash: [0x33u8; 32],
             rewards_base_units: 1_000,
-            recoverable_base_units: 900,
+            recoverable_base_units: Some(900),
         };
         let report = sample_distributor_report(0x22, vec![slot.clone()]);
         assert!(
@@ -9992,6 +10074,8 @@ mod tests {
                 "epoch_seconds",
                 "commitments",
                 "observed_at",
+                "chain_peak_height",
+                "chain_peak_timestamp",
             ])
         );
         assert_eq!(
@@ -10004,6 +10088,11 @@ mod tests {
         );
         assert_eq!(result["epoch_seconds"], json!(report.epoch_seconds));
         assert_eq!(result["observed_at"], json!(report.observed_at));
+        assert_eq!(result["chain_peak_height"], json!(report.chain_peak_height));
+        assert_eq!(
+            result["chain_peak_timestamp"],
+            json!(report.chain_peak_timestamp)
+        );
         let commitments = result["commitments"].as_array().unwrap();
         assert_eq!(commitments.len(), 1);
         let row_keys: std::collections::BTreeSet<&str> = commitments[0]
@@ -10156,6 +10245,65 @@ mod tests {
         );
     }
 
+    /// **Proves:** `funded.observed_at` dates the CONSULTATION (the oldest per-item chain read),
+    /// never the assembly (dig_ecosystem#3323). The handler's pre-loop clock predates every read
+    /// `port.distributor_report` performs, so stamping it there understates staleness; the fix
+    /// folds the reports' own `observed_at` and keeps the oldest (a collection is only as fresh
+    /// as its stalest member). `claimable.observed_at` is untouched — no read happens for it, so
+    /// the handler's own clock remains the honest answer for that `NotConsulted` arm.
+    #[test]
+    fn list_reward_distributors_funded_observed_at_is_the_oldest_report_stamp() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let registry =
+            crate::rewards::funded::FundedDistributorRegistry::with_state_dir(state_dir.path());
+        for launcher_id in [[0x55u8; 32], [0x66u8; 32]] {
+            assert_eq!(
+                registry.record(&crate::rewards::funded::FundedDistributor {
+                    launcher_id,
+                    store_id: None,
+                }),
+                crate::rewards::funded::RecordOutcome::Recorded
+            );
+        }
+        let (node, _td) = test_node(None);
+        assert!(node.install_funded_distributor_registry(registry));
+
+        let report_a = sample_distributor_report(0x55, vec![]);
+        let report_b = sample_distributor_report(0x66, vec![]);
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([
+                    ([0x55u8; 32], Ok(report_a.clone())),
+                    ([0x66u8; 32], Ok(report_b.clone())),
+                ]),
+            }))
+        );
+
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributors"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert_eq!(resp["result"]["funded"]["outcome"], json!("consulted"));
+        assert_eq!(
+            resp["result"]["funded"]["observed_at"],
+            json!(1_700_200_000u64 + 0x55)
+        );
+        assert_eq!(
+            resp["result"]["funded"]["observed_at"],
+            json!(report_a.observed_at)
+        );
+        assert_ne!(
+            resp["result"]["funded"]["observed_at"],
+            json!(report_b.observed_at)
+        );
+        assert_eq!(
+            resp["result"]["claimable"]["outcome"],
+            json!("not_consulted")
+        );
+    }
+
     /// **Proves:** a funded identity whose per-item chain report fails refuses the WHOLE call
     /// (the same `ChainPortError` response the sibling reward-distributor handlers use), rather
     /// than emitting a partial list or a fabricated ref (dig_ecosystem#3308/#3309).
@@ -10198,8 +10346,12 @@ mod tests {
 
     /// **Proves:** `dig.getPayeeRewardClaimStatus` is CONTROL-tier, NOT peer-reachable, dispatched
     /// through the `Method` enum match, and its exact serialized JSON body: `subject` is the
-    /// literal `"payee"`, `claim_log` is `NotConsulted` (no claim log exists in this crate yet),
-    /// and there is never a monetary amount or payout puzzle hash anywhere in the body.
+    /// literal `"payee"`, `claim_log` and `claim_loop` are both `NotConsulted` (neither a claim
+    /// log nor a claim loop exists in this crate yet — the loop lives in `dig-node-service`'s
+    /// `src/rewards_claim/**`, dig_ecosystem#3268 (wiring, landed) / #3432 (the SPEC §13.2
+    /// off-chain seam), never dig_ecosystem#3421 (that ticket is the prover's
+    /// `RewardsChainPort`) — and
+    /// there is never a monetary amount or payout puzzle hash anywhere in the body.
     #[test]
     fn get_payee_reward_claim_status_answers_the_exact_wire_shape() {
         use dig_rpc_protocol::Method;
@@ -10231,7 +10383,7 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            std::collections::BTreeSet::from(["subject", "claim_log"]),
+            std::collections::BTreeSet::from(["subject", "claim_log", "claim_loop"]),
             "no monetary amount, no payout puzzle hash — ever: {resp}"
         );
         assert_eq!(result["subject"], json!("payee"));
@@ -10239,6 +10391,11 @@ mod tests {
         assert!(
             result["claim_log"].get("claims_submitted_count").is_none(),
             "claims_submitted_count must live INSIDE Consulted only, never beside NotConsulted: {resp}"
+        );
+        assert_eq!(result["claim_loop"]["outcome"], json!("not_consulted"));
+        assert!(
+            result["claim_loop"].get("claims_submitted_count").is_none(),
+            "claim_loop's count must live INSIDE Consulted only, never beside NotConsulted: {resp}"
         );
     }
 
@@ -10687,13 +10844,13 @@ mod tests {
             epoch_start: 1,
             clawback_puzzle_hash: [0xaau8; 32],
             rewards_base_units: 5_000,
-            recoverable_base_units: 4_500,
+            recoverable_base_units: Some(4_500),
         };
         let slot_b = crate::rewards::port::CommitmentSlot {
             epoch_start: 2,
             clawback_puzzle_hash: [0xbbu8; 32],
             rewards_base_units: 7_000,
-            recoverable_base_units: 6_300,
+            recoverable_base_units: Some(6_300),
         };
         let report_a = sample_distributor_report(0x70, vec![slot_a]);
         let report_b = sample_distributor_report(0x71, vec![slot_b]);
@@ -10736,6 +10893,70 @@ mod tests {
         assert_ne!(recoverable_b, summed);
         assert_ne!(recoverable_a, swapped_a);
         assert_ne!(recoverable_b, swapped_b);
+    }
+
+    /// Serves ONE commitment carrying `recoverable` through `dig.listRewardDistributorCommitments`
+    /// and returns the serialized `commitments[0]` object, so a test asserts on the wire JSON.
+    fn serve_one_commitment(recoverable: Option<u64>) -> serde_json::Value {
+        let (node, _td) = test_node(None);
+        let launcher = [0x72u8; 32];
+        let slot = crate::rewards::port::CommitmentSlot {
+            epoch_start: 3,
+            clawback_puzzle_hash: [0xccu8; 32],
+            rewards_base_units: 5_000,
+            recoverable_base_units: recoverable,
+        };
+        let report = sample_distributor_report(0x72, vec![slot]);
+        assert!(
+            node.install_reward_chain_port(Arc::new(FakeRewardsChainPort {
+                reports: std::collections::HashMap::from([(launcher, Ok(report))]),
+            }))
+        );
+        let resp = rt().block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listRewardDistributorCommitments",
+                   "params":{"launcher_id": hex::encode(launcher)}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert!(
+            resp.get("error").is_none(),
+            "a commitment must never turn the whole call into an error: {resp}"
+        );
+        resp["result"]["commitments"][0].clone()
+    }
+
+    /// **Guards dig_ecosystem#3439 / #3442:** a `None` (the chain REFUSES this clawback, its epoch
+    /// has started) mapped to `0` tells a user they can claw back nothing when the chain actually
+    /// refuses; mapped to an error it hides every other commitment. It must serialize as the key
+    /// PRESENT with JSON `null`.
+    #[test]
+    fn unrecoverable_commitment_serializes_recoverable_as_present_null() {
+        let c = serve_one_commitment(None);
+        let obj = c.as_object().unwrap();
+        assert!(
+            obj.contains_key("recoverable_base_units"),
+            "key must be present: {c}"
+        );
+        assert!(
+            c["recoverable_base_units"].is_null(),
+            "None must be null, not 0: {c}"
+        );
+    }
+
+    /// **Guards dig_ecosystem#3439:** `Some(0)` (recoverable, but the share is zero) is a different
+    /// statement from `None` and must stay the number `0`.
+    #[test]
+    fn zero_recoverable_commitment_serializes_as_zero() {
+        let c = serve_one_commitment(Some(0));
+        assert_eq!(c["recoverable_base_units"], json!(0), "{c}");
+    }
+
+    /// **Guards dig_ecosystem#3439:** a positive recoverable figure passes through verbatim.
+    #[test]
+    fn positive_recoverable_commitment_serializes_verbatim() {
+        let c = serve_one_commitment(Some(4_500));
+        assert_eq!(c["recoverable_base_units"], json!(4_500), "{c}");
     }
 
     /// **Proves:** `total_paid_out_base_units`/`reserve_base_units` stay attributed to the

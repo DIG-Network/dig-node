@@ -15,7 +15,6 @@ use dig_node_core::rewards::port::{
     Bytes32 as PortBytes32, ChainPortError, CommitmentSlot, DistributorChainState, DistributorRef,
     DistributorReport, EntryWriteBundle, RewardsChainPort,
 };
-use dig_rewards_coin::clawback::recoverable_base_units;
 use dig_rewards_coin::state::DistributorSnapshot;
 use dig_rewards_coin::RewardsError;
 use dig_wallet::sage::corroborated_source::CorroboratedChainSource;
@@ -186,6 +185,13 @@ fn report_from_snapshot(
     comment: dig_rewards_coin::comment::LaunchComment,
     first_epoch_start: u64,
 ) -> Result<DistributorReport, ChainPortError> {
+    // dig-rpc-protocol 0.14 chain-view anchor (dig_ecosystem#3262/#3329, SPEC §4.5/§4.6 cl.6): the
+    // peak comes from the SAME `ChainObservation` that decided every commitment's presence and
+    // recoverability below, never from a second read -- a row can then never contradict its own
+    // anchor. `dig-rewards-coin` itself refuses an absent peak, so `0` is never a stand-in here.
+    let observed = snapshot.observed();
+    let chain_peak_height = u64::from(observed.peak_height());
+    let chain_peak_timestamp = observed.peak_timestamp();
     let distributor = snapshot.distributor();
     let constants = distributor.info.constants;
 
@@ -214,21 +220,18 @@ fn report_from_snapshot(
     // `Ok(Some(..))`.
     let current_distributor_epoch = epoch_ordinal(epoch_end, first_epoch_start, epoch_seconds);
 
+    // The chain's own answer, carried unchanged: `None` is a VALUE ("the chain refuses this
+    // clawback", dig_ecosystem#3442), not an error and never `0`.
     let commitments = snapshot
-        .slots()
-        .commitments
+        .commitments()
         .iter()
-        .map(|commitment| {
-            let recoverable = recoverable_base_units(commitment.rewards, withdrawal_share_bps)
-                .ok_or(ChainPortError::InvalidWithdrawalShare)?;
-            Ok(CommitmentSlot {
-                epoch_start: commitment.epoch_start,
-                clawback_puzzle_hash: commitment.clawback_ph.into(),
-                rewards_base_units: commitment.rewards,
-                recoverable_base_units: recoverable,
-            })
+        .map(|commitment| CommitmentSlot {
+            epoch_start: commitment.distributor_epoch_start(),
+            clawback_puzzle_hash: commitment.clawback_authority().into(),
+            rewards_base_units: commitment.rewards_base_units(),
+            recoverable_base_units: commitment.recoverable_base_units(),
         })
-        .collect::<Result<Vec<_>, ChainPortError>>()?;
+        .collect();
 
     let observed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -251,6 +254,8 @@ fn report_from_snapshot(
         entry_set_stale: snapshot.entry_set_stale(),
         commitments,
         observed_at,
+        chain_peak_height,
+        chain_peak_timestamp,
     })
 }
 

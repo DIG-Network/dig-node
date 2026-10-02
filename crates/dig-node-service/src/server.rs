@@ -2227,6 +2227,27 @@ where
     // node in the network — a correct answer, and a permanently unchanging one.
     bring_up_collateral_records();
 
+    // This node's funder-ownership registry (dig_ecosystem#3285), installed against the same
+    // hardened state dir the control token lives in (`state.state_dir`, resolved above). Unlike
+    // the chain-reading installs below, this is pure local state — no chain source, no
+    // `enable_chain_sync` gate — so it installs unconditionally, including under an integration
+    // harness with sync disabled. Until this call existed nothing installed a registry in any
+    // shipped binary, so `dig.listRewardDistributors`'s `funded` half answered `not_consulted` on
+    // every production node regardless of what an operator had funded (dig_ecosystem#3292).
+    // `install_funded_distributor_registry`'s `OnceLock` means a second call here (there is none)
+    // would simply be refused, not double-installed. The registry itself starts EMPTY on a fresh
+    // node — no record on disk until dig_ecosystem#3291's writer runs — so the correct read right
+    // after this call is `NotConfigured(NoRecordWritten)`, not a funded set; that is success, not
+    // a bug.
+    if !state.node.install_funded_distributor_registry(
+        dig_node_core::rewards::funded::FundedDistributorRegistry::with_state_dir(&state.state_dir),
+    ) {
+        tracing::warn!(
+            "install_funded_distributor_registry declined a second install: a funder-ownership \
+             registry was already installed on this Node"
+        );
+    }
+
     // The CENSUS half (#400). `bring_up_collateral_records` writes epoch 1, which is derivable
     // from nothing; this is what lets the node record epoch n. It runs detached and on a timer
     // because a census depends on the chain having moved: an epoch that has begun by the clock is

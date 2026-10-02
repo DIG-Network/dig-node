@@ -96,7 +96,7 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
         .collect()
 }
 
-/// **Proves:** exactly ONE `dig-rpc-protocol` resolves in the workspace, and it is the 0.12 line that
+/// **Proves:** exactly ONE `dig-rpc-protocol` resolves in the workspace, and it is the 0.15 line that
 /// defines the module wire (`ModuleInfo` / `GetModuleInfoParams` / `FetchModuleRangeParams`), the
 /// recursive-ask contract this node adopted (`GetAvailabilityParams::budget_ms` / `::ask_id`,
 /// `AvailabilityAnswer::absence_established`, `ErrorCode::ContentMissInconclusive`), AND (#3269) the
@@ -110,10 +110,10 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
 /// is the point: a consumer's own lock can pin an old patch even when every caret dep and every
 /// higher-layer bump looks correct.
 ///
-/// **Cascade closed (#3269, final leg):** `dig-node-core` depends on 0.12 directly; `dig-peer`
-/// (0.15.0), `dig-download` (0.24.0) and `dig-peer-selector` (0.13.0) all now resolve
-/// `dig-rpc-protocol` 0.12 too, so `cargo metadata` resolves exactly one line. This assertion is
-/// deliberately left at exactly-one/0.12 (never widened to accept a set — see #836/#1576); if a
+/// **Cascade closed (#3329, final leg):** `dig-node-core` depends on 0.15 directly; `dig-peer`
+/// (0.17.0), `dig-download` (0.26.0) and `dig-peer-selector` (0.15.0) all now resolve
+/// `dig-rpc-protocol` 0.15 too, so `cargo metadata` resolves exactly one line. This assertion is
+/// deliberately left at exactly-one/0.15 (never widened to accept a set — see #836/#1576/#3269); if a
 /// future dependency bump reopens the split, this test goes red again on purpose.
 #[test]
 fn the_workspace_carries_exactly_one_module_wire_crate() {
@@ -125,9 +125,9 @@ fn the_workspace_carries_exactly_one_module_wire_crate() {
          majors means two `ModuleInfo` shapes across the module pull's trust boundary"
     );
     assert!(
-        versions[0].starts_with("0.12."),
+        versions[0].starts_with("0.15."),
         "the availability contract plus the #3269 reward RPC surface this node adopted ship in \
-         dig-rpc-protocol 0.12; the workspace resolved {} — on an earlier line the canonical items \
+         dig-rpc-protocol 0.15; the workspace resolved {} — on an earlier line the canonical items \
          simply do not exist and this node would be back to declaring its own",
         versions[0]
     );
