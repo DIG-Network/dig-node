@@ -415,7 +415,7 @@ mod tests {
         async fn unspent_coins_by_hint(&self, _hint: ChiaBytes32) -> ChainResult<Vec<Coin>> {
             match self
                 .answers_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     left.checked_sub(1)
                 }) {
                 Ok(_) => Ok(Vec::new()),
