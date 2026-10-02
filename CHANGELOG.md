@@ -4,27 +4,6 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.262.0] - 2026-10-02
-
-### BREAKING
-- `dig.listRewardDistributorCommitments`: `recoverable_base_units` is now `null` (key present) when a commitment is
-  not recoverable; `0` remains a real zero. Clients that decode it as a plain integer must accept `null`; dig-app
-  `nightly-20261002` or later is required to render it. Cascades dig-rpc-protocol 0.15, dig-peer 0.17,
-  dig-download 0.26, dig-peer-selector 0.15 (#631, dig_ecosystem#3442)
-
-### Features
-- **rewards:** `recoverable_base_units` can say "not recoverable" instead of collapsing to 0 (#631)
-
-### Bug Fixes
-- **rewards:** Install FundedDistributorRegistry at startup; refuse a malformed launcher_id (#626, dig_ecosystem#3292)
-- **rewards:** Fold observed_at to the oldest report; log IoFailed (#628, dig_ecosystem#3323, dig_ecosystem#3324)
-
-### Documentation
-- **spec:** Section 26 prover loop spawn, four controls, kill switch (#627, dig_ecosystem#3265)
-
-### Chores
-- **deps:** Bump the dig-rpc-protocol cascade to 0.14.0 (#629, dig_ecosystem#3329)
-
 ## [0.255.0] - 2026-09-07
 
 ### Chores
