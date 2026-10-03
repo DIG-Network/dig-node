@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.262.1] - 2026-10-03
+
+### Build
+- **deps:** Bump dig-rewards-coin to 0.11 and raise dig-* floors (dig_ecosystem#3450) (#634)
+
 ## [0.255.0] - 2026-09-07
 
 ### Chores
