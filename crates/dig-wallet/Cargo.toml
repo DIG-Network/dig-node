@@ -13,6 +13,12 @@ path = "src/lib.rs"
 name = "dig-wallet"
 path = "src/main.rs"
 
+# Compiles the branded DIG icon (`../../assets/dig.rc`) into a Windows resource that
+# `build.rs` links into the `dig-wallet` binary (dig_ecosystem#2917). Not a `dig-*`/
+# `chia-*` crate, so no cross-repo version lockstep applies here.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 # Store-format libs from the digstore repo (git deps, pinned to the same rev as the
 # node — bump together). digstore-chain: BIP-39 seed + HD wallet scan + DIG-CAT +
