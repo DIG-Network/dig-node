@@ -176,13 +176,6 @@ pub enum ChainPortError {
     /// SPEC §3.7 clause 4 applies to every attacker-adjacent string, and a chain error is not
     /// exempt).
     Other(String),
-    /// dig-rpc-protocol 0.14 (dig_ecosystem#3262/#3329): the adapter completed its distributor
-    /// read but could not obtain a chain peak height/timestamp from the SAME read to fill
-    /// [`DistributorReport::chain_peak_height`]/[`DistributorReport::chain_peak_timestamp`]. Per
-    /// SPEC §4.5 both fields are required and never `0`-as-absence, so a responder that cannot
-    /// anchor its answer to a chain view MUST refuse the whole call rather than answer with an
-    /// invented, stale, or independently-read peak.
-    ChainPeakUnavailable,
 }
 
 /// One clawback commitment slot, as `dig.listRewardDistributorCommitments` (SPEC §7.4 clause 5)
@@ -271,8 +264,11 @@ pub struct DistributorReport {
     /// independent `peak_height()` call: a peak read separately from the snapshot names a height
     /// the data did not come from, which is wrong in the most convincing possible way — a plausible
     /// number beside stale data, with nothing erroring. Required, never `0`-as-absence: an adapter
-    /// that cannot obtain the peak alongside its read MUST refuse the whole call
-    /// (`ChainPortError::ChainPeakUnavailable`) instead of reporting one.
+    /// that cannot obtain the peak alongside its read MUST refuse the whole call instead of
+    /// reporting one. The real adapter does: `dig_rewards_coin`'s `read_distributor` refuses to
+    /// build a `ChainObservation` without a peak (`Malformed`, surfaced as
+    /// `ChainPortError::Other`; a failed read is `ChainUnavailable`, surfaced as
+    /// `ChainPortError::Unavailable`), so this field is never `0`-as-absence.
     pub chain_peak_height: u64,
     /// `block_timestamp(chain_peak_height)` from that SAME chain read — the chain clock
     /// `entry_set_stale` is computed against, never the wall clock `observed_at` uses. Same
