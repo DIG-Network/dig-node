@@ -74,13 +74,6 @@ const REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE: &str = "REWARD_INVALID_WITHDRAWAL
 /// `REWARD_INVALID_WITHDRAWAL_SHARE_MACHINE`'s sibling shape.
 const REWARD_ZERO_IDENTITY_MACHINE: &str = "REWARD_ZERO_IDENTITY";
 
-/// dig_ecosystem#3262/#3329: the machine code for [`ChainPortError::ChainPeakUnavailable`] — the
-/// adapter's distributor read succeeded but it could not anchor a `chain_peak_height`/
-/// `chain_peak_timestamp` from that SAME read, so the whole call is refused rather than answered
-/// with an invented or independently-read peak (SPEC §4.5). Sibling shape to the other
-/// reward-distributor refusals above.
-const REWARD_CHAIN_PEAK_UNAVAILABLE_MACHINE: &str = "REWARD_CHAIN_PEAK_UNAVAILABLE";
-
 /// Maps a [`ChainPortError`] to the JSON-RPC error response for both reward-distributor read
 /// methods (dig_ecosystem#3269 unit 2) — one mapping so `dig.getRewardDistributor` and
 /// `dig.listRewardDistributorCommitments` can never disagree about how a given port failure reads
@@ -111,12 +104,6 @@ fn reward_chain_port_error_response(id: &Value, error: &ChainPortError) -> Value
             "code": CONTROL_ERROR,
             "message": format!("reward-distributor chain read failed: {msg}"),
             "data": { "code": "CONTROL_ERROR", "origin": "control" }
-        }}),
-        ChainPortError::ChainPeakUnavailable => json!({"jsonrpc":"2.0","id":id,"error":{
-            "code": CONTROL_ERROR,
-            "message": "distributor read succeeded but no chain peak height/timestamp from that \
-                        same read was available to anchor the result",
-            "data": { "code": REWARD_CHAIN_PEAK_UNAVAILABLE_MACHINE, "origin": "control" }
         }}),
     }
 }
