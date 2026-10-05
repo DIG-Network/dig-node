@@ -4,11 +4,6 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.262.2] - 2026-10-05
-
-### Refactor
-- **rewards:** Remove never-emitted `ChainPortError::ChainPeakUnavailable` and its `REWARD_CHAIN_PEAK_UNAVAILABLE` machine code; an absent chain peak keeps refusing as `-32032` `CONTROL_ERROR` and is now pinned by a test (dig_ecosystem#3448) (#636)
-
 ## [0.255.0] - 2026-09-07
 
 ### Chores
