@@ -40,15 +40,37 @@ mod common;
 use std::sync::Arc;
 
 use dig_chainsource_interface::MockChainSource;
-use dig_node_core::rewards::port::RewardsChainPort;
+use dig_node_core::rewards::port::{ChainPortError, RewardsChainPort};
 use dig_node_core::Node;
 use dig_node_service::rewards::RealRewardsChainPort;
 use dig_rewards_coin::constants::WITHDRAWAL_SHARE_BPS;
 
 use common::rewards_fixture::{
     launch_fixture, launch_funded_admitted_fixture_with_shape, mock_chain_source,
-    mock_chain_source_for_funded_fixture_with_clock, FIRST_EPOCH_START, TEST_EPOCH_SECONDS,
+    mock_chain_source_for_funded_fixture_with_clock, mock_chain_source_without_peak,
+    FIRST_EPOCH_START, TEST_EPOCH_SECONDS,
 };
+
+/// dig_ecosystem#3448: a chain that reports no peak refuses the whole report -- never a `0` peak.
+/// Everything else is the real launch, so the read reaches the peak step (a `NotADistributor` or
+/// `Unavailable` refusal would fail the message assertion): the refusal is `read_distributor`'s
+/// own "no peak height" `Malformed`, surfaced as `ChainPortError::Other`.
+#[tokio::test(flavor = "multi_thread")]
+async fn distributor_report_refuses_when_the_chain_has_no_peak() {
+    let fixture = launch_fixture().expect("a real distributor launches cleanly in the simulator");
+    let source = mock_chain_source_without_peak(&fixture);
+    let port = RealRewardsChainPort::<MockChainSource>::new(Arc::new(source));
+
+    let result = port.distributor_report(fixture.launcher_id.into()).await;
+
+    match result {
+        Err(ChainPortError::Other(msg)) => assert!(
+            msg.contains("no peak height"),
+            "the refusal must come from the peak read, got: {msg}"
+        ),
+        other => panic!("an absent peak must refuse with Other(\"no peak height\"), got {other:?}"),
+    }
+}
 
 /// A3: `RealRewardsChainPort::distributor_report` — the real production adapter, driven by a
 /// `MockChainSource` loaded from a real simulator launch — reports the values launched with,

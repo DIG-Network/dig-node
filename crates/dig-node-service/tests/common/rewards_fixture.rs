@@ -234,6 +234,14 @@ pub fn launch_fixture_with_approval(
 /// `read_distributor_guarded`/`read_launch_comment` read — mirrors
 /// `dig-rewards-coin::tests::simulator::chain_source_with_gaps`.
 pub fn mock_chain_source(fixture: &LaunchedFixture) -> MockChainSource {
+    let peak = fixture.sim.height();
+    mock_chain_source_without_peak(fixture).with_peak(peak)
+}
+
+/// [`mock_chain_source`] minus `with_peak`: every coin, spend, lineage and block timestamp, but a
+/// chain that reports no peak height. A peak once set cannot be unset on `MockChainSource`, so
+/// the peak-less source has to be built first and the peak added by the caller that wants one.
+pub fn mock_chain_source_without_peak(fixture: &LaunchedFixture) -> MockChainSource {
     let singleton_members = [fixture.launcher_id, fixture.distributor_coin_id];
 
     // The eve coin: `read_distributor` needs the SPEND that consumed it, not any record it
@@ -274,11 +282,10 @@ pub fn mock_chain_source(fixture: &LaunchedFixture) -> MockChainSource {
         ),
     );
 
-    let peak = fixture.sim.height();
-    for height in 0..=peak {
+    for height in 0..=fixture.sim.height() {
         source = source.with_timestamp(height, u64::from(height) * 1_000 + 1);
     }
-    source.with_peak(peak)
+    source
 }
 
 // ---------------------------------------------------------------------------------------------
