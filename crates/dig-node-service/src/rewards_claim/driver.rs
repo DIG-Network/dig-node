@@ -1860,7 +1860,7 @@ mod tests {
         );
     }
 
-    /// A cycle that CANNOT claim -- today's real production path, with no chain adapter wired --
+    /// A cycle that CANNOT claim -- a chain port that only ever answers `Unavailable` --
     /// must be a WARNING naming the state, not an `INFO` line that reads like health. This is the
     /// defect the whole ticket exists to remove: silence covering a permanent inability to earn.
     #[tokio::test(start_paused = true)]
