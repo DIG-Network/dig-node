@@ -60,12 +60,13 @@ pub struct RewardsClaimConfig {
     /// them is the silent-failure case this ticket exists to prevent, so opting IN by default is
     /// the honest posture — see [`crate::rewards_claim`]'s module doc.
     ///
-    /// # R5: `true` here does not mean the loop is running yet
-    /// Nothing in this codebase constructs a [`super::ClaimEngine`] outside this module's own tests
-    /// (DIG-Network/dig_ecosystem#3268, not yet landed) — see [`crate::rewards_claim`]'s module doc,
-    /// "Not yet wired into node startup". An operator who reads their own `rewards-claim.json` and
-    /// sees `enabled: true` is exactly the person who needs to know that; the module doc alone does
-    /// not reach them.
+    /// # R5: `true` here is necessary, not sufficient, for the loop to run
+    /// Node startup spawns the claim loop only when this is `true` AND `Config::enable_chain_sync`
+    /// is `true`; even then, if the corroborated chain source cannot be built (offline, no peers),
+    /// the loop reports `ClaimDriverRefusal::ChainSourceUnbuildable` and runs zero cycles — see
+    /// [`crate::rewards_claim`]'s module doc, "Wired into node startup". An operator who reads their
+    /// own `rewards-claim.json` and sees `enabled: true` is exactly the person who needs to know
+    /// that; the module doc alone does not reach them.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 

@@ -245,9 +245,9 @@ impl<P: ClaimChainPort, H: DistributorHintSource> ClaimEngine<P, H> {
     /// Without this call, the engine is exactly as it was before F7: a fresh
     /// [`Self::cycle_fee_budget_mojos`] and no cadence gate on every construction. That is
     /// deliberately still true for a caller that has not opted in (every pre-F7 test), but it is
-    /// also the defect this method exists to close for production use: nothing here is wired into
-    /// node startup yet (`crate::rewards_claim`'s module doc, "Not yet wired into node startup"),
-    /// so the production wiring (#3268) is the one place expected to call this.
+    /// also the defect this method exists to close for production use, so the production engine
+    /// construction in `driver.rs` (`run_claim_driver_in_with_clock`) calls it — see
+    /// `crate::rewards_claim`'s module doc, "Wired into node startup".
     /// F10 (§8.6 floor): also applied here, not just in [`RewardsClaimConfig::load_from`] --
     /// this is a constructor argument, independent of whatever the config file says, and the same
     /// hot-loop hazard applies to whatever caller passes it a degenerate value directly. Applied

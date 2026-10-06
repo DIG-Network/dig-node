@@ -13,7 +13,7 @@ use super::types::{DiscoveredDistributor, Discovery, OwnEntry};
 /// Why a claim-chain call could not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimPortError {
-    /// No chain source is wired yet — [`UnavailableClaimChainPort`]'s only answer, and what any
+    /// No chain source is reachable — [`UnavailableClaimChainPort`]'s only answer, and what any
     /// real adapter should answer for an unreachable chain too.
     Unavailable,
     /// A chain answered but the call failed for a reason worth a message (bounded before logging).
